@@ -31,6 +31,20 @@ class _MockModel(nn.Module):
     def embed(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self._embed(input_ids)
 
+    def init_state(self, batch_size: int):
+        return [torch.zeros(batch_size, 16) for _ in range(len(self.layers))]
+
+    def step(self, token_ids, states):
+        x = self._embed(token_ids).squeeze(1)
+        new_states = []
+        for i, layer in enumerate(self.layers):
+            x = layer(x)
+            new_states.append(x.detach().clone())
+        hidden = x
+        x = self.final_norm(x.unsqueeze(1)).squeeze(1)
+        logits = self.lm_head(x)
+        return logits, hidden, new_states
+
 
 class TestMetabolicForkImport(unittest.TestCase):
     def test_metabolic_fork_import(self) -> None:

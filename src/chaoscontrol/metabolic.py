@@ -319,6 +319,8 @@ def micro_mcts(
     x_base = model.embed(input_ids)
     root_logits, root_hidden = _forward_pass(x_base)
 
+    batch, seq = input_ids.shape
+
     # Get top-k candidate tokens from last-position logits as "actions"
     k = 8
     # root_logits shape: (batch, seq, vocab)
@@ -338,6 +340,16 @@ def micro_mcts(
     total_visits = 0
 
     with torch.no_grad():
+        # Build root recurrence state by stepping through input sequence.
+        # This replaces O(N*H*seq) full forward passes with 1 sequential
+        # setup pass + N*H cheap O(1) step() calls.
+        state = model.init_state(batch)
+        for t in range(seq):
+            _, _, state = model.step(input_ids[:, t : t + 1], state)
+
+        # state is now the recurrence state after the full input sequence
+        root_state = [s.clone() for s in state]
+
         for _ in range(n_rollouts):
             # --- PUCT selection (AlphaZero-style) ---
             # UCB = Q(a) + c * P(a) * sqrt(N) / (1 + n(a))
@@ -351,37 +363,24 @@ def micro_mcts(
             chosen_idx = ucb_scores.argmax().item()
             chosen_token = top_actions[chosen_idx]  # scalar token id
 
-            # --- Rollout: step forward H tokens greedily ---
-            # Start from the chosen token appended to input_ids
-            batch = input_ids.size(0)
-            current_token = chosen_token.unsqueeze(0).expand(batch)  # (batch,)
-
-            # Build a running sequence: start with input_ids + chosen token
-            rollout_ids = torch.cat(
-                [input_ids, current_token.unsqueeze(1)], dim=1
-            )  # (batch, seq+1)
+            # --- Rollout using step() interface: O(1) per token ---
+            rollout_state = [s.clone() for s in root_state]
+            current_token = chosen_token.unsqueeze(0).expand(batch).unsqueeze(-1)  # (batch, 1)
 
             for _step in range(horizon):
-                x_roll = model.embed(rollout_ids)
-                roll_logits, _ = _forward_pass(x_roll)
-                # Sample from softmax distribution for stochastic rollouts
-                roll_probs = F.softmax(roll_logits[:, -1, :], dim=-1)
-                next_token = torch.multinomial(roll_probs, 1).squeeze(-1)  # (batch,)
-                rollout_ids = torch.cat(
-                    [rollout_ids, next_token.unsqueeze(1)], dim=1
+                step_logits, step_hidden, rollout_state = model.step(
+                    current_token, rollout_state
                 )
+                # Sample next token from softmax distribution
+                roll_probs = F.softmax(step_logits, dim=-1)
+                current_token = torch.multinomial(roll_probs, 1)  # (batch, 1)
 
-            # --- Value estimate at end of rollout ---
-            x_final = model.embed(rollout_ids)
-            final_logits, _ = _forward_pass(x_final)
-
+            # --- Value estimate from final step ---
             if value_proxy == "confidence":
-                probs = F.softmax(final_logits[:, -1, :], dim=-1)
-                value = probs.max(dim=-1).values.mean().item()
+                value = F.softmax(step_logits, dim=-1).max(dim=-1).values.mean().item()
             else:
                 # neg_ce: negative cross-entropy (higher is better)
-                probs = F.softmax(final_logits[:, -1, :], dim=-1)
-                value = probs.max(dim=-1).values.log().mean().item()
+                value = F.softmax(step_logits, dim=-1).max(dim=-1).values.log().mean().item()
 
             # --- Back up ---
             visit_counts[chosen_idx] += 1
@@ -407,7 +406,9 @@ def micro_mcts(
     for a in range(k):
         if visit_counts[a] > 0:
             token_idx = top_actions[a]
-            boost = visit_probs[a] * mean_values[a]
+            boost = (visit_probs[a] * mean_values[a]).to(
+                dtype=adjusted_logits.dtype, device=adjusted_logits.device
+            )
             adjusted_logits[:, -1, token_idx] = (
                 adjusted_logits[:, -1, token_idx] + boost
             )
