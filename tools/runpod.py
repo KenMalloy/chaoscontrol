@@ -265,7 +265,7 @@ def cmd_create(args: argparse.Namespace) -> None:
         "runpodctl", "pod", "create",
         "--template-id", args.template_id,
         "--gpu-id", args.gpu_id,
-        "--gpu-count", "1",
+        "--gpu-count", str(args.gpu_count),
         "--name", name,
         "--ports", "22/tcp",
         "--cloud-type", args.cloud_type,
@@ -288,7 +288,7 @@ def cmd_create(args: argparse.Namespace) -> None:
 
 
 def cmd_deploy(args: argparse.Namespace) -> None:
-    """Push repo to pod, set up venv, run experiments."""
+    """Push repo to pod, set up venv, download FineWeb data."""
     pod_id = args.pod_id
     print("=== Pushing repo to pod ===")
     push_cmd = build_rsync_push_command(
@@ -298,14 +298,8 @@ def cmd_deploy(args: argparse.Namespace) -> None:
     )
     run_passthrough(push_cmd)
 
-    print("\n=== Setting up venv and running experiments ===")
-    remote_cmds = " && ".join([
-        f"cd {DEFAULT_REMOTE_REPO_ROOT}",
-        "python3 -m venv .venv",
-        ".venv/bin/pip install torch numpy pyyaml --quiet",
-        f"bash run_all.sh {args.enwik8_path} --budget {args.budget}",
-    ])
-    ssh_cmd = build_ssh_command(pod_id, remote_cmds)
+    print("\n=== Running bootstrap (venv + FineWeb download) ===")
+    ssh_cmd = build_ssh_command(pod_id, f"bash {DEFAULT_REMOTE_REPO_ROOT}/tools/bootstrap_pod.sh")
     run_passthrough(ssh_cmd)
 
 
@@ -396,21 +390,20 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="ChaosControl RunPod orchestration")
     sub = p.add_subparsers(dest="command", required=True)
 
-    create = sub.add_parser("create", help="Create a single-GPU pod")
+    create = sub.add_parser("create", help="Create a GPU pod")
     create.add_argument("--template-id", default="y5cejece4j")
-    create.add_argument("--gpu-id", default="NVIDIA H100 80GB HBM3")
+    create.add_argument("--gpu-id", default="NVIDIA A40 48GB")
+    create.add_argument("--gpu-count", type=int, default=3)
     create.add_argument("--name")
     create.add_argument("--cloud-type", default="COMMUNITY")
     create.add_argument("--public-ip", action=argparse.BooleanOptionalAction, default=True)
     create.add_argument("--container-disk-gb", type=int, default=50)
-    create.add_argument("--volume-gb", type=int, default=50)
+    create.add_argument("--volume-gb", type=int, default=100)
     add_lease_args(create)
     create.set_defaults(handler=cmd_create)
 
-    deploy = sub.add_parser("deploy", help="Push repo to pod, set up venv, run experiments")
+    deploy = sub.add_parser("deploy", help="Push repo to pod, set up venv, download data")
     deploy.add_argument("pod_id")
-    deploy.add_argument("--enwik8-path", default="/workspace/enwik8")
-    deploy.add_argument("--budget", type=int, default=300)
     deploy.set_defaults(handler=cmd_deploy)
 
     start = sub.add_parser("start", help="Start a stopped pod")
