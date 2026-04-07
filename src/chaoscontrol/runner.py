@@ -56,6 +56,11 @@ def build_model(cfg: ChaosControlConfig, device: torch.device, param_dtype: torc
             wernicke_router=cfg.wernicke_router,
             wernicke_balance_weight=cfg.wernicke_balance_weight,
             semantic_tier_bases=cfg.semantic_tier_bases,
+            typed_storage=cfg.typed_storage,
+            typed_consolidation=cfg.typed_consolidation,
+            compression_consequence=cfg.compression_consequence,
+            cue_projection=cfg.cue_projection,
+            dynamic_crit_per_layer=cfg.dynamic_crit_per_layer,
         )
     model = model.to(device)
     if device.type == "cuda":
@@ -103,11 +108,12 @@ def run_experiment(config_path: str, *, enwik8_path: str, budget_seconds: float 
 
     print(f"Result: bpb={eval_result['bpb']:.4f} | steps={train_result['steps']} | {train_result['elapsed_s']:.1f}s")
 
+    total_params = params + train_result.get("extra_params", 0)
     return {
         "config": {k: v for k, v in cfg.__dict__.items() if not k.startswith("_")},
         "train": train_result,
         "eval": eval_result,
-        "params": params,
+        "params": total_params,
     }
 
 

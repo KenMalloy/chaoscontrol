@@ -131,7 +131,7 @@ def train_chaoscontrol_for_budget(
 
         loss.backward()
         if grad_clip_norm > 0.0:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
+            torch.nn.utils.clip_grad_norm_(all_params, grad_clip_norm)
         optimizer.step()
 
         ce_val_prev = history[-1]["loss"] if history else loss_ema  # noqa: F841
@@ -186,6 +186,7 @@ def train_chaoscontrol_for_budget(
         "history": history,
         "elapsed_s": float(time.perf_counter() - start_time),
         "fork_count": fork_count,
+        "extra_params": sum(p.numel() for p in structured_proj.parameters()) if structured_proj else 0,
     }
 
 
@@ -260,6 +261,11 @@ def run_chaoscontrol_matrix(
             wernicke_router=cfg.wernicke_router,
             wernicke_balance_weight=cfg.wernicke_balance_weight,
             semantic_tier_bases=cfg.semantic_tier_bases,
+            typed_storage=cfg.typed_storage,
+            typed_consolidation=cfg.typed_consolidation,
+            compression_consequence=cfg.compression_consequence,
+            cue_projection=cfg.cue_projection,
+            dynamic_crit_per_layer=cfg.dynamic_crit_per_layer,
         ).to(device)
 
         train_result = train_chaoscontrol_for_budget(

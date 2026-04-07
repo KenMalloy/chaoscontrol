@@ -99,6 +99,11 @@ class ChaosStudentLM(nn.Module):
         wernicke_router: str = "vq",
         wernicke_balance_weight: float = 0.01,
         semantic_tier_bases: int = 0,
+        typed_storage: bool = False,
+        typed_consolidation: bool = False,
+        compression_consequence: bool = False,
+        cue_projection: bool = True,
+        dynamic_crit_per_layer: bool = False,
     ) -> None:
         super().__init__()
         self.vocab_size = vocab_size
@@ -159,6 +164,13 @@ class ChaosStudentLM(nn.Module):
         if semantic_tier_bases > 0:
             self.semantic_tier = SemanticTier(dim, num_bases=semantic_tier_bases)
 
+        # Gap-analysis flags
+        self.typed_storage = typed_storage
+        self.typed_consolidation = typed_consolidation
+        self.compression_consequence = compression_consequence
+        self.cue_projection = cue_projection
+        self.dynamic_crit_per_layer = dynamic_crit_per_layer
+
     def artifact_bytes(self) -> int:
         return int(sum(p.numel() for p in self.parameters()) * 2)
 
@@ -178,10 +190,12 @@ class ChaosStudentLM(nn.Module):
 
         if self.outer_model is not None:
             if isinstance(self.outer_model, MultiSlotOuterModel):
-                # Cue-dependent retrieval: mean pool over input embeddings
-                # gives a better "what is this sequence about" signal than
-                # a single noisy first token
-                cue = x.detach().mean(dim=1)  # (batch, dim)
+                # Cue-dependent retrieval. If cue_projection=False (gap analysis),
+                # pass cue=None so retrieval uses uniform weighting over slots
+                # instead of the learned cue projection — tests whether the
+                # recurrence state naturally serves as an address.
+                # Normal mode: mean pool over input embeddings as cue.
+                cue = x.detach().mean(dim=1) if self.cue_projection else None
                 outer_read = self.outer_model.read(x.size(0), cue=cue)
             else:
                 outer_read = self.outer_model.read(x.size(0))

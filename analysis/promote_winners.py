@@ -56,12 +56,17 @@ def main():
         sorted_winners = sorted(all_winners, key=lambda x: x[2].get("eval", {}).get("bpb", 999))
         pair_cfg = dict(sorted_winners[0][2].get("config", {}))
         second_cfg = sorted_winners[1][2].get("config", {})
-        # Merge non-default fields from second into first
-        defaults = {"a_mode": "diag", "rich_b_mode": "none", "outer_model_dim": 0,
-                    "wernicke_enabled": False, "metabolic_gate": False}
-        for key, default_val in defaults.items():
-            if second_cfg.get(key) != default_val:
-                pair_cfg[key] = second_cfg[key]
+        # Merge ALL non-default fields from second into first
+        # Use ChaosControlConfig defaults as reference
+        from chaoscontrol.config import ChaosControlConfig
+        default_cfg = ChaosControlConfig(enwik8_path="/tmp")
+        for key in vars(default_cfg):
+            if key.startswith("_") or key == "enwik8_path":
+                continue
+            default_val = getattr(default_cfg, key)
+            second_val = second_cfg.get(key, default_val)
+            if second_val != default_val:
+                pair_cfg[key] = second_val
         pair_cfg.pop("enwik8_path", None)
         with open(out_dir / "best_pair.yaml", "w") as f:
             yaml.dump(pair_cfg, f, default_flow_style=False)
