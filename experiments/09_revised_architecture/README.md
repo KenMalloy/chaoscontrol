@@ -7,9 +7,11 @@ memory, Wernicke routing, regret tracking) to compression quality.  By running
 each layer with 3 seeds and picking winners statistically, we avoid
 confirmation bias and identify which components are genuinely load-bearing.
 
-The random-gate control (fires at the same average rate as surprise-gating but
-at random steps) tests whether surprise *timing* matters or whether the benefit
-comes purely from extra compute.
+The random-gate control fires with the same probability parameter as the
+surprise threshold, not matched to the surprise gate's empirical rate.  The
+analyzer reports both rates for comparison (via `gate_fired` and
+`surprise_would_fire` fields in the step log).  This tests whether surprise
+*timing* matters or whether the benefit comes purely from extra compute.
 
 ## Null hypothesis
 

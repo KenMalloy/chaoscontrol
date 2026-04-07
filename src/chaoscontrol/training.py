@@ -99,10 +99,16 @@ def train_chaoscontrol_for_budget(
 
         # Check metabolic gate: should we fork?
         surprise_ratio = abs(loss_ema - (history[-1]["loss"] if history else loss_ema)) / max(loss_ema, 1e-6) if history else 0.0
+        # Compute surprise gate decision (always, even in random mode)
+        surprise_would_fire = surprise_ratio > current_threshold
+
         if metabolic_threshold_mode == "random":
+            # Random fires with probability = threshold (same parameter as surprise)
             use_fork = metabolic_gate and (rng.random() < metabolic_threshold)
-        else:
-            use_fork = metabolic_gate and surprise_ratio > current_threshold
+        elif metabolic_threshold_mode == "adaptive":
+            use_fork = metabolic_gate and surprise_would_fire
+        else:  # "fixed"
+            use_fork = metabolic_gate and surprise_would_fire
 
         # Adaptive threshold: compare current loss against the loss BEFORE
         # the last fork. If loss improved since then, fork helped -- lower
@@ -215,6 +221,8 @@ def train_chaoscontrol_for_budget(
             step_record["threshold"] = current_threshold
             step_record["surprise_ratio"] = surprise_ratio
             step_record["metabolic_mode"] = metabolic_mode
+            step_record["gate_fired"] = use_fork
+            step_record["surprise_would_fire"] = surprise_would_fire
         if mc_stats is not None:
             step_record["mc_variance"] = float(mc_stats["logits_var"].mean().cpu())
             step_record["mc_entropy"] = float(mc_stats["entropy"].mean().cpu())
