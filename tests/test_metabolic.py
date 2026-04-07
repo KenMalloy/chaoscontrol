@@ -107,5 +107,35 @@ class TestMetabolicForkScoringModes(unittest.TestCase):
         assert not torch.allclose(out1["logits"], out2["logits"])
 
 
+class TestStructuredProjections(unittest.TestCase):
+    def test_produces_k_views(self) -> None:
+        from chaoscontrol.metabolic import StructuredProjections
+        sp = StructuredProjections(dim=16, k=4)
+        x = torch.randn(2, 8, 16)
+        views = sp(x)
+        assert len(views) == 4
+        assert views[0].shape == (2, 8, 16)
+
+    def test_views_differ(self) -> None:
+        from chaoscontrol.metabolic import StructuredProjections
+        sp = StructuredProjections(dim=16, k=4)
+        x = torch.randn(2, 8, 16)
+        views = sp(x)
+        assert not torch.allclose(views[0], views[1])
+
+    def test_structured_fork_produces_logits(self) -> None:
+        from chaoscontrol.metabolic import metabolic_fork, StructuredProjections
+        sp = StructuredProjections(dim=16, k=4)
+        model = _MockModel(vocab_size=256, dim=16, num_layers=2)
+        ids = torch.randint(0, 256, (2, 8))
+        out = metabolic_fork(
+            model, ids, k=4, noise_std=0.1,
+            score_mode="ensemble_agreement",
+            generation_mode="structured",
+            structured_proj=sp,
+        )
+        assert out["logits"].shape == (2, 8, 256)
+
+
 if __name__ == "__main__":
     unittest.main()

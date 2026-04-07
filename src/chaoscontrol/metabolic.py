@@ -4,6 +4,7 @@ from __future__ import annotations
 from typing import Any
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 
 
@@ -14,6 +15,8 @@ def metabolic_fork(
     k: int = 4,
     noise_std: float = 0.01,
     score_mode: str = "memory_consistency",
+    generation_mode: str = "noise",
+    structured_proj: StructuredProjections | None = None,
 ) -> dict[str, Any]:
     """Generate K candidate forward passes with perturbed embeddings, select best.
 
@@ -31,6 +34,10 @@ def metabolic_fork(
         noise_std: Std-dev of Gaussian perturbation added to embeddings.
         score_mode: One of ``"ensemble_agreement"``, ``"memory_consistency"``,
             or ``"loss_lookahead"``.
+        generation_mode: ``"noise"`` (default) adds Gaussian perturbation;
+            ``"structured"`` uses learned projection heads via *structured_proj*.
+        structured_proj: A :class:`StructuredProjections` instance. Required
+            when *generation_mode* is ``"structured"``.
 
     Returns:
         The candidate dict with the highest score, containing keys
@@ -45,32 +52,60 @@ def metabolic_fork(
     x_base = model.embed(input_ids)
     batch, seq, dim = x_base.shape
 
-    # Generate K candidates with different perturbations to embeddings
+    # Generate K candidates
     candidates: list[dict[str, torch.Tensor]] = []
-    for _ in range(k):
-        noise = torch.randn_like(x_base) * noise_std
-        x_perturbed = x_base + noise
 
-        # Read from outer model (same for all candidates — it's the shared memory)
-        if model.outer_model is not None:
-            if MultiSlotOuterModel is not None and isinstance(
-                model.outer_model, MultiSlotOuterModel
-            ):
-                cue = x_perturbed.detach().mean(dim=1)
-                outer_read = model.outer_model.read(batch, cue=cue)
-            else:
-                outer_read = model.outer_model.read(batch)
-            x_perturbed = x_perturbed + outer_read.unsqueeze(1)
+    if generation_mode == "structured" and structured_proj is not None:
+        views = structured_proj(x_base)
+        for view in views:
+            x_candidate = view
 
-        # Run through layers
-        h = x_perturbed
-        for layer in model.layers:
-            h = layer(h)
+            # Read from outer model (same for all candidates — it's the shared memory)
+            if model.outer_model is not None:
+                if MultiSlotOuterModel is not None and isinstance(
+                    model.outer_model, MultiSlotOuterModel
+                ):
+                    cue = x_candidate.detach().mean(dim=1)
+                    outer_read = model.outer_model.read(batch, cue=cue)
+                else:
+                    outer_read = model.outer_model.read(batch)
+                x_candidate = x_candidate + outer_read.unsqueeze(1)
 
-        hidden = h
-        h = model.final_norm(h)
-        logits = model.lm_head(h)
-        candidates.append({"logits": logits, "hidden": hidden})
+            # Run through layers
+            h = x_candidate
+            for layer in model.layers:
+                h = layer(h)
+
+            hidden = h
+            h = model.final_norm(h)
+            logits = model.lm_head(h)
+            candidates.append({"logits": logits, "hidden": hidden})
+    else:
+        # Noise-based generation (default)
+        for _ in range(k):
+            noise = torch.randn_like(x_base) * noise_std
+            x_perturbed = x_base + noise
+
+            # Read from outer model (same for all candidates — it's the shared memory)
+            if model.outer_model is not None:
+                if MultiSlotOuterModel is not None and isinstance(
+                    model.outer_model, MultiSlotOuterModel
+                ):
+                    cue = x_perturbed.detach().mean(dim=1)
+                    outer_read = model.outer_model.read(batch, cue=cue)
+                else:
+                    outer_read = model.outer_model.read(batch)
+                x_perturbed = x_perturbed + outer_read.unsqueeze(1)
+
+            # Run through layers
+            h = x_perturbed
+            for layer in model.layers:
+                h = layer(h)
+
+            hidden = h
+            h = model.final_norm(h)
+            logits = model.lm_head(h)
+            candidates.append({"logits": logits, "hidden": hidden})
 
     # Score candidates
     if score_mode == "ensemble_agreement":
@@ -110,3 +145,23 @@ def metabolic_fork(
 
     best_idx = max(range(len(scores)), key=lambda i: scores[i])
     return candidates[best_idx]
+
+
+class StructuredProjections(nn.Module):
+    """K learned projection heads — each emphasizes different features.
+
+    'Choosing the question' — NFT-aligned generation mechanism.
+    Instead of random noise perturbation, each projection head creates
+    a structurally different view of the input. The system selects
+    which view produced the best result.
+    """
+
+    def __init__(self, dim: int, k: int = 4) -> None:
+        super().__init__()
+        self.projections = nn.ModuleList([
+            nn.Linear(dim, dim, bias=False) for _ in range(k)
+        ])
+
+    def forward(self, x: torch.Tensor) -> list[torch.Tensor]:
+        """Return K different views of x."""
+        return [proj(x) for proj in self.projections]
