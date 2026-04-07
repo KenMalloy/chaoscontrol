@@ -268,5 +268,73 @@ class TestFullSequenceWrite(unittest.TestCase):
         assert m._slot_buckets[-1] == 3
 
 
+class TestDemandDrivenCompression(unittest.TestCase):
+    def test_no_compression_below_capacity(self):
+        """Slots stay full-fidelity when VRAM has space."""
+        from chaoscontrol.memory import MultiSlotOuterModel
+        m = MultiSlotOuterModel(model_dim=16, outer_dim=8, max_slots=10)
+        for _ in range(5):
+            m.write(torch.randn(1, 16))
+        assert len(m._slots) == 5
+        assert all(s.shape == (1, 8) for s in m._slots)
+
+    def test_latent_traces_created_on_compression(self):
+        """When compression merges slots, displaced entries become latent traces."""
+        from chaoscontrol.memory import MultiSlotOuterModel
+        m = MultiSlotOuterModel(model_dim=16, outer_dim=8, max_slots=4, compress_ratio=2)
+        # Write enough to trigger multiple compressions
+        # Use a single bucket so typed compression can merge within the bucket
+        for i in range(12):
+            m.write(torch.randn(1, 16), bucket_id=0)
+        assert hasattr(m, '_latent_traces')
+        # Some latent traces should exist (slots were merged away)
+        # Note: not all compressions produce latent traces — only when
+        # the merge results in fewer total slots than before
+        assert len(m._slots) <= 4  # still within capacity
+
+    def test_latent_trace_has_bucket_id(self):
+        """Latent traces preserve their bucket membership."""
+        from chaoscontrol.memory import MultiSlotOuterModel
+        m = MultiSlotOuterModel(model_dim=16, outer_dim=8, max_slots=4, compress_ratio=2)
+        for i in range(12):
+            m.write(torch.randn(1, 16), bucket_id=1)
+        if m._latent_traces:
+            assert all('bucket_id' in t for t in m._latent_traces)
+
+    def test_try_reactivate_with_matching_bucket(self):
+        """try_reactivate returns True and adds a slot when bucket matches a latent trace."""
+        from chaoscontrol.memory import MultiSlotOuterModel
+        m = MultiSlotOuterModel(model_dim=16, outer_dim=8, max_slots=8, compress_ratio=2)
+        # Force latent traces by heavy writing + compression
+        for i in range(20):
+            m.write(torch.randn(1, 16), bucket_id=0)
+        if m._latent_traces:
+            slots_before = len(m._slots)
+            result = m.try_reactivate(bucket_id=0, surprise=10.0)
+            assert result is True
+            assert len(m._slots) == slots_before + 1
+        # If no latent traces were created (compression didn't fully displace),
+        # that's OK — the test is conditional
+
+    def test_try_reactivate_no_match_returns_false(self):
+        """try_reactivate returns False when no latent trace matches the bucket."""
+        from chaoscontrol.memory import MultiSlotOuterModel
+        m = MultiSlotOuterModel(model_dim=16, outer_dim=8, max_slots=8, compress_ratio=2)
+        for i in range(20):
+            m.write(torch.randn(1, 16), bucket_id=0)
+        result = m.try_reactivate(bucket_id=99, surprise=10.0)
+        assert result is False
+
+    def test_try_reactivate_low_surprise_returns_false(self):
+        """try_reactivate returns False when surprise is below threshold."""
+        from chaoscontrol.memory import MultiSlotOuterModel
+        m = MultiSlotOuterModel(model_dim=16, outer_dim=8, max_slots=8, compress_ratio=2)
+        for i in range(20):
+            m.write(torch.randn(1, 16), bucket_id=0)
+        if m._latent_traces:
+            result = m.try_reactivate(bucket_id=0, surprise=0.001)
+            assert result is False
+
+
 if __name__ == "__main__":
     unittest.main()

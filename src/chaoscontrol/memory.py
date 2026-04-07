@@ -253,6 +253,7 @@ class MultiSlotOuterModel(nn.Module):
         self._slot_buckets: list[int] = []           # per-slot bucket type from Wernicke
         self._retrieval_weights: torch.Tensor | None = None  # cached from last read
         self._compression_consequences: list[tuple[int, float]] = []  # (bucket_id, quality_delta)
+        self._latent_traces: list[dict] = []  # {bucket_id: int, centroid_contrib: Tensor}
 
     def get_extra_state(self) -> dict:
         """Persist slots, survival scores, and bucket assignments in state_dict."""
@@ -421,6 +422,13 @@ class MultiSlotOuterModel(nn.Module):
                     quality_delta = -float((merged_slot - original_mean).norm())
                     self._compression_consequences.append((bucket_id, quality_delta))
 
+                    # Record latent traces for the individual slots absorbed by the merge
+                    for i in to_merge:
+                        self._latent_traces.append({
+                            "bucket_id": old_buckets[i],
+                            "centroid_contrib": old_slots[i].detach().clone(),
+                        })
+
                     for i in sorted(to_keep):
                         kept_slots.append(old_slots[i])
                         kept_survival.append(old_survival[i])
@@ -457,10 +465,35 @@ class MultiSlotOuterModel(nn.Module):
                 merged_slot = sum(w.item() * t for w, t in zip(weights, merged_tensors))
                 merged_score = sum(merged_survivals) / len(merged_survivals)
 
+                # Record latent traces for the individual slots absorbed by the merge
+                for i in to_merge_idx:
+                    self._latent_traces.append({
+                        "bucket_id": old_buckets[i],
+                        "centroid_contrib": old_slots[i].detach().clone(),
+                    })
+
                 kept_old = [(old_slots[i], old_survival[i], old_buckets[i]) for i in sorted(to_keep_idx)]
                 self._slots = [s for s, _, _ in kept_old] + [merged_slot] + new_slots
                 self._survival = [sc for _, sc, _ in kept_old] + [merged_score] + new_survival
                 self._slot_buckets = [b for _, _, b in kept_old] + [-1] + new_buckets
+
+    def try_reactivate(self, bucket_id: int, surprise: float, reactivation_threshold: float = 1.0) -> bool:
+        """Attempt to reactivate a latent trace matching the given bucket.
+
+        Returns True if a trace was reactivated (added back as a slot), False otherwise.
+        Only fires when surprise exceeds threshold AND a matching latent trace exists.
+        """
+        if surprise < reactivation_threshold:
+            return False
+        for i, trace in enumerate(self._latent_traces):
+            if trace["bucket_id"] == bucket_id:
+                # Reactivate: add the centroid contribution back as a slot
+                self._slots.append(trace["centroid_contrib"])
+                self._survival.append(0.0)
+                self._slot_buckets.append(trace["bucket_id"])
+                self._latent_traces.pop(i)
+                return True
+        return False
 
     def compute_consolidation_signal(self, current_loss: float, running_avg: float) -> float:
         """Same as OuterModel — surprise magnitude."""
