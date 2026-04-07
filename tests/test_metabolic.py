@@ -263,5 +263,76 @@ class TestMonteCarloMetabolic(unittest.TestCase):
         assert spread_k16 < spread_k2, f"K=16 spread {spread_k16} should be tighter than K=2 {spread_k2}"
 
 
+class TestMicroMCTS(unittest.TestCase):
+    """Tests for micro_mcts forward-only tree search gate."""
+
+    def _make_model(self) -> _MockModel:
+        torch.manual_seed(42)
+        return _MockModel(vocab_size=256, dim=16, num_layers=2)
+
+    def _make_ids(self, batch: int = 2, seq: int = 16) -> torch.Tensor:
+        return torch.randint(0, 256, (batch, seq))
+
+    def test_returns_logits_and_hidden(self) -> None:
+        """micro_mcts returns logits (2,16,256) and hidden (2,16,16)."""
+        from chaoscontrol.metabolic import micro_mcts
+        model = self._make_model()
+        ids = self._make_ids()
+        torch.manual_seed(7)
+        out = micro_mcts(model, ids, n_rollouts=4, horizon=8)
+        assert "logits" in out
+        assert out["logits"].shape == (2, 16, 256)
+        assert "hidden" in out
+        assert out["hidden"].shape == (2, 16, 16)
+
+    def test_returns_mcts_stats(self) -> None:
+        """Output has mcts_stats with visit_counts, mean_values, root_value."""
+        from chaoscontrol.metabolic import micro_mcts
+        model = self._make_model()
+        ids = self._make_ids()
+        torch.manual_seed(7)
+        out = micro_mcts(model, ids, n_rollouts=4, horizon=8)
+        assert "mcts_stats" in out
+        stats = out["mcts_stats"]
+        assert "visit_counts" in stats
+        assert "mean_values" in stats
+        assert "root_value" in stats
+
+    def test_more_rollouts_changes_output(self) -> None:
+        """n_rollouts=4 vs 16 produce different logits (different seeds)."""
+        from chaoscontrol.metabolic import micro_mcts
+        model = self._make_model()
+        ids = self._make_ids()
+        torch.manual_seed(10)
+        out4 = micro_mcts(model, ids, n_rollouts=4, horizon=8)
+        torch.manual_seed(20)
+        out16 = micro_mcts(model, ids, n_rollouts=16, horizon=8)
+        assert not torch.allclose(out4["logits"], out16["logits"])
+
+    def test_ucb_exploration_constant_affects_search(self) -> None:
+        """ucb_c=0.1 vs 5.0 produce different logits."""
+        from chaoscontrol.metabolic import micro_mcts
+        model = self._make_model()
+        ids = self._make_ids()
+        torch.manual_seed(42)
+        out_low = micro_mcts(model, ids, n_rollouts=16, horizon=8, ucb_c=0.1)
+        torch.manual_seed(42)
+        out_high = micro_mcts(model, ids, n_rollouts=16, horizon=8, ucb_c=5.0)
+        assert not torch.allclose(out_low["logits"], out_high["logits"])
+
+    def test_zero_rollouts_falls_back_to_forward(self) -> None:
+        """n_rollouts=0 just returns a normal forward pass (no mcts_stats)."""
+        from chaoscontrol.metabolic import micro_mcts
+        model = self._make_model()
+        ids = self._make_ids()
+        out = micro_mcts(model, ids, n_rollouts=0)
+        assert "logits" in out
+        assert out["logits"].shape == (2, 16, 256)
+        assert "hidden" in out
+        assert out["hidden"].shape == (2, 16, 16)
+        # No MCTS stats for zero rollouts
+        assert "mcts_stats" not in out
+
+
 if __name__ == "__main__":
     unittest.main()

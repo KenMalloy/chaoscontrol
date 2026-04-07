@@ -272,6 +272,157 @@ def metabolic_monte_carlo(
     }
 
 
+def micro_mcts(
+    model: Any,
+    input_ids: torch.Tensor,
+    *,
+    n_rollouts: int = 4,
+    horizon: int = 8,
+    ucb_c: float = 1.41,
+    value_proxy: str = "confidence",
+) -> dict[str, Any]:
+    """Forward-only MCTS gate: tree search using the SSM as a world model.
+
+    When surprise triggers the metabolic gate, runs N rollouts of depth H
+    tokens from the current state, uses UCB to select which candidate branch
+    to explore, backs up values, and returns root logits + search statistics.
+
+    Args:
+        model: Duck-typed model with embed, layers, final_norm, lm_head.
+        input_ids: Token ids, shape (batch, seq).
+        n_rollouts: Number of MCTS rollouts (0 = plain forward pass).
+        horizon: Rollout depth in tokens.
+        ucb_c: UCB exploration constant.
+        value_proxy: "confidence" (max softmax prob) or "neg_ce" (negative CE).
+
+    Returns:
+        Dict with "logits", "hidden", and optionally "mcts_stats".
+    """
+
+    def _forward_pass(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Run embedding tensor through layers -> norm -> lm_head."""
+        h = x
+        for layer in model.layers:
+            h = layer(h)
+        hidden = h
+        h = model.final_norm(h)
+        logits = model.lm_head(h)
+        return logits, hidden
+
+    # --- Fallback: n_rollouts=0 means plain forward pass ---
+    if n_rollouts == 0:
+        x = model.embed(input_ids)
+        logits, hidden = _forward_pass(x)
+        return {"logits": logits, "hidden": hidden}
+
+    # --- Base forward pass to get root logits and hidden ---
+    x_base = model.embed(input_ids)
+    root_logits, root_hidden = _forward_pass(x_base)
+
+    # Get top-k candidate tokens from last-position logits as "actions"
+    k = 8
+    # root_logits shape: (batch, seq, vocab)
+    last_logits = root_logits[:, -1, :]  # (batch, vocab)
+    # Average across batch for action selection
+    mean_last_logits = last_logits.mean(dim=0)  # (vocab,)
+    _, top_actions = torch.topk(mean_last_logits, k)  # (k,)
+
+    # MCTS bookkeeping
+    visit_counts = torch.zeros(k, dtype=torch.long)
+    value_sums = torch.zeros(k, dtype=torch.float)
+
+    # Prior probabilities for PUCT: softmax of top-k logits
+    top_logits = mean_last_logits[top_actions]  # (k,)
+    prior_probs = F.softmax(top_logits, dim=0)  # (k,)
+
+    total_visits = 0
+
+    with torch.no_grad():
+        for _ in range(n_rollouts):
+            # --- PUCT selection (AlphaZero-style) ---
+            # UCB = Q(a) + c * P(a) * sqrt(N) / (1 + n(a))
+            ucb_scores = torch.zeros(k)
+            sqrt_total = math.sqrt(total_visits + 1)
+            for a in range(k):
+                q_val = (value_sums[a] / visit_counts[a]) if visit_counts[a] > 0 else 0.0
+                exploration = ucb_c * prior_probs[a].item() * sqrt_total / (1 + visit_counts[a].item())
+                ucb_scores[a] = q_val + exploration
+
+            chosen_idx = ucb_scores.argmax().item()
+            chosen_token = top_actions[chosen_idx]  # scalar token id
+
+            # --- Rollout: step forward H tokens greedily ---
+            # Start from the chosen token appended to input_ids
+            batch = input_ids.size(0)
+            current_token = chosen_token.unsqueeze(0).expand(batch)  # (batch,)
+
+            # Build a running sequence: start with input_ids + chosen token
+            rollout_ids = torch.cat(
+                [input_ids, current_token.unsqueeze(1)], dim=1
+            )  # (batch, seq+1)
+
+            for _step in range(horizon):
+                x_roll = model.embed(rollout_ids)
+                roll_logits, _ = _forward_pass(x_roll)
+                # Sample from softmax distribution for stochastic rollouts
+                roll_probs = F.softmax(roll_logits[:, -1, :], dim=-1)
+                next_token = torch.multinomial(roll_probs, 1).squeeze(-1)  # (batch,)
+                rollout_ids = torch.cat(
+                    [rollout_ids, next_token.unsqueeze(1)], dim=1
+                )
+
+            # --- Value estimate at end of rollout ---
+            x_final = model.embed(rollout_ids)
+            final_logits, _ = _forward_pass(x_final)
+
+            if value_proxy == "confidence":
+                probs = F.softmax(final_logits[:, -1, :], dim=-1)
+                value = probs.max(dim=-1).values.mean().item()
+            else:
+                # neg_ce: negative cross-entropy (higher is better)
+                probs = F.softmax(final_logits[:, -1, :], dim=-1)
+                value = probs.max(dim=-1).values.log().mean().item()
+
+            # --- Back up ---
+            visit_counts[chosen_idx] += 1
+            value_sums[chosen_idx] += value
+            total_visits += 1
+
+    # Compute mean values per action
+    mean_values = torch.zeros(k)
+    for a in range(k):
+        if visit_counts[a] > 0:
+            mean_values[a] = value_sums[a] / visit_counts[a]
+
+    # Root value: weighted average of action values by visit count
+    if total_visits > 0:
+        root_value = (mean_values * visit_counts.float()).sum().item() / total_visits
+    else:
+        root_value = 0.0
+
+    # Blend MCTS search results into root logits at the last position.
+    # Boost logits of tokens proportionally to their visit-weighted values.
+    adjusted_logits = root_logits.clone()
+    visit_probs = visit_counts.float() / max(total_visits, 1)
+    for a in range(k):
+        if visit_counts[a] > 0:
+            token_idx = top_actions[a]
+            boost = visit_probs[a] * mean_values[a]
+            adjusted_logits[:, -1, token_idx] = (
+                adjusted_logits[:, -1, token_idx] + boost
+            )
+
+    return {
+        "logits": adjusted_logits,
+        "hidden": root_hidden,
+        "mcts_stats": {
+            "visit_counts": visit_counts,
+            "mean_values": mean_values,
+            "root_value": root_value,
+        },
+    }
+
+
 class StructuredProjections(nn.Module):
     """K learned projection heads — each emphasizes different features.
 
