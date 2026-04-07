@@ -58,6 +58,24 @@ class TestWernickeLayer(unittest.TestCase):
         _, _, bloss = w(x)
         assert bloss.item() > 0  # collapsed usage should produce nonzero balance loss
 
+    def test_compression_consequence_moe_updates_router(self):
+        w = WernickeLayer(dim=16, k_max=4, window=4, router_type="moe")
+        initial = w.router.weight.data.clone()
+        w.compression_consequence_update(bucket_id=0, quality_delta=-0.5)
+        assert not torch.allclose(initial, w.router.weight.data)
+
+    def test_compression_consequence_vq_pushes_codebook(self):
+        w = WernickeLayer(dim=16, k_max=4, window=4, router_type="vq")
+        initial = w.codebook.data.clone()
+        w.compression_consequence_update(bucket_id=0, quality_delta=-0.5)
+        assert not torch.allclose(initial, w.codebook.data)
+
+    def test_compression_consequence_no_update_on_good_merge(self):
+        w = WernickeLayer(dim=16, k_max=4, window=4, router_type="moe")
+        initial = w.router.weight.data.clone()
+        w.compression_consequence_update(bucket_id=0, quality_delta=0.5)  # good merge
+        assert torch.allclose(initial, w.router.weight.data)
+
     def test_typed_compression_merges_within_bucket(self):
         om = MultiSlotOuterModel(model_dim=16, outer_dim=32, max_slots=4, compress_ratio=2)
         # Write slots with different bucket ids

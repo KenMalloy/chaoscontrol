@@ -116,3 +116,29 @@ class WernickeLayer(nn.Module):
             refined = refined + w_k * proj_k
 
         return refined, bucket_ids, balance_loss
+
+    def compression_consequence_update(self, bucket_id: int, quality_delta: float, lr: float = 0.01) -> None:
+        """Gradient-free update from memory compression outcomes.
+
+        When a merge in the outer model produces a quality drop (quality_delta < 0),
+        nudge the router to be more discriminating for that bucket. The typing
+        head learns from the *consequences* of its typing decisions.
+
+        Works for both MoE and VQ routers.
+        """
+        if quality_delta >= 0:
+            return  # only update on bad merges
+        with torch.no_grad():
+            if self.router_type == "moe":
+                self.router.weight.data[bucket_id] *= (1.0 + lr * abs(quality_delta))
+            elif self.router_type == "vq":
+                # Push codebook vector away from its nearest neighbor
+                dists = torch.cdist(
+                    self.codebook.data.unsqueeze(0),
+                    self.codebook.data.unsqueeze(0),
+                ).squeeze(0)
+                dists[bucket_id, bucket_id] = float("inf")
+                nearest = dists[bucket_id].argmin()
+                direction = self.codebook.data[bucket_id] - self.codebook.data[nearest]
+                direction = direction / (direction.norm() + 1e-8)
+                self.codebook.data[bucket_id] += lr * abs(quality_delta) * direction
