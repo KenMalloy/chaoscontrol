@@ -336,5 +336,47 @@ class TestDemandDrivenCompression(unittest.TestCase):
             assert result is False
 
 
+class TestEvalWarmup(unittest.TestCase):
+    def test_warmup_writes_episodic_slots_during_eval(self):
+        """When warmup=True, eval should write to episodic memory."""
+        from chaoscontrol.model import ChaosStudentLM
+        from chaoscontrol.evaluation import evaluate_chaoscontrol_bpb
+        torch.manual_seed(42)
+        model = ChaosStudentLM(
+            vocab_size=256, dim=32, num_layers=2,
+            outer_model_dim=16, outer_model_type="multislot",
+        )
+        tokens = torch.randint(0, 256, (5000,))
+        starts = list(range(0, 4000, 128))
+        eval_starts = starts[:16]
+        result = evaluate_chaoscontrol_bpb(
+            model, tokens=tokens, eval_starts=eval_starts,
+            batch_size=4, seq_len=64, device=torch.device("cpu"),
+            warmup=True,
+        )
+        assert len(model.outer_model._slots) > 0  # slots were written during eval
+        assert "bpb" in result
+
+    def test_no_warmup_does_not_write_slots(self):
+        """When warmup=False (default), eval should NOT write to memory."""
+        from chaoscontrol.model import ChaosStudentLM
+        from chaoscontrol.evaluation import evaluate_chaoscontrol_bpb
+        torch.manual_seed(42)
+        model = ChaosStudentLM(
+            vocab_size=256, dim=32, num_layers=2,
+            outer_model_dim=16, outer_model_type="multislot",
+        )
+        tokens = torch.randint(0, 256, (5000,))
+        starts = list(range(0, 4000, 128))
+        eval_starts = starts[:16]
+        result = evaluate_chaoscontrol_bpb(
+            model, tokens=tokens, eval_starts=eval_starts,
+            batch_size=4, seq_len=64, device=torch.device("cpu"),
+            warmup=False,
+        )
+        assert len(model.outer_model._slots) == 0
+        assert "bpb" in result
+
+
 if __name__ == "__main__":
     unittest.main()

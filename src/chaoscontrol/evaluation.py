@@ -25,6 +25,7 @@ def evaluate_chaoscontrol_bpb(
     metabolic_noise_std: float = 0.01,
     generation_mode: str = "noise",
     structured_proj: Any = None,
+    warmup: bool = False,
 ) -> dict[str, float]:
     """Evaluate ChaosStudentLM, returning loss and bits-per-byte.
 
@@ -45,7 +46,21 @@ def evaluate_chaoscontrol_bpb(
                 autocast_dtype = next(model.parameters()).dtype if device.type == "cuda" else torch.float32
                 with maybe_autocast(device, autocast_dtype):
                     # Standard deterministic eval
-                    logits = model(inputs)["logits"]
+                    out = model(inputs)
+                    logits = out["logits"]
+
+                    # Warmup: write to episodic memory for future batches
+                    if warmup and getattr(model, "outer_model", None) is not None:
+                        hidden_last = out["hidden"][:, -1, :].detach()
+                        batch_loss = F.cross_entropy(
+                            logits.float().reshape(-1, vocab_size),
+                            targets.reshape(-1),
+                        ).item()
+                        model.outer_model.consolidation_step(
+                            hidden_last,
+                            current_loss=batch_loss,
+                            bucket_id=None,
+                        )
 
                     # Gate-aware eval (if metabolic gate is active)
                     if metabolic_gate:
