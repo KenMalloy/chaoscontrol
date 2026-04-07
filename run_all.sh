@@ -11,6 +11,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 REPO_ROOT="$(cd "$(dirname "$0")" && pwd)"
+export PYTHONPATH="$REPO_ROOT/src:${PYTHONPATH:-}"
 
 echo "=== ChaosControl Research Suite ==="
 echo "enwik8:  $ENWIK8"

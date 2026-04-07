@@ -4,8 +4,9 @@ from chaoscontrol.baselines import SimpleTransformerLM
 def test_forward_shape():
     model = SimpleTransformerLM(vocab_size=256, dim=64, num_layers=2, num_heads=4)
     ids = torch.randint(0, 256, (2, 16))
-    logits = model(ids)
-    assert logits.shape == (2, 16, 256)
+    out = model(ids)
+    assert isinstance(out, dict)
+    assert out["logits"].shape == (2, 16, 256)
 
 def test_param_budget():
     model = SimpleTransformerLM(vocab_size=256, dim=128, num_layers=4, num_heads=4)
@@ -26,6 +27,6 @@ def test_causal_no_future_leakage():
 def test_deterministic():
     model = SimpleTransformerLM(vocab_size=256, dim=32, num_layers=2, num_heads=2)
     ids = torch.randint(0, 256, (2, 8))
-    out1 = model(ids)
-    out2 = model(ids)
+    out1 = model(ids)["logits"]
+    out2 = model(ids)["logits"]
     assert torch.allclose(out1, out2)

@@ -10,6 +10,7 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+export PYTHONPATH="$REPO_ROOT/src:${PYTHONPATH:-}"
 RESULTS_DIR="$(dirname "$0")/results"
 mkdir -p "$RESULTS_DIR"
 

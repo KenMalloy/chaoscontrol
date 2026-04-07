@@ -4,6 +4,6 @@ outer_model_dim: 64
 outer_model_type: multislot
 semantic_tier_bases: 8
 consolidation_trigger: resolution
-consolidation_mode: independent
+consolidation_mode: symmetric
 model_dim: 128
 num_layers: 4

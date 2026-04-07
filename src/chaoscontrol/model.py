@@ -8,7 +8,7 @@ import torch.nn as nn
 
 from chaoscontrol.core import RMSNorm, FeedForward, ChaosSSMCore
 from chaoscontrol.routing import RichBNN, DistributedB
-from chaoscontrol.memory import OuterModel, MultiSlotOuterModel
+from chaoscontrol.memory import OuterModel, MultiSlotOuterModel, SemanticTier
 from chaoscontrol.wernicke import WernickeLayer
 
 
@@ -98,6 +98,7 @@ class ChaosStudentLM(nn.Module):
         wernicke_window: int = 8,
         wernicke_router: str = "vq",
         wernicke_balance_weight: float = 0.01,
+        semantic_tier_bases: int = 0,
     ) -> None:
         super().__init__()
         self.vocab_size = vocab_size
@@ -153,6 +154,11 @@ class ChaosStudentLM(nn.Module):
                     dim, outer_dim=outer_model_dim, **common_kw,
                 )
 
+        # Semantic tier: always-on background bias from episodic experience
+        self.semantic_tier: SemanticTier | None = None
+        if semantic_tier_bases > 0:
+            self.semantic_tier = SemanticTier(dim, num_bases=semantic_tier_bases)
+
     def artifact_bytes(self) -> int:
         return int(sum(p.numel() for p in self.parameters()) * 2)
 
@@ -180,6 +186,10 @@ class ChaosStudentLM(nn.Module):
             else:
                 outer_read = self.outer_model.read(x.size(0))
             x = x + outer_read.unsqueeze(1)  # broadcast across seq dim
+
+        if self.semantic_tier is not None:
+            semantic_bias = self.semantic_tier.read(x.size(0))
+            x = x + semantic_bias.unsqueeze(1)
 
         all_stats: list[dict] = []
         for layer in self.layers:

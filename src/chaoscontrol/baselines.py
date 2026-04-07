@@ -22,12 +22,21 @@ class SimpleTransformerLM(nn.Module):
     def artifact_bytes(self):
         return int(sum(p.numel() for p in self.parameters()) * 2)
 
-    def forward(self, input_ids):
+    def forward(self, input_ids, *, return_jacobian_stats=False):
         x = self.embed(input_ids)
         for layer in self.layers:
             x = layer(x)
+        hidden = x
         x = self.final_norm(x)
-        return self.lm_head(x)
+        logits = self.lm_head(x)
+        out = {"logits": logits, "hidden": hidden}
+        if return_jacobian_stats:
+            # Transformer has no Jacobian stats — return zeros
+            out["jacobian_stats"] = {
+                "lambda_max": torch.tensor(0.0),
+                "sv_log_var": torch.tensor(0.0),
+            }
+        return out
 
 
 class TransformerBlock(nn.Module):

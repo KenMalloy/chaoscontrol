@@ -55,6 +55,7 @@ def build_model(cfg: ChaosControlConfig, device: torch.device, param_dtype: torc
             wernicke_window=cfg.wernicke_window,
             wernicke_router=cfg.wernicke_router,
             wernicke_balance_weight=cfg.wernicke_balance_weight,
+            semantic_tier_bases=cfg.semantic_tier_bases,
         )
     model = model.to(device)
     if device.type == "cuda":
@@ -92,6 +93,7 @@ def run_experiment(config_path: str, *, enwik8_path: str, budget_seconds: float 
         metabolic_threshold_mode=cfg.metabolic_threshold_mode,
         metabolic_score=cfg.metabolic_score,
         metabolic_noise_std=cfg.metabolic_noise_std,
+        generation_mode=cfg.generation_mode,
     )
 
     eval_result = evaluate_chaoscontrol_bpb(

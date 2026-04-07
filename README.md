@@ -21,7 +21,7 @@ A state-space model designed from biological principles — typed compositional 
 
 ```bash
 # Single experiment
-.venv/bin/python -m chaoscontrol.runner \
+PYTHONPATH=src .venv/bin/python -m chaoscontrol.runner \
     --config experiments/01_baseline/configs/ssm_small.yaml \
     --enwik8-path /path/to/enwik8 \
     --budget 300

@@ -64,3 +64,12 @@ class ChaosControlConfig:
     model_type: str = "ssm"  # "ssm" or "transformer"
     semantic_tier_bases: int = 0  # 0 = disabled
     generation_mode: str = "noise"  # "noise" or "structured"
+
+    # Typed storage/consolidation (for Wernicke + memory interaction)
+    typed_storage: bool = False
+    typed_consolidation: bool = False
+    compression_consequence: bool = False
+
+    # Gap analysis flags
+    cue_projection: bool = True  # False = use raw recurrence state as retrieval key
+    dynamic_crit_per_layer: bool = False

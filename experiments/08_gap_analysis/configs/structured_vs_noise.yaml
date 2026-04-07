@@ -12,6 +12,6 @@ metabolic_k: 4
 metabolic_threshold: 0.1
 metabolic_threshold_mode: fixed
 metabolic_score: memory_consistency
-generation_mode: learned_projections
+generation_mode: structured
 model_dim: 128
 num_layers: 4

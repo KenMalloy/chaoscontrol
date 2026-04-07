@@ -6,7 +6,7 @@ outer_model_dim: 64
 outer_model_type: multislot
 semantic_tier_bases: 8
 consolidation_trigger: resolution
-consolidation_mode: episodic_to_semantic
+consolidation_mode: symmetric
 wernicke_enabled: true
 wernicke_router: vq
 wernicke_k_max: 16

@@ -15,7 +15,7 @@ import torch.nn.functional as F
 from chaoscontrol.config import ChaosControlConfig
 from chaoscontrol.core import criticality_loss
 from chaoscontrol.data import batch_from_starts, maybe_autocast, maybe_sync_cuda
-from chaoscontrol.metabolic import metabolic_fork
+from chaoscontrol.metabolic import metabolic_fork, StructuredProjections
 from chaoscontrol.memory import MultiSlotOuterModel
 
 
@@ -42,9 +42,22 @@ def train_chaoscontrol_for_budget(
     metabolic_threshold_mode: str = "fixed",
     metabolic_score: str = "memory_consistency",
     metabolic_noise_std: float = 0.01,
+    generation_mode: str = "noise",
 ) -> dict[str, Any]:
     """Train ChaosStudentLM for a time budget with optional criticality regularization."""
-    optimizer = torch.optim.AdamW(model.parameters(), lr=base_lr, weight_decay=weight_decay)
+    # Set up structured projections if requested (before optimizer so its params are included)
+    structured_proj = None
+    if generation_mode == "structured":
+        model_dim = model.embed.weight.shape[1]
+        structured_proj = StructuredProjections(
+            dim=model_dim,
+            k=metabolic_k,
+        ).to(device)
+
+    all_params = list(model.parameters())
+    if structured_proj is not None:
+        all_params += list(structured_proj.parameters())
+    optimizer = torch.optim.AdamW(all_params, lr=base_lr, weight_decay=weight_decay)
     rng = random.Random(seed)
     history: list[dict[str, float]] = []
     start_time = time.perf_counter()
@@ -56,6 +69,7 @@ def train_chaoscontrol_for_budget(
     current_threshold = metabolic_threshold  # adaptive mode will adjust this
     last_forked = False
     pre_fork_loss: float = 0.0  # loss BEFORE the fork, for adaptive comparison
+
     model.train()
 
     while True:
@@ -89,6 +103,8 @@ def train_chaoscontrol_for_budget(
                     k=metabolic_k,
                     noise_std=metabolic_noise_std,
                     score_mode=metabolic_score,
+                    generation_mode=generation_mode,
+                    structured_proj=structured_proj,
                 )
                 fork_count += 1
                 # Forked path doesn't produce jacobian_stats, so run a cheap
@@ -145,6 +161,20 @@ def train_chaoscontrol_for_budget(
                 bucket_id=dominant_bucket,
             )
             step_record["surprise"] = float(surprise)
+
+        # Semantic tier consolidation: extract gist from recent episodic slots
+        if (
+            hasattr(model, "semantic_tier")
+            and model.semantic_tier is not None
+            and hasattr(model, "outer_model")
+            and model.outer_model is not None
+            and hasattr(model.outer_model, "_slots")
+            and model.outer_model._slots
+        ):
+            recent_slots = torch.cat(model.outer_model._slots[-5:], dim=0)  # (N, outer_dim)
+            # Decode slots back to model_dim for semantic tier encoder
+            recent_decoded = model.outer_model.decoder(recent_slots)  # (N, model_dim)
+            model.semantic_tier.consolidate_from_episodes(recent_decoded)
 
         history.append(step_record)
         steps += 1
