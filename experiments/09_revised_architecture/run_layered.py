@@ -73,10 +73,17 @@ def run_layer(config_paths: list[Path], enwik8_path: str, budget: float,
 
 
 def pick_winner(layer_results: dict) -> tuple[str, float, float]:
-    """Pick config with lowest mean bpb across seeds.  Returns (name, mean, std)."""
+    """Pick config with lowest mean bpb across seeds.  Returns (name, mean, std).
+
+    Prefers ``bpb_gated`` when available (metabolic gate was active during eval),
+    falling back to plain ``bpb`` otherwise.
+    """
     stats: dict[str, tuple[float, float]] = {}
     for name, seed_results in layer_results.items():
-        bpbs = [r["eval"]["bpb"] for r in seed_results.values()]
+        bpbs = []
+        for r in seed_results.values():
+            ev = r["eval"]
+            bpbs.append(ev.get("bpb_gated", ev["bpb"]))
         mean = statistics.mean(bpbs)
         std = statistics.stdev(bpbs) if len(bpbs) > 1 else 0.0
         stats[name] = (mean, std)

@@ -23,9 +23,13 @@ def evaluate_chaoscontrol_bpb(
     metabolic_k: int = 4,
     metabolic_score: str = "memory_consistency",
     metabolic_noise_std: float = 0.01,
+    metabolic_mode: str = "fork",
     generation_mode: str = "noise",
     structured_proj: Any = None,
     warmup: bool = False,
+    warmup_write_mode: str = "last",
+    warmup_latent: bool = False,
+    warmup_cold_start: bool = False,
 ) -> dict[str, float]:
     """Evaluate ChaosStudentLM, returning loss and bits-per-byte.
 
@@ -80,14 +84,30 @@ def evaluate_chaoscontrol_bpb(
 
                     # Gate-aware eval (if metabolic gate is active)
                     if metabolic_gate:
-                        gated_out = metabolic_fork(
-                            model, inputs,
-                            k=metabolic_k,
-                            noise_std=metabolic_noise_std,
-                            score_mode=metabolic_score,
-                            generation_mode=generation_mode,
-                            structured_proj=structured_proj,
-                        )
+                        if metabolic_mode == "mcts":
+                            from chaoscontrol.metabolic import micro_mcts
+                            gated_out = micro_mcts(
+                                model, inputs,
+                                n_rollouts=metabolic_k, horizon=8,
+                            )
+                        elif metabolic_mode == "monte_carlo":
+                            from chaoscontrol.metabolic import metabolic_monte_carlo
+                            gated_out = metabolic_monte_carlo(
+                                model, inputs,
+                                k=metabolic_k,
+                                noise_std=metabolic_noise_std,
+                                generation_mode=generation_mode,
+                                structured_proj=structured_proj,
+                            )
+                        else:
+                            gated_out = metabolic_fork(
+                                model, inputs,
+                                k=metabolic_k,
+                                noise_std=metabolic_noise_std,
+                                score_mode=metabolic_score,
+                                generation_mode=generation_mode,
+                                structured_proj=structured_proj,
+                            )
                         gated_logits = gated_out["logits"]
                         total_loss_gated += float(
                             F.cross_entropy(

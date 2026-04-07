@@ -107,5 +107,52 @@ class TestFullStackIntegration(unittest.TestCase):
         assert logits.shape == (2, 256)
 
 
+    def test_eval_respects_metabolic_mode(self):
+        """evaluate_chaoscontrol_bpb must dispatch to the correct gate
+        function based on metabolic_mode and always produce bpb_gated."""
+        torch.manual_seed(42)
+        model = ChaosStudentLM(
+            vocab_size=256, dim=32, num_layers=2, ff_mult=2,
+            a_mode="diag",
+            outer_model_dim=16, outer_model_type="multislot",
+            outer_max_slots=8, outer_compress_ratio=2,
+        )
+        device = torch.device("cpu")
+        tokens = torch.randint(0, 256, (500,))
+        eval_starts = choose_eval_starts(
+            build_lm_starts(500, seq_len=32, stride=16),
+            batch_size=2, eval_batches=2, seed=42,
+        )
+
+        results = {}
+        for mode in ("fork", "monte_carlo", "mcts"):
+            res = evaluate_chaoscontrol_bpb(
+                model,
+                tokens=tokens,
+                eval_starts=eval_starts,
+                batch_size=2,
+                seq_len=32,
+                device=device,
+                metabolic_gate=True,
+                metabolic_k=2,
+                metabolic_mode=mode,
+            )
+            self.assertIn("bpb_gated", res, f"bpb_gated missing for mode={mode}")
+            self.assertGreater(res["bpb_gated"], 0, f"bpb_gated <= 0 for mode={mode}")
+            self.assertTrue(
+                res["bpb_gated"] == res["bpb_gated"],
+                f"NaN bpb_gated for mode={mode}",
+            )
+            results[mode] = res["bpb_gated"]
+
+        # Different modes should generally give different gated bpb values
+        # (not a hard assert — just sanity-check that at least two differ)
+        vals = list(results.values())
+        self.assertFalse(
+            vals[0] == vals[1] == vals[2],
+            "All three modes returned identical bpb_gated — dispatch may be broken",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -122,6 +122,7 @@ def run_experiment(config_path: str, *, enwik8_path: str, budget_seconds: float 
         batch_size=cfg.batch_size, seq_len=cfg.seq_len, device=device,
         metabolic_gate=cfg.metabolic_gate, metabolic_k=cfg.metabolic_k,
         metabolic_score=cfg.metabolic_score, metabolic_noise_std=cfg.metabolic_noise_std,
+        metabolic_mode=cfg.metabolic_mode,
         generation_mode=cfg.generation_mode, structured_proj=structured_proj,
         warmup=cfg.eval_warmup,
     )
