@@ -46,7 +46,8 @@ SHARED_DEFAULTS = {
 
 
 # ── helpers ──────────────────────────────────────────────────────────
-def run_config(config_path: Path, data_path: str, budget: float, seed: int) -> dict:
+def run_config(config_path: Path, data_path: str, budget: float, seed: int,
+               *, gpu_id: int | None = None) -> dict:
     """Run a single config with a given seed.  Returns parsed result dict."""
     RESULTS.mkdir(parents=True, exist_ok=True)
     out_path = RESULTS / f"{config_path.stem}_seed{seed}.json"
@@ -66,24 +67,90 @@ def run_config(config_path: Path, data_path: str, budget: float, seed: int) -> d
     ]
     env = dict(os.environ)
     env["PYTHONPATH"] = str(REPO / "src") + os.pathsep + env.get("PYTHONPATH", "")
+    if gpu_id is not None:
+        env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
     subprocess.run(cmd, check=True, env=env)
     tmp.unlink(missing_ok=True)
     return json.loads(out_path.read_text())
 
 
+def _launch_config(config_path: Path, data_path: str, budget: float, seed: int,
+                   gpu_id: int | None = None) -> tuple[subprocess.Popen, Path, Path]:
+    """Launch a config run as a background process.  Returns (proc, out_path, tmp_path)."""
+    RESULTS.mkdir(parents=True, exist_ok=True)
+    out_path = RESULTS / f"{config_path.stem}_seed{seed}.json"
+
+    cfg = yaml.safe_load(config_path.read_text())
+    cfg["seed"] = seed
+    tmp = config_path.parent / f".tmp_{config_path.stem}_s{seed}.yaml"
+    tmp.write_text(yaml.dump(cfg, default_flow_style=False))
+
+    cmd = [
+        sys.executable, "-m", "chaoscontrol.runner",
+        "--config", str(tmp),
+        "--data-path", data_path,
+        "--budget", str(budget),
+        "--output-json", str(out_path),
+    ]
+    env = dict(os.environ)
+    env["PYTHONPATH"] = str(REPO / "src") + os.pathsep + env.get("PYTHONPATH", "")
+    if gpu_id is not None:
+        env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+    log_path = RESULTS / f"{config_path.stem}_seed{seed}.log"
+    log_fh = open(log_path, "w")
+    proc = subprocess.Popen(cmd, env=env, stdout=log_fh, stderr=subprocess.STDOUT)
+    return proc, out_path, tmp, log_fh
+
+
 def run_layer(config_paths: list[Path], data_path: str, budget: float,
-              seeds: list[int], layer_name: str) -> dict:
-    """Run all configs x seeds for a layer.  Returns {config_name: {seed: result}}."""
+              seeds: list[int], layer_name: str,
+              *, num_gpus: int = 1) -> dict:
+    """Run all configs x seeds for a layer.  Returns {config_name: {seed: result}}.
+
+    When num_gpus > 1, seeds for each config run in parallel across GPUs.
+    Configs still run sequentially (later layers depend on earlier results).
+    """
     results: dict[str, dict[int, dict]] = {}
     total = len(config_paths) * len(seeds)
     done = 0
+
     for cfg in sorted(config_paths):
         name = cfg.stem
         results[name] = {}
-        for seed in seeds:
-            done += 1
-            print(f"  [{layer_name}] ({done}/{total}) {name} seed={seed} ...")
-            results[name][seed] = run_config(cfg, data_path, budget, seed)
+
+        if num_gpus > 1 and len(seeds) > 1:
+            # Parallel: launch all seeds concurrently, one per GPU
+            print(f"  [{layer_name}] {name} — launching {len(seeds)} seeds on {num_gpus} GPUs ...")
+            active: list[tuple[int, subprocess.Popen, Path, Path, object]] = []
+
+            for i, seed in enumerate(seeds):
+                gpu_id = i % num_gpus
+                proc, out_path, tmp, log_fh = _launch_config(cfg, data_path, budget, seed, gpu_id)
+                active.append((seed, proc, out_path, tmp, log_fh))
+
+            # Wait for all seeds to finish
+            for seed, proc, out_path, tmp, log_fh in active:
+                proc.wait()
+                log_fh.close()
+                tmp.unlink(missing_ok=True)
+                done += 1
+                if proc.returncode != 0:
+                    print(f"  [{layer_name}] *** {name} seed={seed} FAILED (rc={proc.returncode})")
+                    log_path = RESULTS / f"{cfg.stem}_seed{seed}.log"
+                    if log_path.exists():
+                        print(f"      See {log_path}")
+                    continue
+                results[name][seed] = json.loads(out_path.read_text())
+                bpb = results[name][seed]["eval"].get("bpb_gated",
+                          results[name][seed]["eval"]["bpb"])
+                print(f"  [{layer_name}] ({done}/{total}) {name} seed={seed} → bpb={bpb:.4f}")
+        else:
+            # Sequential: single GPU or single seed
+            for seed in seeds:
+                done += 1
+                print(f"  [{layer_name}] ({done}/{total}) {name} seed={seed} ...")
+                results[name][seed] = run_config(cfg, data_path, budget, seed)
+
     return results
 
 
@@ -611,11 +678,14 @@ def main():
     parser.add_argument("--l5-budget", type=float, default=900, help="Layer 5 budget in seconds")
     parser.add_argument("--start-layer", type=int, default=0,
                         help="Layer to start from (0=tokenizer, 1=gate, …, 6=inference)")
+    parser.add_argument("--num-gpus", type=int, default=1,
+                        help="Number of GPUs for seed parallelism (default: 1 = sequential)")
     args = parser.parse_args()
 
     data_path = args.data_path
     budget = args.budget
     l5_budget = args.l5_budget
+    num_gpus = args.num_gpus
 
     summary: dict[str, dict] = {}
     tokenizer_settings: dict = {}
@@ -626,7 +696,7 @@ def main():
         print("  LAYER 0: Tokenizer Architecture")
         print("=" * 72)
         l0_configs = generate_l0_configs()
-        l0_results = run_layer(l0_configs, data_path, budget, SEEDS, "L0")
+        l0_results = run_layer(l0_configs, data_path, budget, SEEDS, "L0", num_gpus=num_gpus)
         print_layer_summary("Layer 0: Tokenizer Architecture", l0_results)
         l0_winner, l0_mean, l0_std, l0_stats = pick_winner(l0_results)
         print(f"  >>> L0 winner: {l0_winner} (bpb={l0_mean:.4f} +/- {l0_std:.4f})")
@@ -666,7 +736,7 @@ def main():
         print("  LAYER 0.5: Codebook Alignment")
         print("=" * 72)
         l05_configs = generate_l05_configs(tokenizer_settings)
-        l05_results = run_layer(l05_configs, data_path, budget, SEEDS, "L0.5")
+        l05_results = run_layer(l05_configs, data_path, budget, SEEDS, "L0.5", num_gpus=num_gpus)
         print_layer_summary("Layer 0.5: Codebook Alignment", l05_results)
         l05_winner, l05_mean, l05_std, l05_stats = pick_winner(l05_results)
         print(f"  >>> L0.5 winner: {l05_winner} (bpb={l05_mean:.4f} +/- {l05_std:.4f})")
@@ -695,7 +765,7 @@ def main():
         print("  LAYER 1: Gate Modes")
         print("=" * 72)
         l1_configs = sorted(CONFIGS.glob("L1_*.yaml"))
-        l1_results = run_layer(l1_configs, data_path, budget, SEEDS, "L1")
+        l1_results = run_layer(l1_configs, data_path, budget, SEEDS, "L1", num_gpus=num_gpus)
         print_layer_summary("Layer 1: Gate Modes", l1_results)
         l1_winner, l1_mean, l1_std, l1_stats = pick_winner(l1_results)
         print(f"  >>> L1 winner: {l1_winner} (bpb={l1_mean:.4f} +/- {l1_std:.4f})")
@@ -721,7 +791,7 @@ def main():
         print("  LAYER 2: +Memory")
         print("=" * 72)
         l2_configs = generate_l2_configs(gate_settings, tokenizer_settings)
-        l2_results = run_layer(l2_configs, data_path, budget, SEEDS, "L2")
+        l2_results = run_layer(l2_configs, data_path, budget, SEEDS, "L2", num_gpus=num_gpus)
         print_layer_summary("Layer 2: +Memory", l2_results)
         l2_winner, l2_mean, l2_std, l2_stats = pick_winner(l2_results)
         print(f"  >>> L2 winner: {l2_winner} (bpb={l2_mean:.4f} +/- {l2_std:.4f})")
@@ -744,7 +814,7 @@ def main():
         print("  LAYER 3: +Wernicke + Regret")
         print("=" * 72)
         l3_configs = generate_l3_configs(gate_settings, mem_settings, tokenizer_settings)
-        l3_results = run_layer(l3_configs, data_path, budget, SEEDS, "L3")
+        l3_results = run_layer(l3_configs, data_path, budget, SEEDS, "L3", num_gpus=num_gpus)
         print_layer_summary("Layer 3: +Wernicke + Regret", l3_results)
         l3_winner, l3_mean, l3_std, l3_stats = pick_winner(l3_results)
         print(f"  >>> L3 winner: {l3_winner} (bpb={l3_mean:.4f} +/- {l3_std:.4f})")
@@ -767,7 +837,7 @@ def main():
         print("  LAYER 3.5: Dark Horses")
         print("=" * 72)
         l35_configs = generate_l35_configs(gate_settings, mem_settings, tokenizer_settings)
-        l35_results = run_layer(l35_configs, data_path, budget, SEEDS, "L3.5")
+        l35_results = run_layer(l35_configs, data_path, budget, SEEDS, "L3.5", num_gpus=num_gpus)
         print_layer_summary("Layer 3.5: Dark Horses", l35_results)
 
         with open(RESULTS / "L35_summary.json", "w") as f:
@@ -789,7 +859,7 @@ def main():
         print("  LAYER 4: Scaling")
         print("=" * 72)
         l4_configs = generate_l4_configs(full_stack, tokenizer_settings)
-        l4_results = run_layer(l4_configs, data_path, budget, SEEDS, "L4")
+        l4_results = run_layer(l4_configs, data_path, budget, SEEDS, "L4", num_gpus=num_gpus)
         print_layer_summary("Layer 4: Scaling", l4_results)
 
         with open(RESULTS / "L4_summary.json", "w") as f:
@@ -802,7 +872,7 @@ def main():
         print(f"  LAYER 5: Full A-mode (budget={l5_budget}s)")
         print("=" * 72)
         l5_configs = generate_l5_configs(full_stack)
-        l5_results = run_layer(l5_configs, data_path, l5_budget, SEEDS, "L5")
+        l5_results = run_layer(l5_configs, data_path, l5_budget, SEEDS, "L5", num_gpus=num_gpus)
         print_layer_summary("Layer 5: Full A-mode", l5_results)
 
         with open(RESULTS / "L5_summary.json", "w") as f:
@@ -815,7 +885,7 @@ def main():
         print("  LAYER 6: Inference-Time Adaptation Depth")
         print("=" * 72)
         l6_configs = generate_l6_configs(full_stack)
-        l6_results = run_layer(l6_configs, data_path, budget, SEEDS, "L6")
+        l6_results = run_layer(l6_configs, data_path, budget, SEEDS, "L6", num_gpus=num_gpus)
         print_layer_summary("Layer 6: Inference-Time Adaptation Depth", l6_results)
         l6_winner, l6_mean, l6_std, l6_stats = pick_winner(l6_results)
         print(f"  >>> L6 winner: {l6_winner} (bpb={l6_mean:.4f} +/- {l6_std:.4f})")
