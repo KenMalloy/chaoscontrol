@@ -1,0 +1,4 @@
+a_mode: full
+crit_target_coupling: 0.92
+model_dim: 128
+num_layers: 4

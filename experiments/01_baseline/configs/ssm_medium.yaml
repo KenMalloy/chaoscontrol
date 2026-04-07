@@ -1,0 +1,3 @@
+model_type: ssm
+model_dim: 256
+num_layers: 4

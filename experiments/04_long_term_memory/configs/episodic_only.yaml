@@ -1,0 +1,7 @@
+a_mode: full
+rich_b_mode: hub
+outer_model_dim: 64
+outer_model_type: multislot
+consolidation_trigger: immediate
+model_dim: 128
+num_layers: 4
