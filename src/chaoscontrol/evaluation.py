@@ -65,21 +65,31 @@ def evaluate_chaoscontrol_bpb(
     if warmup and getattr(model, "outer_model", None) is not None:
         om = model.outer_model
         saved_outer_state = {
-            "slots": [s.clone() for s in om._slots],
-            "survival": list(om._survival),
-            "slot_buckets": list(om._slot_buckets),
             "loss_ema": om.loss_ema.clone(),
             # Trigger state
             "_spike_seen": om._spike_seen,
             "_steps_since_spike": om._steps_since_spike,
             "_pre_spike_loss": om._pre_spike_loss,
-            "_retrieval_weights": om._retrieval_weights,
         }
+        # MultiSlotOuterModel fields (not present on single-slot OuterModel)
+        if hasattr(om, "_slots"):
+            saved_outer_state["slots"] = [s.clone() for s in om._slots]
+        if hasattr(om, "_survival"):
+            saved_outer_state["survival"] = list(om._survival)
+        if hasattr(om, "_slot_buckets"):
+            saved_outer_state["slot_buckets"] = list(om._slot_buckets)
+        if hasattr(om, "_retrieval_weights"):
+            saved_outer_state["_retrieval_weights"] = om._retrieval_weights
+        if hasattr(om, "_compression_consequences"):
+            saved_outer_state["_compression_consequences"] = list(om._compression_consequences)
         if hasattr(om, "_latent_traces"):
             saved_outer_state["latent_traces"] = [
                 {"bucket_id": t["bucket_id"], "centroid_contrib": t["centroid_contrib"].clone()}
                 for t in om._latent_traces
             ]
+        # Single-slot OuterModel state field
+        if hasattr(om, "state"):
+            saved_outer_state["state"] = om.state.clone()
         if hasattr(om, "consolidation_w"):
             saved_outer_state["consolidation_w"] = om.consolidation_w.clone()
         if hasattr(om, "_last_signal_was_pain"):
@@ -89,9 +99,12 @@ def evaluate_chaoscontrol_bpb(
 
         # Cold start: wipe all memory before eval loop
         if warmup_cold_start:
-            om._slots = []
-            om._survival = []
-            om._slot_buckets = []
+            if hasattr(om, "_slots"):
+                om._slots = []
+            if hasattr(om, "_survival"):
+                om._survival = []
+            if hasattr(om, "_slot_buckets"):
+                om._slot_buckets = []
             if hasattr(om, "_latent_traces"):
                 om._latent_traces = []
 
@@ -142,7 +155,7 @@ def evaluate_chaoscontrol_bpb(
                             surprise_ratio = batch_loss / max(running_avg, 1e-6)
                             if surprise_ratio > 1.0:
                                 model.outer_model.try_reactivate(
-                                    bucket_id=-1, surprise=surprise_ratio,
+                                    bucket_id=None, surprise=surprise_ratio,
                                 )
 
                     # Gate-aware eval (if metabolic gate is active)
@@ -186,17 +199,27 @@ def evaluate_chaoscontrol_bpb(
     finally:
         if saved_outer_state is not None:
             om = model.outer_model
-            om._slots = saved_outer_state["slots"]
-            om._survival = saved_outer_state["survival"]
-            om._slot_buckets = saved_outer_state["slot_buckets"]
             om.loss_ema = saved_outer_state["loss_ema"]
             # Trigger state
             om._spike_seen = saved_outer_state["_spike_seen"]
             om._steps_since_spike = saved_outer_state["_steps_since_spike"]
             om._pre_spike_loss = saved_outer_state["_pre_spike_loss"]
-            om._retrieval_weights = saved_outer_state["_retrieval_weights"]
+            # MultiSlotOuterModel fields
+            if "slots" in saved_outer_state:
+                om._slots = saved_outer_state["slots"]
+            if "survival" in saved_outer_state:
+                om._survival = saved_outer_state["survival"]
+            if "slot_buckets" in saved_outer_state:
+                om._slot_buckets = saved_outer_state["slot_buckets"]
+            if "_retrieval_weights" in saved_outer_state:
+                om._retrieval_weights = saved_outer_state["_retrieval_weights"]
+            if "_compression_consequences" in saved_outer_state:
+                om._compression_consequences = saved_outer_state["_compression_consequences"]
             if "latent_traces" in saved_outer_state:
                 om._latent_traces = saved_outer_state["latent_traces"]
+            # Single-slot OuterModel state
+            if "state" in saved_outer_state:
+                om.state = saved_outer_state["state"]
             if "consolidation_w" in saved_outer_state:
                 om.consolidation_w = saved_outer_state["consolidation_w"]
             if "_last_signal_was_pain" in saved_outer_state:
