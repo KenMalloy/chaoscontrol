@@ -233,5 +233,40 @@ class TestSemanticTier(unittest.TestCase):
         assert st.bases.abs().max().item() < 10.0
 
 
+class TestFullSequenceWrite(unittest.TestCase):
+    def test_write_from_sequence_captures_trajectory(self):
+        """write_sequence should encode the full trajectory, not just last position."""
+        from chaoscontrol.memory import MultiSlotOuterModel
+        m = MultiSlotOuterModel(model_dim=16, outer_dim=8, max_slots=4)
+        # Single position write
+        h_last = torch.randn(2, 16)
+        m.write(h_last)
+        slot_single = m._slots[-1].clone()
+        m._slots.pop()
+        m._survival.pop()
+        m._slot_buckets.pop()
+
+        # Full sequence write — should differ because it has more context
+        h_seq = torch.randn(2, 32, 16)  # (batch, seq, dim)
+        m.write_sequence(h_seq)
+        slot_seq = m._slots[-1]
+        assert not torch.allclose(slot_single, slot_seq)
+
+    def test_write_sequence_shape(self):
+        from chaoscontrol.memory import MultiSlotOuterModel
+        m = MultiSlotOuterModel(model_dim=16, outer_dim=8, max_slots=4)
+        h_seq = torch.randn(2, 32, 16)
+        m.write_sequence(h_seq, per_sample_weights=torch.tensor([1.0, 2.0]))
+        assert len(m._slots) == 1
+        assert m._slots[0].shape == (1, 8)
+
+    def test_write_sequence_with_bucket_id(self):
+        from chaoscontrol.memory import MultiSlotOuterModel
+        m = MultiSlotOuterModel(model_dim=16, outer_dim=8, max_slots=4)
+        h_seq = torch.randn(2, 32, 16)
+        m.write_sequence(h_seq, bucket_id=3)
+        assert m._slot_buckets[-1] == 3
+
+
 if __name__ == "__main__":
     unittest.main()

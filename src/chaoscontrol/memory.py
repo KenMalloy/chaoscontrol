@@ -328,6 +328,22 @@ class MultiSlotOuterModel(nn.Module):
         if len(self._slots) > self.max_slots:
             self._compress()
 
+    def write_sequence(
+        self,
+        h_seq: torch.Tensor,
+        *,
+        per_sample_weights: torch.Tensor | None = None,
+        bucket_id: int | None = None,
+    ) -> None:
+        """Encode from full sequence hidden states (batch, seq, dim).
+
+        Captures the trajectory leading to a surprising event, not just
+        the final hidden state. Mean-pools over the sequence dimension
+        to create a trajectory-aware representation before encoding.
+        """
+        h_pooled = h_seq.mean(dim=1)  # (batch, dim)
+        self.write(h_pooled, per_sample_weights=per_sample_weights, bucket_id=bucket_id)
+
     def update_survival(self, current_loss: float) -> None:
         """Update survival scores for slots that contributed to last retrieval.
 
