@@ -14,12 +14,11 @@ python3 -m venv .venv
 # Download FineWeb data if not present
 FINEWEB_DIR=/workspace/fineweb_data
 if [ ! -d "$FINEWEB_DIR/datasets" ]; then
-    echo "=== Downloading FineWeb data (sp1024 + raw bytes) ==="
+    echo "=== Downloading FineWeb data (sp1024) ==="
     mkdir -p "$FINEWEB_DIR"
+    # Run the download script from the fineweb dir so it writes there
     cd "$FINEWEB_DIR"
-    .venv/bin/pip install huggingface-hub
-    # Download competition tokenized shards (for BPE baseline reference)
-    python3 /workspace/chaoscontrol/baselines/parameter_golf/cached_challenge_fineweb.py \
+    /workspace/chaoscontrol/.venv/bin/python /workspace/chaoscontrol/baselines/parameter_golf/cached_challenge_fineweb.py \
         --variant sp1024 --train-shards 80
     cd /workspace/chaoscontrol
 else
