@@ -97,5 +97,62 @@ class TestCriticalityRegularizer(unittest.TestCase):
         assert loss.item() > 1e-5  # 0.0 is above the -0.13 target
 
 
+class TestChaosSSMCoreStep(unittest.TestCase):
+    """Test single-token stepping matches sequential forward pass."""
+
+    def test_diag_step_matches_forward(self):
+        """Stepping token-by-token should produce the same output as forward()."""
+        torch.manual_seed(42)
+        core = ChaosSSMCore(dim=16, a_mode="diag")
+        x = torch.randn(2, 8, 16)
+
+        # Full forward
+        y_full = core(x)
+
+        # Step-by-step
+        state = torch.zeros(2, 16)
+        outputs = []
+        for t in range(8):
+            out, state = core.step(x[:, t, :], state)
+            outputs.append(out)
+        y_step = torch.stack(outputs, dim=1)
+
+        assert torch.allclose(y_full, y_step, atol=1e-5), f"max diff: {(y_full - y_step).abs().max()}"
+
+    def test_paired_step_matches_forward(self):
+        torch.manual_seed(42)
+        core = ChaosSSMCore(dim=16, a_mode="paired")
+        x = torch.randn(2, 8, 16)
+        y_full = core(x)
+        state = torch.zeros(2, 16)
+        outputs = []
+        for t in range(8):
+            out, state = core.step(x[:, t, :], state)
+            outputs.append(out)
+        y_step = torch.stack(outputs, dim=1)
+        assert torch.allclose(y_full, y_step, atol=1e-5)
+
+    def test_full_step_matches_forward(self):
+        torch.manual_seed(42)
+        core = ChaosSSMCore(dim=16, a_mode="full", a_full_rank=4)
+        x = torch.randn(2, 8, 16)
+        y_full = core(x)
+        state = torch.zeros(2, 16)
+        outputs = []
+        for t in range(8):
+            out, state = core.step(x[:, t, :], state)
+            outputs.append(out)
+        y_step = torch.stack(outputs, dim=1)
+        assert torch.allclose(y_full, y_step, atol=1e-4)
+
+    def test_step_returns_correct_shapes(self):
+        core = ChaosSSMCore(dim=16, a_mode="diag")
+        inp = torch.randn(2, 16)  # (batch, dim) — single token
+        state = torch.zeros(2, 16)
+        out, new_state = core.step(inp, state)
+        assert out.shape == (2, 16)
+        assert new_state.shape == (2, 16)
+
+
 if __name__ == "__main__":
     unittest.main()

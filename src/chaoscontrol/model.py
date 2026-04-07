@@ -49,6 +49,26 @@ class ChaosSSMBlock(nn.Module):
         else:
             raise ValueError(f"unsupported rich_b_mode: {rich_b_mode}")
 
+    def step(
+        self,
+        x: torch.Tensor,
+        state: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Single-token step through the block.
+
+        Args:
+            x: (batch, dim) — single token
+            state: (batch, dim) — previous recurrence state for this block's core
+
+        Returns:
+            (output, new_state) — output is (batch, dim), new_state is (batch, dim)
+        """
+        normed = self.input_norm(x)
+        y, new_state = self.core.step(normed, state, rich_b=self.rich_b)
+        x = x + y
+        x = x + self.ff(self.ff_norm(x))
+        return x, new_state
+
     def forward(
         self,
         x: torch.Tensor,
@@ -172,6 +192,41 @@ class ChaosStudentLM(nn.Module):
         self.compression_consequence = compression_consequence
         self.cue_projection = cue_projection
         self.dynamic_crit_per_layer = dynamic_crit_per_layer
+
+    def init_state(self, batch_size: int) -> list[torch.Tensor]:
+        """Initialize recurrence states for all layers."""
+        device = self.embed.weight.device
+        return [torch.zeros(batch_size, self.dim, device=device) for _ in range(len(self.layers))]
+
+    def step(
+        self,
+        token_ids: torch.Tensor,
+        states: list[torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor, list[torch.Tensor]]:
+        """Single-token forward step.
+
+        Args:
+            token_ids: (batch, 1) — single token ids
+            states: list of (batch, dim) per layer
+
+        Returns:
+            (logits, hidden, new_states)
+            logits: (batch, vocab)
+            hidden: (batch, dim)
+            new_states: list of (batch, dim) per layer
+        """
+        x = self.embed(token_ids).squeeze(1)  # (batch, dim)
+
+        new_states = []
+        for i, layer in enumerate(self.layers):
+            x, new_s = layer.step(x, states[i])
+            new_states.append(new_s)
+
+        hidden = x
+        x = self.final_norm(x.unsqueeze(1)).squeeze(1)  # RMSNorm expects (..., dim)
+        logits = self.lm_head(x)
+
+        return logits, hidden, new_states
 
     def artifact_bytes(self) -> int:
         return int(sum(p.numel() for p in self.parameters()) * 2)

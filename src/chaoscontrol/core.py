@@ -100,6 +100,81 @@ class ChaosSSMCore(nn.Module):
         A_c = S - gamma * torch.eye(self.dim, device=S.device, dtype=S.dtype) + self.U @ self.V.T
         return A_c
 
+    def step(
+        self,
+        inp: torch.Tensor,
+        state: torch.Tensor,
+        *,
+        rich_b: Any = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Single-token recurrence step.
+
+        Args:
+            inp: (batch, dim) — single token embedding (already projected if needed)
+            state: (batch, dim) — previous recurrence state
+
+        Returns:
+            (output, new_state) — both (batch, dim)
+        """
+        if self.a_mode == "diag":
+            a_base = torch.sigmoid(self.log_a).to(dtype=inp.dtype)[None, :]
+            delta = F.softplus(self.delta_proj(inp)).clamp_min(1e-4)
+            decay = torch.exp(-delta * a_base)
+            if rich_b is not None:
+                update = rich_b(inp, state)
+            else:
+                select = torch.sigmoid(self.select_proj(inp))
+                candidate = torch.tanh(self.in_proj(inp))
+                update = select * candidate
+            new_state = decay * state + update
+            out = torch.sigmoid(self.gate_proj(inp)) * new_state
+            return self.out_proj(out), new_state
+
+        elif self.a_mode == "paired":
+            batch = inp.shape[0]
+            dim = self.dim
+            n_pairs = dim // 2
+            delta = F.softplus(self.delta_proj(inp)).clamp_min(1e-4)
+            r = torch.exp(-F.softplus(self.log_r)).to(dtype=inp.dtype)
+            cos_t = torch.cos(self.theta).to(dtype=inp.dtype)
+            sin_t = torch.sin(self.theta).to(dtype=inp.dtype)
+            delta_pairs = (delta[:, 0::2] + delta[:, 1::2]) * 0.5
+            effective_r = torch.exp(-delta_pairs * (1.0 - r[None, :]))
+            s = state.view(batch, n_pairs, 2)
+            s0 = s[:, :, 0]
+            s1 = s[:, :, 1]
+            new_s0 = effective_r * (cos_t[None, :] * s0 - sin_t[None, :] * s1)
+            new_s1 = effective_r * (sin_t[None, :] * s0 + cos_t[None, :] * s1)
+            decayed = torch.stack([new_s0, new_s1], dim=-1).view(batch, dim)
+            if rich_b is not None:
+                update = rich_b(inp, state)
+            else:
+                select = torch.sigmoid(self.select_proj(inp))
+                candidate = torch.tanh(self.in_proj(inp))
+                update = select * candidate
+            new_state = decayed + update
+            out = torch.sigmoid(self.gate_proj(inp)) * new_state
+            return self.out_proj(out), new_state
+
+        elif self.a_mode == "full":
+            A_c = self._get_A_full().to(dtype=inp.dtype)
+            delta = F.softplus(self.delta_proj(inp)).clamp(1e-4, 2.0)
+            d = delta.mean()
+            A_d = torch.matrix_exp(d * A_c)
+            proposed = state @ A_d.T
+            if rich_b is not None:
+                update = rich_b(inp, state)
+            else:
+                select = torch.sigmoid(self.select_proj(inp))
+                candidate = torch.tanh(self.in_proj(inp))
+                update = select * candidate
+            new_state = proposed + update
+            out = torch.sigmoid(self.gate_proj(inp)) * new_state
+            return self.out_proj(out), new_state
+
+        else:
+            raise ValueError(f"unsupported a_mode: {self.a_mode}")
+
     def forward(
         self,
         x: torch.Tensor,
