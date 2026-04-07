@@ -281,7 +281,9 @@ def micro_mcts(
     ucb_c: float = 1.41,
     value_proxy: str = "confidence",
 ) -> dict[str, Any]:
-    """Forward-only MCTS gate: tree search using the SSM as a world model.
+    """Deliberative planning gate: forward-only tree search triggered by surprise,
+    analogous to System 2 / model-based reasoning. Uses the SSM recurrence as a
+    world model for efficient O(1)-per-step rollouts.
 
     When surprise triggers the metabolic gate, runs N rollouts of depth H
     tokens from the current state, uses UCB to select which candidate branch

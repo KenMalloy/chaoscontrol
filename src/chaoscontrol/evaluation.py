@@ -38,6 +38,22 @@ def evaluate_chaoscontrol_bpb(
     total_loss_gated = 0.0
     total_tokens = 0
     vocab_size = model.vocab_size
+
+    # Save outer model state before eval warmup so memory writes don't persist
+    saved_outer_state = None
+    if warmup and getattr(model, "outer_model", None) is not None:
+        saved_outer_state = {
+            "slots": [s.clone() for s in model.outer_model._slots],
+            "survival": list(model.outer_model._survival),
+            "slot_buckets": list(model.outer_model._slot_buckets),
+            "loss_ema": model.outer_model.loss_ema.clone(),
+        }
+        if hasattr(model.outer_model, "_latent_traces"):
+            saved_outer_state["latent_traces"] = [
+                {"bucket_id": t["bucket_id"], "centroid_contrib": t["centroid_contrib"].clone()}
+                for t in model.outer_model._latent_traces
+            ]
+
     try:
         with torch.no_grad():
             for idx in range(0, len(eval_starts), batch_size):
@@ -85,6 +101,13 @@ def evaluate_chaoscontrol_bpb(
                 )
                 total_tokens += int(targets.numel())
     finally:
+        if saved_outer_state is not None:
+            model.outer_model._slots = saved_outer_state["slots"]
+            model.outer_model._survival = saved_outer_state["survival"]
+            model.outer_model._slot_buckets = saved_outer_state["slot_buckets"]
+            model.outer_model.loss_ema = saved_outer_state["loss_ema"]
+            if "latent_traces" in saved_outer_state:
+                model.outer_model._latent_traces = saved_outer_state["latent_traces"]
         if was_training:
             model.train()
     mean_loss = total_loss / max(total_tokens, 1)

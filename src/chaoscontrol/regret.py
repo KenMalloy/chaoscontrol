@@ -1,14 +1,21 @@
-"""CFR-style regret tracking per information set (Wernicke bucket)."""
+"""Experience-weighted regret tracking per semantic type (Wernicke bucket).
+
+Tracks counterfactual regret for actions not taken, grouped by information
+set (bucket_id). Uses regret matching to bias future exploration toward
+under-explored alternatives. Inspired by CFR but adapted for single-agent
+language modeling — no adversary, regret drives exploration not equilibrium.
+"""
 from __future__ import annotations
 import torch
 
 
 class RegretTable:
-    """Tracks cumulative regret per (bucket_id, action) pair.
+    """Experience-weighted regret tracking per semantic type (Wernicke bucket).
 
-    Uses regret matching to convert positive cumulative regrets
-    into an action selection strategy. Negative regrets are clamped
-    to zero (standard CFR).
+    Tracks counterfactual regret for actions not taken, grouped by information
+    set (bucket_id). Uses regret matching to bias future exploration toward
+    under-explored alternatives. Inspired by CFR but adapted for single-agent
+    language modeling — no adversary, regret drives exploration not equilibrium.
     """
 
     def __init__(self, n_buckets: int, n_actions: int) -> None:

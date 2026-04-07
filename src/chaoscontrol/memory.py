@@ -346,8 +346,10 @@ class MultiSlotOuterModel(nn.Module):
     ) -> None:
         """Encode from full sequence hidden states (batch, seq, dim).
 
-        Captures the trajectory leading to a surprising event, not just
-        the final hidden state. Uses exponentially-weighted mean with
+        Surprise-gated hippocampal encoding: promotes the hidden state
+        trajectory to episodic storage when prediction error triggers
+        consolidation. Recency-weighted to emphasize states closest to
+        the surprising event. Uses exponentially-weighted mean with
         recency bias so later positions contribute more, preserving
         temporal order information that flat mean-pooling discards.
         """
@@ -501,6 +503,9 @@ class MultiSlotOuterModel(nn.Module):
 
         Returns True if a trace was reactivated (added back as a slot), False otherwise.
         Only fires when surprise exceeds threshold AND a matching latent trace exists.
+        Reactivated memories are degraded (Gaussian noise added) reflecting the
+        reconstructive nature of memory retrieval — consolidated memories are
+        rebuilt, not replayed.
         """
         if surprise < reactivation_threshold:
             return False
