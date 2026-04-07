@@ -1,0 +1,504 @@
+"""VRAM long-term memory modules: OuterModel and MultiSlotOuterModel.
+
+OuterModel  -- single-slot lossy encode/decode with surprise-driven consolidation.
+MultiSlotOuterModel -- multi-slot variant with cue-dependent retrieval, survival
+                       scoring, typed compression, and checkpoint persistence.
+"""
+from __future__ import annotations
+
+from collections import defaultdict
+from typing import Any
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+class OuterModel(nn.Module):
+    """VRAM long-term memory with lossy encode/decode and surprise-driven consolidation.
+
+    The outer state lives in a different representational space (outer_dim)
+    from the recurrence (model_dim). Encode != decode^-1 guarantees lossiness.
+    Persists across sequences (state is a buffer, not reset).
+    """
+
+    def __init__(
+        self,
+        model_dim: int,
+        outer_dim: int = 64,
+        consolidation_mode: str = "symmetric",
+        ema_decay: float = 0.99,
+        trigger: str = "immediate",
+        trigger_window: int = 8,
+    ) -> None:
+        super().__init__()
+        self.model_dim = model_dim
+        self.outer_dim = outer_dim
+        self.consolidation_mode = consolidation_mode
+        self.ema_decay = ema_decay
+        self.trigger = trigger
+        self.trigger_window = trigger_window
+
+        # Trigger state for resolution/windowed modes
+        self._spike_seen = False
+        self._steps_since_spike = 0
+        self._pre_spike_loss: float = 0.0
+
+        # Encoder is a structural transform, not learnable via task loss.
+        # The outer model's learning rule is self-supervised (surprise-driven).
+        self.encoder = nn.Linear(model_dim, outer_dim, bias=False)
+        self.encoder.weight.requires_grad_(False)
+
+        # Decoder IS on the forward path and receives task-loss gradients.
+        # This is the interface between outer model and the task — it should
+        # learn to produce useful reconstructions.
+        self.decoder = nn.Linear(outer_dim, model_dim, bias=False)
+
+        # Inertia is structural (controls accumulation speed), not task-learnable.
+        self.log_inertia = nn.Parameter(torch.tensor(2.0, dtype=torch.float32), requires_grad=False)
+
+        if consolidation_mode == "learned":
+            # Gradient-free: online adjustment based on whether pain or reward
+            # consolidations tend to precede loss improvements.
+            self.register_buffer("consolidation_w", torch.tensor(0.0))
+            self.register_buffer("_last_signal_was_pain", torch.tensor(False))
+            self.register_buffer("_last_loss", torch.tensor(0.0))
+            self.register_buffer("_last_wrote", torch.tensor(False))
+
+        # Persistent buffers (not reset between sequences)
+        self.register_buffer("state", torch.zeros(1, outer_dim))
+        self.register_buffer("loss_ema", torch.tensor([2.0]))
+
+    def read(self, batch_size: int) -> torch.Tensor:
+        """Lossy decode. Expand state to batch and project back to model_dim."""
+        return self.decoder(self.state.expand(batch_size, -1))
+
+    def write(self, h: torch.Tensor, *, per_sample_weights: torch.Tensor | None = None) -> None:
+        """Lossy encode. Weighted average across batch, accumulate with inertia.
+
+        If per_sample_weights is provided (batch,), samples with higher weight
+        contribute more to the stored memory — e.g. weight by per-sample surprise.
+        """
+        encoded = torch.tanh(self.encoder(h.detach()))
+        if per_sample_weights is not None:
+            w = per_sample_weights.detach()
+            w = w / w.sum().clamp_min(1e-8)  # normalize to sum to 1
+            encoded_agg = (w.unsqueeze(-1) * encoded).sum(dim=0, keepdim=True)
+        else:
+            encoded_agg = encoded.mean(dim=0, keepdim=True)
+        inertia = torch.sigmoid(self.log_inertia)
+        self.state = (inertia * self.state.detach() + (1 - inertia) * encoded_agg).detach()
+
+    def compute_consolidation_signal(self, current_loss: float, running_avg: float) -> float:
+        """Compute surprise magnitude.
+
+        symmetric:    |loss - avg|
+        pain_biased:  pain + 0.5 * reward
+        learned:      sigmoid(w) * pain + (1 - sigmoid(w)) * reward
+        """
+        pain = max(current_loss - running_avg, 0.0)
+        reward = max(running_avg - current_loss, 0.0)
+
+        if self.consolidation_mode == "symmetric":
+            return abs(current_loss - running_avg)
+        elif self.consolidation_mode == "pain_biased":
+            return pain + 0.5 * reward
+        elif self.consolidation_mode == "learned":
+            w = torch.sigmoid(self.consolidation_w).item()
+            return w * pain + (1.0 - w) * reward
+        else:
+            raise ValueError(f"unsupported consolidation_mode: {self.consolidation_mode}")
+
+    def consolidation_step(
+        self,
+        h: torch.Tensor,
+        current_loss: float,
+        per_sample_weights: torch.Tensor | None = None,
+        bucket_id: int | None = None,
+    ) -> float:
+        """Full step: compute signal, gate write by surprise, update EMA.
+
+        Only writes when signal/running_avg > 0.01 (skip boring moments).
+        For "learned" mode: gradient-free update — if the last consolidation
+        was pain-triggered and loss improved, nudge w toward pain; if reward-
+        triggered and loss improved, nudge w toward reward.
+        Returns the surprise signal value.
+        """
+        running_avg = self.loss_ema.item()
+        signal = self.compute_consolidation_signal(current_loss, running_avg)
+        is_pain = current_loss > running_avg
+
+        # Gradient-free update for learned consolidation weight.
+        # Only update w when the PREVIOUS step actually wrote memory,
+        # so credit assignment is grounded in real consolidation events.
+        if self.consolidation_mode == "learned" and self._last_wrote.item():
+            loss_improved = current_loss < self._last_loss.item()
+            if loss_improved:
+                # Last consolidation type worked — nudge toward it
+                if self._last_signal_was_pain.item():
+                    self.consolidation_w = self.consolidation_w + 0.01
+                else:
+                    self.consolidation_w = self.consolidation_w - 0.01
+
+        # Determine whether to write based on trigger mode
+        surprise_threshold = running_avg > 0 and signal / running_avg > 0.01
+        wrote = False
+
+        if self.trigger == "immediate":
+            # Write on surprise directly
+            if surprise_threshold:
+                self.write(h, per_sample_weights=per_sample_weights)
+                wrote = True
+
+        elif self.trigger == "resolution":
+            # Spike = flag that accumulation phase should flush on settlement.
+            # Always accumulating (overlapping). Spike marks "something happened."
+            # Settlement (loss returns below running_avg after spike) = flush.
+            if surprise_threshold and not self._spike_seen:
+                self._spike_seen = True
+                self._pre_spike_loss = running_avg
+            if self._spike_seen:
+                # Check for resolution: loss settled back below pre-spike level
+                settled = current_loss <= self._pre_spike_loss
+                if settled:
+                    self.write(h, per_sample_weights=per_sample_weights)
+                    wrote = True
+                    self._spike_seen = False
+
+        elif self.trigger == "windowed":
+            # Spike opens a window. Flush after N steps.
+            if surprise_threshold and not self._spike_seen:
+                self._spike_seen = True
+                self._steps_since_spike = 0
+            if self._spike_seen:
+                self._steps_since_spike += 1
+                if self._steps_since_spike >= self.trigger_window:
+                    self.write(h, per_sample_weights=per_sample_weights)
+                    wrote = True
+                    self._spike_seen = False
+
+        # Track for learned mode's gradient-free update
+        if self.consolidation_mode == "learned":
+            self._last_signal_was_pain = torch.tensor(is_pain)
+            self._last_loss = torch.tensor(current_loss)
+            self._last_wrote = torch.tensor(wrote)
+
+        # Update EMA
+        self.loss_ema = self.ema_decay * self.loss_ema + (1 - self.ema_decay) * current_loss
+
+        return signal
+
+
+class MultiSlotOuterModel(nn.Module):
+    """Multi-slot VRAM long-term memory with cue-dependent retrieval and compression.
+
+    Each consolidation event writes a new slot. When max_slots is reached,
+    the oldest slots are merged (lossy compression = forgetting). Retrieval
+    uses dot-product similarity between the current hidden state and each slot.
+    Per-slot survival scores track impact: how much does this slot help when cued?
+    """
+
+    def __init__(
+        self,
+        model_dim: int,
+        outer_dim: int = 64,
+        consolidation_mode: str = "symmetric",
+        ema_decay: float = 0.99,
+        trigger: str = "immediate",
+        trigger_window: int = 8,
+        max_slots: int = 64,
+        compress_ratio: int = 2,
+    ) -> None:
+        super().__init__()
+        self.model_dim = model_dim
+        self.outer_dim = outer_dim
+        self.consolidation_mode = consolidation_mode
+        self.ema_decay = ema_decay
+        self.trigger = trigger
+        self.trigger_window = trigger_window
+        self.max_slots = max_slots
+        self.compress_ratio = max(2, compress_ratio)
+
+        # Trigger state
+        self._spike_seen = False
+        self._steps_since_spike = 0
+        self._pre_spike_loss: float = 0.0
+
+        # Encoder: frozen structural transform
+        self.encoder = nn.Linear(model_dim, outer_dim, bias=False)
+        self.encoder.weight.requires_grad_(False)
+
+        # Decoder: on forward path, receives task gradients
+        self.decoder = nn.Linear(outer_dim, model_dim, bias=False)
+
+        # Cue projection: project hidden state to outer_dim for similarity
+        self.cue_proj = nn.Linear(model_dim, outer_dim, bias=False)
+
+        if consolidation_mode == "learned":
+            self.register_buffer("consolidation_w", torch.tensor(0.0))
+            self.register_buffer("_last_signal_was_pain", torch.tensor(False))
+            self.register_buffer("_last_loss", torch.tensor(0.0))
+            self.register_buffer("_last_wrote", torch.tensor(False))
+
+        self.register_buffer("loss_ema", torch.tensor([2.0]))
+
+        # Slot storage (not parameters — runtime state, persisted via extra_state)
+        self._slots: list[torch.Tensor] = []        # each (1, outer_dim)
+        self._survival: list[float] = []             # per-slot survival score
+        self._slot_buckets: list[int] = []           # per-slot bucket type from Wernicke
+        self._retrieval_weights: torch.Tensor | None = None  # cached from last read
+
+    def get_extra_state(self) -> dict:
+        """Persist slots, survival scores, and bucket assignments in state_dict."""
+        return {
+            "slots": [s.cpu() for s in self._slots],
+            "survival": list(self._survival),
+            "slot_buckets": list(self._slot_buckets),
+        }
+
+    def set_extra_state(self, state: dict) -> None:
+        """Restore slots, survival scores, and bucket assignments from checkpoint."""
+        device = self.decoder.weight.device
+        self._slots = [s.to(device) for s in state["slots"]]
+        self._survival = list(state["survival"])
+        self._slot_buckets = list(state.get("slot_buckets", [-1] * len(self._slots)))
+
+    def read(self, batch_size: int, *, cue: torch.Tensor | None = None) -> torch.Tensor:
+        """Cue-dependent retrieval across slots.
+
+        If no slots exist, returns zeros. If cue is provided (batch, model_dim),
+        similarity between cue and each slot weights the decode.
+        """
+        if not self._slots:
+            return torch.zeros(batch_size, self.model_dim, device=self.decoder.weight.device)
+
+        # Stack slots: (num_slots, outer_dim)
+        slot_matrix = torch.cat(self._slots, dim=0)
+
+        if cue is not None:
+            # Project cue to outer space for similarity
+            cue_outer = self.cue_proj(cue)  # (batch, outer_dim)
+            # Similarity: (batch, num_slots)
+            sim = torch.mm(cue_outer, slot_matrix.T)
+            weights = F.softmax(sim, dim=-1)  # (batch, num_slots)
+            # Cache for survival scoring
+            self._retrieval_weights = weights.detach()
+            # Weighted retrieval: (batch, outer_dim)
+            retrieved = torch.mm(weights, slot_matrix)
+        else:
+            # Uniform retrieval (no cue)
+            retrieved = slot_matrix.mean(dim=0, keepdim=True).expand(batch_size, -1)
+            self._retrieval_weights = None
+
+        return self.decoder(retrieved)
+
+    def write(
+        self,
+        h: torch.Tensor,
+        *,
+        per_sample_weights: torch.Tensor | None = None,
+        bucket_id: int | None = None,
+    ) -> None:
+        """Encode and append a new slot. Compress if at capacity.
+
+        If bucket_id is provided, tags the slot with that bucket type from the
+        Wernicke layer. Typed slots are only merged with same-type slots during
+        compression.
+        """
+        encoded = torch.tanh(self.encoder(h.detach()))
+        if per_sample_weights is not None:
+            w = per_sample_weights.detach()
+            w = w / w.sum().clamp_min(1e-8)
+            slot = (w.unsqueeze(-1) * encoded).sum(dim=0, keepdim=True)
+        else:
+            slot = encoded.mean(dim=0, keepdim=True)
+
+        self._slots.append(slot.detach())
+        self._survival.append(0.0)
+        self._slot_buckets.append(bucket_id if bucket_id is not None else -1)
+
+        # Compress if at capacity
+        if len(self._slots) > self.max_slots:
+            self._compress()
+
+    def update_survival(self, current_loss: float) -> None:
+        """Update survival scores for slots that contributed to last retrieval.
+
+        Impact = how much better is the model when this slot fires?
+        survival_score += (running_avg - actual_loss) weighted by retrieval weight.
+        """
+        if self._retrieval_weights is None or not self._slots:
+            return
+        running_avg = self.loss_ema.item()
+        impact = running_avg - current_loss  # positive = model did better than avg
+        # Weight impact by how much each slot contributed to retrieval
+        # Average across batch
+        mean_weights = self._retrieval_weights.mean(dim=0)  # (num_slots,)
+        for i in range(min(len(self._survival), mean_weights.size(0))):
+            self._survival[i] += impact * mean_weights[i].item()
+
+    def _compress(self) -> None:
+        """Merge the oldest slots with lowest survival scores.
+
+        Takes the oldest half, sorts by survival, merges the bottom
+        compress_ratio into one averaged slot. High-survival old slots survive.
+        When bucket types are present, only merges slots sharing the same bucket.
+        """
+        if len(self._slots) <= self.compress_ratio:
+            return
+
+        # Target: merge the N oldest low-survival slots into N//compress_ratio
+        n_old = len(self._slots) // 2
+        if n_old < self.compress_ratio:
+            return
+
+        old_slots = self._slots[:n_old]
+        old_survival = self._survival[:n_old]
+        old_buckets = self._slot_buckets[:n_old]
+        new_slots = self._slots[n_old:]
+        new_survival = self._survival[n_old:]
+        new_buckets = self._slot_buckets[n_old:]
+
+        # Check if we have typed slots (any bucket != -1)
+        has_types = any(b != -1 for b in old_buckets)
+
+        if has_types:
+            # Typed compression: only merge within same bucket
+            # Group old slots by bucket
+            bucket_groups: dict[int, list[int]] = defaultdict(list)
+            for i in range(n_old):
+                bucket_groups[old_buckets[i]].append(i)
+
+            kept_slots = []
+            kept_survival = []
+            kept_buckets = []
+
+            for bucket_id, group_indices in bucket_groups.items():
+                if len(group_indices) >= self.compress_ratio:
+                    # Sort by survival ascending, merge the lowest
+                    group_sorted = sorted(group_indices, key=lambda i: old_survival[i])
+                    merge_count = min(self.compress_ratio, len(group_sorted))
+                    to_merge = group_sorted[:merge_count]
+                    to_keep = group_sorted[merge_count:]
+
+                    # Merge
+                    merged_tensors = [old_slots[i] for i in to_merge]
+                    merged_survivals = [old_survival[i] for i in to_merge]
+                    weights = torch.tensor([max(s, 0.01) for s in merged_survivals])
+                    weights = weights / weights.sum()
+                    merged_slot = sum(w.item() * t for w, t in zip(weights, merged_tensors))
+                    merged_score = sum(merged_survivals) / len(merged_survivals)
+
+                    for i in sorted(to_keep):
+                        kept_slots.append(old_slots[i])
+                        kept_survival.append(old_survival[i])
+                        kept_buckets.append(old_buckets[i])
+                    kept_slots.append(merged_slot)
+                    kept_survival.append(merged_score)
+                    kept_buckets.append(bucket_id)
+                else:
+                    # Not enough slots in this bucket to merge — keep them all
+                    for i in sorted(group_indices):
+                        kept_slots.append(old_slots[i])
+                        kept_survival.append(old_survival[i])
+                        kept_buckets.append(old_buckets[i])
+
+            self._slots = kept_slots + new_slots
+            self._survival = kept_survival + new_survival
+            self._slot_buckets = kept_buckets + new_buckets
+        else:
+            # Untyped compression: original behavior
+            indices = sorted(range(n_old), key=lambda i: old_survival[i])
+            merge_count = min(self.compress_ratio, n_old)
+            to_merge_idx = indices[:merge_count]
+            to_keep_idx = indices[merge_count:]
+
+            if to_merge_idx:
+                merged_tensors = [old_slots[i] for i in to_merge_idx]
+                merged_survivals = [old_survival[i] for i in to_merge_idx]
+                weights = torch.tensor([max(s, 0.01) for s in merged_survivals])
+                weights = weights / weights.sum()
+                merged_slot = sum(w.item() * t for w, t in zip(weights, merged_tensors))
+                merged_score = sum(merged_survivals) / len(merged_survivals)
+
+                kept_old = [(old_slots[i], old_survival[i], old_buckets[i]) for i in sorted(to_keep_idx)]
+                self._slots = [s for s, _, _ in kept_old] + [merged_slot] + new_slots
+                self._survival = [sc for _, sc, _ in kept_old] + [merged_score] + new_survival
+                self._slot_buckets = [b for _, _, b in kept_old] + [-1] + new_buckets
+
+    def compute_consolidation_signal(self, current_loss: float, running_avg: float) -> float:
+        """Same as OuterModel — surprise magnitude."""
+        pain = max(current_loss - running_avg, 0.0)
+        reward = max(running_avg - current_loss, 0.0)
+        if self.consolidation_mode == "symmetric":
+            return abs(current_loss - running_avg)
+        elif self.consolidation_mode == "pain_biased":
+            return pain + 0.5 * reward
+        elif self.consolidation_mode == "learned":
+            w = torch.sigmoid(self.consolidation_w).item()
+            return w * pain + (1.0 - w) * reward
+        raise ValueError(f"unsupported consolidation_mode: {self.consolidation_mode}")
+
+    def consolidation_step(
+        self,
+        h: torch.Tensor,
+        current_loss: float,
+        per_sample_weights: torch.Tensor | None = None,
+        bucket_id: int | None = None,
+    ) -> float:
+        """Full step: trigger logic, write, survival update, EMA update."""
+        running_avg = self.loss_ema.item()
+        signal = self.compute_consolidation_signal(current_loss, running_avg)
+        is_pain = current_loss > running_avg
+
+        # Learned mode gradient-free update
+        if self.consolidation_mode == "learned" and self._last_wrote.item():
+            loss_improved = current_loss < self._last_loss.item()
+            if loss_improved:
+                if self._last_signal_was_pain.item():
+                    self.consolidation_w = self.consolidation_w + 0.01
+                else:
+                    self.consolidation_w = self.consolidation_w - 0.01
+
+        # Update survival scores based on last retrieval
+        self.update_survival(current_loss)
+
+        # Trigger logic (same as OuterModel)
+        surprise_threshold = running_avg > 0 and signal / running_avg > 0.01
+        wrote = False
+
+        write_kw: dict[str, Any] = {"per_sample_weights": per_sample_weights}
+        if bucket_id is not None:
+            write_kw["bucket_id"] = bucket_id
+
+        if self.trigger == "immediate":
+            if surprise_threshold:
+                self.write(h, **write_kw)
+                wrote = True
+        elif self.trigger == "resolution":
+            if surprise_threshold and not self._spike_seen:
+                self._spike_seen = True
+                self._pre_spike_loss = running_avg
+            if self._spike_seen:
+                if current_loss <= self._pre_spike_loss:
+                    self.write(h, **write_kw)
+                    wrote = True
+                    self._spike_seen = False
+        elif self.trigger == "windowed":
+            if surprise_threshold and not self._spike_seen:
+                self._spike_seen = True
+                self._steps_since_spike = 0
+            if self._spike_seen:
+                self._steps_since_spike += 1
+                if self._steps_since_spike >= self.trigger_window:
+                    self.write(h, **write_kw)
+                    wrote = True
+                    self._spike_seen = False
+
+        if self.consolidation_mode == "learned":
+            self._last_signal_was_pain = torch.tensor(is_pain)
+            self._last_loss = torch.tensor(current_loss)
+            self._last_wrote = torch.tensor(wrote)
+
+        self.loss_ema = self.ema_decay * self.loss_ema + (1 - self.ema_decay) * current_loss
+        return signal
