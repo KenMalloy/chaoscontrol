@@ -1,0 +1,118 @@
+"""WernickeLayer: typed compositional preprocessing with VQ/MoE routing."""
+from __future__ import annotations
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+from chaoscontrol.core import RMSNorm
+
+
+class WernickeLayer(nn.Module):
+    """Typed compositional preprocessing between byte embeddings and SSM recurrence.
+
+    Three stages:
+      1. Composition — causal 1D convolution composes raw bytes into higher-level units.
+      2. Typing — hard bucket assignment via VQ codebook or MoE top-1 routing
+         with straight-through estimator for gradients.
+      3. Refinement — per-bucket linear projection applied to each unit.
+
+    Returns (refined_output, bucket_ids, balance_loss).
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        k_max: int = 16,
+        window: int = 8,
+        router_type: str = "vq",
+        balance_weight: float = 0.01,
+    ) -> None:
+        super().__init__()
+        # Stage 1: composition via causal conv1d
+        self.compose_conv = nn.Conv1d(dim, dim, kernel_size=window, padding=window - 1, bias=False)
+        self.compose_norm = RMSNorm(dim)
+
+        # Stage 2: hard bucket assignment
+        self.router_type = router_type
+        if router_type == "vq":
+            self.codebook = nn.Parameter(torch.randn(k_max, dim) * 0.01)
+        elif router_type == "moe":
+            self.router = nn.Linear(dim, k_max, bias=False)
+        else:
+            raise ValueError(f"unsupported router_type: {router_type}")
+
+        # Stage 3: per-bucket refinement
+        self.bucket_projs = nn.ModuleList([
+            nn.Linear(dim, dim, bias=False) for _ in range(k_max)
+        ])
+
+        self.k_max = k_max
+        self.window = window
+        self.balance_weight = balance_weight
+
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Forward pass.
+
+        Args:
+            x: (batch, seq, dim) — raw byte embeddings.
+
+        Returns:
+            refined: (batch, seq, dim) — composed, typed, refined representations.
+            bucket_ids: (batch, seq) — integer bucket assignments.
+            balance_loss: scalar — penalizes uneven bucket usage.
+        """
+        batch, seq, dim = x.shape
+
+        # Stage 1: Composition via causal conv1d
+        # Conv1d expects (batch, channels, seq)
+        h = x.transpose(1, 2)  # (batch, dim, seq)
+        h = self.compose_conv(h)  # (batch, dim, seq + window - 1)
+        # Causal: slice off the last (window-1) positions to prevent future leakage
+        h = h[:, :, :seq]  # (batch, dim, seq)
+        h = h.transpose(1, 2)  # (batch, seq, dim)
+        h = self.compose_norm(h)
+
+        # Stage 2: Typing — hard bucket assignment
+        if self.router_type == "vq":
+            # Distances from each position to each codebook vector
+            # h: (batch, seq, dim), codebook: (k_max, dim)
+            # dists: (batch, seq, k_max)
+            dists = torch.cdist(h, self.codebook.unsqueeze(0).expand(batch, -1, -1))
+            # Hard assignment: nearest codebook vector
+            bucket_ids = dists.argmin(dim=-1)  # (batch, seq)
+            # Straight-through: forward uses hard one-hot, backward uses soft distances
+            one_hot = F.one_hot(bucket_ids, self.k_max).float()  # (batch, seq, k_max)
+            soft_weights = F.softmax(-dists, dim=-1)  # (batch, seq, k_max)
+            # Straight-through estimator
+            routing_weights = one_hot + soft_weights - soft_weights.detach()
+        elif self.router_type == "moe":
+            # Linear projection to k_max logits, top-1 selection
+            logits = self.router(h)  # (batch, seq, k_max)
+            bucket_ids = logits.argmax(dim=-1)  # (batch, seq)
+            one_hot = F.one_hot(bucket_ids, self.k_max).float()  # (batch, seq, k_max)
+            soft_weights = F.softmax(logits, dim=-1)  # (batch, seq, k_max)
+            # Straight-through estimator
+            routing_weights = one_hot + soft_weights - soft_weights.detach()
+        else:
+            raise ValueError(f"unsupported router_type: {self.router_type}")
+
+        # Balance loss: penalize uneven bucket usage
+        # Fraction of tokens assigned to each bucket
+        bucket_counts = one_hot.sum(dim=(0, 1))  # (k_max,)
+        bucket_frac = bucket_counts / bucket_counts.sum().clamp_min(1e-8)
+        # Uniform target: 1/k_max for each bucket
+        uniform = torch.ones_like(bucket_frac) / self.k_max
+        balance_loss = ((bucket_frac - uniform) ** 2).sum() * self.k_max
+
+        # Stage 3: Refinement — per-bucket projection via routing weights
+        # Compute all bucket projections and mix via routing weights
+        # Stack all projections: for each bucket, project h
+        # refined = sum over buckets of routing_weight_k * bucket_proj_k(h)
+        refined = torch.zeros_like(h)
+        for k in range(self.k_max):
+            proj_k = self.bucket_projs[k](h)  # (batch, seq, dim)
+            w_k = routing_weights[:, :, k].unsqueeze(-1)  # (batch, seq, 1)
+            refined = refined + w_k * proj_k
+
+        return refined, bucket_ids, balance_loss
