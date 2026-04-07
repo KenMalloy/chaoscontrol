@@ -91,9 +91,28 @@ def run_experiment(config_path: str, *, enwik8_path: str, budget_seconds: float 
     val_starts = build_lm_starts(int(val_tokens.numel()), cfg.seq_len, cfg.stride)
     eval_starts = choose_eval_starts(val_starts, batch_size=cfg.batch_size, eval_batches=cfg.eval_batches, seed=cfg.seed)
 
+    # Create tokenizer if configured
+    tokenizer = None
+    if cfg.tokenizer_type == "fixed_stride":
+        from chaoscontrol.tokenizer import FixedStrideTokenizer
+        tokenizer = FixedStrideTokenizer(
+            byte_dim=cfg.tokenizer_byte_dim,
+            token_dim=cfg.tokenizer_token_dim,
+            codebook_size=cfg.tokenizer_codebook_size,
+            stride=cfg.tokenizer_stride,
+            beta=cfg.tokenizer_beta,
+        ).to(device)
+        if device.type == "cuda":
+            tokenizer = tokenizer.to(dtype=param_dtype)
+        # Override vocab_size so the model's embedding and lm_head match codebook
+        cfg.vocab_size = cfg.tokenizer_codebook_size
+
     model = build_model(cfg, device, param_dtype)
-    params = sum(p.numel() for p in model.parameters())
-    print(f"Model: {cfg.model_type} | dim={cfg.model_dim} | params={params:,} | {model.artifact_bytes() if hasattr(model, 'artifact_bytes') else params*2:,} bytes")
+    model_params = sum(p.numel() for p in model.parameters())
+    tok_params = sum(p.numel() for p in tokenizer.parameters()) if tokenizer else 0
+    params = model_params + tok_params
+    tok_info = f" | tokenizer={cfg.tokenizer_type}(stride={cfg.tokenizer_stride}, K={cfg.tokenizer_codebook_size})" if tokenizer else ""
+    print(f"Model: {cfg.model_type} | dim={cfg.model_dim} | params={params:,} | {model.artifact_bytes() if hasattr(model, 'artifact_bytes') else params*2:,} bytes{tok_info}")
 
 
     train_result = train_chaoscontrol_for_budget(
@@ -117,6 +136,9 @@ def run_experiment(config_path: str, *, enwik8_path: str, budget_seconds: float 
         consolidation_write=cfg.consolidation_write,
         latent_persistence=cfg.latent_persistence,
         cfr_enabled=cfg.cfr_enabled,
+        tokenizer=tokenizer,
+        align_type=cfg.align_type,
+        align_weight=cfg.align_weight,
     )
 
     # Use the trained structured_proj (not a fresh random one)
@@ -136,6 +158,7 @@ def run_experiment(config_path: str, *, enwik8_path: str, budget_seconds: float 
         warmup_latent=cfg.warmup_latent,
         warmup_cold_start=cfg.warmup_cold_start,
         total_raw_bytes=total_raw_bytes,
+        tokenizer=tokenizer,
     )
 
     bpb_str = f"bpb={eval_result['bpb']:.4f}"

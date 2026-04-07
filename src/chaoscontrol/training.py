@@ -49,6 +49,9 @@ def train_chaoscontrol_for_budget(
     consolidation_write: str = "last",
     latent_persistence: bool = False,
     cfr_enabled: bool = False,
+    tokenizer: Any = None,
+    align_type: str = "none",
+    align_weight: float = 0.05,
 ) -> dict[str, Any]:
     """Train ChaosStudentLM for a time budget with optional criticality regularization."""
     # Set up structured projections if requested (before optimizer so its params are included)
@@ -63,6 +66,8 @@ def train_chaoscontrol_for_budget(
     all_params = list(model.parameters())
     if structured_proj is not None:
         all_params += list(structured_proj.parameters())
+    if tokenizer is not None:
+        all_params += list(tokenizer.parameters())
     optimizer = torch.optim.AdamW(all_params, lr=base_lr, weight_decay=weight_decay)
     rng = random.Random(seed)
     history: list[dict[str, float]] = []
@@ -97,6 +102,18 @@ def train_chaoscontrol_for_budget(
 
         batch_starts = [train_starts[rng.randrange(len(train_starts))] for _ in range(batch_size)]
         inputs, targets = batch_from_starts(train_tokens, batch_starts, seq_len, device)
+
+        # Tokenizer: convert raw byte inputs to VQ token IDs
+        tok_commit_loss = None
+        tok_recon_loss = None
+        if tokenizer is not None:
+            tok_out = tokenizer(inputs)
+            tok_commit_loss = tok_out["commit_loss"]
+            tok_recon_loss = tok_out["recon_loss"]
+            token_ids = tok_out["token_ids"]  # (batch, token_seq)
+            # Model input: token IDs; targets: shifted by 1 (predict next VQ token)
+            inputs = token_ids[:, :-1]
+            targets = token_ids[:, 1:]
 
         # Check metabolic gate: should we fork?
         surprise_ratio = abs(loss_ema - (history[-1]["loss"] if history else loss_ema)) / max(loss_ema, 1e-6) if history else 0.0
@@ -221,6 +238,33 @@ def train_chaoscontrol_for_budget(
             if "balance_loss" in out and model.wernicke is not None:
                 loss = loss + model.wernicke_balance_weight * out["balance_loss"]
 
+            # Tokenizer losses: commitment + reconstruction
+            if tok_commit_loss is not None:
+                loss = loss + tok_commit_loss
+            if tok_recon_loss is not None:
+                loss = loss + tok_recon_loss
+
+            # Codebook alignment loss (tokenizer <-> Wernicke)
+            if (
+                tokenizer is not None
+                and align_type != "none"
+                and getattr(model, "wernicke", None) is not None
+                and hasattr(model.wernicke, "codebook")
+            ):
+                from chaoscontrol.alignment import compute_alignment_loss
+                wernicke_entries = model.wernicke.codebook  # (K_wer, dim)
+                align_kwargs: dict[str, Any] = {}
+                if align_type == "diversity":
+                    align_kwargs["projected_tok_entries"] = tokenizer.codebook
+                    align_kwargs["wernicke_entries"] = wernicke_entries
+                elif align_type in ("contrastive", "distillation") and "bucket_ids" in out:
+                    align_kwargs["projected_tok_embeds"] = out["hidden"]
+                    align_kwargs["wernicke_entries"] = wernicke_entries
+                    align_kwargs["wernicke_assignments"] = out["bucket_ids"]
+                if align_kwargs:
+                    a_loss = compute_alignment_loss(align_type, **align_kwargs)
+                    loss = loss + align_weight * a_loss
+
         loss.backward()
         if grad_clip_norm > 0.0:
             torch.nn.utils.clip_grad_norm_(all_params, grad_clip_norm)
@@ -233,6 +277,10 @@ def train_chaoscontrol_for_budget(
         if use_fork:
             pre_fork_loss = ce_val_prev  # save loss BEFORE this fork for next step's comparison
         step_record: dict[str, Any] = {"step": float(steps), "loss": ce_val, "forked": use_fork}
+        if tok_commit_loss is not None:
+            step_record["commit_loss"] = float(tok_commit_loss.detach().cpu())
+        if tok_recon_loss is not None:
+            step_record["recon_loss"] = float(tok_recon_loss.detach().cpu())
         if metabolic_gate:
             step_record["threshold"] = current_threshold
             step_record["surprise_ratio"] = surprise_ratio

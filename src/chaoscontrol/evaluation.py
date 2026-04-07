@@ -47,6 +47,7 @@ def evaluate_chaoscontrol_bpb(
     warmup_latent: bool = False,
     warmup_cold_start: bool = False,
     total_raw_bytes: int | None = None,
+    tokenizer: Any = None,
 ) -> dict[str, float]:
     """Evaluate ChaosStudentLM, returning loss and bits-per-byte.
 
@@ -58,6 +59,7 @@ def evaluate_chaoscontrol_bpb(
     total_loss = 0.0
     total_loss_gated = 0.0
     total_tokens = 0
+    total_raw_bytes_seen = 0  # raw byte count for tokenizer bpb
     vocab_size = model.vocab_size
 
     # Save outer model state before eval warmup so memory writes don't persist
@@ -117,6 +119,16 @@ def evaluate_chaoscontrol_bpb(
             for idx in range(0, len(eval_starts), batch_size):
                 batch_starts = eval_starts[idx : idx + batch_size]
                 inputs, targets = batch_from_starts(tokens, batch_starts, seq_len, device)
+
+                # Tokenizer: convert raw bytes to VQ token IDs
+                raw_bytes_in_batch = int(inputs.numel())
+                if tokenizer is not None:
+                    tok_out = tokenizer(inputs)
+                    token_ids = tok_out["token_ids"]  # (batch, token_seq)
+                    inputs = token_ids[:, :-1]
+                    targets = token_ids[:, 1:]
+                    total_raw_bytes_seen += raw_bytes_in_batch
+
                 autocast_dtype = next(model.parameters()).dtype if device.type == "cuda" else torch.float32
                 with maybe_autocast(device, autocast_dtype):
                     # Standard deterministic eval
@@ -235,9 +247,14 @@ def evaluate_chaoscontrol_bpb(
         if was_training:
             model.train()
     mean_loss = total_loss / max(total_tokens, 1)
+    # When tokenizer is active, bpb denominator is raw bytes, not VQ tokens
+    if tokenizer is not None and total_raw_bytes_seen > 0:
+        bpb = compute_bpb(total_loss, total_raw_bytes_seen)
+    else:
+        bpb = float(mean_loss / math.log(2.0))
     result = {
         "loss": float(mean_loss),
-        "bpb": float(mean_loss / math.log(2.0)),  # per-token bpb
+        "bpb": bpb,
         "tokens": float(total_tokens),
     }
     # When raw byte count is provided, add the proper tokenizer-agnostic bpb

@@ -95,6 +95,18 @@ class ChaosControlConfig:
     dynamic_crit_per_layer: bool = False
     compression_selection: str = "survival"  # "survival" or "random" — controls slot merge ordering
 
+    # Tokenizer configuration
+    tokenizer_type: str = "none"  # "none", "fixed_stride", (future: "learned_boundary", "attn_pool")
+    tokenizer_stride: int = 4
+    tokenizer_byte_dim: int = 64
+    tokenizer_token_dim: int = 128
+    tokenizer_codebook_size: int = 1024
+    tokenizer_beta: float = 0.25  # VQ commitment loss weight
+
+    # Codebook alignment (tokenizer <-> Wernicke)
+    align_type: str = "none"  # "none", "contrastive", "diversity", "distillation"
+    align_weight: float = 0.05
+
     # Data source configuration (additive — enwik8 remains the default)
     data_path: str = ""  # path to FineWeb data directory; empty = use enwik8_path
     data_format: str = "enwik8"  # "enwik8" or "fineweb_bytes"

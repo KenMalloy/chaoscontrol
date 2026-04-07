@@ -225,5 +225,93 @@ class TestFullStackIntegration(unittest.TestCase):
         )
 
 
+    def test_tokenizer_training_integration(self):
+        """FixedStrideTokenizer + ChaosStudentLM: 5 training steps,
+        verify loss decreases and commit_loss/recon_loss are logged."""
+        from chaoscontrol.tokenizer import FixedStrideTokenizer
+
+        torch.manual_seed(42)
+        codebook_size = 64
+        stride = 4
+        byte_dim = 16
+        token_dim = 32
+        model_dim = 32
+
+        tokenizer = FixedStrideTokenizer(
+            byte_dim=byte_dim,
+            token_dim=token_dim,
+            codebook_size=codebook_size,
+            stride=stride,
+            beta=0.25,
+        )
+
+        # Model vocab_size = codebook_size (matches VQ token IDs)
+        model = ChaosStudentLM(
+            vocab_size=codebook_size, dim=model_dim, num_layers=2, ff_mult=2,
+            a_mode="diag",
+        )
+        device = torch.device("cpu")
+
+        # Fake byte tokens (0-255)
+        tokens = torch.randint(0, 256, (2000,))
+        seq_len = 64  # must be divisible by stride for clean token sequences
+        train_starts = build_lm_starts(1800, seq_len=seq_len, stride=32)
+        eval_starts_list = build_lm_starts(200, seq_len=seq_len, stride=32)
+        eval_starts = choose_eval_starts(
+            eval_starts_list, batch_size=2, eval_batches=2, seed=42,
+        )
+
+        result = train_chaoscontrol_for_budget(
+            model,
+            train_tokens=tokens[:1800],
+            train_starts=train_starts,
+            seq_len=seq_len,
+            batch_size=2,
+            device=device,
+            param_dtype=torch.float32,
+            budget_seconds=5.0,
+            base_lr=1e-3,
+            weight_decay=0.01,
+            grad_clip_norm=1.0,
+            seed=42,
+            tokenizer=tokenizer,
+        )
+
+        assert result["steps"] >= 5, f"Expected >= 5 steps, got {result['steps']}"
+
+        # Check commit_loss and recon_loss are logged
+        for h in result["history"]:
+            assert "commit_loss" in h, f"commit_loss missing at step {h['step']}"
+            assert "recon_loss" in h, f"recon_loss missing at step {h['step']}"
+            assert h["commit_loss"] == h["commit_loss"], f"NaN commit_loss at step {h['step']}"
+            assert h["recon_loss"] == h["recon_loss"], f"NaN recon_loss at step {h['step']}"
+
+        # Loss should decrease over training
+        first_loss = result["history"][0]["loss"]
+        last_loss = result["history"][-1]["loss"]
+        assert last_loss < first_loss, (
+            f"Loss did not decrease: first={first_loss:.4f}, last={last_loss:.4f}"
+        )
+
+        # No NaN in loss history
+        for h in result["history"]:
+            assert h["loss"] == h["loss"], f"NaN loss at step {h['step']}"
+
+        # Eval with tokenizer
+        from chaoscontrol.evaluation import evaluate_chaoscontrol_bpb as eval_bpb
+        eval_result = eval_bpb(
+            model,
+            tokens=tokens[1800:],
+            eval_starts=eval_starts,
+            batch_size=2,
+            seq_len=seq_len,
+            device=device,
+            tokenizer=tokenizer,
+        )
+        assert "bpb" in eval_result
+        assert eval_result["bpb"] == eval_result["bpb"], "NaN in eval bpb"
+        assert eval_result["bpb"] > 0
+
+
 if __name__ == "__main__":
     unittest.main()
