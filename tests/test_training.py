@@ -120,5 +120,16 @@ class TestCLI(unittest.TestCase):
         assert cfg.crit_target_coupling == 0.92
 
 
+class TestLatentReactivationWithoutBucket(unittest.TestCase):
+    def test_latent_reactivation_without_bucket(self) -> None:
+        from chaoscontrol.memory import MultiSlotOuterModel
+        m = MultiSlotOuterModel(model_dim=16, outer_dim=8, max_slots=4, compress_ratio=2)
+        for _ in range(20):
+            m.write(torch.randn(1, 16), bucket_id=0)
+        if m._latent_traces:
+            result = m.try_reactivate(bucket_id=None, surprise=10.0)
+            assert result is True  # Should match any trace
+
+
 if __name__ == "__main__":
     unittest.main()

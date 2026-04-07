@@ -313,8 +313,14 @@ def train_chaoscontrol_for_budget(
 
             # Latent persistence: reactivate compressed slot traces on high surprise
             if latent_persistence and hasattr(model.outer_model, 'try_reactivate'):
-                if dominant_bucket is not None and surprise_ratio_for_latent > current_threshold:
-                    reactivated = model.outer_model.try_reactivate(bucket_id=dominant_bucket, surprise=surprise_ratio_for_latent)
+                if surprise_ratio_for_latent > current_threshold:
+                    if dominant_bucket is not None:
+                        reactivated = model.outer_model.try_reactivate(
+                            bucket_id=dominant_bucket, surprise=surprise_ratio_for_latent)
+                    else:
+                        # No bucket info — try reactivating any latent trace
+                        reactivated = model.outer_model.try_reactivate(
+                            bucket_id=None, surprise=surprise_ratio_for_latent)
                     if reactivated:
                         step_record["latent_reactivated"] = True
 
@@ -381,15 +387,18 @@ def train_chaoscontrol_for_budget(
             and hasattr(model.outer_model, "_slots")
             and model.outer_model._slots
         ):
-            if getattr(model, "typed_consolidation", False) and dominant_bucket is not None:
-                # Type-aware: only consolidate slots matching dominant bucket
-                matching = [
-                    s for s, b in zip(model.outer_model._slots, model.outer_model._slot_buckets)
-                    if b == dominant_bucket
-                ]
-                slots_for_consolidation = matching[-5:] if matching else model.outer_model._slots[-5:]
+            if getattr(model, "typed_consolidation", False):
+                if dominant_bucket is not None:
+                    # Type-aware: filter by bucket
+                    matching = [
+                        s for s, b in zip(model.outer_model._slots, model.outer_model._slot_buckets)
+                        if b == dominant_bucket
+                    ]
+                    slots_for_consolidation = matching[-5:] if matching else model.outer_model._slots[-5:]
+                else:
+                    # No bucket info: fall back to untyped
+                    slots_for_consolidation = model.outer_model._slots[-5:]
             else:
-                # Untyped: use all recent slots
                 slots_for_consolidation = model.outer_model._slots[-5:]
             recent_slots = torch.cat(slots_for_consolidation, dim=0)
             recent_decoded = model.outer_model.decoder(recent_slots)

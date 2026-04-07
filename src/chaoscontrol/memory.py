@@ -498,11 +498,12 @@ class MultiSlotOuterModel(nn.Module):
         while len(self._latent_traces) > self.max_slots:
             self._latent_traces.pop(0)
 
-    def try_reactivate(self, bucket_id: int, surprise: float, reactivation_threshold: float = 1.0) -> bool:
+    def try_reactivate(self, bucket_id: int | None, surprise: float, reactivation_threshold: float = 1.0) -> bool:
         """Attempt to reactivate a latent trace matching the given bucket.
 
         Returns True if a trace was reactivated (added back as a slot), False otherwise.
         Only fires when surprise exceeds threshold AND a matching latent trace exists.
+        When bucket_id is None, matches any latent trace (untyped fallback).
         Reactivated memories are degraded (Gaussian noise added) reflecting the
         reconstructive nature of memory retrieval — consolidated memories are
         rebuilt, not replayed.
@@ -510,7 +511,7 @@ class MultiSlotOuterModel(nn.Module):
         if surprise < reactivation_threshold:
             return False
         for i, trace in enumerate(self._latent_traces):
-            if trace["bucket_id"] == bucket_id:
+            if bucket_id is None or trace["bucket_id"] == bucket_id:
                 # Reactivate with degradation — reconstructed memories are imperfect
                 reactivated_slot = trace["centroid_contrib"].clone()
                 noise = torch.randn_like(reactivated_slot) * 0.1  # reconstruction noise
