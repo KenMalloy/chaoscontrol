@@ -107,6 +107,11 @@ def run_experiment(config_path: str, *, enwik8_path: str, budget_seconds: float 
         metabolic_noise_std=cfg.metabolic_noise_std,
         generation_mode=cfg.generation_mode,
         metabolic_mode=cfg.metabolic_mode,
+        mcts_horizon=cfg.mcts_horizon,
+        mcts_ucb_c=cfg.mcts_ucb_c,
+        consolidation_write=cfg.consolidation_write,
+        latent_persistence=cfg.latent_persistence,
+        cfr_enabled=cfg.cfr_enabled,
     )
 
     # Use the trained structured_proj (not a fresh random one)
@@ -118,6 +123,7 @@ def run_experiment(config_path: str, *, enwik8_path: str, budget_seconds: float 
         metabolic_gate=cfg.metabolic_gate, metabolic_k=cfg.metabolic_k,
         metabolic_score=cfg.metabolic_score, metabolic_noise_std=cfg.metabolic_noise_std,
         generation_mode=cfg.generation_mode, structured_proj=structured_proj,
+        warmup=cfg.eval_warmup,
     )
 
     bpb_str = f"bpb={eval_result['bpb']:.4f}"

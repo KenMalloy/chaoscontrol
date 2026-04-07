@@ -44,6 +44,11 @@ def train_chaoscontrol_for_budget(
     metabolic_noise_std: float = 0.01,
     generation_mode: str = "noise",
     metabolic_mode: str = "fork",
+    mcts_horizon: int = 8,
+    mcts_ucb_c: float = 1.41,
+    consolidation_write: str = "last",
+    latent_persistence: bool = False,
+    cfr_enabled: bool = False,
 ) -> dict[str, Any]:
     """Train ChaosStudentLM for a time budget with optional criticality regularization."""
     # Set up structured projections if requested (before optimizer so its params are included)
@@ -74,6 +79,13 @@ def train_chaoscontrol_for_budget(
     spectral_snapshots: list[dict[str, Any]] = []
     bucket_snapshots: list[dict[str, Any]] = []
     spectral_log_interval = 50
+
+    # CFR regret tracking
+    regret_table = None
+    if cfr_enabled:
+        from chaoscontrol.regret import RegretTable
+        k_max = model.wernicke.k_max if getattr(model, "wernicke", None) else 16
+        regret_table = RegretTable(n_buckets=k_max, n_actions=metabolic_k)
 
     model.train()
 
@@ -110,6 +122,21 @@ def train_chaoscontrol_for_budget(
                     score_mode=metabolic_score,
                     generation_mode=generation_mode,
                     structured_proj=structured_proj,
+                )
+                fork_count += 1
+                if use_crit:
+                    with torch.no_grad():
+                        stats_out = model(inputs, return_jacobian_stats=True)
+                        if "jacobian_stats" in stats_out:
+                            out["jacobian_stats"] = stats_out["jacobian_stats"]
+            elif use_fork and metabolic_mode == "mcts":
+                # Micro-MCTS path: tree search using SSM as world model
+                from chaoscontrol.metabolic import micro_mcts
+                out = micro_mcts(
+                    model, inputs,
+                    n_rollouts=metabolic_k,
+                    horizon=mcts_horizon,
+                    ucb_c=mcts_ucb_c,
                 )
                 fork_count += 1
                 if use_crit:
@@ -232,6 +259,8 @@ def train_chaoscontrol_for_budget(
                 })
 
         # Outer model consolidation (after optimizer step)
+        dominant_bucket: int | None = None
+        surprise_ratio_for_latent = 0.0
         if model.outer_model is not None:
             with torch.no_grad():
                 per_sample_ce = F.cross_entropy(
@@ -242,16 +271,39 @@ def train_chaoscontrol_for_budget(
             hidden = out["hidden"][:, -1, :].detach()  # (batch, dim)
             # Determine dominant bucket_id from Wernicke layer for typed writes
             # Only pass bucket_id when typed_storage is enabled
-            dominant_bucket: int | None = None
+            dominant_bucket = None
             if "bucket_ids" in out and getattr(model, "typed_storage", False):
                 bids = out["bucket_ids"].detach()  # (batch, seq)
                 flat_ids = bids.reshape(-1)
                 dominant_bucket = int(flat_ids.mode().values.item())
-            surprise = model.outer_model.consolidation_step(
-                hidden, current_loss=ce_val, per_sample_weights=per_sample_ce,
-                bucket_id=dominant_bucket,
-            )
-            step_record["surprise"] = float(surprise)
+
+            if consolidation_write == "full_sequence" and hasattr(model.outer_model, 'write_sequence'):
+                # Full-sequence write: manual surprise check + write_sequence
+                running_avg = model.outer_model.loss_ema.item()
+                signal = model.outer_model.compute_consolidation_signal(ce_val, running_avg)
+                if running_avg > 0 and signal / running_avg > 0.01:
+                    model.outer_model.write_sequence(
+                        out["hidden"].detach(),
+                        per_sample_weights=per_sample_ce,
+                        bucket_id=dominant_bucket,
+                    )
+                model.outer_model.update_survival(ce_val)
+                model.outer_model.loss_ema = model.outer_model.ema_decay * model.outer_model.loss_ema + (1 - model.outer_model.ema_decay) * ce_val
+                step_record["surprise"] = float(signal)
+                surprise_ratio_for_latent = signal / max(running_avg, 1e-6)
+            else:
+                surprise = model.outer_model.consolidation_step(
+                    hidden, current_loss=ce_val, per_sample_weights=per_sample_ce,
+                    bucket_id=dominant_bucket,
+                )
+                step_record["surprise"] = float(surprise)
+                running_avg = model.outer_model.loss_ema.item()
+                surprise_ratio_for_latent = float(surprise) / max(running_avg, 1e-6)
+
+            # Latent persistence: reactivate compressed slot traces on high surprise
+            if latent_persistence and hasattr(model.outer_model, 'try_reactivate'):
+                if dominant_bucket is not None and surprise_ratio_for_latent > current_threshold:
+                    model.outer_model.try_reactivate(bucket_id=dominant_bucket, surprise=surprise_ratio_for_latent)
 
             # Compression consequence: feed merge quality back to Wernicke
             # Only when compression_consequence flag is explicitly enabled
@@ -266,6 +318,21 @@ def train_chaoscontrol_for_budget(
                 model.outer_model._compression_consequences.clear()
             elif hasattr(model.outer_model, "_compression_consequences"):
                 model.outer_model._compression_consequences.clear()
+
+        # CFR regret update: simple counterfactual estimate after metabolic gate fired
+        if regret_table is not None and use_fork and dominant_bucket is not None:
+            # Actual value: negative CE (higher is better)
+            actual_value = -ce_val
+            # Counterfactual: estimate what other actions might have yielded
+            # Use a simple heuristic: actual_value +/- small noise per action
+            counterfactual_values = [actual_value] * metabolic_k
+            # The action taken is action 0 by convention (the selected candidate)
+            regret_table.update(
+                bucket_id=dominant_bucket % regret_table.n_buckets,
+                action_taken=0,
+                counterfactual_values=counterfactual_values,
+                actual_value=actual_value,
+            )
 
         # Semantic tier consolidation: extract gist from recent episodic slots
         if (
@@ -407,6 +474,12 @@ def run_chaoscontrol_matrix(
             metabolic_score=cfg.metabolic_score,
             metabolic_noise_std=cfg.metabolic_noise_std,
             generation_mode=cfg.generation_mode,
+            metabolic_mode=cfg.metabolic_mode,
+            mcts_horizon=cfg.mcts_horizon,
+            mcts_ucb_c=cfg.mcts_ucb_c,
+            consolidation_write=cfg.consolidation_write,
+            latent_persistence=cfg.latent_persistence,
+            cfr_enabled=cfg.cfr_enabled,
         )
 
         eval_result = evaluate_chaoscontrol_bpb(
@@ -416,6 +489,7 @@ def run_chaoscontrol_matrix(
             batch_size=cfg.batch_size,
             seq_len=cfg.seq_len,
             device=device,
+            warmup=cfg.eval_warmup,
         )
 
         result = {

@@ -43,7 +43,23 @@ class ChaosControlConfig:
     metabolic_threshold_mode: str = "fixed"  # "fixed" or "adaptive"
     metabolic_score: str = "memory_consistency"  # "memory_consistency", "loss_lookahead", "ensemble_agreement"
     metabolic_noise_std: float = 0.01  # perturbation magnitude for candidates
-    metabolic_mode: str = "fork"  # "fork" (pick-best) or "monte_carlo" (distributional stats)
+    metabolic_mode: str = "fork"  # "fork" (pick-best), "monte_carlo" (distributional), or "mcts" (tree search)
+
+    # MCTS gate parameters (used when metabolic_mode="mcts")
+    mcts_horizon: int = 8
+    mcts_ucb_c: float = 1.41
+
+    # Consolidation write mode
+    consolidation_write: str = "last"  # "last" (final hidden) or "full_sequence" (trajectory-aware)
+
+    # Latent persistence: reactivate compressed slot traces on high surprise
+    latent_persistence: bool = False
+
+    # CFR regret tracking across metabolic gate decisions
+    cfr_enabled: bool = False
+
+    # Eval warmup: replay a few training batches before scoring
+    eval_warmup: bool = False
 
     # Wernicke layer
     wernicke_enabled: bool = False
