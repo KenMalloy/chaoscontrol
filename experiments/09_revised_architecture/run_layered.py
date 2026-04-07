@@ -118,7 +118,11 @@ def extract_gate_settings(config_path: Path) -> dict:
         "metabolic_threshold", "metabolic_threshold_mode",
         "mcts_horizon", "mcts_ucb_c",
     ]
-    return {k: cfg[k] for k in gate_keys if k in cfg}
+    settings = {k: cfg[k] for k in gate_keys if k in cfg}
+    # Explicit no-gate when baseline wins
+    if "metabolic_gate" not in settings:
+        settings["metabolic_gate"] = False
+    return settings
 
 
 def write_yaml(path: Path, data: dict):
@@ -201,6 +205,11 @@ def generate_l3_configs(gate_settings: dict, mem_settings: dict) -> list[Path]:
             "wernicke_k_max": 16,
             "cfr_enabled": True,
             "typed_storage": True,
+            # CFR needs the gate to generate counterfactuals
+            "metabolic_gate": True,
+            "metabolic_mode": base.get("metabolic_mode", "fork"),
+            "metabolic_k": base.get("metabolic_k", 4),
+            "metabolic_threshold": base.get("metabolic_threshold", 0.1),
         },
         "L3_wernicke_cfr_consequence": {
             **base,
@@ -210,6 +219,11 @@ def generate_l3_configs(gate_settings: dict, mem_settings: dict) -> list[Path]:
             "cfr_enabled": True,
             "typed_storage": True,
             "compression_consequence": True,
+            # CFR needs the gate to generate counterfactuals
+            "metabolic_gate": True,
+            "metabolic_mode": base.get("metabolic_mode", "fork"),
+            "metabolic_k": base.get("metabolic_k", 4),
+            "metabolic_threshold": base.get("metabolic_threshold", 0.1),
         },
     }
     paths = []
