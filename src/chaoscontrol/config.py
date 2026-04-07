@@ -40,7 +40,7 @@ class ChaosControlConfig:
     metabolic_gate: bool = False
     metabolic_k: int = 4  # number of candidate rollouts
     metabolic_threshold: float = 0.1  # surprise/running_avg threshold to trigger fork
-    metabolic_threshold_mode: str = "fixed"  # "fixed" or "adaptive"
+    metabolic_threshold_mode: str = "fixed"  # "fixed", "adaptive", or "random"
     metabolic_score: str = "memory_consistency"  # "memory_consistency", "loss_lookahead", "ensemble_agreement"
     metabolic_noise_std: float = 0.01  # perturbation magnitude for candidates
     metabolic_mode: str = "fork"  # "fork" (pick-best), "monte_carlo" (distributional), or "mcts" (tree search)

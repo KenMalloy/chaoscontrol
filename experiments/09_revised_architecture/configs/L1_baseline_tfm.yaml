@@ -1,0 +1,5 @@
+# Layer 1: Transformer baseline
+model_type: transformer
+model_dim: 128
+num_layers: 4
+a_mode: diag

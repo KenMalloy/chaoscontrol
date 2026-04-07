@@ -99,7 +99,10 @@ def train_chaoscontrol_for_budget(
 
         # Check metabolic gate: should we fork?
         surprise_ratio = abs(loss_ema - (history[-1]["loss"] if history else loss_ema)) / max(loss_ema, 1e-6) if history else 0.0
-        use_fork = metabolic_gate and surprise_ratio > current_threshold
+        if metabolic_threshold_mode == "random":
+            use_fork = metabolic_gate and (rng.random() < metabolic_threshold)
+        else:
+            use_fork = metabolic_gate and surprise_ratio > current_threshold
 
         # Adaptive threshold: compare current loss against the loss BEFORE
         # the last fork. If loss improved since then, fork helped -- lower
@@ -303,7 +306,9 @@ def train_chaoscontrol_for_budget(
             # Latent persistence: reactivate compressed slot traces on high surprise
             if latent_persistence and hasattr(model.outer_model, 'try_reactivate'):
                 if dominant_bucket is not None and surprise_ratio_for_latent > current_threshold:
-                    model.outer_model.try_reactivate(bucket_id=dominant_bucket, surprise=surprise_ratio_for_latent)
+                    reactivated = model.outer_model.try_reactivate(bucket_id=dominant_bucket, surprise=surprise_ratio_for_latent)
+                    if reactivated:
+                        step_record["latent_reactivated"] = True
 
             # Compression consequence: feed merge quality back to Wernicke
             # Only when compression_consequence flag is explicitly enabled
@@ -585,7 +590,7 @@ def parse_chaoscontrol_args(argv: list[str] | None = None) -> argparse.Namespace
     p.add_argument("--metabolic-gate", action="store_true", default=False)
     p.add_argument("--metabolic-k", type=int, default=4)
     p.add_argument("--metabolic-threshold", type=float, default=0.1)
-    p.add_argument("--metabolic-threshold-mode", default="fixed", choices=["fixed", "adaptive"])
+    p.add_argument("--metabolic-threshold-mode", default="fixed", choices=["fixed", "adaptive", "random"])
     p.add_argument("--metabolic-score", default="memory_consistency",
                     choices=["memory_consistency", "loss_lookahead", "ensemble_agreement"])
     p.add_argument("--metabolic-noise-std", type=float, default=0.01)

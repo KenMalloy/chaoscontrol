@@ -1,0 +1,5 @@
+# Layer 1: SSM baseline (no metabolic gate)
+model_type: ssm
+model_dim: 128
+num_layers: 4
+a_mode: diag

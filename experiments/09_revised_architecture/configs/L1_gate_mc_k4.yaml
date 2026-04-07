@@ -1,0 +1,10 @@
+# Layer 1: Monte Carlo gate, k=4
+model_type: ssm
+model_dim: 128
+num_layers: 4
+a_mode: diag
+metabolic_gate: true
+metabolic_k: 4
+metabolic_mode: monte_carlo
+metabolic_threshold: 0.1
+metabolic_threshold_mode: fixed
