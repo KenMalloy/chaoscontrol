@@ -1,0 +1,2 @@
+model_type: ssm
+eval_warmup: false

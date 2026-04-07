@@ -1,0 +1,5 @@
+model_type: ssm
+eval_warmup: true
+warmup_write_mode: full_sequence
+warmup_latent: true
+warmup_cold_start: false

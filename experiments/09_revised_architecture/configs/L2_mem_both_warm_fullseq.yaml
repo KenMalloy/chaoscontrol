@@ -1,0 +1,12 @@
+model_dim: 128
+num_layers: 4
+a_mode: diag
+model_type: ssm
+metabolic_gate: false
+outer_model_dim: 64
+outer_model_type: multislot
+semantic_tier_bases: 8
+eval_warmup: true
+consolidation_write: full_sequence
+latent_persistence: true
+typed_consolidation: true

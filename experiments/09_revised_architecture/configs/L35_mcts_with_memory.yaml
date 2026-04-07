@@ -1,0 +1,17 @@
+model_dim: 128
+num_layers: 4
+a_mode: diag
+model_type: ssm
+metabolic_gate: true
+metabolic_k: 4
+metabolic_mode: mcts
+mcts_horizon: 8
+metabolic_threshold: 0.1
+metabolic_threshold_mode: fixed
+outer_model_dim: 64
+outer_model_type: multislot
+semantic_tier_bases: 8
+eval_warmup: true
+consolidation_write: full_sequence
+latent_persistence: true
+typed_consolidation: true

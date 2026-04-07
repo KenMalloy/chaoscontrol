@@ -1,0 +1,9 @@
+a_mode: full
+rich_b_mode: hub
+outer_model_dim: 64
+outer_model_type: multislot
+wernicke_enabled: true
+wernicke_router: moe
+wernicke_k_max: 16
+model_dim: 128
+num_layers: 4

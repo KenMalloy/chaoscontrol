@@ -1,0 +1,12 @@
+a_mode: full
+rich_b_mode: hub
+outer_model_dim: 64
+metabolic_gate: true
+metabolic_k: 4
+metabolic_threshold: 0.1
+metabolic_threshold_mode: fixed
+metabolic_score: memory_consistency
+metabolic_noise_std: 0.002
+generation_mode: noise
+model_dim: 128
+num_layers: 4

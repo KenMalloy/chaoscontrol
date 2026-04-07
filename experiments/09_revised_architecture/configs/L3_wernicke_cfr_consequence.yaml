@@ -1,0 +1,14 @@
+model_dim: 128
+num_layers: 4
+a_mode: diag
+model_type: ssm
+metabolic_gate: true
+wernicke_enabled: true
+wernicke_router: moe
+wernicke_k_max: 16
+cfr_enabled: true
+typed_storage: true
+compression_consequence: true
+metabolic_mode: fork
+metabolic_k: 4
+metabolic_threshold: 0.1

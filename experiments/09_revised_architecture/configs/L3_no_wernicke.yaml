@@ -1,0 +1,5 @@
+model_dim: 128
+num_layers: 4
+a_mode: diag
+model_type: ssm
+metabolic_gate: false

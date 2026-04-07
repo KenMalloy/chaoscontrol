@@ -1,4 +1,0 @@
-a_mode: full
-crit_reg_alpha: 0.0
-model_dim: 128
-num_layers: 4

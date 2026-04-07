@@ -1,0 +1,14 @@
+a_mode: full
+rich_b_mode: hub
+outer_model_dim: 64
+outer_model_type: multislot
+wernicke_enabled: true
+wernicke_router: vq
+wernicke_k_max: 16
+metabolic_gate: true
+metabolic_k: 4
+metabolic_threshold: 0.1
+metabolic_threshold_mode: fixed
+metabolic_score: memory_consistency
+model_dim: 128
+num_layers: 4

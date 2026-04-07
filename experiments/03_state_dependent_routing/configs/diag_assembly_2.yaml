@@ -1,5 +1,0 @@
-a_mode: diag
-rich_b_mode: assembly
-rich_b_settling_steps: 2
-model_dim: 128
-num_layers: 4

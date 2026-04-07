@@ -1,62 +1,90 @@
 # ChaosControl
 
-**An SSM built to mirror how the mind processes language.**
+**A biologically-inspired SSM for the OpenAI Parameter Golf competition.**
+
+16MB artifact. FineWeb validation. Bits-per-byte.
 
 ## Thesis
 
-A state-space model designed from biological principles — typed compositional preprocessing, episodic and semantic memory with surprise-driven consolidation, near-critical dynamics, and metabolically-gated generation — outperforms both vanilla SSMs and transformer-patched SSMs on language modeling.
+A state-space model designed from biological principles — learned tokenization, typed composition, episodic/semantic memory with surprise-driven consolidation, metabolic gating with MCTS planning, and counterfactual regret tracking — can match or beat transformers on language modeling while offering O(d) inference and fixed-size state.
+
+## Architecture
+
+```
+raw bytes (256)
+  -> FixedStrideTokenizer (Stage 0: bytes -> learned VQ tokens)
+  -> Wernicke (Stage 1: tokens -> typed semantic units)
+  -> SSM recurrence (working memory, diag/paired/full A-modes)
+  -> Metabolic gate (System 2: fork/MC/MCTS on surprise)
+  -> Memory tiers (episodic -> semantic -> latent, demand-driven compression)
+  -> CFR regret tracking (exploration bias via counterfactual lookahead)
+```
 
 ## Components
 
-| Component | Brain analogy | What it does |
+| Component | Analogy | What it does |
 |---|---|---|
-| **Critical dynamics** | Cortical criticality | A matrix parameterized for near-critical operation; perturbations propagate at all scales |
-| **State-dependent routing** | Distributed semantic network | Input coupling B(x,h) depends on state; distributed sub-networks with lateral settling |
-| **Episodic memory** | Hippocampal consolidation | Multi-slot VRAM memory with cue-dependent retrieval, surprise-driven writes, survival scoring |
-| **Semantic memory** | Neocortical knowledge | Always-on background bias extracted from episodic experience over time |
-| **Typed composition** | Wernicke's area | Composes bytes into units, assigns type buckets, routes to typed memory banks |
-| **Metabolic gate** | Quantum navigational faculty | Generation+selection fork on high-surprise tokens; structured projections choose the question |
+| **Learned tokenizer** | Perceptual segmentation | Fixed-stride causal conv + VQ codebook; bytes -> tokens |
+| **Wernicke layer** | Typed composition | VQ/MoE routing into semantic buckets |
+| **SSM core** | Working memory | State-space recurrence with critical dynamics |
+| **Metabolic gate** | System 2 reasoning | MCTS/fork/MC search on high-surprise tokens |
+| **Episodic memory** | Hippocampal consolidation | Multi-slot memory with surprise-driven writes |
+| **Semantic memory** | Neocortical knowledge | Background bias extracted from episodes |
+| **Latent persistence** | Memory reactivation | Compressed traces reactivated on surprise |
+| **CFR tracking** | Exploration policy | Counterfactual regret minimization over gate decisions |
 
 ## Quick start
 
 ```bash
-# Single experiment
-PYTHONPATH=src .venv/bin/python -m chaoscontrol.runner \
-    --config experiments/01_baseline/configs/ssm_small.yaml \
-    --enwik8-path /path/to/enwik8 \
-    --budget 300
+# Experiment 09: layered ablation (L0 tokenizer through L6 inference adaptation)
+bash experiments/09_revised_architecture/run.sh /path/to/enwik8 --budget 150
 
-# Full suite (~7 hours, single GPU)
-bash run_all.sh /path/to/enwik8 --budget 300
+# With FineWeb data
+bash experiments/09_revised_architecture/run.sh /path/to/enwik8 \
+    --budget 150 --data-path /path/to/fineweb --data-format fineweb_bytes
+
+# Tests
+PYTHONPATH=src .venv/bin/python -m pytest tests/ -q
 ```
 
 ## Experiments
 
-| # | Name | Configs | Tests |
+| Experiment | Layers | Configs | What it tests |
 |---|---|---|---|
-| 01 | Baseline | 6 | SSM floor, transformer ceiling |
-| 02 | Critical dynamics | 7 | A parameterization, oscillations, target sweep |
-| 03 | State-dependent routing | 10 | NN vs distributed, topology comparison |
-| 04 | Long-term memory | 10 | Episodic, semantic, consolidation, two-tier |
-| 05 | Typed composition | 10 | Wernicke layer, VQ vs MoE, compression-consequence |
-| 06 | Metabolic gate | 11 | Scoring, threshold, structured projections |
-| 07 | Full system | 10 | Synergy test, ablations, scaling |
-| 08 | Gap analysis | 6 | Weakest claims tested explicitly |
+| **09: Revised architecture** | L0-L6 | ~35 | Tokenizer, gate modes, memory, Wernicke, CFR, scaling, inference adaptation |
+| **10: Scaling laws** | -- | ~63 | SSM vs transformer vs Mamba-2 scaling curves, component ROI, quantization robustness |
 
-**Total: 70 configs, ~7 hours on a single GPU**
+## Baselines
+
+| Baseline | bpb | Source |
+|---|---|---|
+| Competition transformer | 1.2244 | `baselines/parameter_golf/train_gpt.py` |
+| Competition SOTA | 1.1147 | `baselines/parameter_golf/sota/` |
+| Mamba-2 | TBD | `src/chaoscontrol/baselines.py` (requires `mamba-ssm`) |
+| Our transformer | TBD | `src/chaoscontrol/baselines.py` |
 
 ## Project structure
 
 ```
-src/chaoscontrol/     # modular source (core, routing, memory, wernicke, metabolic, model, training, evaluation, runner, baselines, data, config)
-tests/                # 97 unit tests
-experiments/          # 8 reproducible experiment directories
-analysis/             # post-run analysis and winner promotion
-docs/                 # design docs and research notes
-```
-
-## Test suite
-
-```bash
-.venv/bin/python -m pytest tests/ -v
+src/chaoscontrol/        # core library
+  core.py                #   SSM recurrence (diag/paired/full A-modes)
+  model.py               #   ChaosStudentLM (SSM + Wernicke + memory + gate)
+  tokenizer.py            #   FixedStrideTokenizer (VQ + reconstruction)
+  alignment.py            #   codebook coupling losses
+  vq.py                   #   vector quantization utilities
+  metabolic.py            #   fork, monte carlo, micro-MCTS gates
+  memory.py               #   episodic/semantic/latent memory tiers
+  regret.py               #   CFR regret table
+  training.py             #   training loop
+  evaluation.py           #   eval + bpb calculation
+  runner.py               #   experiment runner
+  baselines.py            #   SimpleTransformerLM, Mamba2LM
+  data.py                 #   enwik8 + FineWeb loaders
+  config.py               #   ChaosControlConfig dataclass
+experiments/09_*/         # active experiment (layered ablation)
+baselines/parameter_golf/ # competition baseline + SOTA reference
+docs/plans/               # design docs and implementation plans
+tools/                    # deployment scripts (RunPod)
+tests/                    # 177 tests
+archive/round1/           # completed round 1 experiments (01-08)
 ```
