@@ -164,15 +164,11 @@ def generate_l0_configs() -> list[Path]:
             "tokenizer_type": "none",
             "vocab_size": 256,
         },
-        "L0_bpe": {
-            # Competition BPE tokenizer (reference, not our learned tokenizer).
-            # Uses the competition's sp1024 vocabulary.  BPE is external, not
-            # our module — mark as requiring fineweb BPE data.
-            **base,
-            "tokenizer_type": "none",
-            "vocab_size": 1024,
-            "requires_fineweb_bpe": True,
-        },
+        # L0_bpe deferred: BPE is the competition's tokenizer (sp1024), not ours.
+        # Comparing BPE-on-SSM is interesting but needs plumbing beyond a config
+        # flag (uint16 shard loading, external SentencePiece model, etc.).
+        # The meaningful comparison is raw bytes vs. our learned VQ tokenizer
+        # vs. the competition transformer (which uses BPE internally).
         "L0_fixed_k512": {
             **base,
             "tokenizer_type": "fixed_stride",

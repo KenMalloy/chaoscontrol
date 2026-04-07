@@ -263,5 +263,10 @@ def evaluate_chaoscontrol_bpb(
     if metabolic_gate:
         mean_loss_gated = total_loss_gated / max(total_tokens, 1)
         result["loss_gated"] = float(mean_loss_gated)
-        result["bpb_gated"] = float(mean_loss_gated / math.log(2.0))
+        # When tokenizer is active, bpb denominator must be raw bytes (not tokens)
+        # to stay on the same scale as bpb.
+        if total_raw_bytes_seen > 0:
+            result["bpb_gated"] = compute_bpb(total_loss_gated, total_raw_bytes_seen)
+        else:
+            result["bpb_gated"] = float(mean_loss_gated / math.log(2.0))
     return result

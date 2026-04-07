@@ -436,9 +436,12 @@ def train_chaoscontrol_for_budget(
                     else:
                         counterfactual_values.append(actual_value)
 
-            action_taken = 0
-            if "mcts_stats" in out and "visit_counts" in out["mcts_stats"]:
+            if "best_idx" in out:
+                action_taken = out["best_idx"]
+            elif "mcts_stats" in out and "visit_counts" in out["mcts_stats"]:
                 action_taken = int(out["mcts_stats"]["visit_counts"].argmax().item())
+            else:
+                action_taken = 0
 
             regret_table.update(
                 bucket_id=cfr_bucket % regret_table.n_buckets,

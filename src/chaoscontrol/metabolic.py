@@ -164,7 +164,9 @@ def metabolic_fork(
             scores[i] = scores[i] * (1.0 + prior_bias[i].item())
 
     best_idx = max(range(len(scores)), key=lambda i: scores[i])
-    return candidates[best_idx]
+    result = candidates[best_idx]
+    result["best_idx"] = best_idx
+    return result
 
 
 def metabolic_monte_carlo(
