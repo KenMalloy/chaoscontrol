@@ -11,6 +11,22 @@ from chaoscontrol.data import batch_from_starts, maybe_autocast
 from chaoscontrol.metabolic import metabolic_fork, StructuredProjections
 
 
+def compute_bpb(total_ce_nats: float, total_raw_bytes: int) -> float:
+    """Compute bits-per-byte. Tokenizer-agnostic.
+
+    Args:
+        total_ce_nats: Sum of cross-entropy loss (in nats) across all predicted tokens.
+        total_raw_bytes: Count of raw bytes in the evaluation text.
+            This is a property of the text, independent of the model's tokenizer.
+
+    Returns:
+        Bits per byte. Lower is better.
+    """
+    if total_raw_bytes <= 0:
+        return 0.0
+    return total_ce_nats / total_raw_bytes / math.log(2.0)
+
+
 def evaluate_chaoscontrol_bpb(
     model: Any,
     *,
@@ -30,6 +46,7 @@ def evaluate_chaoscontrol_bpb(
     warmup_write_mode: str = "last",
     warmup_latent: bool = False,
     warmup_cold_start: bool = False,
+    total_raw_bytes: int | None = None,
 ) -> dict[str, float]:
     """Evaluate ChaosStudentLM, returning loss and bits-per-byte.
 
@@ -46,17 +63,37 @@ def evaluate_chaoscontrol_bpb(
     # Save outer model state before eval warmup so memory writes don't persist
     saved_outer_state = None
     if warmup and getattr(model, "outer_model", None) is not None:
+        om = model.outer_model
         saved_outer_state = {
-            "slots": [s.clone() for s in model.outer_model._slots],
-            "survival": list(model.outer_model._survival),
-            "slot_buckets": list(model.outer_model._slot_buckets),
-            "loss_ema": model.outer_model.loss_ema.clone(),
+            "slots": [s.clone() for s in om._slots],
+            "survival": list(om._survival),
+            "slot_buckets": list(om._slot_buckets),
+            "loss_ema": om.loss_ema.clone(),
+            # Trigger state
+            "_spike_seen": om._spike_seen,
+            "_steps_since_spike": om._steps_since_spike,
+            "_pre_spike_loss": om._pre_spike_loss,
+            "_retrieval_weights": om._retrieval_weights,
         }
-        if hasattr(model.outer_model, "_latent_traces"):
+        if hasattr(om, "_latent_traces"):
             saved_outer_state["latent_traces"] = [
                 {"bucket_id": t["bucket_id"], "centroid_contrib": t["centroid_contrib"].clone()}
-                for t in model.outer_model._latent_traces
+                for t in om._latent_traces
             ]
+        if hasattr(om, "consolidation_w"):
+            saved_outer_state["consolidation_w"] = om.consolidation_w.clone()
+        if hasattr(om, "_last_signal_was_pain"):
+            saved_outer_state["_last_signal_was_pain"] = om._last_signal_was_pain.clone()
+            saved_outer_state["_last_loss"] = om._last_loss.clone()
+            saved_outer_state["_last_wrote"] = om._last_wrote.clone()
+
+        # Cold start: wipe all memory before eval loop
+        if warmup_cold_start:
+            om._slots = []
+            om._survival = []
+            om._slot_buckets = []
+            if hasattr(om, "_latent_traces"):
+                om._latent_traces = []
 
     try:
         with torch.no_grad():
@@ -71,16 +108,42 @@ def evaluate_chaoscontrol_bpb(
 
                     # Warmup: write to episodic memory for future batches
                     if warmup and getattr(model, "outer_model", None) is not None:
-                        hidden_last = out["hidden"][:, -1, :].detach()
                         batch_loss = F.cross_entropy(
                             logits.float().reshape(-1, vocab_size),
                             targets.reshape(-1),
                         ).item()
-                        model.outer_model.consolidation_step(
-                            hidden_last,
-                            current_loss=batch_loss,
-                            bucket_id=None,
-                        )
+
+                        if warmup_write_mode == "full_sequence" and hasattr(model.outer_model, "write_sequence"):
+                            # Full-sequence write: mirrors training's full_sequence path
+                            running_avg = model.outer_model.loss_ema.item()
+                            signal = model.outer_model.compute_consolidation_signal(batch_loss, running_avg)
+                            if running_avg > 0 and signal / running_avg > 0.01:
+                                model.outer_model.write_sequence(
+                                    out["hidden"].detach(),
+                                    bucket_id=None,
+                                )
+                            model.outer_model.update_survival(batch_loss)
+                            model.outer_model.loss_ema = (
+                                model.outer_model.ema_decay * model.outer_model.loss_ema
+                                + (1 - model.outer_model.ema_decay) * batch_loss
+                            )
+                        else:
+                            # Default: consolidation_step with last hidden
+                            hidden_last = out["hidden"][:, -1, :].detach()
+                            model.outer_model.consolidation_step(
+                                hidden_last,
+                                current_loss=batch_loss,
+                                bucket_id=None,
+                            )
+
+                        # Latent reactivation on high surprise
+                        if warmup_latent and hasattr(model.outer_model, "try_reactivate"):
+                            running_avg = model.outer_model.loss_ema.item()
+                            surprise_ratio = batch_loss / max(running_avg, 1e-6)
+                            if surprise_ratio > 1.0:
+                                model.outer_model.try_reactivate(
+                                    bucket_id=-1, surprise=surprise_ratio,
+                                )
 
                     # Gate-aware eval (if metabolic gate is active)
                     if metabolic_gate:
@@ -122,20 +185,35 @@ def evaluate_chaoscontrol_bpb(
                 total_tokens += int(targets.numel())
     finally:
         if saved_outer_state is not None:
-            model.outer_model._slots = saved_outer_state["slots"]
-            model.outer_model._survival = saved_outer_state["survival"]
-            model.outer_model._slot_buckets = saved_outer_state["slot_buckets"]
-            model.outer_model.loss_ema = saved_outer_state["loss_ema"]
+            om = model.outer_model
+            om._slots = saved_outer_state["slots"]
+            om._survival = saved_outer_state["survival"]
+            om._slot_buckets = saved_outer_state["slot_buckets"]
+            om.loss_ema = saved_outer_state["loss_ema"]
+            # Trigger state
+            om._spike_seen = saved_outer_state["_spike_seen"]
+            om._steps_since_spike = saved_outer_state["_steps_since_spike"]
+            om._pre_spike_loss = saved_outer_state["_pre_spike_loss"]
+            om._retrieval_weights = saved_outer_state["_retrieval_weights"]
             if "latent_traces" in saved_outer_state:
-                model.outer_model._latent_traces = saved_outer_state["latent_traces"]
+                om._latent_traces = saved_outer_state["latent_traces"]
+            if "consolidation_w" in saved_outer_state:
+                om.consolidation_w = saved_outer_state["consolidation_w"]
+            if "_last_signal_was_pain" in saved_outer_state:
+                om._last_signal_was_pain = saved_outer_state["_last_signal_was_pain"]
+                om._last_loss = saved_outer_state["_last_loss"]
+                om._last_wrote = saved_outer_state["_last_wrote"]
         if was_training:
             model.train()
     mean_loss = total_loss / max(total_tokens, 1)
     result = {
         "loss": float(mean_loss),
-        "bpb": float(mean_loss / math.log(2.0)),
+        "bpb": float(mean_loss / math.log(2.0)),  # per-token bpb
         "tokens": float(total_tokens),
     }
+    # When raw byte count is provided, add the proper tokenizer-agnostic bpb
+    if total_raw_bytes is not None:
+        result["bpb_raw"] = compute_bpb(total_loss, total_raw_bytes)
     if metabolic_gate:
         mean_loss_gated = total_loss_gated / max(total_tokens, 1)
         result["loss_gated"] = float(mean_loss_gated)
