@@ -81,7 +81,7 @@ class ChaosControlConfig:
     budget_seconds: float = 60.0
 
     # New fields for ChaosControl repo
-    model_type: str = "ssm"  # "ssm" or "transformer"
+    model_type: str = "ssm"  # "ssm", "transformer", or "mamba2"
     semantic_tier_bases: int = 0  # 0 = disabled
     generation_mode: str = "noise"  # "noise" or "structured"
 

@@ -38,18 +38,21 @@ Parameter counts matched by adjusting transformer layer count / ff_mult. Exact c
 | `full_ssm` | SSM (diag) | Winner stack from exp 09 |
 | `our_tfm` | SimpleTransformerLM | None — our transformer |
 | `comp_tfm` | Competition baseline | None — parameter-golf train_gpt.py |
+| `mamba2_ssm` | Mamba2LM (mamba-ssm) | None — Mamba-2 SSM baseline via `mamba_ssm.Mamba2` |
 
 `full_ssm` uses the winning component configuration from experiment 09 (gate mode, memory tier, Wernicke routing, CFR — whatever won each layer).
 
 `comp_tfm` only runs at XL size (512d) where it matches the competition baseline's architecture. At smaller sizes, `our_tfm` suffices for the scaling curve.
+
+`mamba2_ssm` uses the `Mamba2LM` wrapper in `baselines.py`. Requires `pip install mamba-ssm>=2.3.0` (CUDA required). Runs at all sizes for a direct SSM-vs-SSM scaling comparison against both our custom SSM and the transformer.
 
 ### Training Protocol
 
 - **Dataset:** FineWeb (same as competition)
 - **Budget:** 600s per run (10 min, matching competition rules)
 - **Seeds:** 3 per config
-- **Total runs:** 5 sizes × 4 configs × 3 seeds = 60 runs (minus comp_tfm at XS-L = 48 runs)
-- **Estimated wall time:** ~8 hours sequential, ~2 hours with 4-way parallelism
+- **Total runs:** 5 sizes × 5 configs × 3 seeds = 75 runs (minus comp_tfm at XS-L = 63 runs)
+- **Estimated wall time:** ~10.5 hours sequential, ~2.5 hours with 4-way parallelism
 
 ### Compute Budget Matching
 

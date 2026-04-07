@@ -33,6 +33,12 @@ def build_model(cfg: ChaosControlConfig, device: torch.device, param_dtype: torc
             vocab_size=cfg.vocab_size, dim=cfg.model_dim,
             num_layers=cfg.num_layers, num_heads=max(1, cfg.model_dim // 32),
         )
+    elif cfg.model_type == "mamba2":
+        from chaoscontrol.baselines import Mamba2LM
+        model = Mamba2LM(
+            vocab_size=cfg.vocab_size, dim=cfg.model_dim,
+            num_layers=cfg.num_layers,
+        )
     else:
         model = ChaosStudentLM(
             vocab_size=cfg.vocab_size, dim=cfg.model_dim,
