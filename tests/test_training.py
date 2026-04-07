@@ -1,0 +1,124 @@
+"""Tests for training loop, matrix runner, evaluation, and CLI."""
+from __future__ import annotations
+
+import unittest
+
+import torch
+import torch.nn.functional as F
+
+from chaoscontrol.config import ChaosControlConfig
+from chaoscontrol.model import ChaosStudentLM
+from chaoscontrol.metabolic import metabolic_fork
+from chaoscontrol.training import (
+    build_chaoscontrol_matrix,
+    parse_chaoscontrol_args,
+    train_chaoscontrol_for_budget,
+)
+
+
+class TestTraining(unittest.TestCase):
+    def test_train_runs(self) -> None:
+        model = ChaosStudentLM(
+            vocab_size=256, dim=16, num_layers=2, ff_mult=2,
+            a_mode="diag", rich_b_mode="none", outer_model_dim=0,
+        )
+        tokens = torch.randint(0, 256, (512,))
+        starts = list(range(0, 400, 32))
+        result = train_chaoscontrol_for_budget(
+            model, train_tokens=tokens, train_starts=starts,
+            seq_len=16, batch_size=2, device=torch.device("cpu"),
+            param_dtype=torch.float32, budget_seconds=2.0,
+            base_lr=1e-3, weight_decay=0.0, grad_clip_norm=1.0,
+            seed=42, crit_reg_alpha=0.0, crit_reg_beta=0.0,
+        )
+        assert result["steps"] > 0
+        assert "history" in result
+
+    def test_train_with_outer_model(self) -> None:
+        model = ChaosStudentLM(
+            vocab_size=256, dim=16, num_layers=2, ff_mult=2,
+            a_mode="diag", rich_b_mode="none", outer_model_dim=32,
+        )
+        tokens = torch.randint(0, 256, (512,))
+        starts = list(range(0, 400, 32))
+        initial_state = model.outer_model.state.clone()
+        result = train_chaoscontrol_for_budget(
+            model, train_tokens=tokens, train_starts=starts,
+            seq_len=16, batch_size=2, device=torch.device("cpu"),
+            param_dtype=torch.float32, budget_seconds=2.0,
+            base_lr=1e-3, weight_decay=0.0, grad_clip_norm=1.0,
+            seed=42, crit_reg_alpha=0.0, crit_reg_beta=0.0,
+        )
+        assert not torch.allclose(initial_state, model.outer_model.state)
+
+
+class TestMatrixRunner(unittest.TestCase):
+    def test_matrix_generates_all_cells(self) -> None:
+        cells = build_chaoscontrol_matrix()
+        assert len(cells) == 24
+        a_modes = set(c["a_mode"] for c in cells)
+        assert a_modes == {"diag", "paired", "full"}
+        b_modes = set(c["rich_b_mode"] for c in cells)
+        assert b_modes == {"none", "nn", "hub", "assembly", "hybrid"}
+
+
+class TestMetabolicGate(unittest.TestCase):
+    def test_fork_produces_logits(self) -> None:
+        model = ChaosStudentLM(
+            vocab_size=256, dim=16, num_layers=2, ff_mult=2,
+            a_mode="diag", rich_b_mode="none", outer_model_dim=0,
+        )
+        ids = torch.randint(0, 256, (2, 16))
+        out = metabolic_fork(model, ids, k=3, noise_std=0.1, score_mode="ensemble_agreement")
+        assert out["logits"].shape == (2, 16, 256)
+
+    def test_training_with_gate_tracks_forks(self) -> None:
+        model = ChaosStudentLM(
+            vocab_size=256, dim=16, num_layers=2, ff_mult=2,
+            a_mode="diag", rich_b_mode="none", outer_model_dim=0,
+        )
+        tokens = torch.randint(0, 256, (512,))
+        starts = list(range(0, 400, 32))
+        result = train_chaoscontrol_for_budget(
+            model, train_tokens=tokens, train_starts=starts,
+            seq_len=16, batch_size=2, device=torch.device("cpu"),
+            param_dtype=torch.float32, budget_seconds=2.0,
+            base_lr=1e-3, weight_decay=0.0, grad_clip_norm=1.0,
+            seed=42, crit_reg_alpha=0.0, crit_reg_beta=0.0,
+            metabolic_gate=True, metabolic_k=2, metabolic_threshold=0.0,
+            metabolic_noise_std=0.1, metabolic_score="ensemble_agreement",
+        )
+        assert "fork_count" in result
+        # With threshold=0.0, most steps should fork
+        assert result["fork_count"] > 0
+
+
+class TestCLI(unittest.TestCase):
+    def test_parse_args_defaults(self) -> None:
+        args = parse_chaoscontrol_args(["--enwik8-path", "/tmp/enwik8"])
+        cfg = ChaosControlConfig(**{k.replace("-", "_"): v for k, v in vars(args).items() if k != "run_matrix"})
+        assert cfg.a_mode == "diag"
+        assert cfg.consolidation_trigger == "immediate"
+        assert cfg.a_full_rank == 8
+        assert cfg.rich_b_bottleneck == 32
+        assert cfg.crit_target_coupling == 0.88
+
+    def test_parse_args_all_knobs_reachable(self) -> None:
+        args = parse_chaoscontrol_args([
+            "--enwik8-path", "/tmp/enwik8",
+            "--a-full-rank", "16",
+            "--rich-b-settling-steps", "3",
+            "--consolidation-trigger", "resolution",
+            "--consolidation-ema-decay", "0.95",
+            "--crit-target-coupling", "0.92",
+        ])
+        cfg = ChaosControlConfig(**{k.replace("-", "_"): v for k, v in vars(args).items() if k != "run_matrix"})
+        assert cfg.a_full_rank == 16
+        assert cfg.rich_b_settling_steps == 3
+        assert cfg.consolidation_trigger == "resolution"
+        assert cfg.consolidation_ema_decay == 0.95
+        assert cfg.crit_target_coupling == 0.92
+
+
+if __name__ == "__main__":
+    unittest.main()
