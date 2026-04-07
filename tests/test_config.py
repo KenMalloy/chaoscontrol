@@ -22,3 +22,20 @@ def test_all_rich_b_modes():
 def test_model_type():
     cfg = ChaosControlConfig(enwik8_path="/tmp", model_type="transformer")
     assert cfg.model_type == "transformer"
+
+
+def test_data_format_defaults():
+    """New data_path / data_format fields default to enwik8 behavior."""
+    cfg = ChaosControlConfig(enwik8_path="/tmp/enwik8")
+    assert cfg.data_path == ""
+    assert cfg.data_format == "enwik8"
+
+
+def test_data_format_fineweb():
+    cfg = ChaosControlConfig(
+        enwik8_path="/tmp/enwik8",
+        data_path="/tmp/fineweb",
+        data_format="fineweb_bytes",
+    )
+    assert cfg.data_path == "/tmp/fineweb"
+    assert cfg.data_format == "fineweb_bytes"

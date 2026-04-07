@@ -87,6 +87,82 @@ def prepare_tokenized_enwik8_splits(path, *, device, cache_on_device=True):
 
 
 # ---------------------------------------------------------------------------
+# FineWeb loading
+# ---------------------------------------------------------------------------
+
+def load_fineweb_tokens(data_dir: str) -> tuple[torch.Tensor, torch.Tensor]:
+    """Load FineWeb binary shards (uint16 SentencePiece token IDs).
+
+    Returns (train_tokens, val_tokens) as int64 tensors.
+    The competition format stores shards as flat binary files of uint16.
+    """
+    data_path = Path(data_dir)
+    train_shards = sorted(data_path.glob("fineweb_train_*.bin"))
+    val_shards = sorted(data_path.glob("fineweb_val_*.bin"))
+    if not train_shards:
+        raise FileNotFoundError(f"No training shards found in {data_dir}")
+    if not val_shards:
+        raise FileNotFoundError(f"No validation shards found in {data_dir}")
+
+    train_arrays = [np.fromfile(str(s), dtype=np.uint16) for s in train_shards]
+    val_arrays = [np.fromfile(str(s), dtype=np.uint16) for s in val_shards]
+
+    train_tokens = torch.from_numpy(np.concatenate(train_arrays).astype(np.int64, copy=False))
+    val_tokens = torch.from_numpy(np.concatenate(val_arrays).astype(np.int64, copy=False))
+    return train_tokens, val_tokens
+
+
+def load_fineweb_raw_bytes(text_path: str) -> torch.Tensor:
+    """Load a raw UTF-8 text file as a uint8 byte tensor (int64 for LM use).
+
+    This is the raw-bytes approach: each byte is a token in [0, 255].
+    """
+    p = Path(text_path)
+    raw = p.read_bytes()
+    if len(raw) == 0:
+        raise ValueError(f"empty text file: {text_path}")
+    return torch.tensor(list(raw), dtype=torch.int64)
+
+
+def prepare_fineweb_splits(
+    data_dir: str,
+    *,
+    device: torch.device,
+    cache_on_device: bool = True,
+    train_fraction: float = 0.90,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Load FineWeb data, returning (train, val, test) tensors.
+
+    If a raw text file (docs_raw.txt) exists in data_dir, uses raw bytes.
+    Otherwise falls back to the uint16 shard format (SentencePiece tokens).
+    """
+    data_path = Path(data_dir)
+    raw_text = data_path / "docs_raw.txt"
+
+    if raw_text.exists():
+        # Raw bytes path
+        all_tokens = load_fineweb_raw_bytes(str(raw_text))
+        train_end = int(all_tokens.numel() * train_fraction)
+        val_end = int(all_tokens.numel() * (train_fraction + 0.05))
+        train_tokens = all_tokens[:train_end]
+        val_tokens = all_tokens[train_end:val_end]
+        test_tokens = all_tokens[val_end:]
+    else:
+        # SentencePiece uint16 shard path — train/val already split by shards
+        train_tokens, val_tokens = load_fineweb_tokens(data_dir)
+        # No separate test set in competition format; carve 10% off val
+        split_at = int(val_tokens.numel() * 0.5)
+        test_tokens = val_tokens[split_at:]
+        val_tokens = val_tokens[:split_at]
+
+    return (
+        maybe_cache_tokens_on_device(train_tokens, device=device, enabled=cache_on_device),
+        maybe_cache_tokens_on_device(val_tokens, device=device, enabled=cache_on_device),
+        maybe_cache_tokens_on_device(test_tokens, device=device, enabled=cache_on_device),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Batching helpers
 # ---------------------------------------------------------------------------
 

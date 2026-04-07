@@ -94,3 +94,7 @@ class ChaosControlConfig:
     cue_projection: bool = True  # False = use raw recurrence state as retrieval key
     dynamic_crit_per_layer: bool = False
     compression_selection: str = "survival"  # "survival" or "random" — controls slot merge ordering
+
+    # Data source configuration (additive — enwik8 remains the default)
+    data_path: str = ""  # path to FineWeb data directory; empty = use enwik8_path
+    data_format: str = "enwik8"  # "enwik8" or "fineweb_bytes"

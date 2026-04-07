@@ -11,7 +11,7 @@ import torch
 from chaoscontrol.config import ChaosControlConfig
 from chaoscontrol.data import (
     resolve_device, resolve_param_dtype, prepare_tokenized_enwik8_splits,
-    build_lm_starts, choose_eval_starts, maybe_sync_cuda,
+    prepare_fineweb_splits, build_lm_starts, choose_eval_starts, maybe_sync_cuda,
 )
 from chaoscontrol.model import ChaosStudentLM
 from chaoscontrol.training import train_chaoscontrol_for_budget
@@ -79,9 +79,14 @@ def run_experiment(config_path: str, *, enwik8_path: str, budget_seconds: float 
         torch.backends.cudnn.benchmark = True
         torch.set_float32_matmul_precision("high")
 
-    train_tokens, val_tokens, _test = prepare_tokenized_enwik8_splits(
-        Path(cfg.enwik8_path), device=device,
-    )
+    if cfg.data_format == "fineweb_bytes" and cfg.data_path:
+        train_tokens, val_tokens, _test = prepare_fineweb_splits(
+            cfg.data_path, device=device,
+        )
+    else:
+        train_tokens, val_tokens, _test = prepare_tokenized_enwik8_splits(
+            Path(cfg.enwik8_path), device=device,
+        )
     train_starts = build_lm_starts(int(train_tokens.numel()), cfg.seq_len, cfg.stride)
     val_starts = build_lm_starts(int(val_tokens.numel()), cfg.seq_len, cfg.stride)
     eval_starts = choose_eval_starts(val_starts, batch_size=cfg.batch_size, eval_batches=cfg.eval_batches, seed=cfg.seed)
