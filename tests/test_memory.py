@@ -309,10 +309,10 @@ class TestDemandDrivenCompression(unittest.TestCase):
         for i in range(20):
             m.write(torch.randn(1, 16), bucket_id=0)
         if m._latent_traces:
-            slots_before = len(m._slots)
             result = m.try_reactivate(bucket_id=0, surprise=10.0)
             assert result is True
-            assert len(m._slots) == slots_before + 1
+            # Reactivation may trigger compression, so slots stay within capacity
+            assert len(m._slots) <= m.max_slots
         # If no latent traces were created (compression didn't fully displace),
         # that's OK — the test is conditional
 
@@ -376,6 +376,61 @@ class TestEvalWarmup(unittest.TestCase):
         )
         assert len(model.outer_model._slots) == 0
         assert "bpb" in result
+
+
+class TestLatentTraceEviction(unittest.TestCase):
+    def test_latent_traces_capped_at_max_slots(self):
+        from chaoscontrol.memory import MultiSlotOuterModel
+        m = MultiSlotOuterModel(model_dim=16, outer_dim=8, max_slots=4, compress_ratio=2)
+        for i in range(50):
+            m.write(torch.randn(1, 16), bucket_id=0)
+        assert len(m._latent_traces) <= 4
+
+    def test_latent_traces_in_checkpoint(self):
+        from chaoscontrol.memory import MultiSlotOuterModel
+        m = MultiSlotOuterModel(model_dim=16, outer_dim=8, max_slots=4, compress_ratio=2)
+        for i in range(10):
+            m.write(torch.randn(1, 16), bucket_id=0)
+        state = m.get_extra_state()
+        assert "latent_traces" in state
+
+    def test_reactivation_respects_max_slots(self):
+        from chaoscontrol.memory import MultiSlotOuterModel
+        m = MultiSlotOuterModel(model_dim=16, outer_dim=8, max_slots=4, compress_ratio=2)
+        for i in range(20):
+            m.write(torch.randn(1, 16), bucket_id=0)
+        if m._latent_traces:
+            m.try_reactivate(bucket_id=0, surprise=10.0)
+            assert len(m._slots) <= 5  # max_slots + 1 before compress triggers
+
+    def test_reactivation_adds_noise(self):
+        from chaoscontrol.memory import MultiSlotOuterModel
+        m = MultiSlotOuterModel(model_dim=16, outer_dim=8, max_slots=4, compress_ratio=2)
+        for i in range(20):
+            m.write(torch.randn(1, 16), bucket_id=0)
+        if m._latent_traces:
+            original = m._latent_traces[0]["centroid_contrib"].clone()
+            m.try_reactivate(bucket_id=0, surprise=10.0)
+            reactivated = m._slots[-1]
+            # Should differ due to noise
+            assert not torch.allclose(original, reactivated)
+
+
+class TestWriteSequenceRecency(unittest.TestCase):
+    def test_recency_bias_differs_from_flat_mean(self):
+        from chaoscontrol.memory import MultiSlotOuterModel
+        m1 = MultiSlotOuterModel(model_dim=16, outer_dim=8, max_slots=4)
+        m2 = MultiSlotOuterModel(model_dim=16, outer_dim=8, max_slots=4)
+        # Same weights for both
+        m2.load_state_dict(m1.state_dict())
+
+        h_seq = torch.randn(2, 32, 16)
+        m1.write_sequence(h_seq)  # recency-weighted
+        # Manual flat mean for comparison
+        m2.write(h_seq.mean(dim=1))
+
+        # Slots should differ because recency weighting != flat mean
+        assert not torch.allclose(m1._slots[0], m2._slots[0])
 
 
 if __name__ == "__main__":

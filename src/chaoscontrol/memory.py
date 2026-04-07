@@ -256,19 +256,27 @@ class MultiSlotOuterModel(nn.Module):
         self._latent_traces: list[dict] = []  # {bucket_id: int, centroid_contrib: Tensor}
 
     def get_extra_state(self) -> dict:
-        """Persist slots, survival scores, and bucket assignments in state_dict."""
+        """Persist slots, survival scores, bucket assignments, and latent traces in state_dict."""
         return {
             "slots": [s.cpu() for s in self._slots],
             "survival": list(self._survival),
             "slot_buckets": list(self._slot_buckets),
+            "latent_traces": [
+                {"bucket_id": t["bucket_id"], "centroid_contrib": t["centroid_contrib"].cpu()}
+                for t in self._latent_traces
+            ],
         }
 
     def set_extra_state(self, state: dict) -> None:
-        """Restore slots, survival scores, and bucket assignments from checkpoint."""
+        """Restore slots, survival scores, bucket assignments, and latent traces from checkpoint."""
         device = self.decoder.weight.device
         self._slots = [s.to(device) for s in state["slots"]]
         self._survival = list(state["survival"])
         self._slot_buckets = list(state.get("slot_buckets", [-1] * len(self._slots)))
+        self._latent_traces = [
+            {"bucket_id": t["bucket_id"], "centroid_contrib": t["centroid_contrib"].to(device)}
+            for t in state.get("latent_traces", [])
+        ]
 
     def read(self, batch_size: int, *, cue: torch.Tensor | None = None) -> torch.Tensor:
         """Cue-dependent retrieval across slots.
@@ -339,10 +347,17 @@ class MultiSlotOuterModel(nn.Module):
         """Encode from full sequence hidden states (batch, seq, dim).
 
         Captures the trajectory leading to a surprising event, not just
-        the final hidden state. Mean-pools over the sequence dimension
-        to create a trajectory-aware representation before encoding.
+        the final hidden state. Uses exponentially-weighted mean with
+        recency bias so later positions contribute more, preserving
+        temporal order information that flat mean-pooling discards.
         """
-        h_pooled = h_seq.mean(dim=1)  # (batch, dim)
+        batch, seq, dim = h_seq.shape
+        # Exponential recency weights: later positions matter more
+        positions = torch.arange(seq, dtype=h_seq.dtype, device=h_seq.device)
+        weights = torch.exp(positions - positions[-1])  # exp-decay, last position = weight 1.0
+        weights = weights / weights.sum()
+        # Weighted sum over sequence: (batch, dim)
+        h_pooled = (h_seq * weights.unsqueeze(0).unsqueeze(-1)).sum(dim=1)
         self.write(h_pooled, per_sample_weights=per_sample_weights, bucket_id=bucket_id)
 
     def update_survival(self, current_loss: float) -> None:
@@ -477,6 +492,10 @@ class MultiSlotOuterModel(nn.Module):
                 self._survival = [sc for _, sc, _ in kept_old] + [merged_score] + new_survival
                 self._slot_buckets = [b for _, _, b in kept_old] + [-1] + new_buckets
 
+        # Evict oldest latent traces if over capacity
+        while len(self._latent_traces) > self.max_slots:
+            self._latent_traces.pop(0)
+
     def try_reactivate(self, bucket_id: int, surprise: float, reactivation_threshold: float = 1.0) -> bool:
         """Attempt to reactivate a latent trace matching the given bucket.
 
@@ -487,11 +506,17 @@ class MultiSlotOuterModel(nn.Module):
             return False
         for i, trace in enumerate(self._latent_traces):
             if trace["bucket_id"] == bucket_id:
-                # Reactivate: add the centroid contribution back as a slot
-                self._slots.append(trace["centroid_contrib"])
+                # Reactivate with degradation — reconstructed memories are imperfect
+                reactivated_slot = trace["centroid_contrib"].clone()
+                noise = torch.randn_like(reactivated_slot) * 0.1  # reconstruction noise
+                reactivated_slot = reactivated_slot + noise
+                self._slots.append(reactivated_slot)
                 self._survival.append(0.0)
                 self._slot_buckets.append(trace["bucket_id"])
                 self._latent_traces.pop(i)
+                # Compress if reactivation pushed past capacity
+                if len(self._slots) > self.max_slots:
+                    self._compress()
                 return True
         return False
 
