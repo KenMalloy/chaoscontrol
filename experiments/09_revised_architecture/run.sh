@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
-ENWIK8="${1:?Usage: run.sh /path/to/enwik8 [--budget SECONDS] [--l5-budget SECONDS]}"
+DATA="${1:?Usage: run.sh /path/to/fineweb_data [--budget SECONDS] [--l5-budget SECONDS]}"
 shift
 BUDGET=150
 L5_BUDGET=900
@@ -15,6 +15,6 @@ REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 export PYTHONPATH="$REPO_ROOT/src:${PYTHONPATH:-}"
 
 python3 "$(dirname "$0")/run_layered.py" \
-    --enwik8-path "$ENWIK8" \
+    --data-path "$DATA" \
     --budget "$BUDGET" \
     --l5-budget "$L5_BUDGET"

@@ -42,8 +42,7 @@ SHARED_DEFAULTS = {
 
 
 # ── helpers ──────────────────────────────────────────────────────────
-def run_config(config_path: Path, enwik8_path: str, budget: float, seed: int,
-               *, data_path: str = "", data_format: str = "enwik8") -> dict:
+def run_config(config_path: Path, data_path: str, budget: float, seed: int) -> dict:
     """Run a single config with a given seed.  Returns parsed result dict."""
     RESULTS.mkdir(parents=True, exist_ok=True)
     out_path = RESULTS / f"{config_path.stem}_seed{seed}.json"
@@ -51,19 +50,13 @@ def run_config(config_path: Path, enwik8_path: str, budget: float, seed: int,
     # Write a temporary YAML with the seed overridden
     cfg = yaml.safe_load(config_path.read_text())
     cfg["seed"] = seed
-    # Inject data source settings into the config YAML so the runner picks
-    # them up via the standard config dataclass path.
-    if data_path:
-        cfg["data_path"] = data_path
-    if data_format != "enwik8":
-        cfg["data_format"] = data_format
     tmp = config_path.parent / f".tmp_{config_path.stem}_s{seed}.yaml"
     tmp.write_text(yaml.dump(cfg, default_flow_style=False))
 
     cmd = [
         sys.executable, "-m", "chaoscontrol.runner",
         "--config", str(tmp),
-        "--enwik8-path", enwik8_path,
+        "--data-path", data_path,
         "--budget", str(budget),
         "--output-json", str(out_path),
     ]
@@ -74,9 +67,8 @@ def run_config(config_path: Path, enwik8_path: str, budget: float, seed: int,
     return json.loads(out_path.read_text())
 
 
-def run_layer(config_paths: list[Path], enwik8_path: str, budget: float,
-              seeds: list[int], layer_name: str,
-              *, data_path: str = "", data_format: str = "enwik8") -> dict:
+def run_layer(config_paths: list[Path], data_path: str, budget: float,
+              seeds: list[int], layer_name: str) -> dict:
     """Run all configs x seeds for a layer.  Returns {config_name: {seed: result}}."""
     results: dict[str, dict[int, dict]] = {}
     total = len(config_paths) * len(seeds)
@@ -87,10 +79,7 @@ def run_layer(config_paths: list[Path], enwik8_path: str, budget: float,
         for seed in seeds:
             done += 1
             print(f"  [{layer_name}] ({done}/{total}) {name} seed={seed} ...")
-            results[name][seed] = run_config(
-                cfg, enwik8_path, budget, seed,
-                data_path=data_path, data_format=data_format,
-            )
+            results[name][seed] = run_config(cfg, data_path, budget, seed)
     return results
 
 
@@ -538,22 +527,16 @@ def extract_wernicke_settings(config_path: Path) -> dict:
 # ── main ─────────────────────────────────────────────────────────────
 def main():
     parser = argparse.ArgumentParser(description="Layered runner for experiment 09")
-    parser.add_argument("--enwik8-path", required=True, help="Path to enwik8 data file")
+    parser.add_argument("--data-path", required=True, help="Path to FineWeb data directory")
     parser.add_argument("--budget", type=float, default=150, help="Per-run budget in seconds")
     parser.add_argument("--l5-budget", type=float, default=900, help="Layer 5 budget in seconds")
     parser.add_argument("--start-layer", type=int, default=0,
                         help="Layer to start from (0=tokenizer, 1=gate, …, 6=inference)")
-    parser.add_argument("--data-path", default="",
-                        help="Path to FineWeb data directory (default: use enwik8)")
-    parser.add_argument("--data-format", default="enwik8", choices=["enwik8", "fineweb_bytes"],
-                        help="Data format (default: enwik8)")
     args = parser.parse_args()
 
-    enwik8_path = args.enwik8_path
+    data_path = args.data_path
     budget = args.budget
     l5_budget = args.l5_budget
-    data_path = args.data_path
-    data_format = args.data_format
 
     summary: dict[str, dict] = {}
     tokenizer_settings: dict = {}
@@ -564,8 +547,7 @@ def main():
         print("  LAYER 0: Tokenizer Architecture")
         print("=" * 72)
         l0_configs = generate_l0_configs()
-        l0_results = run_layer(l0_configs, enwik8_path, budget, SEEDS, "L0",
-                               data_path=data_path, data_format=data_format)
+        l0_results = run_layer(l0_configs, data_path, budget, SEEDS, "L0")
         print_layer_summary("Layer 0: Tokenizer Architecture", l0_results)
         l0_winner, l0_mean, l0_std = pick_winner(l0_results)
         print(f"  >>> L0 winner: {l0_winner} (bpb={l0_mean:.4f} +/- {l0_std:.4f})")
@@ -605,8 +587,7 @@ def main():
         print("  LAYER 0.5: Codebook Alignment")
         print("=" * 72)
         l05_configs = generate_l05_configs(tokenizer_settings)
-        l05_results = run_layer(l05_configs, enwik8_path, budget, SEEDS, "L0.5",
-                                data_path=data_path, data_format=data_format)
+        l05_results = run_layer(l05_configs, data_path, budget, SEEDS, "L0.5")
         print_layer_summary("Layer 0.5: Codebook Alignment", l05_results)
         l05_winner, l05_mean, l05_std = pick_winner(l05_results)
         print(f"  >>> L0.5 winner: {l05_winner} (bpb={l05_mean:.4f} +/- {l05_std:.4f})")
@@ -635,8 +616,7 @@ def main():
         print("  LAYER 1: Gate Modes")
         print("=" * 72)
         l1_configs = sorted(CONFIGS.glob("L1_*.yaml"))
-        l1_results = run_layer(l1_configs, enwik8_path, budget, SEEDS, "L1",
-                               data_path=data_path, data_format=data_format)
+        l1_results = run_layer(l1_configs, data_path, budget, SEEDS, "L1")
         print_layer_summary("Layer 1: Gate Modes", l1_results)
         l1_winner, l1_mean, l1_std = pick_winner(l1_results)
         print(f"  >>> L1 winner: {l1_winner} (bpb={l1_mean:.4f} +/- {l1_std:.4f})")
@@ -662,8 +642,7 @@ def main():
         print("  LAYER 2: +Memory")
         print("=" * 72)
         l2_configs = generate_l2_configs(gate_settings, tokenizer_settings)
-        l2_results = run_layer(l2_configs, enwik8_path, budget, SEEDS, "L2",
-                               data_path=data_path, data_format=data_format)
+        l2_results = run_layer(l2_configs, data_path, budget, SEEDS, "L2")
         print_layer_summary("Layer 2: +Memory", l2_results)
         l2_winner, l2_mean, l2_std = pick_winner(l2_results)
         print(f"  >>> L2 winner: {l2_winner} (bpb={l2_mean:.4f} +/- {l2_std:.4f})")
@@ -686,8 +665,7 @@ def main():
         print("  LAYER 3: +Wernicke + Regret")
         print("=" * 72)
         l3_configs = generate_l3_configs(gate_settings, mem_settings, tokenizer_settings)
-        l3_results = run_layer(l3_configs, enwik8_path, budget, SEEDS, "L3",
-                               data_path=data_path, data_format=data_format)
+        l3_results = run_layer(l3_configs, data_path, budget, SEEDS, "L3")
         print_layer_summary("Layer 3: +Wernicke + Regret", l3_results)
         l3_winner, l3_mean, l3_std = pick_winner(l3_results)
         print(f"  >>> L3 winner: {l3_winner} (bpb={l3_mean:.4f} +/- {l3_std:.4f})")
@@ -710,8 +688,7 @@ def main():
         print("  LAYER 3.5: Dark Horses")
         print("=" * 72)
         l35_configs = generate_l35_configs(gate_settings, mem_settings, tokenizer_settings)
-        l35_results = run_layer(l35_configs, enwik8_path, budget, [SEEDS[0]], "L3.5",
-                                data_path=data_path, data_format=data_format)
+        l35_results = run_layer(l35_configs, data_path, budget, [SEEDS[0]], "L3.5")
         print_layer_summary("Layer 3.5: Dark Horses", l35_results)
 
         with open(RESULTS / "L35_summary.json", "w") as f:
@@ -733,8 +710,7 @@ def main():
         print("  LAYER 4: Scaling")
         print("=" * 72)
         l4_configs = generate_l4_configs(full_stack, tokenizer_settings)
-        l4_results = run_layer(l4_configs, enwik8_path, budget, [SEEDS[0]], "L4",
-                               data_path=data_path, data_format=data_format)
+        l4_results = run_layer(l4_configs, data_path, budget, [SEEDS[0]], "L4")
         print_layer_summary("Layer 4: Scaling", l4_results)
 
         with open(RESULTS / "L4_summary.json", "w") as f:
@@ -747,8 +723,7 @@ def main():
         print(f"  LAYER 5: Full A-mode (budget={l5_budget}s)")
         print("=" * 72)
         l5_configs = generate_l5_configs(full_stack)
-        l5_results = run_layer(l5_configs, enwik8_path, l5_budget, [SEEDS[0]], "L5",
-                               data_path=data_path, data_format=data_format)
+        l5_results = run_layer(l5_configs, data_path, l5_budget, [SEEDS[0]], "L5")
         print_layer_summary("Layer 5: Full A-mode", l5_results)
 
         with open(RESULTS / "L5_summary.json", "w") as f:
@@ -761,8 +736,7 @@ def main():
         print("  LAYER 6: Inference-Time Adaptation Depth")
         print("=" * 72)
         l6_configs = generate_l6_configs(full_stack)
-        l6_results = run_layer(l6_configs, enwik8_path, budget, SEEDS, "L6",
-                               data_path=data_path, data_format=data_format)
+        l6_results = run_layer(l6_configs, data_path, budget, SEEDS, "L6")
         print_layer_summary("Layer 6: Inference-Time Adaptation Depth", l6_results)
         l6_winner, l6_mean, l6_std = pick_winner(l6_results)
         print(f"  >>> L6 winner: {l6_winner} (bpb={l6_mean:.4f} +/- {l6_std:.4f})")

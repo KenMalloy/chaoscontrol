@@ -3,7 +3,7 @@ from dataclasses import dataclass
 
 @dataclass
 class ChaosControlConfig:
-    enwik8_path: str
+    data_path: str
     device: str = "auto"
     dtype: str = "bf16"
     seed: int = 1337
@@ -107,6 +107,3 @@ class ChaosControlConfig:
     align_type: str = "none"  # "none", "contrastive", "diversity", "distillation"
     align_weight: float = 0.05
 
-    # Data source configuration (additive — enwik8 remains the default)
-    data_path: str = ""  # path to FineWeb data directory; empty = use enwik8_path
-    data_format: str = "enwik8"  # "enwik8" or "fineweb_bytes"

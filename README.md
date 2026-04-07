@@ -37,11 +37,7 @@ raw bytes (256)
 
 ```bash
 # Experiment 09: layered ablation (L0 tokenizer through L6 inference adaptation)
-bash experiments/09_revised_architecture/run.sh /path/to/enwik8 --budget 150
-
-# With FineWeb data
-bash experiments/09_revised_architecture/run.sh /path/to/enwik8 \
-    --budget 150 --data-path /path/to/fineweb --data-format fineweb_bytes
+bash experiments/09_revised_architecture/run.sh /path/to/fineweb_data --budget 150
 
 # Tests
 PYTHONPATH=src .venv/bin/python -m pytest tests/ -q

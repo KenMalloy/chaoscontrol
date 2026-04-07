@@ -49,21 +49,20 @@ Total: 28 config templates, 73 runs.
 
 ## Dependencies
 
-- Experiments 01-08 (conceptual foundation; no data dependency)
-- `enwik8` dataset
+- FineWeb dataset (download via `baselines/parameter_golf/cached_challenge_fineweb.py`)
 - `pyyaml` for config generation
 
 ## Running
 
 ```bash
-# Full run (default 300s per config, 1800s for L5)
-./run.sh /path/to/enwik8
+# Full run (default 150s per config, 900s for L5)
+./run.sh /path/to/fineweb_data
 
 # Custom budget
-./run.sh /path/to/enwik8 --budget 120
+./run.sh /path/to/fineweb_data --budget 120
 
 # Resume from a specific layer
-python run_layered.py --enwik8-path /path/to/enwik8 --start-layer 3
+python run_layered.py --data-path /path/to/fineweb_data --start-layer 3
 ```
 
 ## Analysis

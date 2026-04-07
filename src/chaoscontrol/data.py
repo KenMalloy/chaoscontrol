@@ -54,40 +54,7 @@ def maybe_sync_cuda(device):
 
 
 # ---------------------------------------------------------------------------
-# enwik8 loading
-# ---------------------------------------------------------------------------
-
-def load_enwik8_splits(
-    path: Path,
-    *,
-    train_fraction: float = 0.90,
-    val_fraction: float = 0.05,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    raw = np.fromfile(path, dtype=np.uint8)
-    if raw.size == 0:
-        raise ValueError(f"empty enwik8 file: {path}")
-    tokens = torch.from_numpy(raw.astype(np.int64, copy=False))
-    train_end = int(tokens.numel() * train_fraction)
-    val_end = int(tokens.numel() * (train_fraction + val_fraction))
-    train_tokens = tokens[:train_end]
-    val_tokens = tokens[train_end:val_end]
-    test_tokens = tokens[val_end:]
-    if min(train_tokens.numel(), val_tokens.numel(), test_tokens.numel()) <= 0:
-        raise ValueError("enwik8 split produced an empty partition")
-    return train_tokens, val_tokens, test_tokens
-
-
-def prepare_tokenized_enwik8_splits(path, *, device, cache_on_device=True):
-    train, val, test = load_enwik8_splits(path)
-    return (
-        maybe_cache_tokens_on_device(train, device=device, enabled=cache_on_device),
-        maybe_cache_tokens_on_device(val, device=device, enabled=cache_on_device),
-        maybe_cache_tokens_on_device(test, device=device, enabled=cache_on_device),
-    )
-
-
-# ---------------------------------------------------------------------------
-# FineWeb loading
+# Data loading
 # ---------------------------------------------------------------------------
 
 def load_fineweb_tokens(data_dir: str) -> tuple[torch.Tensor, torch.Tensor]:

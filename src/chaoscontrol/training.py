@@ -640,7 +640,7 @@ def run_chaoscontrol_matrix(
 def parse_chaoscontrol_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description="ChaosControl SSM-native experiment")
     # Data / device
-    p.add_argument("--enwik8-path", required=True)
+    p.add_argument("--data-path", required=True)
     p.add_argument("--device", default="auto")
     p.add_argument("--dtype", default="fp16")
     p.add_argument("--seed", type=int, default=1337)

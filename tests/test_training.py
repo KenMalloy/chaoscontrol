@@ -95,7 +95,7 @@ class TestMetabolicGate(unittest.TestCase):
 
 class TestCLI(unittest.TestCase):
     def test_parse_args_defaults(self) -> None:
-        args = parse_chaoscontrol_args(["--enwik8-path", "/tmp/enwik8"])
+        args = parse_chaoscontrol_args(["--data-path", "/tmp/data"])
         cfg = ChaosControlConfig(**{k.replace("-", "_"): v for k, v in vars(args).items() if k != "run_matrix"})
         assert cfg.a_mode == "diag"
         assert cfg.consolidation_trigger == "immediate"
@@ -105,7 +105,7 @@ class TestCLI(unittest.TestCase):
 
     def test_parse_args_all_knobs_reachable(self) -> None:
         args = parse_chaoscontrol_args([
-            "--enwik8-path", "/tmp/enwik8",
+            "--data-path", "/tmp/data",
             "--a-full-rank", "16",
             "--rich-b-settling-steps", "3",
             "--consolidation-trigger", "resolution",

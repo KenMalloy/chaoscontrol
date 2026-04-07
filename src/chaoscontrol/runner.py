@@ -10,7 +10,7 @@ import torch
 
 from chaoscontrol.config import ChaosControlConfig
 from chaoscontrol.data import (
-    resolve_device, resolve_param_dtype, prepare_tokenized_enwik8_splits,
+    resolve_device, resolve_param_dtype,
     prepare_fineweb_splits, build_lm_starts, choose_eval_starts, maybe_sync_cuda,
 )
 from chaoscontrol.model import ChaosStudentLM
@@ -18,9 +18,9 @@ from chaoscontrol.training import train_chaoscontrol_for_budget
 from chaoscontrol.evaluation import evaluate_chaoscontrol_bpb
 
 
-def load_config(path: str, *, enwik8_path: str, budget_seconds: float | None = None) -> ChaosControlConfig:
+def load_config(path: str, *, data_path: str, budget_seconds: float | None = None) -> ChaosControlConfig:
     raw = yaml.safe_load(Path(path).read_text())
-    raw["enwik8_path"] = enwik8_path
+    raw["data_path"] = data_path
     if budget_seconds is not None:
         raw["budget_seconds"] = budget_seconds
     return ChaosControlConfig(**raw)
@@ -75,8 +75,8 @@ def build_model(cfg: ChaosControlConfig, device: torch.device, param_dtype: torc
     return model
 
 
-def run_experiment(config_path: str, *, enwik8_path: str, budget_seconds: float = 300) -> dict[str, Any]:
-    cfg = load_config(config_path, enwik8_path=enwik8_path, budget_seconds=budget_seconds)
+def run_experiment(config_path: str, *, data_path: str, budget_seconds: float = 300) -> dict[str, Any]:
+    cfg = load_config(config_path, data_path=data_path, budget_seconds=budget_seconds)
     device = resolve_device(cfg.device)
     param_dtype = resolve_param_dtype(cfg.dtype, device)
 
@@ -85,14 +85,9 @@ def run_experiment(config_path: str, *, enwik8_path: str, budget_seconds: float 
         torch.backends.cudnn.benchmark = True
         torch.set_float32_matmul_precision("high")
 
-    if cfg.data_format == "fineweb_bytes" and cfg.data_path:
-        train_tokens, val_tokens, _test = prepare_fineweb_splits(
-            cfg.data_path, device=device,
-        )
-    else:
-        train_tokens, val_tokens, _test = prepare_tokenized_enwik8_splits(
-            Path(cfg.enwik8_path), device=device,
-        )
+    train_tokens, val_tokens, _test = prepare_fineweb_splits(
+        cfg.data_path, device=device,
+    )
     train_starts = build_lm_starts(int(train_tokens.numel()), cfg.seq_len, cfg.stride)
     val_starts = build_lm_starts(int(val_tokens.numel()), cfg.seq_len, cfg.stride)
     eval_starts = choose_eval_starts(val_starts, batch_size=cfg.batch_size, eval_batches=cfg.eval_batches, seed=cfg.seed)
@@ -185,12 +180,12 @@ if __name__ == "__main__":
     import argparse
     p = argparse.ArgumentParser()
     p.add_argument("--config", required=True)
-    p.add_argument("--enwik8-path", required=True)
+    p.add_argument("--data-path", required=True)
     p.add_argument("--budget", type=float, default=300)
     p.add_argument("--output-json", default=None)
     args = p.parse_args()
 
-    result = run_experiment(args.config, enwik8_path=args.enwik8_path, budget_seconds=args.budget)
+    result = run_experiment(args.config, data_path=args.data_path, budget_seconds=args.budget)
 
     if args.output_json:
         out = Path(args.output_json)
