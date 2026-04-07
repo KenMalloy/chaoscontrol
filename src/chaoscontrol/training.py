@@ -319,17 +319,42 @@ def train_chaoscontrol_for_budget(
             elif hasattr(model.outer_model, "_compression_consequences"):
                 model.outer_model._compression_consequences.clear()
 
-        # CFR regret update: simple counterfactual estimate after metabolic gate fired
+        # CFR regret update: estimate counterfactual values via short lookahead
         if regret_table is not None and use_fork and dominant_bucket is not None:
-            # Actual value: negative CE (higher is better)
-            actual_value = -ce_val
-            # Counterfactual: estimate what other actions might have yielded
-            # Use a simple heuristic: actual_value +/- small noise per action
-            counterfactual_values = [actual_value] * metabolic_k
-            # The action taken is action 0 by convention (the selected candidate)
+            actual_value = -ce_val  # negative CE (higher is better)
+
+            # Get the top-K candidate tokens from last position
+            with torch.no_grad():
+                last_logits = out["logits"][:, -1, :].detach()
+                k_actions = min(metabolic_k, last_logits.size(-1))
+                _, top_tokens = last_logits.mean(dim=0).topk(k_actions)
+
+                # Build state at the last position by stepping through input
+                rollout_state = model.init_state(inputs.size(0))
+                for t in range(inputs.size(1)):
+                    _, _, rollout_state = model.step(inputs[:, t:t+1], rollout_state)
+
+                # Short lookahead (2 steps) for each candidate token
+                counterfactual_values = []
+                for a in range(k_actions):
+                    token = top_tokens[a].unsqueeze(0).expand(inputs.size(0)).unsqueeze(-1)
+                    cf_state = [s.clone() for s in rollout_state]
+                    cf_logits, _, cf_state = model.step(token, cf_state)
+                    # One more step with greedy continuation
+                    next_token = cf_logits.argmax(dim=-1, keepdim=True)
+                    cf_logits2, _, _ = model.step(next_token, cf_state)
+                    # Value = negative mean CE of 2-step lookahead
+                    cf_probs = F.softmax(cf_logits2, dim=-1)
+                    cf_value = cf_probs.max(dim=-1).values.mean().item()
+                    counterfactual_values.append(cf_value)
+
+            action_taken = 0
+            if "mcts_stats" in out and "visit_counts" in out["mcts_stats"]:
+                action_taken = int(out["mcts_stats"]["visit_counts"].argmax().item())
+
             regret_table.update(
                 bucket_id=dominant_bucket % regret_table.n_buckets,
-                action_taken=0,
+                action_taken=action_taken,
                 counterfactual_values=counterfactual_values,
                 actual_value=actual_value,
             )
