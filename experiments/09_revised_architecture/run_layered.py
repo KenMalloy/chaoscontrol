@@ -357,26 +357,21 @@ def generate_l6_configs(full_stack: dict) -> list[Path]:
             **base_no_adapt,
             "eval_warmup": True,
         },
-        # WM + all tiers: episodic + semantic consolidation + latent reactivation
+        # WM + all tiers: cold start -- wipe memory, rebuild during eval
         "L6_wm_plus_all": {
             **base_no_adapt,
             "eval_warmup": True,
-            "consolidation_write": "full_sequence",
-            "latent_persistence": True,
-            "typed_consolidation": True,
+            "warmup_write_mode": "full_sequence",
+            "warmup_latent": True,
+            "warmup_cold_start": True,
         },
-        # WM + all tiers, seeded from compressed LTM (not cold start)
-        # Same as above but the model was trained with these features ON,
-        # so episodic slots already exist from training. Eval adds to them.
+        # WM + all tiers, seeded: keep training memory, eval adds to it
         "L6_wm_plus_all_seeded": {
             **base_no_adapt,
             "eval_warmup": True,
-            "consolidation_write": "full_sequence",
-            "latent_persistence": True,
-            "typed_consolidation": True,
-            # The "seeded" part: training had memory enabled, so slots carry over.
-            # This config is identical to L6_wm_plus_all but the distinction
-            # matters if we add pre-eval rehydration later.
+            "warmup_write_mode": "full_sequence",
+            "warmup_latent": True,
+            "warmup_cold_start": False,
         },
     }
     paths = []

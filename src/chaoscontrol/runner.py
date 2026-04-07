@@ -125,6 +125,9 @@ def run_experiment(config_path: str, *, enwik8_path: str, budget_seconds: float 
         metabolic_mode=cfg.metabolic_mode,
         generation_mode=cfg.generation_mode, structured_proj=structured_proj,
         warmup=cfg.eval_warmup,
+        warmup_write_mode=cfg.warmup_write_mode,
+        warmup_latent=cfg.warmup_latent,
+        warmup_cold_start=cfg.warmup_cold_start,
     )
 
     bpb_str = f"bpb={eval_result['bpb']:.4f}"

@@ -60,6 +60,9 @@ class ChaosControlConfig:
 
     # Eval warmup: replay a few training batches before scoring
     eval_warmup: bool = False
+    warmup_write_mode: str = "last"  # "last" or "full_sequence"
+    warmup_latent: bool = False  # try_reactivate on high surprise during warmup
+    warmup_cold_start: bool = False  # True = wipe memory before eval
 
     # Wernicke layer
     wernicke_enabled: bool = False
