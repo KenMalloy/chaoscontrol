@@ -30,8 +30,9 @@ across 3 seeds) and injects its settings into the next layer.
 | L3.5  | 3       | 1     | Dark horses: cross-layer combos the layered design might miss |
 | L4    | 4       | 1     | Scaling: dim 128/256/384 + transformer baseline |
 | L5    | 3       | 1     | Full A-mode at 128/256/384 (30-minute budget) |
+| L6    | 4       | 3     | Inference-time adaptation depth: which memory tiers help at eval |
 
-Total: 24 config templates, 61 runs.
+Total: 28 config templates, 73 runs.
 
 ## Predictions
 
@@ -41,6 +42,8 @@ Total: 24 config templates, 61 runs.
 4. Semantic tier adds measurable improvement over episodic-only
 5. Wernicke with CFR beats plain Wernicke
 6. Full stack scales better than transformer at dim=384
+7. Deeper inference-time adaptation (episodic + semantic + latent) beats WM-only eval
+8. Seeded LTM (compressed memories from training) outperforms cold-start warmup
 
 ## Dependencies
 
@@ -75,3 +78,4 @@ counts, and cross-layer winner progression.
 - If random-gate control matches surprise-gated: the gate timing claim is dead
 - If no memory config beats no-memory: episodic/semantic memory is not load-bearing
 - If transformer beats full stack at dim=384: the SSM architecture thesis fails
+- If wm_only matches wm_plus_all in L6: deeper memory tiers don't help at inference

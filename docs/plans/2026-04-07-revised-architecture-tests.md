@@ -162,9 +162,32 @@ Layer 4 winners rerun on full A-mode at 1800s budget.
 | full_stack_384_full | full | 1800s |
 | transformer_384 | (baseline, reuse L4 result) | — |
 
+### Layer 6: Inference-Time Adaptation Depth (4 configs × 3 seeds)
+Full stack winner. Tests how many memory tiers should participate during eval.
+The SSM recurrence always adapts (it IS working memory). The question is
+whether deeper tiers improve inference when allowed to run during the forward pass.
+
+| Config | What adapts at eval time |
+|--------|------------------------|
+| wm_only | Just the recurrence (standard SSM inference) |
+| wm_plus_episodic | Recurrence + surprise-gated episodic writes |
+| wm_plus_all | Recurrence + episodic + semantic consolidation + latent reactivation |
+| wm_plus_all_seeded | Same, but LTM starts from training (not cold start) |
+
+This layer answers the artifact strategy question: is it worth shipping compressed
+LTM seeds in the artifact (spending budget on memory instead of SSM weights), knowing
+that the model can reconstitute memories during the eval forward pass?
+
 ---
 
-## Total: ~24 configs
+## Total: ~28 configs, ~73 runs
+
+- Layer 1-3: 17 configs × 3 seeds = 51 runs × 300s = 255 min
+- Layer 3.5: 3 configs × 1 seed = 3 runs × 300s = 15 min
+- Layer 4: 4 configs × 1 seed = 4 runs × 300s = 20 min
+- Layer 5: 3 configs × 1 seed = 3 runs × 1800s = 90 min
+- Layer 6: 4 configs × 3 seeds = 12 runs × 300s = 60 min
+- **Total: ~7.3 hours GPU time**
 
 - Layer 1-3: 16 configs × 300s = 80 min
 - Layer 4: 4 configs × 300s = 20 min

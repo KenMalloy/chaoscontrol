@@ -314,6 +314,58 @@ def generate_l5_configs(full_stack: dict) -> list[Path]:
     return paths
 
 
+def generate_l6_configs(full_stack: dict) -> list[Path]:
+    """Generate Layer 6: inference-time adaptation depth.
+
+    Tests how many memory tiers participate during eval.
+    The SSM recurrence always adapts (it IS the working memory).
+    The question is whether deeper tiers (episodic, semantic, latent)
+    improve inference when allowed to run during the eval forward pass.
+    """
+    # Base: full stack but with all eval-time adaptation OFF
+    base_no_adapt = {**full_stack}
+    base_no_adapt["eval_warmup"] = False
+
+    configs = {
+        # WM only: standard SSM inference, no memory writes during eval
+        "L6_wm_only": {
+            **base_no_adapt,
+        },
+        # WM + episodic: surprise-gated episodic writes during eval
+        "L6_wm_plus_episodic": {
+            **base_no_adapt,
+            "eval_warmup": True,
+        },
+        # WM + all tiers: episodic + semantic consolidation + latent reactivation
+        "L6_wm_plus_all": {
+            **base_no_adapt,
+            "eval_warmup": True,
+            "consolidation_write": "full_sequence",
+            "latent_persistence": True,
+            "typed_consolidation": True,
+        },
+        # WM + all tiers, seeded from compressed LTM (not cold start)
+        # Same as above but the model was trained with these features ON,
+        # so episodic slots already exist from training. Eval adds to them.
+        "L6_wm_plus_all_seeded": {
+            **base_no_adapt,
+            "eval_warmup": True,
+            "consolidation_write": "full_sequence",
+            "latent_persistence": True,
+            "typed_consolidation": True,
+            # The "seeded" part: training had memory enabled, so slots carry over.
+            # This config is identical to L6_wm_plus_all but the distinction
+            # matters if we add pre-eval rehydration later.
+        },
+    }
+    paths = []
+    for name, cfg in configs.items():
+        p = CONFIGS / f"{name}.yaml"
+        write_yaml(p, cfg)
+        paths.append(p)
+    return paths
+
+
 def extract_mem_settings(config_path: Path) -> dict:
     """Extract memory-related fields from a config YAML."""
     cfg = yaml.safe_load(config_path.read_text())
@@ -340,7 +392,7 @@ def main():
     parser = argparse.ArgumentParser(description="Layered runner for experiment 09")
     parser.add_argument("--enwik8-path", required=True, help="Path to enwik8 data file")
     parser.add_argument("--budget", type=float, default=300, help="Per-run budget in seconds")
-    parser.add_argument("--start-layer", type=int, default=1, help="Layer to start from (1-5)")
+    parser.add_argument("--start-layer", type=int, default=1, help="Layer to start from (1-6)")
     args = parser.parse_args()
 
     enwik8_path = args.enwik8_path
@@ -467,6 +519,22 @@ def main():
         with open(RESULTS / "L5_summary.json", "w") as f:
             json.dump({"results": {n: {str(s): r for s, r in sr.items()} for n, sr in l5_results.items()}},
                        f, indent=2, default=str)
+
+    # ── Layer 6: Inference-time adaptation depth (4 configs x 3 seeds) ─
+    if args.start_layer <= 6:
+        print("\n" + "=" * 72)
+        print("  LAYER 6: Inference-Time Adaptation Depth")
+        print("=" * 72)
+        l6_configs = generate_l6_configs(full_stack)
+        l6_results = run_layer(l6_configs, enwik8_path, budget, SEEDS, "L6")
+        print_layer_summary("Layer 6: Inference-Time Adaptation Depth", l6_results)
+        l6_winner, l6_mean, l6_std = pick_winner(l6_results)
+        print(f"  >>> L6 winner: {l6_winner} (bpb={l6_mean:.4f} +/- {l6_std:.4f})")
+        summary["L6"] = {"winner": l6_winner, "mean_bpb": l6_mean, "std_bpb": l6_std}
+
+        with open(RESULTS / "L6_summary.json", "w") as f:
+            json.dump({"results": {n: {str(s): r for s, r in sr.items()} for n, sr in l6_results.items()},
+                        "winner": l6_winner}, f, indent=2, default=str)
 
     # ── Final summary ────────────────────────────────────────────────
     print("\n" + "=" * 72)
