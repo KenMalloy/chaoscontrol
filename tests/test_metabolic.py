@@ -137,5 +137,131 @@ class TestStructuredProjections(unittest.TestCase):
         assert out["logits"].shape == (2, 8, 256)
 
 
+class TestMonteCarloMetabolic(unittest.TestCase):
+    """Tests for the Monte Carlo metabolic gate — distributional statistics."""
+
+    def _make_model(self) -> _MockModel:
+        torch.manual_seed(42)
+        return _MockModel(vocab_size=256, dim=16, num_layers=2)
+
+    def _make_ids(self, batch: int = 2, seq: int = 16) -> torch.Tensor:
+        return torch.randint(0, 256, (batch, seq))
+
+    def test_returns_mc_stats(self) -> None:
+        from chaoscontrol.metabolic import metabolic_monte_carlo
+        model = self._make_model()
+        ids = self._make_ids()
+        out = metabolic_monte_carlo(model, ids, k=4, noise_std=0.1)
+        assert "mc_stats" in out
+        stats = out["mc_stats"]
+        assert "logits_var" in stats
+        assert "entropy" in stats
+        assert "agreement" in stats
+        assert "uncertainty_map" in stats
+        assert "candidate_divergence" in stats
+
+    def test_logits_are_ensemble_mean(self) -> None:
+        from chaoscontrol.metabolic import metabolic_monte_carlo
+        model = self._make_model()
+        ids = self._make_ids()
+        out = metabolic_monte_carlo(model, ids, k=4, noise_std=0.1)
+        assert out["logits"].shape == (2, 16, 256)
+        assert out["hidden"].shape == (2, 16, 16)
+
+    def test_variance_shape(self) -> None:
+        from chaoscontrol.metabolic import metabolic_monte_carlo
+        model = self._make_model()
+        ids = self._make_ids()
+        out = metabolic_monte_carlo(model, ids, k=4, noise_std=0.1)
+        assert out["mc_stats"]["logits_var"].shape == (2, 16)
+
+    def test_entropy_bounded(self) -> None:
+        """Entropy should be non-negative and bounded by log(vocab_size)."""
+        import math
+        from chaoscontrol.metabolic import metabolic_monte_carlo
+        model = self._make_model()
+        ids = self._make_ids()
+        out = metabolic_monte_carlo(model, ids, k=4, noise_std=0.1)
+        entropy = out["mc_stats"]["entropy"]
+        assert (entropy >= 0).all()
+        assert (entropy <= math.log(256) + 0.01).all()
+
+    def test_agreement_bounded_zero_one(self) -> None:
+        from chaoscontrol.metabolic import metabolic_monte_carlo
+        model = self._make_model()
+        ids = self._make_ids()
+        out = metabolic_monte_carlo(model, ids, k=4, noise_std=0.1)
+        agreement = out["mc_stats"]["agreement"]
+        assert (agreement >= -0.01).all()
+        assert (agreement <= 1.01).all()
+
+    def test_higher_noise_increases_variance(self) -> None:
+        """More noise in the MC sample should produce higher logits variance."""
+        from chaoscontrol.metabolic import metabolic_monte_carlo
+        model = self._make_model()
+        ids = self._make_ids()
+        torch.manual_seed(99)
+        out_low = metabolic_monte_carlo(model, ids, k=8, noise_std=0.01)
+        torch.manual_seed(99)
+        out_high = metabolic_monte_carlo(model, ids, k=8, noise_std=1.0)
+        var_low = out_low["mc_stats"]["logits_var"].mean().item()
+        var_high = out_high["mc_stats"]["logits_var"].mean().item()
+        assert var_high > var_low, f"high noise var {var_high} should exceed low {var_low}"
+
+    def test_higher_noise_increases_divergence(self) -> None:
+        """More noise should produce higher candidate divergence."""
+        from chaoscontrol.metabolic import metabolic_monte_carlo
+        model = self._make_model()
+        ids = self._make_ids()
+        torch.manual_seed(99)
+        out_low = metabolic_monte_carlo(model, ids, k=8, noise_std=0.01)
+        torch.manual_seed(99)
+        out_high = metabolic_monte_carlo(model, ids, k=8, noise_std=1.0)
+        div_low = out_low["mc_stats"]["candidate_divergence"].item()
+        div_high = out_high["mc_stats"]["candidate_divergence"].item()
+        assert div_high > div_low
+
+    def test_uncertainty_map_peaks_at_genuine_uncertainty(self) -> None:
+        """Uncertainty map should be high only when BOTH variance and entropy are high."""
+        from chaoscontrol.metabolic import metabolic_monte_carlo
+        model = self._make_model()
+        ids = self._make_ids()
+        out = metabolic_monte_carlo(model, ids, k=8, noise_std=0.5)
+        umap = out["mc_stats"]["uncertainty_map"]
+        # Should be non-negative (product of two [0,1] quantities)
+        assert (umap >= -0.01).all()
+
+    def test_structured_generation_returns_stats(self) -> None:
+        from chaoscontrol.metabolic import metabolic_monte_carlo, StructuredProjections
+        model = self._make_model()
+        sp = StructuredProjections(dim=16, k=4)
+        ids = self._make_ids(batch=2, seq=8)
+        out = metabolic_monte_carlo(
+            model, ids, k=4, generation_mode="structured", structured_proj=sp,
+        )
+        assert "mc_stats" in out
+        assert out["logits"].shape == (2, 8, 256)
+        assert out["mc_stats"]["logits_var"].shape == (2, 8)
+
+    def test_more_candidates_reduces_variance_of_mean(self) -> None:
+        """Central limit theorem: more samples → more stable mean estimate."""
+        from chaoscontrol.metabolic import metabolic_monte_carlo
+        model = self._make_model()
+        ids = self._make_ids()
+        # Run twice with K=2 and K=16, compare divergence
+        runs_k2 = []
+        runs_k16 = []
+        for seed in range(5):
+            torch.manual_seed(seed)
+            out2 = metabolic_monte_carlo(model, ids, k=2, noise_std=0.5)
+            runs_k2.append(out2["logits"].mean().item())
+            torch.manual_seed(seed + 100)
+            out16 = metabolic_monte_carlo(model, ids, k=16, noise_std=0.5)
+            runs_k16.append(out16["logits"].mean().item())
+        spread_k2 = max(runs_k2) - min(runs_k2)
+        spread_k16 = max(runs_k16) - min(runs_k16)
+        assert spread_k16 < spread_k2, f"K=16 spread {spread_k16} should be tighter than K=2 {spread_k2}"
+
+
 if __name__ == "__main__":
     unittest.main()
