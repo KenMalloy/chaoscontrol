@@ -15,7 +15,7 @@ import torch.nn.functional as F
 from chaoscontrol.config import ChaosControlConfig
 from chaoscontrol.core import criticality_loss
 from chaoscontrol.data import batch_from_starts, maybe_autocast, maybe_sync_cuda
-from chaoscontrol.metabolic import metabolic_fork, StructuredProjections
+from chaoscontrol.metabolic import metabolic_fork, metabolic_monte_carlo, StructuredProjections
 from chaoscontrol.memory import MultiSlotOuterModel
 
 
@@ -43,6 +43,7 @@ def train_chaoscontrol_for_budget(
     metabolic_score: str = "memory_consistency",
     metabolic_noise_std: float = 0.01,
     generation_mode: str = "noise",
+    metabolic_mode: str = "fork",
 ) -> dict[str, Any]:
     """Train ChaosStudentLM for a time budget with optional criticality regularization."""
     # Set up structured projections if requested (before optimizer so its params are included)
@@ -70,6 +71,9 @@ def train_chaoscontrol_for_budget(
     last_forked = False
     pre_fork_loss: float = 0.0  # loss BEFORE the fork, for adaptive comparison
     ce_val_prev: float = loss_ema  # previous step's loss, for adaptive threshold
+    spectral_snapshots: list[dict[str, Any]] = []
+    bucket_snapshots: list[dict[str, Any]] = []
+    spectral_log_interval = 50
 
     model.train()
 
@@ -97,8 +101,8 @@ def train_chaoscontrol_for_budget(
 
         optimizer.zero_grad(set_to_none=True)
         with maybe_autocast(device, param_dtype):
-            if use_fork:
-                # Expensive path: generation + selection
+            if use_fork and metabolic_mode == "fork":
+                # Pick-best path: generation + selection
                 out = metabolic_fork(
                     model, inputs,
                     k=metabolic_k,
@@ -108,23 +112,59 @@ def train_chaoscontrol_for_budget(
                     structured_proj=structured_proj,
                 )
                 fork_count += 1
-                # Forked path doesn't produce jacobian_stats, so run a cheap
-                # stats-only pass on the winning output for consistent L_crit
                 if use_crit:
                     with torch.no_grad():
                         stats_out = model(inputs, return_jacobian_stats=True)
                         if "jacobian_stats" in stats_out:
                             out["jacobian_stats"] = stats_out["jacobian_stats"]
             else:
-                # Cheap path: single deterministic pass
+                # Cheap deterministic pass (always — MC mode uses this as the base)
                 out = model(inputs, return_jacobian_stats=use_crit)
-            ce_loss = F.cross_entropy(out["logits"].reshape(-1, vocab_size), targets.reshape(-1))
+
+            # Monte Carlo path: sample the possibility space on surprise,
+            # use distributional stats to weight the gradient — no winner picked
+            mc_stats = None
+            if use_fork and metabolic_mode == "monte_carlo":
+                fork_count += 1
+                with torch.no_grad():
+                    mc_out = metabolic_monte_carlo(
+                        model, inputs,
+                        k=metabolic_k,
+                        noise_std=metabolic_noise_std,
+                        generation_mode=generation_mode,
+                        structured_proj=structured_proj,
+                    )
+                    mc_stats = mc_out["mc_stats"]
+
+            # Compute loss — MC mode weights per-token CE by uncertainty
+            if mc_stats is not None:
+                # Per-token CE weighted by uncertainty map
+                per_token_ce = F.cross_entropy(
+                    out["logits"].reshape(-1, vocab_size), targets.reshape(-1), reduction="none",
+                ).reshape(inputs.size(0), -1)  # (batch, seq)
+                umap = mc_stats["uncertainty_map"]  # (batch, seq)
+                # Scale: mean weight = 1.0, uncertain tokens get up to 2x
+                weights = 1.0 + umap / (umap.mean() + 1e-8)
+                ce_loss = (per_token_ce * weights).mean()
+            else:
+                ce_loss = F.cross_entropy(out["logits"].reshape(-1, vocab_size), targets.reshape(-1))
             loss = ce_loss
             if use_crit and "jacobian_stats" in out:
-                loss = loss + criticality_loss(
-                    out["jacobian_stats"], alpha=crit_reg_alpha, beta=crit_reg_beta,
-                    target_log_sv=math.log(crit_target_coupling),
-                )
+                if "per_layer_jacobian_stats" in out:
+                    # Dynamic per-layer criticality: linearly spaced targets
+                    n_layers = len(out["per_layer_jacobian_stats"])
+                    spread = 0.04  # +/- around global target
+                    for li, layer_stats in enumerate(out["per_layer_jacobian_stats"]):
+                        layer_target = crit_target_coupling - spread + 2 * spread * li / max(n_layers - 1, 1)
+                        loss = loss + criticality_loss(
+                            layer_stats, alpha=crit_reg_alpha / n_layers, beta=crit_reg_beta / n_layers,
+                            target_log_sv=math.log(layer_target),
+                        )
+                else:
+                    loss = loss + criticality_loss(
+                        out["jacobian_stats"], alpha=crit_reg_alpha, beta=crit_reg_beta,
+                        target_log_sv=math.log(crit_target_coupling),
+                    )
             # Wernicke balance loss
             if "balance_loss" in out and model.wernicke is not None:
                 loss = loss + model.wernicke_balance_weight * out["balance_loss"]
@@ -141,6 +181,55 @@ def train_chaoscontrol_for_budget(
         if use_fork:
             pre_fork_loss = ce_val_prev  # save loss BEFORE this fork for next step's comparison
         step_record: dict[str, Any] = {"step": float(steps), "loss": ce_val, "forked": use_fork}
+        if metabolic_gate:
+            step_record["threshold"] = current_threshold
+            step_record["surprise_ratio"] = surprise_ratio
+            step_record["metabolic_mode"] = metabolic_mode
+        if mc_stats is not None:
+            step_record["mc_variance"] = float(mc_stats["logits_var"].mean().cpu())
+            step_record["mc_entropy"] = float(mc_stats["entropy"].mean().cpu())
+            step_record["mc_divergence"] = float(mc_stats["candidate_divergence"].cpu())
+
+        # Spectral logging: FFT power spectrum + Jacobian stats snapshot
+        if steps % spectral_log_interval == 0 and "hidden" in out and not use_fork:
+            with torch.no_grad():
+                h = out["hidden"].detach().float()  # (batch, seq, dim)
+                spec = torch.fft.rfft(h, dim=1)  # (batch, seq//2+1, dim)
+                power = spec.abs().pow(2).mean(dim=(0, 2))  # (seq//2+1,)
+                snapshot: dict[str, Any] = {
+                    "step": int(steps),
+                    "power_spectrum": power.cpu().tolist(),
+                    "dominant_freq": int(power[1:].argmax().item()) + 1,
+                }
+                if "jacobian_stats" in out:
+                    snapshot["lambda_max"] = float(out["jacobian_stats"]["lambda_max"].cpu())
+                    snapshot["sv_log_var"] = float(out["jacobian_stats"]["sv_log_var"].cpu())
+                if "per_layer_jacobian_stats" in out:
+                    snapshot["per_layer_lambda_max"] = [
+                        float(s["lambda_max"].cpu()) for s in out["per_layer_jacobian_stats"]
+                    ]
+                # Semantic/episodic divergence snapshot
+                if (
+                    hasattr(model, "semantic_tier") and model.semantic_tier is not None
+                    and hasattr(model, "outer_model") and model.outer_model is not None
+                    and hasattr(model.outer_model, "_slots") and model.outer_model._slots
+                ):
+                    semantic_norm = float(model.semantic_tier.bases.norm().cpu())
+                    episodic_norm = float(torch.cat(model.outer_model._slots, dim=0).norm().cpu())
+                    snapshot["semantic_norm"] = semantic_norm
+                    snapshot["episodic_norm"] = episodic_norm
+                spectral_snapshots.append(snapshot)
+
+        # Bucket distribution logging (Wernicke typed composition)
+        if steps % spectral_log_interval == 0 and "bucket_ids" in out:
+            with torch.no_grad():
+                bids = out["bucket_ids"].detach().reshape(-1)
+                counts = torch.bincount(bids, minlength=model.wernicke.k_max if model.wernicke else 1)
+                bucket_snapshots.append({
+                    "step": int(steps),
+                    "bucket_counts": counts.cpu().tolist(),
+                    "active_buckets": int((counts > 0).sum().item()),
+                })
 
         # Outer model consolidation (after optimizer step)
         if model.outer_model is not None:
@@ -152,8 +241,9 @@ def train_chaoscontrol_for_budget(
                 ).reshape(inputs.size(0), -1).mean(dim=1)  # (batch,)
             hidden = out["hidden"][:, -1, :].detach()  # (batch, dim)
             # Determine dominant bucket_id from Wernicke layer for typed writes
+            # Only pass bucket_id when typed_storage is enabled
             dominant_bucket: int | None = None
-            if "bucket_ids" in out:
+            if "bucket_ids" in out and getattr(model, "typed_storage", False):
                 bids = out["bucket_ids"].detach()  # (batch, seq)
                 flat_ids = bids.reshape(-1)
                 dominant_bucket = int(flat_ids.mode().values.item())
@@ -162,6 +252,20 @@ def train_chaoscontrol_for_budget(
                 bucket_id=dominant_bucket,
             )
             step_record["surprise"] = float(surprise)
+
+            # Compression consequence: feed merge quality back to Wernicke
+            # Only when compression_consequence flag is explicitly enabled
+            if (
+                getattr(model, "compression_consequence", False)
+                and hasattr(model.outer_model, "_compression_consequences")
+                and model.outer_model._compression_consequences
+                and model.wernicke is not None
+            ):
+                for bucket_id, quality_delta in model.outer_model._compression_consequences:
+                    model.wernicke.compression_consequence_update(bucket_id, quality_delta)
+                model.outer_model._compression_consequences.clear()
+            elif hasattr(model.outer_model, "_compression_consequences"):
+                model.outer_model._compression_consequences.clear()
 
         # Semantic tier consolidation: extract gist from recent episodic slots
         if (
@@ -172,9 +276,18 @@ def train_chaoscontrol_for_budget(
             and hasattr(model.outer_model, "_slots")
             and model.outer_model._slots
         ):
-            recent_slots = torch.cat(model.outer_model._slots[-5:], dim=0)  # (N, outer_dim)
-            # Decode slots back to model_dim for semantic tier encoder
-            recent_decoded = model.outer_model.decoder(recent_slots)  # (N, model_dim)
+            if getattr(model, "typed_consolidation", False) and dominant_bucket is not None:
+                # Type-aware: only consolidate slots matching dominant bucket
+                matching = [
+                    s for s, b in zip(model.outer_model._slots, model.outer_model._slot_buckets)
+                    if b == dominant_bucket
+                ]
+                slots_for_consolidation = matching[-5:] if matching else model.outer_model._slots[-5:]
+            else:
+                # Untyped: use all recent slots
+                slots_for_consolidation = model.outer_model._slots[-5:]
+            recent_slots = torch.cat(slots_for_consolidation, dim=0)
+            recent_decoded = model.outer_model.decoder(recent_slots)
             model.semantic_tier.consolidate_from_episodes(recent_decoded)
 
         history.append(step_record)
@@ -187,6 +300,9 @@ def train_chaoscontrol_for_budget(
         "elapsed_s": float(time.perf_counter() - start_time),
         "fork_count": fork_count,
         "extra_params": sum(p.numel() for p in structured_proj.parameters()) if structured_proj else 0,
+        "structured_proj": structured_proj,
+        "spectral_snapshots": spectral_snapshots,
+        "bucket_snapshots": bucket_snapshots,
     }
 
 

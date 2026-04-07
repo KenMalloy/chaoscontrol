@@ -1,5 +1,5 @@
-# Requires code modification — different criticality targets per layer.
-# Tests dynamic criticality — do subsystems tune differently?
+# Per-layer criticality targets: linearly spaced around global target.
+# Tests whether different layers should operate at different criticality levels.
 a_mode: full
 rich_b_mode: hub
 outer_model_dim: 64

@@ -5,7 +5,7 @@ from dataclasses import dataclass
 class ChaosControlConfig:
     enwik8_path: str
     device: str = "auto"
-    dtype: str = "fp16"
+    dtype: str = "bf16"
     seed: int = 1337
     output_json: str | None = None
 
@@ -13,10 +13,10 @@ class ChaosControlConfig:
     model_dim: int = 128
     num_layers: int = 4
     ff_mult: int = 2
-    seq_len: int = 128
-    stride: int = 64
-    batch_size: int = 4
-    eval_batches: int = 8
+    seq_len: int = 256
+    stride: int = 128
+    batch_size: int = 64
+    eval_batches: int = 32
 
     a_mode: str = "diag"  # "diag", "paired", "full"
     a_full_rank: int = 8
@@ -43,6 +43,7 @@ class ChaosControlConfig:
     metabolic_threshold_mode: str = "fixed"  # "fixed" or "adaptive"
     metabolic_score: str = "memory_consistency"  # "memory_consistency", "loss_lookahead", "ensemble_agreement"
     metabolic_noise_std: float = 0.01  # perturbation magnitude for candidates
+    metabolic_mode: str = "fork"  # "fork" (pick-best) or "monte_carlo" (distributional stats)
 
     # Wernicke layer
     wernicke_enabled: bool = False
@@ -73,3 +74,4 @@ class ChaosControlConfig:
     # Gap analysis flags
     cue_projection: bool = True  # False = use raw recurrence state as retrieval key
     dynamic_crit_per_layer: bool = False
+    compression_selection: str = "survival"  # "survival" or "random" — controls slot merge ordering

@@ -1,6 +1,6 @@
-# Requires code modification — see design doc.
 # Survival scoring vs random during compression.
 # Is impact-based retention doing real work?
+compression_selection: random
 a_mode: full
 rich_b_mode: hub
 outer_model_dim: 64

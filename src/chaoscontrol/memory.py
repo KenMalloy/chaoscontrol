@@ -6,6 +6,7 @@ MultiSlotOuterModel -- multi-slot variant with cue-dependent retrieval, survival
 """
 from __future__ import annotations
 
+import random as _random
 from collections import defaultdict
 from typing import Any
 
@@ -71,7 +72,7 @@ class OuterModel(nn.Module):
 
     def read(self, batch_size: int) -> torch.Tensor:
         """Lossy decode. Expand state to batch and project back to model_dim."""
-        return self.decoder(self.state.expand(batch_size, -1))
+        return self.decoder(self.state.expand(batch_size, -1).to(dtype=self.decoder.weight.dtype))
 
     def write(self, h: torch.Tensor, *, per_sample_weights: torch.Tensor | None = None) -> None:
         """Lossy encode. Weighted average across batch, accumulate with inertia.
@@ -79,7 +80,8 @@ class OuterModel(nn.Module):
         If per_sample_weights is provided (batch,), samples with higher weight
         contribute more to the stored memory — e.g. weight by per-sample surprise.
         """
-        encoded = torch.tanh(self.encoder(h.detach()))
+        h_enc = h.detach().to(dtype=self.encoder.weight.dtype)
+        encoded = torch.tanh(self.encoder(h_enc))
         if per_sample_weights is not None:
             w = per_sample_weights.detach()
             w = w / w.sum().clamp_min(1e-8)  # normalize to sum to 1
@@ -208,6 +210,7 @@ class MultiSlotOuterModel(nn.Module):
         trigger_window: int = 8,
         max_slots: int = 64,
         compress_ratio: int = 2,
+        compression_selection: str = "survival",
     ) -> None:
         super().__init__()
         self.model_dim = model_dim
@@ -218,6 +221,8 @@ class MultiSlotOuterModel(nn.Module):
         self.trigger_window = trigger_window
         self.max_slots = max_slots
         self.compress_ratio = max(2, compress_ratio)
+        self.compression_selection = compression_selection
+        self._compress_rng = _random.Random(42)  # seeded for reproducibility
 
         # Trigger state
         self._spike_seen = False
@@ -247,6 +252,7 @@ class MultiSlotOuterModel(nn.Module):
         self._survival: list[float] = []             # per-slot survival score
         self._slot_buckets: list[int] = []           # per-slot bucket type from Wernicke
         self._retrieval_weights: torch.Tensor | None = None  # cached from last read
+        self._compression_consequences: list[tuple[int, float]] = []  # (bucket_id, quality_delta)
 
     def get_extra_state(self) -> dict:
         """Persist slots, survival scores, and bucket assignments in state_dict."""
@@ -290,7 +296,7 @@ class MultiSlotOuterModel(nn.Module):
             retrieved = slot_matrix.mean(dim=0, keepdim=True).expand(batch_size, -1)
             self._retrieval_weights = None
 
-        return self.decoder(retrieved)
+        return self.decoder(retrieved.to(dtype=self.decoder.weight.dtype))
 
     def write(
         self,
@@ -305,7 +311,8 @@ class MultiSlotOuterModel(nn.Module):
         Wernicke layer. Typed slots are only merged with same-type slots during
         compression.
         """
-        encoded = torch.tanh(self.encoder(h.detach()))
+        h_enc = h.detach().to(dtype=self.encoder.weight.dtype)
+        encoded = torch.tanh(self.encoder(h_enc))
         if per_sample_weights is not None:
             w = per_sample_weights.detach()
             w = w / w.sum().clamp_min(1e-8)
@@ -375,8 +382,12 @@ class MultiSlotOuterModel(nn.Module):
 
             for bucket_id, group_indices in bucket_groups.items():
                 if len(group_indices) >= self.compress_ratio:
-                    # Sort by survival ascending, merge the lowest
-                    group_sorted = sorted(group_indices, key=lambda i: old_survival[i])
+                    # Sort by survival ascending (or random for ablation), merge the lowest
+                    if self.compression_selection == "random":
+                        group_sorted = list(group_indices)
+                        self._compress_rng.shuffle(group_sorted)
+                    else:
+                        group_sorted = sorted(group_indices, key=lambda i: old_survival[i])
                     merge_count = min(self.compress_ratio, len(group_sorted))
                     to_merge = group_sorted[:merge_count]
                     to_keep = group_sorted[merge_count:]
@@ -388,6 +399,11 @@ class MultiSlotOuterModel(nn.Module):
                     weights = weights / weights.sum()
                     merged_slot = sum(w.item() * t for w, t in zip(weights, merged_tensors))
                     merged_score = sum(merged_survivals) / len(merged_survivals)
+
+                    # Compression consequence: how much info was lost?
+                    original_mean = sum(merged_tensors) / len(merged_tensors)
+                    quality_delta = -float((merged_slot - original_mean).norm())
+                    self._compression_consequences.append((bucket_id, quality_delta))
 
                     for i in sorted(to_keep):
                         kept_slots.append(old_slots[i])
@@ -407,8 +423,12 @@ class MultiSlotOuterModel(nn.Module):
             self._survival = kept_survival + new_survival
             self._slot_buckets = kept_buckets + new_buckets
         else:
-            # Untyped compression: original behavior
-            indices = sorted(range(n_old), key=lambda i: old_survival[i])
+            # Untyped compression: sort by survival (or random for ablation)
+            if self.compression_selection == "random":
+                indices = list(range(n_old))
+                self._compress_rng.shuffle(indices)
+            else:
+                indices = sorted(range(n_old), key=lambda i: old_survival[i])
             merge_count = min(self.compress_ratio, n_old)
             to_merge_idx = indices[:merge_count]
             to_keep_idx = indices[merge_count:]
@@ -537,5 +557,5 @@ class SemanticTier(nn.Module):
         Args:
             episode_vectors: (N, model_dim) — recent episodic slot contents
         """
-        encoded = self.encoder(episode_vectors.detach()).mean(dim=0, keepdim=True)
+        encoded = self.encoder(episode_vectors.detach().to(dtype=self.encoder.weight.dtype)).mean(dim=0, keepdim=True)
         self.bases = ((1 - self.update_rate) * self.bases.detach() + self.update_rate * encoded).detach()

@@ -104,6 +104,7 @@ class ChaosStudentLM(nn.Module):
         compression_consequence: bool = False,
         cue_projection: bool = True,
         dynamic_crit_per_layer: bool = False,
+        compression_selection: str = "survival",
     ) -> None:
         super().__init__()
         self.vocab_size = vocab_size
@@ -152,6 +153,7 @@ class ChaosStudentLM(nn.Module):
                     dim, outer_dim=outer_model_dim,
                     max_slots=outer_max_slots,
                     compress_ratio=outer_compress_ratio,
+                    compression_selection=compression_selection,
                     **common_kw,
                 )
             else:
@@ -229,4 +231,6 @@ class ChaosStudentLM(nn.Module):
             for key in all_stats[0]:
                 merged[key] = torch.stack([s[key] for s in all_stats]).mean()
             out["jacobian_stats"] = merged
+            if self.dynamic_crit_per_layer:
+                out["per_layer_jacobian_stats"] = all_stats
         return out

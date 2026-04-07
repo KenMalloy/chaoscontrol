@@ -61,6 +61,7 @@ def build_model(cfg: ChaosControlConfig, device: torch.device, param_dtype: torc
             compression_consequence=cfg.compression_consequence,
             cue_projection=cfg.cue_projection,
             dynamic_crit_per_layer=cfg.dynamic_crit_per_layer,
+            compression_selection=cfg.compression_selection,
         )
     model = model.to(device)
     if device.type == "cuda":
@@ -73,6 +74,11 @@ def run_experiment(config_path: str, *, enwik8_path: str, budget_seconds: float 
     device = resolve_device(cfg.device)
     param_dtype = resolve_param_dtype(cfg.dtype, device)
 
+    # H100 optimizations
+    if device.type == "cuda":
+        torch.backends.cudnn.benchmark = True
+        torch.set_float32_matmul_precision("high")
+
     train_tokens, val_tokens, _test = prepare_tokenized_enwik8_splits(
         Path(cfg.enwik8_path), device=device,
     )
@@ -83,6 +89,7 @@ def run_experiment(config_path: str, *, enwik8_path: str, budget_seconds: float 
     model = build_model(cfg, device, param_dtype)
     params = sum(p.numel() for p in model.parameters())
     print(f"Model: {cfg.model_type} | dim={cfg.model_dim} | params={params:,} | {model.artifact_bytes() if hasattr(model, 'artifact_bytes') else params*2:,} bytes")
+
 
     train_result = train_chaoscontrol_for_budget(
         model, train_tokens=train_tokens, train_starts=train_starts,
@@ -99,14 +106,24 @@ def run_experiment(config_path: str, *, enwik8_path: str, budget_seconds: float 
         metabolic_score=cfg.metabolic_score,
         metabolic_noise_std=cfg.metabolic_noise_std,
         generation_mode=cfg.generation_mode,
+        metabolic_mode=cfg.metabolic_mode,
     )
+
+    # Use the trained structured_proj (not a fresh random one)
+    structured_proj = train_result.get("structured_proj")
 
     eval_result = evaluate_chaoscontrol_bpb(
         model, tokens=val_tokens, eval_starts=eval_starts,
         batch_size=cfg.batch_size, seq_len=cfg.seq_len, device=device,
+        metabolic_gate=cfg.metabolic_gate, metabolic_k=cfg.metabolic_k,
+        metabolic_score=cfg.metabolic_score, metabolic_noise_std=cfg.metabolic_noise_std,
+        generation_mode=cfg.generation_mode, structured_proj=structured_proj,
     )
 
-    print(f"Result: bpb={eval_result['bpb']:.4f} | steps={train_result['steps']} | {train_result['elapsed_s']:.1f}s")
+    bpb_str = f"bpb={eval_result['bpb']:.4f}"
+    if "bpb_gated" in eval_result:
+        bpb_str += f" bpb_gated={eval_result['bpb_gated']:.4f}"
+    print(f"Result: {bpb_str} | steps={train_result['steps']} | {train_result['elapsed_s']:.1f}s")
 
     total_params = params + train_result.get("extra_params", 0)
     return {
