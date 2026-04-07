@@ -27,6 +27,10 @@ from pathlib import Path
 
 import yaml
 
+# Local statistical utilities (pure Python, no scipy dependency)
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from stats import bootstrap_ci, cohens_d, sem as compute_sem, welch_ttest
+
 REPO = Path(__file__).resolve().parents[2]
 CONFIGS = Path(__file__).resolve().parent / "configs"
 RESULTS = Path(__file__).resolve().parent / "results"
@@ -83,48 +87,127 @@ def run_layer(config_paths: list[Path], data_path: str, budget: float,
     return results
 
 
-def pick_winner(layer_results: dict) -> tuple[str, float, float]:
-    """Pick config with lowest mean bpb across seeds.  Returns (name, mean, std).
+def pick_winner(layer_results: dict) -> tuple[str, float, float, dict]:
+    """Pick config with lowest mean bpb across seeds.
 
-    Prefers ``bpb_gated`` when available (metabolic gate was active during eval),
-    falling back to plain ``bpb`` otherwise.
+    Returns (name, mean, std, stats_info) where *stats_info* contains:
+        - ``significant``: bool -- winner significantly better than runner-up
+        - ``p_value``: float -- Welch t-test p-value vs runner-up
+        - ``ci_95``: tuple[float, float] -- 95 % bootstrap CI for winner mean
+        - ``effect_size``: float -- Cohen's d between winner and runner-up
+        - ``n_seeds``: int
+
+    Prefers ``bpb_gated`` when available (metabolic gate was active during
+    eval), falling back to plain ``bpb`` otherwise.
     """
-    stats: dict[str, tuple[float, float]] = {}
+    per_config: dict[str, list[float]] = {}
     for name, seed_results in layer_results.items():
         bpbs = []
         for r in seed_results.values():
             ev = r["eval"]
             bpbs.append(ev.get("bpb_gated", ev["bpb"]))
-        mean = statistics.mean(bpbs)
-        std = statistics.stdev(bpbs) if len(bpbs) > 1 else 0.0
-        stats[name] = (mean, std)
-    winner = min(stats, key=lambda k: stats[k][0])
-    return winner, stats[winner][0], stats[winner][1]
+        per_config[name] = bpbs
+
+    # Sort configs by mean bpb (ascending -- lower is better)
+    ranked = sorted(per_config.items(), key=lambda kv: statistics.mean(kv[1]))
+    winner_name, winner_bpbs = ranked[0]
+    winner_mean = statistics.mean(winner_bpbs)
+    winner_std = statistics.stdev(winner_bpbs) if len(winner_bpbs) > 1 else 0.0
+
+    # Significance vs runner-up
+    stats_info: dict = {
+        "significant": False,
+        "p_value": 1.0,
+        "ci_95": bootstrap_ci(winner_bpbs),
+        "effect_size": 0.0,
+        "n_seeds": len(winner_bpbs),
+    }
+
+    if len(ranked) >= 2:
+        runner_bpbs = ranked[1][1]
+        if len(winner_bpbs) >= 2 and len(runner_bpbs) >= 2:
+            _t, p = welch_ttest(winner_bpbs, runner_bpbs)
+            d = cohens_d(winner_bpbs, runner_bpbs)
+            stats_info["p_value"] = p
+            stats_info["effect_size"] = d
+            stats_info["significant"] = p < 0.05
+            if p >= 0.05:
+                print(
+                    f"  WARNING: winner {winner_name} is NOT significantly "
+                    f"better than runner-up {ranked[1][0]} "
+                    f"(p={p:.4f}, Cohen's d={d:.2f})"
+                )
+        else:
+            print(
+                f"  WARNING: cannot test significance with n<2 seeds "
+                f"(winner n={len(winner_bpbs)}, runner-up n={len(runner_bpbs)})"
+            )
+
+    return winner_name, winner_mean, winner_std, stats_info
 
 
 def print_layer_summary(layer_name: str, layer_results: dict):
-    """Print a ranked table for the layer."""
+    """Print a ranked table with SEM, bootstrap 95% CI, and significance."""
+    # Collect per-config bpbs and compute statistics
     rows = []
+    per_config_bpbs: dict[str, list[float]] = {}
     for name, seed_results in layer_results.items():
         bpbs = [r["eval"].get("bpb_gated", r["eval"]["bpb"]) for r in seed_results.values()]
+        per_config_bpbs[name] = bpbs
         mean = statistics.mean(bpbs)
-        std = statistics.stdev(bpbs) if len(bpbs) > 1 else 0.0
-        rows.append((name, mean, std, len(bpbs)))
+        se = compute_sem(bpbs)
+        ci = bootstrap_ci(bpbs)
+        rows.append((name, mean, se, ci, len(bpbs), bpbs))
     rows.sort(key=lambda r: r[1])
-    print(f"\n{'=' * 72}")
-    print(f"  {layer_name} — ranked by mean bpb")
-    print(f"{'=' * 72}")
-    print(f"  {'Config':<40} {'Mean BPB':>10} {'Std':>8} {'Seeds':>6}")
-    print(f"  {'-' * 66}")
-    for name, mean, std, n in rows:
-        flag = " *" if name == rows[0][0] else ""
-        print(f"  {name:<40} {mean:10.4f} {std:8.4f} {n:6}{flag}")
-    # Warn if top-2 have overlapping standard errors
-    if len(rows) >= 2:
-        m1, s1 = rows[0][1], rows[0][2]
-        m2, s2 = rows[1][1], rows[1][2]
-        if m1 + s1 > m2 - s2:
-            print(f"  *** WARNING: top-2 ({rows[0][0]}, {rows[1][0]}) have overlapping SE")
+
+    # Compute significance of each config vs the winner (row 0)
+    sig_labels: dict[str, str] = {}
+    winner_bpbs = rows[0][5] if rows else []
+    for name, _mean, _se, _ci, n, bpbs in rows:
+        if name == rows[0][0]:
+            # Winner: test vs runner-up
+            if len(rows) >= 2:
+                runner_bpbs = rows[1][5]
+                if len(winner_bpbs) >= 2 and len(runner_bpbs) >= 2:
+                    _t, p = welch_ttest(winner_bpbs, runner_bpbs)
+                    sig_labels[name] = "**" if p < 0.01 else ("*" if p < 0.05 else "ns")
+                else:
+                    sig_labels[name] = "n<2"
+            else:
+                sig_labels[name] = ""
+        else:
+            if len(winner_bpbs) >= 2 and len(bpbs) >= 2:
+                _t, p = welch_ttest(bpbs, winner_bpbs)
+                sig_labels[name] = "**" if p < 0.01 else ("*" if p < 0.05 else "ns")
+            else:
+                sig_labels[name] = "n<2"
+
+    print(f"\n  {layer_name}")
+    print(f"  {'=' * 78}")
+    hdr = (
+        f"  {'Config':<36} {'Sig':>4} {'Mean BPB':>10} {'SEM':>9}"
+        f"  {'95% CI':>20} {'Seeds':>6}"
+    )
+    print(hdr)
+    print(f"  {'-' * 78}")
+    for name, mean, se, ci, n, _bpbs in rows:
+        sig = sig_labels.get(name, "")
+        ci_str = f"[{ci[0]:.4f}, {ci[1]:.4f}]"
+        print(
+            f"  {name:<36} {sig:>4} {mean:10.4f} +/-{se:.4f}"
+            f"  {ci_str:>20} {n:6}"
+        )
+
+    # Winner line with effect-size summary
+    if len(rows) >= 2 and len(rows[0][5]) >= 2 and len(rows[1][5]) >= 2:
+        _t, p = welch_ttest(rows[0][5], rows[1][5])
+        d = cohens_d(rows[0][5], rows[1][5])
+        print(
+            f"  Winner: {rows[0][0]} "
+            f"(p={p:.4f} vs runner-up, Cohen's d={d:.2f})"
+        )
+    elif rows:
+        print(f"  Winner: {rows[0][0]} (significance not testable, n<2)")
     print()
 
 
@@ -545,7 +628,7 @@ def main():
         l0_configs = generate_l0_configs()
         l0_results = run_layer(l0_configs, data_path, budget, SEEDS, "L0")
         print_layer_summary("Layer 0: Tokenizer Architecture", l0_results)
-        l0_winner, l0_mean, l0_std = pick_winner(l0_results)
+        l0_winner, l0_mean, l0_std, l0_stats = pick_winner(l0_results)
         print(f"  >>> L0 winner: {l0_winner} (bpb={l0_mean:.4f} +/- {l0_std:.4f})")
         summary["L0"] = {"winner": l0_winner, "mean_bpb": l0_mean, "std_bpb": l0_std}
 
@@ -585,7 +668,7 @@ def main():
         l05_configs = generate_l05_configs(tokenizer_settings)
         l05_results = run_layer(l05_configs, data_path, budget, SEEDS, "L0.5")
         print_layer_summary("Layer 0.5: Codebook Alignment", l05_results)
-        l05_winner, l05_mean, l05_std = pick_winner(l05_results)
+        l05_winner, l05_mean, l05_std, l05_stats = pick_winner(l05_results)
         print(f"  >>> L0.5 winner: {l05_winner} (bpb={l05_mean:.4f} +/- {l05_std:.4f})")
         summary["L0.5"] = {"winner": l05_winner, "mean_bpb": l05_mean, "std_bpb": l05_std}
 
@@ -614,7 +697,7 @@ def main():
         l1_configs = sorted(CONFIGS.glob("L1_*.yaml"))
         l1_results = run_layer(l1_configs, data_path, budget, SEEDS, "L1")
         print_layer_summary("Layer 1: Gate Modes", l1_results)
-        l1_winner, l1_mean, l1_std = pick_winner(l1_results)
+        l1_winner, l1_mean, l1_std, l1_stats = pick_winner(l1_results)
         print(f"  >>> L1 winner: {l1_winner} (bpb={l1_mean:.4f} +/- {l1_std:.4f})")
         summary["L1"] = {"winner": l1_winner, "mean_bpb": l1_mean, "std_bpb": l1_std}
 
@@ -640,7 +723,7 @@ def main():
         l2_configs = generate_l2_configs(gate_settings, tokenizer_settings)
         l2_results = run_layer(l2_configs, data_path, budget, SEEDS, "L2")
         print_layer_summary("Layer 2: +Memory", l2_results)
-        l2_winner, l2_mean, l2_std = pick_winner(l2_results)
+        l2_winner, l2_mean, l2_std, l2_stats = pick_winner(l2_results)
         print(f"  >>> L2 winner: {l2_winner} (bpb={l2_mean:.4f} +/- {l2_std:.4f})")
         summary["L2"] = {"winner": l2_winner, "mean_bpb": l2_mean, "std_bpb": l2_std}
 
@@ -663,7 +746,7 @@ def main():
         l3_configs = generate_l3_configs(gate_settings, mem_settings, tokenizer_settings)
         l3_results = run_layer(l3_configs, data_path, budget, SEEDS, "L3")
         print_layer_summary("Layer 3: +Wernicke + Regret", l3_results)
-        l3_winner, l3_mean, l3_std = pick_winner(l3_results)
+        l3_winner, l3_mean, l3_std, l3_stats = pick_winner(l3_results)
         print(f"  >>> L3 winner: {l3_winner} (bpb={l3_mean:.4f} +/- {l3_std:.4f})")
         summary["L3"] = {"winner": l3_winner, "mean_bpb": l3_mean, "std_bpb": l3_std}
 
@@ -678,13 +761,13 @@ def main():
 
     wernicke_settings = extract_wernicke_settings(CONFIGS / f"{l3_winner}.yaml")
 
-    # ── Layer 3.5: Dark Horses (3 configs x 1 seed) ─────────────────
+    # ── Layer 3.5: Dark Horses (3 configs x 3 seeds) ─────────────────
     if args.start_layer <= 3:
         print("\n" + "=" * 72)
         print("  LAYER 3.5: Dark Horses")
         print("=" * 72)
         l35_configs = generate_l35_configs(gate_settings, mem_settings, tokenizer_settings)
-        l35_results = run_layer(l35_configs, data_path, budget, [SEEDS[0]], "L3.5")
+        l35_results = run_layer(l35_configs, data_path, budget, SEEDS, "L3.5")
         print_layer_summary("Layer 3.5: Dark Horses", l35_results)
 
         with open(RESULTS / "L35_summary.json", "w") as f:
@@ -700,26 +783,26 @@ def main():
         **wernicke_settings,
     }
 
-    # ── Layer 4: Scaling (4 configs x 1 seed) ───────────────────────
+    # ── Layer 4: Scaling (4 configs x 3 seeds) ───────────────────────
     if args.start_layer <= 4:
         print("\n" + "=" * 72)
         print("  LAYER 4: Scaling")
         print("=" * 72)
         l4_configs = generate_l4_configs(full_stack, tokenizer_settings)
-        l4_results = run_layer(l4_configs, data_path, budget, [SEEDS[0]], "L4")
+        l4_results = run_layer(l4_configs, data_path, budget, SEEDS, "L4")
         print_layer_summary("Layer 4: Scaling", l4_results)
 
         with open(RESULTS / "L4_summary.json", "w") as f:
             json.dump({"results": {n: {str(s): r for s, r in sr.items()} for n, sr in l4_results.items()}},
                        f, indent=2, default=str)
 
-    # ── Layer 5: Full A-mode (3 configs x 1 seed, 1800s budget) ─────
+    # ── Layer 5: Full A-mode (3 configs x 3 seeds) ───────────────────
     if args.start_layer <= 5:
         print("\n" + "=" * 72)
         print(f"  LAYER 5: Full A-mode (budget={l5_budget}s)")
         print("=" * 72)
         l5_configs = generate_l5_configs(full_stack)
-        l5_results = run_layer(l5_configs, data_path, l5_budget, [SEEDS[0]], "L5")
+        l5_results = run_layer(l5_configs, data_path, l5_budget, SEEDS, "L5")
         print_layer_summary("Layer 5: Full A-mode", l5_results)
 
         with open(RESULTS / "L5_summary.json", "w") as f:
@@ -734,7 +817,7 @@ def main():
         l6_configs = generate_l6_configs(full_stack)
         l6_results = run_layer(l6_configs, data_path, budget, SEEDS, "L6")
         print_layer_summary("Layer 6: Inference-Time Adaptation Depth", l6_results)
-        l6_winner, l6_mean, l6_std = pick_winner(l6_results)
+        l6_winner, l6_mean, l6_std, l6_stats = pick_winner(l6_results)
         print(f"  >>> L6 winner: {l6_winner} (bpb={l6_mean:.4f} +/- {l6_std:.4f})")
         summary["L6"] = {"winner": l6_winner, "mean_bpb": l6_mean, "std_bpb": l6_std}
 

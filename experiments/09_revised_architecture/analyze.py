@@ -11,7 +11,12 @@ Reads per-layer summary JSONs and individual run results to produce:
 """
 import json
 import statistics
+import sys
 from pathlib import Path
+
+# Local statistical utilities (pure Python, no scipy dependency)
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from stats import bootstrap_ci, cohens_d, sem as compute_sem, welch_ttest
 
 RESULTS = Path(__file__).resolve().parent / "results"
 
@@ -35,44 +40,83 @@ def load_individual_results() -> dict[str, dict]:
 
 
 def print_ranked_table(layer_name: str, data: dict):
-    """Print a ranked BPB table for a layer."""
+    """Print a ranked BPB table for a layer with SEM, CI, and significance."""
     layer_results = data.get("results", {})
     if not layer_results:
         return
 
     rows = []
     for name, seed_results in layer_results.items():
-        bpbs = [r["eval"]["bpb"] for r in seed_results.values() if "eval" in r]
+        # Prefer bpb_gated when available (matches pick_winner logic)
+        bpbs = []
+        for r in seed_results.values():
+            if "eval" not in r:
+                continue
+            ev = r["eval"]
+            bpbs.append(ev.get("bpb_gated", ev["bpb"]))
         steps_list = [r["train"]["steps"] for r in seed_results.values() if "train" in r]
         if not bpbs:
             continue
         mean_bpb = statistics.mean(bpbs)
-        std_bpb = statistics.stdev(bpbs) if len(bpbs) > 1 else 0.0
+        se = compute_sem(bpbs)
+        ci = bootstrap_ci(bpbs)
         mean_steps = statistics.mean(steps_list) if steps_list else 0
-        rows.append((name, mean_bpb, std_bpb, len(bpbs), mean_steps))
+        rows.append((name, mean_bpb, se, ci, len(bpbs), mean_steps, bpbs))
     rows.sort(key=lambda r: r[1])
 
-    print(f"\n{'=' * 80}")
-    print(f"  {layer_name}")
-    print(f"{'=' * 80}")
-    print(f"  {'Config':<40} {'Mean BPB':>10} {'Std':>8} {'Seeds':>6} {'Steps':>8}")
-    print(f"  {'-' * 74}")
-    for name, mean, std, n, steps in rows:
-        marker = " <-- WINNER" if name == rows[0][0] else ""
-        print(f"  {name:<40} {mean:10.4f} {std:8.4f} {n:6} {steps:8.0f}{marker}")
+    print(f"\n  {layer_name}")
+    print(f"  {'=' * 88}")
+    hdr = (
+        f"  {'Config':<36} {'Sig':>4} {'Mean BPB':>10} {'SEM':>9}"
+        f"  {'95% CI':>20} {'Seeds':>6} {'Steps':>8}"
+    )
+    print(hdr)
+    print(f"  {'-' * 88}")
 
-    # Significance check
-    if len(rows) >= 2:
-        m1, s1 = rows[0][1], rows[0][2]
-        m2, s2 = rows[1][1], rows[1][2]
-        if m1 + s1 > m2 - s2:
-            print(f"\n  *** SIGNIFICANCE WARNING: top-2 ({rows[0][0]}, {rows[1][0]})")
-            print(f"      have overlapping standard errors ({m1:.4f}+/-{s1:.4f} vs {m2:.4f}+/-{s2:.4f})")
-            print(f"      Difference may not be statistically significant.")
+    winner_bpbs = rows[0][6] if rows else []
+    for name, mean, se, ci, n, steps, bpbs in rows:
+        # Significance label
+        if n < 2:
+            sig = "n=1"
+        elif name == rows[0][0]:
+            if len(rows) >= 2 and len(rows[1][6]) >= 2:
+                _t, p = welch_ttest(winner_bpbs, rows[1][6])
+                sig = "**" if p < 0.01 else ("*" if p < 0.05 else "ns")
+            else:
+                sig = ""
+        else:
+            if len(winner_bpbs) >= 2:
+                _t, p = welch_ttest(bpbs, winner_bpbs)
+                sig = "**" if p < 0.01 else ("*" if p < 0.05 else "ns")
+            else:
+                sig = ""
+
+        ci_str = f"[{ci[0]:.4f}, {ci[1]:.4f}]"
+        marker = " <-- WINNER" if name == rows[0][0] else ""
+        print(
+            f"  {name:<36} {sig:>4} {mean:10.4f} +/-{se:.4f}"
+            f"  {ci_str:>20} {n:6} {steps:8.0f}{marker}"
+        )
+
+    # Winner line with effect-size summary
+    if len(rows) >= 2 and len(rows[0][6]) >= 2 and len(rows[1][6]) >= 2:
+        _t, p = welch_ttest(rows[0][6], rows[1][6])
+        d = cohens_d(rows[0][6], rows[1][6])
+        print(
+            f"\n  Winner: {rows[0][0]} "
+            f"(p={p:.4f} vs runner-up, Cohen's d={d:.2f})"
+        )
+        if p >= 0.05:
+            print(
+                f"  *** WARNING: winner is NOT significantly better than "
+                f"runner-up (p={p:.4f})"
+            )
+    elif rows and len(rows[0][6]) < 2:
+        print(f"\n  Winner: {rows[0][0]} (NOTE: n=1, significance not testable)")
 
     # Step-normalized BPB
     print(f"\n  Step-normalized (bpb / steps * 1000):")
-    for name, mean, std, n, steps in rows:
+    for name, mean, _se, _ci, _n, steps, _bpbs in rows:
         if steps > 0:
             norm = mean / steps * 1000
             print(f"    {name:<40} {norm:10.6f}")
@@ -144,17 +188,22 @@ def print_cross_layer_progression():
     print(f"\n{'=' * 80}")
     print(f"  Cross-Layer Winner Progression")
     print(f"{'=' * 80}")
-    for tag in ["L1", "L2", "L3", "L4", "L5"]:
+    for tag in ["L0", "L1", "L2", "L3", "L4", "L5", "L6"]:
         data = load_layer_summary(tag)
         if data and "winner" in data:
-            # Compute winner's bpb from results
             winner = data["winner"]
             seed_results = data.get("results", {}).get(winner, {})
-            bpbs = [r["eval"]["bpb"] for r in seed_results.values() if "eval" in r]
+            bpbs = []
+            for r in seed_results.values():
+                if "eval" in r:
+                    ev = r["eval"]
+                    bpbs.append(ev.get("bpb_gated", ev["bpb"]))
             if bpbs:
                 mean = statistics.mean(bpbs)
-                std = statistics.stdev(bpbs) if len(bpbs) > 1 else 0.0
-                print(f"  {tag}: {winner:<40} bpb={mean:.4f} +/- {std:.4f}")
+                se = compute_sem(bpbs)
+                n = len(bpbs)
+                n_note = "" if n >= 2 else " (n=1)"
+                print(f"  {tag}: {winner:<40} bpb={mean:.4f} +/-{se:.4f} SEM (n={n}){n_note}")
             else:
                 print(f"  {tag}: {winner}")
 
@@ -163,9 +212,14 @@ def print_cross_layer_progression():
     if l35:
         print(f"\n  Dark Horses (L3.5):")
         for name, seed_results in l35.get("results", {}).items():
-            bpbs = [r["eval"]["bpb"] for r in seed_results.values() if "eval" in r]
+            bpbs = []
+            for r in seed_results.values():
+                if "eval" in r:
+                    ev = r["eval"]
+                    bpbs.append(ev.get("bpb_gated", ev["bpb"]))
             if bpbs:
-                print(f"    {name:<38} bpb={statistics.mean(bpbs):.4f}")
+                se = compute_sem(bpbs)
+                print(f"    {name:<38} bpb={statistics.mean(bpbs):.4f} +/-{se:.4f} SEM (n={len(bpbs)})")
 
 
 def main():
@@ -206,9 +260,25 @@ def main():
         with open(full_path) as f:
             summary = json.load(f)
         print(f"\n{'=' * 80}")
-        print(f"  Final Summary")
+        print(f"  Final Summary (values are mean +/- SEM)")
         print(f"{'=' * 80}")
         for layer, info in summary.items():
+            # Recompute SEM from the layer summary if available
+            layer_data = load_layer_summary(layer.replace(".", ""))
+            if layer_data:
+                winner = info["winner"]
+                seed_results = layer_data.get("results", {}).get(winner, {})
+                bpbs = []
+                for r in seed_results.values():
+                    if "eval" in r:
+                        ev = r["eval"]
+                        bpbs.append(ev.get("bpb_gated", ev["bpb"]))
+                if bpbs:
+                    mean = statistics.mean(bpbs)
+                    se = compute_sem(bpbs)
+                    print(f"  {layer}: {winner} — bpb={mean:.4f} +/-{se:.4f} SEM (n={len(bpbs)})")
+                    continue
+            # Fallback: use stored values (std_bpb may actually be std, not SEM)
             print(f"  {layer}: {info['winner']} — bpb={info['mean_bpb']:.4f} +/- {info['std_bpb']:.4f}")
 
 
