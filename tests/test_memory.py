@@ -7,7 +7,7 @@ import unittest
 
 import torch
 
-from chaoscontrol.memory import MultiSlotOuterModel, OuterModel
+from chaoscontrol.memory import MultiSlotOuterModel, OuterModel, SemanticTier
 
 
 class TestOuterModel(unittest.TestCase):
@@ -192,6 +192,45 @@ class TestCheckpointPersistence(unittest.TestCase):
         om2.load_state_dict(torch.load(buf, weights_only=False))
         assert len(om2._slots) == 2
         assert om2._survival[0] == 42.0
+
+
+class TestSemanticTier(unittest.TestCase):
+    def test_read_shape(self):
+        st = SemanticTier(model_dim=16, num_bases=8)
+        bias = st.read(batch_size=2)
+        assert bias.shape == (2, 16)
+
+    def test_read_zero_before_consolidation(self):
+        st = SemanticTier(model_dim=16, num_bases=8)
+        bias = st.read(batch_size=2)
+        assert torch.allclose(bias, torch.zeros_like(bias))
+
+    def test_updates_from_episodes(self):
+        st = SemanticTier(model_dim=16, num_bases=8)
+        initial = st.bases.clone()
+        for _ in range(10):
+            st.consolidate_from_episodes(torch.randn(1, 16) + 1.0)
+        assert not torch.allclose(initial, st.bases)
+
+    def test_always_on_after_consolidation(self):
+        st = SemanticTier(model_dim=16, num_bases=8)
+        st.consolidate_from_episodes(torch.randn(3, 16) * 5.0)
+        bias = st.read(batch_size=2)
+        assert bias.abs().sum() > 0
+
+    def test_encoder_not_trainable(self):
+        st = SemanticTier(model_dim=16, num_bases=8)
+        assert not st.encoder.weight.requires_grad
+
+    def test_decoder_is_trainable(self):
+        st = SemanticTier(model_dim=16, num_bases=8)
+        assert st.decoder.weight.requires_grad
+
+    def test_slow_update_rate(self):
+        st = SemanticTier(model_dim=16, num_bases=8, update_rate=0.01)
+        st.consolidate_from_episodes(torch.ones(1, 16) * 100.0)
+        # After one update at 1% rate, bases should be small
+        assert st.bases.abs().max().item() < 10.0
 
 
 if __name__ == "__main__":

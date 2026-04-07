@@ -502,3 +502,40 @@ class MultiSlotOuterModel(nn.Module):
 
         self.loss_ema = self.ema_decay * self.loss_ema + (1 - self.ema_decay) * current_loss
         return signal
+
+
+class SemanticTier(nn.Module):
+    """Neocortical knowledge layer — always-on background bias.
+
+    Stores slowly-updated basis vectors extracted from episodic experience.
+    Not cue-dependent, not gated — shapes all processing as a persistent prior.
+
+    The semantic tier is to the episodic tier what "waterfronts have workers"
+    is to "I saw the fisherman on Tuesday." Gist, not episodes.
+    """
+
+    def __init__(self, model_dim: int, num_bases: int = 8, update_rate: float = 0.01) -> None:
+        super().__init__()
+        self.model_dim = model_dim
+        self.num_bases = num_bases
+        self.update_rate = update_rate
+        # Decoder is on the forward path — receives task gradients
+        self.decoder = nn.Linear(num_bases, model_dim, bias=False)
+        # Encoder is structural — does not receive task gradients
+        self.encoder = nn.Linear(model_dim, num_bases, bias=False)
+        self.encoder.weight.requires_grad_(False)
+        # Basis vectors persist across sequences
+        self.register_buffer("bases", torch.zeros(1, num_bases))
+
+    def read(self, batch_size: int) -> torch.Tensor:
+        """Always-on bias — added to recurrence at every step."""
+        return self.decoder(self.bases.expand(batch_size, -1))
+
+    def consolidate_from_episodes(self, episode_vectors: torch.Tensor) -> None:
+        """Extract shared structure from episode vectors into bases.
+
+        Args:
+            episode_vectors: (N, model_dim) — recent episodic slot contents
+        """
+        encoded = self.encoder(episode_vectors.detach()).mean(dim=0, keepdim=True)
+        self.bases = ((1 - self.update_rate) * self.bases.detach() + self.update_rate * encoded).detach()
