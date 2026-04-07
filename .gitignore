@@ -7,4 +7,4 @@ experiments/*/results/*
 !experiments/*/results/.gitkeep
 *.pt
 *.bin
-enwik8
+.claude/
