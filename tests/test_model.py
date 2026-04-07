@@ -105,8 +105,8 @@ class TestChaosStudentLMStep(unittest.TestCase):
         assert hidden.shape == (2, 16)  # (batch, dim)
         assert len(new_state) == 2  # one state per layer
 
-    def test_step_sequence_matches_forward(self):
-        """Stepping token-by-token should match forward() logits."""
+    def test_step_matches_forward_bare_model(self):
+        """step() matches forward() on bare SSM (no Wernicke/memory)."""
         torch.manual_seed(42)
         model = ChaosStudentLM(vocab_size=256, dim=16, num_layers=2)
         ids = torch.randint(0, 256, (2, 8))
@@ -124,6 +124,28 @@ class TestChaosStudentLMStep(unittest.TestCase):
         logits_step = torch.stack(step_logits, dim=1)
 
         assert torch.allclose(logits_full, logits_step, atol=1e-4), f"max diff: {(logits_full - logits_step).abs().max()}"
+
+    def test_step_intentionally_diverges_with_features(self):
+        """step() SHOULD differ from forward() when Wernicke/memory are active."""
+        torch.manual_seed(42)
+        model = ChaosStudentLM(
+            vocab_size=256, dim=16, num_layers=2,
+            wernicke_enabled=True, wernicke_k_max=4, wernicke_window=4,
+            outer_model_dim=8, outer_model_type="multislot",
+        )
+        ids = torch.randint(0, 256, (2, 8))
+
+        # Forward (full path with Wernicke + memory)
+        out_full = model(ids)
+
+        # Step (simplified world model)
+        state = model.init_state(2)
+        for t in range(8):
+            logits_t, _, state = model.step(ids[:, t:t+1], state)
+
+        # They SHOULD differ because step skips Wernicke and memory
+        assert not torch.allclose(out_full["logits"][:, -1, :], logits_t, atol=0.1), \
+            "step() should diverge from forward() when features are active"
 
 
 if __name__ == "__main__":

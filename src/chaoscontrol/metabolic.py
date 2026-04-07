@@ -285,6 +285,10 @@ def micro_mcts(
     analogous to System 2 / model-based reasoning. Uses the SSM recurrence as a
     world model for efficient O(1)-per-step rollouts.
 
+    Rollouts use model.step() — the simplified world model (SSM recurrence only).
+    This is intentional: planning operates on a compressed internal model, not
+    full perception.
+
     When surprise triggers the metabolic gate, runs N rollouts of depth H
     tokens from the current state, uses UCB to select which candidate branch
     to explore, backs up values, and returns root logits + search statistics.

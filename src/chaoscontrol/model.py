@@ -203,7 +203,15 @@ class ChaosStudentLM(nn.Module):
         token_ids: torch.Tensor,
         states: list[torch.Tensor],
     ) -> tuple[torch.Tensor, torch.Tensor, list[torch.Tensor]]:
-        """Single-token forward step.
+        """Single-token forward step through the SSM recurrence only.
+
+        Intentionally simpler than forward() — skips Wernicke typed composition,
+        episodic/semantic memory reads, and outer model interactions. This is the
+        "world model" for MCTS planning: analogous to System 2 deliberation
+        operating on a compressed internal model rather than full perception.
+
+        For components that require the full forward path (Wernicke routing,
+        memory cue-dependent retrieval), use forward() on complete sequences.
 
         Args:
             token_ids: (batch, 1) — single token ids
