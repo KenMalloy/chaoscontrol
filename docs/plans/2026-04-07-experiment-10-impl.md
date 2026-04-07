@@ -1053,9 +1053,231 @@ SIZE_TABLE = {
 
 No existing files are modified. All 3 new files are self-contained.
 
+---
+
+### Task 9: Inference benchmarks (latency + memory footprint)
+
+**Files:** `experiments/10_scaling_laws/run_scaling.py` (new function), `experiments/10_scaling_laws/analyze_scaling.py` (new plot)
+
+**Problem/Goal:** After training each config, benchmark inference latency and memory footprint. SSM's O(d) recurrence vs transformer's O(nd) attention is a key selling point.
+
+**Implementation:**
+
+Add to `run_scaling.py`:
+
+```python
+def benchmark_inference(model, device, seq_lengths=[1024, 4096, 16384]):
+    """Benchmark inference latency and memory footprint.
+    
+    Returns:
+        {"latency_per_token_ms": float, "state_bytes": dict[int, int]}
+    """
+    model.eval()
+    results = {}
+    
+    # Latency: time 1000 step() calls (SSM) or forward with seq_len=1 (transformer)
+    if hasattr(model, "step"):
+        state = model.init_state(1)
+        dummy = torch.randint(0, model.vocab_size, (1, 1), device=device)
+        # Warmup
+        for _ in range(10):
+            _, _, state = model.step(dummy, state)
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        for _ in range(1000):
+            _, _, state = model.step(dummy, state)
+        torch.cuda.synchronize()
+        results["latency_per_token_ms"] = (time.perf_counter() - t0)
+    else:
+        # Transformer: forward pass on single token sequences
+        dummy = torch.randint(0, model.vocab_size, (1, 1), device=device)
+        for _ in range(10):
+            model(dummy)
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        for _ in range(1000):
+            model(dummy)
+        torch.cuda.synchronize()
+        results["latency_per_token_ms"] = (time.perf_counter() - t0)
+    
+    # Memory footprint at different sequence lengths
+    state_bytes = {}
+    for sl in seq_lengths:
+        if hasattr(model, "init_state"):
+            # SSM: fixed state, independent of seq_len
+            state = model.init_state(1)
+            state_bytes[sl] = sum(s.nelement() * s.element_size() for s in state)
+        else:
+            # Transformer: KV cache grows with seq_len
+            # Estimate: 2 * num_layers * dim * seq_len * element_size (K and V)
+            n_layers = len(model.layers) if hasattr(model, "layers") else 4
+            dim = model.embed.embedding_dim if hasattr(model, "embed") else 128
+            state_bytes[sl] = 2 * n_layers * dim * sl * 2  # bf16
+    results["state_bytes"] = state_bytes
+    return results
+```
+
+Call after each training run, append to results JSON.
+
+Add to `analyze_scaling.py`:
+
+```python
+def plot_inference_efficiency(data):
+    """Two-panel plot: latency per token vs size, and memory footprint vs seq_len."""
+    # Panel 1: latency per token at each model size
+    # Panel 2: state/KV-cache bytes at seq_len=1024,4096,16384 for SSM vs transformer at XL
+```
+
+---
+
+### Task 10: Quantization robustness sweep
+
+**Files:** `experiments/10_scaling_laws/run_scaling.py` (new function)
+
+**Problem/Goal:** Measure bpb degradation under int8 and int6 quantization for each trained model. If SSM loses less bpb from quantization, that's a publishable advantage for the 16MB artifact constraint.
+
+**Implementation:**
+
+```python
+def quantize_and_eval(model, tokens, eval_starts, seq_len, device, batch_size=32):
+    """Quantize model to int8 and int6, measure bpb at each level.
+    
+    Returns {"bf16_bpb": float, "int8_bpb": float, "int6_bpb": float,
+             "int8_delta": float, "int6_delta": float}
+    """
+    from chaoscontrol.evaluation import evaluate_chaoscontrol_bpb
+    
+    # bf16 baseline (already have this from training)
+    bf16_result = evaluate_chaoscontrol_bpb(
+        model, tokens=tokens, eval_starts=eval_starts,
+        batch_size=batch_size, seq_len=seq_len, device=device,
+    )
+    bf16_bpb = bf16_result["bpb"]
+    
+    # int8: quantize all linear weight tensors
+    int8_model = copy.deepcopy(model)
+    for name, param in int8_model.named_parameters():
+        if param.ndim == 2:  # weight matrices
+            scale = param.abs().max() / 127
+            param.data = (param.data / scale).round().clamp(-128, 127) * scale
+    int8_result = evaluate_chaoscontrol_bpb(
+        int8_model, tokens=tokens, eval_starts=eval_starts,
+        batch_size=batch_size, seq_len=seq_len, device=device,
+    )
+    
+    # int6: same but 5-bit range (-32..31)
+    int6_model = copy.deepcopy(model)
+    for name, param in int6_model.named_parameters():
+        if param.ndim == 2:
+            scale = param.abs().max() / 31
+            param.data = (param.data / scale).round().clamp(-32, 31) * scale
+    int6_result = evaluate_chaoscontrol_bpb(
+        int6_model, tokens=tokens, eval_starts=eval_starts,
+        batch_size=batch_size, seq_len=seq_len, device=device,
+    )
+    
+    return {
+        "bf16_bpb": bf16_bpb,
+        "int8_bpb": int8_result["bpb"],
+        "int6_bpb": int6_result["bpb"],
+        "int8_delta": int8_result["bpb"] - bf16_bpb,
+        "int6_delta": int6_result["bpb"] - bf16_bpb,
+    }
+```
+
+Add a `plot_quantization_robustness` function to `analyze_scaling.py` — grouped bar chart of quantization deltas for SSM vs transformer at each size.
+
+---
+
+### Task 11: Component-specific metrics logging
+
+**Files:** `experiments/10_scaling_laws/run_scaling.py`
+
+**Problem/Goal:** Extract and log component-specific metrics from training history for the extended analysis.
+
+**Implementation:**
+
+After each training run completes, extract from the training history:
+
+```python
+def extract_component_metrics(train_result: dict) -> dict:
+    """Extract component-specific metrics from training history."""
+    history = train_result.get("history", [])
+    metrics = {}
+    
+    # Gate fire rate
+    fires = [s.get("gate_fired", False) for s in history if "gate_fired" in s]
+    metrics["gate_fire_rate"] = sum(fires) / max(len(fires), 1)
+    
+    # Memory slot utilization (unique buckets / max_slots)
+    buckets_used = set()
+    for s in history:
+        if "dominant_bucket" in s and s["dominant_bucket"] is not None:
+            buckets_used.add(s["dominant_bucket"])
+    metrics["unique_buckets"] = len(buckets_used)
+    
+    # CFR regret entropy (if regret_table returned)
+    regret_table = train_result.get("regret_table")
+    if regret_table is not None and hasattr(regret_table, "cumulative_regret"):
+        import numpy as np
+        regret = regret_table.cumulative_regret
+        strategy = np.exp(regret) / np.exp(regret).sum(axis=-1, keepdims=True)
+        entropy = -(strategy * np.log(strategy + 1e-10)).sum(axis=-1).mean()
+        metrics["cfr_entropy"] = float(entropy)
+    
+    # Codebook utilization (from Wernicke bucket snapshots)
+    bucket_snaps = train_result.get("bucket_snapshots", [])
+    if bucket_snaps:
+        last_snap = bucket_snaps[-1]
+        total_entries = max(len(last_snap), 1)
+        active = sum(1 for v in last_snap if v > 0)
+        metrics["wernicke_codebook_utilization"] = active / total_entries
+    
+    # Spectral structure: A-matrix eigenvalue stats from spectral snapshots
+    spectral = train_result.get("spectral_snapshots", [])
+    if spectral:
+        last = spectral[-1]
+        metrics["spectral_max_freq"] = float(max(last)) if last else 0.0
+        metrics["spectral_mean_freq"] = float(sum(last) / len(last)) if last else 0.0
+    
+    return metrics
+```
+
+Log these alongside the per-run JSON results.
+
+Add to `analyze_scaling.py`:
+- `plot_gate_fire_rate` — fire rate vs model size, with bpb delta overlay
+- `plot_codebook_utilization` — tokenizer + Wernicke utilization vs size
+- `plot_spectral_evolution` — eigenvalue distribution at each size
+- `plot_seed_variance` — std(bpb) per condition per size as bar chart
+
+---
+
+### Summary: File inventory (updated)
+
+| File | Action | Purpose |
+|------|--------|---------|
+| `experiments/10_scaling_laws/run.sh` | Create | Shell entry point |
+| `experiments/10_scaling_laws/run_scaling.py` | Create | Training runner (Tasks 2-6, 8-11) |
+| `experiments/10_scaling_laws/analyze_scaling.py` | Create | Post-hoc analysis (Task 7 + extended plots) |
+| `experiments/10_scaling_laws/configs/` | Created at runtime | Generated YAML configs |
+| `experiments/10_scaling_laws/results/` | Created at runtime | Per-run JSON results |
+| `experiments/10_scaling_laws/plots/` | Created at runtime | PNG plots (9 total) |
+
+Plots produced by `analyze_scaling.py`:
+1. `scaling_curves.png` — bpb vs params with power-law fits
+2. `isoflop_curves.png` — bpb vs total FLOPs
+3. `component_delta.png` — component ROI vs model size
+4. `inference_efficiency.png` — latency per token + memory footprint
+5. `quantization_robustness.png` — bpb delta from int8/int6
+6. `gate_fire_rate.png` — gate utilization vs size
+7. `codebook_utilization.png` — tokenizer + Wernicke codebook usage
+8. `spectral_evolution.png` — A-matrix eigenvalue structure vs size
+9. `seed_variance.png` — seed-to-seed bpb std
+
 ### Execution order
 
 1. Run experiment 09 (if not already done) to produce `full_summary.json`
-2. `bash experiments/10_scaling_laws/run.sh /path/to/enwik8` -- trains all configs (~8h sequential)
-3. `python experiments/10_scaling_laws/analyze_scaling.py` -- generates plots and summary
+2. `bash experiments/10_scaling_laws/run.sh /path/to/data` — trains all configs (~8h sequential)
+3. `python experiments/10_scaling_laws/analyze_scaling.py` — generates 9 plots + summary table
 4. Review kill criteria output before proceeding to further experiments

@@ -110,17 +110,64 @@ Plot the competition baseline (1.2244 bpb) and SOTA (1.1147 bpb) as horizontal l
 
 ---
 
+## Extended Metrics
+
+### Efficiency (the inference advantage story)
+
+| Metric | How to measure | Why it matters |
+|--------|---------------|----------------|
+| **Inference latency per token** | Time `model.step()` for SSM vs full forward for transformer (single token, batch=1). Measure at each model size. | SSM recurrence is O(d) per step vs O(nd) for attention. If bpb is competitive, faster inference is a publishable advantage. |
+| **Memory footprint at inference** | SSM: fixed state size = `num_layers × d`. Transformer: KV cache grows with sequence. Report state bytes vs KV cache bytes at seq_len=1024,4096,16384. | Fixed-size state vs growing KV cache matters for the 16MB artifact story and real deployment. |
+| **Training throughput** | steps/sec and tokens/sec, already logged. Plot alongside bpb for visual isoFLOP argument. | Makes the compute-efficiency claim concrete and visual. |
+
+### Representation Quality
+
+| Metric | How to measure | Why it matters |
+|--------|---------------|----------------|
+| **Codebook utilization** | Fraction of VQ entries assigned at least once in eval. Measure for both tokenizer codebook and Wernicke codebook at each scale. Dead entries = wasted parameters. | If utilization increases with scale, the model learns to use more of its vocabulary. If it decreases, larger codebooks waste capacity. |
+| **Spectral structure** | FFT snapshots of A-matrix eigenvalues (already collected every 50 steps). Plot eigenvalue distribution at each model size. | Showing how learned dynamics change with scale (richer temporal structure at larger d?) is novel for SSMs. |
+
+### Component-Specific
+
+| Metric | How to measure | Why it matters |
+|--------|---------------|----------------|
+| **Gate fire rate vs bpb delta** | From step logs: `gate_fired` rate and per-firing bpb improvement. Plot both vs model size. | Does the gate fire more or less at scale? Does each firing contribute more? |
+| **Memory slot utilization** | Unique slot buckets used / max_slots. Diversity of stored episodes. | At larger d, does episodic memory get used more effectively (more diverse slots) or does the larger recurrence make it redundant? |
+| **CFR regret convergence** | Regret table entropy over training steps. Lower entropy = more converged strategy. Plot convergence rate vs model size. | Faster convergence at scale = the larger model has a more stable "policy." |
+
+### Robustness
+
+| Metric | How to measure | Why it matters |
+|--------|---------------|----------------|
+| **Seed variance** | std(bpb) across 3 seeds at each size. Compare SSM vs transformer. | Lower variance = more stable optimization landscape. If SESSM has lower seed variance, the recurrence provides regularization. |
+| **Quantization degradation** | bpb(bf16) vs bpb(int8) vs bpb(int6) at each size. Delta = quantization tax. | Both architectures get quantized to fit 16MB. Which loses less? SSM weights may be more quantization-friendly than attention matrices. |
+
+### Paper Thesis
+
+The strongest angle: **"SESSM matches transformer on bpb, beats it on inference efficiency and quantization robustness, and the bio components' ROI grows with scale."** Three independent axes of comparison:
+
+1. **Scaling efficiency** — bpb per parameter / per FLOP
+2. **Inference advantage** — O(d) latency, fixed memory footprint
+3. **Component value at scale** — bio stack ROI curve slopes upward
+
+Any two of these holding would be publishable. All three would be a strong contribution.
+
+---
+
 ## Kill Criteria
 
 - If bare SSM at XL (512d, 600s) scores worse than 2.0 bpb on FineWeb → architecture is not competitive, investigate before continuing
 - If transformer α > SSM α by >0.1 → transformers scale better here, bio components can't compensate
 - If component_delta < 0 at XL → full stack hurts at scale, strip back to bare SSM for competition entry
+- If seed variance(SSM) > 2× seed variance(transformer) → optimization landscape is too noisy
 
 ## Success Criteria
 
 - SSM scaling exponent α ≥ transformer α (SSM scales at least as well)
 - component_delta > 0 at all sizes (bio stack always helps)
 - SESSM at XL beats competition baseline (< 1.2244 bpb)
+- Inference latency < 50% of transformer at matched bpb
+- Quantization degradation(SSM) ≤ quantization degradation(transformer)
 - Publishable scaling law plot with confidence intervals
 
 ---
@@ -141,7 +188,27 @@ The experiment runner is a new file: `experiments/10_scaling_laws/run_scaling.py
 1. Reads experiment 09 results to determine winning configs
 2. Generates size-matched SSM and transformer configs at each scale
 3. Trains each config for 600s
-4. Logs: bpb, param_count, steps, wall_time, FLOPs_estimate
-5. Produces scaling law plots (matplotlib) and a summary table
+4. Logs per run:
+   - bpb, param_count, steps, wall_time, tokens/sec, steps/sec
+   - FLOPs_estimate (per step and total)
+   - Gate fire rate, memory slot utilization, codebook utilization
+   - Spectral snapshots (A-matrix eigenvalues)
+   - CFR regret table entropy (if applicable)
+   - Seed index for variance computation
+5. Post-training per run:
+   - Inference latency benchmark: `model.step()` × 1000 tokens, batch=1 (SSM) vs equivalent transformer forward
+   - Memory footprint: SSM state bytes vs transformer KV cache bytes at seq_len=[1024, 4096, 16384]
+   - Quantization sweep: bf16 → int8 → int6, measure bpb at each
+
+The analyzer (`experiments/10_scaling_laws/analyze_scaling.py`) produces:
+1. **Scaling law plot** — bpb vs params with fitted power-law curves + competition reference lines
+2. **isoFLOP plot** — bpb vs total FLOPs
+3. **Component ROI plot** — component_delta vs model size
+4. **Inference efficiency plot** — latency per token and memory footprint vs model size
+5. **Quantization robustness plot** — bpb delta from quantization vs model size
+6. **Codebook utilization plot** — fraction of active entries vs model size (tokenizer + Wernicke)
+7. **Spectral evolution plot** — A-matrix eigenvalue distributions at each scale
+8. **Seed variance table** — std(bpb) per config per size
+9. **Summary table** — all metrics at each size, LaTeX-ready
 
 The competition baseline (`baselines/parameter_golf/train_gpt.py`) runs separately with its own data pipeline. Its bpb is plotted as a reference line.
