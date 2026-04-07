@@ -18,6 +18,11 @@ class SimpleTransformerLM(nn.Module):
         ])
         self.final_norm = RMSNorm(dim)
         self.lm_head = nn.Linear(dim, vocab_size, bias=False)
+        # Duck-typing compatibility with ChaosStudentLM for shared train/eval
+        self.outer_model = None
+        self.wernicke = None
+        self.wernicke_balance_weight = 0.0
+        self.semantic_tier = None
 
     def artifact_bytes(self):
         return int(sum(p.numel() for p in self.parameters()) * 2)

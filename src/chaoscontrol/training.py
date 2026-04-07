@@ -69,6 +69,7 @@ def train_chaoscontrol_for_budget(
     current_threshold = metabolic_threshold  # adaptive mode will adjust this
     last_forked = False
     pre_fork_loss: float = 0.0  # loss BEFORE the fork, for adaptive comparison
+    ce_val_prev: float = loss_ema  # previous step's loss, for adaptive threshold
 
     model.train()
 
@@ -88,7 +89,7 @@ def train_chaoscontrol_for_budget(
         # the last fork. If loss improved since then, fork helped -- lower
         # threshold. If not, raise it.
         if metabolic_threshold_mode == "adaptive" and last_forked and history:
-            fork_helped = ce_val_prev < pre_fork_loss if steps > 0 else False  # noqa: F821
+            fork_helped = ce_val_prev < pre_fork_loss if steps > 0 else False
             if fork_helped:
                 current_threshold = max(0.01, current_threshold * 0.95)
             else:
@@ -258,6 +259,7 @@ def run_chaoscontrol_matrix(
             wernicke_window=cfg.wernicke_window,
             wernicke_router=cfg.wernicke_router,
             wernicke_balance_weight=cfg.wernicke_balance_weight,
+            semantic_tier_bases=cfg.semantic_tier_bases,
         ).to(device)
 
         train_result = train_chaoscontrol_for_budget(
@@ -282,6 +284,7 @@ def run_chaoscontrol_matrix(
             metabolic_threshold_mode=cfg.metabolic_threshold_mode,
             metabolic_score=cfg.metabolic_score,
             metabolic_noise_std=cfg.metabolic_noise_std,
+            generation_mode=cfg.generation_mode,
         )
 
         eval_result = evaluate_chaoscontrol_bpb(
