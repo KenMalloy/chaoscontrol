@@ -391,13 +391,14 @@ def extract_wernicke_settings(config_path: Path) -> dict:
 def main():
     parser = argparse.ArgumentParser(description="Layered runner for experiment 09")
     parser.add_argument("--enwik8-path", required=True, help="Path to enwik8 data file")
-    parser.add_argument("--budget", type=float, default=300, help="Per-run budget in seconds")
+    parser.add_argument("--budget", type=float, default=150, help="Per-run budget in seconds")
+    parser.add_argument("--l5-budget", type=float, default=900, help="Layer 5 budget in seconds")
     parser.add_argument("--start-layer", type=int, default=1, help="Layer to start from (1-6)")
     args = parser.parse_args()
 
     enwik8_path = args.enwik8_path
     budget = args.budget
-    l5_budget = 1800
+    l5_budget = args.l5_budget
 
     summary: dict[str, dict] = {}
 
