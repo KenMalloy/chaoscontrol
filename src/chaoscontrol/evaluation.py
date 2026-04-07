@@ -87,6 +87,8 @@ def evaluate_chaoscontrol_bpb(
                 {"bucket_id": t["bucket_id"], "centroid_contrib": t["centroid_contrib"].clone()}
                 for t in om._latent_traces
             ]
+        if hasattr(om, "_compress_rng"):
+            saved_outer_state["_compress_rng_state"] = om._compress_rng.getstate()
         # Single-slot OuterModel state field
         if hasattr(om, "state"):
             saved_outer_state["state"] = om.state.clone()
@@ -107,6 +109,8 @@ def evaluate_chaoscontrol_bpb(
                 om._slot_buckets = []
             if hasattr(om, "_latent_traces"):
                 om._latent_traces = []
+            if hasattr(om, "state"):
+                om.state.zero_()
 
     try:
         with torch.no_grad():
@@ -217,6 +221,8 @@ def evaluate_chaoscontrol_bpb(
                 om._compression_consequences = saved_outer_state["_compression_consequences"]
             if "latent_traces" in saved_outer_state:
                 om._latent_traces = saved_outer_state["latent_traces"]
+            if "_compress_rng_state" in saved_outer_state:
+                om._compress_rng.setstate(saved_outer_state["_compress_rng_state"])
             # Single-slot OuterModel state
             if "state" in saved_outer_state:
                 om.state = saved_outer_state["state"]

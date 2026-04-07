@@ -367,9 +367,12 @@ def train_chaoscontrol_for_budget(
                 k_actions = min(metabolic_k, last_logits.size(-1))
                 _, top_tokens = last_logits.mean(dim=0).topk(k_actions)
 
-                # Build state at the last position by stepping through input
+                # Build state up to the penultimate input position so that
+                # each candidate token replaces the last input slot.
+                # model.step(candidate, rollout_state) then predicts position
+                # seq_len, matching targets[:, -1].
                 rollout_state = model.init_state(inputs.size(0))
-                for t in range(inputs.size(1)):
+                for t in range(inputs.size(1) - 1):  # stop one short
                     _, _, rollout_state = model.step(inputs[:, t:t+1], rollout_state)
 
                 # Counterfactual values via negative CE (same scale as actual_value)
@@ -378,15 +381,6 @@ def train_chaoscontrol_for_budget(
                     token = top_tokens[a].unsqueeze(0).expand(inputs.size(0)).unsqueeze(-1)
                     cf_state = [s.clone() for s in rollout_state]
                     cf_logits, _, cf_state = model.step(token, cf_state)
-                    # Use next actual target token for CE computation.
-                    # Correctness note: rollout_state was built by stepping
-                    # through inputs[:, 0:seq_len] (positions 0..seq_len-1).
-                    # model.step(token, rollout_state) produces cf_logits
-                    # predicting position seq_len.  targets = data[:, 1:seq_len+1],
-                    # so targets[:, -1] = data[:, seq_len] — exactly the actual
-                    # byte at position seq_len.  This IS the correct target for
-                    # the counterfactual, regardless of which alternative token
-                    # was stepped, because we score against what actually followed.
                     if inputs.size(1) > 0:
                         next_target = targets[:, -1]
                         cf_ce = F.cross_entropy(cf_logits, next_target).item()
