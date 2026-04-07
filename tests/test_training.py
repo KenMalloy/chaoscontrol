@@ -120,6 +120,90 @@ class TestCLI(unittest.TestCase):
         assert cfg.crit_target_coupling == 0.92
 
 
+class TestWarmupTriggerStateIsolated(unittest.TestCase):
+    def test_warmup_trigger_state_isolated(self) -> None:
+        """Eval warmup must not leak trigger state back to the model."""
+        from chaoscontrol.evaluation import evaluate_chaoscontrol_bpb
+        from chaoscontrol.memory import MultiSlotOuterModel
+
+        model = ChaosStudentLM(
+            vocab_size=256, dim=16, num_layers=2, ff_mult=2,
+            a_mode="diag", rich_b_mode="none",
+            outer_model_dim=16, outer_model_type="multislot",
+        )
+        om = model.outer_model
+
+        # Seed some trigger state before eval
+        om._spike_seen = True
+        om._steps_since_spike = 5
+        om._pre_spike_loss = 1.23
+        om._retrieval_weights = torch.tensor([[0.5, 0.5]])
+        # Write a slot so memory is non-empty
+        om.write(torch.randn(1, 16), bucket_id=0)
+        initial_n_slots = len(om._slots)
+
+        tokens = torch.randint(0, 256, (512,))
+        eval_starts = list(range(0, 400, 32))
+
+        evaluate_chaoscontrol_bpb(
+            model,
+            tokens=tokens,
+            eval_starts=eval_starts,
+            batch_size=2,
+            seq_len=16,
+            device=torch.device("cpu"),
+            warmup=True,
+            warmup_write_mode="full_sequence",
+            warmup_latent=True,
+            warmup_cold_start=False,
+        )
+
+        # Trigger state must be restored exactly
+        assert om._spike_seen is True, "_spike_seen not restored"
+        assert om._steps_since_spike == 5, "_steps_since_spike not restored"
+        assert om._pre_spike_loss == 1.23, "_pre_spike_loss not restored"
+        assert om._retrieval_weights is not None, "_retrieval_weights not restored"
+        assert torch.allclose(om._retrieval_weights, torch.tensor([[0.5, 0.5]])), \
+            "_retrieval_weights value not restored"
+        # Slot count must be restored (warmup may have added slots, but they should be rolled back)
+        assert len(om._slots) == initial_n_slots, \
+            f"slot count changed: {initial_n_slots} -> {len(om._slots)}"
+
+    def test_warmup_cold_start_wipes_then_restores(self) -> None:
+        """Cold start should wipe memory during eval but restore it after."""
+        from chaoscontrol.evaluation import evaluate_chaoscontrol_bpb
+
+        model = ChaosStudentLM(
+            vocab_size=256, dim=16, num_layers=2, ff_mult=2,
+            a_mode="diag", rich_b_mode="none",
+            outer_model_dim=16, outer_model_type="multislot",
+        )
+        om = model.outer_model
+        # Seed some slots
+        om.write(torch.randn(1, 16), bucket_id=0)
+        om.write(torch.randn(1, 16), bucket_id=1)
+        initial_n_slots = len(om._slots)
+        assert initial_n_slots == 2
+
+        tokens = torch.randint(0, 256, (512,))
+        eval_starts = list(range(0, 400, 32))
+
+        evaluate_chaoscontrol_bpb(
+            model,
+            tokens=tokens,
+            eval_starts=eval_starts,
+            batch_size=2,
+            seq_len=16,
+            device=torch.device("cpu"),
+            warmup=True,
+            warmup_cold_start=True,
+        )
+
+        # After eval, slots must be restored to pre-eval state
+        assert len(om._slots) == initial_n_slots, \
+            f"cold start did not restore slots: {initial_n_slots} -> {len(om._slots)}"
+
+
 class TestLatentReactivationWithoutBucket(unittest.TestCase):
     def test_latent_reactivation_without_bucket(self) -> None:
         from chaoscontrol.memory import MultiSlotOuterModel
