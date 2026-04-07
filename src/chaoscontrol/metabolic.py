@@ -25,6 +25,7 @@ def metabolic_fork(
     score_mode: str = "memory_consistency",
     generation_mode: str = "noise",
     structured_proj: StructuredProjections | None = None,
+    prior_bias: torch.Tensor | None = None,
 ) -> dict[str, Any]:
     """Generate K candidate forward passes with perturbed embeddings, select best.
 
@@ -46,6 +47,9 @@ def metabolic_fork(
             ``"structured"`` uses learned projection heads via *structured_proj*.
         structured_proj: A :class:`StructuredProjections` instance. Required
             when *generation_mode* is ``"structured"``.
+        prior_bias: Optional CFR strategy tensor of shape ``(n_actions,)``
+            from regret matching. When provided, biases candidate scoring
+            toward high-regret actions.
 
     Returns:
         The candidate dict with the highest score, containing keys
@@ -150,6 +154,14 @@ def metabolic_fork(
         # Default fallback
         mean_logits = torch.stack([c["logits"] for c in candidates]).mean(dim=0)
         scores = [-F.mse_loss(c["logits"], mean_logits).item() for c in candidates]
+
+    # Apply CFR prior bias to candidate scores
+    if prior_bias is not None:
+        n_candidates = len(scores)
+        bias_len = min(n_candidates, prior_bias.size(0))
+        for i in range(bias_len):
+            # Multiplicative bias: high-regret candidates get boosted scores
+            scores[i] = scores[i] * (1.0 + prior_bias[i].item())
 
     best_idx = max(range(len(scores)), key=lambda i: scores[i])
     return candidates[best_idx]
@@ -280,6 +292,7 @@ def micro_mcts(
     horizon: int = 8,
     ucb_c: float = 1.41,
     value_proxy: str = "confidence",
+    prior_bias: torch.Tensor | None = None,
 ) -> dict[str, Any]:
     """Deliberative planning gate: forward-only tree search triggered by surprise,
     analogous to System 2 / model-based reasoning. Uses the SSM recurrence as a
@@ -300,6 +313,9 @@ def micro_mcts(
         horizon: Rollout depth in tokens.
         ucb_c: UCB exploration constant.
         value_proxy: "confidence" (max softmax prob) or "neg_ce" (negative CE).
+        prior_bias: Optional CFR strategy tensor of shape ``(n_actions,)``
+            from regret matching. When provided, multiplies into PUCT prior
+            probabilities to bias exploration toward high-regret actions.
 
     Returns:
         Dict with "logits", "hidden", and optionally "mcts_stats".
@@ -342,6 +358,12 @@ def micro_mcts(
     # Prior probabilities for PUCT: softmax of top-k logits
     top_logits = mean_last_logits[top_actions]  # (k,)
     prior_probs = F.softmax(top_logits, dim=0)  # (k,)
+
+    # Apply CFR prior bias to PUCT priors
+    if prior_bias is not None:
+        bias_len = min(k, prior_bias.size(0))
+        prior_probs[:bias_len] = prior_probs[:bias_len] * prior_bias[:bias_len]
+        prior_probs = prior_probs / prior_probs.sum()  # renormalize
 
     total_visits = 0
 

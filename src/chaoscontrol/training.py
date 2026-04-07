@@ -82,6 +82,7 @@ def train_chaoscontrol_for_budget(
 
     # CFR regret tracking
     regret_table = None
+    prev_dominant_bucket: int | None = None  # one-step-delayed bucket for CFR bias
     if cfr_enabled:
         from chaoscontrol.regret import RegretTable
         k_max = model.wernicke.k_max if getattr(model, "wernicke", None) else 16
@@ -120,6 +121,13 @@ def train_chaoscontrol_for_budget(
             else:
                 current_threshold = min(1.0, current_threshold * 1.05)
 
+        # Get CFR strategy bias if available (uses previous step's bucket)
+        cfr_prior_bias = None
+        if regret_table is not None and prev_dominant_bucket is not None:
+            cfr_prior_bias = regret_table.get_strategy(
+                prev_dominant_bucket % regret_table.n_buckets
+            )
+
         optimizer.zero_grad(set_to_none=True)
         with maybe_autocast(device, param_dtype):
             if use_fork and metabolic_mode == "fork":
@@ -131,6 +139,7 @@ def train_chaoscontrol_for_budget(
                     score_mode=metabolic_score,
                     generation_mode=generation_mode,
                     structured_proj=structured_proj,
+                    prior_bias=cfr_prior_bias,
                 )
                 fork_count += 1
                 if use_crit:
@@ -146,6 +155,7 @@ def train_chaoscontrol_for_budget(
                     n_rollouts=metabolic_k,
                     horizon=mcts_horizon,
                     ucb_c=mcts_ucb_c,
+                    prior_bias=cfr_prior_bias,
                 )
                 fork_count += 1
                 if use_crit:
@@ -339,7 +349,10 @@ def train_chaoscontrol_for_budget(
                 model.outer_model._compression_consequences.clear()
 
         # CFR regret update: estimate counterfactual values via short lookahead
-        if regret_table is not None and use_fork and dominant_bucket is not None:
+        # On fork/MCTS steps, bucket_ids aren't in the output (the gate bypasses
+        # Wernicke), so fall back to prev_dominant_bucket (one-step delayed).
+        cfr_bucket = dominant_bucket if dominant_bucket is not None else prev_dominant_bucket
+        if regret_table is not None and use_fork and cfr_bucket is not None:
             actual_value = -ce_val  # negative CE (higher is better)
 
             # Get the top-K candidate tokens from last position
@@ -353,26 +366,27 @@ def train_chaoscontrol_for_budget(
                 for t in range(inputs.size(1)):
                     _, _, rollout_state = model.step(inputs[:, t:t+1], rollout_state)
 
-                # Short lookahead (2 steps) for each candidate token
+                # Counterfactual values via negative CE (same scale as actual_value)
                 counterfactual_values = []
                 for a in range(k_actions):
                     token = top_tokens[a].unsqueeze(0).expand(inputs.size(0)).unsqueeze(-1)
                     cf_state = [s.clone() for s in rollout_state]
                     cf_logits, _, cf_state = model.step(token, cf_state)
-                    # One more step with greedy continuation
-                    next_token = cf_logits.argmax(dim=-1, keepdim=True)
-                    cf_logits2, _, _ = model.step(next_token, cf_state)
-                    # Value = negative mean CE of 2-step lookahead
-                    cf_probs = F.softmax(cf_logits2, dim=-1)
-                    cf_value = cf_probs.max(dim=-1).values.mean().item()
-                    counterfactual_values.append(cf_value)
+                    # Use next actual target token for CE computation
+                    if inputs.size(1) > 0:
+                        # Target is the token that actually came next in the training data
+                        next_target = targets[:, -1]  # last target position
+                        cf_ce = F.cross_entropy(cf_logits, next_target).item()
+                        counterfactual_values.append(-cf_ce)  # negative CE, same scale
+                    else:
+                        counterfactual_values.append(actual_value)
 
             action_taken = 0
             if "mcts_stats" in out and "visit_counts" in out["mcts_stats"]:
                 action_taken = int(out["mcts_stats"]["visit_counts"].argmax().item())
 
             regret_table.update(
-                bucket_id=dominant_bucket % regret_table.n_buckets,
+                bucket_id=cfr_bucket % regret_table.n_buckets,
                 action_taken=action_taken,
                 counterfactual_values=counterfactual_values,
                 actual_value=actual_value,
@@ -404,6 +418,9 @@ def train_chaoscontrol_for_budget(
             recent_decoded = model.outer_model.decoder(recent_slots)
             model.semantic_tier.consolidate_from_episodes(recent_decoded)
 
+        # Store bucket for next step's CFR bias (one-step delayed)
+        prev_dominant_bucket = dominant_bucket
+
         history.append(step_record)
         steps += 1
 
@@ -417,6 +434,7 @@ def train_chaoscontrol_for_budget(
         "structured_proj": structured_proj,
         "spectral_snapshots": spectral_snapshots,
         "bucket_snapshots": bucket_snapshots,
+        "regret_table": regret_table,
     }
 
 

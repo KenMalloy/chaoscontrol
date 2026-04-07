@@ -154,5 +154,76 @@ class TestFullStackIntegration(unittest.TestCase):
         )
 
 
+    def test_cfr_accumulates_meaningful_regret(self):
+        """After training with CFR enabled, the regret table should have
+        non-zero entries and at least one bucket with a non-uniform strategy."""
+        torch.manual_seed(42)
+        model = ChaosStudentLM(
+            vocab_size=256, dim=32, num_layers=2, ff_mult=2,
+            a_mode="diag",
+            rich_b_mode="nn", rich_b_bottleneck=16,
+            outer_model_dim=16, outer_model_type="multislot",
+            outer_max_slots=8, outer_compress_ratio=2,
+            wernicke_enabled=True, wernicke_k_max=4, wernicke_window=4,
+            wernicke_router="moe",
+            semantic_tier_bases=4,
+            typed_storage=True,
+            typed_consolidation=True,
+            compression_consequence=True,
+            compression_selection="survival",
+        )
+        device = torch.device("cpu")
+
+        tokens = torch.randint(0, 256, (2000,))
+        train_starts = build_lm_starts(1800, seq_len=32, stride=16)
+
+        result = train_chaoscontrol_for_budget(
+            model,
+            train_tokens=tokens[:1800],
+            train_starts=train_starts,
+            seq_len=32,
+            batch_size=2,
+            device=device,
+            param_dtype=torch.float32,
+            budget_seconds=8.0,
+            base_lr=1e-3,
+            weight_decay=0.01,
+            grad_clip_norm=1.0,
+            seed=42,
+            metabolic_gate=True,
+            metabolic_k=2,
+            metabolic_threshold=0.05,
+            metabolic_mode="mcts",
+            mcts_horizon=2,
+            mcts_ucb_c=1.0,
+            consolidation_write="full_sequence",
+            latent_persistence=True,
+            cfr_enabled=True,
+        )
+
+        assert result["steps"] > 0, "Should complete at least 1 step"
+        regret_table = result.get("regret_table")
+        assert regret_table is not None, "regret_table should be returned when cfr_enabled"
+
+        # Check that cumulative regret is not all zeros
+        total_regret = regret_table.cumulative_regret.abs().sum().item()
+        assert total_regret > 0, (
+            "CFR regret table should have non-zero entries after training "
+            f"(got total abs regret = {total_regret})"
+        )
+
+        # Check at least one bucket has a non-uniform strategy
+        found_non_uniform = False
+        for b in range(regret_table.n_buckets):
+            strategy = regret_table.get_strategy(b)
+            uniform_val = 1.0 / regret_table.n_actions
+            if not all(abs(strategy[a].item() - uniform_val) < 1e-5 for a in range(regret_table.n_actions)):
+                found_non_uniform = True
+                break
+        assert found_non_uniform, (
+            "At least one bucket should have a non-uniform strategy after training"
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
