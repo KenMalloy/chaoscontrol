@@ -163,12 +163,20 @@ Copy `TestChaosControlConfig` from parameter-golf's `tests/test_chaoscontrol.py`
 
 **Step 2: Extract ChaosControlConfig**
 
-Copy the dataclass from `parameter-golf/tools/chaoscontrol.py:34-84` into `src/chaoscontrol/config.py`. No imports beyond stdlib + dataclass.
+Copy the dataclass from `parameter-golf/tools/chaoscontrol.py:34-84` into `src/chaoscontrol/config.py`. Add these new fields not yet in the source:
+
+```python
+    model_type: str = "ssm"  # "ssm" or "transformer"
+    semantic_tier_bases: int = 0  # 0 = disabled
+    generation_mode: str = "noise"  # "noise" or "structured"
+```
+
+No imports beyond stdlib + dataclass.
 
 **Step 3: Test, commit**
 
 ```bash
-git commit -m "feat: add config.py — ChaosControlConfig dataclass"
+git commit -m "feat: add config.py — ChaosControlConfig with model_type and new fields"
 ```
 
 ---
@@ -181,7 +189,7 @@ git commit -m "feat: add config.py — ChaosControlConfig dataclass"
 
 **Step 1: Write tests**
 
-Copy `TestChaosSSMCore`, `TestAPaired`, `TestAFull`, `TestCriticalityRegularizer` from parameter-golf tests.
+Copy `TestChaosSSMCore` (which includes diag, paired oscillation, and full tests) and `TestCriticalityRegularizer` from parameter-golf's `tests/test_chaoscontrol.py`.
 
 **Step 2: Extract classes**
 
@@ -317,7 +325,7 @@ git commit -m "feat: add model.py — ChaosSSMBlock and ChaosStudentLM"
 
 **Step 1: Write tests**
 
-Copy `TestTraining` from parameter-golf tests.
+Copy `TestTraining`, `TestMatrixRunner`, and `TestCLI` from parameter-golf's `tests/test_chaoscontrol.py`.
 
 **Step 2: Extract functions**
 
@@ -330,6 +338,88 @@ Copy `TestTraining` from parameter-golf tests.
 
 ```bash
 git commit -m "feat: add training.py and evaluation.py"
+```
+
+---
+
+### Task 10.5: Add runner.py — experiment dispatcher
+
+**Files:**
+- Create: `src/chaoscontrol/runner.py`
+- Test: `tests/test_runner.py`
+
+**Step 1: Write the failing test**
+
+```python
+from chaoscontrol.runner import load_config, build_model
+import yaml, tempfile, os
+
+def test_load_config_from_yaml():
+    cfg_dict = {"model_type": "ssm", "model_dim": 64, "a_mode": "diag"}
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
+        yaml.dump(cfg_dict, f)
+        path = f.name
+    cfg = load_config(path, enwik8_path="/tmp/enwik8")
+    assert cfg.model_type == "ssm"
+    assert cfg.model_dim == 64
+    os.unlink(path)
+
+def test_build_model_ssm():
+    from chaoscontrol.config import ChaosControlConfig
+    cfg = ChaosControlConfig(enwik8_path="/tmp/enwik8", model_type="ssm", model_dim=16, num_layers=2)
+    model = build_model(cfg)
+    assert hasattr(model, "vocab_size")
+
+def test_build_model_transformer():
+    from chaoscontrol.config import ChaosControlConfig
+    cfg = ChaosControlConfig(enwik8_path="/tmp/enwik8", model_type="transformer", model_dim=16, num_layers=2)
+    model = build_model(cfg)
+    assert hasattr(model, "forward")
+```
+
+**Step 2: Implement runner.py**
+
+```python
+import yaml
+from pathlib import Path
+from chaoscontrol.config import ChaosControlConfig
+from chaoscontrol.model import ChaosStudentLM
+from chaoscontrol.baselines import SimpleTransformerLM
+
+def load_config(path: str, *, enwik8_path: str, budget_seconds: float | None = None) -> ChaosControlConfig:
+    raw = yaml.safe_load(Path(path).read_text())
+    raw["enwik8_path"] = enwik8_path
+    if budget_seconds is not None:
+        raw["budget_seconds"] = budget_seconds
+    return ChaosControlConfig(**raw)
+
+def build_model(cfg: ChaosControlConfig):
+    if cfg.model_type == "transformer":
+        return SimpleTransformerLM(
+            vocab_size=cfg.vocab_size, dim=cfg.model_dim,
+            num_layers=cfg.num_layers, num_heads=cfg.model_dim // 32 or 4,
+        )
+    return ChaosStudentLM(
+        vocab_size=cfg.vocab_size, dim=cfg.model_dim,
+        num_layers=cfg.num_layers, ff_mult=cfg.ff_mult,
+        a_mode=cfg.a_mode, ... # all config fields
+    )
+
+def run_experiment(config_path: str, *, enwik8_path: str, budget_seconds: float = 300):
+    """Load config, build model, train, eval, save results."""
+    cfg = load_config(config_path, enwik8_path=enwik8_path, budget_seconds=budget_seconds)
+    # ... resolve device, load data, train, eval, save JSON
+```
+
+This is the single entry point all experiment run.sh scripts call:
+```bash
+.venv/bin/python -m chaoscontrol.runner --config configs/ssm_small.yaml --enwik8-path "$ENWIK8" --budget "$BUDGET"
+```
+
+**Step 3: Test, commit**
+
+```bash
+git commit -m "feat: add runner.py — YAML config loader, model dispatcher, experiment runner"
 ```
 
 ---
@@ -508,11 +598,19 @@ A gradient-free nudge to the router weights. When a merge in bucket X produces a
 ```python
 def compression_consequence_update(self, bucket_id, quality_delta, lr=0.01):
     """Gradient-free update: bad merge → make this bucket more discriminating."""
-    if self.router_type != "moe" or quality_delta >= 0:
-        return  # only update on bad merges, only for MoE router
+    if quality_delta >= 0:
+        return  # only update on bad merges
     with torch.no_grad():
-        # Strengthen this bucket's router weights (make it more selective)
-        self.router.weight.data[bucket_id] *= (1.0 + lr * abs(quality_delta))
+        if self.router_type == "moe":
+            # Strengthen this bucket's router weights (more selective)
+            self.router.weight.data[bucket_id] *= (1.0 + lr * abs(quality_delta))
+        elif self.router_type == "vq":
+            # Push this bucket's codebook vector away from its nearest neighbor
+            dists = torch.cdist(self.codebook.unsqueeze(0), self.codebook.unsqueeze(0)).squeeze(0)
+            dists[bucket_id, bucket_id] = float("inf")
+            nearest = dists[bucket_id].argmin()
+            direction = self.codebook[bucket_id] - self.codebook[nearest]
+            self.codebook.data[bucket_id] += lr * abs(quality_delta) * direction
 ```
 
 **Step 3: Wire into MultiSlotOuterModel._compress()** — after merging, compute quality_delta (compare retrieval on a cached cue before and after merge), call `wernicke.compression_consequence_update()` if quality dropped.
@@ -628,12 +726,26 @@ ENWIK8="${1:?Usage: run_all.sh /path/to/enwik8 [--budget SECONDS]}"
 shift
 BUDGET="${2:-300}"
 
-for exp in experiments/0*/; do
+# Phase 1: Independent experiments (01-06)
+for exp in experiments/0{1,2,3,4,5,6}_*/; do
     echo "=== Running $(basename $exp) ==="
     bash "$exp/run.sh" "$ENWIK8" --budget "$BUDGET"
 done
+
+# Phase 2: Select winners from 01-06, generate configs for 07-08
+echo "=== Promoting winners ==="
+.venv/bin/python analysis/promote_winners.py
+
+# Phase 3: Dependent experiments (07-08)
+for exp in experiments/0{7,8}_*/; do
+    echo "=== Running $(basename $exp) ==="
+    bash "$exp/run.sh" "$ENWIK8" --budget "$BUDGET"
+done
+
 echo "=== All experiments complete ==="
 ```
+
+Also create `analysis/promote_winners.py` — reads results from experiments 01-06, identifies best single component and best pair, writes `experiments/07_full_system/configs/best_single.yaml`, `best_pair.yaml`, etc. This bridges the dependency between independent and dependent experiments.
 
 **Step 2: Write README.md**
 
@@ -679,4 +791,5 @@ Task 1 (scaffolding)
 
 Tasks 4-8 can be done in parallel after Task 3.
 Tasks 11-14 can be done in parallel after Task 10.
-Tasks 15-22 can be done in parallel after Task 14.
+Tasks 15-20 (experiments 01-06) can be done in parallel after Task 14.
+Tasks 21-22 (experiments 07-08) depend on results from 01-06 via promote_winners.py.
