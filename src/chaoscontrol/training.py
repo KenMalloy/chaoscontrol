@@ -121,9 +121,15 @@ def train_chaoscontrol_for_budget(
             else:
                 current_threshold = min(1.0, current_threshold * 1.05)
 
-        # Get CFR strategy bias if available (uses previous step's bucket)
+        # Get CFR strategy bias if available (uses previous step's bucket).
+        # Random gate is the CONTROL condition -- it must not receive CFR
+        # regret bias, otherwise the control is contaminated.
         cfr_prior_bias = None
-        if regret_table is not None and prev_dominant_bucket is not None:
+        if (
+            regret_table is not None
+            and prev_dominant_bucket is not None
+            and metabolic_threshold_mode != "random"
+        ):
             cfr_prior_bias = regret_table.get_strategy(
                 prev_dominant_bucket % regret_table.n_buckets
             )
@@ -372,10 +378,17 @@ def train_chaoscontrol_for_budget(
                     token = top_tokens[a].unsqueeze(0).expand(inputs.size(0)).unsqueeze(-1)
                     cf_state = [s.clone() for s in rollout_state]
                     cf_logits, _, cf_state = model.step(token, cf_state)
-                    # Use next actual target token for CE computation
+                    # Use next actual target token for CE computation.
+                    # Correctness note: rollout_state was built by stepping
+                    # through inputs[:, 0:seq_len] (positions 0..seq_len-1).
+                    # model.step(token, rollout_state) produces cf_logits
+                    # predicting position seq_len.  targets = data[:, 1:seq_len+1],
+                    # so targets[:, -1] = data[:, seq_len] — exactly the actual
+                    # byte at position seq_len.  This IS the correct target for
+                    # the counterfactual, regardless of which alternative token
+                    # was stepped, because we score against what actually followed.
                     if inputs.size(1) > 0:
-                        # Target is the token that actually came next in the training data
-                        next_target = targets[:, -1]  # last target position
+                        next_target = targets[:, -1]
                         cf_ce = F.cross_entropy(cf_logits, next_target).item()
                         counterfactual_values.append(-cf_ce)  # negative CE, same scale
                     else:

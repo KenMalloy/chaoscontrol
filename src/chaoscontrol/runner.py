@@ -117,6 +117,8 @@ def run_experiment(config_path: str, *, enwik8_path: str, budget_seconds: float 
     # Use the trained structured_proj (not a fresh random one)
     structured_proj = train_result.get("structured_proj")
 
+    total_raw_bytes = int(val_tokens.numel())
+
     eval_result = evaluate_chaoscontrol_bpb(
         model, tokens=val_tokens, eval_starts=eval_starts,
         batch_size=cfg.batch_size, seq_len=cfg.seq_len, device=device,
@@ -128,6 +130,7 @@ def run_experiment(config_path: str, *, enwik8_path: str, budget_seconds: float 
         warmup_write_mode=cfg.warmup_write_mode,
         warmup_latent=cfg.warmup_latent,
         warmup_cold_start=cfg.warmup_cold_start,
+        total_raw_bytes=total_raw_bytes,
     )
 
     bpb_str = f"bpb={eval_result['bpb']:.4f}"

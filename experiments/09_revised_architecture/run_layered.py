@@ -95,7 +95,7 @@ def print_layer_summary(layer_name: str, layer_results: dict):
     """Print a ranked table for the layer."""
     rows = []
     for name, seed_results in layer_results.items():
-        bpbs = [r["eval"]["bpb"] for r in seed_results.values()]
+        bpbs = [r["eval"].get("bpb_gated", r["eval"]["bpb"]) for r in seed_results.values()]
         mean = statistics.mean(bpbs)
         std = statistics.stdev(bpbs) if len(bpbs) > 1 else 0.0
         rows.append((name, mean, std, len(bpbs)))
