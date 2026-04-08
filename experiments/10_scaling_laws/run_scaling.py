@@ -299,25 +299,29 @@ def generate_configs(
                 cfg["model_dim"] = dim
                 cfg["num_layers"] = ssm_layers
             elif cond_name == "our_tfm":
-                # Match transformer params to full_ssm (not bare) for fair comparison.
-                # If full_ssm config exists for this size, estimate its total params;
-                # otherwise fall back to bare SSM params.
+                # Match transformer params to full_ssm by instantiating it.
+                # Arithmetic estimation misses component params (Wernicke bucket
+                # projections, memory encoder/decoder, semantic tier, etc.).
                 full_cfg = configs_at_size.get("full_ssm")
+                target_params = None
                 if full_cfg:
-                    # Estimate full_ssm params including components
-                    full_params = count_ssm_params(dim, ssm_layers, 2)
-                    # Add Wernicke, memory, and other component params
-                    if full_cfg.get("wernicke_enabled"):
-                        k_max = full_cfg.get("wernicke_k_max", 16)
-                        full_params += dim * k_max + k_max * dim  # codebook + router
-                    if full_cfg.get("outer_model_dim", 0) > 0:
-                        om_dim = full_cfg["outer_model_dim"]
-                        full_params += 2 * dim * om_dim  # encoder + decoder
-                    tfm_match = match_transformer_to_ssm(
-                        dim, ssm_layers, ff_mult=2, target_params=full_params,
-                    )
-                else:
-                    tfm_match = match_transformer_to_ssm(dim, ssm_layers, ff_mult=2)
+                    try:
+                        import torch
+                        from chaoscontrol.config import ChaosControlConfig
+                        from chaoscontrol.runner import build_model
+                        from chaoscontrol.data import resolve_device, resolve_param_dtype
+                        tmp_cfg_dict = {**full_cfg, "data_path": "/tmp"}
+                        tmp_cfg = ChaosControlConfig(**tmp_cfg_dict)
+                        device = resolve_device("cpu")
+                        dtype = resolve_param_dtype("fp32", device)
+                        tmp_model = build_model(tmp_cfg, device, dtype)
+                        target_params = sum(p.numel() for p in tmp_model.parameters())
+                        del tmp_model
+                    except Exception as e:
+                        print(f"  [WARN] Could not instantiate full_ssm for param count: {e}")
+                tfm_match = match_transformer_to_ssm(
+                    dim, ssm_layers, ff_mult=2, target_params=target_params,
+                )
                 cfg = {
                     "model_type": "transformer",
                     "model_dim": dim,
@@ -633,30 +637,26 @@ def extract_component_metrics(train_result: dict) -> dict:
     metrics["unique_buckets"] = len(buckets_used)
 
     # Codebook utilization (from Wernicke bucket snapshots)
-    # Snapshots are dicts mapping bucket_id -> count
+    # Each snapshot is {"step": int, "bucket_counts": [int, ...], "active_buckets": int}
     bucket_snaps = train_result.get("bucket_snapshots", [])
     if bucket_snaps:
         last_snap = bucket_snaps[-1]
-        if isinstance(last_snap, dict):
-            counts = list(last_snap.values())
-        else:
-            counts = list(last_snap)
-        total_entries = max(len(counts), 1)
-        active = sum(1 for v in counts if v > 0)
-        metrics["wernicke_codebook_utilization"] = active / total_entries
+        if isinstance(last_snap, dict) and "bucket_counts" in last_snap:
+            counts = last_snap["bucket_counts"]
+            total_entries = max(len(counts), 1)
+            active = sum(1 for v in counts if v > 0)
+            metrics["wernicke_codebook_utilization"] = active / total_entries
 
     # Spectral structure
-    # Snapshots are dicts mapping frequency_bin -> magnitude
+    # Each snapshot is {"step": int, "power_spectrum": [float, ...], "dominant_freq": int, ...}
     spectral = train_result.get("spectral_snapshots", [])
     if spectral:
         last = spectral[-1]
-        if isinstance(last, dict):
-            vals = list(last.values())
-        else:
-            vals = list(last)
-        if vals:
-            metrics["spectral_max_freq"] = float(max(vals))
-            metrics["spectral_mean_freq"] = float(sum(vals) / len(vals))
+        if isinstance(last, dict) and "power_spectrum" in last:
+            vals = last["power_spectrum"]
+            if vals:
+                metrics["spectral_max_freq"] = float(max(vals))
+                metrics["spectral_mean_freq"] = float(sum(vals) / len(vals))
 
     return metrics
 
