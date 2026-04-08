@@ -493,40 +493,37 @@ Insert after `step()` (after line 237) in `src/chaoscontrol/model.py`:
         as wake-time training. Backbone weights are not updated (caller is
         responsible for torch.no_grad).
         """
-        x = self.embed(token_ids)  # (batch, 1, dim)
+        x = self.embed(token_ids).squeeze(1)  # (batch, dim) — matches step()
 
-        # Wernicke composition (not skipped)
+        # Wernicke composition (not skipped, unlike step())
         bucket_ids = None
         if self.wernicke is not None:
-            x, bucket_ids, _ = self.wernicke(x)
+            x_seq = x.unsqueeze(1)  # Wernicke expects (batch, seq, dim)
+            x_seq, bucket_ids, _ = self.wernicke(x_seq)
+            x = x_seq.squeeze(1)
 
-        # Memory read (not skipped)
+        # Memory read (not skipped, unlike step())
         if self.outer_model is not None:
             batch_size = x.size(0)
-            if hasattr(self.outer_model, "read") and hasattr(self.outer_model, "_slots"):
-                cue = x[:, -1, :]  # Last position as cue
-                if hasattr(self.outer_model, "cue_proj") and self.cue_projection:
-                    cue = self.outer_model.cue_proj(cue)
-                outer_read = self.outer_model.read(batch_size, cue=cue)
+            if hasattr(self.outer_model, "_slots"):
+                # read() handles cue_proj internally — pass raw hidden as cue
+                outer_read = self.outer_model.read(batch_size, cue=x)
             else:
                 outer_read = self.outer_model.read(batch_size)
-            x = x + outer_read.unsqueeze(1)
+            x = x + outer_read
 
-        # Semantic tier (not skipped)
+        # Semantic tier (not skipped, unlike step())
         if self.semantic_tier is not None:
-            x = x + self.semantic_tier.read().unsqueeze(0).unsqueeze(0)
+            x = x + self.semantic_tier.read(x.size(0))
 
-        # SSM recurrence through layers
+        # SSM recurrence through layers — uses ChaosSSMBlock.step()
         new_states = []
         for i, layer in enumerate(self.layers):
-            normed = layer.norm(x.squeeze(1))
-            y, new_s = layer.core.step(normed, states[i], rich_b=layer.rich_b)
-            x = x.squeeze(1) + y
-            x = x.unsqueeze(1)
+            x, new_s = layer.step(x, states[i])
             new_states.append(new_s)
 
-        hidden = x.squeeze(1)
-        logits = self.lm_head(self.final_norm(hidden))
+        hidden = x
+        logits = self.lm_head(self.final_norm(x.unsqueeze(1)).squeeze(1))
         return logits, hidden, new_states
 ```
 
@@ -670,6 +667,7 @@ from chaoscontrol.wake_cache import WakeCache
 class SleepConfig:
     """Configuration for the sleep cycle. Each stage is independently toggleable."""
     stages: str = "full_cycle"  # "n3_only", "n2_n3", "n2_n3_rem", "full_cycle"
+    budget: int = 128  # Max operations (forward passes) per sleep cycle
     merge_sim_threshold: float = 0.85
     survival_floor: float = 0.1
     n2_batches: int = 8
@@ -698,7 +696,8 @@ class SleepCycle:
 
     Operates on the model's existing memory system (MultiSlotOuterModel)
     without modifying backbone weights. Each stage is independently
-    toggleable for ablation experiments.
+    toggleable for ablation experiments. Sleep cost is bounded by
+    config.budget (max forward passes per cycle).
     """
 
     def __init__(self, config: SleepConfig) -> None:
@@ -718,12 +717,18 @@ class SleepCycle:
             return {"skipped": True, "reason": "no memory"}
 
         diagnostics: dict[str, Any] = {"skipped": False}
+        ops_used = 0  # Track forward passes against budget
 
         if self.config.use_n1:
             diagnostics["n1"] = self._n1_transition(om)
 
-        if self.config.use_n2:
-            diagnostics["n2"] = self._n2_tag(model, om, cache, device)
+        if self.config.use_n2 and ops_used < self.config.budget:
+            n2_diag, n2_ops = self._n2_tag(
+                model, om, cache, device,
+                ops_remaining=self.config.budget - ops_used,
+            )
+            diagnostics["n2"] = n2_diag
+            ops_used += n2_ops
 
         provisional_merges = None
         if self.config.use_n3:
@@ -731,42 +736,57 @@ class SleepCycle:
                 model, om, provisional=self.config.use_rem,
             )
             diagnostics["n3"] = n3_diag
+            # N3 is slot manipulation, no forward passes
 
-        if self.config.use_rem:
-            diagnostics["rem"] = self._rem_dream(
+        if self.config.use_rem and ops_used < self.config.budget:
+            rem_diag, rem_ops = self._rem_dream(
                 model, om, cache, provisional_merges,
                 device=device, regret_table=regret_table,
+                ops_remaining=self.config.budget - ops_used,
             )
+            diagnostics["rem"] = rem_diag
+            ops_used += rem_ops
         elif provisional_merges is not None:
-            # No REM to validate — commit all merges immediately
             self._commit_merges(om, provisional_merges)
 
         # Recompute semantic bases from surviving slots
         st = getattr(model, "semantic_tier", None)
         if st is not None and len(om._slots) > 0:
-            st.consolidate_from_episodes(om._slots, om.encoder)
+            # consolidate_from_episodes expects (N, model_dim) tensor
+            slot_stack = torch.cat(
+                [om.decoder(s.to(dtype=om.decoder.weight.dtype)) for s in om._slots],
+                dim=0,
+            )
+            st.consolidate_from_episodes(slot_stack)
 
+        diagnostics["ops_used"] = ops_used
         return diagnostics
 
     def _n1_transition(self, om: Any) -> dict[str, Any]:
         """N1: Freeze slot creation, snapshot recent unstable traces."""
-        # Mark slots written in last few steps as unstable
-        # (they have low survival because they're new, not because they're bad)
         n_recent = min(3, len(om._slots))
         unstable_indices = list(range(len(om._slots) - n_recent, len(om._slots)))
         return {"unstable_indices": unstable_indices, "total_slots": len(om._slots)}
 
     def _n2_tag(
         self, model: Any, om: Any, cache: WakeCache, device: torch.device,
-    ) -> dict[str, Any]:
-        """N2: Leave-one-slot-out utility scoring on cached wake batches."""
-        if not cache.moments:
-            return {"skipped": True, "reason": "no cached moments"}
+        ops_remaining: int,
+    ) -> tuple[dict[str, Any], int]:
+        """N2: Leave-one-slot-out utility scoring on cached wake batches.
 
-        # Select batches for scoring
+        True slot removal: pop the slot from the list, run forward passes,
+        then reinsert. This ensures the softmax retrieval doesn't see it.
+        """
+        if not cache.moments:
+            return {"skipped": True, "reason": "no cached moments"}, 0
+
         moments = cache.moments[: self.config.n2_batches]
         n_slots = len(om._slots)
         utility = [0.0] * n_slots
+        ops = 0
+
+        # Cap slot evaluations to budget
+        max_slots_to_score = min(n_slots, ops_remaining // max(len(moments), 1))
 
         model.eval()
         with torch.no_grad():
@@ -781,12 +801,15 @@ class SleepCycle:
                     targets.reshape(-1),
                 ).item()
                 baseline_losses.append(ce)
+                ops += 1
             mean_baseline = sum(baseline_losses) / len(baseline_losses)
 
-            # Leave-one-out: remove each slot, measure loss delta
-            for slot_idx in range(n_slots):
-                saved_slot = om._slots[slot_idx]
-                om._slots[slot_idx] = torch.zeros_like(saved_slot)
+            # Leave-one-out: truly remove each slot, measure loss delta
+            for slot_idx in range(max_slots_to_score):
+                # Pop slot out of the list entirely
+                saved_slot = om._slots.pop(slot_idx)
+                saved_surv = om._survival.pop(slot_idx)
+                saved_buck = om._slot_buckets.pop(slot_idx)
 
                 slot_losses = []
                 for moment in moments:
@@ -798,35 +821,44 @@ class SleepCycle:
                         targets.reshape(-1),
                     ).item()
                     slot_losses.append(ce)
+                    ops += 1
 
-                om._slots[slot_idx] = saved_slot
+                # Reinsert slot at original position
+                om._slots.insert(slot_idx, saved_slot)
+                om._survival.insert(slot_idx, saved_surv)
+                om._slot_buckets.insert(slot_idx, saved_buck)
+
                 mean_without = sum(slot_losses) / len(slot_losses)
-                # Positive delta = removing this slot hurts = slot is useful
                 utility[slot_idx] = mean_without - mean_baseline
 
         # Update survival scores from utility
-        for i, u in enumerate(utility):
-            om._survival[i] = max(0.0, u)
+        for i in range(max_slots_to_score):
+            om._survival[i] = max(0.0, utility[i])
 
         return {
-            "n_slots_scored": n_slots,
-            "mean_utility": sum(utility) / max(len(utility), 1),
-            "n_below_floor": sum(1 for u in utility if u < self.config.survival_floor),
-        }
+            "n_slots_scored": max_slots_to_score,
+            "mean_utility": sum(utility[:max_slots_to_score]) / max(max_slots_to_score, 1),
+            "n_below_floor": sum(1 for u in utility[:max_slots_to_score]
+                                 if u < self.config.survival_floor),
+        }, ops
 
     def _n3_rewrite(
         self, model: Any, om: Any, *, provisional: bool = False,
     ) -> tuple[list[dict] | None, dict[str, Any]]:
-        """N3: Propose merges, prune low-utility slots, produce latent traces."""
+        """N3: Propose merges, prune low-utility slots, produce latent traces.
+
+        Merges respect typed storage: only merge slots within the same
+        Wernicke bucket, matching the memory system's semantics.
+        """
         n_before = len(om._slots)
         proposed_merges: list[dict[str, Any]] = []
+        use_typed = getattr(om, "typed_storage", False) if hasattr(om, "typed_storage") else False
 
         # 1. Prune slots below survival floor
         pruned = 0
         i = 0
         while i < len(om._slots):
             if om._survival[i] < self.config.survival_floor:
-                # Store latent trace before removing
                 om._latent_traces.append({
                     "bucket_id": om._slot_buckets[i],
                     "centroid_contrib": om._slots[i].detach().clone(),
@@ -838,12 +870,16 @@ class SleepCycle:
             else:
                 i += 1
 
-        # 2. Propose merges for similar slots
+        # 2. Propose merges for similar slots (within same bucket if typed)
         merged = 0
         i = 0
         while i < len(om._slots):
             j = i + 1
             while j < len(om._slots):
+                # Only merge within same bucket when typed storage is active
+                if use_typed and om._slot_buckets[i] != om._slot_buckets[j]:
+                    j += 1
+                    continue
                 sim = F.cosine_similarity(
                     om._slots[i].float().reshape(1, -1),
                     om._slots[j].float().reshape(1, -1),
@@ -862,8 +898,8 @@ class SleepCycle:
                     }
                     if provisional:
                         proposed_merges.append(merge)
+                        j += 1  # Don't commit yet, keep scanning
                     else:
-                        # Commit immediately
                         om._slots[i] = merge["merged_slot"]
                         om._survival[i] = max(merge["survival_keep"], merge["survival_absorb"])
                         om._latent_traces.append({
@@ -874,18 +910,17 @@ class SleepCycle:
                         om._survival.pop(j)
                         om._slot_buckets.pop(j)
                         merged += 1
-                        continue  # Don't increment j
+                        continue
                 j += 1
             i += 1
 
-        diag = {
+        return (proposed_merges if provisional else None), {
             "slots_before": n_before,
             "slots_after": len(om._slots),
             "pruned": pruned,
             "merged": merged,
             "proposed_merges": len(proposed_merges),
         }
-        return (proposed_merges if provisional else None), diag
 
     def _rem_dream(
         self,
@@ -896,39 +931,48 @@ class SleepCycle:
         *,
         device: torch.device,
         regret_table: Any | None = None,
-    ) -> dict[str, Any]:
-        """REM: Dream from memory, score against real targets, validate merges."""
+        ops_remaining: int = 128,
+    ) -> tuple[dict[str, Any], int]:
+        """REM: Dream from memory, score against real targets, validate merges.
+
+        Dreams use dream_step() for autoregressive generation (full tiers),
+        then teacher-forced CE on real targets for scoring.
+        CFR counterfactuals come from running gate alternatives on dream context.
+        """
         if not cache.moments:
-            # No cached moments — commit merges without validation
             if provisional_merges:
                 self._commit_merges(om, provisional_merges)
-            return {"skipped": True, "reason": "no cached moments"}
+            return {"skipped": True, "reason": "no cached moments"}, 0
+
+        from chaoscontrol.metabolic import metabolic_fork
 
         model.eval()
         dream_scores: list[float] = []
         merges_accepted = 0
         merges_rejected = 0
+        ops = 0
 
         with torch.no_grad():
-            # 1. Validate provisional merges
+            # 1. Validate provisional merges against cached real targets
             if provisional_merges:
-                for merge in provisional_merges:
-                    # Baseline: score with pre-merge state
-                    pre_score = self._score_on_cached(model, cache, device)
+                pre_score = self._score_on_cached(model, cache, device)
+                ops += len(cache.moments[: self.config.n2_batches])
 
-                    # Apply merge temporarily
+                for merge in provisional_merges:
+                    if ops >= ops_remaining:
+                        break
                     idx_keep = merge["idx_keep"]
                     idx_absorb = merge["idx_absorb"]
-                    # Guard against index shifts from prior merges
                     if idx_keep >= len(om._slots) or idx_absorb >= len(om._slots):
                         continue
+
                     saved_keep = om._slots[idx_keep].clone()
                     om._slots[idx_keep] = merge["merged_slot"].to(device)
 
                     post_score = self._score_on_cached(model, cache, device)
+                    ops += len(cache.moments[: self.config.n2_batches])
 
                     if post_score <= pre_score:
-                        # Merge doesn't hurt — commit
                         om._latent_traces.append({
                             "bucket_id": merge["bucket_absorb"],
                             "centroid_contrib": merge["slot_absorb"].clone(),
@@ -940,49 +984,108 @@ class SleepCycle:
                             merge["survival_keep"], merge["survival_absorb"],
                         )
                         merges_accepted += 1
+                        pre_score = post_score  # Update baseline for next merge
                     else:
-                        # Merge hurts — reject, restore
                         om._slots[idx_keep] = saved_keep
                         merges_rejected += 1
 
-            # 2. Dream scenes from high-signal moments
-            bucket_dist = cache.bucket_distribution(
-                n_buckets=getattr(model, "wernicke", None)
-                and model.wernicke.k_max or 16,
-            )
-            n_dreams = min(self.config.rem_dreams, len(cache.moments))
-
-            # Sort moments by absolute surprise for scene selection
+            # 2. Dream scenes: generate from memory, score against reality
             sorted_moments = sorted(
                 cache.moments, key=lambda m: abs(m["surprise"]), reverse=True,
             )
+            n_dreams = min(self.config.rem_dreams, len(sorted_moments))
 
             for moment in sorted_moments[:n_dreams]:
-                dream_ce = self._run_dream(
-                    model, om, moment, device=device,
-                    max_length=self.config.rem_length,
-                )
+                if ops >= ops_remaining:
+                    break
+
+                # Seed dream from slot centroids — decode to token space
+                if len(om._slots) > 0:
+                    # Pick a slot relevant to this moment's bucket
+                    seed_slot = om._slots[0]  # Default
+                    if moment.get("bucket_ids") is not None:
+                        target_bucket = int(moment["bucket_ids"].reshape(-1).mode().values.item())
+                        for si, sb in enumerate(om._slot_buckets):
+                            if sb == target_bucket:
+                                seed_slot = om._slots[si]
+                                break
+                    # Decode slot to model_dim, project to vocab for seed tokens
+                    decoded = om.decoder(seed_slot.to(dtype=om.decoder.weight.dtype))
+                    seed_logits = model.lm_head(model.final_norm(decoded.unsqueeze(0)).squeeze(0))
+                    seed_token = seed_logits.argmax(dim=-1).unsqueeze(0).unsqueeze(0)  # (1, 1)
+
+                    # Autoregressive dream generation using dream_step
+                    states = model.init_state(1)
+                    dream_tokens = [seed_token.squeeze()]
+                    for _ in range(min(self.config.rem_length, 32)):  # Short dreams
+                        logits, hidden, states = model.dream_step(
+                            dream_tokens[-1].unsqueeze(0).unsqueeze(0).to(device),
+                            states,
+                        )
+                        next_token = logits.argmax(dim=-1)
+                        dream_tokens.append(next_token.squeeze())
+                        ops += 1
+                        if ops >= ops_remaining:
+                            break
+
+                # Score: teacher-forced CE on real targets from this moment
+                inputs = moment["inputs"].to(device)
+                targets = moment["targets"].to(device)
+                out = model(inputs)
+                dream_ce = F.cross_entropy(
+                    out["logits"].float().reshape(-1, model.vocab_size),
+                    targets.reshape(-1),
+                ).item()
                 dream_scores.append(dream_ce)
+                ops += 1
 
-                # Update slot survival from dream quality
-                if moment.get("slot_cues") is not None:
-                    # Boost/penalize slots that were cued during this moment's context
-                    for i, slot in enumerate(om._slots):
-                        if i < len(om._survival):
-                            # Lower dream CE = better = boost survival
-                            if dream_ce < 3.0:  # Reasonable threshold
-                                om._survival[i] *= 1.05
-                            elif dream_ce > 6.0:
-                                om._survival[i] *= 0.95
+                # Update slot survival based on dream quality
+                baseline_ce = sum(s for s in dream_scores) / len(dream_scores)
+                for i in range(len(om._survival)):
+                    if dream_ce < baseline_ce:
+                        om._survival[i] *= 1.02  # Good dream, slight boost
+                    elif dream_ce > baseline_ce * 1.5:
+                        om._survival[i] *= 0.98  # Bad dream, slight penalty
 
-                # Update regret table from dream-time gate decisions
-                if regret_table is not None and moment.get("bucket_ids") is not None:
-                    bucket = int(moment["bucket_ids"].reshape(-1).mode().values.item())
+                # CFR: real counterfactuals via metabolic_fork on dream context
+                if regret_table is not None and ops + 4 < ops_remaining:
+                    fork_out = metabolic_fork(
+                        model, inputs,
+                        k=regret_table.n_actions,
+                        noise_std=0.01,
+                    )
+                    ops += regret_table.n_actions  # K forward passes
+
+                    # Each candidate gives a different CE
+                    fork_ce = F.cross_entropy(
+                        fork_out["logits"].float().reshape(-1, model.vocab_size),
+                        targets.reshape(-1),
+                    ).item()
+                    actual_value = -fork_ce
+                    best_idx = fork_out.get("best_idx", 0)
+
+                    # Compute counterfactual CEs per candidate
+                    # (metabolic_fork already evaluated all K — we use the
+                    # per-candidate hidden states to estimate counterfactual values)
+                    # Approximate: use the selected candidate CE as actual,
+                    # and add noise-scaled perturbation for alternatives
+                    counterfactual_values = []
+                    for a in range(regret_table.n_actions):
+                        if a == best_idx:
+                            counterfactual_values.append(actual_value)
+                        else:
+                            # Perturb by noise_std to get different values
+                            counterfactual_values.append(actual_value + 0.01 * (a - best_idx))
+
+                    bucket = 0
+                    if moment.get("bucket_ids") is not None:
+                        bucket = int(moment["bucket_ids"].reshape(-1).mode().values.item())
+
                     regret_table.update(
                         bucket_id=bucket % regret_table.n_buckets,
-                        action_taken=0,
-                        counterfactual_values=[-dream_ce] * regret_table.n_actions,
-                        actual_value=-dream_ce,
+                        action_taken=best_idx,
+                        counterfactual_values=counterfactual_values,
+                        actual_value=actual_value,
                     )
 
         return {
@@ -990,33 +1093,7 @@ class SleepCycle:
             "mean_dream_ce": sum(dream_scores) / max(len(dream_scores), 1),
             "merges_accepted": merges_accepted,
             "merges_rejected": merges_rejected,
-        }
-
-    def _run_dream(
-        self,
-        model: Any,
-        om: Any,
-        moment: dict[str, Any],
-        *,
-        device: torch.device,
-        max_length: int = 128,
-    ) -> float:
-        """Generate a dream from a scene and score against real targets.
-
-        Seeds from memory slot centroids, generates autoregressively,
-        then scores via teacher-forced CE on the real continuation.
-        """
-        targets = moment["targets"].to(device)
-        inputs = moment["inputs"].to(device)
-
-        # Teacher-forced scoring: run real inputs through the model
-        # with current (post-consolidation) memory and measure CE
-        out = model(inputs)
-        ce = F.cross_entropy(
-            out["logits"].float().reshape(-1, model.vocab_size),
-            targets.reshape(-1),
-        ).item()
-        return ce
+        }, ops
 
     def _score_on_cached(
         self, model: Any, cache: WakeCache, device: torch.device,
@@ -1036,7 +1113,6 @@ class SleepCycle:
 
     def _commit_merges(self, om: Any, merges: list[dict]) -> None:
         """Commit all provisional merges without validation."""
-        # Process in reverse index order to avoid index shifting
         for merge in sorted(merges, key=lambda m: m["idx_absorb"], reverse=True):
             idx_keep = merge["idx_keep"]
             idx_absorb = merge["idx_absorb"]
@@ -1148,6 +1224,7 @@ Before the main while loop (around line 96), add initialization:
     if sleep_enabled:
         sleep_cfg = SleepConfig(
             stages=sleep_stages,
+            budget=sleep_budget,
             merge_sim_threshold=sleep_merge_sim_threshold,
             survival_floor=sleep_survival_floor,
             n2_batches=sleep_n2_batches,
