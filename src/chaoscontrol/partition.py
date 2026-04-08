@@ -113,3 +113,61 @@ class PartitionTopology:
         for p in self.awake_partitions():
             result |= p.bucket_ids
         return result
+
+
+class PolyphasicScheduler:
+    """K-of-N polyphasic sleep scheduler with round-robin rotation."""
+
+    def __init__(
+        self,
+        topology: PartitionTopology,
+        k_awake: int,
+        swap_interval: int = 256,
+    ) -> None:
+        self.topology = topology
+        self.k_awake = k_awake
+        self.swap_interval = swap_interval
+        self._step_count = 0
+        self._sleep_cursor = 0
+
+        n = len(self.topology.partitions)
+        n_sleeping = n - k_awake
+
+        # Set initial assignment: first n_sleeping partitions sleeping, rest awake
+        for i, p in enumerate(self.topology.partitions):
+            p.mode = "sleeping" if i < n_sleeping else "awake"
+
+    def awake(self) -> list[SemanticPartition]:
+        return self.topology.awake_partitions()
+
+    def sleeping(self) -> list[SemanticPartition]:
+        return self.topology.sleeping_partitions()
+
+    def step(self) -> bool:
+        """Advance one step. Returns True if a swap occurred."""
+        self._step_count += 1
+        if self._step_count % self.swap_interval != 0:
+            return False
+        self._rotate()
+        return True
+
+    def _rotate(self) -> None:
+        """Round-robin: shift the sleeping window by 1 position.
+
+        N partitions form a ring.  The sleeping window is N-K consecutive
+        partitions starting at ``_sleep_cursor``.  After rotation the cursor
+        advances by 1 (mod N).
+        """
+        n = len(self.topology.partitions)
+        n_sleeping = n - self.k_awake
+
+        # Wake the partition that is leaving the sleeping window
+        leaving = self._sleep_cursor
+        self.topology.partitions[leaving].mode = "awake"
+
+        # Advance cursor
+        self._sleep_cursor = (self._sleep_cursor + 1) % n
+
+        # Put the partition entering the sleeping window to sleep
+        entering = (self._sleep_cursor + n_sleeping - 1) % n
+        self.topology.partitions[entering].mode = "sleeping"

@@ -1,7 +1,7 @@
-"""Tests for SemanticPartition and PartitionTopology."""
+"""Tests for SemanticPartition, PartitionTopology, and PolyphasicScheduler."""
 
 import pytest
-from chaoscontrol.partition import SemanticPartition, PartitionTopology
+from chaoscontrol.partition import SemanticPartition, PartitionTopology, PolyphasicScheduler
 
 
 def test_partition_init():
@@ -129,3 +129,74 @@ def test_awake_sleeping_helpers():
 
     # awake_bucket_ids should be buckets from partitions 0 and 2
     assert topo.awake_bucket_ids() == {0, 1, 2, 3, 8, 9, 10, 11}
+
+
+# ------------------------------------------------------------------
+# PolyphasicScheduler tests
+# ------------------------------------------------------------------
+
+
+def test_scheduler_init():
+    """4 partitions, k_awake=3 -> 3 awake, 1 sleeping."""
+    topo = PartitionTopology.slot_striped(n_partitions=4)
+    sched = PolyphasicScheduler(topo, k_awake=3)
+
+    awake = sched.awake()
+    sleeping = sched.sleeping()
+
+    assert len(awake) == 3
+    assert len(sleeping) == 1
+    # The first (N-K)=1 partition should be sleeping initially
+    assert sleeping[0].partition_id == 0
+    awake_ids = {p.partition_id for p in awake}
+    assert awake_ids == {1, 2, 3}
+
+
+def test_scheduler_rotation():
+    """swap_interval=2, step twice, verify swap happened and different partition sleeping."""
+    topo = PartitionTopology.slot_striped(n_partitions=4)
+    sched = PolyphasicScheduler(topo, k_awake=3, swap_interval=2)
+
+    # Initially partition 0 is sleeping
+    assert sched.sleeping()[0].partition_id == 0
+
+    # First step: no swap
+    swapped = sched.step()
+    assert swapped is False
+    assert sched.sleeping()[0].partition_id == 0
+
+    # Second step: swap occurs
+    swapped = sched.step()
+    assert swapped is True
+    # After rotation, the sleeping window shifts by 1 -> partition 1 sleeping
+    assert sched.sleeping()[0].partition_id == 1
+
+
+def test_scheduler_round_robin():
+    """swap_interval=1, step 4 times with 4 partitions -> every partition has slept."""
+    topo = PartitionTopology.slot_striped(n_partitions=4)
+    sched = PolyphasicScheduler(topo, k_awake=3, swap_interval=1)
+
+    slept: set[int] = set()
+    # Capture initial sleeping partition
+    slept.add(sched.sleeping()[0].partition_id)
+
+    for _ in range(4):
+        sched.step()
+        for p in sched.sleeping():
+            slept.add(p.partition_id)
+
+    # Every partition should have been sleeping at some point
+    assert slept == {0, 1, 2, 3}
+
+
+def test_scheduler_fixed_capacity():
+    """8 partitions, k_awake=6, step 100 times -> always 6 awake + 2 sleeping = 8."""
+    topo = PartitionTopology.slot_striped(n_partitions=8)
+    sched = PolyphasicScheduler(topo, k_awake=6, swap_interval=3)
+
+    for _ in range(100):
+        sched.step()
+        assert len(sched.awake()) == 6
+        assert len(sched.sleeping()) == 2
+        assert len(sched.awake()) + len(sched.sleeping()) == 8
