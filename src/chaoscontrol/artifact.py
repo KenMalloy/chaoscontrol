@@ -103,9 +103,10 @@ def serialize_artifact(
     config: ChaosControlConfig,
     path: str | Path,
     *,
-    target_bytes: int = 16_777_216,
+    target_bytes: int = 16_000_000,  # 16 MB decimal (Parameter Golf limit)
     regret_table: RegretTable | None = None,
     lzma_preset: int = 6,
+    force_quantization: str | None = None,
 ) -> dict[str, Any]:
     """Quantize, compress, and write a ChaosControl model to a single file.
 
@@ -212,19 +213,25 @@ def serialize_artifact(
         pruned = original_slot_count - kept
         return compressed, quantization, kept, pruned
 
-    # Try int8 first
-    compressed, quant, kept, pruned = _try_pack(state, "int8")
-
-    if len(compressed) > target_bytes:
-        # Try int6
-        compressed, quant, kept, pruned = _try_pack(state, "int6")
-
-    if len(compressed) > target_bytes and original_slot_count > 0:
-        # Prune episodic slots progressively
-        for keep_n in range(original_slot_count - 1, -1, -1):
-            compressed, quant, kept, pruned = _try_pack(state, "int6", slots_to_keep=keep_n)
-            if len(compressed) <= target_bytes:
-                break
+    # Quantize: either forced level or auto-escalate to fit budget
+    if force_quantization is not None:
+        compressed, quant, kept, pruned = _try_pack(state, force_quantization)
+        if len(compressed) > target_bytes and original_slot_count > 0:
+            for keep_n in range(original_slot_count - 1, -1, -1):
+                compressed, quant, kept, pruned = _try_pack(
+                    state, force_quantization, slots_to_keep=keep_n)
+                if len(compressed) <= target_bytes:
+                    break
+    else:
+        # Auto mode: try int8 first, then int6, then prune slots
+        compressed, quant, kept, pruned = _try_pack(state, "int8")
+        if len(compressed) > target_bytes:
+            compressed, quant, kept, pruned = _try_pack(state, "int6")
+        if len(compressed) > target_bytes and original_slot_count > 0:
+            for keep_n in range(original_slot_count - 1, -1, -1):
+                compressed, quant, kept, pruned = _try_pack(state, "int6", slots_to_keep=keep_n)
+                if len(compressed) <= target_bytes:
+                    break
 
     if len(compressed) > target_bytes:
         raise ValueError(
