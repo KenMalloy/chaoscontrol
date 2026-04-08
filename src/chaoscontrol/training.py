@@ -140,7 +140,7 @@ def train_chaoscontrol_for_budget(
         elif polyphasic_topology == "bucket_striped":
             topo = PartitionTopology.bucket_striped(polyphasic_n_partitions, k_max)
         else:
-            topo = PartitionTopology.slot_striped(polyphasic_n_partitions)
+            topo = PartitionTopology.slot_striped(polyphasic_n_partitions, k_max)
         scheduler = PolyphasicScheduler(topo, polyphasic_k_awake, polyphasic_swap_interval)
 
     model.train()
@@ -559,20 +559,25 @@ def train_chaoscontrol_for_budget(
             if "bucket_ids" in out:
                 wake_cache.update_bucket_counts(out["bucket_ids"])
 
+            # Polyphasic scheduler: step every training step (not just sleep triggers)
+            if scheduler is not None:
+                swapped = scheduler.step()
+                if swapped:
+                    step_record["polyphasic_swap"] = True
+
             # Sleep trigger: fixed interval
             if wake_steps_since_sleep >= sleep_interval:
                 if scheduler is not None:
                     # Polyphasic: run scoped sleep on each sleeping partition
+                    sleep_diags = []
                     for p in scheduler.sleeping():
                         sleep_diag = sleep_cycle.run(
                             model, wake_cache,
                             device=device, regret_table=regret_table,
                             partition=p,
                         )
-                        step_record["sleep"] = sleep_diag
-                    swapped = scheduler.step()
-                    if swapped:
-                        step_record["polyphasic_swap"] = True
+                        sleep_diags.append(sleep_diag)
+                    step_record["sleep"] = sleep_diags
                 else:
                     # Global offline sleep (existing behavior)
                     sleep_diag = sleep_cycle.run(

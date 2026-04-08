@@ -64,9 +64,10 @@ def _base(**overrides) -> dict:
         "seq_len": 256,
         "stride": 128,
         "batch_size": 32,
-        "lr": 2e-3,
+        "base_lr": 2e-3,
         # Memory
         "outer_model_type": "multislot",
+        "outer_model_dim": 64,
         "outer_max_slots": 64,
         "consolidation_write": "full_sequence",
         "latent_persistence": True,

@@ -50,9 +50,9 @@ def test_slot_striped_topology():
     topo = PartitionTopology.slot_striped(n_partitions=4)
 
     assert len(topo.partitions) == 4
-    # All partitions should have empty bucket_ids (slot-based, not bucket-based)
-    for p in topo.partitions:
-        assert p.bucket_ids == set()
+    # Buckets assigned round-robin: partition 0 gets {0,4,8,12}, etc.
+    assert topo.partitions[0].bucket_ids == {0, 4, 8, 12}
+    assert topo.partitions[1].bucket_ids == {1, 5, 9, 13}
 
     owner_map = topo.slot_owner_map(total_slots=64)
     assert len(owner_map) == 64

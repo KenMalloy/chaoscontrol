@@ -38,14 +38,19 @@ class PartitionTopology:
     # ------------------------------------------------------------------
 
     @classmethod
-    def slot_striped(cls, n_partitions: int) -> PartitionTopology:
-        """Round-robin slots across partitions — no semantic (bucket) awareness.
+    def slot_striped(cls, n_partitions: int, k_max: int = 16) -> PartitionTopology:
+        """Round-robin bucket assignment across partitions.
 
-        All partitions have empty bucket_ids; ownership is determined by
-        slot index via ``slot_owner_map``.
+        Each partition gets every Nth bucket (round-robin), giving uniform
+        coverage without semantic grouping. This is the control topology
+        for testing polyphasic economics independent of typed ownership.
         """
+        bucket_sets: list[set[int]] = [set() for _ in range(n_partitions)]
+        for b in range(k_max):
+            bucket_sets[b % n_partitions].add(b)
         partitions = [
-            SemanticPartition(partition_id=i) for i in range(n_partitions)
+            SemanticPartition(partition_id=i, bucket_ids=bucket_sets[i])
+            for i in range(n_partitions)
         ]
         return cls(partitions)
 
@@ -124,6 +129,9 @@ class PolyphasicScheduler:
         k_awake: int,
         swap_interval: int = 256,
     ) -> None:
+        n = len(topology.partitions)
+        if not (0 < k_awake < n):
+            raise ValueError(f"k_awake must be in (0, {n}), got {k_awake}")
         self.topology = topology
         self.k_awake = k_awake
         self.swap_interval = swap_interval

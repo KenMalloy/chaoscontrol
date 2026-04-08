@@ -91,7 +91,7 @@ def test_polyphasic_slot_striped():
     topo = PartitionTopology.slot_striped(n_partitions=4)
     sched = PolyphasicScheduler(topo, k_awake=3, swap_interval=1)
 
-    # With slot_striped, bucket_ids are empty — ownership is by slot index
+    # With slot_striped, buckets are assigned round-robin (uniform, not semantic)
     slot_map = topo.slot_owner_map(total_slots=16)
     assert slot_map[0] == 0
     assert slot_map[1] == 1
