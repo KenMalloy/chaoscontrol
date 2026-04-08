@@ -45,6 +45,20 @@ Unihemispheric sleep fits that story cleanly.
 
 ## Core Architecture
 
+### Key Distinction: Hardware vs Semantic Sleep
+
+**All GPUs always participate in trunk SGD.** Data-parallel forward/backward runs on every GPU every step. No GPU is "diverted" to consolidation work.
+
+"Sleeping" is purely a **semantic-state mode**. A sleeping partition's slots, traces, and bases are in consolidation mode (N2/N3/REM), but the GPU hosting that partition still does its share of trunk gradient computation. Sleep is a memory-management concept, not a hardware-scheduling concept.
+
+This matters for testability: the mechanism claim is about structured consolidation improving memory quality, not about GPU utilization patterns.
+
+### Fixed Total Capacity
+
+**Total semantic capacity is fixed regardless of N.** If the system has 64 total slots, 64 latent traces, 16 semantic bases, and 16 Wernicke buckets, those numbers hold whether N=1 (single partition, full offline sleep) or N=8 (eight partitions, polyphasic). More partitions distribute the same pool more finely — they do not grow it.
+
+This is critical for deconfounding. Without fixed capacity, "N=8 beats N=4" could just mean "more slots = better," not "better consolidation scheduling = better."
+
 ### High-Level Split
 
 Treat the semantic engine as N partitions (one per GPU in the simplest mapping):
@@ -54,9 +68,9 @@ Treat the semantic engine as N partitions (one per GPU in the simplest mapping):
 Each partition owns:
 
 - a subset of Wernicke bucket families (the natural ownership boundary)
-- episodic slots assigned to those buckets
-- associated latent traces
-- associated semantic bases or semantic subspace
+- its share of the fixed episodic slot pool (total_slots / N per partition)
+- its share of latent traces
+- its share of semantic bases
 - a local regret/gate policy table
 
 At any training instant, a scheduler assigns each partition to one of two modes:
@@ -64,9 +78,9 @@ At any training instant, a scheduler assigns each partition to one of two modes:
 - **awake** (K partitions)
 - **sleeping** (N−K partitions)
 
-The K:N ratio is the polyphasic wake fraction. K=6, N=8 means 75% semantic capacity awake, 25% consolidating. The scheduler rotates assignments so every partition gets regular sleep.
+The K:N ratio is the polyphasic wake fraction. K=6, N=8 means 75% of semantic capacity is accepting new writes, 25% is consolidating. The scheduler rotates assignments so every partition gets regular sleep.
 
-The trunk remains globally active (data-parallel across all GPUs).
+The trunk remains globally active (data-parallel across all GPUs). Every GPU does forward/backward every step.
 
 ### What "Awake" Means
 
@@ -268,54 +282,75 @@ The central claim is:
 
 > Polyphasic partitioned sleep preserves most of the consolidation benefit of full offline sleep while converting the wake-step tax into a semantic capacity tradeoff. Adding GPUs increases consolidation depth, not just throughput.
 
-That can be tested cleanly.
+That can be tested cleanly — provided we deconfound the mechanism from capacity and throughput effects.
 
 ## Required Ablations
 
-### Primary Wake/Sleep Economics
+### Primary Comparison (locked defaults)
 
-1. `no_sleep`
-2. `full_offline_sleep` (Experiment 11 baseline)
-3. `polyphasic_K6_N8` (6 awake, 2 sleeping)
+The primary experiment varies **only the sleep scheduling mode**. Everything else is held constant:
 
-This is the key experiment. If polyphasic matches or beats full offline sleep while recovering wake throughput, the idea is real.
+- **Total semantic capacity**: 64 slots, 64 latent traces, 16 bases, 16 buckets (fixed across all conditions)
+- **Cross-partition read policy**: read-only summary (locked)
+- **Swap interval**: 256 steps (locked)
+- **Sleep payload**: inherited from Experiment 11 winner (locked)
+- **Trunk**: identical data-parallel SGD on all GPUs in all conditions
+- **Budget**: fixed wall-clock seconds
 
-### Wake Fraction (K-of-N)
+| Condition | Description | Sleep mode |
+|-----------|-------------|------------|
+| `no_sleep` | No consolidation | — |
+| `full_offline_sleep` | Exp 11 full_cycle (global pause) | All partitions sleep together |
+| `polyphasic_K6_N8` | 6 awake, 2 sleeping, round-robin | Concurrent consolidation |
 
-1. `K7_N8` — light nap (87.5% capacity, 1 consolidating)
-2. `K6_N8` — default (75% capacity, 2 consolidating)
-3. `K4_N8` — deep sleep (50% capacity, 4 consolidating)
+This is the key experiment. If polyphasic matches or beats full offline sleep at the same total capacity while recovering wake throughput, the idea is real.
 
-### Partition Strategy
+### Exploratory: Wake Fraction (K-of-N)
+
+Same locked defaults, vary only K:
+
+1. `K7_N8` — light nap (87.5% capacity awake, 1 consolidating)
+2. `K6_N8` — default (75% capacity awake, 2 consolidating)
+3. `K4_N8` — deep sleep (50% capacity awake, 4 consolidating)
+
+### Exploratory: Partition Strategy
 
 1. arbitrary slot-halving (fallback)
 2. bucket-owned partitions (CCSSM-native)
 
 If bucket-owned wins, the result is genuinely distinctive.
 
-### Cross-Partition Read Policy
+### Exploratory: Cross-Partition Read Policy
 
 1. no reads from sleeping partitions
 2. read-only summary from sleeping partitions
 3. full live reads from sleeping partitions
 
-The likely sweet spot is `read-only summary`. Full live reads risk conflating wake and sleep.
-
-### Swap Interval
+### Exploratory: Swap Interval
 
 1. short (every 64 steps)
 2. medium (every 256 steps)
 3. long (every 1024 steps)
 
-Too fast will thrash. Too slow will let sleeping partitions' state go stale.
-
-### Sleep Payload
+### Exploratory: Sleep Payload
 
 1. `N2/N3` only
 2. `N2/N3/REM`
 3. `N2/N3/REM` + reactivation
 
-This tells you what actually earns its keep in background consolidation. Results from Experiment 11 will inform which stages to include.
+Informed by Experiment 11 results.
+
+### Statistical Discipline
+
+Inherit Experiment 11's framework:
+
+- **Seeds**: 7 per condition (minimum for Wilcoxon power after Holm correction)
+- **Confirmatory family**: 2 contrasts (Holm-corrected, m=2)
+  1. `polyphasic_K6_N8` vs `no_sleep` — does polyphasic sleep help?
+  2. `polyphasic_K6_N8` vs `full_offline_sleep` — is it competitive with global pause?
+- **Exploratory family**: K-of-N, partition strategy, read policy, swap interval, payload (uncorrected, effect sizes and CIs)
+- **Per contrast**: paired Wilcoxon signed-rank, bootstrap 95% CI, Cohen's d
+- With 7 seeds and m=2 confirmatory: min corrected p = 0.0156 × 2 = 0.031 < 0.05
 
 ## Metrics
 
