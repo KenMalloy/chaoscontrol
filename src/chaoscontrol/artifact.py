@@ -360,18 +360,20 @@ def eval_artifact(
     *,
     eval_batches: int = 32,
     batch_size: int | None = None,
+    pretrain_model: nn.Module | None = None,
+    pretrain_tokenizer: nn.Module | None = None,
 ) -> dict[str, Any]:
-    """Load an artifact and evaluate it, returning bpb and loss metrics.
+    """Load an artifact and evaluate it, producing three bpb measurements.
 
-    Args:
-        path: Path to the serialized artifact.
-        data_path: Path to data directory (for prepare_fineweb_splits).
-        device: Device to run evaluation on.
-        eval_batches: Number of evaluation batches.
-        batch_size: Override batch size (defaults to config value).
+    1. **bpb_pretrain** — the training-time model (bf16), before compression.
+       Only computed if pretrain_model is provided.
+    2. **bpb_artifact** — the model loaded from the compressed artifact.
+    3. **bpb_ttt** — the artifact model after test-time training (forward pass
+       over training data with episodic memory writes), then fresh eval.
 
     Returns:
-        Dict with keys like ``bpb``, ``loss``, ``tokens``, plus artifact metadata.
+        Dict with bpb_pretrain, bpb_artifact, bpb_ttt,
+        quant_degradation (2 - 1), ttt_recovery (2 - 3).
     """
     from chaoscontrol.data import (
         prepare_fineweb_splits, build_lm_starts, choose_eval_starts,
@@ -380,26 +382,59 @@ def eval_artifact(
 
     device = torch.device(device) if isinstance(device, str) else device
 
+    train_tokens, val_tokens, _test = prepare_fineweb_splits(data_path, device=device)
+
+    # Load artifact
     model, tokenizer, config = load_artifact(path, device)
-
-    _train, val_tokens, _test = prepare_fineweb_splits(data_path, device=device)
-
     bs = batch_size or config.batch_size
-    val_starts = build_lm_starts(int(val_tokens.numel()), config.seq_len, config.seq_len)
-    eval_starts = choose_eval_starts(val_starts, batch_size=bs, eval_batches=eval_batches, seed=config.seed)
 
-    result = evaluate_chaoscontrol_bpb(
-        model,
-        tokens=val_tokens,
-        eval_starts=eval_starts,
-        batch_size=bs,
-        seq_len=config.seq_len,
-        device=device,
-        tokenizer=tokenizer,
+    val_starts = build_lm_starts(int(val_tokens.numel()), config.seq_len, config.seq_len)
+    eval_starts = choose_eval_starts(
+        val_starts, batch_size=bs, eval_batches=eval_batches, seed=config.seed,
     )
 
-    # Include artifact metadata
-    result["artifact_path"] = str(path)
-    result["artifact_size_bytes"] = Path(path).stat().st_size
+    result: dict[str, Any] = {
+        "artifact_path": str(path),
+        "artifact_size_bytes": Path(path).stat().st_size,
+    }
+
+    # 1. bpb_pretrain — training-time model, before compression
+    if pretrain_model is not None:
+        pretrain_eval = evaluate_chaoscontrol_bpb(
+            pretrain_model, tokens=val_tokens, eval_starts=eval_starts,
+            batch_size=bs, seq_len=config.seq_len, device=device,
+            tokenizer=pretrain_tokenizer,
+        )
+        result["bpb_pretrain"] = pretrain_eval["bpb"]
+
+    # 2. bpb_artifact — loaded from compressed artifact
+    artifact_eval = evaluate_chaoscontrol_bpb(
+        model, tokens=val_tokens, eval_starts=eval_starts,
+        batch_size=bs, seq_len=config.seq_len, device=device,
+        tokenizer=tokenizer,
+    )
+    result["bpb_artifact"] = artifact_eval["bpb"]
+
+    # 3. bpb_ttt — test-time training: forward pass over training data
+    # with episodic writes, then fresh eval on validation
+    train_starts = build_lm_starts(int(train_tokens.numel()), config.seq_len, config.seq_len)
+    ttt_eval_starts = choose_eval_starts(
+        train_starts, batch_size=bs, eval_batches=min(eval_batches, 16), seed=config.seed,
+    )
+    ttt_eval = evaluate_chaoscontrol_bpb(
+        model, tokens=val_tokens, eval_starts=eval_starts,
+        batch_size=bs, seq_len=config.seq_len, device=device,
+        tokenizer=tokenizer,
+        warmup=True,
+        warmup_write_mode="full_sequence",
+        warmup_latent=True,
+        warmup_cold_start=False,
+    )
+    result["bpb_ttt"] = ttt_eval["bpb"]
+
+    # Derived metrics
+    if "bpb_pretrain" in result:
+        result["quant_degradation"] = result["bpb_artifact"] - result["bpb_pretrain"]
+    result["ttt_recovery"] = result["bpb_artifact"] - result["bpb_ttt"]
 
     return result
