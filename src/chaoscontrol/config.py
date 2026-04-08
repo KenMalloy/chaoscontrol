@@ -109,7 +109,7 @@ class ChaosControlConfig:
 
     # Sleep cycle (structured memory consolidation)
     sleep_enabled: bool = False
-    sleep_stages: str = "full_cycle"  # "n3_only", "n2_n3", "n2_n3_rem_validate", "n2_n3_rem_cfr", "n2_n3_rem_reactivate", "n2_n3_rem_all", "full_cycle"
+    sleep_stages: str = "full_cycle"  # "n3_only", "n2_n3", "n2_n3_rem_base", "n2_n3_rem_validate", "n2_n3_rem_cfr", "n2_n3_rem_reactivate", "n2_n3_rem_all", "full_cycle"
     sleep_wake_ratio: int = 2
     sleep_interval: int = 256
     sleep_budget: int = 128

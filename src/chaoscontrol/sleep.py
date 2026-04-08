@@ -22,8 +22,8 @@ class SleepConfig:
     """Configuration for the sleep cycle."""
 
     stages: str = "full_cycle"
-    # "n3_only", "n2_n3", "n2_n3_rem_validate", "n2_n3_rem_cfr",
-    # "n2_n3_rem_reactivate", "n2_n3_rem_all", "full_cycle"
+    # "n3_only", "n2_n3", "n2_n3_rem_base", "n2_n3_rem_validate",
+    # "n2_n3_rem_cfr", "n2_n3_rem_reactivate", "n2_n3_rem_all", "full_cycle"
 
     budget: int = 128        # total max ops
     n2_budget: int = 64      # fixed sub-budget for N2
@@ -52,6 +52,7 @@ class SleepConfig:
     @property
     def use_rem(self) -> bool:
         return self.stages in (
+            "n2_n3_rem_base",
             "n2_n3_rem_validate",
             "n2_n3_rem_cfr",
             "n2_n3_rem_reactivate",
@@ -72,6 +73,7 @@ class SleepCycle:
     def __init__(self, config: SleepConfig | None = None) -> None:
         self.config = config or SleepConfig()
         self._rng = _random.Random(42)
+        self._provisional_merges: list[dict] = []
 
     # ------------------------------------------------------------------
     # Public entry point

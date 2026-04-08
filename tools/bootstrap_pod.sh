@@ -19,7 +19,7 @@ if [ ! -d "$FINEWEB_DIR/datasets" ]; then
     # Run the download script from the fineweb dir so it writes there
     cd "$FINEWEB_DIR"
     /workspace/chaoscontrol/.venv/bin/python /workspace/chaoscontrol/baselines/parameter_golf/cached_challenge_fineweb.py \
-        --variant sp1024 --train-shards 80
+        --variant sp1024 --train-shards 80 --with-docs
     cd /workspace/chaoscontrol
 else
     echo "=== FineWeb data already present ==="

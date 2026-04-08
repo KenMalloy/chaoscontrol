@@ -5,31 +5,34 @@ Tests whether the full sleep cycle (N1/N2/N3/REM) outperforms no-sleep
 and partial-sleep configurations when added to the full ChaosControl stack
 (SSM + memory + Wernicke MoE).
 
-8 conditions x 5 seeds = 40 training runs
+9 conditions x 7 seeds = 63 training runs
 
 Conditions:
-  1. no_sleep        -- baseline, sleep_enabled=False
-  2. n3_only         -- sleep_enabled=True, stages="n3_only"
-  3. n2_n3           -- stages="n2_n3"
-  4. n2_n3_rem_validate -- stages="n2_n3_rem_validate"
-  5. n2_n3_rem_cfr   -- stages="n2_n3_rem_cfr"
-  6. n2_n3_rem_reactivate -- stages="n2_n3_rem_reactivate"
-  7. n2_n3_rem_all   -- stages="n2_n3_rem_all"
-  8. full_cycle      -- stages="full_cycle"
+  1. no_sleep             -- baseline, sleep_enabled=False
+  2. n3_only              -- sleep_enabled=True, stages="n3_only"
+  3. n2_n3                -- stages="n2_n3"
+  4. n2_n3_rem_base       -- dreams + scoring only (no mechanisms)
+  5. n2_n3_rem_validate   -- stages="n2_n3_rem_validate"
+  6. n2_n3_rem_cfr        -- stages="n2_n3_rem_cfr"
+  7. n2_n3_rem_reactivate -- stages="n2_n3_rem_reactivate"
+  8. n2_n3_rem_all        -- stages="n2_n3_rem_all"
+  9. full_cycle           -- stages="full_cycle"
 
-Pre-specified contrasts (Welch t-test):
+Confirmatory contrasts (paired Wilcoxon signed-rank, Holm-corrected, m=3):
   1. no_sleep vs full_cycle (does sleep help at all?)
   2. n3_only vs n2_n3 (does N2 tagging add value?)
   3. n2_n3 vs n2_n3_rem_all (does REM add value?)
-  4. n2_n3 vs n2_n3_rem_validate (validate isolation)
-  5. n2_n3 vs n2_n3_rem_cfr (CFR isolation)
-  6. n2_n3 vs n2_n3_rem_reactivate (reactivate isolation)
+
+Exploratory contrasts (uncorrected, effect sizes and CIs):
+  4. n2_n3_rem_base vs n2_n3_rem_validate (merge validation vs base REM)
+  5. n2_n3_rem_base vs n2_n3_rem_cfr (CFR vs base REM)
+  6. n2_n3_rem_base vs n2_n3_rem_reactivate (reactivation vs base REM)
   7. n2_n3_rem_all vs full_cycle (does N1 transition help?)
 
 Decision criteria:
-  - full_cycle < no_sleep by >0.05 bpb (sig) -> ADOPT FULL CYCLE
-  - partial < no_sleep, full_cycle ~ partial  -> ADOPT PARTIAL
-  - no_sleep = all sleep variants             -> SLEEP NOT HELPFUL YET
+  - full_cycle < no_sleep (Holm-corrected p < 0.05) -> ADOPT FULL CYCLE
+  - full_cycle trends better but ns after correction -> CAUTIOUS ADOPTION
+  - no_sleep = all sleep variants                    -> SLEEP NOT HELPFUL YET
 """
 import argparse
 import json
@@ -49,9 +52,9 @@ RESULTS = EXPERIMENT / "results"
 CHECKPOINTS = EXPERIMENT / "checkpoints"
 
 sys.path.insert(0, str(REPO / "experiments" / "09_revised_architecture"))
-from stats import welch_ttest, bootstrap_ci, cohens_d, sem
+from stats import bootstrap_ci, cohens_d, sem
 
-SEEDS = [1337, 2674, 4011, 5348, 6685]
+SEEDS = [1337, 2674, 4011, 5348, 6685, 8022, 9359]
 
 
 # -- Config templates -------------------------------------------------------
@@ -102,6 +105,9 @@ CONDITIONS = {
     "no_sleep": _base(sleep_enabled=False),
     "n3_only": _base(sleep_enabled=True, sleep_stages="n3_only", **SLEEP_COMMON),
     "n2_n3": _base(sleep_enabled=True, sleep_stages="n2_n3", **SLEEP_COMMON),
+    "n2_n3_rem_base": _base(
+        sleep_enabled=True, sleep_stages="n2_n3_rem_base", **SLEEP_COMMON
+    ),
     "n2_n3_rem_validate": _base(
         sleep_enabled=True, sleep_stages="n2_n3_rem_validate", **SLEEP_COMMON
     ),
@@ -120,15 +126,26 @@ CONDITIONS = {
 }
 
 # Pre-specified contrasts: (name, condition_a, condition_b, description)
-CONTRASTS = [
+# Confirmatory family (Holm-corrected, 3 contrasts).
+# With 7 seeds, min two-sided Wilcoxon p = 2/128 = 0.0156.
+# After 3-way Holm: best corrected p = 0.0156 * 3 = 0.047 < 0.05.
+CONFIRMATORY_CONTRASTS = [
     ("sleep_vs_none", "no_sleep", "full_cycle", "Does sleep help at all?"),
     ("n2_value", "n3_only", "n2_n3", "Does N2 tagging add value?"),
     ("rem_value", "n2_n3", "n2_n3_rem_all", "Does REM add value?"),
-    ("validate_isolation", "n2_n3", "n2_n3_rem_validate", "Validate isolation"),
-    ("cfr_isolation", "n2_n3", "n2_n3_rem_cfr", "CFR isolation"),
-    ("reactivate_isolation", "n2_n3", "n2_n3_rem_reactivate", "Reactivate isolation"),
+]
+
+# Exploratory family (uncorrected, effect sizes and CIs reported).
+# REM mechanism contrasts compare against n2_n3_rem_base (dreams + scoring
+# only) so each contrast isolates the named mechanism, not base REM.
+EXPLORATORY_CONTRASTS = [
+    ("validate_isolation", "n2_n3_rem_base", "n2_n3_rem_validate", "Base REM + validate vs base REM"),
+    ("cfr_isolation", "n2_n3_rem_base", "n2_n3_rem_cfr", "Base REM + CFR vs base REM"),
+    ("reactivate_isolation", "n2_n3_rem_base", "n2_n3_rem_reactivate", "Base REM + reactivate vs base REM"),
     ("n1_value", "n2_n3_rem_all", "full_cycle", "Does N1 transition help?"),
 ]
+
+CONTRASTS = CONFIRMATORY_CONTRASTS + EXPLORATORY_CONTRASTS
 
 
 # -- Execution ---------------------------------------------------------------
@@ -176,56 +193,55 @@ def _launch(
 
 
 def run_training_grid(data_path: str, budget: float, num_gpus: int):
-    """Run all 35 training configs, parallelizing seeds across GPUs."""
+    """Run all training configs, parallelizing across conditions and seeds.
+
+    Builds a flat queue of (condition, seed) pairs, skips completed runs,
+    and dispatches up to num_gpus concurrent jobs at a time.
+    """
     RESULTS.mkdir(parents=True, exist_ok=True)
     CHECKPOINTS.mkdir(parents=True, exist_ok=True)
 
-    total = len(CONDITIONS) * len(SEEDS)
-    completed = 0
-
+    # Build flat queue of all pending runs
+    queue: list[tuple[str, dict, int]] = []
     for cond_name, cond_config in CONDITIONS.items():
-        print(f"\n{'='*60}")
-        print(f"  {cond_name}  ({len(SEEDS)} seeds, budget={budget}s)")
-        print(f"{'='*60}")
-
-        # Check for existing results (resume)
-        existing = []
         for seed in SEEDS:
             tag = f"{cond_name}_s{seed}"
-            path = RESULTS / f"{tag}.json"
-            if path.exists():
-                existing.append(seed)
-        if len(existing) == len(SEEDS):
-            print(f"  Already done, skipping")
-            completed += len(SEEDS)
-            continue
+            if not (RESULTS / f"{tag}.json").exists():
+                queue.append((cond_name, cond_config, seed))
 
-        # Launch seeds in batches of num_gpus
-        seed_queue = [s for s in SEEDS if not (RESULTS / f"{cond_name}_s{s}.json").exists()]
-        for batch_start in range(0, len(seed_queue), num_gpus):
-            batch_seeds = seed_queue[batch_start:batch_start + num_gpus]
-            jobs = []
-            for i, seed in enumerate(batch_seeds):
-                gpu_id = i % num_gpus if num_gpus > 1 else None
-                proc, out_path, tmp, log_fh = _launch(
-                    cond_name, cond_config, seed, budget, data_path, gpu_id,
-                )
-                jobs.append((proc, out_path, tmp, log_fh, seed))
+    total = len(CONDITIONS) * len(SEEDS)
+    completed = total - len(queue)
+    print(f"\n  {len(queue)} runs pending, {completed} already done, {total} total")
+    print(f"  {num_gpus} GPUs, ~{len(queue) // num_gpus + (1 if len(queue) % num_gpus else 0)} batches")
 
-            for proc, out_path, tmp, log_fh, seed in jobs:
-                proc.wait()
-                log_fh.close()
-                tmp.unlink(missing_ok=True)
-                completed += 1
-                if proc.returncode != 0:
-                    print(f"  FAILED: seed={seed} (exit {proc.returncode})")
-                    continue
-                if out_path.exists():
-                    with open(out_path) as f:
-                        result = json.load(f)
-                    bpb = result["eval"]["bpb"]
-                    steps = result["train"]["steps"]
-                    print(f"  seed={seed}: bpb={bpb:.4f}  steps={steps}")
+    for batch_start in range(0, len(queue), num_gpus):
+        batch = queue[batch_start:batch_start + num_gpus]
+        batch_num = batch_start // num_gpus + 1
+        total_batches = len(queue) // num_gpus + (1 if len(queue) % num_gpus else 0)
+        print(f"\n  --- Batch {batch_num}/{total_batches} ---")
+        jobs = []
+        for i, (cond_name, cond_config, seed) in enumerate(batch):
+            gpu_id = i % num_gpus if num_gpus > 1 else None
+            proc, out_path, tmp, log_fh = _launch(
+                cond_name, cond_config, seed, budget, data_path, gpu_id,
+            )
+            jobs.append((proc, out_path, tmp, log_fh, cond_name, seed))
+            print(f"    GPU {i}: {cond_name} seed={seed}")
+
+        for proc, out_path, tmp, log_fh, cond_name, seed in jobs:
+            proc.wait()
+            log_fh.close()
+            tmp.unlink(missing_ok=True)
+            completed += 1
+            if proc.returncode != 0:
+                print(f"    FAILED: {cond_name} seed={seed} (exit {proc.returncode})")
+                continue
+            if out_path.exists():
+                with open(out_path) as f:
+                    result = json.load(f)
+                bpb = result["eval"]["bpb"]
+                steps = result["train"]["steps"]
+                print(f"    {cond_name} seed={seed}: bpb={bpb:.4f}  steps={steps}")
 
         print(f"  [{completed}/{total}]")
 
@@ -277,9 +293,9 @@ def _paired_deltas(
 def _wilcoxon_signed_rank_p(deltas: list[float]) -> float:
     """Wilcoxon signed-rank test (two-sided) for small samples.
 
-    Returns approximate p-value. With n=5, minimum achievable p is 1/32 = 0.03125.
+    Returns exact p-value. With n=7, minimum achievable two-sided p is
+    2/128 = 0.015625 (all deltas same sign).
     """
-    import math
     nonzero = [(abs(d), 1 if d > 0 else -1) for d in deltas if d != 0.0]
     n = len(nonzero)
     if n == 0:
@@ -303,12 +319,19 @@ def _wilcoxon_signed_rank_p(deltas: list[float]) -> float:
 
 
 def _holm_bonferroni(p_values: list[tuple[str, float]]) -> list[tuple[str, float, float, bool]]:
-    """Apply Holm-Bonferroni correction. Returns [(name, raw_p, corrected_p, significant)]."""
+    """Apply Holm-Bonferroni correction with step-down monotonic max.
+
+    Returns [(name, raw_p, corrected_p, significant)].
+    """
     m = len(p_values)
     sorted_pv = sorted(p_values, key=lambda x: x[1])
     results = []
+    prev_corrected = 0.0
     for i, (name, p) in enumerate(sorted_pv):
         corrected = min(1.0, p * (m - i))
+        # Step-down monotonic max: corrected p can never decrease
+        corrected = max(corrected, prev_corrected)
+        prev_corrected = corrected
         results.append((name, p, corrected, corrected < 0.05))
     return results
 
@@ -351,48 +374,74 @@ def _print_summary():
         print(f"  {cond_name:<25} {mean_bpb:>10.4f} {s:>8.4f} {ci_str:>18} {len(bpbs):>3}  steps={steps}")
         summary[cond_name] = {"mean_bpb": mean_bpb, "sem": s, "ci": ci, "n": len(bpbs), "bpbs": bpbs}
 
-    # -- Pre-specified contrasts (paired Wilcoxon + Holm correction) --
-    print(f"\n  Pre-specified contrasts (paired Wilcoxon signed-rank, Holm-corrected):")
-    print(f"  {'-'*70}")
-
-    raw_p_values = []
-    contrast_details = {}
-    for contrast_name, cond_a, cond_b, desc in CONTRASTS:
+    # -- Helper: compute contrast details --
+    def _compute_contrast(contrast_name, cond_a, cond_b, desc):
         deltas = _paired_deltas(results, cond_a, cond_b)
         if len(deltas) < 2:
-            print(f"    {desc}: insufficient paired data")
-            continue
+            return None
         p = _wilcoxon_signed_rank_p(deltas)
-        mean_delta = sum(deltas) / len(deltas)
         a_bpbs = summary.get(cond_a, {}).get("bpbs", [])
         b_bpbs = summary.get(cond_b, {}).get("bpbs", [])
-        d = cohens_d(a_bpbs, b_bpbs) if a_bpbs and b_bpbs else 0.0
-        delta_ci = bootstrap_ci(deltas)
-        raw_p_values.append((contrast_name, p))
-        contrast_details[contrast_name] = {
-            "desc": desc, "cond_a": cond_a, "cond_b": cond_b,
-            "mean_delta": mean_delta, "p_raw": p, "d": d,
-            "delta_ci": delta_ci, "n_pairs": len(deltas),
+        return {
+            "name": contrast_name, "desc": desc,
+            "cond_a": cond_a, "cond_b": cond_b,
+            "mean_delta": sum(deltas) / len(deltas),
+            "p_raw": p,
+            "d": cohens_d(a_bpbs, b_bpbs) if a_bpbs and b_bpbs else 0.0,
+            "delta_ci": bootstrap_ci(deltas),
+            "n_pairs": len(deltas),
         }
 
-    # Apply Holm-Bonferroni correction
-    corrected = _holm_bonferroni(raw_p_values)
+    def _print_contrast(det, corr_p=None, sig=None, label=""):
+        winner = det["cond_b"] if det["mean_delta"] < 0 else det["cond_a"]
+        a_mean = summary.get(det["cond_a"], {}).get("mean_bpb", 0)
+        b_mean = summary.get(det["cond_b"], {}).get("mean_bpb", 0)
+        print(f"    {label}{det['desc']}")
+        print(f"      {det['cond_a']}={a_mean:.4f} vs {det['cond_b']}={b_mean:.4f}")
+        print(f"      mean delta={det['mean_delta']:+.4f} ({winner} wins)")
+        print(f"      95% CI of delta: [{det['delta_ci'][0]:+.4f}, {det['delta_ci'][1]:+.4f}]")
+        if corr_p is not None:
+            sig_str = "SIGNIFICANT" if sig else "ns"
+            print(f"      Wilcoxon p={det['p_raw']:.4f} (corrected p={corr_p:.4f}) {sig_str}  d={det['d']:.2f}")
+        else:
+            print(f"      Wilcoxon p={det['p_raw']:.4f} (uncorrected)  d={det['d']:.2f}")
+
+    # -- Confirmatory contrasts (Holm-corrected within family) --
+    print(f"\n  Confirmatory contrasts (paired Wilcoxon, Holm-corrected, m={len(CONFIRMATORY_CONTRASTS)}):")
+    print(f"  {'-'*70}")
+
+    confirm_details = {}
+    confirm_pvals = []
+    for contrast_name, cond_a, cond_b, desc in CONFIRMATORY_CONTRASTS:
+        det = _compute_contrast(contrast_name, cond_a, cond_b, desc)
+        if det is None:
+            print(f"    {desc}: insufficient paired data")
+            continue
+        confirm_details[contrast_name] = det
+        confirm_pvals.append((contrast_name, det["p_raw"]))
+
+    corrected = _holm_bonferroni(confirm_pvals)
     corrected_map = {name: (raw, corr, sig) for name, raw, corr, sig in corrected}
 
-    for contrast_name, cond_a, cond_b, desc in CONTRASTS:
-        det = contrast_details.get(contrast_name)
+    for contrast_name, cond_a, cond_b, desc in CONFIRMATORY_CONTRASTS:
+        det = confirm_details.get(contrast_name)
         if not det:
             continue
         raw_p, corr_p, sig = corrected_map.get(contrast_name, (1.0, 1.0, False))
-        sig_str = "SIGNIFICANT" if sig else "ns"
-        winner = cond_b if det["mean_delta"] < 0 else cond_a
-        print(f"    {desc}")
-        a_mean = summary.get(cond_a, {}).get("mean_bpb", 0)
-        b_mean = summary.get(cond_b, {}).get("mean_bpb", 0)
-        print(f"      {cond_a}={a_mean:.4f} vs {cond_b}={b_mean:.4f}")
-        print(f"      mean delta={det['mean_delta']:+.4f} ({winner} wins)")
-        print(f"      95% CI of delta: [{det['delta_ci'][0]:+.4f}, {det['delta_ci'][1]:+.4f}]")
-        print(f"      Wilcoxon p={raw_p:.4f} (corrected p={corr_p:.4f}) {sig_str}  d={det['d']:.2f}")
+        _print_contrast(det, corr_p=corr_p, sig=sig)
+
+    # -- Exploratory contrasts (uncorrected, effect sizes and CIs) --
+    print(f"\n  Exploratory contrasts (uncorrected, effect sizes only):")
+    print(f"  {'-'*70}")
+
+    explore_details = {}
+    for contrast_name, cond_a, cond_b, desc in EXPLORATORY_CONTRASTS:
+        det = _compute_contrast(contrast_name, cond_a, cond_b, desc)
+        if det is None:
+            print(f"    {desc}: insufficient paired data")
+            continue
+        explore_details[contrast_name] = det
+        _print_contrast(det, label="[EXPLORATORY] ")
 
     # -- Decision recommendation --
     print(f"\n{'='*70}")
@@ -421,7 +470,7 @@ def _print_summary():
             # Note best partial as EXPLORATORY only
             best_partial = None
             best_partial_bpb = float("inf")
-            for cond in ["n3_only", "n2_n3", "n2_n3_rem_validate", "n2_n3_rem_cfr", "n2_n3_rem_reactivate", "n2_n3_rem_all"]:
+            for cond in ["n3_only", "n2_n3", "n2_n3_rem_base", "n2_n3_rem_validate", "n2_n3_rem_cfr", "n2_n3_rem_reactivate", "n2_n3_rem_all"]:
                 s = summary.get(cond)
                 if s and s["mean_bpb"] < best_partial_bpb:
                     best_partial = cond

@@ -103,22 +103,23 @@ experiments/11_sleep_cycle/
 
 ### Conditions
 
-All use the full stack (SSM + episodic memory + Wernicke MoE) at 600s budget, 5 seeds. Fixed sleep trigger interval (every 256 wake steps) and fixed sleep budget (128 steps) for clean ablation. N2 and REM get fixed sub-budgets (N2: 64 ops, REM: 64 ops) so stage attribution is not confounded by budget starvation. Realized ops per stage are logged alongside bpb. No adaptive fatigue in the primary experiment.
+All use the full stack (SSM + episodic memory + Wernicke MoE) at 600s budget, 7 seeds. Fixed sleep trigger interval (every 256 wake steps) and fixed sleep budget (128 steps) for clean ablation. N2 and REM get fixed sub-budgets (N2: 64 ops, REM: 64 ops) so stage attribution is not confounded by budget starvation. Realized ops per stage are logged alongside bpb. No adaptive fatigue in the primary experiment.
 
-Each REM mechanism (merge validation, latent reactivation, gate policy) is independently toggleable so we can isolate their contributions without conflation.
+Each REM mechanism (merge validation, latent reactivation, gate policy) is independently toggleable so we can isolate their contributions without conflation. The `n2_n3_rem_base` condition runs dreams and teacher-forced scoring (including slot survival updates) but disables all three mechanisms, providing a clean baseline for REM mechanism isolation contrasts.
 
 | Condition | Stages | What it isolates |
 |-----------|--------|-----------------|
 | `no_sleep` | None | Baseline |
 | `n3_only` | Compression pass | Deliberate compression vs overflow-triggered |
 | `n2_n3` | Score + compress | Utility-based rescoring value |
-| `n2_n3_rem_validate` | + merge validation | Dream-guided consolidation quality |
-| `n2_n3_rem_cfr` | + gate policy | Dream-time gate/CFR training |
-| `n2_n3_rem_reactivate` | + latent recovery | Dream-diagnosed information loss recovery |
+| `n2_n3_rem_base` | + dreams + scoring only | Base REM (dream generation + slot survival) |
+| `n2_n3_rem_validate` | + merge validation | Base REM + merge validation |
+| `n2_n3_rem_cfr` | + gate policy | Base REM + gate/CFR training |
+| `n2_n3_rem_reactivate` | + latent recovery | Base REM + latent reactivation |
 | `n2_n3_rem_all` | + all three REM mechanisms | Combined REM value |
 | `full_cycle` | N1 + N2 + N3 + all REM | N1 transition mechanism |
 
-8 conditions x 5 seeds = 40 training runs. ~2.2 hours on 3x A40.
+9 conditions x 7 seeds = 63 training runs. ~3.5 hours on 3x A40.
 
 ### Follow-up Conditions (separate from primary ablation)
 
@@ -130,23 +131,33 @@ Each REM mechanism (merge validation, latent reactivation, gate policy) is indep
 
 ### Statistical Analysis Plan
 
-**Pre-specified contrasts (ordered by priority):**
+**Confirmatory family (Holm-Bonferroni corrected, m=3):**
 
-1. Primary: `full_cycle` vs `no_sleep` — does the complete sleep cycle help?
-2. Secondary: `n2_n3` vs `n3_only` — does utility scoring improve compression?
-3. Secondary: `n2_n3_rem_all` vs `n2_n3` — do dreams add value beyond consolidation?
-4. Exploratory: `n2_n3_rem_validate` vs `n2_n3` — is the lift from merge validation?
-5. Exploratory: `n2_n3_rem_cfr` vs `n2_n3` — is the lift from gate policy?
-6. Exploratory: `n2_n3_rem_reactivate` vs `n2_n3` — is the lift from latent recovery?
-7. Exploratory: `full_cycle` vs `n2_n3_rem_all` — does N1 transition matter?
+1. `full_cycle` vs `no_sleep` — does the complete sleep cycle help?
+2. `n3_only` vs `n2_n3` — does N2 tagging add value?
+3. `n2_n3` vs `n2_n3_rem_all` — do dreams add value beyond consolidation?
 
-**For each contrast, report:**
+**Exploratory family (uncorrected, effect sizes and CIs):**
+
+4. `n2_n3_rem_base` vs `n2_n3_rem_validate` — does merge validation add to base REM?
+5. `n2_n3_rem_base` vs `n2_n3_rem_cfr` — does CFR training add to base REM?
+6. `n2_n3_rem_base` vs `n2_n3_rem_reactivate` — does latent reactivation add to base REM?
+7. `n2_n3_rem_all` vs `full_cycle` — does N1 transition matter?
+
+**For each confirmatory contrast, report:**
 - Mean delta bpb with 95% bootstrap CI (10,000 resamples)
 - Wilcoxon signed-rank p-value (paired by seed)
-- Holm-Bonferroni correction across all 7 contrasts
+- Holm-Bonferroni correction within the confirmatory family (m=3)
 - Cohen's d effect size
 
-With 5 seeds, Wilcoxon has 32 possible rank assignments — minimum achievable p is 0.0312. Sufficient for primary contrast significance at alpha=0.05 after Holm correction (primary contrast corrected threshold = 0.05/7 = 0.007, which requires 7 seeds to achieve). For the primary contrast alone at alpha=0.05 uncorrected, 5 seeds suffice. For stronger claims after full correction, increase to 7 seeds (minimum p = 0.0078).
+**For each exploratory contrast, report:**
+- Mean delta bpb with 95% bootstrap CI
+- Uncorrected Wilcoxon p-value (labeled EXPLORATORY)
+- Cohen's d effect size
+
+With 7 seeds, the exact two-sided Wilcoxon signed-rank test has minimum achievable p = 2/128 = 0.0156. After 3-way Holm correction, best possible corrected p = 0.0156 × 3 = 0.047 < 0.05. The confirmatory family is therefore adequately powered.
+
+REM mechanism isolation contrasts (4–6) compare against `n2_n3_rem_base` rather than `n2_n3`. The base condition runs dreams with teacher-forced scoring and slot survival updates, but disables all three mechanisms. This ensures each exploratory contrast isolates the named mechanism rather than confounding it with base dream effects.
 
 ### Decision Criteria
 
