@@ -135,15 +135,22 @@ def _extract_jsonl_to_raw(jsonl_path: Path, raw_path: Path) -> None:
     """
     import json as _json
     tmp = raw_path.with_suffix(".tmp")
+    skipped = 0
     with open(jsonl_path, "r", encoding="utf-8") as fin, open(tmp, "wb") as fout:
         for line in fin:
             line = line.strip()
             if not line:
                 continue
-            doc = _json.loads(line)
+            try:
+                doc = _json.loads(line)
+            except _json.JSONDecodeError:
+                skipped += 1
+                continue
             text = doc.get("text", "")
             fout.write(text.encode("utf-8"))
             fout.write(b"\n")
+    if skipped:
+        print(f"  Skipped {skipped} malformed JSONL lines")
     tmp.rename(raw_path)
 
 
