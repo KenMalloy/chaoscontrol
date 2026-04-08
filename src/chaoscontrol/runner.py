@@ -75,7 +75,72 @@ def build_model(cfg: ChaosControlConfig, device: torch.device, param_dtype: torc
     return model
 
 
-def run_experiment(config_path: str, *, data_path: str, budget_seconds: float = 300) -> dict[str, Any]:
+def save_checkpoint(
+    checkpoint_dir: Path,
+    name: str,
+    model: Any,
+    tokenizer: Any | None,
+    structured_proj: Any | None,
+    cfg: ChaosControlConfig,
+) -> Path:
+    """Save full training checkpoint: model + tokenizer + memory state + config."""
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    ckpt_path = checkpoint_dir / f"{name}.pt"
+    payload: dict[str, Any] = {
+        "model_state_dict": model.state_dict(),
+        "config": {k: v for k, v in cfg.__dict__.items() if not k.startswith("_")},
+    }
+    if tokenizer is not None:
+        payload["tokenizer_state_dict"] = tokenizer.state_dict()
+    if structured_proj is not None:
+        payload["structured_proj"] = structured_proj
+    torch.save(payload, ckpt_path)
+    print(f"Checkpoint saved: {ckpt_path} ({ckpt_path.stat().st_size / 1024:.0f} KB)")
+    return ckpt_path
+
+
+def load_checkpoint(
+    ckpt_path: Path,
+    device: torch.device,
+    param_dtype: torch.dtype,
+) -> dict[str, Any]:
+    """Load checkpoint, rebuild model + tokenizer, return all state."""
+    payload = torch.load(ckpt_path, map_location=device, weights_only=False)
+    cfg = ChaosControlConfig(**payload["config"])
+
+    # Rebuild tokenizer
+    tokenizer = None
+    if cfg.tokenizer_type == "fixed_stride":
+        from chaoscontrol.tokenizer import FixedStrideTokenizer
+        tokenizer = FixedStrideTokenizer(
+            byte_dim=cfg.tokenizer_byte_dim,
+            token_dim=cfg.tokenizer_token_dim,
+            codebook_size=cfg.tokenizer_codebook_size,
+            stride=cfg.tokenizer_stride,
+            beta=cfg.tokenizer_beta,
+        ).to(device)
+        if device.type == "cuda":
+            tokenizer = tokenizer.to(dtype=param_dtype)
+        cfg.vocab_size = cfg.tokenizer_codebook_size
+
+    # Rebuild model and load weights (includes memory extra_state)
+    model = build_model(cfg, device, param_dtype)
+    model.load_state_dict(payload["model_state_dict"])
+
+    if tokenizer is not None and "tokenizer_state_dict" in payload:
+        tokenizer.load_state_dict(payload["tokenizer_state_dict"])
+
+    return {
+        "model": model,
+        "tokenizer": tokenizer,
+        "structured_proj": payload.get("structured_proj"),
+        "config": cfg,
+    }
+
+
+def run_experiment(config_path: str, *, data_path: str, budget_seconds: float = 300,
+                   checkpoint_dir: str | None = None,
+                   checkpoint_name: str | None = None) -> dict[str, Any]:
     cfg = load_config(config_path, data_path=data_path, budget_seconds=budget_seconds)
     device = resolve_device(cfg.device)
     param_dtype = resolve_param_dtype(cfg.dtype, device)
@@ -140,6 +205,17 @@ def run_experiment(config_path: str, *, data_path: str, budget_seconds: float = 
         tokenizer=tokenizer,
         align_type=cfg.align_type,
         align_weight=cfg.align_weight,
+        sleep_enabled=cfg.sleep_enabled,
+        sleep_stages=cfg.sleep_stages,
+        sleep_interval=cfg.sleep_interval,
+        sleep_budget=cfg.sleep_budget,
+        sleep_n2_budget=cfg.sleep_n2_budget,
+        sleep_rem_budget=cfg.sleep_rem_budget,
+        sleep_n2_batches=cfg.sleep_n2_batches,
+        sleep_rem_dreams=cfg.sleep_rem_dreams,
+        sleep_rem_length=cfg.sleep_rem_length,
+        sleep_merge_sim_threshold=cfg.sleep_merge_sim_threshold,
+        sleep_survival_floor=cfg.sleep_survival_floor,
     )
 
     # Use the trained structured_proj (not a fresh random one)
@@ -168,11 +244,21 @@ def run_experiment(config_path: str, *, data_path: str, budget_seconds: float = 
     print(f"Result: {bpb_str} | steps={train_result['steps']} | {train_result['elapsed_s']:.1f}s")
 
     total_params = params + train_result.get("extra_params", 0)
+
+    # Save checkpoint if requested
+    ckpt_path = None
+    if checkpoint_dir is not None:
+        ckpt_name = checkpoint_name or (Path(config_path).stem + f"_seed{cfg.seed}")
+        ckpt_path = save_checkpoint(
+            Path(checkpoint_dir), ckpt_name, model, tokenizer, structured_proj, cfg,
+        )
+
     return {
         "config": {k: v for k, v in cfg.__dict__.items() if not k.startswith("_")},
         "train": train_result,
         "eval": eval_result,
         "params": total_params,
+        "checkpoint_path": str(ckpt_path) if ckpt_path else None,
     }
 
 
@@ -183,9 +269,14 @@ if __name__ == "__main__":
     p.add_argument("--data-path", required=True)
     p.add_argument("--budget", type=float, default=300)
     p.add_argument("--output-json", default=None)
+    p.add_argument("--checkpoint-dir", default=None)
+    p.add_argument("--checkpoint-name", default=None)
     args = p.parse_args()
 
-    result = run_experiment(args.config, data_path=args.data_path, budget_seconds=args.budget)
+    result = run_experiment(args.config, data_path=args.data_path,
+                            budget_seconds=args.budget,
+                            checkpoint_dir=args.checkpoint_dir,
+                            checkpoint_name=args.checkpoint_name)
 
     if args.output_json:
         out = Path(args.output_json)
