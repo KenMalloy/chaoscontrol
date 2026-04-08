@@ -319,18 +319,16 @@ def generate_l0_configs() -> list[Path]:
     plus a transformer baseline on raw bytes.
     All use diag A-mode, no gate, no memory, no Wernicke.
     """
-    base = {**SHARED_DEFAULTS, "metabolic_gate": False}
+    # Raw UTF-8 bytes (vocab 256). L0 tests whether our learned VQ tokenizer
+    # adds value over feeding raw bytes directly into the SSM.
+    base = {**SHARED_DEFAULTS, "metabolic_gate": False, "vocab_size": 256}
     configs = {
+        # Baseline: raw bytes → SSM directly
         "L0_bytes": {
             **base,
             "tokenizer_type": "none",
-            "vocab_size": 256,
         },
-        # L0_bpe deferred: BPE is the competition's tokenizer (sp1024), not ours.
-        # Comparing BPE-on-SSM is interesting but needs plumbing beyond a config
-        # flag (uint16 shard loading, external SentencePiece model, etc.).
-        # The meaningful comparison is raw bytes vs. our learned VQ tokenizer
-        # vs. the competition transformer (which uses BPE internally).
+        # Learned VQ tokenizer: raw bytes → causal conv + VQ → SSM
         "L0_fixed_k512": {
             **base,
             "tokenizer_type": "fixed_stride",
@@ -339,7 +337,7 @@ def generate_l0_configs() -> list[Path]:
             "tokenizer_byte_dim": 64,
             "tokenizer_token_dim": 128,
             "tokenizer_beta": 0.25,
-            "vocab_size": 512,
+            "vocab_size": 512,  # model vocab = VQ codebook size
         },
         "L0_fixed_k1024": {
             **base,
@@ -351,10 +349,10 @@ def generate_l0_configs() -> list[Path]:
             "tokenizer_beta": 0.25,
             "vocab_size": 1024,
         },
+        # Transformer baseline on same raw bytes
         "L0_bytes_tfm": {
             **base,
             "tokenizer_type": "none",
-            "vocab_size": 256,
             "model_type": "transformer",
         },
     }
@@ -726,8 +724,7 @@ def main():
             l0_winner = l0_data["winner"]
             print(f"  [L0] Loaded winner from prior run: {l0_winner}")
         else:
-            # No prior L0 run — fall back to raw bytes (existing behaviour).
-            # Generate the default config so downstream extraction works.
+            # No prior L0 run — fall back to raw bytes baseline.
             l0_winner = "L0_bytes"
             write_yaml(CONFIGS / "L0_bytes.yaml", {
                 **SHARED_DEFAULTS, "metabolic_gate": False,

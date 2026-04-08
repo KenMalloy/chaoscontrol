@@ -39,13 +39,13 @@ def test_choose_eval_starts():
 # ---------------------------------------------------------------------------
 
 def test_load_fineweb_raw_bytes():
-    """load_fineweb_raw_bytes should convert a UTF-8 file to int64 byte values."""
+    """load_fineweb_raw_bytes should return mmap-backed byte tensor."""
     content = b"Hello, world!\n"
     with tempfile.NamedTemporaryFile(suffix=".txt", delete=False) as f:
         f.write(content)
         f.flush()
         tokens = load_fineweb_raw_bytes(f.name)
-    assert tokens.dtype == torch.int64
+    assert tokens.dtype == torch.uint8
     assert tokens.numel() == len(content)
     assert tokens[0].item() == ord("H")
     assert tokens[-1].item() == ord("\n")

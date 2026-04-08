@@ -127,16 +127,37 @@ def load_fineweb_tokens(data_dir: str) -> tuple[torch.Tensor, torch.Tensor]:
     return train_tokens, val_tokens
 
 
-def load_fineweb_raw_bytes(text_path: str) -> torch.Tensor:
-    """Load a raw UTF-8 text file as a uint8 byte tensor (int64 for LM use).
+def _extract_jsonl_to_raw(jsonl_path: Path, raw_path: Path) -> None:
+    """Extract raw UTF-8 text from docs_selected.jsonl to a flat bytes file.
 
-    This is the raw-bytes approach: each byte is a token in [0, 255].
+    Each line in the JSONL has a "text" field. We concatenate all text
+    with newline separators and write as raw bytes.
+    """
+    import json as _json
+    tmp = raw_path.with_suffix(".tmp")
+    with open(jsonl_path, "r", encoding="utf-8") as fin, open(tmp, "wb") as fout:
+        for line in fin:
+            line = line.strip()
+            if not line:
+                continue
+            doc = _json.loads(line)
+            text = doc.get("text", "")
+            fout.write(text.encode("utf-8"))
+            fout.write(b"\n")
+    tmp.rename(raw_path)
+
+
+def load_fineweb_raw_bytes(text_path: str) -> torch.Tensor:
+    """Load a raw UTF-8 text file as a byte tensor via mmap.
+
+    Returns torch.uint8 tensor (values 0-255) backed by mmap.
+    batch_from_starts converts to int64 per-batch via .to(dtype=torch.long).
     """
     p = Path(text_path)
-    raw = p.read_bytes()
-    if len(raw) == 0:
-        raise ValueError(f"empty text file: {text_path}")
-    return torch.tensor(list(raw), dtype=torch.int64)
+    if not p.exists() or p.stat().st_size == 0:
+        raise ValueError(f"empty or missing text file: {text_path}")
+    mmap = np.memmap(str(p), dtype=np.uint8, mode="r")
+    return torch.from_numpy(mmap)
 
 
 def prepare_fineweb_splits(
@@ -146,39 +167,39 @@ def prepare_fineweb_splits(
     cache_on_device: bool = True,
     train_fraction: float = 0.90,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Load FineWeb data, returning (train, val, test) tensors.
+    """Load FineWeb data as raw UTF-8 bytes, returning (train, val, test) tensors.
 
-    If a raw text file (docs_raw.txt) exists in data_dir, uses raw bytes.
-    Otherwise falls back to the uint16 shard format (SentencePiece tokens).
+    Priority:
+      1. docs_raw.txt — pre-extracted raw text (mmap, zero-copy)
+      2. docs_selected.jsonl — extract text, write docs_raw.txt, then mmap
+      3. Raise error — we need raw bytes, not tokenized shards
+
+    All tensors stay on CPU. batch_from_starts handles per-batch GPU transfer.
     """
     data_path = Path(data_dir)
     raw_text = data_path / "docs_raw.txt"
 
-    if raw_text.exists():
-        # Raw bytes path
-        all_tokens = load_fineweb_raw_bytes(str(raw_text))
-        train_end = int(all_tokens.numel() * train_fraction)
-        val_end = int(all_tokens.numel() * (train_fraction + 0.05))
-        train_tokens = all_tokens[:train_end]
-        val_tokens = all_tokens[train_end:val_end]
-        test_tokens = all_tokens[val_end:]
-    else:
-        # SentencePiece uint16 shard path — train/val already split by shards.
-        # Data is mmap-backed (int16 on CPU). Do NOT cache on device — the full
-        # dataset would exhaust GPU memory. batch_from_starts handles per-batch
-        # transfer via .to(device=device, dtype=torch.long).
-        train_tokens, val_tokens = load_fineweb_tokens(data_dir)
-        # No separate test set in competition format; carve 10% off val
-        split_at = int(val_tokens.numel() * 0.5)
-        test_tokens = val_tokens[split_at:]
-        val_tokens = val_tokens[:split_at]
-        return train_tokens, val_tokens, test_tokens
+    # If JSONL exists but raw text doesn't, extract it
+    jsonl = data_path / "docs_selected.jsonl"
+    if not raw_text.exists() and jsonl.exists():
+        print(f"  Extracting raw text from {jsonl} ...")
+        _extract_jsonl_to_raw(jsonl, raw_text)
+        print(f"  Wrote {raw_text} ({raw_text.stat().st_size / 1e9:.2f} GB)")
 
-    return (
-        maybe_cache_tokens_on_device(train_tokens, device=device, enabled=cache_on_device),
-        maybe_cache_tokens_on_device(val_tokens, device=device, enabled=cache_on_device),
-        maybe_cache_tokens_on_device(test_tokens, device=device, enabled=cache_on_device),
-    )
+    if not raw_text.exists():
+        raise FileNotFoundError(
+            f"No raw text found in {data_dir}. Need docs_raw.txt or docs_selected.jsonl. "
+            f"Download with: python cached_challenge_fineweb.py --with-docs"
+        )
+
+    all_tokens = load_fineweb_raw_bytes(str(raw_text))
+    train_end = int(all_tokens.numel() * train_fraction)
+    val_end = int(all_tokens.numel() * (train_fraction + 0.05))
+    train_tokens = all_tokens[:train_end]
+    val_tokens = all_tokens[train_end:val_end]
+    test_tokens = all_tokens[val_end:]
+    # Data is mmap-backed — do NOT cache on device (would copy entire dataset to GPU)
+    return train_tokens, val_tokens, test_tokens
 
 
 # ---------------------------------------------------------------------------
