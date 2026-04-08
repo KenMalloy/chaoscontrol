@@ -292,6 +292,7 @@ class MultiSlotOuterModel(nn.Module):
 
         if cue is not None:
             # Project cue to outer space for similarity
+            cue = cue.to(dtype=self.cue_proj.weight.dtype)
             cue_outer = self.cue_proj(cue)  # (batch, outer_dim)
             # Similarity: (batch, num_slots)
             sim = torch.mm(cue_outer, slot_matrix.T)
