@@ -23,7 +23,7 @@ class SleepConfig:
 
     stages: str = "full_cycle"
     # "n3_only", "n2_n3", "n2_n3_rem_validate", "n2_n3_rem_cfr",
-    # "n2_n3_rem_full", "full_cycle"
+    # "n2_n3_rem_reactivate", "n2_n3_rem_all", "full_cycle"
 
     budget: int = 128        # total max ops
     n2_budget: int = 64      # fixed sub-budget for N2
@@ -35,6 +35,7 @@ class SleepConfig:
     rem_length: int = 128
     rem_validate: bool = True
     rem_cfr: bool = True
+    rem_reactivate: bool = True
 
     @property
     def use_n1(self) -> bool:
@@ -53,7 +54,8 @@ class SleepConfig:
         return self.stages in (
             "n2_n3_rem_validate",
             "n2_n3_rem_cfr",
-            "n2_n3_rem_full",
+            "n2_n3_rem_reactivate",
+            "n2_n3_rem_all",
             "full_cycle",
         )
 
@@ -132,18 +134,21 @@ class SleepCycle:
         if cfg.use_rem:
             validate_merges = cfg.stages in (
                 "n2_n3_rem_validate",
-                "n2_n3_rem_full",
+                "n2_n3_rem_all",
                 "full_cycle",
             )
             use_cfr = cfg.stages in (
                 "n2_n3_rem_cfr",
-                "n2_n3_rem_full",
+                "n2_n3_rem_all",
                 "full_cycle",
             )
+            rem_reactivate = self.config.rem_reactivate and self.config.stages in (
+                "n2_n3_rem_reactivate", "n2_n3_rem_all", "full_cycle")
             rem_diag = self._rem_dream(
                 model, om, cache, device,
                 regret_table=regret_table if use_cfr else None,
                 validate_merges=validate_merges,
+                reactivate_on_loss=rem_reactivate,
             )
             diag["rem"] = rem_diag
             diag["total_ops"] += rem_diag.get("ops", 0)
@@ -486,12 +491,14 @@ class SleepCycle:
         device: torch.device | str,
         regret_table: Any | None = None,
         validate_merges: bool = True,
+        reactivate_on_loss: bool = False,
     ) -> dict[str, Any]:
         """Execute REM dream phase: generate, score, optionally validate merges + CFR."""
         cfg = self.config
         ops = 0
         dream_scores: list[float] = []
         cfr_updates = 0
+        reactivations = 0
 
         n_dreams = min(cfg.rem_dreams, cfg.rem_budget)
         if not om._slots:
@@ -543,6 +550,26 @@ class SleepCycle:
                 impact = running_avg - score  # positive = better than average
                 om._survival[seed_idx] += impact * 0.1
 
+                # Phase B½: Latent trace reactivation on poor dreams
+                # If dream CE is significantly worse than the cached moment's
+                # surprise (proxy for wake-time difficulty), attempt to recover
+                # a latent trace for the seed slot's bucket.
+                if reactivate_on_loss and cache.moments:
+                    moment = cache.moments[dream_idx % len(cache.moments)]
+                    baseline_ce = moment.get("surprise", 1.0)
+                    if baseline_ce > 0:
+                        ratio = score / baseline_ce
+                        bucket = om._slot_buckets[seed_idx] if seed_idx < len(om._slot_buckets) else None
+                        if ratio > 1.0 and om.try_reactivate(
+                            bucket_id=bucket, surprise=ratio
+                        ):
+                            reactivations += 1
+                            # Re-score to verify reactivation helped
+                            rescore = self._score_dream(model, target_batches, device)
+                            if rescore < score:
+                                dream_scores[-1] = rescore
+                            ops += 1
+
             # Phase C: Counterfactual regret updates (if enabled)
             if regret_table is not None and target_batches:
                 cfr_updates += self._cfr_update(
@@ -582,6 +609,7 @@ class SleepCycle:
                 sum(dream_scores) / len(dream_scores) if dream_scores else 0.0
             ),
             "cfr_updates": cfr_updates,
+            "reactivations": reactivations,
             "merges_accepted": merges_accepted,
             "merges_rejected": merges_rejected,
         }

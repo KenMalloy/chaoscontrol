@@ -105,8 +105,12 @@ class TestSleepConfig:
         cfg = SleepConfig(stages="n2_n3_rem_cfr")
         assert cfg.use_rem is True
 
-    def test_rem_full(self):
-        cfg = SleepConfig(stages="n2_n3_rem_full")
+    def test_rem_all(self):
+        cfg = SleepConfig(stages="n2_n3_rem_all")
+        assert cfg.use_rem is True
+
+    def test_rem_reactivate(self):
+        cfg = SleepConfig(stages="n2_n3_rem_reactivate")
         assert cfg.use_rem is True
 
     def test_defaults(self):

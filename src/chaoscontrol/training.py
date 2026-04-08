@@ -65,6 +65,7 @@ def train_chaoscontrol_for_budget(
     sleep_rem_length: int = 128,
     sleep_merge_sim_threshold: float = 0.85,
     sleep_survival_floor: float = 0.1,
+    sleep_rem_reactivate: bool = True,
 ) -> dict[str, Any]:
     """Train ChaosStudentLM for a time budget with optional criticality regularization."""
     # Set up structured projections if requested (before optimizer so its params are included)
@@ -119,6 +120,7 @@ def train_chaoscontrol_for_budget(
             n2_batches=sleep_n2_batches,
             rem_dreams=sleep_rem_dreams,
             rem_length=sleep_rem_length,
+            rem_reactivate=sleep_rem_reactivate,
         )
         sleep_cycle = SleepCycle(sleep_cfg)
     sleep_cycles_run = 0

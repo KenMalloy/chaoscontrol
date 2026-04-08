@@ -216,6 +216,7 @@ def run_experiment(config_path: str, *, data_path: str, budget_seconds: float = 
         sleep_rem_length=cfg.sleep_rem_length,
         sleep_merge_sim_threshold=cfg.sleep_merge_sim_threshold,
         sleep_survival_floor=cfg.sleep_survival_floor,
+        sleep_rem_reactivate=cfg.sleep_rem_reactivate,
     )
 
     # Use the trained structured_proj (not a fresh random one)

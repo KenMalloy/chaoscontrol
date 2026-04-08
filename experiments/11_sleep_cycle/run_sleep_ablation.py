@@ -5,7 +5,7 @@ Tests whether the full sleep cycle (N1/N2/N3/REM) outperforms no-sleep
 and partial-sleep configurations when added to the full ChaosControl stack
 (SSM + memory + Wernicke MoE).
 
-7 conditions x 5 seeds = 35 training runs
+8 conditions x 5 seeds = 40 training runs
 
 Conditions:
   1. no_sleep        -- baseline, sleep_enabled=False
@@ -13,15 +13,18 @@ Conditions:
   3. n2_n3           -- stages="n2_n3"
   4. n2_n3_rem_validate -- stages="n2_n3_rem_validate"
   5. n2_n3_rem_cfr   -- stages="n2_n3_rem_cfr"
-  6. n2_n3_rem_full  -- stages="n2_n3_rem_full"
-  7. full_cycle      -- stages="full_cycle"
+  6. n2_n3_rem_reactivate -- stages="n2_n3_rem_reactivate"
+  7. n2_n3_rem_all   -- stages="n2_n3_rem_all"
+  8. full_cycle      -- stages="full_cycle"
 
 Pre-specified contrasts (Welch t-test):
   1. no_sleep vs full_cycle (does sleep help at all?)
   2. n3_only vs n2_n3 (does N2 tagging add value?)
-  3. n2_n3 vs n2_n3_rem_full (does REM add value?)
-  4. n2_n3_rem_validate vs n2_n3_rem_cfr (validate vs CFR)
-  5. n2_n3_rem_full vs full_cycle (does N1 transition help?)
+  3. n2_n3 vs n2_n3_rem_all (does REM add value?)
+  4. n2_n3 vs n2_n3_rem_validate (validate isolation)
+  5. n2_n3 vs n2_n3_rem_cfr (CFR isolation)
+  6. n2_n3 vs n2_n3_rem_reactivate (reactivate isolation)
+  7. n2_n3_rem_all vs full_cycle (does N1 transition help?)
 
 Decision criteria:
   - full_cycle < no_sleep by >0.05 bpb (sig) -> ADOPT FULL CYCLE
@@ -105,8 +108,11 @@ CONDITIONS = {
     "n2_n3_rem_cfr": _base(
         sleep_enabled=True, sleep_stages="n2_n3_rem_cfr", **SLEEP_COMMON
     ),
-    "n2_n3_rem_full": _base(
-        sleep_enabled=True, sleep_stages="n2_n3_rem_full", **SLEEP_COMMON
+    "n2_n3_rem_reactivate": _base(
+        sleep_enabled=True, sleep_stages="n2_n3_rem_reactivate", **SLEEP_COMMON
+    ),
+    "n2_n3_rem_all": _base(
+        sleep_enabled=True, sleep_stages="n2_n3_rem_all", **SLEEP_COMMON
     ),
     "full_cycle": _base(
         sleep_enabled=True, sleep_stages="full_cycle", **SLEEP_COMMON
@@ -117,9 +123,11 @@ CONDITIONS = {
 CONTRASTS = [
     ("sleep_vs_none", "no_sleep", "full_cycle", "Does sleep help at all?"),
     ("n2_value", "n3_only", "n2_n3", "Does N2 tagging add value?"),
-    ("rem_value", "n2_n3", "n2_n3_rem_full", "Does REM add value?"),
-    ("validate_vs_cfr", "n2_n3_rem_validate", "n2_n3_rem_cfr", "Validate vs CFR"),
-    ("n1_value", "n2_n3_rem_full", "full_cycle", "Does N1 transition help?"),
+    ("rem_value", "n2_n3", "n2_n3_rem_all", "Does REM add value?"),
+    ("validate_isolation", "n2_n3", "n2_n3_rem_validate", "Validate isolation"),
+    ("cfr_isolation", "n2_n3", "n2_n3_rem_cfr", "CFR isolation"),
+    ("reactivate_isolation", "n2_n3", "n2_n3_rem_reactivate", "Reactivate isolation"),
+    ("n1_value", "n2_n3_rem_all", "full_cycle", "Does N1 transition help?"),
 ]
 
 
@@ -413,7 +421,7 @@ def _print_summary():
             # Note best partial as EXPLORATORY only
             best_partial = None
             best_partial_bpb = float("inf")
-            for cond in ["n3_only", "n2_n3", "n2_n3_rem_validate", "n2_n3_rem_cfr", "n2_n3_rem_full"]:
+            for cond in ["n3_only", "n2_n3", "n2_n3_rem_validate", "n2_n3_rem_cfr", "n2_n3_rem_reactivate", "n2_n3_rem_all"]:
                 s = summary.get(cond)
                 if s and s["mean_bpb"] < best_partial_bpb:
                     best_partial = cond

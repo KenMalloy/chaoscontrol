@@ -7,4 +7,5 @@ def test_sleep_config_defaults():
     assert cfg.sleep_budget == 128
     assert cfg.sleep_n2_budget == 64
     assert cfg.sleep_rem_budget == 64
+    assert cfg.sleep_rem_reactivate is True
     assert cfg.sleep_adaptive_fatigue is False
