@@ -5,21 +5,28 @@ Param-matched comparison for the paper. Three models at the same budget,
 dimensions, and layer count. Answers: "how much does each architectural
 layer contribute?"
 
-4 conditions x 7 seeds = 28 runs
+8 conditions x 7 seeds = 56 runs
 
 Conditions:
-  1. mamba2       -- external SSM baseline (Mamba-2 from mamba-ssm)
-  2. bare_ssm     -- our SSM core, no memory, no Wernicke
-  3. ssm_wernicke -- our SSM + Wernicke MoE, no episodic memory
-  4. full_stack   -- our SSM + Wernicke + episodic memory (exp 11 baseline)
+  Architecture baselines:
+    1. mamba2             -- external SSM baseline (requires mamba-ssm)
+    2. bare_ssm           -- our SSM core, no memory, no Wernicke
+    3. ssm_wernicke_k16   -- SSM + Wernicke MoE (k_max=16)
+    4. full_stack_k16     -- SSM + Wernicke + episodic memory (k_max=16)
+  k_max sweep:
+    5. ssm_wernicke_k32   -- Wernicke k_max=32
+    6. ssm_wernicke_k64   -- Wernicke k_max=64
+    7. full_stack_k32     -- full stack k_max=32
+    8. full_stack_k64     -- full stack k_max=64
 
 Confirmatory contrasts (Holm-corrected, m=2):
-  1. full_stack vs mamba2      (does our full architecture beat Mamba-2?)
-  2. bare_ssm vs mamba2        (is our SSM core competitive with Mamba-2?)
+  1. full_stack_k16 vs mamba2   (does our full architecture beat Mamba-2?)
+  2. bare_ssm vs mamba2         (is our SSM core competitive with Mamba-2?)
 
 Exploratory:
-  3. ssm_wernicke vs bare_ssm  (Wernicke contribution)
-  4. full_stack vs ssm_wernicke (memory contribution)
+  3. ssm_wernicke_k16 vs bare_ssm       (Wernicke contribution)
+  4. full_stack_k16 vs ssm_wernicke_k16  (memory contribution)
+  5-8. k_max sweep: 16→32, 16→64 for both Wernicke-only and full stack
 
 Requires: pip install mamba-ssm>=2.3.0
 
@@ -64,20 +71,32 @@ def _base(**overrides) -> dict:
     return base
 
 
-CONDITIONS = {
-    "mamba2": _base(model_type="mamba2"),
-    "bare_ssm": _base(),
-    "ssm_wernicke": _base(
+def _wernicke(k_max=16, **extra):
+    return _base(
         wernicke_enabled=True, wernicke_router="moe",
-        wernicke_k_max=16, typed_storage=True,
-    ),
-    "full_stack": _base(
+        wernicke_k_max=k_max, typed_storage=True, **extra,
+    )
+
+def _full(k_max=16, **extra):
+    return _wernicke(
+        k_max=k_max,
         outer_model_type="multislot", outer_model_dim=64,
         outer_max_slots=64, consolidation_write="full_sequence",
-        latent_persistence=True,
-        wernicke_enabled=True, wernicke_router="moe",
-        wernicke_k_max=16, typed_storage=True,
-    ),
+        latent_persistence=True, **extra,
+    )
+
+CONDITIONS = {
+    # Architecture baselines
+    "mamba2": _base(model_type="mamba2"),
+    "bare_ssm": _base(),
+    "ssm_wernicke_k16": _wernicke(k_max=16),
+    "full_stack_k16": _full(k_max=16),
+    # k_max sweep (Wernicke only — isolate bucket count from memory)
+    "ssm_wernicke_k32": _wernicke(k_max=32),
+    "ssm_wernicke_k64": _wernicke(k_max=64),
+    # k_max sweep (full stack — bucket count with memory)
+    "full_stack_k32": _full(k_max=32),
+    "full_stack_k64": _full(k_max=64),
 }
 
 # Wilcoxon signed-rank helpers (same as experiment 11)
@@ -119,13 +138,19 @@ def _holm_bonferroni(p_values):
 
 
 CONFIRMATORY_CONTRASTS = [
-    ("full_vs_mamba2", "mamba2", "full_stack", "Full stack vs Mamba-2"),
+    ("full_vs_mamba2", "mamba2", "full_stack_k16", "Full stack vs Mamba-2"),
     ("bare_vs_mamba2", "mamba2", "bare_ssm", "Our SSM vs Mamba-2"),
 ]
 
 EXPLORATORY_CONTRASTS = [
-    ("wernicke_value", "bare_ssm", "ssm_wernicke", "Wernicke MoE contribution"),
-    ("memory_value", "ssm_wernicke", "full_stack", "Episodic memory contribution"),
+    ("wernicke_value", "bare_ssm", "ssm_wernicke_k16", "Wernicke MoE contribution"),
+    ("memory_value", "ssm_wernicke_k16", "full_stack_k16", "Episodic memory contribution"),
+    # k_max sweep (Wernicke only)
+    ("kmax_w_16v32", "ssm_wernicke_k16", "ssm_wernicke_k32", "Wernicke k_max 16→32"),
+    ("kmax_w_16v64", "ssm_wernicke_k16", "ssm_wernicke_k64", "Wernicke k_max 16→64"),
+    # k_max sweep (full stack)
+    ("kmax_f_16v32", "full_stack_k16", "full_stack_k32", "Full stack k_max 16→32"),
+    ("kmax_f_16v64", "full_stack_k16", "full_stack_k64", "Full stack k_max 16→64"),
 ]
 
 
