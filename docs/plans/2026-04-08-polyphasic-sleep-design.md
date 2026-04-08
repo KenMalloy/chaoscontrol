@@ -107,37 +107,62 @@ The sleeping side is internally active but externally closed, which is exactly t
 
 ## 8×H100 Mapping
 
-Each GPU owns a partition. With 8 GPUs and `wernicke_k_max=16` buckets:
+Each GPU holds the trunk replica (data-parallel) plus one partition's semantic state. The question is how to assign slots to partitions.
 
-- GPU 0 → buckets 0-1
-- GPU 1 → buckets 2-3
-- ...
-- GPU 7 → buckets 14-15
+### Three Partition Topologies
 
-Each GPU holds the trunk replica (data-parallel) plus its partition's semantic state (slots, traces, bases, regret table for its buckets).
+#### `slot_striped` — Prototype + Control Baseline
 
-### Partition Scheme: Bucket-Owned
+Slots assigned round-robin across GPUs regardless of bucket:
 
-The natural partition boundary is **Wernicke bucket ownership**:
+```
+owner_gpu = slot_idx % world_size
+```
 
-- buckets are assigned to partitions (round-robin or load-balanced)
-- each partition owns the episodic slots, latent traces, and semantic bases for its bucket families
-- sleep/consolidation happens over semantic territory, not arbitrary memory indices
+- Load-balances naturally
+- Easy to implement and debug
+- When a GPU sleeps, every bucket loses 1/N capacity uniformly
+- No bucket goes fully offline — available context drops a little everywhere
+- Proves the economics: "does polyphasic sleep help at all?"
+- **Weakness**: destroys semantic locality, makes N2/N3/REM arbitrary, muddies the Wernicke typing story
 
-This is the CCSSM-native design because:
+#### `bucket_owned` — Pure Semantic Locality
 
-- it aligns with typed storage
-- each partition has a coherent semantic domain
-- it enables semantically sparse distributed execution
-- the scheduler can sleep the least-active partition first
+Each GPU exclusively owns whole bucket families:
 
-### Fallback: Slot-Halving
+```
+owner_gpu = bucket_id % world_size
+```
 
-If bucket-owned partitions prove too complex to prototype:
+- Strong semantic locality — each partition has a coherent domain
+- Enables semantically sparse distributed execution
+- Scheduler can sleep the least-active partition first
+- **Weakness**: when a GPU sleeps, its buckets go fully offline (hot bucket → cold aisle problem)
 
-- slots are assigned round-robin to partitions regardless of bucket
-- simpler but semantically arbitrary
-- still tests the core economic claim (wake:sleep tradeoff)
+#### `bucket_striped` — The Real Bet
+
+Bucket families map to GPU groups, slots striped within each group:
+
+```
+primary_group = bucket_id % num_groups
+owner_gpu = pick_gpu_within_group(primary_group, slot_idx)
+```
+
+- Semantic locality at the bucket level (typed ownership shapes consolidation)
+- Load-balancing within a bucket family (no hot-bucket problem)
+- When a GPU sleeps, its bucket families lose one lane, not the whole road
+- Less arbitrary fragmentation than pure striping
+- **This is the topology most likely to say something new**
+
+### Experimental Role of Each Topology
+
+| Topology | Role | What it proves |
+|----------|------|---------------|
+| `slot_striped` | Prototype + control | Polyphasic economics work (independent of topology) |
+| `bucket_owned` | Semantic locality test | Typed ownership matters for consolidation quality |
+| `bucket_striped` | Main thesis | Typed ownership + load balance = best of both |
+
+`slot_striped` proves the economics. `bucket_striped` vs `slot_striped` proves the mechanism is semantic.
 
 ### Wake:Sleep Scheduling
 
@@ -313,12 +338,13 @@ Same locked defaults, vary only K:
 2. `K6_N8` — default (75% capacity awake, 2 consolidating)
 3. `K4_N8` — deep sleep (50% capacity awake, 4 consolidating)
 
-### Exploratory: Partition Strategy
+### Exploratory: Partition Topology
 
-1. arbitrary slot-halving (fallback)
-2. bucket-owned partitions (CCSSM-native)
+1. `slot_striped` — round-robin slots, no semantic awareness (control)
+2. `bucket_owned` — exclusive bucket families per GPU
+3. `bucket_striped` — bucket families map to GPU groups, striped within (main bet)
 
-If bucket-owned wins, the result is genuinely distinctive.
+If `bucket_striped` beats `slot_striped`, the mechanism is semantic, not just economic.
 
 ### Exploratory: Cross-Partition Read Policy
 
