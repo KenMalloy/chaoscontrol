@@ -228,12 +228,15 @@ def plot_scaling_curves(
     for cond, points in data.items():
         params = [p["params"] for p in points]
         bpbs = [p["bpb"] for p in points]
-        stds = [p["bpb_std"] for p in points]
+        sems = [
+            compute_sem(p.get("bpb_values", [])) if len(p.get("bpb_values", [])) >= 2 else 0.0
+            for p in points
+        ]
         color = COLORS.get(cond, "#999999")
         marker = MARKERS.get(cond, "D")
 
         ax.errorbar(
-            params, bpbs, yerr=stds, fmt=marker, color=color,
+            params, bpbs, yerr=sems, fmt=marker, color=color,
             label=cond, markersize=8, capsize=4, linewidth=1.5,
         )
 
@@ -338,10 +341,18 @@ def plot_component_delta(data: dict[str, list[dict]]):
 
     sizes = []
     deltas = []
+    sig_labels = []
     for size in bare_map:
         if size in full_map:
             sizes.append(size)
             deltas.append(bare_map[size]["bpb"] - full_map[size]["bpb"])
+            bare_vals = bare_map[size].get("bpb_values", [])
+            full_vals = full_map[size].get("bpb_values", [])
+            if len(bare_vals) >= 2 and len(full_vals) >= 2:
+                _t, p_val = welch_ttest(bare_vals, full_vals)
+                sig_labels.append("**" if p_val < 0.01 else ("*" if p_val < 0.05 else "ns"))
+            else:
+                sig_labels.append("n<2")
 
     ax.bar(sizes, deltas, color="#4CAF50", alpha=0.7, edgecolor="black")
     ax.axhline(y=0, color="black", linewidth=0.5)
@@ -352,10 +363,10 @@ def plot_component_delta(data: dict[str, list[dict]]):
     ax.set_title("Component ROI Across Scale", fontsize=14)
     ax.grid(True, alpha=0.3, axis="y")
 
-    # Annotate each bar
-    for i, (size, delta) in enumerate(zip(sizes, deltas)):
+    # Annotate each bar with delta and significance
+    for i, (size, delta, sig) in enumerate(zip(sizes, deltas, sig_labels)):
         ax.annotate(
-            f"{delta:+.4f}", (i, delta), textcoords="offset points",
+            f"{delta:+.4f} {sig}", (i, delta), textcoords="offset points",
             xytext=(0, 10 if delta >= 0 else -15), ha="center", fontsize=9,
         )
 
@@ -370,21 +381,26 @@ def plot_component_delta(data: dict[str, list[dict]]):
 
 def print_summary_table(data: dict[str, list[dict]], fits: dict[str, dict]):
     """Print a formatted summary table to stdout."""
-    print("\n" + "=" * 90)
+    print("\n" + "=" * 100)
     print("  SCALING LAW RESULTS")
-    print("=" * 90)
+    print("=" * 100)
     print(
         f"  {'Size':<6} {'Condition':<14} {'Params':>10} {'BPB':>8} "
-        f"{'Std':>8} {'Steps':>8} {'FLOPs':>12}"
+        f"{'±SEM':>8} {'95% CI':>20} {'Seeds':>5} {'Steps':>8} {'FLOPs':>12}"
     )
-    print(f"  {'-' * 80}")
+    print(f"  {'-' * 95}")
 
     for cond, points in sorted(data.items()):
         for p in points:
+            bpb_vals = p.get("bpb_values", [])
+            n = len(bpb_vals)
+            sem_val = compute_sem(bpb_vals) if n >= 2 else 0.0
+            ci = bootstrap_ci(bpb_vals) if n >= 2 else (p["bpb"], p["bpb"])
+            ci_str = f"[{ci[0]:.4f}, {ci[1]:.4f}]"
             print(
                 f"  {p['size']:<6} {cond:<14} {p['params']:>10,.0f} "
-                f"{p['bpb']:>8.4f} {p['bpb_std']:>8.4f} "
-                f"{p['steps']:>8,.0f} {p['total_flops']:>12.2e}"
+                f"{p['bpb']:>8.4f} {sem_val:>8.4f} {ci_str:>20} "
+                f"{n:>5} {p['steps']:>8,.0f} {p['total_flops']:>12.2e}"
             )
         print()
 
@@ -466,13 +482,35 @@ def print_summary_table(data: dict[str, list[dict]], fits: dict[str, dict]):
     )
     if bare_xl and full_xl:
         delta = bare_xl["bpb"] - full_xl["bpb"]
+        bare_vals = bare_xl.get("bpb_values", [])
+        full_vals = full_xl.get("bpb_values", [])
+        if len(bare_vals) >= 2 and len(full_vals) >= 2:
+            _t, p_delta = welch_ttest(bare_vals, full_vals)
+            d_delta = cohens_d(bare_vals, full_vals)
+            sig_str = f"p={p_delta:.4f}, d={d_delta:.2f}"
+        else:
+            sig_str = "n<2, no test"
         if delta < 0:
             print(
                 f"  *** KILL: component_delta at XL is {delta:.4f} < 0 "
-                "(full stack hurts)"
+                f"(full stack hurts) [{sig_str}]"
             )
         else:
-            print(f"  OK: component_delta at XL is {delta:+.4f} (full stack helps)")
+            print(f"  OK: component_delta at XL is {delta:+.4f} (full stack helps) [{sig_str}]")
+
+    # Seed variance comparison: is SSM more stable than transformer?
+    print("\n  SEED VARIANCE COMPARISON")
+    print(f"  {'-' * 60}")
+    for size in sorted(size_cond_bpbs.keys()):
+        conds = size_cond_bpbs[size]
+        row = f"  {size:<6}"
+        for cond in ["bare_ssm", "full_ssm", "our_tfm", "mamba2_ssm"]:
+            vals = conds.get(cond, [])
+            if len(vals) >= 2:
+                row += f"  {cond}: std={statistics.stdev(vals):.4f} (n={len(vals)})"
+            elif vals:
+                row += f"  {cond}: n=1"
+        print(row)
 
 
 # ── Main ─────────────────────────────────────────────────────────────
