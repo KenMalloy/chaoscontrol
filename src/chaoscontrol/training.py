@@ -17,6 +17,8 @@ from chaoscontrol.core import criticality_loss
 from chaoscontrol.data import batch_from_starts, maybe_autocast, maybe_sync_cuda
 from chaoscontrol.metabolic import metabolic_fork, metabolic_monte_carlo, StructuredProjections
 from chaoscontrol.memory import MultiSlotOuterModel
+from chaoscontrol.wake_cache import WakeCache
+from chaoscontrol.sleep import SleepCycle, SleepConfig
 
 
 def train_chaoscontrol_for_budget(
@@ -52,6 +54,17 @@ def train_chaoscontrol_for_budget(
     tokenizer: Any = None,
     align_type: str = "none",
     align_weight: float = 0.05,
+    sleep_enabled: bool = False,
+    sleep_stages: str = "full_cycle",
+    sleep_interval: int = 256,
+    sleep_budget: int = 128,
+    sleep_n2_budget: int = 64,
+    sleep_rem_budget: int = 64,
+    sleep_n2_batches: int = 8,
+    sleep_rem_dreams: int = 4,
+    sleep_rem_length: int = 128,
+    sleep_merge_sim_threshold: float = 0.85,
+    sleep_survival_floor: float = 0.1,
 ) -> dict[str, Any]:
     """Train ChaosStudentLM for a time budget with optional criticality regularization."""
     # Set up structured projections if requested (before optimizer so its params are included)
@@ -92,6 +105,24 @@ def train_chaoscontrol_for_budget(
         from chaoscontrol.regret import RegretTable
         k_max = model.wernicke.k_max if getattr(model, "wernicke", None) else 16
         regret_table = RegretTable(n_buckets=k_max, n_actions=metabolic_k)
+
+    wake_cache = WakeCache(max_moments=32, max_hidden_buffer=64) if sleep_enabled else None
+    sleep_cycle = None
+    if sleep_enabled:
+        sleep_cfg = SleepConfig(
+            stages=sleep_stages,
+            budget=sleep_budget,
+            n2_budget=sleep_n2_budget,
+            rem_budget=sleep_rem_budget,
+            merge_sim_threshold=sleep_merge_sim_threshold,
+            survival_floor=sleep_survival_floor,
+            n2_batches=sleep_n2_batches,
+            rem_dreams=sleep_rem_dreams,
+            rem_length=sleep_rem_length,
+        )
+        sleep_cycle = SleepCycle(sleep_cfg)
+    sleep_cycles_run = 0
+    wake_steps_since_sleep = 0
 
     model.train()
 
@@ -479,6 +510,35 @@ def train_chaoscontrol_for_budget(
         # Store bucket for next step's CFR bias (one-step delayed)
         prev_dominant_bucket = dominant_bucket
 
+        # Wake cache: record high-signal moments for sleep
+        if wake_cache is not None:
+            wake_steps_since_sleep += 1
+            wake_cache.push_hidden(out["hidden"].detach())
+            # Record moments with surprise above half the gate threshold
+            surprise_for_cache = surprise_ratio_for_latent if model.outer_model is not None else surprise_ratio
+            if abs(surprise_for_cache) > current_threshold * 0.5:
+                wake_cache.record_moment(
+                    surprise=surprise_for_cache,
+                    inputs=inputs,
+                    targets=targets,
+                    hidden=out["hidden"],
+                    bucket_ids=out.get("bucket_ids"),
+                    slot_cues=out["hidden"][:, -1, :] if out["hidden"].ndim == 3 else None,
+                )
+            if "bucket_ids" in out:
+                wake_cache.update_bucket_counts(out["bucket_ids"])
+
+            # Sleep trigger: fixed interval
+            if wake_steps_since_sleep >= sleep_interval:
+                sleep_diag = sleep_cycle.run(
+                    model, wake_cache,
+                    device=device, regret_table=regret_table,
+                )
+                sleep_cycles_run += 1
+                wake_steps_since_sleep = 0
+                wake_cache.clear()
+                step_record["sleep"] = sleep_diag
+
         history.append(step_record)
         steps += 1
 
@@ -493,6 +553,7 @@ def train_chaoscontrol_for_budget(
         "spectral_snapshots": spectral_snapshots,
         "bucket_snapshots": bucket_snapshots,
         "regret_table": regret_table,
+        "sleep_cycles": sleep_cycles_run,
     }
 
 

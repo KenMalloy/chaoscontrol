@@ -327,9 +327,10 @@ class SleepCycle:
 
         # If REM is not active, commit merges immediately
         if not cfg.use_rem:
+            committed = 0
             for merge in provisional_merges:
-                self._commit_merge(om, merge)
-            committed = len(provisional_merges)
+                if self._commit_merge(om, merge):
+                    committed += 1
             provisional_merges = []
         else:
             committed = 0
@@ -415,10 +416,18 @@ class SleepCycle:
                     break  # each slot participates in at most one merge
         return proposals
 
-    def _commit_merge(self, om: Any, merge: dict[str, Any]) -> None:
-        """Execute a merge: replace slot_a with weighted average, remove slot_b."""
+    def _commit_merge(self, om: Any, merge: dict[str, Any]) -> bool:
+        """Execute a merge: replace slot_a with weighted average, remove slot_b.
+
+        Returns True if the merge was applied, False if indices were stale.
+        """
         idx_a = merge["idx_a"]
         idx_b = merge["idx_b"]
+
+        # Guard: indices may be stale after N3 pruning
+        n = len(om._slots)
+        if idx_a >= n or idx_b >= n or idx_a == idx_b:
+            return False
 
         # Weighted average by survival
         sa = max(merge["survival_a"], 0.01)
@@ -448,6 +457,8 @@ class SleepCycle:
         # Evict oldest latent traces if over capacity
         while len(om._latent_traces) > om.max_slots:
             om._latent_traces.pop(0)
+
+        return True
 
     # ------------------------------------------------------------------
     # REM — Dream
@@ -533,16 +544,16 @@ class SleepCycle:
             for merge in self._provisional_merges:
                 if ops >= cfg.rem_budget:
                     # Budget exhausted: commit remaining merges by default
-                    self._commit_merge(om, merge)
-                    merges_accepted += 1
+                    if self._commit_merge(om, merge):
+                        merges_accepted += 1
                     continue
 
                 accepted = self._validate_merge(
                     model, om, merge, target_batches, device
                 )
                 if accepted:
-                    self._commit_merge(om, merge)
-                    merges_accepted += 1
+                    if self._commit_merge(om, merge):
+                        merges_accepted += 1
                 else:
                     # Reject merge: reactivate latent trace
                     self._reject_merge(om, merge)
