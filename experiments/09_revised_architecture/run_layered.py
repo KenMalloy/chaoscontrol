@@ -98,7 +98,15 @@ def _launch_config(config_path: Path, data_path: str, budget: float, seed: int,
         env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
     log_path = RESULTS / f"{config_path.stem}_seed{seed}.log"
     log_fh = open(log_path, "w")
-    proc = subprocess.Popen(cmd, env=env, stdout=log_fh, stderr=subprocess.STDOUT)
+    # Tee to container init stdout so RunPod web console shows live output
+    if Path("/proc/1/fd/1").exists():
+        shell_cmd = " ".join(cmd) + f" 2>&1 | tee {log_path} > /proc/1/fd/1"
+        proc = subprocess.Popen(
+            ["bash", "-c", shell_cmd], env=env,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+    else:
+        proc = subprocess.Popen(cmd, env=env, stdout=log_fh, stderr=subprocess.STDOUT)
     return proc, out_path, tmp, log_fh
 
 
