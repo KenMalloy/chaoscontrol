@@ -97,7 +97,7 @@ class WakeCache:
 
     def update_bucket_counts(self, bucket_ids: torch.Tensor) -> None:
         """Accumulate a bincount of Wernicke bucket assignments."""
-        ids = bucket_ids.detach().cpu().long()
+        ids = bucket_ids.detach().cpu().long().reshape(-1)
         counts = torch.bincount(ids)
         if self._bucket_counts is None:
             self._bucket_counts = counts
