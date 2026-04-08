@@ -57,11 +57,34 @@ def maybe_sync_cuda(device):
 # Data loading
 # ---------------------------------------------------------------------------
 
+def _concat_shards_mmap(shard_paths: list[Path], cache_path: Path) -> np.ndarray:
+    """Concatenate binary shards into a single memory-mapped file.
+
+    On first call, reads all shards and writes a flat binary cache.
+    On subsequent calls (including from parallel processes), returns an
+    mmap view of the cache — all processes share the same physical pages.
+    """
+    if cache_path.exists():
+        return np.memmap(str(cache_path), dtype=np.uint16, mode="r")
+
+    # Build the cache: read shards into memory once, write flat binary
+    arrays = [np.fromfile(str(s), dtype=np.uint16) for s in shard_paths]
+    combined = np.concatenate(arrays)
+    # Write atomically via temp file to avoid partial reads from parallel processes
+    tmp_path = cache_path.with_suffix(".tmp")
+    combined.tofile(str(tmp_path))
+    tmp_path.rename(cache_path)
+    # Return mmap of the cache (not the in-memory copy)
+    del combined, arrays
+    return np.memmap(str(cache_path), dtype=np.uint16, mode="r")
+
+
 def load_fineweb_tokens(data_dir: str) -> tuple[torch.Tensor, torch.Tensor]:
     """Load FineWeb binary shards (uint16 SentencePiece token IDs).
 
-    Returns (train_tokens, val_tokens) as int64 tensors.
-    The competition format stores shards as flat binary files of uint16.
+    Returns (train_tokens, val_tokens) as int64 tensors backed by
+    memory-mapped files. Multiple processes sharing the same data_dir
+    will share physical memory pages via the OS page cache.
     """
     data_path = Path(data_dir)
     train_shards = sorted(data_path.glob("fineweb_train_*.bin"))
@@ -71,11 +94,16 @@ def load_fineweb_tokens(data_dir: str) -> tuple[torch.Tensor, torch.Tensor]:
     if not val_shards:
         raise FileNotFoundError(f"No validation shards found in {data_dir}")
 
-    train_arrays = [np.fromfile(str(s), dtype=np.uint16) for s in train_shards]
-    val_arrays = [np.fromfile(str(s), dtype=np.uint16) for s in val_shards]
+    train_mmap = _concat_shards_mmap(train_shards, data_path / ".train_cache.bin")
+    val_mmap = _concat_shards_mmap(val_shards, data_path / ".val_cache.bin")
 
-    train_tokens = torch.from_numpy(np.concatenate(train_arrays).astype(np.int64, copy=False))
-    val_tokens = torch.from_numpy(np.concatenate(val_arrays).astype(np.int64, copy=False))
+    # Zero-copy: view uint16 mmap as int16 (identical bit patterns for
+    # values < 32768; sp1024 vocab max is 1023). torch.from_numpy shares
+    # the mmap backing. Multiple processes reading the same cache file
+    # share OS page cache — no per-process duplication.
+    # batch_from_starts does .to(dtype=torch.long) per-batch.
+    train_tokens = torch.from_numpy(train_mmap.view(np.int16))
+    val_tokens = torch.from_numpy(val_mmap.view(np.int16))
     return train_tokens, val_tokens
 
 
@@ -115,12 +143,16 @@ def prepare_fineweb_splits(
         val_tokens = all_tokens[train_end:val_end]
         test_tokens = all_tokens[val_end:]
     else:
-        # SentencePiece uint16 shard path — train/val already split by shards
+        # SentencePiece uint16 shard path — train/val already split by shards.
+        # Data is mmap-backed (int16 on CPU). Do NOT cache on device — the full
+        # dataset would exhaust GPU memory. batch_from_starts handles per-batch
+        # transfer via .to(device=device, dtype=torch.long).
         train_tokens, val_tokens = load_fineweb_tokens(data_dir)
         # No separate test set in competition format; carve 10% off val
         split_at = int(val_tokens.numel() * 0.5)
         test_tokens = val_tokens[split_at:]
         val_tokens = val_tokens[:split_at]
+        return train_tokens, val_tokens, test_tokens
 
     return (
         maybe_cache_tokens_on_device(train_tokens, device=device, enabled=cache_on_device),
