@@ -236,6 +236,59 @@ class ChaosStudentLM(nn.Module):
 
         return logits, hidden, new_states
 
+    def dream_step(
+        self,
+        token_ids: torch.Tensor,
+        states: list[torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor, list[torch.Tensor]]:
+        """Full-tier single-token forward step for REM dream generation.
+
+        Like step() but includes ALL tiers (Wernicke, memory, semantic) that
+        step() intentionally skips. During REM dream generation the model needs
+        to experience the full forward path so that dream sequences reflect the
+        complete perception pipeline.
+
+        Args:
+            token_ids: (batch, 1) — single token ids
+            states: list of (batch, dim) per layer
+
+        Returns:
+            (logits, hidden, new_states)
+            logits: (batch, vocab)
+            hidden: (batch, dim)
+            new_states: list of (batch, dim) per layer
+        """
+        x = self.embed(token_ids).squeeze(1)  # (batch, dim)
+
+        # Wernicke (NOT skipped, unlike step)
+        if self.wernicke is not None:
+            x_seq = x.unsqueeze(1)  # Wernicke expects (batch, seq, dim)
+            x_seq, bucket_ids, _ = self.wernicke(x_seq)
+            x = x_seq.squeeze(1)
+
+        # Memory read (NOT skipped)
+        if self.outer_model is not None:
+            batch_size = x.size(0)
+            if hasattr(self.outer_model, "_slots"):
+                outer_read = self.outer_model.read(batch_size, cue=x)
+            else:
+                outer_read = self.outer_model.read(batch_size)
+            x = x + outer_read
+
+        # Semantic tier (NOT skipped)
+        if self.semantic_tier is not None:
+            x = x + self.semantic_tier.read(x.size(0))
+
+        # SSM recurrence — use ChaosSSMBlock.step()
+        new_states = []
+        for i, layer in enumerate(self.layers):
+            x, new_s = layer.step(x, states[i])
+            new_states.append(new_s)
+
+        hidden = x
+        logits = self.lm_head(self.final_norm(x.unsqueeze(1)).squeeze(1))
+        return logits, hidden, new_states
+
     def artifact_bytes(self) -> int:
         return int(sum(p.numel() for p in self.parameters()) * 2)
 
