@@ -74,14 +74,17 @@ Dreams are directed by the day's significant experiences — high-signal moments
 
 4. **Dream scoring:** Score against cached real continuations from the wake-time high-signal moments, not internal coherence. For each scene, the dream asks: "given this consolidated memory state, can I predict what actually happened?" This is teacher-forced cross-entropy on real targets, not self-referential plausibility. This anchors dream quality to wake-time bpb and prevents the system from learning self-consistent fantasies.
 
-5. **Merge validation:** For each provisional N3 merge, run dreams seeded from the merged slot's context. If teacher-forced score worsens relative to pre-merge baseline: reject the merge and reactivate the latent trace (restore the absorbed slots with degradation noise). If score holds or improves: commit the merge. This gives REM a same-cycle repair channel without "changing the past" — N3 proposes, REM approves.
+5. **Merge validation (rem_validate):** For each provisional N3 merge, run dreams seeded from the merged slot's context. If teacher-forced score worsens relative to pre-merge baseline: reject the merge and reactivate the latent trace (restore the absorbed slots with degradation noise). If score holds or improves: commit the merge. This gives REM a same-cycle repair channel without "changing the past" — N3 proposes, REM approves.
 
-6. **Updates from validated dreams:**
-   - Regret table: gate decisions during dreams populate counterfactual values. This is where CFR trains — on cheap internally-generated sequences with real-target scoring.
-   - Compression penalties: rejected merges increase protection for similar slots in future N3 passes.
+6. **Latent reactivation (rem_reactivate):** When a dream scene scores poorly (teacher-forced CE significantly above wake-time CE for the same cached moment), attempt `try_reactivate()` on the associated Wernicke bucket. The latent trace system already exists (`memory.py:501`) — compressed slots leave centroid traces that can be restored with degradation noise on high surprise. During wake, reactivation fires on surprise threshold. During REM, it fires on dream-diagnosed information loss. If reactivation improves the re-scored CE, the trace stays active. If not, it gets re-compressed. This is distinct from merge validation: validation prevents bad merges from committing; reactivation recovers information lost in *prior* compressions (from wake or previous sleep cycles).
+
+7. **Gate policy (rem_cfr):** Gate decisions during dreams populate counterfactual values via perturbed forward passes. This is where CFR trains — on cheap internally-generated sequences with real-target scoring. The regret table updates bias future gate decisions toward actions that would have performed better during dreams.
+
+8. **Updates from dreams:**
    - Slot survival: slots that seed dreams with good teacher-forced scores get boosted. Slots that seed poor scores get penalized.
+   - Compression penalties: rejected merges and failed reactivations increase protection for similar slots in future N3 passes.
 
-7. **What does NOT update:**
+9. **What does NOT update:**
    - Model weights (backbone frozen — body paralysis)
    - Canonical episodic memory (dreams are not real experiences)
    - Semantic bases (only update from real slots during N3)
@@ -102,17 +105,20 @@ experiments/11_sleep_cycle/
 
 All use the full stack (SSM + episodic memory + Wernicke MoE) at 600s budget, 5 seeds. Fixed sleep trigger interval (every 256 wake steps) and fixed sleep budget (128 steps) for clean ablation. N2 and REM get fixed sub-budgets (N2: 64 ops, REM: 64 ops) so stage attribution is not confounded by budget starvation. Realized ops per stage are logged alongside bpb. No adaptive fatigue in the primary experiment.
 
-| Condition | Stages | What it tests |
-|-----------|--------|---------------|
-| `no_sleep` | None | Baseline |
-| `n3_only` | Compression pass | Does deliberate compression beat overflow-triggered? |
-| `n2_n3` | Score + compress | Does utility-based rescoring improve what survives? |
-| `n2_n3_rem_validate` | Score + compress + merge validation | Do dreams improve consolidation quality? |
-| `n2_n3_rem_cfr` | Score + compress + gate policy | Do dreams improve gate/CFR decisions? |
-| `n2_n3_rem_full` | Score + compress + validation + CFR | Both REM mechanisms together |
-| `full_cycle` | N1 + N2 + N3 + full REM | Does the transition mode-switch matter? |
+Each REM mechanism (merge validation, latent reactivation, gate policy) is independently toggleable so we can isolate their contributions without conflation.
 
-7 conditions x 5 seeds = 35 training runs. ~2 hours on 3x A40.
+| Condition | Stages | What it isolates |
+|-----------|--------|-----------------|
+| `no_sleep` | None | Baseline |
+| `n3_only` | Compression pass | Deliberate compression vs overflow-triggered |
+| `n2_n3` | Score + compress | Utility-based rescoring value |
+| `n2_n3_rem_validate` | + merge validation | Dream-guided consolidation quality |
+| `n2_n3_rem_cfr` | + gate policy | Dream-time gate/CFR training |
+| `n2_n3_rem_reactivate` | + latent recovery | Dream-diagnosed information loss recovery |
+| `n2_n3_rem_all` | + all three REM mechanisms | Combined REM value |
+| `full_cycle` | N1 + N2 + N3 + all REM | N1 transition mechanism |
+
+8 conditions x 5 seeds = 40 training runs. ~2.2 hours on 3x A40.
 
 ### Follow-up Conditions (separate from primary ablation)
 
@@ -128,21 +134,24 @@ All use the full stack (SSM + episodic memory + Wernicke MoE) at 600s budget, 5 
 
 1. Primary: `full_cycle` vs `no_sleep` — does the complete sleep cycle help?
 2. Secondary: `n2_n3` vs `n3_only` — does utility scoring improve compression?
-3. Secondary: `n2_n3_rem_full` vs `n2_n3` — do dreams add value beyond consolidation?
-4. Exploratory: `n2_n3_rem_validate` vs `n2_n3` — is the REM lift from merge validation?
-5. Exploratory: `n2_n3_rem_cfr` vs `n2_n3` — is the REM lift from gate policy?
-6. Exploratory: `full_cycle` vs `n2_n3_rem_full` — does N1 transition matter?
+3. Secondary: `n2_n3_rem_all` vs `n2_n3` — do dreams add value beyond consolidation?
+4. Exploratory: `n2_n3_rem_validate` vs `n2_n3` — is the lift from merge validation?
+5. Exploratory: `n2_n3_rem_cfr` vs `n2_n3` — is the lift from gate policy?
+6. Exploratory: `n2_n3_rem_reactivate` vs `n2_n3` — is the lift from latent recovery?
+7. Exploratory: `full_cycle` vs `n2_n3_rem_all` — does N1 transition matter?
 
 **For each contrast, report:**
 - Mean delta bpb with 95% bootstrap CI (10,000 resamples)
 - Wilcoxon signed-rank p-value (paired by seed)
-- Holm-Bonferroni correction across the 6 contrasts
+- Holm-Bonferroni correction across all 7 contrasts
 - Cohen's d effect size
 
-With 5 seeds, Wilcoxon has 32 possible rank assignments — minimum achievable p is 0.0312. Sufficient for primary contrast significance at alpha=0.05 after correction. For stronger claims, increase to 7 seeds (minimum p = 0.0078).
+With 5 seeds, Wilcoxon has 32 possible rank assignments — minimum achievable p is 0.0312. Sufficient for primary contrast significance at alpha=0.05 after Holm correction (primary contrast corrected threshold = 0.05/7 = 0.007, which requires 7 seeds to achieve). For the primary contrast alone at alpha=0.05 uncorrected, 5 seeds suffice. For stronger claims after full correction, increase to 7 seeds (minimum p = 0.0078).
 
 ### Decision Criteria
 
-If `full_cycle` or `n2_n3_rem_full` significantly outperforms `no_sleep` (corrected p < 0.05) at 600s despite spending budget on consolidation instead of gradient steps: the sleep cycle works and the architecture is ready for H100 scale-up.
+If `full_cycle` or `n2_n3_rem_all` significantly outperforms `no_sleep` (corrected p < 0.05) at 600s despite spending budget on consolidation instead of gradient steps: the sleep cycle works and the architecture is ready for H100 scale-up.
 
 If no condition beats `no_sleep` after correction: consolidation costs more than it's worth at this scale and budget, and the architecture needs rethinking before scaling.
+
+If individual REM mechanisms show isolated significant effects (e.g., reactivation helps but CFR doesn't), that guides which mechanisms to invest in at scale.

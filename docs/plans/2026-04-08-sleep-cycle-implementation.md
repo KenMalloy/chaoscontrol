@@ -406,6 +406,7 @@ Append after line 108 (`align_weight: float = 0.05`) in `src/chaoscontrol/config
     sleep_rem_length: int = 128  # Max tokens per dream sequence
     sleep_merge_sim_threshold: float = 0.85  # Cosine similarity threshold for N3 merge proposals
     sleep_survival_floor: float = 0.1  # Slots below this utility in N2 are prunable
+    sleep_rem_reactivate: bool = True  # REM attempts latent trace recovery on poor dreams
     sleep_adaptive_fatigue: bool = False  # Use dynamic fatigue vs fixed interval
 ```
 
@@ -668,7 +669,7 @@ from chaoscontrol.wake_cache import WakeCache
 @dataclass
 class SleepConfig:
     """Configuration for the sleep cycle. Each stage is independently toggleable."""
-    stages: str = "full_cycle"  # "n3_only", "n2_n3", "n2_n3_rem_validate", "n2_n3_rem_cfr", "n2_n3_rem_full", "full_cycle"
+    stages: str = "full_cycle"  # "n3_only", "n2_n3", "n2_n3_rem_validate", "n2_n3_rem_cfr", "n2_n3_rem_reactivate", "n2_n3_rem_all", "full_cycle"
     budget: int = 128  # Max total operations (forward passes) per sleep cycle
     n2_budget: int = 64  # Fixed sub-budget for N2 scoring
     rem_budget: int = 64  # Fixed sub-budget for REM dreams
@@ -679,6 +680,7 @@ class SleepConfig:
     rem_length: int = 128
     rem_validate: bool = True  # REM validates provisional merges
     rem_cfr: bool = True  # REM updates gate/CFR policy
+    rem_reactivate: bool = True  # REM attempts latent trace recovery on poor dreams
 
     @property
     def use_n1(self) -> bool:
@@ -694,7 +696,7 @@ class SleepConfig:
 
     @property
     def use_rem(self) -> bool:
-        return self.stages in ("n2_n3_rem_validate", "n2_n3_rem_cfr", "n2_n3_rem_full", "full_cycle")
+        return self.stages in ("n2_n3_rem_validate", "n2_n3_rem_cfr", "n2_n3_rem_reactivate", "n2_n3_rem_all", "full_cycle")
 
 
 class SleepCycle:
@@ -747,14 +749,17 @@ class SleepCycle:
         if self.config.use_rem:
             # Determine which REM mechanisms are active based on stage config
             rem_validate = self.config.rem_validate and self.config.stages in (
-                "n2_n3_rem_validate", "n2_n3_rem_full", "full_cycle")
+                "n2_n3_rem_validate", "n2_n3_rem_all", "full_cycle")
             rem_cfr = self.config.rem_cfr and self.config.stages in (
-                "n2_n3_rem_cfr", "n2_n3_rem_full", "full_cycle")
+                "n2_n3_rem_cfr", "n2_n3_rem_all", "full_cycle")
+            rem_reactivate = self.config.rem_reactivate and self.config.stages in (
+                "n2_n3_rem_reactivate", "n2_n3_rem_all", "full_cycle")
             rem_diag, rem_ops = self._rem_dream(
                 model, om, cache, provisional_merges,
                 device=device, regret_table=regret_table if rem_cfr else None,
                 ops_remaining=self.config.rem_budget,
                 validate_merges=rem_validate,
+                reactivate_on_loss=rem_reactivate,
             )
             diagnostics["rem"] = rem_diag
             ops_used += rem_ops
@@ -950,14 +955,16 @@ class SleepCycle:
         regret_table: Any | None = None,
         ops_remaining: int = 128,
         validate_merges: bool = True,
+        reactivate_on_loss: bool = False,
     ) -> tuple[dict[str, Any], int]:
         """REM: Dream from memory, score against real targets, validate merges.
 
-        Dreams use dream_step() for autoregressive generation (full tiers),
-        then teacher-forced CE on real targets for scoring.
-        CFR counterfactuals come from running gate alternatives on dream context.
-        validate_merges and regret_table independently control which REM
-        mechanisms are active, allowing clean ablation.
+        Three independently toggleable mechanisms:
+        - validate_merges: test provisional N3 merges, reject bad ones
+        - regret_table (not None): update CFR gate policy from dream counterfactuals
+        - reactivate_on_loss: attempt try_reactivate() when dream CE is poor
+
+        Each can be enabled/disabled for clean ablation.
         """
         if not cache.moments:
             if provisional_merges:
@@ -1069,7 +1076,35 @@ class SleepCycle:
                     elif dream_ce > baseline_ce * 1.5:
                         om._survival[i] *= 0.98
 
-                # Phase C: CFR — score each candidate independently on real targets
+                # Phase C2: Latent reactivation on poor dreams
+                # If dream CE is significantly worse than wake CE for this moment,
+                # the compression lost information. Attempt to recover it.
+                reactivations = 0
+                if reactivate_on_loss and hasattr(om, "try_reactivate"):
+                    wake_ce = moment["surprise"]  # Rough proxy for wake-time CE
+                    if dream_ce > abs(wake_ce) * 1.5 and dream_ce > baseline_ce:
+                        # Dream is much worse than wake — try to recover
+                        bucket = 0
+                        if moment.get("bucket_ids") is not None:
+                            bucket = int(moment["bucket_ids"].reshape(-1).mode().values.item())
+                        reactivated = om.try_reactivate(
+                            bucket_id=bucket, surprise=dream_ce / max(baseline_ce, 1e-6),
+                        )
+                        if reactivated:
+                            reactivations += 1
+                            # Re-score after reactivation
+                            out_after = model(inputs)
+                            ce_after = F.cross_entropy(
+                                out_after["logits"].float().reshape(-1, model.vocab_size),
+                                targets.reshape(-1),
+                            ).item()
+                            ops += 1
+                            if ce_after >= dream_ce:
+                                # Reactivation didn't help — let it be re-compressed naturally
+                                pass
+                            # else: reactivation improved things, trace stays active
+
+                # Phase C3: CFR — score each candidate independently on real targets
                 # NOTE: requires metabolic_fork to return per-candidate logits
                 # (see Task 4b: modify metabolic_fork to add "all_logits" to output)
                 if regret_table is not None and ops + regret_table.n_actions < ops_remaining:
