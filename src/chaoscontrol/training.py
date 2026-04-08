@@ -66,6 +66,11 @@ def train_chaoscontrol_for_budget(
     sleep_merge_sim_threshold: float = 0.85,
     sleep_survival_floor: float = 0.1,
     sleep_rem_reactivate: bool = True,
+    polyphasic_enabled: bool = False,
+    polyphasic_n_partitions: int = 4,
+    polyphasic_k_awake: int = 3,
+    polyphasic_topology: str = "slot_striped",
+    polyphasic_swap_interval: int = 256,
 ) -> dict[str, Any]:
     """Train ChaosStudentLM for a time budget with optional criticality regularization."""
     # Set up structured projections if requested (before optimizer so its params are included)
@@ -125,6 +130,18 @@ def train_chaoscontrol_for_budget(
         sleep_cycle = SleepCycle(sleep_cfg)
     sleep_cycles_run = 0
     wake_steps_since_sleep = 0
+
+    scheduler = None
+    if polyphasic_enabled and sleep_enabled:
+        from chaoscontrol.partition import PartitionTopology, PolyphasicScheduler
+        k_max = getattr(model.wernicke, "k_max", 16) if model.wernicke else 16
+        if polyphasic_topology == "bucket_owned":
+            topo = PartitionTopology.bucket_owned(polyphasic_n_partitions, k_max)
+        elif polyphasic_topology == "bucket_striped":
+            topo = PartitionTopology.bucket_striped(polyphasic_n_partitions, k_max)
+        else:
+            topo = PartitionTopology.slot_striped(polyphasic_n_partitions)
+        scheduler = PolyphasicScheduler(topo, polyphasic_k_awake, polyphasic_swap_interval)
 
     model.train()
 
@@ -385,11 +402,17 @@ def train_chaoscontrol_for_budget(
                 flat_ids = bids.reshape(-1)
                 dominant_bucket = int(flat_ids.mode().values.item())
 
+            # Polyphasic write gating: skip write if bucket's partition is sleeping
+            write_allowed = True
+            if scheduler is not None and dominant_bucket is not None:
+                if not model.outer_model.is_write_allowed(dominant_bucket, scheduler.topology.partitions):
+                    write_allowed = False
+
             if consolidation_write == "full_sequence" and hasattr(model.outer_model, 'write_sequence'):
                 # Full-sequence write: manual surprise check + write_sequence
                 running_avg = model.outer_model.loss_ema.item()
                 signal = model.outer_model.compute_consolidation_signal(ce_val, running_avg)
-                if running_avg > 0 and signal / running_avg > 0.01:
+                if write_allowed and running_avg > 0 and signal / running_avg > 0.01:
                     model.outer_model.write_sequence(
                         out["hidden"].detach(),
                         per_sample_weights=per_sample_ce,
@@ -400,10 +423,16 @@ def train_chaoscontrol_for_budget(
                 step_record["surprise"] = float(signal)
                 surprise_ratio_for_latent = signal / max(running_avg, 1e-6)
             else:
-                surprise = model.outer_model.consolidation_step(
-                    hidden, current_loss=ce_val, per_sample_weights=per_sample_ce,
-                    bucket_id=dominant_bucket,
-                )
+                if write_allowed:
+                    surprise = model.outer_model.consolidation_step(
+                        hidden, current_loss=ce_val, per_sample_weights=per_sample_ce,
+                        bucket_id=dominant_bucket,
+                    )
+                else:
+                    # Partition sleeping — compute signal without writing
+                    surprise = model.outer_model.compute_consolidation_signal(
+                        ce_val, model.outer_model.loss_ema.item()
+                    ) if hasattr(model.outer_model, 'compute_consolidation_signal') else 0.0
                 step_record["surprise"] = float(surprise)
                 running_avg = model.outer_model.loss_ema.item()
                 surprise_ratio_for_latent = float(surprise) / max(running_avg, 1e-6)
@@ -532,14 +561,28 @@ def train_chaoscontrol_for_budget(
 
             # Sleep trigger: fixed interval
             if wake_steps_since_sleep >= sleep_interval:
-                sleep_diag = sleep_cycle.run(
-                    model, wake_cache,
-                    device=device, regret_table=regret_table,
-                )
+                if scheduler is not None:
+                    # Polyphasic: run scoped sleep on each sleeping partition
+                    for p in scheduler.sleeping():
+                        sleep_diag = sleep_cycle.run(
+                            model, wake_cache,
+                            device=device, regret_table=regret_table,
+                            partition=p,
+                        )
+                        step_record["sleep"] = sleep_diag
+                    swapped = scheduler.step()
+                    if swapped:
+                        step_record["polyphasic_swap"] = True
+                else:
+                    # Global offline sleep (existing behavior)
+                    sleep_diag = sleep_cycle.run(
+                        model, wake_cache,
+                        device=device, regret_table=regret_table,
+                    )
+                    step_record["sleep"] = sleep_diag
                 sleep_cycles_run += 1
                 wake_steps_since_sleep = 0
                 wake_cache.clear()
-                step_record["sleep"] = sleep_diag
 
         history.append(step_record)
         steps += 1

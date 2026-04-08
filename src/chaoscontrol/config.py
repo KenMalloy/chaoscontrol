@@ -123,3 +123,10 @@ class ChaosControlConfig:
     sleep_rem_reactivate: bool = True  # REM attempts latent trace recovery on poor dreams
     sleep_adaptive_fatigue: bool = False
 
+    # Polyphasic partitioned sleep
+    polyphasic_enabled: bool = False
+    polyphasic_n_partitions: int = 4
+    polyphasic_k_awake: int = 3
+    polyphasic_topology: str = "slot_striped"  # "slot_striped", "bucket_owned", "bucket_striped"
+    polyphasic_swap_interval: int = 256
+

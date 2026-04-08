@@ -217,6 +217,11 @@ def run_experiment(config_path: str, *, data_path: str, budget_seconds: float = 
         sleep_merge_sim_threshold=cfg.sleep_merge_sim_threshold,
         sleep_survival_floor=cfg.sleep_survival_floor,
         sleep_rem_reactivate=cfg.sleep_rem_reactivate,
+        polyphasic_enabled=cfg.polyphasic_enabled,
+        polyphasic_n_partitions=cfg.polyphasic_n_partitions,
+        polyphasic_k_awake=cfg.polyphasic_k_awake,
+        polyphasic_topology=cfg.polyphasic_topology,
+        polyphasic_swap_interval=cfg.polyphasic_swap_interval,
     )
 
     # Use the trained structured_proj (not a fresh random one)
