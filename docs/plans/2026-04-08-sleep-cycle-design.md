@@ -100,17 +100,19 @@ experiments/11_sleep_cycle/
 
 ### Conditions
 
-All use the full stack (SSM + episodic memory + Wernicke MoE) at 600s budget, 3 seeds. Fixed sleep trigger interval (every 256 wake steps) and fixed sleep budget (128 steps) for clean ablation. No adaptive fatigue in the primary experiment.
+All use the full stack (SSM + episodic memory + Wernicke MoE) at 600s budget, 5 seeds. Fixed sleep trigger interval (every 256 wake steps) and fixed sleep budget (128 steps) for clean ablation. N2 and REM get fixed sub-budgets (N2: 64 ops, REM: 64 ops) so stage attribution is not confounded by budget starvation. Realized ops per stage are logged alongside bpb. No adaptive fatigue in the primary experiment.
 
 | Condition | Stages | What it tests |
 |-----------|--------|---------------|
 | `no_sleep` | None | Baseline |
 | `n3_only` | Compression pass | Does deliberate compression beat overflow-triggered? |
 | `n2_n3` | Score + compress | Does utility-based rescoring improve what survives? |
-| `n2_n3_rem` | Score + compress + dreams | Do dreams improve gate policy and validate merges? |
-| `full_cycle` | N1 + N2 + N3 + REM | Does the transition mode-switch matter? |
+| `n2_n3_rem_validate` | Score + compress + merge validation | Do dreams improve consolidation quality? |
+| `n2_n3_rem_cfr` | Score + compress + gate policy | Do dreams improve gate/CFR decisions? |
+| `n2_n3_rem_full` | Score + compress + validation + CFR | Both REM mechanisms together |
+| `full_cycle` | N1 + N2 + N3 + full REM | Does the transition mode-switch matter? |
 
-5 conditions x 3 seeds = 15 training runs. ~50 minutes on 3x A40.
+7 conditions x 5 seeds = 35 training runs. ~2 hours on 3x A40.
 
 ### Follow-up Conditions (separate from primary ablation)
 
@@ -120,12 +122,27 @@ All use the full stack (SSM + episodic memory + Wernicke MoE) at 600s budget, 3 
 | `full_cycle_ratio_3_1` | 3:1 wake:sleep ratio vs 2:1 |
 | `full_cycle_ratio_4_1` | 4:1 wake:sleep ratio vs 2:1 |
 
-### Claim Structure
+### Statistical Analysis Plan
 
-Each row should beat the row above it, or we learn which stages don't pull their weight. The ablation table is the paper's core evidence.
+**Pre-specified contrasts (ordered by priority):**
+
+1. Primary: `full_cycle` vs `no_sleep` — does the complete sleep cycle help?
+2. Secondary: `n2_n3` vs `n3_only` — does utility scoring improve compression?
+3. Secondary: `n2_n3_rem_full` vs `n2_n3` — do dreams add value beyond consolidation?
+4. Exploratory: `n2_n3_rem_validate` vs `n2_n3` — is the REM lift from merge validation?
+5. Exploratory: `n2_n3_rem_cfr` vs `n2_n3` — is the REM lift from gate policy?
+6. Exploratory: `full_cycle` vs `n2_n3_rem_full` — does N1 transition matter?
+
+**For each contrast, report:**
+- Mean delta bpb with 95% bootstrap CI (10,000 resamples)
+- Wilcoxon signed-rank p-value (paired by seed)
+- Holm-Bonferroni correction across the 6 contrasts
+- Cohen's d effect size
+
+With 5 seeds, Wilcoxon has 32 possible rank assignments — minimum achievable p is 0.0312. Sufficient for primary contrast significance at alpha=0.05 after correction. For stronger claims, increase to 7 seeds (minimum p = 0.0078).
 
 ### Decision Criteria
 
-If `full_cycle` or `n2_n3_rem` significantly outperforms `no_sleep` at 600s despite spending budget on consolidation instead of gradient steps: the sleep cycle works and the architecture is ready for H100 scale-up.
+If `full_cycle` or `n2_n3_rem_full` significantly outperforms `no_sleep` (corrected p < 0.05) at 600s despite spending budget on consolidation instead of gradient steps: the sleep cycle works and the architecture is ready for H100 scale-up.
 
-If no condition beats `no_sleep`: consolidation costs more than it's worth at this scale and budget, and the architecture needs rethinking before scaling.
+If no condition beats `no_sleep` after correction: consolidation costs more than it's worth at this scale and budget, and the architecture needs rethinking before scaling.

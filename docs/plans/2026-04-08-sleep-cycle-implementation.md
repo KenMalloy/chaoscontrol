@@ -395,10 +395,12 @@ Append after line 108 (`align_weight: float = 0.05`) in `src/chaoscontrol/config
 ```python
     # Sleep cycle (structured memory consolidation)
     sleep_enabled: bool = False
-    sleep_stages: str = "full_cycle"  # "n3_only", "n2_n3", "n2_n3_rem", "full_cycle"
+    sleep_stages: str = "full_cycle"  # "n3_only", "n2_n3", "n2_n3_rem_validate", "n2_n3_rem_cfr", "n2_n3_rem_full", "full_cycle"
     sleep_wake_ratio: int = 2  # Wake steps per sleep step (2 = 256 wake : 128 sleep)
     sleep_interval: int = 256  # Fixed: trigger sleep every N wake steps
-    sleep_budget: int = 128  # Fixed: sleep step count per cycle
+    sleep_budget: int = 128  # Fixed: total sleep ops per cycle
+    sleep_n2_budget: int = 64  # Fixed: N2 sub-budget
+    sleep_rem_budget: int = 64  # Fixed: REM sub-budget
     sleep_n2_batches: int = 8  # Cached wake batches to use for N2 leave-one-out scoring
     sleep_rem_dreams: int = 4  # Number of dream scenes per REM phase
     sleep_rem_length: int = 128  # Max tokens per dream sequence
@@ -666,13 +668,17 @@ from chaoscontrol.wake_cache import WakeCache
 @dataclass
 class SleepConfig:
     """Configuration for the sleep cycle. Each stage is independently toggleable."""
-    stages: str = "full_cycle"  # "n3_only", "n2_n3", "n2_n3_rem", "full_cycle"
-    budget: int = 128  # Max operations (forward passes) per sleep cycle
+    stages: str = "full_cycle"  # "n3_only", "n2_n3", "n2_n3_rem_validate", "n2_n3_rem_cfr", "n2_n3_rem_full", "full_cycle"
+    budget: int = 128  # Max total operations (forward passes) per sleep cycle
+    n2_budget: int = 64  # Fixed sub-budget for N2 scoring
+    rem_budget: int = 64  # Fixed sub-budget for REM dreams
     merge_sim_threshold: float = 0.85
     survival_floor: float = 0.1
     n2_batches: int = 8
     rem_dreams: int = 4
     rem_length: int = 128
+    rem_validate: bool = True  # REM validates provisional merges
+    rem_cfr: bool = True  # REM updates gate/CFR policy
 
     @property
     def use_n1(self) -> bool:
@@ -688,7 +694,7 @@ class SleepConfig:
 
     @property
     def use_rem(self) -> bool:
-        return self.stages in ("n2_n3_rem", "full_cycle")
+        return self.stages in ("n2_n3_rem_validate", "n2_n3_rem_cfr", "n2_n3_rem_full", "full_cycle")
 
 
 class SleepCycle:
@@ -722,10 +728,10 @@ class SleepCycle:
         if self.config.use_n1:
             diagnostics["n1"] = self._n1_transition(om)
 
-        if self.config.use_n2 and ops_used < self.config.budget:
+        if self.config.use_n2:
             n2_diag, n2_ops = self._n2_tag(
                 model, om, cache, device,
-                ops_remaining=self.config.budget - ops_used,
+                ops_remaining=self.config.n2_budget,
             )
             diagnostics["n2"] = n2_diag
             ops_used += n2_ops
@@ -738,11 +744,17 @@ class SleepCycle:
             diagnostics["n3"] = n3_diag
             # N3 is slot manipulation, no forward passes
 
-        if self.config.use_rem and ops_used < self.config.budget:
+        if self.config.use_rem:
+            # Determine which REM mechanisms are active based on stage config
+            rem_validate = self.config.rem_validate and self.config.stages in (
+                "n2_n3_rem_validate", "n2_n3_rem_full", "full_cycle")
+            rem_cfr = self.config.rem_cfr and self.config.stages in (
+                "n2_n3_rem_cfr", "n2_n3_rem_full", "full_cycle")
             rem_diag, rem_ops = self._rem_dream(
                 model, om, cache, provisional_merges,
-                device=device, regret_table=regret_table,
-                ops_remaining=self.config.budget - ops_used,
+                device=device, regret_table=regret_table if rem_cfr else None,
+                ops_remaining=self.config.rem_budget,
+                validate_merges=rem_validate,
             )
             diagnostics["rem"] = rem_diag
             ops_used += rem_ops
@@ -937,12 +949,15 @@ class SleepCycle:
         device: torch.device,
         regret_table: Any | None = None,
         ops_remaining: int = 128,
+        validate_merges: bool = True,
     ) -> tuple[dict[str, Any], int]:
         """REM: Dream from memory, score against real targets, validate merges.
 
         Dreams use dream_step() for autoregressive generation (full tiers),
         then teacher-forced CE on real targets for scoring.
         CFR counterfactuals come from running gate alternatives on dream context.
+        validate_merges and regret_table independently control which REM
+        mechanisms are active, allowing clean ablation.
         """
         if not cache.moments:
             if provisional_merges:
@@ -957,6 +972,10 @@ class SleepCycle:
 
         with torch.no_grad():
             # 1. Validate provisional merges against cached real targets
+            if provisional_merges and not validate_merges:
+                # Merge validation disabled — commit all merges immediately
+                self._commit_merges(om, provisional_merges)
+                provisional_merges = None
             if provisional_merges:
                 pre_score = self._score_on_cached(model, cache, device)
                 ops += len(cache.moments[: self.config.n2_batches])
