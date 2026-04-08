@@ -526,6 +526,28 @@ class MultiSlotOuterModel(nn.Module):
                 return True
         return False
 
+    # ------------------------------------------------------------------
+    # Partition-scoped slot queries
+    # ------------------------------------------------------------------
+
+    def get_partition_slot_indices(self, partition: Any) -> list[int]:
+        """Return indices of slots owned by this partition (bucket_id in partition.bucket_ids)."""
+        return [
+            i for i, b in enumerate(self._slot_buckets)
+            if partition.owns_bucket(b)
+        ]
+
+    def partition_slot_count(self, partition: Any) -> int:
+        """Count slots owned by this partition."""
+        return len(self.get_partition_slot_indices(partition))
+
+    def is_write_allowed(self, bucket_id: int, partitions: list[Any]) -> bool:
+        """Check if any awake partition owns this bucket_id."""
+        for p in partitions:
+            if p.owns_bucket(bucket_id) and p.is_awake:
+                return True
+        return False
+
     def compute_consolidation_signal(self, current_loss: float, running_avg: float) -> float:
         """Same as OuterModel — surprise magnitude."""
         pain = max(current_loss - running_avg, 0.0)
