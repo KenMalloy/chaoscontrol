@@ -81,9 +81,10 @@ def estimate_flops_per_step(
         embed_params = 2 * 256 * d
         total_params = L * per_layer_params + embed_params
         base_flops = 6 * total_params * tokens
-        # Add quadratic attention cost
-        attn_flops = 6 * L * 2 * seq_len * d
-        base_flops += attn_flops * batch_size
+        # Add quadratic attention cost: O(seq_len^2 * d) per layer per sequence
+        # QK^T: seq_len * seq_len * d, attn @ V: seq_len * seq_len * d
+        attn_flops = 2 * L * 2 * seq_len * seq_len * d * batch_size
+        base_flops += attn_flops
     elif model_type == "mamba2":
         # Mamba2: similar to SSM but with expand factor
         # Default expand=2: inner_dim = dim*expand
@@ -148,13 +149,15 @@ def count_transformer_params(dim: int, num_layers: int, ff_mult: int = 2) -> int
     return total
 
 
-def match_transformer_to_ssm(ssm_dim: int, ssm_layers: int, ff_mult: int = 2) -> dict:
-    """Find transformer (num_layers, ff_mult) that matches SSM param count within 5%.
+def match_transformer_to_ssm(ssm_dim: int, ssm_layers: int, ff_mult: int = 2,
+                             *, target_params: int | None = None) -> dict:
+    """Find transformer (num_layers, ff_mult) that matches param count within 5%.
 
-    Strategy: fix dim to match SSM dim, sweep num_layers and ff_mult.
+    When target_params is given, matches to that (use for full_ssm with components).
+    Otherwise matches to bare SSM params.
     Returns dict with keys: num_layers, ff_mult, param_count.
     """
-    target = count_ssm_params(ssm_dim, ssm_layers, ff_mult)
+    target = target_params if target_params is not None else count_ssm_params(ssm_dim, ssm_layers, ff_mult)
     best = None
     best_err = float("inf")
 
@@ -296,7 +299,25 @@ def generate_configs(
                 cfg["model_dim"] = dim
                 cfg["num_layers"] = ssm_layers
             elif cond_name == "our_tfm":
-                tfm_match = match_transformer_to_ssm(dim, ssm_layers, ff_mult=2)
+                # Match transformer params to full_ssm (not bare) for fair comparison.
+                # If full_ssm config exists for this size, estimate its total params;
+                # otherwise fall back to bare SSM params.
+                full_cfg = configs_at_size.get("full_ssm")
+                if full_cfg:
+                    # Estimate full_ssm params including components
+                    full_params = count_ssm_params(dim, ssm_layers, 2)
+                    # Add Wernicke, memory, and other component params
+                    if full_cfg.get("wernicke_enabled"):
+                        k_max = full_cfg.get("wernicke_k_max", 16)
+                        full_params += dim * k_max + k_max * dim  # codebook + router
+                    if full_cfg.get("outer_model_dim", 0) > 0:
+                        om_dim = full_cfg["outer_model_dim"]
+                        full_params += 2 * dim * om_dim  # encoder + decoder
+                    tfm_match = match_transformer_to_ssm(
+                        dim, ssm_layers, ff_mult=2, target_params=full_params,
+                    )
+                else:
+                    tfm_match = match_transformer_to_ssm(dim, ssm_layers, ff_mult=2)
                 cfg = {
                     "model_type": "transformer",
                     "model_dim": dim,
@@ -612,19 +633,30 @@ def extract_component_metrics(train_result: dict) -> dict:
     metrics["unique_buckets"] = len(buckets_used)
 
     # Codebook utilization (from Wernicke bucket snapshots)
+    # Snapshots are dicts mapping bucket_id -> count
     bucket_snaps = train_result.get("bucket_snapshots", [])
     if bucket_snaps:
         last_snap = bucket_snaps[-1]
-        total_entries = max(len(last_snap), 1)
-        active = sum(1 for v in last_snap if v > 0)
+        if isinstance(last_snap, dict):
+            counts = list(last_snap.values())
+        else:
+            counts = list(last_snap)
+        total_entries = max(len(counts), 1)
+        active = sum(1 for v in counts if v > 0)
         metrics["wernicke_codebook_utilization"] = active / total_entries
 
     # Spectral structure
+    # Snapshots are dicts mapping frequency_bin -> magnitude
     spectral = train_result.get("spectral_snapshots", [])
     if spectral:
         last = spectral[-1]
-        metrics["spectral_max_freq"] = float(max(last)) if last else 0.0
-        metrics["spectral_mean_freq"] = float(sum(last) / len(last)) if last else 0.0
+        if isinstance(last, dict):
+            vals = list(last.values())
+        else:
+            vals = list(last)
+        if vals:
+            metrics["spectral_max_freq"] = float(max(vals))
+            metrics["spectral_mean_freq"] = float(sum(vals) / len(vals))
 
     return metrics
 
