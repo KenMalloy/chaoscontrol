@@ -137,6 +137,22 @@ class WakeCache:
         return counts.float() / total.float()
 
     # ------------------------------------------------------------------
+    # Partition filtering
+    # ------------------------------------------------------------------
+
+    def filter_moments_by_partition(self, partition: Any) -> list[dict]:
+        """Return moments whose dominant bucket is owned by this partition."""
+        result = []
+        for m in self.moments:
+            bids = m.get("bucket_ids")
+            if bids is None:
+                continue
+            dominant = int(bids.reshape(-1).mode().values.item())
+            if partition.owns_bucket(dominant):
+                result.append(m)
+        return result
+
+    # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
 
