@@ -85,6 +85,7 @@ class SleepCycle:
         cache: Any,
         device: torch.device | str = "cpu",
         regret_table: Any | None = None,
+        partition: Any | None = None,
     ) -> dict[str, Any]:
         """Execute a full sleep cycle and return diagnostics.
 
@@ -99,6 +100,9 @@ class SleepCycle:
             Device for tensor operations.
         regret_table : RegretTable | None
             If provided and REM CFR is active, counterfactual updates are written here.
+        partition : SemanticPartition | None
+            If provided, all stages only operate on slots owned by this partition.
+            When None (default), behaviour is unchanged — all slots are eligible.
 
         Returns
         -------
@@ -116,19 +120,20 @@ class SleepCycle:
         # ---- N1 --------------------------------------------------------
         unstable_indices: set[int] = set()
         if cfg.use_n1:
-            n1_diag = self._n1_transition(om)
+            n1_diag = self._n1_transition(om, partition=partition)
             diag["n1"] = n1_diag
             unstable_indices = set(n1_diag.get("unstable_indices", []))
 
         # ---- N2 --------------------------------------------------------
         if cfg.use_n2:
             n2_diag = self._n2_tag(model, om, cache, device,
-                                   skip_indices=unstable_indices)
+                                   skip_indices=unstable_indices,
+                                   partition=partition)
             diag["n2"] = n2_diag
             diag["total_ops"] += n2_diag.get("ops", 0)
 
         # ---- N3 --------------------------------------------------------
-        n3_diag = self._n3_rewrite(model, om)
+        n3_diag = self._n3_rewrite(model, om, partition=partition)
         diag["n3"] = n3_diag
         diag["total_ops"] += n3_diag.get("ops", 0)
 
@@ -151,6 +156,7 @@ class SleepCycle:
                 regret_table=regret_table if use_cfr else None,
                 validate_merges=validate_merges,
                 reactivate_on_loss=rem_reactivate,
+                partition=partition,
             )
             diag["rem"] = rem_diag
             diag["total_ops"] += rem_diag.get("ops", 0)
@@ -170,15 +176,29 @@ class SleepCycle:
     # N1 — Transition
     # ------------------------------------------------------------------
 
-    def _n1_transition(self, om: Any) -> dict[str, Any]:
+    def _n1_transition(
+        self,
+        om: Any,
+        partition: Any | None = None,
+    ) -> dict[str, Any]:
         """Snapshot recent unstable slot indices.
 
         N1 is simple bookkeeping: identify slots that were recently written
         (low survival magnitude = not yet tested by retrieval) and mark them
         as unstable so N2 does not waste budget scoring them.
+
+        When *partition* is provided, only slots owned by the partition are
+        considered.
         """
+        if partition is not None:
+            eligible = set(om.get_partition_slot_indices(partition))
+        else:
+            eligible = None
+
         unstable_indices: list[int] = []
         for i, surv in enumerate(om._survival):
+            if eligible is not None and i not in eligible:
+                continue
             if abs(surv) < 1e-6:
                 unstable_indices.append(i)
         return {
@@ -197,12 +217,16 @@ class SleepCycle:
         cache: Any,
         device: torch.device | str,
         skip_indices: set[int] | None = None,
+        partition: Any | None = None,
     ) -> dict[str, Any]:
         """Score each slot's utility via leave-one-slot-out CE delta.
 
         When N1 has identified unstable indices (recently written slots),
         those are skipped to avoid penalizing slots that haven't had time
         to prove their value through retrieval.
+
+        When *partition* is provided, only slots owned by the partition are
+        scored (minus *skip_indices*).
         """
         cfg = self.config
         n_slots = len(om._slots)
@@ -221,7 +245,11 @@ class SleepCycle:
         # Skip unstable indices (from N1) — recently written slots that
         # haven't been tested by retrieval yet.
         skip = skip_indices or set()
-        indices = [i for i in range(n_slots) if i not in skip]
+        if partition is not None:
+            eligible = set(om.get_partition_slot_indices(partition))
+            indices = [i for i in range(n_slots) if i in eligible and i not in skip]
+        else:
+            indices = [i for i in range(n_slots) if i not in skip]
         self._rng.shuffle(indices)
 
         ops = 0
@@ -304,16 +332,34 @@ class SleepCycle:
     # N3 — Rewrite (prune + merge)
     # ------------------------------------------------------------------
 
-    def _n3_rewrite(self, model: Any, om: Any) -> dict[str, Any]:
-        """Prune low-survival slots, propose merges for similar slots."""
+    def _n3_rewrite(
+        self,
+        model: Any,
+        om: Any,
+        partition: Any | None = None,
+    ) -> dict[str, Any]:
+        """Prune low-survival slots, propose merges for similar slots.
+
+        When *partition* is provided, only slots owned by the partition are
+        considered for pruning and merge proposals.
+        """
         cfg = self.config
         ops = 0
         pruned_count = 0
         latent_traces_created = 0
 
+        if partition is not None:
+            eligible = set(om.get_partition_slot_indices(partition))
+        else:
+            eligible = None
+
         # --- Prune slots below survival_floor ---
         keep_indices: list[int] = []
         for i in range(len(om._slots)):
+            # Skip non-partition slots — always keep them
+            if eligible is not None and i not in eligible:
+                keep_indices.append(i)
+                continue
             if om._survival[i] < cfg.survival_floor:
                 # Store latent trace before pruning
                 om._latent_traces.append({
@@ -340,9 +386,11 @@ class SleepCycle:
         use_typed = getattr(model, "typed_storage", False)
 
         if use_typed and len(om._slots) >= 2:
-            provisional_merges = self._propose_typed_merges(om, cfg)
+            provisional_merges = self._propose_typed_merges(
+                om, cfg, partition=partition)
         elif not use_typed and len(om._slots) >= 2:
-            provisional_merges = self._propose_untyped_merges(om, cfg)
+            provisional_merges = self._propose_untyped_merges(
+                om, cfg, partition=partition)
 
         ops += len(provisional_merges)
 
@@ -372,12 +420,20 @@ class SleepCycle:
         self,
         om: Any,
         cfg: SleepConfig,
+        partition: Any | None = None,
     ) -> list[dict[str, Any]]:
         """Propose merges for similar slots within the same bucket."""
         from collections import defaultdict
 
+        if partition is not None:
+            eligible = set(om.get_partition_slot_indices(partition))
+        else:
+            eligible = None
+
         bucket_groups: dict[int, list[int]] = defaultdict(list)
         for i in range(len(om._slots)):
+            if eligible is not None and i not in eligible:
+                continue
             bucket_groups[om._slot_buckets[i]].append(i)
 
         proposals: list[dict[str, Any]] = []
@@ -393,9 +449,13 @@ class SleepCycle:
         self,
         om: Any,
         cfg: SleepConfig,
+        partition: Any | None = None,
     ) -> list[dict[str, Any]]:
         """Propose merges for all similar slot pairs (no bucket constraint)."""
-        indices = list(range(len(om._slots)))
+        if partition is not None:
+            indices = om.get_partition_slot_indices(partition)
+        else:
+            indices = list(range(len(om._slots)))
         return self._find_similar_pairs(om, indices, cfg.merge_sim_threshold)
 
     def _find_similar_pairs(
@@ -494,8 +554,13 @@ class SleepCycle:
         regret_table: Any | None = None,
         validate_merges: bool = True,
         reactivate_on_loss: bool = False,
+        partition: Any | None = None,
     ) -> dict[str, Any]:
-        """Execute REM dream phase: generate, score, optionally validate merges + CFR."""
+        """Execute REM dream phase: generate, score, optionally validate merges + CFR.
+
+        When *partition* is provided, only slots owned by the partition are
+        used as dream seeds.
+        """
         cfg = self.config
         ops = 0
         dream_scores: list[float] = []
@@ -506,6 +571,15 @@ class SleepCycle:
         if not om._slots:
             return {"ops": 0, "dreams": 0, "reason": "no slots to dream from"}
 
+        # Determine eligible seed slots
+        if partition is not None:
+            seed_pool = om.get_partition_slot_indices(partition)
+        else:
+            seed_pool = list(range(len(om._slots)))
+
+        if not seed_pool:
+            return {"ops": 0, "dreams": 0, "reason": "no partition slots to dream from"}
+
         # Gather cached targets for teacher-forced scoring
         target_batches = self._gather_n2_batches(cache, device)
 
@@ -513,8 +587,8 @@ class SleepCycle:
             if ops >= cfg.rem_budget:
                 break
 
-            # Select a seed slot (round-robin through available slots)
-            seed_idx = dream_idx % len(om._slots)
+            # Select a seed slot (round-robin through eligible seed pool)
+            seed_idx = seed_pool[dream_idx % len(seed_pool)]
             seed_slot = om._slots[seed_idx]
 
             # Phase A: Generate dream tokens via model.dream_step()
