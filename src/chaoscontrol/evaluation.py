@@ -206,12 +206,13 @@ def evaluate_chaoscontrol_bpb(
                                 structured_proj=structured_proj,
                             )
                         gated_logits = gated_out["logits"]
-                        total_loss_gated += float(
+                        gated_ce = float(
                             F.cross_entropy(
                                 gated_logits.float().reshape(-1, vocab_size),
                                 targets.reshape(-1), reduction="sum",
                             ).item()
                         )
+                        total_loss_gated += gated_ce + total_recon_loss
 
                 batch_ce = float(
                     F.cross_entropy(logits.float().reshape(-1, vocab_size), targets.reshape(-1), reduction="sum").item()

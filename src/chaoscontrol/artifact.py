@@ -415,20 +415,61 @@ def eval_artifact(
     )
     result["bpb_artifact"] = artifact_eval["bpb"]
 
-    # 3. bpb_ttt — test-time training: forward pass over training data
-    # with episodic writes, then fresh eval on validation
+    # 3. bpb_ttt — two-phase test-time training:
+    #    Phase A: forward pass over TRAINING data with episodic memory writes
+    #             (no scoring — this reconstitutes working memory)
+    #    Phase B: fresh eval on VALIDATION data (scoring only, no writes)
+    from chaoscontrol.data import batch_from_starts, maybe_autocast
     train_starts = build_lm_starts(int(train_tokens.numel()), config.seq_len, config.seq_len)
-    ttt_eval_starts = choose_eval_starts(
+    ttt_starts = choose_eval_starts(
         train_starts, batch_size=bs, eval_batches=min(eval_batches, 16), seed=config.seed,
     )
+
+    # Phase A: warm memory on training data
+    model.eval()
+    with torch.no_grad():
+        for idx in range(0, len(ttt_starts), bs):
+            batch_starts = ttt_starts[idx : idx + bs]
+            inputs, targets = batch_from_starts(train_tokens, batch_starts, config.seq_len, device)
+            if tokenizer is not None:
+                tok_out = tokenizer(inputs)
+                inputs = tok_out["token_ids"][:, :-1]
+                targets = tok_out["token_ids"][:, 1:]
+            autocast_dtype = next(model.parameters()).dtype if device.type == "cuda" else torch.float32
+            with maybe_autocast(device, autocast_dtype):
+                out = model(inputs)
+            # Write to episodic memory if available
+            if getattr(model, "outer_model", None) is not None:
+                import torch.nn.functional as _F
+                batch_loss = _F.cross_entropy(
+                    out["logits"].float().reshape(-1, model.vocab_size),
+                    targets.reshape(-1),
+                ).item()
+                if hasattr(model.outer_model, "write_sequence"):
+                    running_avg = model.outer_model.loss_ema.item()
+                    signal = model.outer_model.compute_consolidation_signal(batch_loss, running_avg)
+                    if running_avg > 0 and signal / running_avg > 0.01:
+                        model.outer_model.write_sequence(out["hidden"].detach(), bucket_id=None)
+                    model.outer_model.update_survival(batch_loss)
+                    model.outer_model.loss_ema = (
+                        model.outer_model.ema_decay * model.outer_model.loss_ema
+                        + (1 - model.outer_model.ema_decay) * batch_loss
+                    )
+                else:
+                    hidden_last = out["hidden"][:, -1, :].detach()
+                    model.outer_model.consolidation_step(hidden_last, current_loss=batch_loss, bucket_id=None)
+                # Latent reactivation on surprise
+                if hasattr(model.outer_model, "try_reactivate"):
+                    running_avg = model.outer_model.loss_ema.item()
+                    surprise = batch_loss / max(running_avg, 1e-6)
+                    if surprise > 1.0:
+                        model.outer_model.try_reactivate(bucket_id=None, surprise=surprise)
+
+    # Phase B: fresh eval on validation data (no warmup, no writes)
     ttt_eval = evaluate_chaoscontrol_bpb(
         model, tokens=val_tokens, eval_starts=eval_starts,
         batch_size=bs, seq_len=config.seq_len, device=device,
         tokenizer=tokenizer,
-        warmup=True,
-        warmup_write_mode="full_sequence",
-        warmup_latent=True,
-        warmup_cold_start=False,
     )
     result["bpb_ttt"] = ttt_eval["bpb"]
 
