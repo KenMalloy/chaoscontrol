@@ -224,9 +224,12 @@ def run_training_grid(data_path: str, budget: float, num_gpus: int):
     _print_summary()
 
 
-def _load_results() -> dict[str, list[float]]:
-    """Load per-condition bpb lists from result JSON files."""
-    results: dict[str, list[float]] = {}
+def _load_results() -> dict[str, dict[int, float]]:
+    """Load per-condition, per-seed bpb values from result JSON files.
+
+    Returns {condition_name: {seed: bpb}} so paired analysis can match by seed.
+    """
+    results: dict[str, dict[int, float]] = {}
     for f in sorted(RESULTS.glob("*.json")):
         if f.name == "sleep_summary.json":
             continue
@@ -242,16 +245,73 @@ def _load_results() -> dict[str, list[float]]:
         cond_name = parts[0]
         if cond_name not in CONDITIONS:
             continue
+        try:
+            seed = int(parts[1])
+        except ValueError:
+            continue
         bpb = data.get("eval", {}).get("bpb")
         if bpb is None:
             continue
-        results.setdefault(cond_name, []).append(bpb)
+        results.setdefault(cond_name, {})[seed] = bpb
+    return results
+
+
+def _paired_deltas(
+    results: dict[str, dict[int, float]], cond_a: str, cond_b: str,
+) -> list[float]:
+    """Compute per-seed deltas (b - a) for matched seeds."""
+    a_data = results.get(cond_a, {})
+    b_data = results.get(cond_b, {})
+    shared_seeds = sorted(set(a_data.keys()) & set(b_data.keys()))
+    return [b_data[s] - a_data[s] for s in shared_seeds]
+
+
+def _wilcoxon_signed_rank_p(deltas: list[float]) -> float:
+    """Wilcoxon signed-rank test (two-sided) for small samples.
+
+    Returns approximate p-value. With n=5, minimum achievable p is 1/32 = 0.03125.
+    """
+    import math
+    nonzero = [(abs(d), 1 if d > 0 else -1) for d in deltas if d != 0.0]
+    n = len(nonzero)
+    if n == 0:
+        return 1.0
+    # Rank by absolute value
+    nonzero.sort(key=lambda x: x[0])
+    w_plus = sum(rank + 1 for rank, (_, sign) in enumerate(nonzero) if sign > 0)
+    w_minus = sum(rank + 1 for rank, (_, sign) in enumerate(nonzero) if sign < 0)
+    w = min(w_plus, w_minus)
+    # Exact p for small n: count permutations where W <= observed
+    # Total rank sum = n*(n+1)/2
+    total = n * (n + 1) // 2
+    # Enumerate all 2^n sign assignments
+    count = 0
+    for mask in range(1 << n):
+        w_test = sum((rank + 1) for rank in range(n) if mask & (1 << rank))
+        if w_test <= w:
+            count += 1
+    p = 2.0 * count / (1 << n)  # Two-sided
+    return min(1.0, p)
+
+
+def _holm_bonferroni(p_values: list[tuple[str, float]]) -> list[tuple[str, float, float, bool]]:
+    """Apply Holm-Bonferroni correction. Returns [(name, raw_p, corrected_p, significant)]."""
+    m = len(p_values)
+    sorted_pv = sorted(p_values, key=lambda x: x[1])
+    results = []
+    for i, (name, p) in enumerate(sorted_pv):
+        corrected = min(1.0, p * (m - i))
+        results.append((name, p, corrected, corrected < 0.05))
     return results
 
 
 def _print_summary():
-    """Print summary table and statistical comparisons."""
-    results = _load_results()
+    """Print summary table and statistical comparisons.
+
+    Uses paired analysis (per-seed deltas), Wilcoxon signed-rank tests,
+    Holm-Bonferroni correction, and bootstrap CIs.
+    """
+    results = _load_results()  # {condition: {seed: bpb}}
     if not results:
         print("\n  No results found.")
         return
@@ -260,44 +320,71 @@ def _print_summary():
     print(f"\n{'='*70}")
     print("  SLEEP ABLATION RESULTS")
     print(f"{'='*70}")
-    print(f"\n  {'Condition':<25} {'mean bpb':>10} {'SEM':>8} {'n':>3}")
-    print(f"  {'-'*50}")
+    print(f"\n  {'Condition':<25} {'mean bpb':>10} {'SEM':>8} {'95% CI':>18} {'n':>3}")
+    print(f"  {'-'*68}")
 
     summary: dict[str, dict] = {}
     for cond_name in CONDITIONS:
-        bpbs = results.get(cond_name, [])
-        if not bpbs:
-            print(f"  {cond_name:<25} {'--':>10} {'--':>8} {0:>3}")
+        seed_bpbs = results.get(cond_name, {})
+        if not seed_bpbs:
+            print(f"  {cond_name:<25} {'--':>10} {'--':>8} {'--':>18} {0:>3}")
             continue
+        bpbs = [seed_bpbs[s] for s in sorted(seed_bpbs.keys())]
         mean_bpb = sum(bpbs) / len(bpbs)
         s = sem(bpbs)
-        # Get steps from first result
+        ci = bootstrap_ci(bpbs)
         tag = f"{cond_name}_s{SEEDS[0]}"
         steps_file = RESULTS / f"{tag}.json"
         steps = "?"
         if steps_file.exists():
             with open(steps_file) as fh:
                 steps = json.load(fh)["train"]["steps"]
-        print(f"  {cond_name:<25} {mean_bpb:>10.4f} {s:>8.4f} {len(bpbs):>3}  steps={steps}")
-        summary[cond_name] = {"mean_bpb": mean_bpb, "sem": s, "n": len(bpbs), "bpbs": bpbs}
+        ci_str = f"[{ci[0]:.4f}, {ci[1]:.4f}]"
+        print(f"  {cond_name:<25} {mean_bpb:>10.4f} {s:>8.4f} {ci_str:>18} {len(bpbs):>3}  steps={steps}")
+        summary[cond_name] = {"mean_bpb": mean_bpb, "sem": s, "ci": ci, "n": len(bpbs), "bpbs": bpbs}
 
-    # -- Pre-specified contrasts --
-    print(f"\n  Pre-specified contrasts (Welch t-test):")
+    # -- Pre-specified contrasts (paired Wilcoxon + Holm correction) --
+    print(f"\n  Pre-specified contrasts (paired Wilcoxon signed-rank, Holm-corrected):")
     print(f"  {'-'*70}")
+
+    raw_p_values = []
+    contrast_details = {}
     for contrast_name, cond_a, cond_b, desc in CONTRASTS:
-        a = summary.get(cond_a)
-        b = summary.get(cond_b)
-        if not a or not b:
-            print(f"    {desc}: insufficient data ({cond_a} or {cond_b} missing)")
+        deltas = _paired_deltas(results, cond_a, cond_b)
+        if len(deltas) < 2:
+            print(f"    {desc}: insufficient paired data")
             continue
-        t, p = welch_ttest(a["bpbs"], b["bpbs"])
-        d = cohens_d(a["bpbs"], b["bpbs"])
-        sig = "***" if p < 0.001 else "**" if p < 0.01 else "*" if p < 0.05 else "ns"
-        delta = b["mean_bpb"] - a["mean_bpb"]
-        winner = cond_b if delta < 0 else cond_a
+        p = _wilcoxon_signed_rank_p(deltas)
+        mean_delta = sum(deltas) / len(deltas)
+        a_bpbs = summary.get(cond_a, {}).get("bpbs", [])
+        b_bpbs = summary.get(cond_b, {}).get("bpbs", [])
+        d = cohens_d(a_bpbs, b_bpbs) if a_bpbs and b_bpbs else 0.0
+        delta_ci = bootstrap_ci(deltas)
+        raw_p_values.append((contrast_name, p))
+        contrast_details[contrast_name] = {
+            "desc": desc, "cond_a": cond_a, "cond_b": cond_b,
+            "mean_delta": mean_delta, "p_raw": p, "d": d,
+            "delta_ci": delta_ci, "n_pairs": len(deltas),
+        }
+
+    # Apply Holm-Bonferroni correction
+    corrected = _holm_bonferroni(raw_p_values)
+    corrected_map = {name: (raw, corr, sig) for name, raw, corr, sig in corrected}
+
+    for contrast_name, cond_a, cond_b, desc in CONTRASTS:
+        det = contrast_details.get(contrast_name)
+        if not det:
+            continue
+        raw_p, corr_p, sig = corrected_map.get(contrast_name, (1.0, 1.0, False))
+        sig_str = "SIGNIFICANT" if sig else "ns"
+        winner = cond_b if det["mean_delta"] < 0 else cond_a
         print(f"    {desc}")
-        print(f"      {cond_a}={a['mean_bpb']:.4f} vs {cond_b}={b['mean_bpb']:.4f}")
-        print(f"      delta={delta:+.4f} ({winner} wins) p={p:.4f} {sig} d={d:.2f}")
+        a_mean = summary.get(cond_a, {}).get("mean_bpb", 0)
+        b_mean = summary.get(cond_b, {}).get("mean_bpb", 0)
+        print(f"      {cond_a}={a_mean:.4f} vs {cond_b}={b_mean:.4f}")
+        print(f"      mean delta={det['mean_delta']:+.4f} ({winner} wins)")
+        print(f"      95% CI of delta: [{det['delta_ci'][0]:+.4f}, {det['delta_ci'][1]:+.4f}]")
+        print(f"      Wilcoxon p={raw_p:.4f} (corrected p={corr_p:.4f}) {sig_str}  d={det['d']:.2f}")
 
     # -- Decision recommendation --
     print(f"\n{'='*70}")
@@ -309,46 +396,35 @@ def _print_summary():
     if not no_sleep or not full_cycle:
         print("  Insufficient data for decision.")
     else:
+        primary = corrected_map.get("sleep_vs_none")
         delta = full_cycle["mean_bpb"] - no_sleep["mean_bpb"]
-        t, p = welch_ttest(no_sleep["bpbs"], full_cycle["bpbs"])
-        sig = p < 0.05
+        _, corr_p, sig = primary if primary else (1.0, 1.0, False)
         print(f"\n  no_sleep:    {no_sleep['mean_bpb']:.4f} bpb")
         print(f"  full_cycle:  {full_cycle['mean_bpb']:.4f} bpb")
-        print(f"  delta: {delta:+.4f}  p={p:.4f} {'(significant)' if sig else '(not significant)'}")
-
-        # Find best partial condition
-        best_partial = None
-        best_partial_bpb = float("inf")
-        for cond in ["n3_only", "n2_n3", "n2_n3_rem_validate", "n2_n3_rem_cfr", "n2_n3_rem_full"]:
-            s = summary.get(cond)
-            if s and s["mean_bpb"] < best_partial_bpb:
-                best_partial = cond
-                best_partial_bpb = s["mean_bpb"]
+        print(f"  delta: {delta:+.4f}  corrected p={corr_p:.4f} {'(significant)' if sig else '(not significant)'}")
 
         print(f"\n  Recommendation:")
-        if delta < -0.05 and sig:
+        if delta < 0 and sig:
             print(f"    >>> ADOPT FULL CYCLE <<<")
-            print(f"    Full sleep cycle significantly improves bpb.")
+            print(f"    Full sleep cycle significantly improves bpb (Holm-corrected).")
         elif delta < 0 and not sig:
             print(f"    >>> CAUTIOUS ADOPTION <<<")
-            print(f"    Full cycle trends better but not significant with 5 seeds.")
+            print(f"    Full cycle trends better but not significant after correction.")
+            # Note best partial as EXPLORATORY only
+            best_partial = None
+            best_partial_bpb = float("inf")
+            for cond in ["n3_only", "n2_n3", "n2_n3_rem_validate", "n2_n3_rem_cfr", "n2_n3_rem_full"]:
+                s = summary.get(cond)
+                if s and s["mean_bpb"] < best_partial_bpb:
+                    best_partial = cond
+                    best_partial_bpb = s["mean_bpb"]
             if best_partial and best_partial_bpb < no_sleep["mean_bpb"]:
-                print(f"    Best partial: {best_partial} ({best_partial_bpb:.4f})")
-        elif best_partial and best_partial_bpb < no_sleep["mean_bpb"] - 0.05:
-            bp = summary[best_partial]
-            _, bp_p = welch_ttest(no_sleep["bpbs"], bp["bpbs"])
-            if bp_p < 0.05:
-                print(f"    >>> ADOPT PARTIAL ({best_partial}) <<<")
-                print(f"    Partial sleep helps ({best_partial_bpb:.4f}) but full cycle does not.")
-            else:
-                print(f"    >>> HOLD <<<")
-                print(f"    Partial trends better but not significant.")
+                print(f"    [EXPLORATORY] Best partial: {best_partial} ({best_partial_bpb:.4f})")
+                print(f"    NOTE: this is post-hoc selection, not a confirmatory test.")
         else:
             print(f"    >>> SLEEP NOT HELPFUL YET <<<")
-            print(f"    No sleep variant significantly outperforms the baseline.")
-            print(f"    Consider longer training budgets or architecture changes.")
+            print(f"    No sleep variant significantly outperforms baseline after Holm correction.")
 
-    # Save summary
     with open(RESULTS / "sleep_summary.json", "w") as f:
         json.dump(summary, f, indent=2, default=str)
 

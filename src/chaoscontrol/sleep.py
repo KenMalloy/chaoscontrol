@@ -110,13 +110,16 @@ class SleepCycle:
             return diag
 
         # ---- N1 --------------------------------------------------------
+        unstable_indices: set[int] = set()
         if cfg.use_n1:
             n1_diag = self._n1_transition(om)
             diag["n1"] = n1_diag
+            unstable_indices = set(n1_diag.get("unstable_indices", []))
 
         # ---- N2 --------------------------------------------------------
         if cfg.use_n2:
-            n2_diag = self._n2_tag(model, om, cache, device)
+            n2_diag = self._n2_tag(model, om, cache, device,
+                                   skip_indices=unstable_indices)
             diag["n2"] = n2_diag
             diag["total_ops"] += n2_diag.get("ops", 0)
 
@@ -186,8 +189,14 @@ class SleepCycle:
         om: Any,
         cache: Any,
         device: torch.device | str,
+        skip_indices: set[int] | None = None,
     ) -> dict[str, Any]:
-        """Score each slot's utility via leave-one-slot-out CE delta."""
+        """Score each slot's utility via leave-one-slot-out CE delta.
+
+        When N1 has identified unstable indices (recently written slots),
+        those are skipped to avoid penalizing slots that haven't had time
+        to prove their value through retrieval.
+        """
         cfg = self.config
         n_slots = len(om._slots)
         if n_slots == 0:
@@ -201,12 +210,16 @@ class SleepCycle:
         # Baseline CE with all slots present
         baseline_ce = self._compute_mean_ce(model, batches, device)
 
-        # Shuffle slot indices to avoid position bias
-        indices = list(range(n_slots))
+        # Shuffle slot indices to avoid position bias.
+        # Skip unstable indices (from N1) — recently written slots that
+        # haven't been tested by retrieval yet.
+        skip = skip_indices or set()
+        indices = [i for i in range(n_slots) if i not in skip]
         self._rng.shuffle(indices)
 
         ops = 0
         utilities: list[tuple[int, float]] = []
+        skipped_unstable = n_slots - len(indices)
 
         for idx in indices:
             if ops >= cfg.n2_budget:
@@ -237,6 +250,7 @@ class SleepCycle:
         return {
             "ops": ops,
             "slots_scored": len(utilities),
+            "slots_skipped_unstable": skipped_unstable,
             "baseline_ce": baseline_ce,
             "utilities": utilities,
         }
