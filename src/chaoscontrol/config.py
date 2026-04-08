@@ -70,6 +70,7 @@ class ChaosControlConfig:
     wernicke_window: int = 8
     wernicke_router: str = "vq"  # "vq" or "moe"
     wernicke_balance_weight: float = 0.01
+    wernicke_expert_dim: int = 0  # 0 = use model_dim (full rank); >0 = bottleneck per expert
 
     crit_reg_alpha: float = 0.01
     crit_reg_beta: float = 0.001

@@ -118,6 +118,7 @@ class ChaosStudentLM(nn.Module):
         wernicke_window: int = 8,
         wernicke_router: str = "vq",
         wernicke_balance_weight: float = 0.01,
+        wernicke_expert_dim: int = 0,
         semantic_tier_bases: int = 0,
         typed_storage: bool = False,
         typed_consolidation: bool = False,
@@ -141,6 +142,7 @@ class ChaosStudentLM(nn.Module):
                 window=wernicke_window,
                 router_type=wernicke_router,
                 balance_weight=wernicke_balance_weight,
+                expert_dim=wernicke_expert_dim if wernicke_expert_dim > 0 else None,
             )
 
         self.layers = nn.ModuleList([

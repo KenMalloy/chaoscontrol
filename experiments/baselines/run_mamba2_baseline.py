@@ -71,10 +71,20 @@ def _base(**overrides) -> dict:
     return base
 
 
+# Expert param budget: k_max=16 at dim=128 uses 16*128*128 = 262,144 expert params.
+# Bottleneck experts have 2 matrices (down + up): k_max * 2 * expert_dim * dim.
+# To hold total ≈ 262K: expert_dim = 128*128*16 / (2 * k_max * 128) = 128*16/(2*k_max).
+# k_max=16 → expert_dim=128 (full rank, no bottleneck needed)
+# k_max=32 → expert_dim=32  (32*2*32*128 = 262,144)
+# k_max=64 → expert_dim=16  (64*2*16*128 = 262,144)
+EXPERT_DIM_FOR_K = {16: 0, 32: 32, 64: 16}  # 0 = full rank (default)
+
 def _wernicke(k_max=16, **extra):
     return _base(
         wernicke_enabled=True, wernicke_router="moe",
-        wernicke_k_max=k_max, typed_storage=True, **extra,
+        wernicke_k_max=k_max, typed_storage=True,
+        wernicke_expert_dim=EXPERT_DIM_FOR_K.get(k_max, 0),
+        **extra,
     )
 
 def _full(k_max=16, **extra):
@@ -91,10 +101,9 @@ CONDITIONS = {
     "bare_ssm": _base(),
     "ssm_wernicke_k16": _wernicke(k_max=16),
     "full_stack_k16": _full(k_max=16),
-    # k_max sweep (Wernicke only — isolate bucket count from memory)
+    # k_max sweep — param-controlled (expert_dim shrinks as k_max grows)
     "ssm_wernicke_k32": _wernicke(k_max=32),
     "ssm_wernicke_k64": _wernicke(k_max=64),
-    # k_max sweep (full stack — bucket count with memory)
     "full_stack_k32": _full(k_max=32),
     "full_stack_k64": _full(k_max=64),
 }
@@ -181,7 +190,8 @@ def _launch(name, config, seed, budget, data_path, gpu_id):
     log_fh = open(log_path, "w")
     proc = subprocess.Popen(
         ["bash", "-c", " ".join(shlex.quote(c) for c in cmd)
-         + f" 2>&1 | tee {shlex.quote(str(log_path))} /proc/1/fd/1"],
+         + f" 2>&1 | tee {shlex.quote(str(log_path))}"
+         + (" /proc/1/fd/1" if os.path.exists("/proc/1/fd/1") else "")],
         env=env, stdout=log_fh, stderr=subprocess.STDOUT,
     )
     return proc, out_path, Path(tmp.name), log_fh

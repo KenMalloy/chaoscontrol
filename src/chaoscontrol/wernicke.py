@@ -27,8 +27,11 @@ class WernickeLayer(nn.Module):
         window: int = 8,
         router_type: str = "vq",
         balance_weight: float = 0.01,
+        expert_dim: int | None = None,
     ) -> None:
         super().__init__()
+        self.expert_dim = expert_dim or dim
+
         # Stage 1: composition via causal conv1d
         self.compose_conv = nn.Conv1d(dim, dim, kernel_size=window, padding=window - 1, bias=False)
         self.compose_norm = RMSNorm(dim)
@@ -43,9 +46,19 @@ class WernickeLayer(nn.Module):
             raise ValueError(f"unsupported router_type: {router_type}")
 
         # Stage 3: per-bucket refinement
-        self.bucket_projs = nn.ModuleList([
-            nn.Linear(dim, dim, bias=False) for _ in range(k_max)
-        ])
+        # When expert_dim < dim, each expert projects down then back up,
+        # keeping k_max * expert_dim * dim roughly constant across sweeps.
+        if self.expert_dim == dim:
+            self.bucket_projs = nn.ModuleList([
+                nn.Linear(dim, dim, bias=False) for _ in range(k_max)
+            ])
+        else:
+            self.bucket_projs = nn.ModuleList([
+                nn.Sequential(
+                    nn.Linear(dim, self.expert_dim, bias=False),
+                    nn.Linear(self.expert_dim, dim, bias=False),
+                ) for _ in range(k_max)
+            ])
 
         self.k_max = k_max
         self.window = window

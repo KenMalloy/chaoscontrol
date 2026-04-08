@@ -61,6 +61,7 @@ def build_model(cfg: ChaosControlConfig, device: torch.device, param_dtype: torc
             wernicke_window=cfg.wernicke_window,
             wernicke_router=cfg.wernicke_router,
             wernicke_balance_weight=cfg.wernicke_balance_weight,
+            wernicke_expert_dim=cfg.wernicke_expert_dim,
             semantic_tier_bases=cfg.semantic_tier_bases,
             typed_storage=cfg.typed_storage,
             typed_consolidation=cfg.typed_consolidation,
