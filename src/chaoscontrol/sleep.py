@@ -162,12 +162,17 @@ class SleepCycle:
             diag["total_ops"] += rem_diag.get("ops", 0)
 
         # ---- Semantic tier recomputation -------------------------------
+        # When partition-scoped, only recompute from the partition's slots
+        # to avoid mutating the global semantic basis from a single partition.
         if model.semantic_tier is not None and om._slots:
-            decoded = []
-            for slot in om._slots:
-                decoded.append(om.decoder(slot))  # (1, model_dim)
-            episode_vectors = torch.cat(decoded, dim=0)  # (N, model_dim)
-            model.semantic_tier.consolidate_from_episodes(episode_vectors)
+            if partition is not None:
+                indices = om.get_partition_slot_indices(partition)
+            else:
+                indices = list(range(len(om._slots)))
+            if indices:
+                decoded = [om.decoder(om._slots[i]) for i in indices]
+                episode_vectors = torch.cat(decoded, dim=0)
+                model.semantic_tier.consolidate_from_episodes(episode_vectors)
             diag["semantic_recomputed"] = True
 
         return diag
@@ -233,8 +238,12 @@ class SleepCycle:
         if n_slots == 0:
             return {"ops": 0, "slots_scored": 0}
 
-        # Gather cached batches for scoring
-        batches = self._gather_n2_batches(cache, device)
+        # Gather cached batches for scoring (partition-filtered if scoped)
+        if partition is not None and hasattr(cache, "filter_moments_by_partition"):
+            moments = cache.filter_moments_by_partition(partition)
+        else:
+            moments = cache.moments
+        batches = self._gather_n2_batches(cache, device, moments=moments)
         if not batches:
             return {"ops": 0, "slots_scored": 0, "reason": "no cached batches"}
 
@@ -294,12 +303,14 @@ class SleepCycle:
         self,
         cache: Any,
         device: torch.device | str,
+        moments: list | None = None,
     ) -> list[tuple[torch.Tensor, torch.Tensor]]:
         """Extract (inputs, targets) pairs from cached moments."""
+        source = moments if moments is not None else cache.moments
         batches: list[tuple[torch.Tensor, torch.Tensor]] = []
-        n = min(self.config.n2_batches, len(cache.moments))
+        n = min(self.config.n2_batches, len(source))
         for i in range(n):
-            m = cache.moments[i]
+            m = source[i]
             inputs = m["inputs"].to(device)
             targets = m["targets"].to(device)
             batches.append((inputs, targets))
@@ -580,8 +591,12 @@ class SleepCycle:
         if not seed_pool:
             return {"ops": 0, "dreams": 0, "reason": "no partition slots to dream from"}
 
-        # Gather cached targets for teacher-forced scoring
-        target_batches = self._gather_n2_batches(cache, device)
+        # Gather cached targets for teacher-forced scoring (partition-filtered)
+        if partition is not None and hasattr(cache, "filter_moments_by_partition"):
+            moments = cache.filter_moments_by_partition(partition)
+        else:
+            moments = cache.moments
+        target_batches = self._gather_n2_batches(cache, device, moments=moments)
 
         for dream_idx in range(n_dreams):
             if ops >= cfg.rem_budget:
