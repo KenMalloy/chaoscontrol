@@ -38,7 +38,7 @@ class PartitionTopology:
     # ------------------------------------------------------------------
 
     @classmethod
-    def slot_striped(cls, n_partitions: int, total_slots: int) -> PartitionTopology:
+    def slot_striped(cls, n_partitions: int) -> PartitionTopology:
         """Round-robin slots across partitions — no semantic (bucket) awareness.
 
         All partitions have empty bucket_ids; ownership is determined by
@@ -47,9 +47,7 @@ class PartitionTopology:
         partitions = [
             SemanticPartition(partition_id=i) for i in range(n_partitions)
         ]
-        topo = cls(partitions)
-        topo._n_partitions = n_partitions
-        return topo
+        return cls(partitions)
 
     def slot_owner_map(self, total_slots: int) -> list[int]:
         """Return a list where index *i* is the partition that owns slot *i*."""

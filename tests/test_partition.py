@@ -47,7 +47,7 @@ def test_partition_owns_bucket():
 
 def test_slot_striped_topology():
     """n_partitions=4, total_slots=64 — slot_owner_map assigns round-robin."""
-    topo = PartitionTopology.slot_striped(n_partitions=4, total_slots=64)
+    topo = PartitionTopology.slot_striped(n_partitions=4)
 
     assert len(topo.partitions) == 4
     # All partitions should have empty bucket_ids (slot-based, not bucket-based)
