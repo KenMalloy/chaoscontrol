@@ -122,9 +122,14 @@ def evaluate_chaoscontrol_bpb(
 
                 # Tokenizer: convert raw bytes to VQ token IDs
                 raw_bytes_in_batch = int(inputs.numel())
+                total_recon_loss = 0.0
                 if tokenizer is not None:
                     tok_out = tokenizer(inputs)
                     token_ids = tok_out["token_ids"]  # (batch, token_seq)
+                    # Reconstruction loss: information cost of VQ quantization.
+                    # Must be added to token CE for correct bpb — without it,
+                    # bpb only measures token prediction, not byte prediction.
+                    total_recon_loss += float(tok_out["recon_loss"].item()) * raw_bytes_in_batch
                     inputs = token_ids[:, :-1]
                     targets = token_ids[:, 1:]
                     total_raw_bytes_seen += raw_bytes_in_batch
@@ -208,9 +213,10 @@ def evaluate_chaoscontrol_bpb(
                             ).item()
                         )
 
-                total_loss += float(
+                batch_ce = float(
                     F.cross_entropy(logits.float().reshape(-1, vocab_size), targets.reshape(-1), reduction="sum").item()
                 )
+                total_loss += batch_ce + total_recon_loss
                 total_tokens += int(targets.numel())
     finally:
         if saved_outer_state is not None:
