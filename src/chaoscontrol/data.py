@@ -71,7 +71,7 @@ def _concat_shards_mmap(shard_paths: list[Path], cache_path: Path) -> np.ndarray
     import time
 
     if cache_path.exists():
-        return np.memmap(str(cache_path), dtype=np.uint16, mode="r")
+        return np.memmap(str(cache_path), dtype=np.uint16, mode="c")
 
     # Use per-PID temp file to avoid collisions between parallel processes
     tmp_path = cache_path.with_suffix(f".tmp.{os.getpid()}")
@@ -96,7 +96,7 @@ def _concat_shards_mmap(shard_paths: list[Path], cache_path: Path) -> np.ndarray
             break
         time.sleep(0.5)
 
-    return np.memmap(str(cache_path), dtype=np.uint16, mode="r")
+    return np.memmap(str(cache_path), dtype=np.uint16, mode="c")
 
 
 def load_fineweb_tokens(data_dir: str) -> tuple[torch.Tensor, torch.Tensor]:
@@ -163,7 +163,9 @@ def load_fineweb_raw_bytes(text_path: str) -> torch.Tensor:
     p = Path(text_path)
     if not p.exists() or p.stat().st_size == 0:
         raise ValueError(f"empty or missing text file: {text_path}")
-    mmap = np.memmap(str(p), dtype=np.uint8, mode="r")
+    # mode="c" = copy-on-write: appears writable (no torch warning)
+    # but shares physical pages via mmap. No actual copy unless written to.
+    mmap = np.memmap(str(p), dtype=np.uint8, mode="c")
     return torch.from_numpy(mmap)
 
 
