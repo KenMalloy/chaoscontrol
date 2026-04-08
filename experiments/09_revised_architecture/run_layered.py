@@ -171,9 +171,17 @@ def pick_winner(layer_results: dict) -> tuple[str, float, float, dict]:
     for name, seed_results in layer_results.items():
         bpbs = []
         for r in seed_results.values():
+            if not isinstance(r, dict) or "eval" not in r:
+                continue
             ev = r["eval"]
             bpbs.append(ev.get("bpb_gated", ev["bpb"]))
-        per_config[name] = bpbs
+        if bpbs:
+            per_config[name] = bpbs
+
+    if not per_config:
+        print("  WARNING: No configs produced results. Cannot pick a winner.")
+        return ("NONE", float("inf"), 0.0, {"significant": False, "p_value": 1.0,
+                "ci_95": (0.0, 0.0), "effect_size": 0.0, "n_seeds": 0})
 
     # Sort configs by mean bpb (ascending -- lower is better)
     ranked = sorted(per_config.items(), key=lambda kv: statistics.mean(kv[1]))
@@ -219,7 +227,11 @@ def print_layer_summary(layer_name: str, layer_results: dict):
     rows = []
     per_config_bpbs: dict[str, list[float]] = {}
     for name, seed_results in layer_results.items():
-        bpbs = [r["eval"].get("bpb_gated", r["eval"]["bpb"]) for r in seed_results.values()]
+        bpbs = [r["eval"].get("bpb_gated", r["eval"]["bpb"])
+                for r in seed_results.values() if isinstance(r, dict) and "eval" in r]
+        if not bpbs:
+            print(f"  {name:<30} NO RESULTS (all seeds failed)")
+            continue
         per_config_bpbs[name] = bpbs
         mean = statistics.mean(bpbs)
         se = compute_sem(bpbs)

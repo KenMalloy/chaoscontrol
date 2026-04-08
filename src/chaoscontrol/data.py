@@ -63,19 +63,39 @@ def _concat_shards_mmap(shard_paths: list[Path], cache_path: Path) -> np.ndarray
     On first call, reads all shards and writes a flat binary cache.
     On subsequent calls (including from parallel processes), returns an
     mmap view of the cache — all processes share the same physical pages.
+
+    Race-safe: uses per-PID temp files and retries if another process
+    finishes the cache first.
     """
+    import os
+    import time
+
     if cache_path.exists():
         return np.memmap(str(cache_path), dtype=np.uint16, mode="r")
 
-    # Build the cache: read shards into memory once, write flat binary
-    arrays = [np.fromfile(str(s), dtype=np.uint16) for s in shard_paths]
-    combined = np.concatenate(arrays)
-    # Write atomically via temp file to avoid partial reads from parallel processes
-    tmp_path = cache_path.with_suffix(".tmp")
-    combined.tofile(str(tmp_path))
-    tmp_path.rename(cache_path)
-    # Return mmap of the cache (not the in-memory copy)
-    del combined, arrays
+    # Use per-PID temp file to avoid collisions between parallel processes
+    tmp_path = cache_path.with_suffix(f".tmp.{os.getpid()}")
+    try:
+        arrays = [np.fromfile(str(s), dtype=np.uint16) for s in shard_paths]
+        combined = np.concatenate(arrays)
+        combined.tofile(str(tmp_path))
+        del combined, arrays
+        # Atomic rename — if another process beat us, that's fine
+        try:
+            tmp_path.rename(cache_path)
+        except OSError:
+            # Another process already created the cache; clean up our temp
+            tmp_path.unlink(missing_ok=True)
+    except Exception:
+        tmp_path.unlink(missing_ok=True)
+        raise
+
+    # Wait briefly if cache doesn't exist yet (another process still writing)
+    for _ in range(30):
+        if cache_path.exists():
+            break
+        time.sleep(0.5)
+
     return np.memmap(str(cache_path), dtype=np.uint16, mode="r")
 
 
