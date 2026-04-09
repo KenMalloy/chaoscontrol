@@ -84,6 +84,7 @@ class ChaosControlConfig:
     # New fields for ChaosControl repo
     model_type: str = "ssm"  # "ssm", "transformer", or "mamba2"
     semantic_tier_bases: int = 0  # 0 = disabled
+    semantic_tier_update_rate: float = 0.01
     generation_mode: str = "noise"  # "noise" or "structured"
 
     # Typed storage/consolidation (for Wernicke + memory interaction)

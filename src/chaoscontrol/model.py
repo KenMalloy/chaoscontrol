@@ -120,6 +120,7 @@ class ChaosStudentLM(nn.Module):
         wernicke_balance_weight: float = 0.01,
         wernicke_expert_dim: int = 0,
         semantic_tier_bases: int = 0,
+        semantic_tier_update_rate: float = 0.01,
         typed_storage: bool = False,
         typed_consolidation: bool = False,
         compression_consequence: bool = False,
@@ -186,7 +187,7 @@ class ChaosStudentLM(nn.Module):
         # Semantic tier: always-on background bias from episodic experience
         self.semantic_tier: SemanticTier | None = None
         if semantic_tier_bases > 0:
-            self.semantic_tier = SemanticTier(dim, num_bases=semantic_tier_bases)
+            self.semantic_tier = SemanticTier(dim, num_bases=semantic_tier_bases, update_rate=semantic_tier_update_rate)
 
         # Gap-analysis flags
         self.typed_storage = typed_storage
