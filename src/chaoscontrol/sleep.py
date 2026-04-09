@@ -433,7 +433,14 @@ class SleepCycle:
         cfg: SleepConfig,
         partition: Any | None = None,
     ) -> list[dict[str, Any]]:
-        """Propose merges for similar slots within the same bucket."""
+        """Propose merges for similar slots, gated by bucket affinity.
+
+        Same-bucket merges use the standard similarity threshold.
+        Cross-bucket merges are allowed when bucket affinity is high enough,
+        with an effective threshold scaled by affinity:
+            effective_threshold = merge_sim_threshold / affinity
+        So high-affinity bucket pairs merge more easily.
+        """
         from collections import defaultdict
 
         if partition is not None:
@@ -448,12 +455,35 @@ class SleepCycle:
             bucket_groups[om._slot_buckets[i]].append(i)
 
         proposals: list[dict[str, Any]] = []
+
+        # Within-bucket merges (standard)
         for bucket_id, indices in bucket_groups.items():
             if len(indices) < 2:
                 continue
             proposals.extend(
                 self._find_similar_pairs(om, indices, cfg.merge_sim_threshold)
             )
+
+        # Cross-bucket merges (affinity-gated)
+        if hasattr(om, '_bucket_affinity') and om._bucket_affinity is not None:
+            bucket_ids = sorted(bucket_groups.keys())
+            for i_pos in range(len(bucket_ids)):
+                for j_pos in range(i_pos + 1, len(bucket_ids)):
+                    ba, bb = bucket_ids[i_pos], bucket_ids[j_pos]
+                    affinity = om.bucket_affinity(ba, bb)
+                    if affinity < 0.1:
+                        continue  # no affinity, skip
+                    # Higher affinity → lower threshold → easier to merge
+                    cross_threshold = cfg.merge_sim_threshold / max(affinity, 0.1)
+                    if cross_threshold > 1.0:
+                        continue  # threshold too high, impossible to meet
+                    cross_indices = bucket_groups[ba] + bucket_groups[bb]
+                    if len(cross_indices) < 2:
+                        continue
+                    proposals.extend(
+                        self._find_similar_pairs(om, cross_indices, cross_threshold)
+                    )
+
         return proposals
 
     def _propose_untyped_merges(
@@ -683,13 +713,21 @@ class SleepCycle:
                 accepted = self._validate_merge(
                     model, om, merge, target_batches, device
                 )
+                ba = merge.get("bucket_a", -1)
+                bb = merge.get("bucket_b", -1)
                 if accepted:
                     if self._commit_merge(om, merge):
                         merges_accepted += 1
+                        # Cross-bucket merge succeeded → increase affinity
+                        if ba != bb and ba >= 0 and bb >= 0:
+                            om.update_affinity(ba, bb, delta=1.0)
                 else:
                     # Reject merge: reactivate latent trace
                     self._reject_merge(om, merge)
                     merges_rejected += 1
+                    # Cross-bucket merge failed → decrease affinity
+                    if ba != bb and ba >= 0 and bb >= 0:
+                        om.update_affinity(ba, bb, delta=-1.0)
                 ops += 1
             self._provisional_merges = []
 

@@ -255,9 +255,15 @@ class MultiSlotOuterModel(nn.Module):
         self._compression_consequences: list[tuple[int, float]] = []  # (bucket_id, quality_delta)
         self._latent_traces: list[dict] = []  # {bucket_id: int, centroid_contrib: Tensor}
 
+        # Bucket affinity matrix: learned cross-type merge compatibility.
+        # affinity[a, b] = how safe it is to merge slots from bucket a with bucket b.
+        # Starts as identity (same-bucket = 1.0, cross-bucket = 0.0).
+        # Updated during sleep: committed merges increase affinity, rejected decrease.
+        self._bucket_affinity: torch.Tensor | None = None  # (n_buckets, n_buckets), lazy init
+
     def get_extra_state(self) -> dict:
-        """Persist slots, survival scores, bucket assignments, and latent traces in state_dict."""
-        return {
+        """Persist slots, survival scores, bucket assignments, latent traces, and affinity."""
+        state = {
             "slots": [s.cpu() for s in self._slots],
             "survival": list(self._survival),
             "slot_buckets": list(self._slot_buckets),
@@ -266,9 +272,12 @@ class MultiSlotOuterModel(nn.Module):
                 for t in self._latent_traces
             ],
         }
+        if self._bucket_affinity is not None:
+            state["bucket_affinity"] = self._bucket_affinity.cpu()
+        return state
 
     def set_extra_state(self, state: dict) -> None:
-        """Restore slots, survival scores, bucket assignments, and latent traces from checkpoint."""
+        """Restore slots, survival scores, bucket assignments, latent traces, and affinity."""
         device = self.decoder.weight.device
         self._slots = [s.to(device) for s in state["slots"]]
         self._survival = list(state["survival"])
@@ -277,6 +286,8 @@ class MultiSlotOuterModel(nn.Module):
             {"bucket_id": t["bucket_id"], "centroid_contrib": t["centroid_contrib"].to(device)}
             for t in state.get("latent_traces", [])
         ]
+        if "bucket_affinity" in state:
+            self._bucket_affinity = state["bucket_affinity"].to(device)
 
     def read(self, batch_size: int, *, cue: torch.Tensor | None = None) -> torch.Tensor:
         """Cue-dependent retrieval across slots.
@@ -548,6 +559,73 @@ class MultiSlotOuterModel(nn.Module):
             if p.owns_bucket(bucket_id) and p.is_awake:
                 return True
         return False
+
+    # ------------------------------------------------------------------
+    # Bucket affinity matrix
+    # ------------------------------------------------------------------
+
+    def _ensure_affinity(self, n_buckets: int) -> torch.Tensor:
+        """Lazy-init or grow the affinity matrix to cover n_buckets."""
+        if self._bucket_affinity is None:
+            self._bucket_affinity = torch.eye(n_buckets)
+        elif self._bucket_affinity.shape[0] < n_buckets:
+            old = self._bucket_affinity
+            self._bucket_affinity = torch.eye(n_buckets)
+            self._bucket_affinity[:old.shape[0], :old.shape[1]] = old
+        return self._bucket_affinity
+
+    def bucket_affinity(self, a: int, b: int) -> float:
+        """Get merge affinity between two buckets. 1.0 = same bucket, 0.0 = no affinity."""
+        if self._bucket_affinity is None:
+            return 1.0 if a == b else 0.0
+        n = self._bucket_affinity.shape[0]
+        if a >= n or b >= n:
+            return 1.0 if a == b else 0.0
+        return float(self._bucket_affinity[a, b].item())
+
+    def update_affinity(self, a: int, b: int, delta: float, lr: float = 0.05) -> None:
+        """Update affinity between buckets a and b.
+
+        Positive delta = merge was good (increase affinity).
+        Negative delta = merge was bad (decrease affinity).
+        Diagonal (same bucket) is always 1.0.
+        """
+        if a == b:
+            return  # same-bucket affinity is always 1.0
+        n = max(a, b) + 1
+        aff = self._ensure_affinity(n)
+        aff[a, b] = max(0.0, min(1.0, aff[a, b] + lr * delta))
+        aff[b, a] = aff[a, b]  # symmetric
+
+    def affinity_clusters(self, threshold: float = 0.3) -> list[set[int]]:
+        """Discover coarse bucket groups from the learned affinity matrix.
+
+        Connected components where affinity > threshold form clusters.
+        These are the emergent "coarse buckets" — hierarchical types
+        discovered from data, not designed.
+        """
+        if self._bucket_affinity is None:
+            return []
+        n = self._bucket_affinity.shape[0]
+        visited: set[int] = set()
+        clusters: list[set[int]] = []
+        for i in range(n):
+            if i in visited:
+                continue
+            # BFS from bucket i
+            cluster: set[int] = set()
+            queue = [i]
+            while queue:
+                node = queue.pop()
+                if node in visited:
+                    continue
+                visited.add(node)
+                cluster.add(node)
+                for j in range(n):
+                    if j not in visited and self._bucket_affinity[node, j] > threshold:
+                        queue.append(j)
+            clusters.append(cluster)
+        return clusters
 
     def compute_consolidation_signal(self, current_loss: float, running_avg: float) -> float:
         """Same as OuterModel — surprise magnitude."""
