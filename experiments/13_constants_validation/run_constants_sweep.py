@@ -133,7 +133,7 @@ def _full_stack_sleep(**overrides) -> dict:
         "typed_storage": True,
         # Sleep
         "sleep_enabled": True,
-        "sleep_stages": "full_cycle",
+        "sleep_stages": "n3_only",  # Exp 11 winner — only compression pass earns its keep at 600s
         "sleep_interval": 256,
         "sleep_budget": 128,
         "sleep_n2_budget": 64,
