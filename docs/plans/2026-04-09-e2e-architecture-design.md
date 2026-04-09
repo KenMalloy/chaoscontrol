@@ -292,6 +292,54 @@ No extra pairwise tests in T7.
 
 2 conditions x 8 fresh seeds = 16 runs
 
+### Phase D: Epistemic Gap Follow-up (post-T7)
+
+Run only after T7 locks a real Exp 14 winner. This is a separate
+follow-up, not part of the core Claim 1 proof.
+
+The motivation is epistemic, not architectural:
+
+- the typed buffer stores **evidence** from the past stream
+- these follow-ups test whether a causal state can also store
+  **belief updates** induced by past prediction error
+
+This is the causal analogue of a `delta`-like adaptation state, but it
+must be earned strictly forward from past observations. No future-target
+conditioning, no within-window fitting, no extra side information.
+
+#### Invariants
+
+1. A posterior-state update may only use targets that have already been
+   observed in the stream.
+2. Any update at step `t` may affect predictions from `t+1` onward only.
+3. The TTT evaluation contract above remains unchanged.
+4. Report both `bpb_artifact_cold` and the full `bpb_ttt_after_N`
+   warming curve.
+
+#### Posterior-state options
+
+| Option | State | Purpose |
+|--------|-------|---------|
+| global_delta | One document-level correction vector | Capture document-wide drift (style, domain, spelling, formatting) |
+| bucket_delta | One correction vector per Wernicke bucket | Capture type-specific posterior shifts |
+| residual_cache | Retrieved correction traces keyed by context | Recall context-specific corrections that helped before |
+
+#### Suggested ablation set
+
+| Condition | Evidence memory | Posterior state |
+|-----------|-----------------|-----------------|
+| winner_buffer_only | locked Exp 14 winner | none |
+| winner_global_delta | locked Exp 14 winner | global_delta |
+| winner_bucket_delta | locked Exp 14 winner | bucket_delta |
+| winner_residual_cache | locked Exp 14 winner | residual_cache |
+| winner_buffer_plus_bucket | locked Exp 14 winner | bucket_delta + evidence memory |
+| winner_full_posterior | locked Exp 14 winner | global_delta + bucket_delta + residual_cache |
+
+This follow-up answers a different question from T2/T3:
+
+> Is typed evidence memory enough, or does the model also need a causal
+> posterior-state memory to close the remaining gap?
+
 ### Totals
 
 | Phase | Runs | Batches (8 GPU) | Wall time |
@@ -301,7 +349,7 @@ No extra pairwise tests in T7.
 | C (T6+T7) | 51 | 7 | ~70 min |
 | **Total** | **177** | **24** | **~4 hours** |
 
-T4 is a separate longer-horizon follow-up and is excluded from these
+T4 and Phase D are separate follow-ups and are excluded from these
 totals. Phase A is the core experiment. B is contingent. C requires A
 results.
 
@@ -317,5 +365,7 @@ results.
 6. Spin up 8x H100 -> Phase B if needed + Phase C (~2 hrs) -> tear down
 7. Optional: run T4 only as a longer-horizon follow-up if Claim 1 wins
    and the buffer shows real maintenance pressure
+8. Optional: after T7 locks a winner, run Phase D to test causal
+   posterior-state variants on top of the winning Exp 14 architecture
 
 Total H100 time: ~4 hours across 2-3 sessions.
