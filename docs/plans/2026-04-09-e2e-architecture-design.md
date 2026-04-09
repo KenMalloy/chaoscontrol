@@ -103,6 +103,24 @@ Report bpb_ttt as a warming curve: bpb at N=0 (cold), 100, 500, 1000,
 5000 tokens. The curve shape IS the thesis — steep warming = the typed
 buffer works. The gap between cold and warm = buffer value.
 
+### TTT Evaluation Contract
+
+To keep TTT results fair and reproducible, the protocol is fixed:
+
+1. Use a locked held-out validation slice that is never used for T2-T6
+   model selection.
+2. Build fixed evaluation segments of length at least `N_max + 1024`
+   tokens (e.g. 8192 bytes for `N_max=5000`).
+3. For each segment and each `N` in `{0, 100, 500, 1000, 5000}`:
+   - reset SSM state, buffer, and any semantic cache to empty
+   - consume the first `N` tokens with writes enabled but no scoring
+   - score the next `1024` tokens only
+4. Reset again before the next segment.
+
+If reliable document boundaries are available, segment on document
+boundaries; otherwise use fixed non-overlapping windows. All models and
+seeds must use the exact same evaluation segments.
+
 ## The 16MB Artifact
 
 - SSM weights (dim=128, 4L, criticality): ~200KB at int6 + LZMA
@@ -173,23 +191,34 @@ experiment scale (1500 steps), the buffer never needs maintenance.
 
 ### Phase A: Claim 1 (typed buffer)
 
-#### T2: Buffer retrieval mode x scaling
+#### T2: Retrieval mode x capacity bridge
+
+Primary question: does typed within-bucket retrieval help?
+
+Bridge question: how much of the gain comes from uncapping memory rather
+than from the retrieval rule itself?
 
 | Condition | max_slots | Retrieval |
 |-----------|-----------|-----------|
 | softmax_all_32 | 32 | softmax over all (current baseline) |
+| softmax_all_uncapped | unlimited | softmax over all |
 | mean_uncapped | unlimited | bucket mean |
 | recent_uncapped | unlimited | most recent k=8 in bucket |
+| topk_32_8 | 32 | top-8 in bucket |
 | topk_uncapped_4 | unlimited | top-4 in bucket |
 | topk_uncapped_8 | unlimited | top-8 in bucket |
 | topk_uncapped_16 | unlimited | top-16 in bucket |
 
-6 conditions x 7 seeds = 42 runs
+8 conditions x 7 seeds = 56 runs
 
 #### T3: Wernicke structure (param-matched)
 
 Hold total expert parameter budget constant. Scale expert_dim inversely
 with k_max to isolate typing granularity from model size.
+
+Report realized total parameter counts for every T3 condition in the
+summary table. Treat this as approximately parameter-matched, not
+perfectly identical.
 
 | Condition | Structure | Total buckets |
 |-----------|-----------|--------------|
@@ -206,6 +235,12 @@ with k_max to isolate typing granularity from model size.
 Run only if Claim 1 shows positive results.
 
 #### T4: Append-only vs online defrag
+
+This is NOT part of the core 600s experiment. At ~1500 training steps
+the buffer should still fit easily in VRAM and maintenance pressure is
+likely weak. Only run T4 as a longer-horizon follow-up (for example 5x
+the budget) if realized buffer occupancy, retrieval dilution, or
+throughput suggests maintenance has become relevant.
 
 | Condition | Maintenance |
 |-----------|-------------|
@@ -246,21 +281,29 @@ fw_freeze_step = SWEPT
 
 #### T7: Confirmation (fresh seeds)
 
-Locked winner + strongest baseline on 7 FRESH seeds.
-This is the real statistical test. Everything before is exploratory.
+Single pre-specified contrast only:
 
-2 conditions x 7 fresh seeds = 14 runs
+- locked winner from T6
+- strongest baseline from T6
+
+Run on 8 FRESH seeds and the locked TTT evaluation protocol above.
+This is the real statistical test. Everything before is exploratory.
+No extra pairwise tests in T7.
+
+2 conditions x 8 fresh seeds = 16 runs
 
 ### Totals
 
 | Phase | Runs | Batches (8 GPU) | Wall time |
 |-------|------|----------------|-----------|
-| A (T2+T3) | 77 | 10 | ~100 min |
-| B (T4+T5) | 56 | 7 | ~70 min |
-| C (T6+T7) | 49 | 7 | ~70 min |
-| **Total** | **182** | **24** | **~4 hours** |
+| A (T2+T3) | 91 | 12 | ~120 min |
+| B (T5 core) | 35 | 5 | ~50 min |
+| C (T6+T7) | 51 | 7 | ~70 min |
+| **Total** | **177** | **24** | **~4 hours** |
 
-Phase A is the core experiment. B is contingent. C requires A results.
+T4 is a separate longer-horizon follow-up and is excluded from these
+totals. Phase A is the core experiment. B is contingent. C requires A
+results.
 
 ## Operational Plan
 
@@ -269,8 +312,10 @@ Phase A is the core experiment. B is contingent. C requires A results.
    -> benchmark batch size, verify setup -> tear down
 3. Spin up CPU-only pod + same network disk
    -> download/prep 130GB prerequisite data -> tear down
-4. Spin up 8x H100 -> Phase A (~100 min) -> analyze -> tear down
+4. Spin up 8x H100 -> Phase A (~120 min) -> analyze -> tear down
 5. Decide: run Phase B? Select winners.
-6. Spin up 8x H100 -> Phase B if needed + Phase C (~2.5 hrs) -> tear down
+6. Spin up 8x H100 -> Phase B if needed + Phase C (~2 hrs) -> tear down
+7. Optional: run T4 only as a longer-horizon follow-up if Claim 1 wins
+   and the buffer shows real maintenance pressure
 
 Total H100 time: ~4 hours across 2-3 sessions.
