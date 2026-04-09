@@ -132,3 +132,15 @@ class ChaosControlConfig:
     polyphasic_topology: str = "slot_striped"  # "slot_striped", "bucket_owned", "bucket_striped"
     polyphasic_swap_interval: int = 256
 
+    # Experiment 14: typed KV buffer
+    buffer_mode: str = "legacy"           # "legacy" | "append_only"
+    retrieval_mode: str = "softmax_all"   # "softmax_all" | "bucket_mean" | "bucket_recent" | "bucket_topk"
+    retrieval_k: int = 8                  # k for bucket_recent and bucket_topk
+    bucket_prototypes: bool = False       # per-bucket semantic prototypes
+    prototype_dim: int = 64               # dimension for bucket prototypes
+    prototype_update_rate: float = 0.1    # EMA update rate for prototypes
+
+    # Experiment 14: hierarchical Wernicke
+    wernicke_layers: int = 1              # 1 = flat (current), 2 = hierarchical
+    wernicke_k_max_fine: int = 8          # fine-grained buckets per coarse bucket (hier only)
+
