@@ -433,94 +433,72 @@ class SleepCycle:
         cfg: SleepConfig,
         partition: Any | None = None,
     ) -> list[dict[str, Any]]:
-        """Propose merges for similar slots, gated by bucket affinity.
+        """Propose merges ranked jointly by similarity × affinity.
 
-        Same-bucket merges use the standard similarity threshold.
-        Cross-bucket merges are allowed when bucket affinity is high enough,
-        with an effective threshold scaled by affinity:
-            effective_threshold = merge_sim_threshold / affinity
-        So high-affinity bucket pairs merge more easily.
+        All slot pairs (same-bucket and cross-bucket) are scored together.
+        Same-bucket pairs have affinity=1.0 so they naturally rank high,
+        but a very similar cross-bucket pair with decent affinity can beat
+        a mediocre same-bucket pair.
+
+        Each slot participates in at most one proposal.
         """
-        from collections import defaultdict
-
         if partition is not None:
             eligible = set(om.get_partition_slot_indices(partition))
         else:
             eligible = None
 
-        # Ensure affinity matrix exists (lazy init from the bucket IDs we see)
+        # Ensure affinity matrix exists
         if hasattr(om, '_ensure_affinity'):
             max_bucket = max(om._slot_buckets) + 1 if om._slot_buckets else 1
             om._ensure_affinity(max_bucket)
 
-        bucket_groups: dict[int, list[int]] = defaultdict(list)
-        for i in range(len(om._slots)):
-            if eligible is not None and i not in eligible:
-                continue
-            bucket_groups[om._slot_buckets[i]].append(i)
+        # Collect eligible slot indices
+        indices = [
+            i for i in range(len(om._slots))
+            if eligible is None or i in eligible
+        ]
 
-        proposals: list[dict[str, Any]] = []
-
-        # Within-bucket merges (standard)
-        for bucket_id, indices in bucket_groups.items():
-            if len(indices) < 2:
-                continue
-            proposals.extend(
-                self._find_similar_pairs(om, indices, cfg.merge_sim_threshold)
-            )
-
-        # Cross-bucket merges (affinity-gated with exploration).
-        # For known-affinity pairs: threshold scales inversely with affinity.
-        # For zero-affinity pairs (exploration): use the standard threshold
-        # so the system can bootstrap — identical cross-bucket slots will
-        # merge, update affinity, and future merges become easier.
-        # Each slot participates in at most one proposal (global constraint).
-        already_used = set()
-        for p in proposals:
-            already_used.add(p["idx_a"])
-            already_used.add(p["idx_b"])
-
-        bucket_ids = sorted(bucket_groups.keys())
-        for i_pos in range(len(bucket_ids)):
-            for j_pos in range(i_pos + 1, len(bucket_ids)):
-                ba, bb = bucket_ids[i_pos], bucket_ids[j_pos]
+        # Score all pairs, filter by threshold, rank by merge_score
+        candidates: list[tuple[float, dict[str, Any]]] = []
+        for i_pos in range(len(indices)):
+            idx_a = indices[i_pos]
+            ba = om._slot_buckets[idx_a]
+            for j_pos in range(i_pos + 1, len(indices)):
+                idx_b = indices[j_pos]
+                bb = om._slot_buckets[idx_b]
                 affinity = om.bucket_affinity(ba, bb)
-                if affinity > 0.01:
-                    # Known affinity: scale threshold
-                    cross_threshold = cfg.merge_sim_threshold / affinity
-                    if cross_threshold > 1.0:
-                        continue
-                else:
-                    # Exploration: use standard threshold (identical slots
-                    # can still merge, bootstrapping the affinity signal)
-                    cross_threshold = cfg.merge_sim_threshold
 
-                for idx_a in bucket_groups[ba]:
-                    if idx_a in already_used:
-                        continue
-                    for idx_b in bucket_groups[bb]:
-                        if idx_b in already_used:
-                            continue
-                        sim = F.cosine_similarity(
-                            om._slots[idx_a].reshape(1, -1),
-                            om._slots[idx_b].reshape(1, -1),
-                        ).item()
-                        if sim >= cross_threshold:
-                            proposals.append({
-                                "idx_a": idx_a,
-                                "idx_b": idx_b,
-                                "similarity": sim,
-                                "slot_a": om._slots[idx_a].detach().clone(),
-                                "slot_b": om._slots[idx_b].detach().clone(),
-                                "survival_a": om._survival[idx_a],
-                                "survival_b": om._survival[idx_b],
-                                "bucket_a": om._slot_buckets[idx_a],
-                                "bucket_b": om._slot_buckets[idx_b],
-                            })
-                            already_used.add(idx_a)
-                            already_used.add(idx_b)
-                            break  # idx_a is used, move to next
-                    # (inner break only exits idx_b loop; idx_a loop continues)
+                sim = F.cosine_similarity(
+                    om._slots[idx_a].reshape(1, -1),
+                    om._slots[idx_b].reshape(1, -1),
+                ).item()
+
+                if sim < cfg.merge_sim_threshold:
+                    continue
+
+                merge_score = sim * max(affinity, 0.01)
+                candidates.append((merge_score, {
+                    "idx_a": idx_a,
+                    "idx_b": idx_b,
+                    "similarity": sim,
+                    "slot_a": om._slots[idx_a].detach().clone(),
+                    "slot_b": om._slots[idx_b].detach().clone(),
+                    "survival_a": om._survival[idx_a],
+                    "survival_b": om._survival[idx_b],
+                    "bucket_a": ba,
+                    "bucket_b": bb,
+                }))
+
+        # Greedy selection: highest merge_score first, each slot used once
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        proposals: list[dict[str, Any]] = []
+        used: set[int] = set()
+        for _, proposal in candidates:
+            if proposal["idx_a"] in used or proposal["idx_b"] in used:
+                continue
+            proposals.append(proposal)
+            used.add(proposal["idx_a"])
+            used.add(proposal["idx_b"])
 
         return proposals
 

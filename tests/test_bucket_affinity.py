@@ -109,6 +109,34 @@ def test_slot_one_proposal_only():
         used_slots.add(p["idx_b"])
 
 
+def test_cross_bucket_competes_with_same_bucket():
+    """With high affinity, cross-bucket merge can win over weaker same-bucket pair."""
+    from chaoscontrol.sleep import SleepCycle, SleepConfig
+
+    om = MultiSlotOuterModel(model_dim=16, outer_dim=8, max_slots=10)
+    om._ensure_affinity(2)
+    om.update_affinity(0, 1, delta=1.0, lr=0.9)  # affinity 0.9
+
+    # Slot 0 (bucket 0): unique vector
+    om.write(torch.randn(1, 1, 16), bucket_id=0)
+    # Slot 1 (bucket 0): different random vector
+    om.write(torch.randn(1, 1, 16), bucket_id=0)
+    # Slot 2 (bucket 1): clone of slot 0's encoded value (identical, cross-bucket)
+    om._slots.append(om._slots[0].clone())
+    om._survival.append(0.5)
+    om._slot_buckets.append(1)
+
+    cfg = SleepConfig(stages="n3_only", merge_sim_threshold=0.85)
+    cycle = SleepCycle(cfg)
+    proposals = cycle._propose_typed_merges(om, cfg)
+
+    # Slot 0 and slot 2 are identical (sim=1.0) with affinity=0.9 → score=0.9
+    # Slot 0 and slot 1 are random (sim likely < 0.85) → probably not proposed
+    # So the cross-bucket pair (0,2) should appear
+    cross = [p for p in proposals if p["bucket_a"] != p["bucket_b"]]
+    assert len(cross) >= 1, f"Expected cross-bucket proposal with high affinity, got {proposals}"
+
+
 def test_affinity_serialization():
     om = MultiSlotOuterModel(model_dim=16, outer_dim=8, max_slots=10)
     om._ensure_affinity(4)
