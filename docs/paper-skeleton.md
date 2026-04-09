@@ -66,12 +66,23 @@ All results from H100 final architecture.
 - **5.3 What Sleep Consolidation Changes** — Diagnostic: slot survival distributions before/after sleep, compression rates, affinity matrix structure (if applicable). Not just bpb — what happens inside
 - **5.4 Bucket Utilization** — What the routing learned. Are buckets equally used or specialized? Can we characterize the clusters? The "types of English at byte level" finding
 
-## 6. Related Work (1.5 pages)
+## 6. Related Work (2 pages)
 
-- **6.1 State-Space Models** — S4, Mamba, Mamba-2. We build on this lineage. Our contribution is the semantic engine, not the recurrence
-- **6.2 Memory-Augmented Models** — NTMs, memory networks, Memorizing Transformers. Our approach follows complementary learning systems (McClelland et al. 1995), not differentiable memory. Different lineage
+- **6.1 State-Space Models** — S4 (Gu et al. 2022), Mamba (Gu & Dao 2023), Mamba-2 (Dao & Gu 2024). We build on this lineage. Our contribution is the semantic engine on top, not the recurrence itself
+
+- **6.2 Memory-Augmented Models** — NTMs, memory networks, Memorizing Transformers (Wu et al. 2022), kNN-LM (Khandelwal et al. 2020), Larimar (IBM 2024). These augment models with external memory stores but lack consolidation mechanisms. Our approach follows complementary learning systems (McClelland et al. 1995; updated by Kumaran et al. 2016) — fast hippocampal encoding + slow neocortical consolidation — rather than the differentiable-memory tradition
+
 - **6.3 Mixture of Experts** — GShard, Switch Transformer. Wernicke is MoE for typed semantic routing, not capacity scaling. Buckets organize memory, not just compute
-- **6.4 Sleep and Consolidation in Neural Networks** — Wake-sleep algorithm (Hinton 1995), experience replay (RL), continual learning. To our knowledge, structured sleep-cycle consolidation has not been applied to language model training. [Hedge appropriately based on literature search results]
+
+- **6.4 Sleep and Consolidation in Neural Networks** — The most important positioning section. Three threads:
+
+  *Foundational:* The wake-sleep algorithm (Hinton et al. 1995) alternates generative and recognition phases but does not consolidate memory. EWC (Kirkpatrick et al. 2017) constrains weights during new learning, inspired by synaptic consolidation but operating in weight space, not memory space.
+
+  *Sleep-cycle approaches in vision:* Robinson et al. (2022) model NREM, REM, and synaptic downscaling for continual learning on CIFAR-100 — the first multi-stage sleep framework in deep learning. WSCL (Hopf et al. 2024) implements wake/NREM/REM phases for image classification with replay from short-term and long-term memory. Tadros et al. (2022, Nature Comms) show sleep-like unsupervised replay reduces catastrophic forgetting. SIESTA (Harun et al. 2023) uses wake/sleep for on-device continual learning. **All target image classification and replay stored samples rather than maintaining discrete episodic memory slots.**
+
+  *Sleep-inspired approaches in language:* SleepGate (2026) augments transformer LLMs with learned tag→prune→merge over the KV cache — strikingly similar mechanics to our N2→N3 pipeline, but operates at inference time on the attention cache, not during training on an episodic memory store. "Language Models Need Sleep" (OpenReview 2024) uses "sleep" for knowledge distillation and self-generated training data — same domain and terminology, entirely different mechanism.
+
+  *The gap we fill:* Hayes et al. (2021, Neural Computation) survey replay in deep learning and explicitly identify missing biological elements: structured sleep stages, surprise-modulated replay, and NREM/REM differentiation. Our work addresses this gap directly. To our knowledge, no prior work maintains typed discrete episodic memory slots and applies structured N1→N2→N3→REM consolidation (utility scoring, typed pruning/merging, dream-based validation) during language model training. The closest structural analogues either target images (WSCL, Robinson et al.) or operate at inference time (SleepGate).
 
 ## 7. Discussion (2 pages)
 
@@ -129,18 +140,37 @@ All results from H100 final architecture.
 
 ## References
 
-- McClelland, McNaughton & O'Reilly 1995 — Complementary learning systems
-- Doya 1999 — Cerebellum/cortex/basal ganglia computational trichotomy
-- Herculano-Houzel et al. 2014 — Elephant brain neuron distribution
-- Favila et al. 2016 — Hippocampal pattern differentiation
-- Molitor et al. 2021 — Simultaneous DG separation + CA1 integration
-- Schuck et al. 2016 — OFC task-state representation
-- Leutgeb et al. 2007 — Pattern separation in dentate gyrus and CA3
-- Frank et al. 2001 — Basal ganglia gating model
-- Turrigiano et al. 1998 — Synaptic scaling
-- Patzke et al. 2015 — Cetacean hippocampus
-- Gu et al. 2022 — S4 (Structured State Spaces for Sequence Modeling)
-- Gu & Dao 2023 — Mamba
+**Neuroscience / biological basis:**
+- McClelland, McNaughton & O'Reilly 1995 — Complementary learning systems (*Psych Review*)
+- Kumaran, Hassabis & McClelland 2016 — CLS updated (*Trends Cog Sci*)
+- Doya 1999 — Cerebellum/cortex/basal ganglia computational trichotomy (*Neural Networks*)
+- Herculano-Houzel et al. 2014 — Elephant brain neuron distribution (*Frontiers Neuroanat*)
+- Favila et al. 2016 — Hippocampal pattern differentiation (*Nature Comms*)
+- Molitor et al. 2021 — Simultaneous DG separation + CA1 integration (*J Neuroscience*)
+- Leutgeb et al. 2007 — Pattern separation in DG and CA3 (*Science*)
+- Schuck et al. 2016 — OFC task-state representation (*Neuron*)
+- Frank et al. 2001 — Basal ganglia gating model (*CABN*)
+- Turrigiano et al. 1998 — Synaptic scaling (*Nature*)
+- Patzke et al. 2015 — Cetacean hippocampus (*Brain Struct Funct*)
+
+**SSM lineage:**
+- Gu et al. 2022 — S4: Structured State Spaces for Sequence Modeling
+- Gu & Dao 2023 — Mamba: Linear-Time Sequence Modeling with Selective State Spaces
 - Dao & Gu 2024 — Mamba-2
-- Hinton et al. 1995 — Wake-sleep algorithm
-- [Additional references from literature search]
+
+**Sleep/consolidation in neural networks (must-cite):**
+- Hinton et al. 1995 — Wake-sleep algorithm (*Science*)
+- Kirkpatrick et al. 2017 — Elastic Weight Consolidation (*PNAS*)
+- van de Ven et al. 2020 — Brain-inspired replay (*Nature Comms*)
+- Hayes et al. 2021 — Replay survey, identifies missing biological elements (*Neural Computation*)
+- Robinson et al. 2022 — NREM + REM + downscaling for continual learning (*IJCNN*)
+- Tadros et al. 2022 — Sleep-like unsupervised replay (*Nature Comms*)
+- Hopf et al. 2024 — WSCL: Wake-sleep consolidated learning (*IEEE TNNLS*) **[closest structural analogue]**
+- Harun et al. 2023 — SIESTA: continual learning with sleep (*TMLR*)
+- "Language Models Need Sleep" 2024 — Sleep as distillation + synthetic data (*OpenReview*)
+- SleepGate 2026 — Sleep-inspired KV cache management for LLMs (*arXiv*) **[closest in domain]**
+
+**Memory-augmented models:**
+- Wu et al. 2022 — Memorizing Transformers (*ICLR*)
+- Khandelwal et al. 2020 — kNN-LM (*ICLR*)
+- Ellis et al. 2021 — DreamCoder: wake-sleep for program synthesis (*PLDI*)
