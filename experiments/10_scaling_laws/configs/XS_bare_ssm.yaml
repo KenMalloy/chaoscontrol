@@ -1,0 +1,5 @@
+model_type: ssm
+model_dim: 64
+num_layers: 2
+ff_mult: 2
+a_mode: diag

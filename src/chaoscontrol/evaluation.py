@@ -48,6 +48,7 @@ def evaluate_chaoscontrol_bpb(
     warmup_cold_start: bool = False,
     total_raw_bytes: int | None = None,
     tokenizer: Any = None,
+    prior_bias: Any = None,
 ) -> dict[str, float]:
     """Evaluate ChaosStudentLM, returning loss and bits-per-byte.
 
@@ -186,6 +187,7 @@ def evaluate_chaoscontrol_bpb(
                             gated_out = micro_mcts(
                                 model, inputs,
                                 n_rollouts=metabolic_k, horizon=8,
+                                prior_bias=prior_bias,
                             )
                         elif metabolic_mode == "monte_carlo":
                             from chaoscontrol.metabolic import metabolic_monte_carlo
@@ -204,6 +206,7 @@ def evaluate_chaoscontrol_bpb(
                                 score_mode=metabolic_score,
                                 generation_mode=generation_mode,
                                 structured_proj=structured_proj,
+                                prior_bias=prior_bias,
                             )
                         gated_logits = gated_out["logits"]
                         gated_ce = float(

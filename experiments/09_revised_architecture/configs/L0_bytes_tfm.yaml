@@ -1,0 +1,7 @@
+model_dim: 128
+num_layers: 4
+a_mode: diag
+model_type: transformer
+metabolic_gate: false
+vocab_size: 256
+tokenizer_type: none

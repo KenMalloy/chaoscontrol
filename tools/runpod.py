@@ -238,7 +238,8 @@ def build_rsync_push_command(*, pod_id: str, local_path: Path, remote_path: str)
     port = str(ssh_info["port"])
     ssh_key = str(ssh_info["ssh_key"]["path"])
     return [
-        "rsync", "-az", "--progress", "--exclude", ".venv", "--exclude", "__pycache__",
+        "rsync", "-az", "--no-o", "--no-g", "--progress",
+        "--exclude", ".venv", "--exclude", "__pycache__",
         "--exclude", "*.pyc", "--exclude", "results/", "-e",
         f"ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i {ssh_key} -p {port}",
         str(local_path) + "/",

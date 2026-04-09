@@ -1,0 +1,5 @@
+model_type: transformer
+model_dim: 64
+num_layers: 2
+ff_mult: 3
+a_mode: diag

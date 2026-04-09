@@ -9,10 +9,9 @@ tokenizer_token_dim: 128
 tokenizer_codebook_size: 1024
 tokenizer_beta: 0.25
 vocab_size: 1024
-align_type: diversity
-align_weight: 0.05
 metabolic_gate: false
-outer_model_dim: 64
-outer_model_type: multislot
-semantic_tier_bases: 8
-eval_warmup: false
+wernicke_enabled: true
+wernicke_router: moe
+wernicke_k_max: 16
+align_type: distillation
+align_weight: 0.05

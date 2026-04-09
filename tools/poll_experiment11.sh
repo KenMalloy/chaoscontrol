@@ -6,6 +6,7 @@ set -euo pipefail
 POD_ID="asvnf6bwu59pen"
 POD_IP="63.141.33.5"
 POD_PORT="22114"
+# Note: cron re-enabled after r3 restart with dtype fix
 SSH_KEY="$HOME/.ssh/id_runpod"
 REPO="$HOME/Local Documents/Developer/chaoscontrol"
 RESULTS_REMOTE="/workspace/chaoscontrol/experiments/11_sleep_cycle/results/"
@@ -29,7 +30,7 @@ rsync -az --progress -e "ssh $SSH_OPTS -i $SSH_KEY -p $POD_PORT" \
     root@"$POD_IP":"$RESULTS_REMOTE" "$RESULTS_LOCAL" >> "$LOG" 2>&1 || true
 
 if [ "$DONE" -ge "$TOTAL_RUNS" ]; then
-    echo "$(date): ALL DONE. Harvesting final results and stopping pod." >> "$LOG"
+    echo "$(date): ALL DONE. Harvesting final results. Pod kept alive for follow-up runs." >> "$LOG"
 
     # Final sync
     rsync -az -e "ssh $SSH_OPTS -i $SSH_KEY -p $POD_PORT" \
@@ -39,14 +40,11 @@ if [ "$DONE" -ge "$TOTAL_RUNS" ]; then
     scp $SSH_OPTS -i "$SSH_KEY" -P "$POD_PORT" \
         root@"$POD_IP":/workspace/experiment11.log "$REPO/experiments/11_sleep_cycle/" >> "$LOG" 2>&1 || true
 
-    # Stop the pod
-    runpodctl pod stop "$POD_ID" >> "$LOG" 2>&1 || true
-
-    # Remove ourselves from crontab
+    # Remove ourselves from crontab (but don't stop pod)
     crontab -l 2>/dev/null | grep -v poll_experiment11 | crontab - 2>/dev/null || true
 
-    echo "$(date): Pod stopped. Cron removed. Results in $RESULTS_LOCAL" >> "$LOG"
+    echo "$(date): Cron removed. Pod still running for follow-up. Results in $RESULTS_LOCAL" >> "$LOG"
 
     # Desktop notification
-    osascript -e 'display notification "Experiment 11 complete! 63/63 runs done." with title "ChaosControl"' 2>/dev/null || true
+    osascript -e 'display notification "Experiment 11 complete! 63/63 runs done. Pod kept alive." with title "ChaosControl"' 2>/dev/null || true
 fi

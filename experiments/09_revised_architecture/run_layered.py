@@ -19,6 +19,7 @@ Layer 6:   Inference-time adaptation depth
 import argparse
 import json
 import os
+import shlex
 import statistics
 import subprocess
 import sys
@@ -100,10 +101,7 @@ def _launch_config(config_path: Path, data_path: str, budget: float, seed: int,
     log_fh = open(log_path, "w")
     # Tee to container init stdout so RunPod web console shows live output
     if Path("/proc/1/fd/1").exists():
-        import shlex
-        quoted_cmd = " ".join(shlex.quote(c) for c in cmd)
-        quoted_log = shlex.quote(str(log_path))
-        shell_cmd = f"{quoted_cmd} 2>&1 | tee {quoted_log} > /proc/1/fd/1"
+        shell_cmd = " ".join(shlex.quote(str(c)) for c in cmd) + f" 2>&1 | tee {shlex.quote(str(log_path))} > /proc/1/fd/1"
         proc = subprocess.Popen(
             ["bash", "-c", shell_cmd], env=env,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
