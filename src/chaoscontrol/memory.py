@@ -374,6 +374,19 @@ class MultiSlotOuterModel(nn.Module):
         h_pooled = (h_seq * weights.unsqueeze(0).unsqueeze(-1)).sum(dim=1)
         self.write(h_pooled, per_sample_weights=per_sample_weights, bucket_id=bucket_id)
 
+    def append_kv(self, encoded: torch.Tensor, bucket_id: int | None = None) -> None:
+        """Unconditional append -- no surprise gating, no compression if unlimited.
+
+        For Experiment 14 append_only buffer mode. Stores the pre-encoded
+        vector directly (caller is responsible for encoding via self.encoder).
+        """
+        self._slots.append(encoded.detach())
+        self._survival.append(1.0)
+        self._slot_buckets.append(bucket_id if bucket_id is not None else -1)
+        # Only compress if max_slots > 0 (0 = unlimited)
+        if self.max_slots > 0 and len(self._slots) > self.max_slots:
+            self._compress()
+
     def update_survival(self, current_loss: float) -> None:
         """Update survival scores for slots that contributed to last retrieval.
 
