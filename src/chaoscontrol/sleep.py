@@ -76,6 +76,23 @@ class SleepCycle:
         self._provisional_merges: list[dict] = []
 
     # ------------------------------------------------------------------
+    # Autocast helper — wraps all model calls during sleep
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _autocast_for(model: Any, device: torch.device | str):
+        """Return the appropriate autocast context for sleep model calls.
+
+        All model forward passes during sleep (N2 scoring, dream generation,
+        merge validation, CFR updates) must use this to avoid dtype mismatches
+        between cached float32 data and bf16 model weights.
+        """
+        from chaoscontrol.data import maybe_autocast
+        dev = device if isinstance(device, torch.device) else torch.device(device)
+        param_dtype = next(model.parameters()).dtype
+        return maybe_autocast(dev, param_dtype)
+
+    # ------------------------------------------------------------------
     # Public entry point
     # ------------------------------------------------------------------
 
@@ -323,14 +340,11 @@ class SleepCycle:
         device: torch.device | str,
     ) -> float:
         """Run batches through model and return mean cross-entropy."""
-        from chaoscontrol.data import maybe_autocast
         total_ce = 0.0
         count = 0
-        dev = device if isinstance(device, torch.device) else torch.device(device)
-        param_dtype = next(model.parameters()).dtype
         with torch.no_grad():
             for inputs, targets in batches:
-                with maybe_autocast(dev, param_dtype):
+                with self._autocast_for(model, device):
                     out = model(inputs)
                 logits = out["logits"].float()  # CE needs float32
                 # Flatten for cross-entropy
@@ -658,11 +672,12 @@ class SleepCycle:
 
             # Phase A: Generate dream tokens via model.dream_step()
             # Decode slot -> token space to get seed
-            decoded_seed = om.decoder(seed_slot)  # (1, model_dim)
-            # Project to logits to get seed token
-            with torch.no_grad():
-                seed_logits = model.lm_head(model.final_norm(decoded_seed.unsqueeze(1)).squeeze(1))
-                seed_token = seed_logits.argmax(dim=-1, keepdim=True)  # (1, 1)
+            with self._autocast_for(model, device):
+                decoded_seed = om.decoder(seed_slot)  # (1, model_dim)
+                # Project to logits to get seed token
+                with torch.no_grad():
+                    seed_logits = model.lm_head(model.final_norm(decoded_seed.unsqueeze(1)).squeeze(1))
+                    seed_token = seed_logits.argmax(dim=-1, keepdim=True)  # (1, 1)
 
             # Autoregressive dream generation
             state = model.init_state(batch_size=1)
@@ -670,9 +685,10 @@ class SleepCycle:
             dream_length = min(cfg.rem_length, cfg.rem_budget - ops)
             for _ in range(dream_length):
                 with torch.no_grad():
-                    logits, hidden, state = model.dream_step(
-                        dream_tokens[-1].to(device), state
-                    )
+                    with self._autocast_for(model, device):
+                        logits, hidden, state = model.dream_step(
+                            dream_tokens[-1].to(device), state
+                        )
                     next_token = logits.argmax(dim=-1, keepdim=True)  # (1, 1)
                     dream_tokens.append(next_token)
                 ops += 1
@@ -793,8 +809,9 @@ class SleepCycle:
 
         # Get base value
         with torch.no_grad():
-            base_logits, _, _ = model.dream_step(base_token, state)
-            base_probs = F.softmax(base_logits, dim=-1)
+            with self._autocast_for(model, device):
+                base_logits, _, _ = model.dream_step(base_token, state)
+            base_probs = F.softmax(base_logits.float(), dim=-1)
             base_value = base_probs.max(dim=-1).values.mean().item()
 
         # Generate K counterfactual forward passes
@@ -802,10 +819,11 @@ class SleepCycle:
         for _ in range(k):
             with torch.no_grad():
                 # Perturb by sampling a different token
-                perturbed_probs = F.softmax(base_logits / 1.5, dim=-1)  # temperature
+                perturbed_probs = F.softmax(base_logits.float() / 1.5, dim=-1)  # temperature
                 alt_token = torch.multinomial(perturbed_probs, 1)  # (1, 1)
-                cf_logits, _, _ = model.dream_step(alt_token, state)
-                cf_probs = F.softmax(cf_logits, dim=-1)
+                with self._autocast_for(model, device):
+                    cf_logits, _, _ = model.dream_step(alt_token, state)
+                cf_probs = F.softmax(cf_logits.float(), dim=-1)
                 cf_values.append(cf_probs.max(dim=-1).values.mean().item())
 
         # Determine bucket_id for regret table update
