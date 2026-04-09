@@ -448,6 +448,11 @@ class SleepCycle:
         else:
             eligible = None
 
+        # Ensure affinity matrix exists (lazy init from the bucket IDs we see)
+        if hasattr(om, '_ensure_affinity'):
+            max_bucket = max(om._slot_buckets) + 1 if om._slot_buckets else 1
+            om._ensure_affinity(max_bucket)
+
         bucket_groups: dict[int, list[int]] = defaultdict(list)
         for i in range(len(om._slots)):
             if eligible is not None and i not in eligible:
@@ -464,25 +469,46 @@ class SleepCycle:
                 self._find_similar_pairs(om, indices, cfg.merge_sim_threshold)
             )
 
-        # Cross-bucket merges (affinity-gated)
-        if hasattr(om, '_bucket_affinity') and om._bucket_affinity is not None:
-            bucket_ids = sorted(bucket_groups.keys())
-            for i_pos in range(len(bucket_ids)):
-                for j_pos in range(i_pos + 1, len(bucket_ids)):
-                    ba, bb = bucket_ids[i_pos], bucket_ids[j_pos]
-                    affinity = om.bucket_affinity(ba, bb)
-                    if affinity < 0.1:
-                        continue  # no affinity, skip
-                    # Higher affinity → lower threshold → easier to merge
-                    cross_threshold = cfg.merge_sim_threshold / max(affinity, 0.1)
-                    if cross_threshold > 1.0:
-                        continue  # threshold too high, impossible to meet
-                    cross_indices = bucket_groups[ba] + bucket_groups[bb]
-                    if len(cross_indices) < 2:
-                        continue
-                    proposals.extend(
-                        self._find_similar_pairs(om, cross_indices, cross_threshold)
-                    )
+        # Cross-bucket merges (affinity-gated with exploration floor)
+        # Exploration floor ensures the system can discover affinities from
+        # scratch — without it, zero affinity means zero proposals means
+        # affinity never updates (bootstrap problem).
+        EXPLORATION_FLOOR = 0.05
+        already_proposed_ids = {(p["idx_a"], p["idx_b"]) for p in proposals}
+        bucket_ids = sorted(bucket_groups.keys())
+        for i_pos in range(len(bucket_ids)):
+            for j_pos in range(i_pos + 1, len(bucket_ids)):
+                ba, bb = bucket_ids[i_pos], bucket_ids[j_pos]
+                affinity = om.bucket_affinity(ba, bb)
+                effective_affinity = max(affinity, EXPLORATION_FLOOR)
+                cross_threshold = cfg.merge_sim_threshold / effective_affinity
+                if cross_threshold > 1.0:
+                    continue
+                # Only pair slots from DIFFERENT buckets (avoid duplicating
+                # same-bucket proposals from the within-bucket pass above).
+                for idx_a in bucket_groups[ba]:
+                    for idx_b in bucket_groups[bb]:
+                        if (idx_a, idx_b) in already_proposed_ids:
+                            continue
+                        if (idx_b, idx_a) in already_proposed_ids:
+                            continue
+                        sim = F.cosine_similarity(
+                            om._slots[idx_a].reshape(1, -1),
+                            om._slots[idx_b].reshape(1, -1),
+                        ).item()
+                        if sim >= cross_threshold:
+                            proposals.append({
+                                "idx_a": idx_a,
+                                "idx_b": idx_b,
+                                "similarity": sim,
+                                "slot_a": om._slots[idx_a].detach().clone(),
+                                "slot_b": om._slots[idx_b].detach().clone(),
+                                "survival_a": om._survival[idx_a],
+                                "survival_b": om._survival[idx_b],
+                                "bucket_a": om._slot_buckets[idx_a],
+                                "bucket_b": om._slot_buckets[idx_b],
+                            })
+                            already_proposed_ids.add((idx_a, idx_b))
 
         return proposals
 
@@ -715,18 +741,19 @@ class SleepCycle:
                 )
                 ba = merge.get("bucket_a", -1)
                 bb = merge.get("bucket_b", -1)
+                # Only update affinity when validation had real evidence
+                # (target_batches non-empty). Otherwise the accept/reject
+                # is uninformed and shouldn't change affinity.
+                has_evidence = bool(target_batches)
                 if accepted:
                     if self._commit_merge(om, merge):
                         merges_accepted += 1
-                        # Cross-bucket merge succeeded → increase affinity
-                        if ba != bb and ba >= 0 and bb >= 0:
+                        if has_evidence and ba != bb and ba >= 0 and bb >= 0:
                             om.update_affinity(ba, bb, delta=1.0)
                 else:
-                    # Reject merge: reactivate latent trace
                     self._reject_merge(om, merge)
                     merges_rejected += 1
-                    # Cross-bucket merge failed → decrease affinity
-                    if ba != bb and ba >= 0 and bb >= 0:
+                    if has_evidence and ba != bb and ba >= 0 and bb >= 0:
                         om.update_affinity(ba, bb, delta=-1.0)
                 ops += 1
             self._provisional_merges = []
