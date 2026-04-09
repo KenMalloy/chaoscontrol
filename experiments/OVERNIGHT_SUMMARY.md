@@ -54,10 +54,36 @@ Chained to launch after baselines complete. Updated to use `n3_only` instead of 
 - Exp 13 queued to auto-launch
 - Pod alive, lease through 18:03 UTC
 
+### Baseline Sweep — COMPLETE (49 JSONs + 1 summary, 7 mamba2 failures expected)
+
+| Condition | bpb | Steps | vs bare_ssm |
+|-----------|-----|-------|-------------|
+| **bare_ssm** | **2.478** | 505 | — |
+| ssm_wernicke_k16 | 2.488 | 446 | +0.010 (worse) |
+| ssm_wernicke_k32 | 2.546 | 414 | +0.068 (worse) |
+| ssm_wernicke_k64 | 2.575 | 407 | +0.097 (worse) |
+| full_stack_k16 | 2.502 | 433 | +0.024 (worse) |
+| full_stack_k32 | 2.565 | 404 | +0.087 (worse) |
+| full_stack_k64 | 2.574 | 412 | +0.096 (worse) |
+
+**Key finding: bare_ssm is the best condition. All semantic engine additions hurt at 600s on A40.**
+
+The pattern is consistent with exp 11: anything that costs training steps loses. bare_ssm gets 505 steps, ssm_wernicke_k16 gets 446 (Wernicke overhead), full_stack_k16 gets 433 (memory + Wernicke overhead). The 59-72 lost steps cost more bpb than the semantic engine recovers.
+
+k_max=16 is the best within both Wernicke-only and full-stack families. More buckets = more overhead = fewer steps = worse. The expert bottleneck held params roughly constant, so this is genuinely "more experts hurts" not "more params hurts."
+
+### Experiment 13 — RUNNING
+
+Launched after baselines completed. 182 runs (26 conditions × 7 seeds), 46 batches, ~8 hours. Running criticality sweep first.
+
 ## Decisions Waiting for Ken
 
-1. **The big one:** n3_only wins, meaning the complex sleep stages (N2/N3/REM) don't pay off at 600s. This affects the paper story. Does section 2.5 (Sleep Consolidation) shrink to "periodic compression helps"? Or do we retest at H100 budgets where step cost matters less?
+1. **The biggest finding:** At 600s on A40, bare SSM beats everything. Wernicke routing, episodic memory, and sleep all cost more steps than they recover in bpb. The entire semantic engine is underwater at this budget. This is the same pattern as Phase 1 (memory hurt at 150s). The question: does the semantic engine cross over at longer budgets (10 min H100)? Phase 1→Phase 2 showed memory crossed over between 150s and 600s. Will Wernicke and sleep cross over between 600s and 10 min?
 
-2. **Polyphasic sleep (exp 12):** With n3_only as the payload, polyphasic sleep is just "partition the slots and compress them on rotation." That's much simpler than the full N2/N3/REM pipeline we designed. Is it still worth running?
+2. **Paper story impact:** If the semantic engine only pays off at H100 budgets, the A40 ablation tells a "throughput dominates at short budgets, but the semantic engine's value grows with budget" story. That's still a valid paper — it just needs the H100 data to land the punch.
 
-3. **Synergy matrix:** Only matters if merges happen during sleep. With n3_only, merges still happen (N3 proposes typed merges). So the synergy matrix is still relevant — but the REM validation feedback loop (which updates affinity) is gone. The matrix can still learn from N3 commit/reject decisions.
+3. **Polyphasic sleep (exp 12):** May not be worth running on A40 if even basic sleep barely helps. Save for H100.
+
+4. **k_max:** k16 is the best. More buckets hurt. The expert bottleneck prevented the param confound, so this is a clean finding. Lock k_max=16 for now.
+
+5. **Synergy matrix:** Hard to test when the base architecture (Wernicke + memory) is itself underwater. Save for H100.
