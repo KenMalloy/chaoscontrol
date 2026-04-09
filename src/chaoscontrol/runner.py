@@ -15,7 +15,7 @@ from chaoscontrol.data import (
 )
 from chaoscontrol.model import ChaosStudentLM
 from chaoscontrol.training import train_chaoscontrol_for_budget
-from chaoscontrol.evaluation import evaluate_chaoscontrol_bpb
+from chaoscontrol.evaluation import evaluate_chaoscontrol_bpb, evaluate_warming_curve
 
 
 def load_config(path: str, *, enwik8_path: str, budget_seconds: float | None = None) -> ChaosControlConfig:
@@ -62,6 +62,9 @@ def build_model(cfg: ChaosControlConfig, device: torch.device, param_dtype: torc
             cue_projection=cfg.cue_projection,
             dynamic_crit_per_layer=cfg.dynamic_crit_per_layer,
             compression_selection=cfg.compression_selection,
+            posterior_mode=cfg.posterior_mode,
+            posterior_lr=cfg.posterior_lr,
+            residual_cache_k=cfg.residual_cache_k,
         )
     model = model.to(device)
     if device.type == "cuda":
@@ -125,11 +128,32 @@ def run_experiment(config_path: str, *, enwik8_path: str, budget_seconds: float 
         bpb_str += f" bpb_gated={eval_result['bpb_gated']:.4f}"
     print(f"Result: {bpb_str} | steps={train_result['steps']} | {train_result['elapsed_s']:.1f}s")
 
+    # Warming curve: evaluate bpb at different warm-up lengths (TTT contract)
+    warming_curve: dict[int, float] = {}
+    if hasattr(model, "outer_model") and model.outer_model is not None:
+        n_max = 5000
+        min_segment_len = n_max + 1024 + 256
+        val_len = int(val_tokens.numel())
+        segment_starts_wc = []
+        step = min_segment_len
+        pos = 0
+        while pos + min_segment_len < val_len:
+            segment_starts_wc.append(pos)
+            pos += step
+        if segment_starts_wc:
+            warming_curve = evaluate_warming_curve(
+                model, tokens=val_tokens, segment_starts=segment_starts_wc,
+                score_len=1024, device=device,
+            )
+            curve_str = " ".join(f"{n}:{b:.3f}" for n, b in sorted(warming_curve.items()))
+            print(f"Warming curve: {curve_str}")
+
     total_params = params + train_result.get("extra_params", 0)
     return {
         "config": {k: v for k, v in cfg.__dict__.items() if not k.startswith("_")},
         "train": train_result,
         "eval": eval_result,
+        "warming_curve": warming_curve,
         "params": total_params,
     }
 
