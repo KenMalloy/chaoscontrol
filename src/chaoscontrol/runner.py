@@ -162,9 +162,13 @@ if __name__ == "__main__":
     import argparse
     p = argparse.ArgumentParser()
     p.add_argument("--config", required=True)
-    p.add_argument("--enwik8-path", required=True)
+    p.add_argument("--enwik8-path", "--data-path", required=True, dest="enwik8_path")
     p.add_argument("--budget", type=float, default=300)
     p.add_argument("--output-json", default=None)
+    p.add_argument("--checkpoint-dir", default=None,
+                   help="Directory for model checkpoints (reserved for future use)")
+    p.add_argument("--checkpoint-name", default=None,
+                   help="Checkpoint name tag (reserved for future use)")
     args = p.parse_args()
 
     result = run_experiment(args.config, enwik8_path=args.enwik8_path, budget_seconds=args.budget)
