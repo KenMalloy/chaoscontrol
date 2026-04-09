@@ -155,3 +155,61 @@ class WernickeLayer(nn.Module):
                 direction = self.codebook.data[bucket_id] - self.codebook.data[nearest]
                 direction = direction / (direction.norm() + 1e-8)
                 self.codebook.data[bucket_id] += lr * abs(quality_delta) * direction
+
+
+class HierarchicalWernicke(nn.Module):
+    """Two-level Wernicke routing: coarse type -> fine subtype.
+
+    Total buckets = k_coarse * k_fine. Bucket id = coarse * k_fine + fine.
+    Each level is a standard WernickeLayer. Two cheap routing decisions
+    beat one hard one: 256 buckets for ~27% SSM overhead vs flat_256 at ~25%.
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        k_coarse: int,
+        k_fine: int,
+        window: int = 8,
+        router_type: str = "moe",
+        balance_weight: float = 0.01,
+        expert_dim: int | None = None,
+    ) -> None:
+        super().__init__()
+        self.k_coarse = k_coarse
+        self.k_fine = k_fine
+        self.total_buckets = k_coarse * k_fine
+        self.balance_weight = balance_weight
+
+        self.coarse = WernickeLayer(
+            dim=dim, k_max=k_coarse, window=window,
+            router_type=router_type, balance_weight=balance_weight,
+            expert_dim=expert_dim,
+        )
+        self.fine = WernickeLayer(
+            dim=dim, k_max=k_fine, window=window,
+            router_type=router_type, balance_weight=balance_weight,
+            expert_dim=expert_dim,
+        )
+
+    def forward(
+        self, x: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Forward pass: coarse routing then fine routing.
+
+        Args:
+            x: (batch, seq, dim) -- input representations.
+
+        Returns:
+            refined: (batch, seq, dim) -- refined representations.
+            bucket_ids: (batch, seq) -- composite bucket assignments.
+            balance_loss: scalar -- sum of coarse and fine balance losses.
+        """
+        # Coarse routing
+        x, coarse_ids, balance_coarse = self.coarse(x)
+        # Fine routing
+        x, fine_ids, balance_fine = self.fine(x)
+        # Composite bucket id
+        bucket_ids = coarse_ids * self.k_fine + fine_ids
+        balance_loss = balance_coarse + balance_fine
+        return x, bucket_ids, balance_loss
