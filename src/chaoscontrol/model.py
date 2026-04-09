@@ -8,8 +8,8 @@ import torch.nn as nn
 
 from chaoscontrol.core import RMSNorm, FeedForward, ChaosSSMCore
 from chaoscontrol.routing import RichBNN, DistributedB
-from chaoscontrol.memory import OuterModel, MultiSlotOuterModel, SemanticTier
-from chaoscontrol.wernicke import WernickeLayer
+from chaoscontrol.memory import OuterModel, MultiSlotOuterModel, SemanticTier, BucketPrototypes
+from chaoscontrol.wernicke import WernickeLayer, HierarchicalWernicke
 
 
 class ChaosSSMBlock(nn.Module):
@@ -127,24 +127,50 @@ class ChaosStudentLM(nn.Module):
         cue_projection: bool = True,
         dynamic_crit_per_layer: bool = False,
         compression_selection: str = "survival",
+        # Experiment 14: typed KV buffer
+        buffer_mode: str = "legacy",
+        retrieval_mode: str = "softmax_all",
+        retrieval_k: int = 8,
+        bucket_prototypes: bool = False,
+        prototype_dim: int = 64,
+        prototype_update_rate: float = 0.1,
+        # Experiment 14: hierarchical Wernicke
+        wernicke_layers: int = 1,
+        wernicke_k_max_fine: int = 8,
     ) -> None:
         super().__init__()
         self.vocab_size = vocab_size
         self.dim = dim
         self.embed = nn.Embedding(vocab_size, dim)
 
+        # Experiment 14 config
+        self.buffer_mode = buffer_mode
+        self.retrieval_mode = retrieval_mode
+        self.retrieval_k = retrieval_k
+
         # Wernicke layer: typed compositional preprocessing
-        self.wernicke: WernickeLayer | None = None
+        self.wernicke: WernickeLayer | HierarchicalWernicke | None = None
         self.wernicke_balance_weight = wernicke_balance_weight
         if wernicke_enabled:
-            self.wernicke = WernickeLayer(
-                dim,
-                k_max=wernicke_k_max,
-                window=wernicke_window,
-                router_type=wernicke_router,
-                balance_weight=wernicke_balance_weight,
-                expert_dim=wernicke_expert_dim if wernicke_expert_dim > 0 else None,
-            )
+            if wernicke_layers >= 2:
+                self.wernicke = HierarchicalWernicke(
+                    dim=dim,
+                    k_coarse=wernicke_k_max,
+                    k_fine=wernicke_k_max_fine,
+                    window=wernicke_window,
+                    router_type=wernicke_router,
+                    balance_weight=wernicke_balance_weight,
+                    expert_dim=wernicke_expert_dim if wernicke_expert_dim > 0 else None,
+                )
+            else:
+                self.wernicke = WernickeLayer(
+                    dim,
+                    k_max=wernicke_k_max,
+                    window=wernicke_window,
+                    router_type=wernicke_router,
+                    balance_weight=wernicke_balance_weight,
+                    expert_dim=wernicke_expert_dim if wernicke_expert_dim > 0 else None,
+                )
 
         self.layers = nn.ModuleList([
             ChaosSSMBlock(
@@ -188,6 +214,21 @@ class ChaosStudentLM(nn.Module):
         self.semantic_tier: SemanticTier | None = None
         if semantic_tier_bases > 0:
             self.semantic_tier = SemanticTier(dim, num_bases=semantic_tier_bases, update_rate=semantic_tier_update_rate)
+
+        # Bucket prototypes: per-bucket semantic priors
+        self.bucket_prototypes_module: BucketPrototypes | None = None
+        if bucket_prototypes and outer_model_dim > 0:
+            # Determine total buckets from Wernicke config
+            if wernicke_layers >= 2:
+                total_k = wernicke_k_max * wernicke_k_max_fine
+            else:
+                total_k = wernicke_k_max
+            self.bucket_prototypes_module = BucketPrototypes(
+                k_max=total_k,
+                prototype_dim=prototype_dim,
+                model_dim=dim,
+                update_rate=prototype_update_rate,
+            )
 
         # Gap-analysis flags
         self.typed_storage = typed_storage
@@ -300,7 +341,17 @@ class ChaosStudentLM(nn.Module):
         input_ids: torch.Tensor,
         *,
         return_jacobian_stats: bool = False,
+        memory_write_mode: str = "none",
     ) -> dict[str, Any]:
+        """Forward pass.
+
+        Args:
+            input_ids: (batch, seq) token IDs.
+            return_jacobian_stats: if True, compute and return Jacobian stats.
+            memory_write_mode: "none" (default, side-effect free),
+                "append_only" (append per-token KV pairs to buffer after forward).
+                The caller (training loop or eval) decides when writes happen.
+        """
         x = self.embed(input_ids)
 
         # Wernicke layer: compose bytes into typed units before SSM recurrence
@@ -309,13 +360,40 @@ class ChaosStudentLM(nn.Module):
         if self.wernicke is not None:
             x, bucket_ids, balance_loss = self.wernicke(x)
 
-        if self.outer_model is not None:
+        # Buffer read path
+        if self.outer_model is not None and self.buffer_mode == "append_only":
+            # New Exp14 path: within-bucket retrieval
+            if isinstance(self.outer_model, MultiSlotOuterModel) and self.outer_model._slots:
+                if bucket_ids is not None:
+                    # Per-token bucket reads: use the dominant bucket per sample
+                    # for a single read (efficient), decoded to model_dim by read_bucket
+                    dominant_bucket = int(bucket_ids[:, -1].flatten().mode().values.item())
+                else:
+                    dominant_bucket = 0
+                cue = None
+                if self.retrieval_mode in ("bucket_topk", "softmax_all"):
+                    # Project cue to outer_dim for similarity scoring
+                    cue = self.outer_model.cue_proj(
+                        x.detach().mean(dim=1).to(dtype=self.outer_model.cue_proj.weight.dtype)
+                    )
+                outer_read = self.outer_model.read_bucket(
+                    x.size(0),
+                    bucket_id=dominant_bucket,
+                    mode=self.retrieval_mode,
+                    k=self.retrieval_k,
+                    cue=cue,
+                )
+                x = x + outer_read.unsqueeze(1)  # broadcast across seq dim
+
+            # Bucket prototypes: add per-type prior bias
+            if self.bucket_prototypes_module is not None and bucket_ids is not None:
+                dominant_bucket = int(bucket_ids[:, -1].flatten().mode().values.item())
+                proto = self.bucket_prototypes_module.read(x.size(0), dominant_bucket)
+                x = x + proto.unsqueeze(1)
+
+        elif self.outer_model is not None:
+            # Legacy path: unchanged
             if isinstance(self.outer_model, MultiSlotOuterModel):
-                # Cue-dependent retrieval. If cue_projection=False (gap analysis),
-                # pass cue=None so retrieval uses uniform weighting over slots
-                # instead of the learned cue projection — tests whether the
-                # recurrence state naturally serves as an address.
-                # Normal mode: mean pool over input embeddings as cue.
                 cue = x.detach().mean(dim=1) if self.cue_projection else None
                 outer_read = self.outer_model.read(x.size(0), cue=cue)
             else:
@@ -338,6 +416,38 @@ class ChaosStudentLM(nn.Module):
         hidden = x
         x = self.final_norm(x)
         logits = self.lm_head(x)
+
+        # Fix 2: writes are ONLY performed when the caller explicitly requests.
+        # Fix 3: per-token writes, not one dominant bucket per batch.
+        if (
+            memory_write_mode == "append_only"
+            and self.buffer_mode == "append_only"
+            and self.outer_model is not None
+            and isinstance(self.outer_model, MultiSlotOuterModel)
+        ):
+            with torch.no_grad():
+                batch, seq, dim = hidden.shape
+                h_flat = hidden.detach().reshape(-1, dim)  # (batch*seq, dim)
+                encoded_flat = torch.tanh(
+                    self.outer_model.encoder(h_flat.to(dtype=self.outer_model.encoder.weight.dtype))
+                )  # (batch*seq, outer_dim)
+
+                if bucket_ids is not None:
+                    bids_flat = bucket_ids.detach().reshape(-1)  # (batch*seq,)
+                else:
+                    bids_flat = torch.zeros(batch * seq, dtype=torch.long, device=hidden.device)
+
+                for i in range(batch * seq):
+                    self.outer_model.append_kv(
+                        encoded_flat[i:i+1],
+                        bucket_id=int(bids_flat[i].item()),
+                    )
+
+                # Update bucket prototypes
+                if self.bucket_prototypes_module is not None and bucket_ids is not None:
+                    for i in range(batch * seq):
+                        bid = int(bids_flat[i].item())
+                        self.bucket_prototypes_module.update(bid, encoded_flat[i:i+1])
 
         out: dict[str, Any] = {"logits": logits, "hidden": hidden}
         if balance_loss is not None:
