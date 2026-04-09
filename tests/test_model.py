@@ -92,5 +92,46 @@ class TestChaosStudentLM(unittest.TestCase):
         assert "jacobian_stats" in out
 
 
+    def test_posterior_global_delta_forward(self) -> None:
+        model = ChaosStudentLM(
+            vocab_size=256, dim=16, num_layers=2, ff_mult=2,
+            a_mode="diag", rich_b_mode="none", outer_model_dim=0,
+            posterior_mode="global_delta", posterior_lr=0.01,
+        )
+        ids = torch.randint(0, 256, (2, 16))
+        out = model(ids)
+        assert out["logits"].shape == (2, 16, 256)
+        assert model.posterior is not None
+
+    def test_posterior_bucket_delta_forward(self) -> None:
+        model = ChaosStudentLM(
+            vocab_size=256, dim=16, num_layers=2, ff_mult=2,
+            a_mode="diag", rich_b_mode="none", outer_model_dim=0,
+            wernicke_enabled=True, wernicke_k_max=8, wernicke_router="moe",
+            posterior_mode="bucket_delta", posterior_lr=0.01,
+        )
+        ids = torch.randint(0, 256, (2, 16))
+        out = model(ids)
+        assert out["logits"].shape == (2, 16, 256)
+        assert model.posterior is not None
+
+    def test_posterior_residual_cache_forward(self) -> None:
+        model = ChaosStudentLM(
+            vocab_size=256, dim=16, num_layers=2, ff_mult=2,
+            a_mode="diag", rich_b_mode="none", outer_model_dim=0,
+            posterior_mode="residual_cache", residual_cache_k=2,
+        )
+        ids = torch.randint(0, 256, (2, 16))
+        out = model(ids)
+        assert out["logits"].shape == (2, 16, 256)
+        assert model.posterior is not None
+
+    def test_posterior_none_default(self) -> None:
+        model = ChaosStudentLM(
+            vocab_size=256, dim=16, num_layers=2, ff_mult=2,
+        )
+        assert model.posterior is None
+
+
 if __name__ == "__main__":
     unittest.main()
