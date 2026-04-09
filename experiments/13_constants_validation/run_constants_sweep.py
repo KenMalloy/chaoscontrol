@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Experiment 13: Constants validation — exploratory sweeps.
 
-Two independent 1-D sweeps on the highest-priority unvalidated constants
-identified in docs/plans/constants-audit.md. Both sweeps are EXPLORATORY.
+Five independent sweeps on the highest-priority unvalidated constants
+identified in docs/plans/constants-audit.md. All sweeps are EXPLORATORY.
 Confirmation requires a second-stage rerun on 8+ fresh paired seeds.
 
 Sweep 1 — Criticality target (crit_target_coupling)
@@ -350,7 +350,7 @@ def _print_summary():
         ("Criticality target (bare SSM)", "crit_", "crit_088"),
         ("Memory slot dimension (full stack)", "memdim_", "memdim_064"),
         ("Max slots (full stack)", "slots_", "slots_064"),
-        ("Semantic tier (full stack, bases x rate)", "sem_", "sem_b8_r1em02"),
+        ("Semantic tier (full stack, bases x rate)", "sem_", "sem_off"),
         ("Merge threshold (full stack + sleep)", "merge_", "merge_085"),
     ]:
         print(f"\n  {sweep_name}:")
@@ -391,8 +391,12 @@ def _print_summary():
                 print(f"    95% CI of delta: [{delta_ci[0]:+.4f}, {delta_ci[1]:+.4f}]")
                 if best_name.endswith("080") or best_name.endswith("096") or best_name.endswith("075") or best_name.endswith("095"):
                     print(f"    WARNING: winner is at sweep edge — extend range before locking")
-                if mean_d < 0:
+                # Only nominate a candidate when the CI excludes zero
+                ci_excludes_zero = (delta_ci[0] > 0 and delta_ci[1] > 0) or (delta_ci[0] < 0 and delta_ci[1] < 0)
+                if mean_d < 0 and ci_excludes_zero:
                     print(f"    CANDIDATE: {best_name} for confirmatory rerun on 8+ fresh seeds")
+                elif mean_d < 0:
+                    print(f"    TREND: {best_name} looks better but CI includes zero — no clear winner yet")
                 else:
                     print(f"    Default {default_name} appears optimal in this range")
 

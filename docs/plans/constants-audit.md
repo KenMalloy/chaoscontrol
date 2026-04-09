@@ -60,6 +60,8 @@ Every baked-in default in `ChaosControlConfig`, categorized by justification lev
 | `outer_compress_ratio` | 2 | **Arbitrary** | Merge N into N/2, never swept | Low priority |
 | `consolidation_ema_decay` | 0.99 | **Principled** | Standard EMA, slow-moving average | None |
 | `consolidation_window` | 8 | **Arbitrary** | Steps after spike before flush, never swept | Low priority |
+| `semantic_tier_bases` | 0 (off) | **Arbitrary** | Never validated whether semantic tier helps | **Joint sweep: bases [0,4,8,16] × rate [1e-3,1e-2,1e-1] (exp 13)** |
+| `semantic_tier_update_rate` | 0.01 | **Arbitrary** | EMA blend rate for basis consolidation, dependent on bases | **Joint sweep with bases (exp 13)** |
 
 ## Sleep Cycle
 
