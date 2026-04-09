@@ -1,4 +1,8 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+
+
+_VALID_RETRIEVAL_MODES = ("softmax_all", "bucket_mean", "bucket_recent", "bucket_topk")
+_VALID_POSTERIOR_MODES = ("none", "global_delta", "bucket_delta", "residual_cache")
 
 
 @dataclass
@@ -75,3 +79,23 @@ class ChaosControlConfig:
     cue_projection: bool = True  # False = use raw recurrence state as retrieval key
     dynamic_crit_per_layer: bool = False
     compression_selection: str = "survival"  # "survival" or "random" — controls slot merge ordering
+
+    # Retrieval mode for typed buffer (Exp 14)
+    retrieval_mode: str = "softmax_all"  # "softmax_all", "bucket_mean", "bucket_recent", "bucket_topk"
+
+    # Phase D: posterior-state options
+    posterior_mode: str = "none"  # "none", "global_delta", "bucket_delta", "residual_cache"
+    posterior_lr: float = 0.01
+    residual_cache_k: int = 4
+
+    def __post_init__(self) -> None:
+        if self.retrieval_mode not in _VALID_RETRIEVAL_MODES:
+            raise ValueError(
+                f"retrieval_mode must be one of {_VALID_RETRIEVAL_MODES}, "
+                f"got {self.retrieval_mode!r}"
+            )
+        if self.posterior_mode not in _VALID_POSTERIOR_MODES:
+            raise ValueError(
+                f"posterior_mode must be one of {_VALID_POSTERIOR_MODES}, "
+                f"got {self.posterior_mode!r}"
+            )
