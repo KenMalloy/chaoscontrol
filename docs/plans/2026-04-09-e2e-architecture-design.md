@@ -144,8 +144,13 @@ from the input stream — like a transformer filling its KV cache.
 **Batch size tuning:** At dim=128, the H100 is likely underutilized at
 batch=32. Increasing batch size to saturate the GPU's tensor cores is
 free performance — more tokens per step at ~same wall time per step.
-Benchmark on pod boot to find the largest batch that doesn't slow the
-step. This trades spare VRAM for training throughput.
+Benchmark on pod boot (sweep batch=32,64,128,256,512, measure
+steps/sec). Pick the largest that doesn't slow the step. Batch size
+is a hardware knob, not a science knob — benchmark once, lock across
+all ablation conditions.
+
+**Runtime environment:** Pin CUDA 12.x + PyTorch 2.x for H100 support
+(fp8 kernels, efficient attention). Specify in pod bootstrap script.
 
 ## Engineering Changes (Claim 1)
 
@@ -276,8 +281,9 @@ fw_freeze_step = SWEPT
 | claim1_winner | T2 + T3 winners |
 | full_winner | + T4 + T5 winners (if Claim 2 tested) |
 | transformer | Transformer baseline, same wall time |
+| mamba2 | Mamba-2 baseline, same wall time |
 
-5 conditions x 7 seeds = 35 runs
+6 conditions x 7 seeds = 42 runs
 
 #### T7: Confirmation (fresh seeds)
 
@@ -346,8 +352,8 @@ This follow-up answers a different question from T2/T3:
 |-------|------|----------------|-----------|
 | A (T2+T3) | 91 | 12 | ~120 min |
 | B (T5 core) | 35 | 5 | ~50 min |
-| C (T6+T7) | 51 | 7 | ~70 min |
-| **Total** | **177** | **24** | **~4 hours** |
+| C (T6+T7) | 58 | 8 | ~80 min |
+| **Total** | **184** | **25** | **~4.2 hours** |
 
 T4 and Phase D are separate follow-ups and are excluded from these
 totals. Phase A is the core experiment. B is contingent. C requires A
