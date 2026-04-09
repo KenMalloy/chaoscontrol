@@ -12,7 +12,15 @@ Sweep 1 — Criticality target (crit_target_coupling)
   NOTE: A small confirmatory check on the locked full stack is needed before
   setting a repo-wide default, since Wernicke/memory may shift the optimum.
 
-Sweep 2 — Merge similarity threshold (sleep_merge_sim_threshold)
+Sweep 2 — Memory slot dimension (outer_model_dim)
+  Full stack without sleep. Isolates memory embedding capacity.
+  3 values x 7 seeds = 21 runs.
+
+Sweep 3 — Max slots (outer_max_slots)
+  Full stack without sleep. Isolates memory capacity.
+  3 values x 7 seeds = 21 runs.
+
+Sweep 4 — Merge similarity threshold (sleep_merge_sim_threshold)
   Full stack with full_cycle sleep (PROVISIONAL — may need re-run if exp 11
   picks a non-full_cycle payload or k_max sweep changes from 16).
   5 values x 7 seeds = 35 runs.
@@ -23,8 +31,8 @@ Sweep 2 — Merge similarity threshold (sleep_merge_sim_threshold)
 wernicke_k_max sweep is covered by experiments/baselines/run_mamba2_baseline.py,
 not duplicated here.
 
-Total: 10 conditions x 7 seeds = 70 runs.
-At 4 GPUs: ~18 batches x 10 min = ~3 hours.
+Total: 16 conditions x 7 seeds = 112 runs.
+At 4 GPUs: ~28 batches x 10 min = ~5 hours.
 
 Statistical discipline: 7 seeds, paired Wilcoxon, bootstrap CIs.
 All contrasts are EXPLORATORY (post-selection from 5-point grid).
@@ -67,6 +75,34 @@ def _bare_ssm(**overrides) -> dict:
         "stride": 128,
         "batch_size": 32,
         "base_lr": 2e-3,
+    }
+    base.update(overrides)
+    return base
+
+
+def _full_stack(**overrides) -> dict:
+    """Full stack without sleep. Tests memory parameters in isolation."""
+    base = {
+        "model_type": "ssm",
+        "vocab_size": 256,
+        "model_dim": 128,
+        "num_layers": 4,
+        "ff_mult": 2,
+        "seq_len": 256,
+        "stride": 128,
+        "batch_size": 32,
+        "base_lr": 2e-3,
+        # Memory
+        "outer_model_type": "multislot",
+        "outer_model_dim": 64,
+        "outer_max_slots": 64,
+        "consolidation_write": "full_sequence",
+        "latent_persistence": True,
+        # Wernicke
+        "wernicke_enabled": True,
+        "wernicke_router": "moe",
+        "wernicke_k_max": 16,
+        "typed_storage": True,
     }
     base.update(overrides)
     return base
@@ -116,7 +152,17 @@ for coupling in [0.80, 0.85, 0.88, 0.92, 0.96]:
     name = f"crit_{int(coupling*100):03d}"
     CONDITIONS[name] = _bare_ssm(crit_target_coupling=coupling)
 
-# Sweep 2: Merge similarity threshold (full stack + sleep)
+# Sweep 2: Memory slot dimension (full stack, no sleep)
+for dim in [32, 64, 128]:
+    name = f"memdim_{dim:03d}"
+    CONDITIONS[name] = _full_stack(outer_model_dim=dim)
+
+# Sweep 3: Max slots (full stack, no sleep)
+for slots in [32, 64, 128]:
+    name = f"slots_{slots:03d}"
+    CONDITIONS[name] = _full_stack(outer_max_slots=slots)
+
+# Sweep 4: Merge similarity threshold (full stack + sleep)
 for threshold in [0.75, 0.80, 0.85, 0.90, 0.95]:
     name = f"merge_{int(threshold*100):03d}"
     CONDITIONS[name] = _full_stack_sleep(sleep_merge_sim_threshold=threshold)
@@ -292,6 +338,8 @@ def _print_summary():
     # -- Per-sweep summaries --
     for sweep_name, prefix, default_name in [
         ("Criticality target (bare SSM)", "crit_", "crit_088"),
+        ("Memory slot dimension (full stack)", "memdim_", "memdim_064"),
+        ("Max slots (full stack)", "slots_", "slots_064"),
         ("Merge threshold (full stack + sleep)", "merge_", "merge_085"),
     ]:
         print(f"\n  {sweep_name}:")

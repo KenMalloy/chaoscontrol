@@ -55,8 +55,8 @@ Every baked-in default in `ChaosControlConfig`, categorized by justification lev
 
 | Constant | Value | Category | Justification | Action |
 |----------|-------|----------|---------------|--------|
-| `outer_model_dim` | 64 | **Arbitrary** | Slot embedding dimension, never swept | Could test 32, 128 |
-| `outer_max_slots` | 64 | **Arbitrary** | Max episodic slots before compression, never swept | Could test 32, 128 |
+| `outer_model_dim` | 64 | **Arbitrary** | Slot embedding dimension, never swept | **Sweep: [32, 64, 128] (exp 13)** |
+| `outer_max_slots` | 64 | **Arbitrary** | Max episodic slots before compression, never swept | **Sweep: [32, 64, 128] (exp 13)** |
 | `outer_compress_ratio` | 2 | **Arbitrary** | Merge N into N/2, never swept | Low priority |
 | `consolidation_ema_decay` | 0.99 | **Principled** | Standard EMA, slow-moving average | None |
 | `consolidation_window` | 8 | **Arbitrary** | Steps after spike before flush, never swept | Low priority |
