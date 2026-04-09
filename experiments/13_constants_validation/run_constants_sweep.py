@@ -31,8 +31,8 @@ Sweep 4 — Merge similarity threshold (sleep_merge_sim_threshold)
 wernicke_k_max sweep is covered by experiments/baselines/run_mamba2_baseline.py,
 not duplicated here.
 
-Total: 16 conditions x 7 seeds = 112 runs.
-At 4 GPUs: ~28 batches x 10 min = ~5 hours.
+Total: 20 conditions x 7 seeds = 140 runs.
+At 4 GPUs: ~35 batches x 10 min = ~6 hours.
 
 Statistical discipline: 7 seeds, paired Wilcoxon, bootstrap CIs.
 All contrasts are EXPLORATORY (post-selection from 5-point grid).
@@ -161,6 +161,12 @@ for dim in [32, 64, 128]:
 for slots in [32, 64, 128]:
     name = f"slots_{slots:03d}"
     CONDITIONS[name] = _full_stack(outer_max_slots=slots)
+
+# Sweep 4: Semantic tier bases (full stack, no sleep)
+# 0 = disabled. If 0 wins, drop semantic tier from the paper.
+for bases in [0, 4, 8, 16]:
+    name = f"sembases_{bases:03d}"
+    CONDITIONS[name] = _full_stack(semantic_tier_bases=bases)
 
 # Sweep 4: Merge similarity threshold (full stack + sleep)
 for threshold in [0.75, 0.80, 0.85, 0.90, 0.95]:
@@ -340,6 +346,7 @@ def _print_summary():
         ("Criticality target (bare SSM)", "crit_", "crit_088"),
         ("Memory slot dimension (full stack)", "memdim_", "memdim_064"),
         ("Max slots (full stack)", "slots_", "slots_064"),
+        ("Semantic tier bases (full stack)", "sembases_", "sembases_008"),
         ("Merge threshold (full stack + sleep)", "merge_", "merge_085"),
     ]:
         print(f"\n  {sweep_name}:")
