@@ -137,3 +137,37 @@ def test_read_bucket_empty_buffer():
     result = model.read_bucket(batch_size=2, bucket_id=0, mode="bucket_mean")
     assert result.shape == (2, 128)
     assert torch.allclose(result, torch.zeros(2, 128))
+
+
+# ---- BucketPrototypes tests ----
+
+from chaoscontrol.memory import BucketPrototypes
+
+
+def test_bucket_prototypes_init():
+    bp = BucketPrototypes(k_max=16, prototype_dim=64, model_dim=128, update_rate=0.1)
+    assert bp.prototypes.shape == (16, 64)
+
+
+def test_bucket_prototypes_read_decoded():
+    """read() must return model_dim, not prototype_dim."""
+    bp = BucketPrototypes(k_max=4, prototype_dim=64, model_dim=128, update_rate=0.1)
+    result = bp.read(batch_size=2, bucket_id=1)
+    assert result.shape == (2, 128)  # decoded to model_dim
+
+
+def test_bucket_prototypes_update():
+    bp = BucketPrototypes(k_max=4, prototype_dim=64, model_dim=128, update_rate=1.0)
+    value = torch.ones(1, 64) * 5.0
+    bp.update(bucket_id=2, value=value)
+    # Internal prototype is in prototype_dim
+    assert torch.allclose(bp.prototypes[2], value.squeeze(0))
+
+
+def test_bucket_prototypes_ema():
+    bp = BucketPrototypes(k_max=4, prototype_dim=64, model_dim=128, update_rate=0.5)
+    bp.update(bucket_id=0, value=torch.ones(1, 64) * 10.0)
+    bp.update(bucket_id=0, value=torch.zeros(1, 64))
+    # After two updates with alpha=0.5: first: 0*0.5 + 10*0.5 = 5. Second: 5*0.5 + 0*0.5 = 2.5
+    expected = torch.ones(64) * 2.5
+    assert torch.allclose(bp.prototypes[0], expected)

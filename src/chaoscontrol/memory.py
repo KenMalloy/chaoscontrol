@@ -789,6 +789,46 @@ class MultiSlotOuterModel(nn.Module):
         return signal
 
 
+class BucketPrototypes(nn.Module):
+    """Per-bucket semantic priors. One prototype per Wernicke bucket type,
+    EMA-updated from buffer entries. Ships in artifact for cold-start context.
+
+    Stores prototypes in prototype_dim (typically == outer_dim) and decodes
+    to model_dim on read. This matches Fix 1: all memory reads must be
+    decoded to model_dim before being added to the stream.
+    """
+
+    def __init__(
+        self,
+        k_max: int,
+        prototype_dim: int,
+        model_dim: int,
+        update_rate: float = 0.1,
+    ) -> None:
+        super().__init__()
+        self.k_max = k_max
+        self.prototype_dim = prototype_dim
+        self.model_dim = model_dim
+        self.update_rate = update_rate
+        self.register_buffer("prototypes", torch.zeros(k_max, prototype_dim))
+        # Decoder: prototype_dim -> model_dim (on forward path, receives task gradients)
+        self.decoder = nn.Linear(prototype_dim, model_dim, bias=False)
+
+    def read(self, batch_size: int, bucket_id: int) -> torch.Tensor:
+        """Read prototype for bucket, decoded to model_dim."""
+        proto = self.prototypes[bucket_id].unsqueeze(0)  # (1, prototype_dim)
+        decoded = self.decoder(proto.to(dtype=self.decoder.weight.dtype))  # (1, model_dim)
+        return decoded.expand(batch_size, -1)
+
+    def update(self, bucket_id: int, value: torch.Tensor) -> None:
+        """EMA update of prototype from new observation(s) in prototype_dim."""
+        v = value.detach().mean(dim=0)  # (prototype_dim,)
+        self.prototypes[bucket_id] = (
+            (1 - self.update_rate) * self.prototypes[bucket_id]
+            + self.update_rate * v
+        )
+
+
 class SemanticTier(nn.Module):
     """Neocortical knowledge layer — always-on background bias.
 
