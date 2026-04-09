@@ -1,22 +1,34 @@
 #!/usr/bin/env python3
-"""Experiment 13: Constants validation — sweep unvalidated defaults.
+"""Experiment 13: Constants validation — exploratory sweeps.
 
-Two independent 1-D sweeps on the three highest-priority unvalidated constants
-identified in docs/plans/constants-audit.md.
+Two independent 1-D sweeps on the highest-priority unvalidated constants
+identified in docs/plans/constants-audit.md. Both sweeps are EXPLORATORY.
+Confirmation requires a second-stage rerun on 8+ fresh paired seeds.
 
 Sweep 1 — Criticality target (crit_target_coupling)
   Bare SSM (no memory, no Wernicke) to isolate trunk dynamics.
   5 values x 7 seeds = 35 runs.
+  NOTE: If winner lands on edge (0.80 or 0.96), extend range before locking.
+  NOTE: A small confirmatory check on the locked full stack is needed before
+  setting a repo-wide default, since Wernicke/memory may shift the optimum.
 
 Sweep 2 — Merge similarity threshold (sleep_merge_sim_threshold)
-  Full stack with full_cycle sleep to test consolidation aggressiveness.
+  Full stack with full_cycle sleep (PROVISIONAL — may need re-run if exp 11
+  picks a non-full_cycle payload or k_max sweep changes from 16).
   5 values x 7 seeds = 35 runs.
+  NOTE: Threshold filters candidates by raw similarity, then affinity reorders
+  them via merge_score = sim * affinity. So this sweep tests "how many
+  candidates pass the gate", not the affinity ranking itself.
+
+wernicke_k_max sweep is covered by experiments/baselines/run_mamba2_baseline.py,
+not duplicated here.
 
 Total: 10 conditions x 7 seeds = 70 runs.
 At 4 GPUs: ~18 batches x 10 min = ~3 hours.
 
 Statistical discipline: 7 seeds, paired Wilcoxon, bootstrap CIs.
-Each sweep's confirmatory contrast: default vs best alternative.
+All contrasts are EXPLORATORY (post-selection from 5-point grid).
+Confirmation: rerun winner vs default on 8+ fresh seeds after locks.
 """
 import argparse
 import json
@@ -305,7 +317,7 @@ def _print_summary():
                 best_bpb = mean_bpb
                 best_name = cond_name
 
-        # Contrast: best vs default
+        # Exploratory contrast: best vs default (post-selected, NOT confirmatory)
         if best_name and best_name != default_name and default_name in results:
             deltas = _paired_deltas(results, default_name, best_name)
             if len(deltas) >= 2:
@@ -315,14 +327,15 @@ def _print_summary():
                 b_bpbs = list(results[best_name].values())
                 d = cohens_d(d_bpbs, b_bpbs) if d_bpbs and b_bpbs else 0.0
                 delta_ci = bootstrap_ci(deltas)
-                sig_str = "SIGNIFICANT" if p < 0.05 else "ns"
-                print(f"\n  Best ({best_name}) vs default ({default_name}):")
-                print(f"    delta={mean_d:+.4f}  Wilcoxon p={p:.4f} {sig_str}  d={d:.2f}")
+                print(f"\n  [EXPLORATORY] Best ({best_name}) vs default ({default_name}):")
+                print(f"    delta={mean_d:+.4f}  Wilcoxon p={p:.4f} (uncorrected, post-selected)  d={d:.2f}")
                 print(f"    95% CI of delta: [{delta_ci[0]:+.4f}, {delta_ci[1]:+.4f}]")
-                if p < 0.05:
-                    print(f"    >>> RECOMMENDATION: change default to {best_name} <<<")
+                if best_name.endswith("080") or best_name.endswith("096") or best_name.endswith("075") or best_name.endswith("095"):
+                    print(f"    WARNING: winner is at sweep edge — extend range before locking")
+                if mean_d < 0:
+                    print(f"    CANDIDATE: {best_name} for confirmatory rerun on 8+ fresh seeds")
                 else:
-                    print(f"    Default {default_name} is not significantly worse. Keep it.")
+                    print(f"    Default {default_name} appears optimal in this range")
 
     with open(RESULTS / "constants_summary.json", "w") as f:
         json.dump({k: dict(v) for k, v in results.items()}, f, indent=2, default=str)

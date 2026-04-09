@@ -103,7 +103,7 @@ These are the constants that could materially affect results and have never been
 
 1. **`crit_target_coupling`** [0.80, 0.85, 0.88, 0.92, 0.96] — The SSM's temporal dynamics. Affects everything.
 2. **`wernicke_k_max`** [16, 32, 64] — Already wired and param-controlled. Affects Wernicke and sleep.
-3. **`sleep_merge_sim_threshold`** [0.75, 0.80, 0.85, 0.90, 0.95] — Controls consolidation aggressiveness. With the synergy matrix, this is the base threshold that affinity scales.
+3. **`sleep_merge_sim_threshold`** [0.75, 0.80, 0.85, 0.90, 0.95] — Controls how many slot pairs pass the merge gate. Candidates above this threshold are then ranked by `sim * affinity` — so the threshold controls *volume* of candidates, while affinity controls *priority*. Covered by Experiment 13 (provisional on exp 11 sleep payload and k_max lock).
 
 ### Medium Priority (refinement)
 
