@@ -1,4 +1,4 @@
-# Overnight Summary — 2026-04-09
+# Experiment Summary — 2026-04-09 (Updated: all experiments complete)
 
 ## What Happened
 
@@ -72,18 +72,30 @@ The pattern is consistent with exp 11: anything that costs training steps loses.
 
 k_max=16 is the best within both Wernicke-only and full-stack families. More buckets = more overhead = fewer steps = worse. The expert bottleneck held params roughly constant, so this is genuinely "more experts hurts" not "more params hurts."
 
-### Experiment 13 — RUNNING
+### Experiment 13: Constants Validation — COMPLETE (182/182, 0 failures)
 
-Launched after baselines completed. 182 runs (26 conditions × 7 seeds), 46 batches, ~8 hours. Running criticality sweep first.
+| Constant | Default | Best | Delta | Action |
+|----------|---------|------|-------|--------|
+| crit_target_coupling | 0.88 | **0.92** | -0.017 | Confirm on 8+ seeds |
+| outer_max_slots | 64 | **32** | -0.033 | Confirm on 8+ seeds |
+| outer_model_dim | 64 | 32 | -0.010 | Trend only |
+| semantic_tier | off | b8/r0.1 | -0.008 | Trend only, keep off |
+| merge_threshold | 0.85 | 0.95 | -0.003 | Edge warning, extend range |
+
+Two strong candidates: crit_target_coupling → 0.92 and outer_max_slots → 32.
+Full report: `experiments/13_constants_validation/REPORT_exp13.md`
+
+**Pod stopped.** No more experiments to run until H100 decisions.
 
 ## Decisions Waiting for Ken
 
-1. **The biggest finding:** At 600s on A40, bare SSM beats everything. Wernicke routing, episodic memory, and sleep all cost more steps than they recover in bpb. The entire semantic engine is underwater at this budget. This is the same pattern as Phase 1 (memory hurt at 150s). The question: does the semantic engine cross over at longer budgets (10 min H100)? Phase 1→Phase 2 showed memory crossed over between 150s and 600s. Will Wernicke and sleep cross over between 600s and 10 min?
+1. **The biggest finding:** At 600s on A40, bare SSM beats everything. Wernicke routing, episodic memory, and sleep all cost more steps than they recover in bpb. The entire semantic engine is underwater at this budget. The question: does the semantic engine cross over at longer budgets (10 min H100)?
 
-2. **Paper story impact:** If the semantic engine only pays off at H100 budgets, the A40 ablation tells a "throughput dominates at short budgets, but the semantic engine's value grows with budget" story. That's still a valid paper — it just needs the H100 data to land the punch.
+2. **Constants to lock:**
+   - crit_target_coupling: change to 0.92? (0.017 bpb improvement on bare SSM)
+   - outer_max_slots: change to 32? (0.033 bpb improvement on full stack)
+   - Both need confirmatory rerun on 8+ seeds before locking
 
-3. **Polyphasic sleep (exp 12):** May not be worth running on A40 if even basic sleep barely helps. Save for H100.
+3. **Paper story:** The A40 data tells a throughput-dominance story. The H100 experiment is the one that determines whether the semantic engine crosses over.
 
-4. **k_max:** k16 is the best. More buckets hurt. The expert bottleneck prevented the param confound, so this is a clean finding. Lock k_max=16 for now.
-
-5. **Synergy matrix:** Hard to test when the base architecture (Wernicke + memory) is itself underwater. Save for H100.
+4. **What's next:** Design and run the H100 crossover experiment. The key question: bare_ssm vs full_stack at 10 min on H100.
