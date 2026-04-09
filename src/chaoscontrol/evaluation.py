@@ -280,3 +280,105 @@ def evaluate_chaoscontrol_bpb(
         else:
             result["bpb_gated"] = float(mean_loss_gated / math.log(2.0))
     return result
+
+
+def evaluate_warming_curve(
+    model: Any,
+    data: torch.Tensor,
+    warmup_tokens: list[int],
+    score_tokens: int = 1024,
+    segment_len: int = 8192,
+) -> dict[int, float]:
+    """TTT warming-curve evaluation following the design doc contract.
+
+    For each segment and each N in warmup_tokens:
+      1. Reset SSM state, buffer, and any semantic cache to empty
+      2. Consume the first N tokens with writes enabled but no scoring
+      3. Score the next score_tokens tokens only
+      4. Reset again before the next segment
+
+    Returns {N: bpb} averaged across all segments.
+
+    Args:
+        model: ChaosStudentLM with append_only buffer mode.
+        data: 1-D tensor of token IDs (e.g. raw bytes).
+        warmup_tokens: list of N values (e.g. [0, 100, 500, 1000, 5000]).
+        score_tokens: how many tokens to score after warmup.
+        segment_len: segment size. Must be >= max(warmup_tokens) + score_tokens.
+    """
+    from chaoscontrol.memory import MultiSlotOuterModel
+
+    was_training = model.training
+    model.eval()
+    device = next(model.parameters()).device
+    n_max = max(warmup_tokens) if warmup_tokens else 0
+    min_seg = n_max + score_tokens
+    assert segment_len >= min_seg, f"segment_len ({segment_len}) must be >= {min_seg}"
+
+    # Build non-overlapping segments
+    total = data.numel()
+    segments = []
+    pos = 0
+    while pos + segment_len <= total:
+        segments.append(data[pos:pos + segment_len])
+        pos += segment_len
+    if not segments:
+        # If data is too short for even one segment, use what we have
+        segments = [data[:total]]
+
+    results: dict[int, list[float]] = {n: [] for n in warmup_tokens}
+
+    with torch.no_grad():
+        for seg in segments:
+            seg = seg.to(device)
+            for n in warmup_tokens:
+                # 1. Reset buffer and SSM state
+                if hasattr(model, "outer_model") and model.outer_model is not None:
+                    if isinstance(model.outer_model, MultiSlotOuterModel):
+                        model.outer_model._slots.clear()
+                        model.outer_model._survival.clear()
+                        model.outer_model._slot_buckets.clear()
+
+                # 2. Warm N tokens with writes enabled (no scoring)
+                if n > 0:
+                    warm_input = seg[:n].unsqueeze(0)  # (1, N)
+                    # Process in chunks to avoid memory issues
+                    chunk_size = min(256, n)
+                    for start in range(0, n, chunk_size):
+                        end = min(start + chunk_size, n)
+                        chunk = warm_input[:, start:end]
+                        model(chunk, memory_write_mode="append_only")
+
+                # 3. Score the next score_tokens
+                score_start = n
+                score_end = min(n + score_tokens, len(seg) - 1)
+                if score_end <= score_start:
+                    continue
+                score_input = seg[score_start:score_end].unsqueeze(0)  # (1, T)
+                score_target = seg[score_start + 1:score_end + 1].unsqueeze(0)  # (1, T)
+
+                out = model(score_input, memory_write_mode="none")
+                logits = out["logits"]  # (1, T, vocab)
+                ce_sum = float(
+                    F.cross_entropy(
+                        logits.float().reshape(-1, model.vocab_size),
+                        score_target.reshape(-1),
+                        reduction="sum",
+                    ).item()
+                )
+                n_scored = int(score_target.numel())
+                bpb = compute_bpb(ce_sum, n_scored)
+                results[n].append(bpb)
+
+    # Average across segments
+    curve: dict[int, float] = {}
+    for n in warmup_tokens:
+        bpbs = results[n]
+        if bpbs:
+            curve[n] = sum(bpbs) / len(bpbs)
+        else:
+            curve[n] = 0.0
+
+    if was_training:
+        model.train()
+    return curve
