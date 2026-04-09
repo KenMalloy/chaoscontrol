@@ -233,7 +233,6 @@ def run_training_grid(data_path: str, budget: float, num_gpus: int):
             proc.wait()
             log_fh.close()
             tmp.unlink(missing_ok=True)
-            completed += 1
             if proc.returncode != 0:
                 tag = f"{cond_name}_s{seed}"
                 failed_path = RESULTS / f"{tag}.failed"
