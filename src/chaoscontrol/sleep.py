@@ -469,28 +469,37 @@ class SleepCycle:
                 self._find_similar_pairs(om, indices, cfg.merge_sim_threshold)
             )
 
-        # Cross-bucket merges (affinity-gated with exploration floor)
-        # Exploration floor ensures the system can discover affinities from
-        # scratch — without it, zero affinity means zero proposals means
-        # affinity never updates (bootstrap problem).
-        EXPLORATION_FLOOR = 0.05
-        already_proposed_ids = {(p["idx_a"], p["idx_b"]) for p in proposals}
+        # Cross-bucket merges (affinity-gated with exploration).
+        # For known-affinity pairs: threshold scales inversely with affinity.
+        # For zero-affinity pairs (exploration): use the standard threshold
+        # so the system can bootstrap — identical cross-bucket slots will
+        # merge, update affinity, and future merges become easier.
+        # Each slot participates in at most one proposal (global constraint).
+        already_used = set()
+        for p in proposals:
+            already_used.add(p["idx_a"])
+            already_used.add(p["idx_b"])
+
         bucket_ids = sorted(bucket_groups.keys())
         for i_pos in range(len(bucket_ids)):
             for j_pos in range(i_pos + 1, len(bucket_ids)):
                 ba, bb = bucket_ids[i_pos], bucket_ids[j_pos]
                 affinity = om.bucket_affinity(ba, bb)
-                effective_affinity = max(affinity, EXPLORATION_FLOOR)
-                cross_threshold = cfg.merge_sim_threshold / effective_affinity
-                if cross_threshold > 1.0:
-                    continue
-                # Only pair slots from DIFFERENT buckets (avoid duplicating
-                # same-bucket proposals from the within-bucket pass above).
+                if affinity > 0.01:
+                    # Known affinity: scale threshold
+                    cross_threshold = cfg.merge_sim_threshold / affinity
+                    if cross_threshold > 1.0:
+                        continue
+                else:
+                    # Exploration: use standard threshold (identical slots
+                    # can still merge, bootstrapping the affinity signal)
+                    cross_threshold = cfg.merge_sim_threshold
+
                 for idx_a in bucket_groups[ba]:
+                    if idx_a in already_used:
+                        continue
                     for idx_b in bucket_groups[bb]:
-                        if (idx_a, idx_b) in already_proposed_ids:
-                            continue
-                        if (idx_b, idx_a) in already_proposed_ids:
+                        if idx_b in already_used:
                             continue
                         sim = F.cosine_similarity(
                             om._slots[idx_a].reshape(1, -1),
@@ -508,7 +517,10 @@ class SleepCycle:
                                 "bucket_a": om._slot_buckets[idx_a],
                                 "bucket_b": om._slot_buckets[idx_b],
                             })
-                            already_proposed_ids.add((idx_a, idx_b))
+                            already_used.add(idx_a)
+                            already_used.add(idx_b)
+                            break  # idx_a is used, move to next
+                    # (inner break only exits idx_b loop; idx_a loop continues)
 
         return proposals
 

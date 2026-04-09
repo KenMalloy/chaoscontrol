@@ -67,6 +67,48 @@ def test_affinity_clusters_chain():
     assert big_cluster == {0, 1, 2}
 
 
+def test_cross_bucket_bootstrap():
+    """Two identical slots in different buckets should produce a cross-bucket proposal."""
+    from chaoscontrol.sleep import SleepCycle, SleepConfig
+
+    om = MultiSlotOuterModel(model_dim=16, outer_dim=8, max_slots=10)
+    # Write two identical slots to different buckets
+    slot_val = torch.randn(1, 1, 16)
+    om.write(slot_val.clone(), bucket_id=0)
+    om.write(slot_val.clone(), bucket_id=1)
+
+    cfg = SleepConfig(stages="n3_only", merge_sim_threshold=0.85)
+    cycle = SleepCycle(cfg)
+
+    # The slots are identical (sim=1.0) so even at exploration threshold (0.85)
+    # they should be proposed for cross-bucket merge
+    proposals = cycle._propose_typed_merges(om, cfg)
+    cross = [p for p in proposals if p["bucket_a"] != p["bucket_b"]]
+    assert len(cross) >= 1, f"Expected cross-bucket proposal, got {proposals}"
+
+
+def test_slot_one_proposal_only():
+    """Each slot participates in at most one merge proposal."""
+    from chaoscontrol.sleep import SleepCycle, SleepConfig
+
+    om = MultiSlotOuterModel(model_dim=16, outer_dim=8, max_slots=10)
+    slot_val = torch.randn(1, 1, 16)
+    # 4 identical slots across 2 buckets
+    for bucket in [0, 0, 1, 1]:
+        om.write(slot_val.clone(), bucket_id=bucket)
+
+    cfg = SleepConfig(stages="n3_only", merge_sim_threshold=0.85)
+    cycle = SleepCycle(cfg)
+
+    proposals = cycle._propose_typed_merges(om, cfg)
+    used_slots = set()
+    for p in proposals:
+        assert p["idx_a"] not in used_slots, f"Slot {p['idx_a']} used twice"
+        assert p["idx_b"] not in used_slots, f"Slot {p['idx_b']} used twice"
+        used_slots.add(p["idx_a"])
+        used_slots.add(p["idx_b"])
+
+
 def test_affinity_serialization():
     om = MultiSlotOuterModel(model_dim=16, outer_dim=8, max_slots=10)
     om._ensure_affinity(4)
