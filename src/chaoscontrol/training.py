@@ -71,6 +71,9 @@ def train_chaoscontrol_for_budget(
     polyphasic_k_awake: int = 3,
     polyphasic_topology: str = "slot_striped",
     polyphasic_swap_interval: int = 256,
+    # Experiment 14: typed KV buffer
+    buffer_mode: str = "legacy",
+    wernicke_enabled: bool = False,
 ) -> dict[str, Any]:
     """Train ChaosStudentLM for a time budget with optional criticality regularization."""
     # Set up structured projections if requested (before optimizer so its params are included)
@@ -238,7 +241,9 @@ def train_chaoscontrol_for_budget(
                             out["jacobian_stats"] = stats_out["jacobian_stats"]
             else:
                 # Cheap deterministic pass (always — MC mode uses this as the base)
-                out = model(inputs, return_jacobian_stats=use_crit)
+                # Experiment 14: pass memory_write_mode to control buffer writes
+                _write_mode = "append_only" if buffer_mode == "append_only" else "none"
+                out = model(inputs, return_jacobian_stats=use_crit, memory_write_mode=_write_mode)
 
             # Monte Carlo path: sample the possibility space on surprise,
             # use distributional stats to weight the gradient — no winner picked
@@ -384,9 +389,11 @@ def train_chaoscontrol_for_budget(
                 })
 
         # Outer model consolidation (after optimizer step)
+        # In append_only mode, writes happen inside forward() via memory_write_mode.
+        # Skip legacy consolidation entirely.
         dominant_bucket: int | None = None
         surprise_ratio_for_latent = 0.0
-        if model.outer_model is not None:
+        if model.outer_model is not None and buffer_mode != "append_only":
             with torch.no_grad():
                 per_sample_ce = F.cross_entropy(
                     out["logits"].detach().reshape(-1, vocab_size),
@@ -463,6 +470,12 @@ def train_chaoscontrol_for_budget(
                 model.outer_model._compression_consequences.clear()
             elif hasattr(model.outer_model, "_compression_consequences"):
                 model.outer_model._compression_consequences.clear()
+        elif model.outer_model is not None and buffer_mode == "append_only":
+            # In append_only mode, extract dominant bucket for downstream use
+            if "bucket_ids" in out:
+                bids = out["bucket_ids"].detach()
+                flat_ids = bids.reshape(-1)
+                dominant_bucket = int(flat_ids.mode().values.item())
 
         # CFR regret update: estimate counterfactual values via short lookahead
         # On fork/MCTS steps, bucket_ids aren't in the output (the gate bypasses

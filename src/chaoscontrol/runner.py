@@ -70,6 +70,15 @@ def build_model(cfg: ChaosControlConfig, device: torch.device, param_dtype: torc
             cue_projection=cfg.cue_projection,
             dynamic_crit_per_layer=cfg.dynamic_crit_per_layer,
             compression_selection=cfg.compression_selection,
+            # Experiment 14 fields
+            buffer_mode=cfg.buffer_mode,
+            retrieval_mode=cfg.retrieval_mode,
+            retrieval_k=cfg.retrieval_k,
+            bucket_prototypes=cfg.bucket_prototypes,
+            prototype_dim=cfg.prototype_dim,
+            prototype_update_rate=cfg.prototype_update_rate,
+            wernicke_layers=cfg.wernicke_layers,
+            wernicke_k_max_fine=cfg.wernicke_k_max_fine,
         )
     model = model.to(device)
     if device.type == "cuda":
@@ -224,6 +233,9 @@ def run_experiment(config_path: str, *, data_path: str, budget_seconds: float = 
         polyphasic_k_awake=cfg.polyphasic_k_awake,
         polyphasic_topology=cfg.polyphasic_topology,
         polyphasic_swap_interval=cfg.polyphasic_swap_interval,
+        # Experiment 14
+        buffer_mode=cfg.buffer_mode,
+        wernicke_enabled=cfg.wernicke_enabled,
     )
 
     # Use the trained structured_proj (not a fresh random one)
