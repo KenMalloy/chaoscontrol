@@ -161,6 +161,25 @@ class TestMultiSlotOuterModel(unittest.TestCase):
         # The high-survival slot should have survived
         assert any(s >= 50.0 for s in om._survival)
 
+    def test_append_kv_batch(self) -> None:
+        om = MultiSlotOuterModel(model_dim=16, outer_dim=32, max_slots=100)
+        encoded = torch.randn(5, 32)  # 5 pre-encoded entries
+        bucket_ids = torch.tensor([0, 1, 2, 0, 1])
+        om.append_kv_batch(encoded, bucket_ids)
+        assert len(om._slots) == 5
+        assert om._slot_buckets == [0, 1, 2, 0, 1]
+        assert all(s == 1.0 for s in om._survival)
+        # Each slot should match the encoded entry
+        for i in range(5):
+            assert torch.allclose(om._slots[i], encoded[i:i+1])
+
+    def test_append_kv_batch_empty(self) -> None:
+        om = MultiSlotOuterModel(model_dim=16, outer_dim=32, max_slots=100)
+        encoded = torch.randn(0, 32)
+        bucket_ids = torch.tensor([], dtype=torch.long)
+        om.append_kv_batch(encoded, bucket_ids)
+        assert len(om._slots) == 0
+
     def test_typed_compression_merges_within_bucket(self) -> None:
         om = MultiSlotOuterModel(model_dim=16, outer_dim=32, max_slots=4, compress_ratio=2)
         # Write slots with different bucket ids

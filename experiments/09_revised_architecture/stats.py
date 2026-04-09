@@ -46,7 +46,7 @@ def _std(values: list[float]) -> float:
     return math.sqrt(_var(values))
 
 
-# ── Welch's t-test ──────────────────────────────────────────────────
+# -- Welch's t-test --
 
 
 def _regularised_incomplete_beta(a: float, b: float, x: float) -> float:
@@ -77,7 +77,7 @@ def _regularised_incomplete_beta(a: float, b: float, x: float) -> float:
     d = 0.0
 
     for m in range(0, MAX_ITER):
-        # Two sub-iterations per m — even and odd numerators
+        # Two sub-iterations per m -- even and odd numerators
         for j in range(2):
             if m == 0 and j == 0:
                 numerator = 1.0  # a_0 = 1
@@ -153,7 +153,7 @@ def welch_ttest(a: list[float], b: list[float]) -> tuple[float, float]:
     return (t_stat, p)
 
 
-# ── Bootstrap CI ────────────────────────────────────────────────────
+# -- Bootstrap CI --
 
 
 def bootstrap_ci(
@@ -184,7 +184,7 @@ def bootstrap_ci(
     return (means[lo_idx], means[hi_idx])
 
 
-# ── Cohen's d ───────────────────────────────────────────────────────
+# -- Cohen's d --
 
 
 def cohens_d(a: list[float], b: list[float]) -> float:

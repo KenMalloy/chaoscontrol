@@ -8,8 +8,9 @@ import torch.nn as nn
 
 from chaoscontrol.core import RMSNorm, FeedForward, ChaosSSMCore
 from chaoscontrol.routing import RichBNN, DistributedB
-from chaoscontrol.memory import OuterModel, MultiSlotOuterModel, SemanticTier, BucketPrototypes
-from chaoscontrol.wernicke import WernickeLayer, HierarchicalWernicke
+from chaoscontrol.memory import OuterModel, MultiSlotOuterModel, SemanticTier
+from chaoscontrol.posterior import GlobalDelta, BucketDelta, ResidualCache
+from chaoscontrol.wernicke import WernickeLayer
 
 
 class ChaosSSMBlock(nn.Module):
@@ -127,16 +128,9 @@ class ChaosStudentLM(nn.Module):
         cue_projection: bool = True,
         dynamic_crit_per_layer: bool = False,
         compression_selection: str = "survival",
-        # Experiment 14: typed KV buffer
-        buffer_mode: str = "legacy",
-        retrieval_mode: str = "softmax_all",
-        retrieval_k: int = 8,
-        bucket_prototypes: bool = False,
-        prototype_dim: int = 64,
-        prototype_update_rate: float = 0.1,
-        # Experiment 14: hierarchical Wernicke
-        wernicke_layers: int = 1,
-        wernicke_k_max_fine: int = 8,
+        posterior_mode: str = "none",
+        posterior_lr: float = 0.01,
+        residual_cache_k: int = 4,
     ) -> None:
         super().__init__()
         self.vocab_size = vocab_size
@@ -228,6 +222,20 @@ class ChaosStudentLM(nn.Module):
                 prototype_dim=prototype_dim,
                 model_dim=dim,
                 update_rate=prototype_update_rate,
+            )
+
+        # Phase D: posterior-state module
+        self.posterior: GlobalDelta | BucketDelta | ResidualCache | None = None
+        self.posterior_mode = posterior_mode
+        if posterior_mode == "global_delta":
+            self.posterior = GlobalDelta(dim, lr=posterior_lr)
+        elif posterior_mode == "bucket_delta":
+            self.posterior = BucketDelta(
+                k_max=wernicke_k_max, model_dim=dim, lr=posterior_lr,
+            )
+        elif posterior_mode == "residual_cache":
+            self.posterior = ResidualCache(
+                model_dim=dim, k=residual_cache_k,
             )
 
         # Gap-analysis flags
@@ -412,6 +420,27 @@ class ChaosStudentLM(nn.Module):
                 all_stats.append(stats)
             else:
                 x = result
+
+        # Phase D: posterior read — add correction bias after SSM recurrence,
+        # before LM head. The posterior update happens AFTER loss computation
+        # in the training loop (same pattern as buffer writes).
+        if self.posterior is not None:
+            if isinstance(self.posterior, GlobalDelta):
+                posterior_bias = self.posterior.read(x.size(0))
+                x = x + posterior_bias.unsqueeze(1)
+            elif isinstance(self.posterior, BucketDelta) and bucket_ids is not None:
+                # Use dominant bucket for the posterior read
+                flat_ids = bucket_ids.reshape(-1)
+                dominant = int(flat_ids.mode().values.item())
+                posterior_bias = self.posterior.read(
+                    bucket_id=dominant, batch_size=x.size(0),
+                )
+                x = x + posterior_bias.unsqueeze(1)
+            elif isinstance(self.posterior, ResidualCache):
+                # Use mean-pooled hidden as query context
+                query = x.detach().mean(dim=1)  # (batch, dim)
+                posterior_bias = self.posterior.read(query)
+                x = x + posterior_bias.unsqueeze(1)
 
         hidden = x
         x = self.final_norm(x)

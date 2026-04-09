@@ -1,3 +1,5 @@
+import pytest
+
 from chaoscontrol.config import ChaosControlConfig
 
 def test_defaults():
@@ -8,6 +10,10 @@ def test_defaults():
     assert cfg.model_type == "ssm"
     assert cfg.semantic_tier_bases == 0
     assert cfg.generation_mode == "noise"
+    assert cfg.retrieval_mode == "softmax_all"
+    assert cfg.posterior_mode == "none"
+    assert cfg.posterior_lr == 0.01
+    assert cfg.residual_cache_k == 4
 
 def test_all_a_modes():
     for mode in ("diag", "paired", "full"):
@@ -23,11 +29,24 @@ def test_model_type():
     cfg = ChaosControlConfig(data_path="/tmp", model_type="transformer")
     assert cfg.model_type == "transformer"
 
-def test_tokenizer_fields():
-    cfg = ChaosControlConfig(
-        data_path="/tmp",
-        tokenizer_type="fixed_stride",
-        tokenizer_codebook_size=512,
-    )
-    assert cfg.tokenizer_type == "fixed_stride"
-    assert cfg.tokenizer_codebook_size == 512
+
+def test_valid_retrieval_modes():
+    for mode in ("softmax_all", "bucket_mean", "bucket_recent", "bucket_topk"):
+        cfg = ChaosControlConfig(enwik8_path="/tmp", retrieval_mode=mode)
+        assert cfg.retrieval_mode == mode
+
+
+def test_invalid_retrieval_mode():
+    with pytest.raises(ValueError, match="retrieval_mode must be one of"):
+        ChaosControlConfig(enwik8_path="/tmp", retrieval_mode="invalid_mode")
+
+
+def test_valid_posterior_modes():
+    for mode in ("none", "global_delta", "bucket_delta", "residual_cache"):
+        cfg = ChaosControlConfig(enwik8_path="/tmp", posterior_mode=mode)
+        assert cfg.posterior_mode == mode
+
+
+def test_invalid_posterior_mode():
+    with pytest.raises(ValueError, match="posterior_mode must be one of"):
+        ChaosControlConfig(enwik8_path="/tmp", posterior_mode="bad")

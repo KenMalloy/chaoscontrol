@@ -1,4 +1,8 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+
+
+_VALID_RETRIEVAL_MODES = ("softmax_all", "bucket_mean", "bucket_recent", "bucket_topk")
+_VALID_POSTERIOR_MODES = ("none", "global_delta", "bucket_delta", "residual_cache")
 
 
 @dataclass
@@ -97,50 +101,22 @@ class ChaosControlConfig:
     dynamic_crit_per_layer: bool = False
     compression_selection: str = "survival"  # "survival" or "random" — controls slot merge ordering
 
-    # Tokenizer configuration
-    tokenizer_type: str = "none"  # "none", "fixed_stride", (future: "learned_boundary", "attn_pool")
-    tokenizer_stride: int = 4
-    tokenizer_byte_dim: int = 64
-    tokenizer_token_dim: int = 128
-    tokenizer_codebook_size: int = 1024
-    tokenizer_beta: float = 0.25  # VQ commitment loss weight
+    # Retrieval mode for typed buffer (Exp 14)
+    retrieval_mode: str = "softmax_all"  # "softmax_all", "bucket_mean", "bucket_recent", "bucket_topk"
 
-    # Codebook alignment (tokenizer <-> Wernicke)
-    align_type: str = "none"  # "none", "contrastive", "diversity", "distillation"
-    align_weight: float = 0.05
+    # Phase D: posterior-state options
+    posterior_mode: str = "none"  # "none", "global_delta", "bucket_delta", "residual_cache"
+    posterior_lr: float = 0.01
+    residual_cache_k: int = 4
 
-    # Sleep cycle (structured memory consolidation)
-    sleep_enabled: bool = False
-    sleep_stages: str = "full_cycle"  # "n3_only", "n2_n3", "n2_n3_rem_base", "n2_n3_rem_validate", "n2_n3_rem_cfr", "n2_n3_rem_reactivate", "n2_n3_rem_all", "full_cycle"
-    sleep_wake_ratio: int = 2
-    sleep_interval: int = 256
-    sleep_budget: int = 128
-    sleep_n2_budget: int = 64
-    sleep_rem_budget: int = 64
-    sleep_n2_batches: int = 8
-    sleep_rem_dreams: int = 4
-    sleep_rem_length: int = 128
-    sleep_merge_sim_threshold: float = 0.85
-    sleep_survival_floor: float = 0.1
-    sleep_rem_reactivate: bool = True  # REM attempts latent trace recovery on poor dreams
-    sleep_adaptive_fatigue: bool = False
-
-    # Polyphasic partitioned sleep
-    polyphasic_enabled: bool = False
-    polyphasic_n_partitions: int = 4
-    polyphasic_k_awake: int = 3
-    polyphasic_topology: str = "slot_striped"  # "slot_striped", "bucket_owned", "bucket_striped"
-    polyphasic_swap_interval: int = 256
-
-    # Experiment 14: typed KV buffer
-    buffer_mode: str = "legacy"           # "legacy" | "append_only"
-    retrieval_mode: str = "softmax_all"   # "softmax_all" | "bucket_mean" | "bucket_recent" | "bucket_topk"
-    retrieval_k: int = 8                  # k for bucket_recent and bucket_topk
-    bucket_prototypes: bool = False       # per-bucket semantic prototypes
-    prototype_dim: int = 64               # dimension for bucket prototypes
-    prototype_update_rate: float = 0.1    # EMA update rate for prototypes
-
-    # Experiment 14: hierarchical Wernicke
-    wernicke_layers: int = 1              # 1 = flat (current), 2 = hierarchical
-    wernicke_k_max_fine: int = 8          # fine-grained buckets per coarse bucket (hier only)
-
+    def __post_init__(self) -> None:
+        if self.retrieval_mode not in _VALID_RETRIEVAL_MODES:
+            raise ValueError(
+                f"retrieval_mode must be one of {_VALID_RETRIEVAL_MODES}, "
+                f"got {self.retrieval_mode!r}"
+            )
+        if self.posterior_mode not in _VALID_POSTERIOR_MODES:
+            raise ValueError(
+                f"posterior_mode must be one of {_VALID_POSTERIOR_MODES}, "
+                f"got {self.posterior_mode!r}"
+            )

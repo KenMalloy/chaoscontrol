@@ -17,8 +17,7 @@ from chaoscontrol.core import criticality_loss
 from chaoscontrol.data import batch_from_starts, maybe_autocast, maybe_sync_cuda
 from chaoscontrol.metabolic import metabolic_fork, metabolic_monte_carlo, StructuredProjections
 from chaoscontrol.memory import MultiSlotOuterModel
-from chaoscontrol.wake_cache import WakeCache
-from chaoscontrol.sleep import SleepCycle, SleepConfig
+from chaoscontrol.posterior import GlobalDelta, BucketDelta, ResidualCache
 
 
 def train_chaoscontrol_for_budget(
@@ -551,56 +550,35 @@ def train_chaoscontrol_for_budget(
             recent_decoded = model.outer_model.decoder(recent_slots)
             model.semantic_tier.consolidate_from_episodes(recent_decoded)
 
-        # Store bucket for next step's CFR bias (one-step delayed)
-        prev_dominant_bucket = dominant_bucket
+        # Phase D: posterior-state update (after loss computation, not in forward)
+        # Uses hidden state mean as the prediction error gradient direction.
+        posterior = getattr(model, "posterior", None)
+        if posterior is not None and "hidden" in out:
+            with torch.no_grad():
+                # Compute per-token prediction error gradient direction:
+                # mean of hidden states weighted by per-token CE
+                h = out["hidden"].detach()  # (batch, seq, dim)
+                per_tok_ce = F.cross_entropy(
+                    out["logits"].detach().reshape(-1, vocab_size),
+                    targets.reshape(-1),
+                    reduction="none",
+                ).reshape(inputs.size(0), -1)  # (batch, seq)
+                # Error-weighted mean hidden as gradient direction
+                weights = per_tok_ce / per_tok_ce.sum().clamp_min(1e-8)
+                error_grad = (weights.unsqueeze(-1) * h).sum(dim=(0, 1))  # (dim,)
 
-        # Wake cache: record high-signal moments for sleep
-        if wake_cache is not None:
-            wake_steps_since_sleep += 1
-            wake_cache.push_hidden(out["hidden"].detach())
-            # Record moments with surprise above half the gate threshold
-            surprise_for_cache = surprise_ratio_for_latent if model.outer_model is not None else surprise_ratio
-            if abs(surprise_for_cache) > current_threshold * 0.5:
-                wake_cache.record_moment(
-                    surprise=surprise_for_cache,
-                    inputs=inputs,
-                    targets=targets,
-                    hidden=out["hidden"],
-                    bucket_ids=out.get("bucket_ids"),
-                    slot_cues=out["hidden"][:, -1, :] if out["hidden"].ndim == 3 else None,
-                )
-            if "bucket_ids" in out:
-                wake_cache.update_bucket_counts(out["bucket_ids"])
-
-            # Polyphasic scheduler: step every training step (not just sleep triggers)
-            if scheduler is not None:
-                swapped = scheduler.step()
-                if swapped:
-                    step_record["polyphasic_swap"] = True
-
-            # Sleep trigger: fixed interval
-            if wake_steps_since_sleep >= sleep_interval:
-                if scheduler is not None:
-                    # Polyphasic: run scoped sleep on each sleeping partition
-                    sleep_diags = []
-                    for p in scheduler.sleeping():
-                        sleep_diag = sleep_cycle.run(
-                            model, wake_cache,
-                            device=device, regret_table=regret_table,
-                            partition=p,
-                        )
-                        sleep_diags.append(sleep_diag)
-                    step_record["sleep"] = sleep_diags
-                else:
-                    # Global offline sleep (existing behavior)
-                    sleep_diag = sleep_cycle.run(
-                        model, wake_cache,
-                        device=device, regret_table=regret_table,
-                    )
-                    step_record["sleep"] = sleep_diag
-                sleep_cycles_run += 1
-                wake_steps_since_sleep = 0
-                wake_cache.clear()
+                if isinstance(posterior, GlobalDelta):
+                    posterior.update(error_grad)
+                elif isinstance(posterior, BucketDelta):
+                    # Update the dominant bucket
+                    bucket_id = 0
+                    if "bucket_ids" in out:
+                        flat_ids = out["bucket_ids"].detach().reshape(-1)
+                        bucket_id = int(flat_ids.mode().values.item())
+                    posterior.update(bucket_id, error_grad)
+                elif isinstance(posterior, ResidualCache):
+                    context_key = h.mean(dim=(0, 1))  # (dim,)
+                    posterior.store(context_key, error_grad)
 
         history.append(step_record)
         steps += 1

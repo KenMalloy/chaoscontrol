@@ -74,9 +74,12 @@ def _base(**overrides) -> dict:
 # -- T2: Retrieval mode x capacity --
 
 T2_CONDITIONS = {
+    # softmax_all_32 uses legacy buffer_mode intentionally as the
+    # current-system baseline — this is the exp 9/11/13 architecture
+    # with softmax over all slots, NOT the new typed-bucket retrieval.
     "softmax_all_32": _base(
         outer_max_slots=32, retrieval_mode="softmax_all",
-        buffer_mode="legacy",  # legacy uses softmax over all slots
+        buffer_mode="legacy",
     ),
     "softmax_all_uncapped": _base(
         outer_max_slots=0, retrieval_mode="softmax_all",
@@ -108,6 +111,17 @@ def _expert_dim_for_k(k_max: int, target_params: int = 16 * 128) -> int:
     return max(8, target_params // k_max)
 
 
+def _expert_dim_for_hier(k_coarse: int, k_fine: int, target_params: int = 16 * 128) -> int:
+    """Scale expert_dim for hierarchical configs based on total expert count.
+
+    For hierarchical routing, the total number of experts is k_coarse + k_fine
+    (coarse-layer experts plus fine-layer experts). Scale expert_dim inversely
+    with that total to keep the parameter budget approximately constant.
+    """
+    total_experts = k_coarse + k_fine
+    return max(8, target_params // total_experts)
+
+
 T3_CONDITIONS = {
     "flat_8": _base(
         wernicke_k_max=8,
@@ -128,14 +142,14 @@ T3_CONDITIONS = {
         wernicke_layers=2,
         wernicke_k_max=8,
         wernicke_k_max_fine=8,
-        wernicke_expert_dim=_expert_dim_for_k(8),
+        wernicke_expert_dim=_expert_dim_for_hier(8, 8),
         retrieval_mode="bucket_topk", retrieval_k=8,
     ),
     "hier_8x32": _base(
         wernicke_layers=2,
         wernicke_k_max=8,
         wernicke_k_max_fine=32,
-        wernicke_expert_dim=_expert_dim_for_k(8),
+        wernicke_expert_dim=_expert_dim_for_hier(8, 32),
         retrieval_mode="bucket_topk", retrieval_k=8,
     ),
 }
@@ -159,7 +173,75 @@ T6_CONDITIONS = {
         "batch_size": 32, "base_lr": 2e-3,
     },
 }
-# claim1_winner and current_best will be added dynamically after Phase A
+# claim1_winner, current_best, and full_winner are injected dynamically
+# by inject_dynamic_t6_conditions() before running Phase C.
+
+
+# -- Dynamic T6 condition injection from Phase A results --
+
+def inject_dynamic_t6_conditions() -> None:
+    """Load Phase A results and inject dynamic T6 conditions.
+
+    1. Load T2 and T3 summary JSONs to identify winners.
+    2. Build claim1_winner from combining T2 retrieval winner + T3 structure winner.
+    3. Build current_best from exp 9/11/13 hardcoded winners.
+    4. If Phase B results exist, build full_winner from claim1 + T5 winner.
+    5. Inject all into T6_CONDITIONS.
+    """
+    t2_summary_path = RESULTS / "t2_retrieval_mode_x_capacity_summary.json"
+    t3_summary_path = RESULTS / "t3_wernicke_structure_summary.json"
+
+    t2_winner_name = None
+    t3_winner_name = None
+
+    if t2_summary_path.exists():
+        with open(t2_summary_path) as f:
+            t2_summary = json.load(f)
+        t2_winner_name = min(t2_summary, key=lambda c: t2_summary[c]["mean_bpb"])
+        print(f"  T2 winner: {t2_winner_name} ({t2_summary[t2_winner_name]['mean_bpb']:.4f} bpb)")
+
+    if t3_summary_path.exists():
+        with open(t3_summary_path) as f:
+            t3_summary = json.load(f)
+        t3_winner_name = min(t3_summary, key=lambda c: t3_summary[c]["mean_bpb"])
+        print(f"  T3 winner: {t3_winner_name} ({t3_summary[t3_winner_name]['mean_bpb']:.4f} bpb)")
+
+    # Build claim1_winner: combine T2 retrieval mode + T3 Wernicke structure
+    if t2_winner_name and t3_winner_name:
+        t2_config = T2_CONDITIONS.get(t2_winner_name, {})
+        t3_config = T3_CONDITIONS.get(t3_winner_name, {})
+        claim1 = dict(_base())
+        # Take retrieval settings from T2 winner
+        for key in ("retrieval_mode", "retrieval_k", "outer_max_slots"):
+            if key in t2_config:
+                claim1[key] = t2_config[key]
+        # Take Wernicke structure from T3 winner
+        for key in ("wernicke_k_max", "wernicke_k_max_fine", "wernicke_layers",
+                     "wernicke_expert_dim"):
+            if key in t3_config:
+                claim1[key] = t3_config[key]
+        T6_CONDITIONS["claim1_winner"] = claim1
+
+    # Build current_best: hardcoded from exp 9/11/13 winners
+    T6_CONDITIONS["current_best"] = _base(
+        outer_max_slots=32,
+        retrieval_mode="softmax_all",
+        buffer_mode="legacy",
+        wernicke_k_max=16,
+        semantic_tier_bases=8,
+    )
+
+    # Build full_winner if Phase B (T5) results exist
+    t5_summary_path = RESULTS / "t5_developmental_fast_weights_summary.json"
+    if t5_summary_path.exists() and "claim1_winner" in T6_CONDITIONS:
+        with open(t5_summary_path) as f:
+            t5_summary = json.load(f)
+        t5_winner_name = min(t5_summary, key=lambda c: t5_summary[c]["mean_bpb"])
+        print(f"  T5 winner: {t5_winner_name} ({t5_summary[t5_winner_name]['mean_bpb']:.4f} bpb)")
+        full = dict(T6_CONDITIONS["claim1_winner"])
+        # Add T5 fast weight settings if applicable
+        full["_t5_winner"] = t5_winner_name
+        T6_CONDITIONS["full_winner"] = full
 
 
 # -- Launch and grid helpers --
@@ -261,7 +343,13 @@ def run_grid(conditions: dict, seeds: list[int], data_path: str, budget: float, 
                 bpb = result.get("eval", {}).get("bpb", "?")
                 steps = result.get("train", {}).get("steps", "?")
                 params = result.get("params", "?")
-                print(f"    {cond_name} seed={seed}: bpb={bpb}  steps={steps}  params={params}")
+                warming = result.get("warming_curve", {})
+                warming_str = ""
+                if warming:
+                    warming_str = "  warming=[" + ", ".join(
+                        f"{n}:{b:.3f}" for n, b in sorted(warming.items(), key=lambda x: int(x[0]))
+                    ) + "]"
+                print(f"    {cond_name} seed={seed}: bpb={bpb}  steps={steps}  params={params}{warming_str}")
 
         print(f"  [{completed}/{total}]")
 
@@ -387,6 +475,38 @@ def print_summary(conditions: dict, label: str):
     print(f"  Summary saved to {summary_path}")
 
 
+def _identify_t6_winner_and_baseline() -> tuple[str | None, dict | None, str | None, dict | None]:
+    """Find the T6 winner (lowest mean bpb) and strongest baseline.
+
+    Returns (winner_name, winner_config, baseline_name, baseline_config).
+    Baselines are bare_ssm and transformer.
+    """
+    results = _load_results()
+    baseline_names = {"bare_ssm", "transformer"}
+
+    cond_means: dict[str, float] = {}
+    for cond_name in T6_CONDITIONS:
+        seed_data = results.get(cond_name, {})
+        if seed_data:
+            bpbs = [seed_data[s]["eval"]["bpb"] for s in sorted(seed_data.keys())]
+            cond_means[cond_name] = sum(bpbs) / len(bpbs)
+
+    if not cond_means:
+        return None, None, None, None
+
+    # Winner: lowest bpb across ALL conditions
+    winner_name = min(cond_means, key=cond_means.get)
+
+    # Strongest baseline: lowest bpb among baselines
+    baseline_means = {c: m for c, m in cond_means.items() if c in baseline_names}
+    baseline_name = min(baseline_means, key=baseline_means.get) if baseline_means else None
+
+    return (
+        winner_name, T6_CONDITIONS.get(winner_name),
+        baseline_name, T6_CONDITIONS.get(baseline_name) if baseline_name else None,
+    )
+
+
 def print_t7_confirmation(conditions: dict):
     """Print T7 confirmation results with locked statistical test.
 
@@ -449,6 +569,10 @@ def main():
             print_summary(T3_CONDITIONS, "T3 Wernicke Structure")
             print(f"\n  Phase A wall time: {(time.time() - t0)/60:.1f} min")
 
+    if args.phase == "B":
+        print("\n  Phase B (developmental fast weights) is deferred. Run after Phase A results.")
+        return
+
     if args.phase in ("C", "all"):
         if args.dry_run:
             print(f"\n  Phase C (T6): {len(T6_CONDITIONS)} base conditions x {len(SWEEP_SEEDS)} seeds")
@@ -456,9 +580,29 @@ def main():
             for name in T6_CONDITIONS:
                 print(f"    T6: {name}")
             return
+
         t0 = time.time()
+
+        # Inject dynamic T6 conditions from Phase A results
+        print("\n  Injecting dynamic T6 conditions from Phase A results...")
+        inject_dynamic_t6_conditions()
+
         run_grid(T6_CONDITIONS, SWEEP_SEEDS, args.data_path, args.budget, args.num_gpus, "T6")
         print_summary(T6_CONDITIONS, "T6 Composition")
+
+        # T7: Identify T6 winner and strongest baseline, run confirmation
+        winner_name, winner_config, baseline_name, baseline_config = _identify_t6_winner_and_baseline()
+        if winner_name and baseline_name and winner_config and baseline_config:
+            t7_conditions = {
+                f"t7_{winner_name}": winner_config,
+                f"t7_{baseline_name}": baseline_config,
+            }
+            print(f"\n  T7 contrast: {winner_name} vs {baseline_name}")
+            run_grid(t7_conditions, T7_SEEDS, args.data_path, args.budget, args.num_gpus, "T7")
+            print_t7_confirmation(t7_conditions)
+        else:
+            print("\n  T7 skipped: insufficient T6 results to identify winner and baseline.")
+
         print(f"\n  Phase C wall time: {(time.time() - t0)/60:.1f} min")
 
     total_elapsed = 0

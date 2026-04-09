@@ -261,6 +261,18 @@ class MultiSlotOuterModel(nn.Module):
         # Updated during sleep: committed merges increase affinity, rejected decrease.
         self._bucket_affinity: torch.Tensor | None = None  # (n_buckets, n_buckets), lazy init
 
+    def append_kv_batch(self, encoded_batch: torch.Tensor, bucket_ids: torch.Tensor) -> None:
+        """Append multiple KV pairs at once, avoiding per-iteration encode overhead.
+
+        Args:
+            encoded_batch: (N, outer_dim) pre-encoded KV pairs.
+            bucket_ids: (N,) integer bucket assignments for each pair.
+        """
+        for i in range(encoded_batch.shape[0]):
+            self._slots.append(encoded_batch[i:i + 1].detach())
+            self._survival.append(1.0)
+            self._slot_buckets.append(int(bucket_ids[i].item()))
+
     def get_extra_state(self) -> dict:
         """Persist slots, survival scores, bucket assignments, latent traces, and affinity."""
         state = {
