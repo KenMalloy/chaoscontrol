@@ -315,7 +315,8 @@ That can be tested cleanly — provided we deconfound the mechanism from capacit
 
 The primary experiment varies **only the sleep scheduling mode**. Everything else is held constant:
 
-- **Total semantic capacity**: 64 slots, 64 latent traces, 16 bases, 16 buckets (fixed across all conditions)
+- **Total semantic capacity**: 64 slots, 64 latent traces, 16 bases (fixed across all conditions)
+- **Bucket count (k_max)**: inherited from k_max sweep winner (default 16 until sweep completes). Higher k_max makes sleeping partitions' offline fraction more granular but does not change the 1/N offline ratio. A small k_max interaction check (k16 vs k_winner) should follow the primary comparison.
 - **Cross-partition read policy**: read-only summary (locked)
 - **Swap interval**: 256 steps (locked)
 - **Sleep payload**: inherited from Experiment 11 winner (locked)

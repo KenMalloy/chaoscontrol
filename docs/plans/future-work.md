@@ -57,7 +57,9 @@ Starts uniform (no opinion). Over time, the system discovers which semantic doma
 - Sleep N2 scoring becomes cheaper per bucket but covers more buckets
 - Wernicke codebook grows proportionally
 
-**Test:** k_max sweep: 16 → 32 → 64 → 128, fixed total parameters. If bpb improves with more buckets at the same param count, specialization > capacity per expert.
+**Test:** k_max sweep: 16 → 32 → 64, approximately parameter-controlled via `wernicke_expert_dim` bottleneck (expert params held at ~262K; router grows linearly with k_max, adding ~6K residual). Already wired in `experiments/baselines/run_mamba2_baseline.py`. If bpb improves with more buckets at roughly the same param count, specialization > capacity per expert.
+
+**Dependency:** Polyphasic sleep (experiment 12) should inherit the winning k_max from this sweep, with a small interaction check (k16 vs k_winner).
 
 ---
 
