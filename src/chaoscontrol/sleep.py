@@ -323,18 +323,14 @@ class SleepCycle:
         device: torch.device | str,
     ) -> float:
         """Run batches through model and return mean cross-entropy."""
+        from chaoscontrol.data import maybe_autocast
         total_ce = 0.0
         count = 0
-        # Autocast to match model dtype (bf16 on CUDA, float32 on CPU).
-        # Without this, cached float32 moments crash against bf16 model weights.
+        dev = device if isinstance(device, torch.device) else torch.device(device)
         param_dtype = next(model.parameters()).dtype
-        use_amp = (isinstance(device, torch.device) and device.type == "cuda") or (isinstance(device, str) and device.startswith("cuda"))
         with torch.no_grad():
             for inputs, targets in batches:
-                if use_amp:
-                    with torch.amp.autocast("cuda", dtype=param_dtype):
-                        out = model(inputs)
-                else:
+                with maybe_autocast(dev, param_dtype):
                     out = model(inputs)
                 logits = out["logits"].float()  # CE needs float32
                 # Flatten for cross-entropy

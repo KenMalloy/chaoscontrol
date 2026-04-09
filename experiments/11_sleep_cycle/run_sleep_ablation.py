@@ -210,8 +210,9 @@ def run_training_grid(data_path: str, budget: float, num_gpus: int):
                 queue.append((cond_name, cond_config, seed))
 
     total = len(CONDITIONS) * len(SEEDS)
-    completed = total - len(queue)
-    print(f"\n  {len(queue)} runs pending, {completed} already done, {total} total")
+    succeeded = total - len(queue)
+    n_failed = len(list(RESULTS.glob("*.failed")))
+    print(f"\n  {len(queue)} runs pending, {succeeded} succeeded, {n_failed} previously failed, {total} total")
     print(f"  {num_gpus} GPUs, ~{len(queue) // num_gpus + (1 if len(queue) % num_gpus else 0)} batches")
 
     for batch_start in range(0, len(queue), num_gpus):
@@ -234,6 +235,16 @@ def run_training_grid(data_path: str, budget: float, num_gpus: int):
             tmp.unlink(missing_ok=True)
             completed += 1
             if proc.returncode != 0:
+                tag = f"{cond_name}_s{seed}"
+                failed_path = RESULTS / f"{tag}.failed"
+                log_path = RESULTS / f"{tag}.log"
+                error_tail = ""
+                if log_path.exists():
+                    error_tail = log_path.read_text()[-500:]
+                failed_path.write_text(json.dumps({
+                    "condition": cond_name, "seed": seed,
+                    "exit_code": proc.returncode, "error_tail": error_tail,
+                }))
                 print(f"    FAILED: {cond_name} seed={seed} (exit {proc.returncode})")
                 continue
             if out_path.exists():
@@ -243,7 +254,9 @@ def run_training_grid(data_path: str, budget: float, num_gpus: int):
                 steps = result["train"]["steps"]
                 print(f"    {cond_name} seed={seed}: bpb={bpb:.4f}  steps={steps}")
 
-        print(f"  [{completed}/{total}]")
+        n_json = len(list(RESULTS.glob("*.json"))) - (1 if (RESULTS / "sleep_summary.json").exists() else 0)
+        n_fail = len(list(RESULTS.glob("*.failed")))
+        print(f"  [{n_json} succeeded, {n_fail} failed / {total} total]")
 
     _print_summary()
 

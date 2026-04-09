@@ -203,6 +203,16 @@ def run_training_grid(data_path: str, budget: float, num_gpus: int):
             tmp.unlink(missing_ok=True)
             completed += 1
             if proc.returncode != 0:
+                tag = f"{cond_name}_s{seed}"
+                failed_path = RESULTS / f"{tag}.failed"
+                log_path = RESULTS / f"{tag}.log"
+                error_tail = ""
+                if log_path.exists():
+                    error_tail = log_path.read_text()[-500:]
+                failed_path.write_text(json.dumps({
+                    "condition": cond_name, "seed": seed,
+                    "exit_code": proc.returncode, "error_tail": error_tail,
+                }))
                 print(f"    FAILED: {cond_name} seed={seed} (exit {proc.returncode})")
                 continue
             if out_path.exists():
