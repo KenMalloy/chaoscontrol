@@ -374,6 +374,77 @@ class MultiSlotOuterModel(nn.Module):
         h_pooled = (h_seq * weights.unsqueeze(0).unsqueeze(-1)).sum(dim=1)
         self.write(h_pooled, per_sample_weights=per_sample_weights, bucket_id=bucket_id)
 
+    def read_bucket(
+        self,
+        batch_size: int,
+        bucket_id: int,
+        mode: str = "bucket_mean",
+        k: int = 8,
+        cue: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Retrieve from a specific Wernicke bucket using the specified mode.
+
+        All modes return tensors decoded to model_dim (via self.decoder),
+        not outer_dim. This is critical -- the model stream operates in
+        model_dim space.
+
+        Modes:
+          bucket_mean   -- mean of all entries in the bucket
+          bucket_recent -- mean of last k entries in the bucket
+          bucket_topk   -- softmax-weighted top-k by dot product with cue
+          softmax_all   -- softmax over ALL slots (ignores bucket_id)
+        """
+        device = self.decoder.weight.device
+        dtype = self.decoder.weight.dtype
+
+        if not self._slots:
+            return torch.zeros(batch_size, self.model_dim, device=device)
+
+        if mode == "softmax_all":
+            # Use all slots regardless of bucket -- baseline mode
+            slot_matrix = torch.cat(self._slots, dim=0).to(dtype=dtype)  # (n, outer_dim)
+            if cue is not None:
+                q = cue[0:1].to(dtype=dtype)  # (1, outer_dim)
+                scores = (slot_matrix @ q.T).squeeze(-1)  # (n,)
+                weights = torch.softmax(scores, dim=0)  # (n,)
+                retrieved = (weights.unsqueeze(-1) * slot_matrix).sum(dim=0, keepdim=True)
+            else:
+                retrieved = slot_matrix.mean(dim=0, keepdim=True)
+            decoded = self.decoder(retrieved)  # (1, model_dim)
+            return decoded.expand(batch_size, -1)
+
+        # Gather slots belonging to this bucket
+        indices = [i for i, b in enumerate(self._slot_buckets) if b == bucket_id]
+        if not indices:
+            return torch.zeros(batch_size, self.model_dim, device=device)
+
+        bucket_slots = torch.cat([self._slots[i] for i in indices], dim=0).to(dtype=dtype)  # (n, outer_dim)
+
+        if mode == "bucket_mean":
+            retrieved = bucket_slots.mean(dim=0, keepdim=True)  # (1, outer_dim)
+
+        elif mode == "bucket_recent":
+            recent = bucket_slots[-k:]  # last k entries
+            retrieved = recent.mean(dim=0, keepdim=True)  # (1, outer_dim)
+
+        elif mode == "bucket_topk":
+            if cue is None:
+                raise ValueError("bucket_topk requires a cue tensor")
+            q = cue[0:1].to(dtype=dtype)  # (1, outer_dim)
+            scores = (bucket_slots @ q.T).squeeze(-1)  # (n,)
+            topk_idx = scores.topk(min(k, len(scores))).indices
+            topk_slots = bucket_slots[topk_idx]  # (k, outer_dim)
+            topk_scores = scores[topk_idx]
+            weights = torch.softmax(topk_scores, dim=0)  # (k,)
+            retrieved = (weights.unsqueeze(-1) * topk_slots).sum(dim=0, keepdim=True)
+
+        else:
+            raise ValueError(f"Unknown retrieval mode: {mode}")
+
+        # Fix 1: decode from outer_dim to model_dim before returning
+        decoded = self.decoder(retrieved)  # (1, model_dim)
+        return decoded.expand(batch_size, -1)
+
     def append_kv(self, encoded: torch.Tensor, bucket_id: int | None = None) -> None:
         """Unconditional append -- no surprise gating, no compression if unlimited.
 
