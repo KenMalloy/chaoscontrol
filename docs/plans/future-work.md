@@ -2,6 +2,14 @@
 
 Ideas that emerged during the sleep cycle and polyphasic design sessions (2026-04-08). Ordered roughly by scientific priority, not implementation difficulty.
 
+## Already Implemented (not future work — listed for reference)
+
+- **Polyphasic partitioned sleep** — K-of-N scheduling, 3 topologies, partition-scoped sleep. Code in `partition.py`, integrated into training loop. Experiment 12 runner ready.
+- **k_max sweep** — param-controlled via `wernicke_expert_dim` bottleneck. Wired in `experiments/baselines/run_mamba2_baseline.py`.
+- **Adaptive sleep triggers (fatigue system)** — implemented in `fatigue.py`, disabled in experiments. Enable after experiment 11 confirms which stages help.
+- **Adaptive sleep triggers (fatigue system)** — implemented in `fatigue.py`, disabled in experiments. Needs a follow-up experiment after exp 11 confirms which stages help: does fatigue-based triggering beat fixed interval? High priority — the model should sleep when it's tired, not on a schedule.
+- **Mamba-2 baseline** — `Mamba2LM` in `baselines.py`, wired in runner. Waiting for H100-ready architecture before running.
+
 ---
 
 ## 1. Trunk Scaling (Cerebellum Hypothesis)
@@ -10,13 +18,20 @@ Ideas that emerged during the sleep cycle and polyphasic design sessions (2026-0
 
 **Hypothesis:** Disproportionately scaling the SSM trunk (more layers, wider state) while keeping the semantic engine at current size will improve bpb more than scaling the semantic engine.
 
-**Test:** Trunk-scaling sweep at fixed semantic capacity:
+**Test A (scaling):** Trunk-scaling sweep at fixed semantic capacity:
 - dim=128/4L (current) vs dim=256/4L vs dim=128/8L vs dim=256/8L
 - All with identical memory config (64 slots, 16 buckets, same sleep)
 - Fixed 600s budget
 - If wider/deeper trunk wins despite fewer training steps (bigger model = slower per step), the cerebellum hypothesis holds
 
-**Biological basis:** Herculano-Houzel et al. 2014, Doya 1999
+**Test B (reallocation):** Fixed total param budget, shift allocation:
+- Current: ~60% trunk, ~30% semantic, ~10% routing
+- Elephant-inspired: ~85% trunk, ~10% semantic, ~5% routing
+- Same total parameter count, same training budget
+
+Test A asks "does a bigger trunk help?" Test B asks "does *reallocating* from semantic to trunk help?" They can share a grid.
+
+**Biological basis:** Herculano-Houzel et al. 2014 (elephant cerebellum 97.5%), Doya 1999 (cerebellum as supervised prediction engine)
 
 ---
 
@@ -44,26 +59,7 @@ Starts uniform (no opinion). Over time, the system discovers which semantic doma
 
 ---
 
-## 3. Microzone Scaling (More Experts)
-
-**Observation:** The cerebellum has ~5,000 independent microzones. We have 16 Wernicke buckets. That's 300× fewer.
-
-**Hypothesis:** Scaling from 16 to 64, 256, or more experts — each smaller — improves prediction quality by allowing finer-grained specialization.
-
-**Considerations:**
-- More buckets = more experts = smaller per-expert capacity
-- The synergy matrix grows as N² — at 256 buckets it's 65K floats (still tiny)
-- Memory slots distribute more finely across more buckets — each bucket's slot pool shrinks
-- Sleep N2 scoring becomes cheaper per bucket but covers more buckets
-- Wernicke codebook grows proportionally
-
-**Test:** k_max sweep: 16 → 32 → 64, approximately parameter-controlled via `wernicke_expert_dim` bottleneck (expert params held at ~262K; router grows linearly with k_max, adding ~6K residual). Already wired in `experiments/baselines/run_mamba2_baseline.py`. If bpb improves with more buckets at roughly the same param count, specialization > capacity per expert.
-
-**Dependency:** Polyphasic sleep (experiment 12) should inherit the winning k_max from this sweep, with a small interaction check (k16 vs k_winner).
-
----
-
-## 4. CFR as a Subsystem
+## 3. CFR as a Subsystem
 
 **Observation:** Counterfactual Regret minimization is currently a table that lives inside the training loop. It's updated during REM dreams and queried during inference gating. But it feels like it should be its own module with its own lifecycle.
 
@@ -78,7 +74,7 @@ Starts uniform (no opinion). Over time, the system discovers which semantic doma
 
 ---
 
-## 5. Context-Dependent Bucket Geometry
+## 4. Context-Dependent Bucket Geometry
 
 **Observation:** Our Wernicke buckets are a fixed partition of representation space (VQ codebook or MoE router weights). Biology shows that categorical boundaries sharpen or dissolve based on task context and attention.
 
@@ -90,7 +86,7 @@ Starts uniform (no opinion). Over time, the system discovers which semantic doma
 
 ---
 
-## 6. Hierarchical Buckets (Multi-Scale Organization)
+## 5. Hierarchical Buckets (Multi-Scale Organization)
 
 **Observation:** Brains have multi-scale organization (microcircuits → columns → areas → networks). Our buckets are a single flat set.
 
@@ -100,32 +96,7 @@ Starts uniform (no opinion). Over time, the system discovers which semantic doma
 
 ---
 
-## 7. Adaptive Sleep Triggers (Fatigue System)
-
-**Status:** Implemented (`fatigue.py`) but disabled in experiments. Experiment 11 uses fixed-interval sleep (every 256 steps) to isolate stage contributions.
-
-**Next step:** After experiment 11 results confirm which stages help, run a follow-up with adaptive fatigue triggering. The fatigue system is a dynamic ODE: accumulates under low-surprise/low-improvement/high-pressure, suppressed by high surprise.
-
-**Key question:** Does adaptive triggering beat fixed interval? The hypothesis is yes — the model should sleep when it's tired, not on a schedule. But fixed interval is easier to analyze statistically.
-
----
-
-## 8. Elephant-Inspired Trunk:Semantic Ratio
-
-**Observation:** Elephants allocate 97.5% of neurons to the cerebellum (prediction engine) and have a proportionally large hippocampus but modest cortex. Strong long-term memory despite fewer cortical neurons.
-
-**Implication:** At 10-minute training budgets, the optimal ratio might differ from elephants (who learn over decades). But the principle stands: the prediction engine should probably get more parameters than the semantic engine, not fewer.
-
-**Test:** Parameter-matched comparison:
-- Current: ~60% trunk, ~30% semantic, ~10% routing
-- Elephant-inspired: ~85% trunk, ~10% semantic, ~5% routing
-- Same total parameter budget, same 600s training
-
-This overlaps with item 1 (trunk scaling) but the framing is different: item 1 asks "does a bigger trunk help?" while this asks "does *reallocating* from semantic to trunk help?"
-
----
-
-## 9. Von Economo Neurons (Fast Cross-Partition Communication)
+## 6. Von Economo Neurons (Fast Cross-Partition Communication)
 
 **Observation:** Dolphins and elephants (large-brained social mammals) have von Economo neurons — specialized cells thought to enable fast long-range communication between brain regions. The polyphasic sleep design has an "Invariant 4: cross-partition exchange is summarized." Von Economo neurons suggest there might be a role for fast, targeted communication between partitions beyond slow summaries.
 
@@ -138,7 +109,9 @@ This overlaps with item 1 (trunk scaling) but the framing is different: item 1 a
 ```
 Experiment 11 results
   ├── → Sleep payload decision (which stages?)
-  ├── → Experiment 12 (polyphasic sleep)
+  ├── → k_max sweep (already wired)
+  │     └── → Lock k_max for all downstream experiments
+  ├── → Experiment 12 (polyphasic sleep, at winning k_max)
   │     └── → Partition topology comparison
   ├── → Experiment 10b (quantization robustness)
   │     └── → Artifact story
@@ -152,6 +125,6 @@ Trunk scaling (item 1)
   ├── independent of sleep work
   └── can run in parallel with exp 12
 
-Mamba-2 baseline
+Mamba-2 baseline (already wired)
   └── depends on: architecture locked for H100
 ```
