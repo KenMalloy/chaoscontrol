@@ -8,9 +8,9 @@ import torch.nn as nn
 
 from chaoscontrol.core import RMSNorm, FeedForward, ChaosSSMCore
 from chaoscontrol.routing import RichBNN, DistributedB
-from chaoscontrol.memory import OuterModel, MultiSlotOuterModel, SemanticTier
+from chaoscontrol.memory import OuterModel, MultiSlotOuterModel, SemanticTier, BucketPrototypes
 from chaoscontrol.posterior import GlobalDelta, BucketDelta, ResidualCache
-from chaoscontrol.wernicke import WernickeLayer
+from chaoscontrol.wernicke import WernickeLayer, HierarchicalWernicke
 
 
 class ChaosSSMBlock(nn.Module):
@@ -124,10 +124,10 @@ class ChaosStudentLM(nn.Module):
         wernicke_k_max_fine: int = 16,
         buffer_mode: str = "legacy",
         retrieval_mode: str = "softmax_all",
-        retrieval_k: int = 4,
+        retrieval_k: int = 8,
         bucket_prototypes: bool = False,
         prototype_dim: int = 64,
-        prototype_update_rate: float = 0.01,
+        prototype_update_rate: float = 0.1,
         semantic_tier_bases: int = 0,
         semantic_tier_update_rate: float = 0.01,
         typed_storage: bool = False,

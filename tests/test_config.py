@@ -32,21 +32,21 @@ def test_model_type():
 
 def test_valid_retrieval_modes():
     for mode in ("softmax_all", "bucket_mean", "bucket_recent", "bucket_topk"):
-        cfg = ChaosControlConfig(enwik8_path="/tmp", retrieval_mode=mode)
+        cfg = ChaosControlConfig(data_path="/tmp", retrieval_mode=mode)
         assert cfg.retrieval_mode == mode
 
 
 def test_invalid_retrieval_mode():
     with pytest.raises(ValueError, match="retrieval_mode must be one of"):
-        ChaosControlConfig(enwik8_path="/tmp", retrieval_mode="invalid_mode")
+        ChaosControlConfig(data_path="/tmp", retrieval_mode="invalid_mode")
 
 
 def test_valid_posterior_modes():
     for mode in ("none", "global_delta", "bucket_delta", "residual_cache"):
-        cfg = ChaosControlConfig(enwik8_path="/tmp", posterior_mode=mode)
+        cfg = ChaosControlConfig(data_path="/tmp", posterior_mode=mode)
         assert cfg.posterior_mode == mode
 
 
 def test_invalid_posterior_mode():
     with pytest.raises(ValueError, match="posterior_mode must be one of"):
-        ChaosControlConfig(enwik8_path="/tmp", posterior_mode="bad")
+        ChaosControlConfig(data_path="/tmp", posterior_mode="bad")

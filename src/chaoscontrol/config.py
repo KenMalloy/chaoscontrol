@@ -106,12 +106,12 @@ class ChaosControlConfig:
 
     # Retrieval mode for typed buffer (how the model selects from stored KV entries)
     retrieval_mode: str = "softmax_all"  # "softmax_all", "bucket_mean", "bucket_recent", "bucket_topk"
-    retrieval_k: int = 4  # number of neighbors for bucket_topk / bucket_recent
+    retrieval_k: int = 8  # number of neighbors for bucket_topk / bucket_recent
 
     # Bucket prototypes: per-bucket EMA priors decoded to model_dim
     bucket_prototypes: bool = False
     prototype_dim: int = 64
-    prototype_update_rate: float = 0.01
+    prototype_update_rate: float = 0.1
 
     # Hierarchical Wernicke: number of routing levels (1 = flat, 2 = coarse+fine)
     wernicke_layers: int = 1
