@@ -463,7 +463,7 @@ def evaluate_warming_curve(
                             chunk_len = chunk_end - chunk_start
                             if chunk_start + chunk_len + 1 > tokens.numel():
                                 break
-                            inp = tokens[chunk_start:chunk_start + chunk_len].unsqueeze(0).to(device)
+                            inp = tokens[chunk_start:chunk_start + chunk_len].unsqueeze(0).to(device=device, dtype=torch.long)
                             # Use append_only so the buffer fills during warmup
                             model(inp, memory_write_mode="append_only")
 
@@ -473,8 +473,8 @@ def evaluate_warming_curve(
                     if score_end + 1 > tokens.numel():
                         continue
 
-                    inp = tokens[score_start:score_end].unsqueeze(0).to(device)
-                    target = tokens[score_start + 1:score_end + 1].unsqueeze(0).to(device)
+                    inp = tokens[score_start:score_end].unsqueeze(0).to(device=device, dtype=torch.long)
+                    target = tokens[score_start + 1:score_end + 1].unsqueeze(0).to(device=device, dtype=torch.long)
                     out = model(inp, memory_write_mode="none")
                     logits = out["logits"]
 
@@ -591,8 +591,8 @@ def causal_slot_eval(
         for _trial in range(2):
             _reset_model_state(model)
             _s = segment_starts[0]
-            _inp = tokens[_s:_s + score_tokens].unsqueeze(0).to(device)
-            _tgt = tokens[_s + 1:_s + score_tokens + 1].unsqueeze(0).to(device)
+            _inp = tokens[_s:_s + score_tokens].unsqueeze(0).to(device=device, dtype=torch.long)
+            _tgt = tokens[_s + 1:_s + score_tokens + 1].unsqueeze(0).to(device=device, dtype=torch.long)
             with torch.no_grad():
                 _out = model(_inp, memory_write_mode="none")
                 _logits = model.lm_head(model.final_norm(_out["hidden"]))
@@ -636,8 +636,8 @@ def causal_slot_eval(
                             if win_end + 1 > tokens.numel():
                                 break
 
-                            window_inp = tokens[win_start:win_end].unsqueeze(0).to(device)
-                            window_targets = tokens[win_start + 1:win_end + 1].reshape(-1).to(device)
+                            window_inp = tokens[win_start:win_end].unsqueeze(0).to(device=device, dtype=torch.long)
+                            window_targets = tokens[win_start + 1:win_end + 1].reshape(-1).to(device=device, dtype=torch.long)
 
                             # Forward through model (frozen)
                             write_mode = "append_only" if buffer_on else "none"
@@ -669,8 +669,8 @@ def causal_slot_eval(
                     if freeze_during_scoring:
                         # Primary metric: freeze all adaptation, score in one pass.
                         # Isolates the quality of state built during warmup.
-                        inp = tokens[score_start:score_end].unsqueeze(0).to(device)
-                        target = tokens[score_start + 1:score_end + 1].unsqueeze(0).to(device)
+                        inp = tokens[score_start:score_end].unsqueeze(0).to(device=device, dtype=torch.long)
+                        target = tokens[score_start + 1:score_end + 1].unsqueeze(0).to(device=device, dtype=torch.long)
 
                         with torch.no_grad():
                             out = model(inp, memory_write_mode="none")
@@ -696,8 +696,8 @@ def causal_slot_eval(
                             if win_end + 1 > tokens.numel():
                                 break
 
-                            window_inp = tokens[win_start:win_end].unsqueeze(0).to(device)
-                            window_targets = tokens[win_start + 1:win_end + 1].reshape(-1).to(device)
+                            window_inp = tokens[win_start:win_end].unsqueeze(0).to(device=device, dtype=torch.long)
+                            window_targets = tokens[win_start + 1:win_end + 1].reshape(-1).to(device=device, dtype=torch.long)
 
                             # Forward through model (buffer accumulates if on)
                             write_mode = "append_only" if buffer_on else "none"
