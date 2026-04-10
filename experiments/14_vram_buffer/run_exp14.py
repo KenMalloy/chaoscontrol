@@ -172,6 +172,12 @@ T6_CONDITIONS = {
         "ff_mult": 2, "seq_len": 256, "stride": 128,
         "batch_size": 32, "base_lr": 2e-3,
     },
+    "mamba2": {
+        "model_type": "mamba2",
+        "vocab_size": 256, "model_dim": 128, "num_layers": 4,
+        "seq_len": 256, "stride": 128,
+        "batch_size": 32, "base_lr": 2e-3,
+    },
 }
 # claim1_winner, current_best, and full_winner are injected dynamically
 # by inject_dynamic_t6_conditions() before running Phase C.
@@ -482,7 +488,7 @@ def _identify_t6_winner_and_baseline() -> tuple[str | None, dict | None, str | N
     Baselines are bare_ssm and transformer.
     """
     results = _load_results()
-    baseline_names = {"bare_ssm", "transformer"}
+    baseline_names = {"bare_ssm", "transformer", "mamba2"}
 
     cond_means: dict[str, float] = {}
     for cond_name in T6_CONDITIONS:
