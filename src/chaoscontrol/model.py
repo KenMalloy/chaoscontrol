@@ -399,7 +399,7 @@ class ChaosStudentLM(nn.Module):
                     per_sample_buckets = bucket_ids.mode(dim=1).values  # (batch,)
                 else:
                     per_sample_buckets = torch.zeros(batch, dtype=torch.long, device=x.device)
-                outer_read = torch.zeros(batch, 1, model_dim, device=x.device)
+                outer_read = torch.zeros(batch, 1, model_dim, device=x.device, dtype=x.dtype)
                 for b_id in per_sample_buckets.unique():
                     mask = per_sample_buckets == b_id
                     cue = None
@@ -411,17 +411,17 @@ class ChaosStudentLM(nn.Module):
                         int(mask.sum()), bucket_id=int(b_id.item()),
                         mode=self.retrieval_mode, k=self.retrieval_k, cue=cue,
                     )
-                    outer_read[mask] = read.unsqueeze(1)
+                    outer_read[mask] = read.unsqueeze(1).to(dtype=x.dtype)
                 x = x + outer_read
 
             # Bucket prototypes: per-sample prior bias
             if self.bucket_prototypes_module is not None and bucket_ids is not None:
                 per_sample_buckets = bucket_ids.mode(dim=1).values  # (batch,)
-                proto_bias = torch.zeros(batch, 1, model_dim, device=x.device)
+                proto_bias = torch.zeros(batch, 1, model_dim, device=x.device, dtype=x.dtype)
                 for b_id in per_sample_buckets.unique():
                     mask = per_sample_buckets == b_id
                     proto = self.bucket_prototypes_module.read(int(mask.sum()), int(b_id.item()))
-                    proto_bias[mask] = proto.unsqueeze(1)
+                    proto_bias[mask] = proto.unsqueeze(1).to(dtype=x.dtype)
                 x = x + proto_bias
 
         elif self.outer_model is not None:
@@ -431,11 +431,11 @@ class ChaosStudentLM(nn.Module):
                 outer_read = self.outer_model.read(x.size(0), cue=cue)
             else:
                 outer_read = self.outer_model.read(x.size(0))
-            x = x + outer_read.unsqueeze(1)  # broadcast across seq dim
+            x = x + outer_read.unsqueeze(1).to(dtype=x.dtype)  # broadcast across seq dim
 
         if self.semantic_tier is not None:
             semantic_bias = self.semantic_tier.read(x.size(0))
-            x = x + semantic_bias.unsqueeze(1)
+            x = x + semantic_bias.unsqueeze(1).to(dtype=x.dtype)
 
         all_stats: list[dict] = []
         for layer in self.layers:
