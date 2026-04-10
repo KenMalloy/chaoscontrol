@@ -235,11 +235,16 @@ class ChaosStudentLM(nn.Module):
         # Error-driven posterior module: stores belief corrections from prediction error
         self.posterior: GlobalDelta | BucketDelta | ResidualCache | None = None
         self.posterior_mode = posterior_mode
+        total_buckets = (
+            self.wernicke.total_buckets
+            if hasattr(self.wernicke, "total_buckets")
+            else (self.wernicke.k_max if self.wernicke is not None else wernicke_k_max)
+        )
         if posterior_mode == "global_delta":
             self.posterior = GlobalDelta(dim, lr=posterior_lr)
         elif posterior_mode == "bucket_delta":
             self.posterior = BucketDelta(
-                k_max=wernicke_k_max, model_dim=dim, lr=posterior_lr,
+                k_max=total_buckets, model_dim=dim, lr=posterior_lr,
             )
         elif posterior_mode == "residual_cache":
             self.posterior = ResidualCache(
@@ -443,12 +448,11 @@ class ChaosStudentLM(nn.Module):
                 posterior_bias = self.posterior.read(x.size(0))
                 x = x + posterior_bias.unsqueeze(1)
             elif isinstance(self.posterior, BucketDelta) and bucket_ids is not None:
-                # Use dominant bucket for the posterior read
-                flat_ids = bucket_ids.reshape(-1)
-                dominant = int(flat_ids.mode().values.item())
-                posterior_bias = self.posterior.read(
-                    bucket_id=dominant, batch_size=x.size(0),
-                )
+                per_sample_buckets = bucket_ids.mode(dim=1).values
+                posterior_bias = torch.cat([
+                    self.posterior.read(bucket_id=int(per_sample_buckets[i].item()), batch_size=1)
+                    for i in range(x.size(0))
+                ], dim=0)
                 x = x + posterior_bias.unsqueeze(1)
             elif isinstance(self.posterior, ResidualCache):
                 # Use mean-pooled hidden as query context

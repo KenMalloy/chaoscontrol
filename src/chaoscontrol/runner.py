@@ -163,7 +163,7 @@ def run_experiment(config_path: str, *, data_path: str, budget_seconds: float = 
         torch.backends.cudnn.benchmark = True
         torch.set_float32_matmul_precision("high")
 
-    train_tokens, val_tokens, _test = prepare_fineweb_splits(
+    train_tokens, val_tokens, test_tokens = prepare_fineweb_splits(
         cfg.data_path, device=device,
     )
     train_starts = build_lm_starts(int(train_tokens.numel()), cfg.seq_len, cfg.stride)
@@ -268,8 +268,9 @@ def run_experiment(config_path: str, *, data_path: str, budget_seconds: float = 
     # Warming curve: evaluate bpb at different warm-up lengths (TTT contract)
     warming_curve: dict[int, float] = {}
     if hasattr(model, "outer_model") and model.outer_model is not None:
+        warming_tokens = test_tokens if int(test_tokens.numel()) > 0 else val_tokens
         warming_curve = evaluate_warming_curve(
-            model, val_tokens,
+            model, warming_tokens,
             score_tokens=1024, device=device,
         )
         if warming_curve:

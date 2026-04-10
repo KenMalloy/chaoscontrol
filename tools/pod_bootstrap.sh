@@ -164,29 +164,36 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 9. Batch size recommendation
+# 9. Batch size benchmark
 # ---------------------------------------------------------------------------
 echo ""
-echo "=== Batch size recommendation ==="
+echo "=== Batch size benchmark ==="
 
-$PYTHON -c "
+BENCH_JSON="/workspace/results/exp14_batch_bench.json"
+if [ -d "$REPO" ]; then
+    if $PYTHON "$REPO/tools/benchmark_batch.py" --output-json "$BENCH_JSON"; then
+        $PYTHON -c "
+import json
+with open('$BENCH_JSON') as f:
+    payload = json.load(f)
+print(f\"Recommended batch_size: {payload['recommended_batch_size']}\")
+"
+    else
+        echo "WARNING: benchmark_batch.py failed, falling back to heuristic recommendation"
+        $PYTHON -c "
 import torch
-
 gpu_count = torch.cuda.device_count()
 if gpu_count == 0:
     print('No GPUs detected, cannot recommend batch size')
 else:
     mem_gb = torch.cuda.get_device_properties(0).total_mem / (1024**3)
-    # Heuristic: ~1GB per 64 batch size for dim=128, seq_len=256
-    # Scale linearly with VRAM, conservatively
     recommended = int((mem_gb / 1.5) * 64)
-    # Round down to nearest power of 2 for efficiency
     recommended = 2 ** int(recommended).bit_length() // 2
     recommended = max(32, min(recommended, 512))
-    print(f'GPU VRAM: {mem_gb:.1f} GB x {gpu_count} GPU(s)')
-    print(f'Recommended batch_size: {recommended} (per GPU, for dim=128 seq_len=256)')
-    print(f'For larger models (dim=384+), halve the batch size.')
+    print(f'Recommended batch_size (heuristic fallback): {recommended}')
 "
+    fi
+fi
 
 # ---------------------------------------------------------------------------
 # 10. Summary
