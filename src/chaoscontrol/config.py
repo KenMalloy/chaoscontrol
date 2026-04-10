@@ -101,8 +101,21 @@ class ChaosControlConfig:
     dynamic_crit_per_layer: bool = False
     compression_selection: str = "survival"  # "survival" or "random" — controls slot merge ordering
 
+    # Typed KV buffer mode ("legacy" = consolidation-based, "append_only" = per-token append)
+    buffer_mode: str = "legacy"
+
     # Retrieval mode for typed buffer (how the model selects from stored KV entries)
     retrieval_mode: str = "softmax_all"  # "softmax_all", "bucket_mean", "bucket_recent", "bucket_topk"
+    retrieval_k: int = 4  # number of neighbors for bucket_topk / bucket_recent
+
+    # Bucket prototypes: per-bucket EMA priors decoded to model_dim
+    bucket_prototypes: bool = False
+    prototype_dim: int = 64
+    prototype_update_rate: float = 0.01
+
+    # Hierarchical Wernicke: number of routing levels (1 = flat, 2 = coarse+fine)
+    wernicke_layers: int = 1
+    wernicke_k_max_fine: int = 16  # fine-level codebook size (used when wernicke_layers >= 2)
 
     # Error-driven belief corrections: posterior-state options
     posterior_mode: str = "none"  # "none", "global_delta", "bucket_delta", "residual_cache"
