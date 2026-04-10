@@ -103,22 +103,17 @@ def build_sentencepiece_luts(
 def load_sp_data(
     data_dir: str,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Load pre-tokenized SP shards and split val into val + test.
+    """Load pre-tokenized SP shards. Full val split used for evaluation.
 
     Returns (train_tokens, val_tokens, test_tokens) as CPU int16 tensors.
-
-    Note: SP path splits val into 95% val + 5% test. The byte-level path
-    (prepare_fineweb_splits) splits train into 95% train + 5% test and uses
-    a separate val file. This asymmetry is acceptable for Phase A (all SP
-    conditions share the same val split, comparisons are within-group). If
-    Phase B warming curves run on the test split, verify consistency.
+    test_tokens is empty for Phase A — the full val split is used so that
+    SP and byte conditions are evaluated on comparable data (byte path via
+    prepare_fineweb_splits also uses the full docs_val_raw.txt). Phase B
+    warming curves can split a test set from train when needed.
     """
     train_tokens, val_tokens = load_fineweb_tokens(data_dir)
-    # Reserve last 5% of val as held-out test
-    test_boundary = int(val_tokens.numel() * 0.95)
-    test_tokens = val_tokens[test_boundary:]
-    val_tokens = val_tokens[:test_boundary]
-    print(f"  SP data: train={train_tokens.numel():,} val={val_tokens.numel():,} test={test_tokens.numel():,} tokens")
+    test_tokens = train_tokens[:0]  # empty tensor, same dtype
+    print(f"  SP data: train={train_tokens.numel():,} val={val_tokens.numel():,} tokens")
     return train_tokens, val_tokens, test_tokens
 
 

@@ -333,8 +333,16 @@ def summarize_stage1() -> dict[str, dict]:
         for name, stats in incomplete.items():
             print(f"    {name}: {stats['n_seeds']}/{len(SEEDS)} seeds")
 
-    # Identify SSM winner
-    sp_conditions = {k: v for k, v in summary.items() if k.startswith("sp_")}
+    # Identify SSM winner (require >= 5 seeds for eligibility)
+    MIN_SEEDS_FOR_GATE = 5
+    sp_conditions = {k: v for k, v in summary.items()
+                     if k.startswith("sp_") and v["n_seeds"] >= MIN_SEEDS_FOR_GATE}
+    sp_excluded = {k: v for k, v in summary.items()
+                   if k.startswith("sp_") and v["n_seeds"] < MIN_SEEDS_FOR_GATE}
+    if sp_excluded:
+        print(f"\n  Excluded from winner selection (< {MIN_SEEDS_FOR_GATE} seeds):")
+        for name, stats in sp_excluded.items():
+            print(f"    {name}: {stats['n_seeds']} seeds")
     if sp_conditions:
         winner_name = min(sp_conditions, key=lambda k: sp_conditions[k]["mean_bpb"])
         winner = sp_conditions[winner_name]
@@ -342,6 +350,8 @@ def summarize_stage1() -> dict[str, dict]:
 
         # Go/no-go: tokenizer helps?
         byte_control = summary.get("bare_ssm_byte256")
+        if byte_control and byte_control["n_seeds"] < MIN_SEEDS_FOR_GATE:
+            print(f"\n  WARNING: byte control has only {byte_control['n_seeds']} seeds — Gate 1 unreliable")
         if byte_control:
             improvement = byte_control["mean_bpb"] - winner["mean_bpb"]
             t_stat, p_val = welch_ttest(byte_control["bpbs"], winner["bpbs"])
@@ -455,14 +465,18 @@ def summarize_final(stage1_summary: dict) -> None:
               f"[{ci[0]:.4f}, {ci[1]:.4f}]{stats['n_seeds']:>4}{marker}")
 
     # Gate 2: SSM competitive with transformer?
+    # gap > 0 means SSM is worse; gap <= 0 means SSM is equal or better
     gap = winner["mean_bpb"] - gpt_stats["mean_bpb"]
     t_stat, p_val = welch_ttest(winner["bpbs"], gpt_bpbs)
     d = cohens_d(winner["bpbs"], gpt_bpbs)
     print(f"\n  SSM vs GPT gap: {gap:+.4f} bpb (p={p_val:.4f}, d={d:.2f})")
-    if abs(gap) <= 0.15:
-        print("  GATE 2 PASS: SSM within 0.15 bpb of matched transformer")
+    if gap <= 0.15:
+        if gap <= 0:
+            print("  GATE 2 PASS: SSM matches or beats matched transformer")
+        else:
+            print(f"  GATE 2 PASS: SSM within {gap:.3f} bpb of matched transformer (tolerance: 0.15)")
     else:
-        print("  GATE 2 FAIL: SSM more than 0.15 bpb from matched transformer")
+        print(f"  GATE 2 FAIL: SSM is {gap:.3f} bpb worse than matched transformer (tolerance: 0.15)")
 
     # Overall go/no-go
     byte_control = stage1_summary.get("bare_ssm_byte256")
@@ -471,7 +485,7 @@ def summarize_final(stage1_summary: dict) -> None:
         improvement = byte_control["mean_bpb"] - winner["mean_bpb"]
         _, p1 = welch_ttest(byte_control["bpbs"], winner["bpbs"])
         gate1 = improvement >= 0.1 and p1 < 0.05
-    gate2 = abs(gap) <= 0.15
+    gate2 = gap <= 0.15
 
     print(f"\n  {'='*40}")
     if gate1 and gate2:
