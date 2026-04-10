@@ -492,8 +492,13 @@ class ChaosStudentLM(nn.Module):
                         bucket_id=int(bids_flat[i].item()),
                     )
 
-                # Update bucket prototypes
+                # Update bucket prototypes (encoded_flat is in outer_dim, which must
+                # match prototype_dim — both default to 64 but assert to catch misconfig)
                 if self.bucket_prototypes_module is not None and bucket_ids is not None:
+                    assert encoded_flat.shape[-1] == self.bucket_prototypes_module.prototype_dim, (
+                        f"outer_dim ({encoded_flat.shape[-1]}) != prototype_dim "
+                        f"({self.bucket_prototypes_module.prototype_dim})"
+                    )
                     for i in range(batch * seq):
                         bid = int(bids_flat[i].item())
                         self.bucket_prototypes_module.update(bid, encoded_flat[i:i+1])

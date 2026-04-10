@@ -12,7 +12,7 @@ set -euo pipefail
 
 REPO="/workspace/chaoscontrol"
 DATA="/workspace/data"
-ENWIK8_URL="http://mattmahoney.net/dc/enwik8.zip"
+FINEWEB_DIR="/workspace/fineweb_data"
 
 echo "============================================"
 echo "ChaosControl pod bootstrap"

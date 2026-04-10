@@ -320,6 +320,8 @@ def _reset_model_state(model: Any) -> None:
         om._slot_buckets.clear()
         om._retrieval_weights = None
         om._compression_consequences.clear()
+        if hasattr(om, "_latent_traces"):
+            om._latent_traces.clear()
         om.loss_ema.fill_(2.0)
     elif om is not None:
         # Single-slot OuterModel
@@ -524,6 +526,12 @@ def causal_slot_eval(
 
     was_training = model.training
     model.eval()
+    # Freeze all model parameters so SLOT backward only flows into delta/logit_bias.
+    # Without this, lm_head and final_norm accumulate stale .grad tensors that waste
+    # VRAM and risk corrupting the next training optimizer.step().
+    saved_requires_grad = {n: p.requires_grad for n, p in model.named_parameters()}
+    for p in model.parameters():
+        p.requires_grad_(False)
     model_dim = model.dim
     vocab_size = model.vocab_size
 
@@ -629,6 +637,10 @@ def causal_slot_eval(
 
             results[cond_name] = cond_results
     finally:
+        # Restore model parameter requires_grad and training mode
+        for n, p in model.named_parameters():
+            if n in saved_requires_grad:
+                p.requires_grad_(saved_requires_grad[n])
         if was_training:
             model.train()
 

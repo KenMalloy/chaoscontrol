@@ -70,7 +70,7 @@ def _base(**overrides) -> dict:
         # Memory: append-only typed buffer
         "outer_model_type": "multislot",
         "outer_model_dim": 64,
-        "outer_max_slots": 0,  # unlimited
+        "outer_max_slots": 131072,  # effectively unlimited at 600s (~12M tokens)
         "buffer_mode": "append_only",
         # Wernicke: MoE router
         "wernicke_enabled": True,
