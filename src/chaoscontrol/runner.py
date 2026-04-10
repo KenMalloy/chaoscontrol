@@ -268,20 +268,11 @@ def run_experiment(config_path: str, *, data_path: str, budget_seconds: float = 
     # Warming curve: evaluate bpb at different warm-up lengths (TTT contract)
     warming_curve: dict[int, float] = {}
     if hasattr(model, "outer_model") and model.outer_model is not None:
-        n_max = 5000
-        min_segment_len = n_max + 1024 + 256
-        val_len = int(val_tokens.numel())
-        segment_starts_wc = []
-        step = min_segment_len
-        pos = 0
-        while pos + min_segment_len < val_len:
-            segment_starts_wc.append(pos)
-            pos += step
-        if segment_starts_wc:
-            warming_curve = evaluate_warming_curve(
-                model, tokens=val_tokens, segment_starts=segment_starts_wc,
-                score_len=1024, device=device,
-            )
+        warming_curve = evaluate_warming_curve(
+            model, val_tokens,
+            score_tokens=1024, device=device,
+        )
+        if warming_curve:
             curve_str = " ".join(f"{n}:{b:.3f}" for n, b in sorted(warming_curve.items()))
             print(f"Warming curve: {curve_str}")
 

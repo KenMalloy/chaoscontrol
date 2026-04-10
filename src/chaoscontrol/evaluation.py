@@ -346,35 +346,57 @@ def _reset_model_state(model: Any) -> None:
 
 def evaluate_warming_curve(
     model: Any,
-    *,
     tokens: torch.Tensor,
-    segment_starts: list[int],
-    score_len: int = 1024,
-    warming_steps: list[int] | None = None,
-    device: torch.device,
+    *,
+    warmup_tokens: list[int] | None = None,
+    score_tokens: int = 1024,
+    segment_len: int | None = None,
+    segment_starts: list[int] | None = None,
+    device: torch.device | None = None,
 ) -> dict[int, float]:
     """Evaluate bpb warming curve following the TTT evaluation contract.
 
     For each warming step count N and each segment:
       1. Reset all model state (SSM, buffer, prototypes, semantic tier, posterior)
-      2. Feed N warm-up tokens with writes enabled but no scoring
-      3. Score the next score_len tokens
+      2. Feed N warm-up tokens with memory_write_mode="append_only" (no scoring)
+      3. Score the next score_tokens tokens with memory_write_mode="none"
       4. Reset again before the next segment
+
+    Segments can be specified either via segment_starts (explicit start indices)
+    or segment_len (auto-derive non-overlapping segments from token length).
 
     Args:
         model: ChaosStudentLM instance.
         tokens: Full token tensor (1D, long).
-        segment_starts: Start indices for evaluation segments. Each segment
-            must have at least max(warming_steps) + score_len tokens available.
-        score_len: Number of tokens to score after warming.
-        warming_steps: List of N values (default: WARMING_CURVE_STEPS).
-        device: Device to run on.
+        warmup_tokens: List of N values (default: WARMING_CURVE_STEPS).
+        score_tokens: Number of tokens to score after warming.
+        segment_len: Auto-derive segments of this length. Mutually exclusive
+            with segment_starts.
+        segment_starts: Explicit start indices. Mutually exclusive with
+            segment_len.
+        device: Device to run on (default: model device).
 
     Returns:
-        {N: mean_bpb} for each N in warming_steps.
+        {N: mean_bpb} for each N in warmup_tokens.
     """
-    if warming_steps is None:
-        warming_steps = list(WARMING_CURVE_STEPS)
+    if warmup_tokens is None:
+        warmup_tokens = list(WARMING_CURVE_STEPS)
+
+    if device is None:
+        device = next(model.parameters()).device
+
+    # Derive segment_starts from segment_len if not provided
+    if segment_starts is None:
+        if segment_len is None:
+            segment_len = max(warmup_tokens) + score_tokens + 1
+        total_len = int(tokens.numel())
+        segment_starts = []
+        pos = 0
+        while pos + segment_len <= total_len:
+            segment_starts.append(pos)
+            pos += segment_len
+        if not segment_starts:
+            segment_starts = [0]
 
     was_training = model.training
     model.eval()
@@ -384,17 +406,16 @@ def evaluate_warming_curve(
 
     try:
         with torch.no_grad():
-            for n_warmup in warming_steps:
+            for n_warmup in warmup_tokens:
                 total_loss = 0.0
                 total_tokens_scored = 0
 
                 for seg_start in segment_starts:
                     _reset_model_state(model)
 
-                    # Warm-up phase: feed N tokens, writes enabled, no scoring
+                    # Warm-up phase: feed N tokens with writes enabled, no scoring
                     if n_warmup > 0:
                         warmup_end = seg_start + n_warmup
-                        # Process in chunks to avoid excessive memory
                         chunk_size = 256
                         for chunk_start in range(seg_start, warmup_end, chunk_size):
                             chunk_end = min(chunk_start + chunk_size, warmup_end)
@@ -402,30 +423,18 @@ def evaluate_warming_curve(
                             if chunk_start + chunk_len + 1 > tokens.numel():
                                 break
                             inp = tokens[chunk_start:chunk_start + chunk_len].unsqueeze(0).to(device)
-                            out = model(inp)
-                            # Buffer write happens in forward pass for append-only mode
-                            # For consolidation-based models, trigger a write
-                            om = getattr(model, "outer_model", None)
-                            if om is not None and hasattr(out, "__getitem__") and "hidden" in out:
-                                hidden = out["hidden"][:, -1, :].detach()
-                                logits = out["logits"]
-                                target = tokens[chunk_start + 1:chunk_start + chunk_len + 1].unsqueeze(0).to(device)
-                                if target.shape[1] == logits.shape[1]:
-                                    ce = float(F.cross_entropy(
-                                        logits.reshape(-1, vocab_size),
-                                        target.reshape(-1),
-                                    ).item())
-                                    om.consolidation_step(hidden, current_loss=ce)
+                            # Use append_only so the buffer fills during warmup
+                            model(inp, memory_write_mode="append_only")
 
-                    # Scoring phase: score the next score_len tokens
+                    # Scoring phase: score the next score_tokens tokens (no writes)
                     score_start = seg_start + n_warmup
-                    score_end = score_start + score_len
+                    score_end = score_start + score_tokens
                     if score_end + 1 > tokens.numel():
                         continue
 
                     inp = tokens[score_start:score_end].unsqueeze(0).to(device)
                     target = tokens[score_start + 1:score_end + 1].unsqueeze(0).to(device)
-                    out = model(inp)
+                    out = model(inp, memory_write_mode="none")
                     logits = out["logits"]
 
                     loss = F.cross_entropy(
