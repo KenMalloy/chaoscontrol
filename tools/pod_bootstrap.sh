@@ -48,7 +48,22 @@ echo "=== Python environment ==="
 PYTHON="python3"
 PIP="pip3"
 
+# Create venv if it doesn't exist (avoids PEP 668 "externally-managed" errors)
+if [ ! -f "$REPO/.venv/bin/python3" ]; then
+    echo "Creating venv at $REPO/.venv..."
+    $PYTHON -m venv "$REPO/.venv"
+fi
+export PATH="$REPO/.venv/bin:$PATH"
+PYTHON="$REPO/.venv/bin/python3"
+PIP="$REPO/.venv/bin/pip3"
+
+# Redirect HF/pip caches to network volume to avoid filling container disk
+export HF_HOME="/workspace/.cache"
+export PIP_CACHE_DIR="/workspace/.pip_cache"
+mkdir -p "$HF_HOME" "$PIP_CACHE_DIR"
+
 echo "Python: $($PYTHON --version 2>&1)"
+echo "Venv: $REPO/.venv"
 
 # ---------------------------------------------------------------------------
 # 3. Install PyTorch — auto-detect CUDA version, code is CUDA-agnostic

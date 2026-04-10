@@ -154,6 +154,50 @@ def _extract_jsonl_to_raw(jsonl_path: Path, raw_path: Path) -> None:
     tmp.rename(raw_path)
 
 
+# Competition validation split: first 50k documents
+_COMPETITION_VAL_DOCS = 50_000
+
+
+def _extract_jsonl_split(
+    jsonl_path: Path, val_path: Path, train_path: Path,
+    val_docs: int = _COMPETITION_VAL_DOCS,
+) -> None:
+    """Split docs_selected.jsonl into val and train raw text files.
+
+    The competition defines validation as "the fixed first-50k-document set."
+    First val_docs lines → val, remainder → train.
+    """
+    import json as _json
+    val_tmp = val_path.with_suffix(".tmp")
+    train_tmp = train_path.with_suffix(".tmp")
+    skipped = 0
+    doc_count = 0
+    with (
+        open(jsonl_path, "r", encoding="utf-8") as fin,
+        open(val_tmp, "wb") as fval,
+        open(train_tmp, "wb") as ftrain,
+    ):
+        for line in fin:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                doc = _json.loads(line)
+            except _json.JSONDecodeError:
+                skipped += 1
+                continue
+            text = doc.get("text", "")
+            out = fval if doc_count < val_docs else ftrain
+            out.write(text.encode("utf-8"))
+            out.write(b"\n")
+            doc_count += 1
+    if skipped:
+        print(f"  Skipped {skipped} malformed JSONL lines")
+    val_tmp.rename(val_path)
+    train_tmp.rename(train_path)
+    print(f"  Split: {val_docs} val docs, {doc_count - val_docs} train docs")
+
+
 def load_fineweb_raw_bytes(text_path: str) -> torch.Tensor:
     """Load a raw UTF-8 text file as a byte tensor via mmap.
 
@@ -179,35 +223,56 @@ def prepare_fineweb_splits(
     """Load FineWeb data as raw UTF-8 bytes, returning (train, val, test) tensors.
 
     Priority:
-      1. docs_raw.txt — pre-extracted raw text (mmap, zero-copy)
-      2. docs_selected.jsonl — extract text, write docs_raw.txt, then mmap
-      3. Raise error — we need raw bytes, not tokenized shards
+      1. docs_val_raw.txt + docs_train_raw.txt — document-aware split matching
+         the competition's "first 50k documents = validation" definition.
+      2. docs_selected.jsonl — extract and split by document boundary, then mmap.
+      3. docs_raw.txt — legacy single-file fallback with percentage split.
+      4. Raise error.
 
     All tensors stay on CPU. batch_from_starts handles per-batch GPU transfer.
     """
     data_path = Path(data_dir)
-    raw_text = data_path / "docs_raw.txt"
-
-    # If JSONL exists but raw text doesn't, extract it
+    val_raw = data_path / "docs_val_raw.txt"
+    train_raw = data_path / "docs_train_raw.txt"
     jsonl = data_path / "docs_selected.jsonl"
+
+    # Document-aware split: first 50k docs = val (matches competition definition)
+    if not val_raw.exists() and jsonl.exists():
+        print(f"  Splitting {jsonl} by document boundary (first {_COMPETITION_VAL_DOCS} = val)...")
+        _extract_jsonl_split(jsonl, val_raw, train_raw)
+        print(f"  val:   {val_raw} ({val_raw.stat().st_size / 1e9:.2f} GB)")
+        print(f"  train: {train_raw} ({train_raw.stat().st_size / 1e9:.2f} GB)")
+
+    if val_raw.exists() and train_raw.exists():
+        val_tokens = load_fineweb_raw_bytes(str(val_raw))
+        train_all = load_fineweb_raw_bytes(str(train_raw))
+        # Reserve last 5% of train as held-out test (for warming curve eval)
+        test_boundary = int(train_all.numel() * 0.95)
+        train_tokens = train_all[:test_boundary]
+        test_tokens = train_all[test_boundary:]
+        print(f"  Loaded: train={train_tokens.numel():,} val={val_tokens.numel():,} test={test_tokens.numel():,} bytes")
+        return train_tokens, val_tokens, test_tokens
+
+    # Legacy fallback: single docs_raw.txt with percentage split
+    raw_text = data_path / "docs_raw.txt"
     if not raw_text.exists() and jsonl.exists():
-        print(f"  Extracting raw text from {jsonl} ...")
+        print(f"  Extracting raw text from {jsonl} (legacy single-file mode)...")
         _extract_jsonl_to_raw(jsonl, raw_text)
         print(f"  Wrote {raw_text} ({raw_text.stat().st_size / 1e9:.2f} GB)")
 
     if not raw_text.exists():
         raise FileNotFoundError(
-            f"No raw text found in {data_dir}. Need docs_raw.txt or docs_selected.jsonl. "
-            f"Download with: python cached_challenge_fineweb.py --with-docs"
+            f"No raw text found in {data_dir}. Need docs_selected.jsonl (preferred) "
+            f"or docs_raw.txt. Download with: python cached_challenge_fineweb.py --with-docs"
         )
 
+    print("  WARNING: Using legacy percentage split — validation does not match competition's 50k-document set.")
     all_tokens = load_fineweb_raw_bytes(str(raw_text))
     train_end = int(all_tokens.numel() * train_fraction)
     val_end = int(all_tokens.numel() * (train_fraction + 0.05))
     train_tokens = all_tokens[:train_end]
     val_tokens = all_tokens[train_end:val_end]
     test_tokens = all_tokens[val_end:]
-    # Data is mmap-backed — do NOT cache on device (would copy entire dataset to GPU)
     return train_tokens, val_tokens, test_tokens
 
 

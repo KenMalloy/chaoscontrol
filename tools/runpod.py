@@ -289,7 +289,7 @@ def cmd_create(args: argparse.Namespace) -> None:
 
 
 def cmd_deploy(args: argparse.Namespace) -> None:
-    """Push repo to pod, set up venv, download FineWeb data."""
+    """Push repo to pod, run bootstrap (no data download — use prep_data.sh for that)."""
     pod_id = args.pod_id
     print("=== Pushing repo to pod ===")
     push_cmd = build_rsync_push_command(
@@ -299,8 +299,8 @@ def cmd_deploy(args: argparse.Namespace) -> None:
     )
     run_passthrough(push_cmd)
 
-    print("\n=== Running bootstrap (venv + FineWeb download) ===")
-    ssh_cmd = build_ssh_command(pod_id, f"bash {DEFAULT_REMOTE_REPO_ROOT}/tools/bootstrap_pod.sh")
+    print("\n=== Running bootstrap (venv + smoke test + batch benchmark) ===")
+    ssh_cmd = build_ssh_command(pod_id, f"bash {DEFAULT_REMOTE_REPO_ROOT}/tools/pod_bootstrap.sh")
     run_passthrough(ssh_cmd)
 
 
