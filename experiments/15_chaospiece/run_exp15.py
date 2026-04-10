@@ -392,12 +392,17 @@ def build_vocab_sweep(stage1_summary: dict) -> tuple[dict, dict]:
     """Build Stage 1.5 vocab sweep conditions from Stage 1 winner.
 
     Returns (conditions_4096, conditions_16384). SP8192 result carries from Stage 1.
+    Requires all 7 seeds for the Stage 1 winner — 5-seed minimum is too loose
+    for driving 14 follow-on runs plus downstream GPT comparison.
     """
-    MIN_SEEDS_FOR_GATE = 5
     sp_conditions = {k: v for k, v in stage1_summary.items()
-                     if k.startswith("sp_") and v["n_seeds"] >= MIN_SEEDS_FOR_GATE}
+                     if k.startswith("sp_") and v["n_seeds"] >= len(SEEDS)}
     if not sp_conditions:
-        raise RuntimeError("No eligible SP-SSM results — run Stage 1 first")
+        raise RuntimeError(
+            "No SP-SSM condition has all 7 seeds complete. "
+            "Stage 1.5 requires full seed coverage for the winner to avoid "
+            "committing 14+ follow-on runs to a noisy estimate."
+        )
 
     winner_name = min(sp_conditions, key=lambda k: sp_conditions[k]["mean_bpb"])
     winner_config = SP_SSM_CONDITIONS[winner_name]
@@ -496,11 +501,31 @@ def summarize_vocab_sweep(stage1_summary: dict) -> dict:
         print(f"  {name:<28} {stats['mean_bpb']:>10.4f} {stats['sem']:>8.4f} "
               f"[{ci[0]:.4f}, {ci[1]:.4f}]{stats['n_seeds']:>4}")
 
-    # Pick overall winner
-    eligible = {k: v for k, v in vocab_summary.items() if v["n_seeds"] >= MIN_SEEDS_FOR_GATE}
-    if eligible:
-        overall_winner = min(eligible, key=lambda k: eligible[k]["mean_bpb"])
-        print(f"\n  Overall vocab winner: {overall_winner} ({eligible[overall_winner]['mean_bpb']:.4f} bpb)")
+    # Verify all planned variants are present — missing data must not silently
+    # degrade the sweep into a partial comparison that drives Stage 2.
+    expected_prefixes = {"sp4096_", "sp8192_", "sp16384_"}
+    # sp8192 results come from Stage 1 with "sp_" prefix, not "sp8192_"
+    found_prefixes = set()
+    for k in vocab_summary:
+        if k.startswith("sp4096_"):
+            found_prefixes.add("sp4096_")
+        elif k.startswith("sp16384_"):
+            found_prefixes.add("sp16384_")
+        elif k.startswith("sp_"):
+            found_prefixes.add("sp8192_")  # Stage 1 SP8192 results
+    missing = expected_prefixes - found_prefixes
+    if missing:
+        missing_vocabs = ", ".join(sorted(missing))
+        print(f"\n  ERROR: Vocab sweep incomplete — missing variants: {missing_vocabs}")
+        print(f"  Cannot select winner from partial sweep. Fix data and re-run Stage 1.5.")
+        # Still save partial results for inspection
+    else:
+        eligible = {k: v for k, v in vocab_summary.items() if v["n_seeds"] >= len(SEEDS)}
+        if eligible:
+            overall_winner = min(eligible, key=lambda k: eligible[k]["mean_bpb"])
+            print(f"\n  Overall vocab winner: {overall_winner} ({eligible[overall_winner]['mean_bpb']:.4f} bpb)")
+        else:
+            print(f"\n  WARNING: No condition has all {len(SEEDS)} seeds complete")
 
     # Save summary
     summary_path = RESULTS / "stage1_5_summary.json"
@@ -519,11 +544,31 @@ def build_gpt_matched(vocab_summary: dict) -> tuple[dict, int]:
     """Build GPT condition param-matched to overall vocab sweep winner.
 
     Returns (condition_dict, winner_vocab_size).
+    Refuses to proceed if the vocab sweep is incomplete.
     """
-    MIN_SEEDS_FOR_GATE = 5
-    eligible = {k: v for k, v in vocab_summary.items() if v["n_seeds"] >= MIN_SEEDS_FOR_GATE}
+    # Verify sweep completeness before selecting winner
+    found_vocabs = set()
+    for k in vocab_summary:
+        if k.startswith("sp4096_"):
+            found_vocabs.add(4096)
+        elif k.startswith("sp16384_"):
+            found_vocabs.add(16384)
+        elif k.startswith("sp_"):
+            found_vocabs.add(8192)
+    expected_vocabs = {4096, 8192, 16384}
+    if found_vocabs != expected_vocabs:
+        missing = expected_vocabs - found_vocabs
+        raise RuntimeError(
+            f"Vocab sweep incomplete — missing vocab sizes: {missing}. "
+            f"Cannot match GPT to a partial sweep. Fix data and re-run Stage 1.5."
+        )
+
+    eligible = {k: v for k, v in vocab_summary.items() if v["n_seeds"] >= len(SEEDS)}
     if not eligible:
-        raise RuntimeError("No eligible results — run Stage 1 + 1.5 first")
+        raise RuntimeError(
+            f"No condition has all {len(SEEDS)} seeds complete. "
+            f"Stage 2 requires full seed coverage for the vocab winner."
+        )
 
     winner_name = min(eligible, key=lambda k: eligible[k]["mean_bpb"])
     print(f"\n  Matching GPT to overall winner: {winner_name}")
