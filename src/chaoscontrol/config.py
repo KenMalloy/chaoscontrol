@@ -122,6 +122,40 @@ class ChaosControlConfig:
     posterior_lr: float = 0.01
     residual_cache_k: int = 4
 
+    # Tokenizer options
+    tokenizer_type: str = "none"  # "none" or "fixed_stride"
+    tokenizer_byte_dim: int = 256
+    tokenizer_token_dim: int = 256
+    tokenizer_codebook_size: int = 512
+    tokenizer_stride: int = 4
+    tokenizer_beta: float = 0.25
+
+    # Alignment loss
+    align_type: str = "none"  # "none", "contrastive", "distill", "diversity"
+    align_weight: float = 0.05
+
+    # Sleep cycle parameters
+    sleep_enabled: bool = False
+    sleep_stages: str = "full_cycle"  # "full_cycle", "n3_only", "rem_only", "n2_only"
+    sleep_interval: int = 256  # training steps between sleep cycles
+    sleep_budget: int = 128  # total sleep steps per cycle
+    sleep_n2_budget: int = 64  # N2 consolidation steps
+    sleep_rem_budget: int = 64  # REM dream generation steps
+    sleep_n2_batches: int = 8  # batches per N2 consolidation
+    sleep_rem_dreams: int = 4  # dreams per REM cycle
+    sleep_rem_length: int = 128  # tokens per dream sequence
+    sleep_merge_sim_threshold: float = 0.85  # similarity threshold for slot merging
+    sleep_survival_floor: float = 0.1  # minimum survival score before pruning
+    sleep_rem_reactivate: bool = True  # reactivate latent traces during REM
+    sleep_adaptive_fatigue: bool = False  # scale sleep budget by training fatigue
+
+    # Polyphasic sleep parameters
+    polyphasic_enabled: bool = False
+    polyphasic_n_partitions: int = 4
+    polyphasic_k_awake: int = 3
+    polyphasic_topology: str = "slot_striped"  # "slot_striped" or "bucket_owned"
+    polyphasic_swap_interval: int = 256
+
     def __post_init__(self) -> None:
         if self.retrieval_mode not in _VALID_RETRIEVAL_MODES:
             raise ValueError(

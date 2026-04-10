@@ -18,6 +18,8 @@ from chaoscontrol.data import batch_from_starts, maybe_autocast, maybe_sync_cuda
 from chaoscontrol.metabolic import metabolic_fork, metabolic_monte_carlo, StructuredProjections
 from chaoscontrol.memory import MultiSlotOuterModel
 from chaoscontrol.posterior import GlobalDelta, BucketDelta, ResidualCache
+from chaoscontrol.wake_cache import WakeCache
+from chaoscontrol.sleep import SleepConfig, SleepCycle
 
 
 def train_chaoscontrol_for_budget(
@@ -582,6 +584,10 @@ def train_chaoscontrol_for_budget(
                 elif isinstance(posterior, ResidualCache):
                     context_key = h.mean(dim=(0, 1))  # (dim,)
                     posterior.store(context_key, error_grad)
+
+        # Carry dominant bucket forward for CFR's one-step-delayed lookup
+        if dominant_bucket is not None:
+            prev_dominant_bucket = dominant_bucket
 
         history.append(step_record)
         steps += 1
