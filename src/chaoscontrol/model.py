@@ -386,6 +386,12 @@ class ChaosStudentLM(nn.Module):
             # Typed buffer path: per-sample within-bucket retrieval.
             # Each sample reads from its own dominant bucket (mode over seq dim),
             # not one global bucket for the whole batch.
+            # NOTE: This is a known simplification — writes are per-token (each
+            # token goes to its Wernicke bucket) but reads are per-sample (one
+            # dominant bucket per sequence). Per-token reads would require
+            # per-position retrieval, which has the same O(batch*seq) cost we
+            # avoid in writes. The dominant-bucket approximation is reasonable
+            # when most tokens in a sequence share a primary type.
             batch = x.size(0)
             model_dim = x.size(2)
             if isinstance(self.outer_model, MultiSlotOuterModel) and self.outer_model._slots:
@@ -486,11 +492,7 @@ class ChaosStudentLM(nn.Module):
                 else:
                     bids_flat = torch.zeros(batch * seq, dtype=torch.long, device=hidden.device)
 
-                for i in range(batch * seq):
-                    self.outer_model.append_kv(
-                        encoded_flat[i:i+1],
-                        bucket_id=int(bids_flat[i].item()),
-                    )
+                self.outer_model.append_kv_batch(encoded_flat, bids_flat)
 
                 # Update bucket prototypes (encoded_flat is in outer_dim, which must
                 # match prototype_dim — both default to 64 but assert to catch misconfig)
@@ -499,9 +501,7 @@ class ChaosStudentLM(nn.Module):
                         f"outer_dim ({encoded_flat.shape[-1]}) != prototype_dim "
                         f"({self.bucket_prototypes_module.prototype_dim})"
                     )
-                    for i in range(batch * seq):
-                        bid = int(bids_flat[i].item())
-                        self.bucket_prototypes_module.update(bid, encoded_flat[i:i+1])
+                    self.bucket_prototypes_module.update_batch(bids_flat, encoded_flat)
 
         out: dict[str, Any] = {"logits": logits, "hidden": hidden}
         if balance_loss is not None:

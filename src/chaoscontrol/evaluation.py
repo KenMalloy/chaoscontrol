@@ -666,28 +666,71 @@ def causal_slot_eval(
                     if score_end + 1 > tokens.numel():
                         continue
 
-                    inp = tokens[score_start:score_end].unsqueeze(0).to(device)
-                    target = tokens[score_start + 1:score_end + 1].unsqueeze(0).to(device)
-
-                    with torch.no_grad():
-                        out = model(inp, memory_write_mode="none")
-                        hidden = out["hidden"]
-
                     if freeze_during_scoring:
+                        # Primary metric: freeze all adaptation, score in one pass.
+                        # Isolates the quality of state built during warmup.
+                        inp = tokens[score_start:score_end].unsqueeze(0).to(device)
+                        target = tokens[score_start + 1:score_end + 1].unsqueeze(0).to(device)
+
+                        with torch.no_grad():
+                            out = model(inp, memory_write_mode="none")
+                            hidden = out["hidden"]
+
                         d = delta.detach()
                         lb = logit_bias.detach()
+                        logits = model.lm_head(model.final_norm(hidden + d)) + lb
+                        loss = F.cross_entropy(
+                            logits.reshape(-1, vocab_size),
+                            target.reshape(-1),
+                            reduction="sum",
+                        )
+                        total_loss += float(loss.detach().item())
+                        total_tokens_scored += int(target.numel())
                     else:
-                        d = delta
-                        lb = logit_bias
+                        # Secondary metric: fully-online score-first TTT.
+                        # Competition-legal: score each window, THEN optimize delta
+                        # on the scored tokens. Next window benefits from updated delta.
+                        win_start = score_start
+                        while win_start < score_end:
+                            win_end = min(win_start + window_size, score_end)
+                            if win_end + 1 > tokens.numel():
+                                break
 
-                    logits = model.lm_head(model.final_norm(hidden + d)) + lb
-                    loss = F.cross_entropy(
-                        logits.reshape(-1, vocab_size),
-                        target.reshape(-1),
-                        reduction="sum",
-                    )
-                    total_loss += float(loss.detach().item())
-                    total_tokens_scored += int(target.numel())
+                            window_inp = tokens[win_start:win_end].unsqueeze(0).to(device)
+                            window_targets = tokens[win_start + 1:win_end + 1].reshape(-1).to(device)
+
+                            # Forward through model (buffer accumulates if on)
+                            write_mode = "append_only" if buffer_on else "none"
+                            with torch.no_grad():
+                                out = model(window_inp, memory_write_mode=write_mode)
+                                hidden = out["hidden"].detach()
+
+                            # Score with current delta (from past windows only)
+                            d = delta.detach()
+                            lb = logit_bias.detach()
+                            logits = model.lm_head(model.final_norm(hidden + d)) + lb
+                            score_loss = F.cross_entropy(
+                                logits.reshape(-1, vocab_size),
+                                window_targets,
+                                reduction="sum",
+                            )
+                            total_loss += float(score_loss.item())
+                            total_tokens_scored += int(window_targets.numel())
+
+                            # THEN optimize delta on this window (already scored)
+                            if slot_on:
+                                for _step in range(slot_steps):
+                                    h = hidden + delta
+                                    opt_logits = model.lm_head(model.final_norm(h)) + logit_bias
+                                    opt_loss = F.cross_entropy(
+                                        opt_logits.reshape(-1, vocab_size),
+                                        window_targets,
+                                    )
+                                    opt_loss.backward()
+                                    optimizer.step()
+                                    optimizer.zero_grad()
+
+                            win_start = win_end
 
                 if total_tokens_scored > 0:
                     bpb = float(total_loss / total_tokens_scored / math.log(2.0))

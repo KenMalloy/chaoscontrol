@@ -262,16 +262,26 @@ class MultiSlotOuterModel(nn.Module):
         self._bucket_affinity: torch.Tensor | None = None  # (n_buckets, n_buckets), lazy init
 
     def append_kv_batch(self, encoded_batch: torch.Tensor, bucket_ids: torch.Tensor) -> None:
-        """Append multiple KV pairs at once, avoiding per-iteration encode overhead.
+        """Append multiple KV pairs at once as a batched operation.
+
+        Avoids per-token Python loops and GPU syncs. One .tolist() call
+        for bucket_ids, one torch.split for slots.
 
         Args:
             encoded_batch: (N, outer_dim) pre-encoded KV pairs.
             bucket_ids: (N,) integer bucket assignments for each pair.
         """
-        for i in range(encoded_batch.shape[0]):
-            self._slots.append(encoded_batch[i:i + 1].detach())
-            self._survival.append(1.0)
-            self._slot_buckets.append(int(bucket_ids[i].item()))
+        n = encoded_batch.shape[0]
+        # Single GPU→CPU transfer for all bucket ids
+        bid_list = bucket_ids.tolist()
+        # (N, outer_dim) → N tensors of (1, outer_dim), matching existing slot format
+        self._slots.extend(encoded_batch.detach().unsqueeze(1).unbind(0))
+        self._survival.extend([1.0] * n)
+        self._slot_buckets.extend(bid_list)
+
+        # Compress if capped
+        if self.max_slots > 0 and len(self._slots) > self.max_slots:
+            self._compress()
 
     def get_extra_state(self) -> dict:
         """Persist slots, survival scores, bucket assignments, latent traces, and affinity."""
@@ -840,6 +850,27 @@ class BucketPrototypes(nn.Module):
             (1 - self.update_rate) * self.prototypes[bucket_id]
             + self.update_rate * v
         )
+
+    def update_batch(self, bucket_ids: torch.Tensor, values: torch.Tensor) -> None:
+        """Batched EMA update: one GPU→CPU transfer, aggregate per bucket.
+
+        Args:
+            bucket_ids: (N,) integer bucket assignments.
+            values: (N, prototype_dim) pre-encoded vectors.
+        """
+        bid_list = bucket_ids.tolist()
+        vals = values.detach()
+        # Group by bucket and average, then single EMA update per bucket
+        seen: dict[int, list[int]] = {}
+        for i, bid in enumerate(bid_list):
+            seen.setdefault(bid, []).append(i)
+        for bid, indices in seen.items():
+            bucket_vals = vals[indices]  # (k, prototype_dim)
+            v = bucket_vals.mean(dim=0)  # (prototype_dim,)
+            self.prototypes[bid] = (
+                (1 - self.update_rate) * self.prototypes[bid]
+                + self.update_rate * v
+            )
 
 
 class SemanticTier(nn.Module):

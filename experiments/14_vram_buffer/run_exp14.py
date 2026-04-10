@@ -70,7 +70,7 @@ def _base(**overrides) -> dict:
         # Memory: append-only typed buffer
         "outer_model_type": "multislot",
         "outer_model_dim": 64,
-        "outer_max_slots": 131072,  # effectively unlimited at 600s (~12M tokens)
+        "outer_max_slots": 0,  # 0 = truly unlimited (per-token writes exhaust any fixed cap in ~16 steps)
         "buffer_mode": "append_only",
         # Wernicke: MoE router
         "wernicke_enabled": True,
@@ -87,8 +87,12 @@ def _base(**overrides) -> dict:
 
 T2_CONDITIONS = {
     # softmax_all_32 uses legacy buffer_mode intentionally as the
-    # current-system baseline — this is the exp 9/11/13 architecture
-    # with softmax over all slots, NOT the new typed-bucket retrieval.
+    # prior-architecture reference point. It writes via surprise-gated
+    # consolidation (once per step), not per-token append. This means
+    # comparisons between softmax_all_32 and append_only conditions
+    # vary write path AND retrieval mode — it's a reference, not a
+    # controlled ablation partner. The controlled comparisons are
+    # among the append_only conditions.
     "softmax_all_32": _base(
         outer_max_slots=32, retrieval_mode="softmax_all",
         buffer_mode="legacy",
@@ -102,8 +106,8 @@ T2_CONDITIONS = {
     "recent_uncapped": _base(
         outer_max_slots=0, retrieval_mode="bucket_recent", retrieval_k=8,
     ),
-    "topk_32_8": _base(
-        outer_max_slots=32, retrieval_mode="bucket_topk", retrieval_k=8,
+    "topk_8k_8": _base(
+        outer_max_slots=8192, retrieval_mode="bucket_topk", retrieval_k=8,
     ),
     "topk_uncapped_4": _base(
         outer_max_slots=0, retrieval_mode="bucket_topk", retrieval_k=4,
@@ -308,8 +312,14 @@ def _launch(
     return proc, out_path, tmp, log_fh
 
 
-def run_grid(conditions: dict, seeds: list[int], data_path: str, budget: float, num_gpus: int, phase_label: str):
-    """Run a grid of conditions x seeds, parallelizing across GPUs."""
+def run_grid(conditions: dict, seeds: list[int], data_path: str, budget: float, num_gpus: int, phase_label: str,
+             timeout_multiplier: float = 2.5):
+    """Run a grid of conditions x seeds, parallelizing across GPUs.
+
+    Each run gets at most budget * timeout_multiplier seconds before being
+    killed. This catches conditions that are impractically slow (e.g.
+    softmax_all_uncapped at scale) without burning the full GPU budget.
+    """
     RESULTS.mkdir(parents=True, exist_ok=True)
     CHECKPOINTS.mkdir(parents=True, exist_ok=True)
 
@@ -339,8 +349,41 @@ def run_grid(conditions: dict, seeds: list[int], data_path: str, budget: float, 
             jobs.append((proc, out_path, tmp, log_fh, cond_name, seed))
             print(f"    GPU {i}: {cond_name} seed={seed}")
 
+        run_timeout = budget * timeout_multiplier
         for proc, out_path, tmp, log_fh, cond_name, seed in jobs:
-            proc.wait()
+            try:
+                proc.wait(timeout=run_timeout)
+            except subprocess.TimeoutExpired:
+                # Graceful shutdown: SIGTERM first, give 10s to flush, then SIGKILL
+                proc.terminate()
+                try:
+                    proc.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait()
+                log_fh.close()
+                tmp.unlink(missing_ok=True)
+                completed += 1
+                tag = f"{cond_name}_s{seed}"
+                # Preserve the full log — it's already on disk at RESULTS/{tag}.log
+                log_path = RESULTS / f"{tag}.log"
+                error_tail = ""
+                if log_path.exists():
+                    error_tail = log_path.read_text()[-2000:]
+                failed_path = RESULTS / f"{tag}.failed"
+                failed_path.write_text(json.dumps({
+                    "condition": cond_name, "seed": seed,
+                    "exit_code": -9,
+                    "reason": f"TIMEOUT after {run_timeout:.0f}s ({timeout_multiplier}x budget)",
+                    "log_tail": error_tail,
+                    "log_path": str(log_path),
+                }))
+                # If the process managed to write partial output before dying, keep it
+                if out_path.exists():
+                    print(f"    TIMEOUT: {cond_name} seed={seed} (killed after {run_timeout:.0f}s, partial output saved)")
+                else:
+                    print(f"    TIMEOUT: {cond_name} seed={seed} (killed after {run_timeout:.0f}s, log preserved at {log_path})")
+                continue
             log_fh.close()
             tmp.unlink(missing_ok=True)
             completed += 1
@@ -451,7 +494,7 @@ def print_summary(conditions: dict, label: str):
         return
 
     print(f"\n{'='*80}")
-    print(f"  {label} RESULTS")
+    print(f"  {label} RESULTS (exploratory — confirmatory test is T7)")
     print(f"{'='*80}")
     print(f"\n  {'Condition':<30} {'mean bpb':>10} {'SEM':>8} {'95% CI':>18} {'n':>3} {'params':>10}")
     print(f"  {'-'*83}")
@@ -569,9 +612,21 @@ def main():
     parser.add_argument("--budget", type=float, default=600)
     parser.add_argument("--num-gpus", type=int, default=1)
     parser.add_argument("--phase", choices=["A", "B", "C", "all"], default="A")
+    parser.add_argument("--batch-size", type=int, default=None,
+                        help="Override batch_size for all conditions (hardware knob, not science knob)")
     parser.add_argument("--dry-run", action="store_true",
                         help="Print condition list and exit")
     args = parser.parse_args()
+
+    # Batch size is a hardware knob: benchmark once, lock across all conditions.
+    if args.batch_size is not None:
+        print(f"\n  Batch size override: {args.batch_size} (applied to all conditions)")
+        for cond in T2_CONDITIONS.values():
+            cond["batch_size"] = args.batch_size
+        for cond in T3_CONDITIONS.values():
+            cond["batch_size"] = args.batch_size
+        for cond in T6_CONDITIONS.values():
+            cond["batch_size"] = args.batch_size
 
     if args.phase in ("A", "all"):
         conditions_a = {**T2_CONDITIONS, **T3_CONDITIONS}

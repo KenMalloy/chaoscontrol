@@ -1,6 +1,7 @@
 from dataclasses import dataclass, field
 
 
+_VALID_BUFFER_MODES = ("legacy", "append_only")
 _VALID_RETRIEVAL_MODES = ("softmax_all", "bucket_mean", "bucket_recent", "bucket_topk")
 _VALID_POSTERIOR_MODES = ("none", "global_delta", "bucket_delta", "residual_cache")
 
@@ -157,6 +158,11 @@ class ChaosControlConfig:
     polyphasic_swap_interval: int = 256
 
     def __post_init__(self) -> None:
+        if self.buffer_mode not in _VALID_BUFFER_MODES:
+            raise ValueError(
+                f"buffer_mode must be one of {_VALID_BUFFER_MODES}, "
+                f"got {self.buffer_mode!r}"
+            )
         if self.retrieval_mode not in _VALID_RETRIEVAL_MODES:
             raise ValueError(
                 f"retrieval_mode must be one of {_VALID_RETRIEVAL_MODES}, "
