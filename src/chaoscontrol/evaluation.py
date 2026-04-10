@@ -346,6 +346,44 @@ def _reset_model_state(model: Any) -> None:
         posterior.reset()
 
 
+def _assert_state_clean(model: Any) -> None:
+    """Verify state reset was complete. Catches forgotten stateful components."""
+    om = getattr(model, "outer_model", None)
+    if om is not None and isinstance(om, MultiSlotOuterModel):
+        assert len(om._slots) == 0, "state leak: buffer not empty after reset"
+        assert len(om._survival) == 0, "state leak: survival scores not empty"
+        assert len(om._slot_buckets) == 0, "state leak: bucket assignments not empty"
+        if hasattr(om, "_latent_traces"):
+            assert len(om._latent_traces) == 0, "state leak: latent traces not empty"
+    bpm = getattr(model, "bucket_prototypes_module", None)
+    if bpm is not None and hasattr(bpm, "prototypes"):
+        assert bpm.prototypes.abs().sum() == 0, "state leak: prototypes not zeroed"
+    st = getattr(model, "semantic_tier", None)
+    if st is not None and hasattr(st, "bases"):
+        assert st.bases.abs().sum() == 0, "state leak: semantic tier bases not zeroed"
+    posterior = getattr(model, "posterior", None)
+    if posterior is not None and hasattr(posterior, "reset"):
+        if hasattr(posterior, "delta"):
+            assert posterior.delta.abs().sum() == 0, "state leak: posterior delta not zeroed"
+        if hasattr(posterior, "deltas"):
+            assert posterior.deltas.abs().sum() == 0, "state leak: posterior deltas not zeroed"
+
+
+def _assert_no_grad_leak(model: Any) -> None:
+    """Verify no model parameter accumulated .grad during eval."""
+    for n, p in model.named_parameters():
+        assert p.grad is None or p.grad.abs().sum() == 0, (
+            f"gradient leak: {n} has non-zero .grad after eval"
+        )
+
+
+def _assert_bpb_sane(bpb: float, label: str = "") -> None:
+    """Catch NaN, inf, negative, or impossibly high bpb values."""
+    import math
+    assert math.isfinite(bpb), f"bpb is not finite: {bpb} {label}"
+    assert 0 < bpb < 15, f"bpb out of sane range [0, 15]: {bpb} {label}"
+
+
 def evaluate_warming_curve(
     model: Any,
     tokens: torch.Tensor,
@@ -414,6 +452,7 @@ def evaluate_warming_curve(
 
                 for seg_start in segment_starts:
                     _reset_model_state(model)
+                    _assert_state_clean(model)
 
                     # Warm-up phase: feed N tokens with writes enabled, no scoring
                     if n_warmup > 0:
@@ -448,8 +487,9 @@ def evaluate_warming_curve(
                     total_tokens_scored += int(target.numel())
 
                 if total_tokens_scored > 0:
-                    mean_loss = total_loss / total_tokens_scored
-                    results[n_warmup] = float(mean_loss / math.log(2.0))
+                    bpb = float(total_loss / total_tokens_scored / math.log(2.0))
+                    _assert_bpb_sane(bpb, f"warming_curve N={n_warmup}")
+                    results[n_warmup] = bpb
                 else:
                     results[n_warmup] = float("nan")
     finally:
@@ -544,6 +584,25 @@ def causal_slot_eval(
 
     results: dict[str, dict[int, float]] = {}
 
+    # Reproducibility canary: run cold N=0 on first segment twice. If results
+    # differ, state is leaking between eval calls.
+    if len(segment_starts) > 0:
+        _canary_bpbs = []
+        for _trial in range(2):
+            _reset_model_state(model)
+            _s = segment_starts[0]
+            _inp = tokens[_s:_s + score_tokens].unsqueeze(0).to(device)
+            _tgt = tokens[_s + 1:_s + score_tokens + 1].unsqueeze(0).to(device)
+            with torch.no_grad():
+                _out = model(_inp, memory_write_mode="none")
+                _logits = model.lm_head(model.final_norm(_out["hidden"]))
+                _loss = F.cross_entropy(_logits.reshape(-1, vocab_size), _tgt.reshape(-1), reduction="sum")
+            _canary_bpbs.append(float(_loss.item()))
+        assert _canary_bpbs[0] == _canary_bpbs[1], (
+            f"Reproducibility canary failed: cold N=0 gave different results "
+            f"({_canary_bpbs[0]} vs {_canary_bpbs[1]}). State is leaking between resets."
+        )
+
     try:
         for cond_name in conditions:
             buffer_on, slot_on = _CONDITION_FLAGS[cond_name]
@@ -556,6 +615,7 @@ def causal_slot_eval(
                 for seg_start in segment_starts:
                     # 1. Reset ALL model state
                     _reset_model_state(model)
+                    _assert_state_clean(model)
 
                     # 2. Create fresh delta and logit_bias
                     delta = torch.zeros(1, 1, model_dim, device=device, requires_grad=True)
@@ -630,8 +690,9 @@ def causal_slot_eval(
                     total_tokens_scored += int(target.numel())
 
                 if total_tokens_scored > 0:
-                    mean_loss = total_loss / total_tokens_scored
-                    cond_results[n_warmup] = float(mean_loss / math.log(2.0))
+                    bpb = float(total_loss / total_tokens_scored / math.log(2.0))
+                    _assert_bpb_sane(bpb, f"causal_slot {cond_name} N={n_warmup}")
+                    cond_results[n_warmup] = bpb
                 else:
                     cond_results[n_warmup] = float("nan")
 
@@ -641,6 +702,7 @@ def causal_slot_eval(
         for n, p in model.named_parameters():
             if n in saved_requires_grad:
                 p.requires_grad_(saved_requires_grad[n])
+        _assert_no_grad_leak(model)
         if was_training:
             model.train()
 

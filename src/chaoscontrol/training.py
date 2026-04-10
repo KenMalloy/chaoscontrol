@@ -593,6 +593,12 @@ def train_chaoscontrol_for_budget(
         steps += 1
 
     maybe_sync_cuda(device)
+
+    # VRAM high-water mark — catches unbounded buffer growth before it OOMs
+    peak_vram_mb = 0.0
+    if device.type == "cuda":
+        peak_vram_mb = torch.cuda.max_memory_allocated(device) / (1024 * 1024)
+
     return {
         "steps": int(steps),
         "history": history,
@@ -604,6 +610,7 @@ def train_chaoscontrol_for_budget(
         "bucket_snapshots": bucket_snapshots,
         "regret_table": regret_table,
         "sleep_cycles": sleep_cycles_run,
+        "peak_vram_mb": peak_vram_mb,
     }
 
 
