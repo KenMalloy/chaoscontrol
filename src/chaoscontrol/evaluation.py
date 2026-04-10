@@ -617,9 +617,10 @@ def causal_slot_eval(
                     _reset_model_state(model)
                     _assert_state_clean(model)
 
-                    # 2. Create fresh delta and logit_bias
-                    delta = torch.zeros(1, 1, model_dim, device=device, requires_grad=True)
-                    logit_bias = torch.zeros(1, 1, vocab_size, device=device, requires_grad=True)
+                    # 2. Create fresh delta and logit_bias (match model dtype for bf16)
+                    model_dtype = next(model.parameters()).dtype
+                    delta = torch.zeros(1, 1, model_dim, device=device, dtype=model_dtype, requires_grad=True)
+                    logit_bias = torch.zeros(1, 1, vocab_size, device=device, dtype=model_dtype, requires_grad=True)
                     optimizer = torch.optim.Adam([delta, logit_bias], lr=slot_lr)
 
                     # 3. Warmup phase -- slide windows over segment[:N]

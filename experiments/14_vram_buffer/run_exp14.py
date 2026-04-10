@@ -310,7 +310,7 @@ def _launch(
         shell_cmd = " ".join(shlex.quote(str(c)) for c in cmd)
         shell_cmd += f" 2>&1 | tee {shlex.quote(str(log_path))} /proc/1/fd/1"
         proc = subprocess.Popen(
-            ["bash", "-c", shell_cmd], env=env,
+            ["bash", "-o", "pipefail", "-c", shell_cmd], env=env,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
     else:
@@ -399,16 +399,38 @@ def run_grid(conditions: dict, seeds: list[int], data_path: str, budget: float, 
                 log_path = RESULTS / f"{tag}.log"
                 error_tail = ""
                 if log_path.exists():
-                    error_tail = log_path.read_text()[-500:]
+                    error_tail = log_path.read_text()[-2000:]
                 failed_path.write_text(json.dumps({
                     "condition": cond_name, "seed": seed,
-                    "exit_code": proc.returncode, "error_tail": error_tail,
+                    "exit_code": proc.returncode,
+                    "reason": f"non-zero exit code {proc.returncode}",
+                    "log_tail": error_tail,
+                    "log_path": str(log_path),
                 }))
                 print(f"    FAILED: {cond_name} seed={seed} (exit {proc.returncode})")
                 continue
             if out_path.exists():
-                with open(out_path) as f:
-                    result = json.load(f)
+                try:
+                    with open(out_path) as f:
+                        result = json.load(f)
+                except (json.JSONDecodeError, KeyError):
+                    # Partial/corrupt JSON — crash mid-write
+                    tag = f"{cond_name}_s{seed}"
+                    failed_path = RESULTS / f"{tag}.failed"
+                    log_path = RESULTS / f"{tag}.log"
+                    error_tail = ""
+                    if log_path.exists():
+                        error_tail = log_path.read_text()[-2000:]
+                    failed_path.write_text(json.dumps({
+                        "condition": cond_name, "seed": seed,
+                        "exit_code": 0,
+                        "reason": "output JSON exists but is corrupt — crash mid-write",
+                        "log_tail": error_tail,
+                        "log_path": str(log_path),
+                    }))
+                    out_path.unlink()
+                    print(f"    CORRUPT: {cond_name} seed={seed} (partial .json removed, see {log_path})")
+                    continue
                 bpb = result.get("eval", {}).get("bpb", "?")
                 steps = result.get("train", {}).get("steps", "?")
                 params = result.get("params", "?")
@@ -419,6 +441,22 @@ def run_grid(conditions: dict, seeds: list[int], data_path: str, budget: float, 
                         f"{n}:{b:.3f}" for n, b in sorted(warming.items(), key=lambda x: int(x[0]))
                     ) + "]"
                 print(f"    {cond_name} seed={seed}: bpb={bpb}  steps={steps}  params={params}{warming_str}")
+            else:
+                # Exit 0 but no .json — crash was masked (e.g. by tee pipeline)
+                tag = f"{cond_name}_s{seed}"
+                failed_path = RESULTS / f"{tag}.failed"
+                log_path = RESULTS / f"{tag}.log"
+                error_tail = ""
+                if log_path.exists():
+                    error_tail = log_path.read_text()[-2000:]
+                failed_path.write_text(json.dumps({
+                    "condition": cond_name, "seed": seed,
+                    "exit_code": 0,
+                    "reason": "exit 0 but no output JSON — likely masked crash",
+                    "log_tail": error_tail,
+                    "log_path": str(log_path),
+                }))
+                print(f"    GHOST CRASH: {cond_name} seed={seed} (exit 0, no .json — see {log_path})")
 
         print(f"  [{completed}/{total}]")
 

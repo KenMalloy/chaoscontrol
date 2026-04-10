@@ -389,7 +389,7 @@ class MultiSlotOuterModel(nn.Module):
         """
         batch, seq, dim = h_seq.shape
         # Exponential recency weights: later positions matter more
-        positions = torch.arange(seq, dtype=h_seq.dtype, device=h_seq.device)
+        positions = torch.arange(seq, dtype=torch.float32, device=h_seq.device)
         weights = torch.exp(positions - positions[-1])  # exp-decay, last position = weight 1.0
         weights = weights / weights.sum()
         # Weighted sum over sequence: (batch, dim)

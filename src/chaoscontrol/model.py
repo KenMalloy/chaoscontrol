@@ -261,7 +261,8 @@ class ChaosStudentLM(nn.Module):
     def init_state(self, batch_size: int) -> list[torch.Tensor]:
         """Initialize recurrence states for all layers."""
         device = self.embed.weight.device
-        return [torch.zeros(batch_size, self.dim, device=device) for _ in range(len(self.layers))]
+        dtype = self.embed.weight.dtype
+        return [torch.zeros(batch_size, self.dim, device=device, dtype=dtype) for _ in range(len(self.layers))]
 
     def step(
         self,
