@@ -455,3 +455,181 @@ def evaluate_warming_curve(
             model.train()
 
     return results
+
+
+def causal_slot_eval(
+    model,
+    tokens: torch.Tensor,
+    *,
+    conditions: tuple[str, ...] = ("cold", "buffer_only", "slot_only", "buffer_plus_slot"),
+    warmup_tokens: list[int] | None = None,
+    score_tokens: int = 1024,
+    window_size: int = 256,
+    slot_lr: float = 1e-3,
+    slot_steps: int = 24,
+    segment_starts: list[int] | None = None,
+    segment_len: int | None = None,
+    freeze_during_scoring: bool = True,
+    device: torch.device | None = None,
+) -> dict[str, dict[int, float]]:
+    """Evaluate buffer x Causal SLOT stacking -- the D1 2x2 factorial.
+
+    For each condition, for each segment, for each N in warmup_tokens:
+      1. Reset all model state
+      2. Create fresh delta/logit_bias parameters
+      3. Warmup: slide windows over segment[:N], optionally filling the buffer
+         and/or optimizing delta+logit_bias via SLOT
+      4. Score the next score_tokens tokens
+
+    Model parameters stay FROZEN throughout. Only delta and logit_bias get
+    gradients during SLOT optimization.
+
+    Args:
+        model: ChaosStudentLM instance.
+        tokens: Full token tensor (1D, long).
+        conditions: Which conditions to evaluate.
+        warmup_tokens: List of N values (default: WARMING_CURVE_STEPS).
+        score_tokens: Number of tokens to score after warming.
+        window_size: SLOT sliding window size.
+        slot_lr: Learning rate for SLOT optimizer.
+        slot_steps: Number of optimization steps per window.
+        segment_starts: Explicit start indices (mutually exclusive with segment_len).
+        segment_len: Auto-derive segments of this length (mutually exclusive
+            with segment_starts).
+        freeze_during_scoring: If True, detach delta/logit_bias during scoring
+            (primary metric). If False, allow continued adaptation (streaming metric).
+        device: Device to run on (default: model device).
+
+    Returns:
+        {condition_name: {N: mean_bpb}} for each condition and warmup level.
+    """
+    if warmup_tokens is None:
+        warmup_tokens = list(WARMING_CURVE_STEPS)
+
+    if device is None:
+        device = next(model.parameters()).device
+
+    # Derive segment_starts from segment_len if not provided
+    if segment_starts is None:
+        if segment_len is None:
+            segment_len = max(warmup_tokens) + score_tokens + 1
+        total_len = int(tokens.numel())
+        segment_starts = []
+        pos = 0
+        while pos + segment_len <= total_len:
+            segment_starts.append(pos)
+            pos += segment_len
+        if not segment_starts:
+            segment_starts = [0]
+
+    was_training = model.training
+    model.eval()
+    model_dim = model.dim
+    vocab_size = model.vocab_size
+
+    _CONDITION_FLAGS = {
+        "cold": (False, False),
+        "buffer_only": (True, False),
+        "slot_only": (False, True),
+        "buffer_plus_slot": (True, True),
+    }
+
+    results: dict[str, dict[int, float]] = {}
+
+    try:
+        for cond_name in conditions:
+            buffer_on, slot_on = _CONDITION_FLAGS[cond_name]
+            cond_results: dict[int, float] = {}
+
+            for n_warmup in warmup_tokens:
+                total_loss = 0.0
+                total_tokens_scored = 0
+
+                for seg_start in segment_starts:
+                    # 1. Reset ALL model state
+                    _reset_model_state(model)
+
+                    # 2. Create fresh delta and logit_bias
+                    delta = torch.zeros(1, 1, model_dim, device=device, requires_grad=True)
+                    logit_bias = torch.zeros(1, 1, vocab_size, device=device, requires_grad=True)
+                    optimizer = torch.optim.Adam([delta, logit_bias], lr=slot_lr)
+
+                    # 3. Warmup phase -- slide windows over segment[:N]
+                    # Skip warmup entirely when neither buffer nor SLOT is active:
+                    # cold mode means bare artifact with no adaptation.
+                    if n_warmup > 0 and (buffer_on or slot_on):
+                        warmup_end = seg_start + n_warmup
+                        win_start = seg_start
+                        while win_start < warmup_end:
+                            win_end = min(win_start + window_size, warmup_end)
+                            win_len = win_end - win_start
+
+                            # Bounds check
+                            if win_end + 1 > tokens.numel():
+                                break
+
+                            window_inp = tokens[win_start:win_end].unsqueeze(0).to(device)
+                            window_targets = tokens[win_start + 1:win_end + 1].reshape(-1).to(device)
+
+                            # Forward through model (frozen)
+                            write_mode = "append_only" if buffer_on else "none"
+                            with torch.no_grad():
+                                out = model(window_inp, memory_write_mode=write_mode)
+                                hidden = out["hidden"].detach()
+
+                            # SLOT optimization on this window
+                            if slot_on:
+                                for _step in range(slot_steps):
+                                    h = hidden + delta
+                                    logits = model.lm_head(model.final_norm(h)) + logit_bias
+                                    loss = F.cross_entropy(
+                                        logits.reshape(-1, vocab_size),
+                                        window_targets,
+                                    )
+                                    loss.backward()
+                                    optimizer.step()
+                                    optimizer.zero_grad()
+
+                            win_start = win_end
+
+                    # 4. Scoring phase
+                    score_start = seg_start + n_warmup
+                    score_end = score_start + score_tokens
+                    if score_end + 1 > tokens.numel():
+                        continue
+
+                    inp = tokens[score_start:score_end].unsqueeze(0).to(device)
+                    target = tokens[score_start + 1:score_end + 1].unsqueeze(0).to(device)
+
+                    with torch.no_grad():
+                        out = model(inp, memory_write_mode="none")
+                        hidden = out["hidden"]
+
+                    if freeze_during_scoring:
+                        d = delta.detach()
+                        lb = logit_bias.detach()
+                    else:
+                        d = delta
+                        lb = logit_bias
+
+                    logits = model.lm_head(model.final_norm(hidden + d)) + lb
+                    loss = F.cross_entropy(
+                        logits.reshape(-1, vocab_size),
+                        target.reshape(-1),
+                        reduction="sum",
+                    )
+                    total_loss += float(loss.detach().item())
+                    total_tokens_scored += int(target.numel())
+
+                if total_tokens_scored > 0:
+                    mean_loss = total_loss / total_tokens_scored
+                    cond_results[n_warmup] = float(mean_loss / math.log(2.0))
+                else:
+                    cond_results[n_warmup] = float("nan")
+
+            results[cond_name] = cond_results
+    finally:
+        if was_training:
+            model.train()
+
+    return results
