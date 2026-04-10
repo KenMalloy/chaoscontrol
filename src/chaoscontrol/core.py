@@ -16,8 +16,8 @@ class RMSNorm(nn.Module):
         self.eps = eps
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        normed = F.rms_norm(x, (x.size(-1),), eps=self.eps)
-        return normed * self.weight.to(dtype=x.dtype)
+        normed = F.rms_norm(x.float(), (x.size(-1),), eps=self.eps)
+        return normed.to(x.dtype) * self.weight
 
 
 class FeedForward(nn.Module):
