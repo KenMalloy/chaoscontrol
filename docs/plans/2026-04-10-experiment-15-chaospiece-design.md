@@ -147,11 +147,36 @@ This is analogous to the biological distinction between peripheral
 perception (fast, hardwired) and cortical categorization (learned,
 contextual). Wernicke tried to be both.
 
+### Ontological Framing
+
+Experiment 15 can be read as a lightweight ontology stack for an SSM:
+
+- **Level 1: lexical identity** -- SP8192 provides stable symbols
+  ("what unit is this?").
+- **Level 2: contextual role** -- the Phase C typer assigns a small
+  role inventory on top of those symbols ("what is this unit doing
+  here?").
+- **Level 3: memory addressability** -- token-keyed memory stores and
+  retrieves by these stable units rather than by noisy latent buckets.
+
+This is the deeper thesis behind ChaosPiece: semantic depth in an SSM
+does not come only from longer recurrence. It comes from choosing the
+right units of meaning and preserving them across perception, memory,
+and retrieval.
+
 ## Phase Structure
 
 Each phase is go/no-go on the next. A phase fails if the best condition
 does not beat the control (with statistical significance at p < 0.05,
 two-sided bootstrap test).
+
+The phases are also layered ontologically:
+
+- **Phase A** establishes stable lexical units.
+- **Phase B** tests whether stable units are enough to support useful
+  memory keys.
+- **Phase C** tests whether adding lightweight contextual roles on top
+  of stable units improves memory access and semantic reuse.
 
 ### Phase A: SP8192 Baseline
 
@@ -407,9 +432,10 @@ skip Phase C. Write up: "Token-keyed memory does not benefit language
 modeling under reset-per-segment evaluation, regardless of key
 stability." Pivot to depth recurrence / TTT.
 
-### Phase C: Lightweight Contextual Typer (contingent on Phase B)
+### Phase C: Lightweight Ontological Typer (contingent on Phase B)
 
-**Question:** Does context-dependent typing on stable units add value?
+**Question:** Does adding a lightweight contextual role system on top of
+stable token identities improve memory access and semantic reuse?
 
 **Design:** Add a tiny post-tokenization type head. This is Wernicke
 shrunk from a 16-expert MoE to a small linear projection.
@@ -457,8 +483,32 @@ class ContextualTyper(nn.Module):
 **Parameter cost:** Linear(D, K) = D * K. At D=128, K=8: 1,024 params.
 Trivial.
 
+**Ontological interpretation:** The token ID answers "what lexical unit
+is this?" The type ID answers "what role is this unit playing in this
+context?" This is the minimal ontology Experiment 15 is trying to learn.
+
+**Ontology diagnostics (tracked alongside bpb):**
+
+1. **Type collapse rate:** fraction of tokens assigned to the dominant
+   type. If this is near 1.0, the typer learned nothing.
+2. **Per-token role entropy:** for common tokens (`the`, `of`, `.`,
+   frequent subwords), measure whether the model uses a small set of
+   repeatable roles instead of random switching.
+3. **Contextual consistency:** nearby hidden states with similar local
+   context should often get the same type.
+4. **Cross-context separation:** the same token in clearly different
+   contexts should split across different types more often than chance.
+5. **Retrieval selectivity:** compare token-only vs token+type memory
+   reads. If typing helps, token+type should produce more concentrated
+   and more useful retrieval weights.
+
+These are not primary ranking metrics, but they determine whether a bpb
+gain corresponds to actual ontological structure or just accidental
+optimization noise.
+
 **Success criterion:** Best typed condition beats Phase B winner by
->= 0.01 bpb with p < 0.05.
+>= 0.01 bpb with p < 0.05, while also avoiding trivial collapse in the
+ontology diagnostics above.
 
 ## bpb Calculation
 
