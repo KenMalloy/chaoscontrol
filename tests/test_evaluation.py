@@ -131,8 +131,8 @@ class TestEvaluateWarmingCurve(unittest.TestCase):
         tokens = torch.randint(0, 256, (10000,))
         segment_starts = [0, 2000]
         result = evaluate_warming_curve(
-            model, tokens=tokens, segment_starts=segment_starts,
-            score_len=64, warming_steps=[0, 100],
+            model, tokens, segment_starts=segment_starts,
+            score_tokens=64, warmup_tokens=[0, 100],
             device=device,
         )
         assert 0 in result
@@ -151,8 +151,8 @@ class TestEvaluateWarmingCurve(unittest.TestCase):
         tokens = torch.randint(0, 256, (10000,))
         segment_starts = [0]
         result = evaluate_warming_curve(
-            model, tokens=tokens, segment_starts=segment_starts,
-            score_len=32, warming_steps=[0, 100],
+            model, tokens, segment_starts=segment_starts,
+            score_tokens=32, warmup_tokens=[0, 100],
             device=device,
         )
         # Both should be valid floats
@@ -167,8 +167,8 @@ class TestEvaluateWarmingCurve(unittest.TestCase):
         tokens = torch.randint(0, 256, (100,))
         # Segment starts that would overflow
         result = evaluate_warming_curve(
-            model, tokens=tokens, segment_starts=[99999],
-            score_len=64, warming_steps=[0],
+            model, tokens, segment_starts=[99999],
+            score_tokens=64, warmup_tokens=[0],
             device=device,
         )
         assert result[0] != result[0]  # NaN

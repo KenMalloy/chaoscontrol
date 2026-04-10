@@ -80,8 +80,8 @@ def build_model(
 
 
 def run_step(model: ChaosStudentLM, x: torch.Tensor) -> None:
-    """Single forward + backward step."""
-    out = model(x)
+    """Single forward + backward step with buffer writes enabled."""
+    out = model(x, memory_write_mode="append_only")
     logits = out["logits"]
     # Shift for next-token prediction loss
     loss = torch.nn.functional.cross_entropy(

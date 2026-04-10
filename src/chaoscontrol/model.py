@@ -378,34 +378,40 @@ class ChaosStudentLM(nn.Module):
 
         # Buffer read path
         if self.outer_model is not None and self.buffer_mode == "append_only":
-            # Typed buffer path: within-bucket retrieval
+            # Typed buffer path: per-sample within-bucket retrieval.
+            # Each sample reads from its own dominant bucket (mode over seq dim),
+            # not one global bucket for the whole batch.
+            batch = x.size(0)
+            model_dim = x.size(2)
             if isinstance(self.outer_model, MultiSlotOuterModel) and self.outer_model._slots:
                 if bucket_ids is not None:
-                    # Per-token bucket reads: use the dominant bucket per sample
-                    # for a single read (efficient), decoded to model_dim by read_bucket
-                    dominant_bucket = int(bucket_ids[:, -1].flatten().mode().values.item())
+                    per_sample_buckets = bucket_ids.mode(dim=1).values  # (batch,)
                 else:
-                    dominant_bucket = 0
-                cue = None
-                if self.retrieval_mode in ("bucket_topk", "softmax_all"):
-                    # Project cue to outer_dim for similarity scoring
-                    cue = self.outer_model.cue_proj(
-                        x.detach().mean(dim=1).to(dtype=self.outer_model.cue_proj.weight.dtype)
+                    per_sample_buckets = torch.zeros(batch, dtype=torch.long, device=x.device)
+                outer_read = torch.zeros(batch, 1, model_dim, device=x.device)
+                for b_id in per_sample_buckets.unique():
+                    mask = per_sample_buckets == b_id
+                    cue = None
+                    if self.retrieval_mode in ("bucket_topk", "softmax_all"):
+                        cue = self.outer_model.cue_proj(
+                            x[mask].detach().mean(dim=1).to(dtype=self.outer_model.cue_proj.weight.dtype)
+                        )
+                    read = self.outer_model.read_bucket(
+                        int(mask.sum()), bucket_id=int(b_id.item()),
+                        mode=self.retrieval_mode, k=self.retrieval_k, cue=cue,
                     )
-                outer_read = self.outer_model.read_bucket(
-                    x.size(0),
-                    bucket_id=dominant_bucket,
-                    mode=self.retrieval_mode,
-                    k=self.retrieval_k,
-                    cue=cue,
-                )
-                x = x + outer_read.unsqueeze(1)  # broadcast across seq dim
+                    outer_read[mask] = read.unsqueeze(1)
+                x = x + outer_read
 
-            # Bucket prototypes: add per-type prior bias
+            # Bucket prototypes: per-sample prior bias
             if self.bucket_prototypes_module is not None and bucket_ids is not None:
-                dominant_bucket = int(bucket_ids[:, -1].flatten().mode().values.item())
-                proto = self.bucket_prototypes_module.read(x.size(0), dominant_bucket)
-                x = x + proto.unsqueeze(1)
+                per_sample_buckets = bucket_ids.mode(dim=1).values  # (batch,)
+                proto_bias = torch.zeros(batch, 1, model_dim, device=x.device)
+                for b_id in per_sample_buckets.unique():
+                    mask = per_sample_buckets == b_id
+                    proto = self.bucket_prototypes_module.read(int(mask.sum()), int(b_id.item()))
+                    proto_bias[mask] = proto.unsqueeze(1)
+                x = x + proto_bias
 
         elif self.outer_model is not None:
             # Legacy path: unchanged
