@@ -300,7 +300,7 @@ if __name__ == "__main__":
     import argparse
     p = argparse.ArgumentParser()
     p.add_argument("--config", required=True)
-    p.add_argument("--enwik8-path", "--data-path", required=True, dest="enwik8_path")
+    p.add_argument("--data-path", "--enwik8-path", required=True, dest="data_path")
     p.add_argument("--budget", type=float, default=300)
     p.add_argument("--output-json", default=None)
     p.add_argument("--checkpoint-dir", default=None,
