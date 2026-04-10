@@ -95,7 +95,7 @@ class WernickeLayer(nn.Module):
             # Hard assignment: nearest codebook vector
             bucket_ids = dists.argmin(dim=-1)  # (batch, seq)
             # Straight-through: forward uses hard one-hot, backward uses soft distances
-            one_hot = F.one_hot(bucket_ids, self.k_max).float()  # (batch, seq, k_max)
+            one_hot = F.one_hot(bucket_ids, self.k_max).to(h.dtype)  # (batch, seq, k_max)
             soft_weights = F.softmax(-dists, dim=-1)  # (batch, seq, k_max)
             # Straight-through estimator
             routing_weights = one_hot + soft_weights - soft_weights.detach()
@@ -103,7 +103,7 @@ class WernickeLayer(nn.Module):
             # Linear projection to k_max logits, top-1 selection
             logits = self.router(h)  # (batch, seq, k_max)
             bucket_ids = logits.argmax(dim=-1)  # (batch, seq)
-            one_hot = F.one_hot(bucket_ids, self.k_max).float()  # (batch, seq, k_max)
+            one_hot = F.one_hot(bucket_ids, self.k_max).to(h.dtype)  # (batch, seq, k_max)
             soft_weights = F.softmax(logits, dim=-1)  # (batch, seq, k_max)
             # Straight-through estimator
             routing_weights = one_hot + soft_weights - soft_weights.detach()
