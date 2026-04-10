@@ -298,53 +298,119 @@ No extra pairwise tests in T7.
 
 2 conditions x 8 fresh seeds = 16 runs
 
-### Phase D: Epistemic Gap Follow-up (post-T7)
+### Phase D: Buffer x Causal SLOT Stacking Study (post-T7)
 
-Run only after T7 locks a real Exp 14 winner. This is a separate
-follow-up, not part of the core Claim 1 proof.
+Run only after T7 locks a real Exp 14 winner. This is eval-only —
+zero additional training cost. Tests whether typed buffer adds value
+on top of the strongest known test-time adaptor (Causal SLOT).
 
-The motivation is epistemic, not architectural:
+#### What Causal SLOT is
 
-- the typed buffer stores **evidence** from the past stream
-- these follow-ups test whether a causal state can also store
-  **belief updates** induced by past prediction error
+Causal SLOT optimizes a small delta vector (hidden_dim) and logit bias
+(vocab_size) on PAST windows, then applies them to FUTURE predictions.
+Every scored token was predicted using only backward-looking information.
 
-This is the causal analogue of a `delta`-like adaptation state, but it
-must be earned strictly forward from past observations. No future-target
-conditioning, no within-window fitting, no extra side information.
+```
+delta = zeros(1, 1, hidden_dim)
+logit_bias = zeros(1, 1, vocab_size)
 
-#### Invariants
+for window in sliding_windows:
+    # 1. SCORE with current delta (from past windows only)
+    logits = lm_head(hidden + delta) + logit_bias
+    record_loss(logits, targets)
 
-1. A posterior-state update may only use targets that have already been
-   observed in the stream.
-2. Any update at step `t` may affect predictions from `t+1` onward only.
-3. The TTT evaluation contract above remains unchanged.
-4. Report both `bpb_artifact_cold` and the full `bpb_ttt_after_N`
-   warming curve.
+    # 2. THEN optimize delta on this window (already scored)
+    for step in range(n_steps):
+        loss = cross_entropy(lm_head(hidden + delta) + logit_bias, targets)
+        loss.backward()
+        optimizer.step()
+```
 
-#### Posterior-state options
+Window 0 gets no benefit (cold delta). Window 1+ benefits from past
+adaptation. This is strictly causal — no future-target conditioning.
 
-| Option | State | Purpose |
-|--------|-------|---------|
-| global_delta | One document-level correction vector | Capture document-wide drift (style, domain, spelling, formatting) |
-| bucket_delta | One correction vector per Wernicke bucket | Capture type-specific posterior shifts |
-| residual_cache | Retrieved correction traces keyed by context | Recall context-specific corrections that helped before |
+#### Why they stack
 
-#### Suggested ablation set
+Buffer and SLOT solve different problems:
+- **Buffer:** "I saw this specific pattern in bucket 7" — typed local recall
+- **SLOT:** "this document uses formal English and semicolons" — global drift
 
-| Condition | Evidence memory | Posterior state |
-|-----------|-----------------|-----------------|
-| winner_buffer_only | locked Exp 14 winner | none |
-| winner_global_delta | locked Exp 14 winner | global_delta |
-| winner_bucket_delta | locked Exp 14 winner | bucket_delta |
-| winner_residual_cache | locked Exp 14 winner | residual_cache |
-| winner_buffer_plus_bucket | locked Exp 14 winner | bucket_delta + evidence memory |
-| winner_full_posterior | locked Exp 14 winner | global_delta + bucket_delta + residual_cache |
+They are complementary. Buffer gives local typed context. SLOT gives
+global document-level calibration.
 
-This follow-up answers a different question from T2/T3:
+#### D1: Primary — buffer x causal SLOT (2x2 factorial)
 
-> Is typed evidence memory enough, or does the model also need a causal
-> posterior-state memory to close the remaining gap?
+Run on the locked T7 winner and strongest buffer-capable alternative.
+
+| Condition | Buffer | Causal SLOT | What it measures |
+|-----------|--------|-------------|-----------------|
+| `cold` | off* | off | Bare artifact, no adaptation |
+| `buffer_only` | on | off | Typed context accumulation |
+| `slot_only` | off* | on | Competition standard adaptation |
+| `buffer_plus_slot` | on | on | **Do they stack?** |
+
+*"Buffer off" means: no stream-built append-only buffer, no runtime
+buffer reads. Shipped artifact structure (Wernicke routing, prototypes)
+stays on — cold is "bare artifact," not "artifact with pieces amputated."
+
+For non-buffer baselines (transformer, mamba2, bare_ssm), only run:
+- `cold` and `slot_only`
+
+**SLOT hyperparameters** (fixed, not swept — match competition):
+- `n_steps`: 24 per window
+- `window_size`: match competition default
+- `lr`: match competition default
+- delta: hidden_dim (128), logit_bias: vocab_size (256)
+
+**Two metrics per condition:**
+- **Primary (freeze-after-warmup):** warm on first N tokens, freeze all
+  adaptation, score next 1024. Isolates the quality of state built from
+  the first N tokens.
+- **Secondary (fully-online):** adaptation continues during scoring.
+  Practical streaming number. Report both; primary is the paper metric.
+
+**Pre-registered confirmatory contrast:**
+
+    buffer_plus_slot vs slot_only
+
+on the locked winner checkpoint, with fresh eval segments.
+Everything else in D1 is secondary.
+
+#### D2: Cheaper Posterior Alternatives (follow-up)
+
+Run only on the locked winner. Tests whether cheaper mechanisms can
+approximate SLOT's gain:
+
+| Condition | Mechanism | Cost vs SLOT |
+|-----------|-----------|-------------|
+| buffer_plus_slot | full SLOT (24 steps/window) | baseline |
+| buffer_plus_global_delta | single-step hidden correction | ~free |
+| buffer_plus_bucket_delta | per-bucket correction from error | ~free |
+| buffer_plus_residual_cache | cached (context, correction) pairs | ~free |
+
+This answers: "can we recover some of SLOT's gain more cheaply and
+more causally?" Separate follow-up, does not muddy the D1 headline.
+
+#### Evaluation protocol (same as TTT contract above)
+
+```
+for checkpoint in locked_checkpoints:
+    for segment in heldout_segments:
+        for N in [0, 100, 500, 1000, 5000]:
+            reset_all_state()
+
+            if buffer_on:
+                warm_buffer(segment[:N])
+            if slot_on:
+                causal_slot_update(segment[:N])
+
+            bpb = score_next_1024(
+                segment[N:N+1024],
+                freeze_adaptation=True,   # primary metric
+            )
+```
+
+Then optionally rerun with `freeze_adaptation=False` as the streaming metric.
 
 ### Totals
 
