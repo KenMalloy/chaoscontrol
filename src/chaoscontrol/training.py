@@ -113,7 +113,8 @@ def train_chaoscontrol_for_budget(
     prev_dominant_bucket: int | None = None  # one-step-delayed bucket for CFR bias
     if cfr_enabled:
         from chaoscontrol.regret import RegretTable
-        k_max = model.wernicke.k_max if getattr(model, "wernicke", None) else 16
+        w = getattr(model, "wernicke", None)
+        k_max = getattr(w, "total_buckets", None) or getattr(w, "k_max", 16) if w else 16
         regret_table = RegretTable(n_buckets=k_max, n_actions=metabolic_k)
 
     wake_cache = WakeCache(max_moments=32, max_hidden_buffer=64) if sleep_enabled else None
@@ -382,7 +383,8 @@ def train_chaoscontrol_for_budget(
         if steps % spectral_log_interval == 0 and "bucket_ids" in out:
             with torch.no_grad():
                 bids = out["bucket_ids"].detach().reshape(-1)
-                counts = torch.bincount(bids, minlength=model.wernicke.k_max if model.wernicke else 1)
+                n_buckets = getattr(model.wernicke, "total_buckets", None) or getattr(model.wernicke, "k_max", 1)
+                counts = torch.bincount(bids, minlength=n_buckets)
                 bucket_snapshots.append({
                     "step": int(steps),
                     "bucket_counts": counts.cpu().tolist(),
