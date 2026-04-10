@@ -342,16 +342,17 @@ global document-level calibration.
 
 Run on the locked T7 winner and strongest buffer-capable alternative.
 
-| Condition | Buffer | Causal SLOT | What it measures |
-|-----------|--------|-------------|-----------------|
+| Condition | Runtime buffer | Causal SLOT | What it measures |
+|-----------|---------------|-------------|-----------------|
 | `cold` | off* | off | Bare artifact, no adaptation |
 | `buffer_only` | on | off | Typed context accumulation |
 | `slot_only` | off* | on | Competition standard adaptation |
 | `buffer_plus_slot` | on | on | **Do they stack?** |
 
-*"Buffer off" means: no stream-built append-only buffer, no runtime
-buffer reads. Shipped artifact structure (Wernicke routing, prototypes)
-stays on — cold is "bare artifact," not "artifact with pieces amputated."
+*"Runtime buffer off" means: no stream-built append-only buffer state,
+no runtime buffer reads. Shipped artifact structure (Wernicke routing,
+prototypes) stays on — cold is "bare artifact," not "artifact with
+pieces amputated."
 
 For non-buffer baselines (transformer, mamba2, bare_ssm), only run:
 - `cold` and `slot_only`
@@ -361,6 +362,11 @@ For non-buffer baselines (transformer, mamba2, bare_ssm), only run:
 - `window_size`: match competition default
 - `lr`: match competition default
 - delta: hidden_dim (128), logit_bias: vocab_size (256)
+
+**Partial window handling:** If the last warmup window has fewer tokens
+than window_size, optimize it as a short window (same n_steps, shorter
+sequence). Do not discard partial windows — at low N (e.g. 100) this
+could starve SLOT relative to the buffer, which processes every token.
 
 **Two metrics per condition:**
 - **Primary (freeze-after-warmup):** warm on first N tokens, freeze all
@@ -437,7 +443,7 @@ results.
 6. Spin up 8x H100 -> Phase B if needed + Phase C (~2 hrs) -> tear down
 7. Optional: run T4 only as a longer-horizon follow-up if Claim 1 wins
    and the buffer shows real maintenance pressure
-8. Optional: after T7 locks a winner, run Phase D to test causal
-   posterior-state variants on top of the winning Exp 14 architecture
+8. After T7 locks a winner, run Phase D1 (buffer x Causal SLOT
+   stacking study) and optionally D2 (cheaper posterior alternatives)
 
 Total H100 time: ~4 hours across 2-3 sessions.
