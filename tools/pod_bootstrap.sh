@@ -101,34 +101,23 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 6. Download enwik8 if not present
+# 6. Verify FineWeb data (should already be on the network disk from prep_data.sh)
 # ---------------------------------------------------------------------------
 echo ""
-echo "=== Data: enwik8 ==="
+echo "=== Data: FineWeb ==="
 
-mkdir -p "$DATA"
+FINEWEB_DIR="/workspace/fineweb_data"
+RAW_TEXT=$(find "$FINEWEB_DIR" -name "docs_raw.txt" 2>/dev/null | head -1)
 
-if [ -f "$DATA/enwik8" ]; then
-    SIZE=$(stat -c%s "$DATA/enwik8" 2>/dev/null || stat -f%z "$DATA/enwik8" 2>/dev/null)
-    echo "enwik8 already present ($SIZE bytes), skipping download"
+if [ -n "$RAW_TEXT" ] && [ -s "$RAW_TEXT" ]; then
+    SIZE=$(stat -c%s "$RAW_TEXT" 2>/dev/null || stat -f%z "$RAW_TEXT" 2>/dev/null)
+    echo "FineWeb docs_raw.txt found: $RAW_TEXT ($SIZE bytes)"
+    DATA_PATH="$(dirname "$RAW_TEXT")"
 else
-    echo "Downloading enwik8..."
-    cd "$DATA"
-    wget -q --show-progress "$ENWIK8_URL" -O enwik8.zip
-    unzip -o enwik8.zip
-    rm -f enwik8.zip
-    SIZE=$(stat -c%s "$DATA/enwik8" 2>/dev/null || stat -f%z "$DATA/enwik8" 2>/dev/null)
-    echo "Downloaded enwik8: $SIZE bytes"
-    cd "$REPO"
-fi
-
-# Validate enwik8 size (should be exactly 100,000,000 bytes)
-EXPECTED_SIZE=100000000
-ACTUAL_SIZE=$(stat -c%s "$DATA/enwik8" 2>/dev/null || stat -f%z "$DATA/enwik8" 2>/dev/null)
-if [ "$ACTUAL_SIZE" -ne "$EXPECTED_SIZE" ]; then
-    echo "WARNING: enwik8 size mismatch. Expected $EXPECTED_SIZE, got $ACTUAL_SIZE"
-else
-    echo "enwik8 validated: $ACTUAL_SIZE bytes (OK)"
+    echo "WARNING: FineWeb docs_raw.txt not found in $FINEWEB_DIR"
+    echo "  Run prep_data.sh on a CPU pod first to download and extract FineWeb."
+    echo "  The GPU pod expects the data to already be on the network disk."
+    DATA_PATH="$FINEWEB_DIR"
 fi
 
 # ---------------------------------------------------------------------------
@@ -207,10 +196,10 @@ echo "============================================"
 echo "Bootstrap complete: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
 echo "============================================"
 echo ""
-echo "Data path:  $DATA/enwik8"
+echo "Data path:  $DATA_PATH"
 echo "Repo path:  $REPO"
 echo ""
 echo "Run experiments with:"
 echo "  cd $REPO"
-echo "  python experiments/09_revised_architecture/run_layered.py --data-path $DATA/enwik8 --budget 600 --num-gpus \$(nvidia-smi -L | wc -l)"
+echo "  python experiments/14_vram_buffer/run_exp14.py --data-path $DATA_PATH --budget 600 --num-gpus \$(nvidia-smi -L | wc -l) --phase A"
 echo ""

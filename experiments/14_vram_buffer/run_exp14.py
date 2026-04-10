@@ -14,7 +14,8 @@ Phase C (T6 + T7): composition + confirmation
 
 Run with:
   python experiments/14_vram_buffer/run_exp14.py \
-      --data-path data/enwik8 --budget 600 --num-gpus 8 --phase A
+      --data-path /workspace/fineweb_data/datasets/fineweb10B_byte260 \
+      --budget 600 --num-gpus 8 --phase A
 """
 import argparse
 import json
