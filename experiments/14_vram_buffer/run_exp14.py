@@ -1,20 +1,29 @@
 #!/usr/bin/env python3
-"""Experiment 14: VRAM-resident typed KV buffer ablation.
+"""VRAM-resident typed KV buffer ablation sweep.
 
-Phase A (T2 + T3): core typed buffer ablation
-  T2: Retrieval mode x capacity (8 conditions x 7 seeds = 56 runs)
-  T3: Wernicke structure, param-matched (5 conditions x 7 seeds = 35 runs)
+Tests whether storing per-token key-value pairs in VRAM, organized by
+Wernicke bucket type, improves language model bpb compared to the
+consolidation-based episodic memory and bare baselines (SSM, Transformer,
+Mamba2). The sweep is structured in three phases:
 
-Phase B (T5): developmental fast weights (contingent on Phase A)
-  T5: Fast weight freeze schedule (5 conditions x 7 seeds = 35 runs)
+Phase A -- Core ablation (T2 + T3):
+  T2: Retrieval mode x capacity — how the model selects from stored entries
+      (softmax-all, bucket-mean, bucket-recent, bucket-topk) across buffer
+      sizes (capped vs uncapped). 8 conditions x 7 seeds = 56 runs.
+  T3: Wernicke routing structure — flat vs hierarchical codebooks at matched
+      parameter budgets. 5 conditions x 7 seeds = 35 runs.
 
-Phase C (T6 + T7): composition + confirmation
-  T6: Composition (5 conditions x 7 seeds = 35 runs)
-  T7: Confirmation (2 conditions x 8 fresh seeds = 16 runs)
+Phase B -- Developmental fast weights (T5, contingent on Phase A):
+  T5: Fast weight freeze schedule. 5 conditions x 7 seeds = 35 runs.
+
+Phase C -- Composition + confirmation (T6 + T7):
+  T6: Combines Phase A/B winners with baselines. 5+ conditions x 7 seeds.
+  T7: Locked confirmation of T6 winner vs strongest baseline with 8 fresh
+      seeds and a single pre-registered statistical test. 2 x 8 = 16 runs.
 
 Run with:
-  python experiments/14_vram_buffer/run_exp14.py \
-      --data-path /workspace/fineweb_data/datasets/fineweb10B_byte260 \
+  python experiments/14_vram_buffer/run_exp14.py \\
+      --data-path /workspace/fineweb_data/datasets/fineweb10B_byte260 \\
       --budget 600 --num-gpus 8 --phase A
 """
 import argparse
@@ -73,6 +82,8 @@ def _base(**overrides) -> dict:
 
 
 # -- T2: Retrieval mode x capacity --
+# Condition naming: {retrieval_mode}_{capacity}[_{k}]
+#   e.g. "topk_uncapped_8" = bucket_topk retrieval, no slot cap, k=8 neighbors
 
 T2_CONDITIONS = {
     # softmax_all_32 uses legacy buffer_mode intentionally as the
@@ -180,8 +191,10 @@ T6_CONDITIONS = {
         "batch_size": 32, "base_lr": 2e-3,
     },
 }
-# claim1_winner, current_best, and full_winner are injected dynamically
-# by inject_dynamic_t6_conditions() before running Phase C.
+# Dynamic T6 conditions injected by inject_dynamic_t6_conditions():
+#   claim1_winner — combines best T2 retrieval mode + best T3 Wernicke structure
+#   current_best  — hardcoded winner from prior experiments (consolidation-based memory)
+#   full_winner   — claim1_winner + best T5 fast-weight schedule (if Phase B ran)
 
 
 # -- Dynamic T6 condition injection from Phase A results --
@@ -517,8 +530,8 @@ def _identify_t6_winner_and_baseline() -> tuple[str | None, dict | None, str | N
 def print_t7_confirmation(conditions: dict):
     """Print T7 confirmation results with locked statistical test.
 
-    Fix 5: T7 discipline -- single pre-specified contrast, 8 fresh seeds,
-    locked held-out validation, no extra pairwise tests.
+    T7 uses strict confirmation discipline: single pre-specified contrast,
+    8 fresh seeds, locked held-out validation, no extra pairwise tests.
     """
     results = _load_results()
     cond_names = list(conditions.keys())
@@ -550,7 +563,7 @@ def print_t7_confirmation(conditions: dict):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Experiment 14: VRAM-resident typed KV buffer ablation"
+        description="VRAM-resident typed KV buffer ablation sweep"
     )
     parser.add_argument("--data-path", required=True)
     parser.add_argument("--budget", type=float, default=600)

@@ -70,7 +70,7 @@ def train_chaoscontrol_for_budget(
     polyphasic_k_awake: int = 3,
     polyphasic_topology: str = "slot_striped",
     polyphasic_swap_interval: int = 256,
-    # Experiment 14: typed KV buffer
+    # Typed KV buffer: "append_only" writes per-token to Wernicke buckets; "legacy" uses consolidation
     buffer_mode: str = "legacy",
     wernicke_enabled: bool = False,
 ) -> dict[str, Any]:
@@ -240,7 +240,7 @@ def train_chaoscontrol_for_budget(
                             out["jacobian_stats"] = stats_out["jacobian_stats"]
             else:
                 # Cheap deterministic pass (always — MC mode uses this as the base)
-                # Experiment 14: pass memory_write_mode to control buffer writes
+                # Typed buffer path: pass memory_write_mode to control per-token buffer writes
                 _write_mode = "append_only" if buffer_mode == "append_only" else "none"
                 out = model(inputs, return_jacobian_stats=use_crit, memory_write_mode=_write_mode)
 
@@ -470,7 +470,9 @@ def train_chaoscontrol_for_budget(
             elif hasattr(model.outer_model, "_compression_consequences"):
                 model.outer_model._compression_consequences.clear()
         elif model.outer_model is not None and buffer_mode == "append_only":
-            # In append_only mode, extract dominant bucket for downstream use
+            # In append_only mode, skip reactivation: the buffer never compresses
+            # slots, so no compressed traces exist to reactivate. Just extract
+            # the dominant bucket for downstream use.
             if "bucket_ids" in out:
                 bids = out["bucket_ids"].detach()
                 flat_ids = bids.reshape(-1)
@@ -550,8 +552,9 @@ def train_chaoscontrol_for_budget(
             recent_decoded = model.outer_model.decoder(recent_slots)
             model.semantic_tier.consolidate_from_episodes(recent_decoded)
 
-        # Phase D: posterior-state update (after loss computation, not in forward)
-        # Uses hidden state mean as the prediction error gradient direction.
+        # Posterior-state update: error-driven belief correction (after loss
+        # computation, not in forward). Uses error-weighted hidden state mean
+        # as the prediction error gradient direction.
         posterior = getattr(model, "posterior", None)
         if posterior is not None and "hidden" in out:
             with torch.no_grad():

@@ -453,15 +453,16 @@ class MultiSlotOuterModel(nn.Module):
         else:
             raise ValueError(f"Unknown retrieval mode: {mode}")
 
-        # Fix 1: decode from outer_dim to model_dim before returning
+        # Decode from outer_dim back to model_dim so the retrieved vector
+        # can be added directly to the hidden stream (dimensional alignment)
         decoded = self.decoder(retrieved)  # (1, model_dim)
         return decoded.expand(batch_size, -1)
 
     def append_kv(self, encoded: torch.Tensor, bucket_id: int | None = None) -> None:
         """Unconditional append -- no surprise gating, no compression if unlimited.
 
-        For Experiment 14 append_only buffer mode. Stores the pre-encoded
-        vector directly (caller is responsible for encoding via self.encoder).
+        Used by the append_only buffer mode. Stores the pre-encoded vector
+        directly (caller is responsible for encoding via self.encoder).
         """
         self._slots.append(encoded.detach())
         self._survival.append(1.0)
@@ -806,8 +807,8 @@ class BucketPrototypes(nn.Module):
     EMA-updated from buffer entries. Ships in artifact for cold-start context.
 
     Stores prototypes in prototype_dim (typically == outer_dim) and decodes
-    to model_dim on read. This matches Fix 1: all memory reads must be
-    decoded to model_dim before being added to the stream.
+    to model_dim on read. All memory reads must be decoded to model_dim
+    before being added to the hidden stream (dimensional alignment).
     """
 
     def __init__(

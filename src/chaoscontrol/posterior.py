@@ -1,10 +1,16 @@
-"""Phase D posterior-state modules for Experiment 14.
+"""Error-driven posterior-state modules for belief correction.
 
 Three causal posterior-state options that store belief updates induced by
 past prediction error. All maintain strict forward causality: updates at
 step t may only affect predictions from t+1 onward.
 
-Each class satisfies the TTT contract: reset() clears all posterior state.
+- GlobalDelta: one correction vector for the whole document.
+- BucketDelta: per-Wernicke-bucket correction vectors.
+- ResidualCache: context-keyed cache of (key, correction) pairs with top-k retrieval.
+
+Each class implements the Test-Time Training (TTT) protocol: reset() clears
+all learned state between evaluation segments so the model rebuilds its
+beliefs from scratch on each new segment.
 """
 from __future__ import annotations
 
@@ -44,7 +50,7 @@ class GlobalDelta(nn.Module):
         self.delta = (self.delta + self.lr * grad).detach()
 
     def reset(self) -> None:
-        """TTT contract: clear posterior state between segments."""
+        """Test-Time Training protocol: clear learned state between evaluation segments."""
         self.delta.zero_()
 
 
@@ -88,7 +94,7 @@ class BucketDelta(nn.Module):
         self.deltas[bucket_id] = (self.deltas[bucket_id] + self.lr * grad).detach()
 
     def reset(self) -> None:
-        """TTT contract: clear all per-bucket posterior state."""
+        """Test-Time Training protocol: clear learned state between evaluation segments."""
         self.deltas.zero_()
 
 
@@ -167,6 +173,6 @@ class ResidualCache(nn.Module):
             self._values = self._values[-self.max_entries:]
 
     def reset(self) -> None:
-        """TTT contract: clear all cached correction traces."""
+        """Test-Time Training protocol: clear learned state between evaluation segments."""
         self._keys.clear()
         self._values.clear()

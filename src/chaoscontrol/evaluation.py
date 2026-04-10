@@ -1,4 +1,15 @@
-"""Evaluation utilities for ChaosControl models."""
+"""Evaluation utilities for ChaosControl models.
+
+Key concepts:
+- Warming curves: measure how model performance (bpb) improves as it sees
+  more context tokens before scoring. This quantifies how quickly episodic
+  memory, posterior state, and other runtime buffers adapt to new data.
+- State resets between segments: following the Test-Time Training (TTT)
+  protocol, all runtime state (SSM hidden states, episodic buffer, posterior
+  corrections, semantic tier) is cleared between evaluation segments. This
+  ensures each measurement reflects the model's ability to rebuild context
+  from scratch, not residual state from previous segments.
+"""
 from __future__ import annotations
 
 import math
@@ -289,8 +300,11 @@ def evaluate_chaoscontrol_bpb(
 def _reset_model_state(model: Any) -> None:
     """Reset all stateful components: SSM state, buffer, prototypes, semantic tier, posterior.
 
-    This implements the TTT evaluation contract: between segments, all
-    runtime state is cleared so the buffer rebuilds from scratch.
+    This implements the Test-Time Training (TTT) evaluation protocol:
+    between evaluation segments, all runtime state is cleared so the model
+    rebuilds its beliefs from scratch. Without this reset, bpb scores would
+    reflect residual state from previous segments rather than the model's
+    true adaptation speed on fresh data.
     """
     # Reset SSM recurrence state (hidden states in ChaosSSMCore)
     for layer in getattr(model, "layers", []):

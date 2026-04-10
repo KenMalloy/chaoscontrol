@@ -137,7 +137,7 @@ class ChaosStudentLM(nn.Module):
         self.dim = dim
         self.embed = nn.Embedding(vocab_size, dim)
 
-        # Experiment 14 config
+        # Typed KV buffer config
         self.buffer_mode = buffer_mode
         self.retrieval_mode = retrieval_mode
         self.retrieval_k = retrieval_k
@@ -224,7 +224,7 @@ class ChaosStudentLM(nn.Module):
                 update_rate=prototype_update_rate,
             )
 
-        # Phase D: posterior-state module
+        # Error-driven posterior module: stores belief corrections from prediction error
         self.posterior: GlobalDelta | BucketDelta | ResidualCache | None = None
         self.posterior_mode = posterior_mode
         if posterior_mode == "global_delta":
@@ -370,7 +370,7 @@ class ChaosStudentLM(nn.Module):
 
         # Buffer read path
         if self.outer_model is not None and self.buffer_mode == "append_only":
-            # New Exp14 path: within-bucket retrieval
+            # Typed buffer path: within-bucket retrieval
             if isinstance(self.outer_model, MultiSlotOuterModel) and self.outer_model._slots:
                 if bucket_ids is not None:
                     # Per-token bucket reads: use the dominant bucket per sample
@@ -421,7 +421,7 @@ class ChaosStudentLM(nn.Module):
             else:
                 x = result
 
-        # Phase D: posterior read — add correction bias after SSM recurrence,
+        # Error-driven posterior read — add correction bias after SSM recurrence,
         # before LM head. The posterior update happens AFTER loss computation
         # in the training loop (same pattern as buffer writes).
         if self.posterior is not None:
@@ -446,8 +446,10 @@ class ChaosStudentLM(nn.Module):
         x = self.final_norm(x)
         logits = self.lm_head(x)
 
-        # Fix 2: writes are ONLY performed when the caller explicitly requests.
-        # Fix 3: per-token writes, not one dominant bucket per batch.
+        # Memory writes are deferred to the caller (training loop / eval) so
+        # forward() stays side-effect free by default.
+        # Each token is written to its own Wernicke bucket, not collapsed
+        # to one dominant bucket per batch, preserving per-token type fidelity.
         if (
             memory_write_mode == "append_only"
             and self.buffer_mode == "append_only"
