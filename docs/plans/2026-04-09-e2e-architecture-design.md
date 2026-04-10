@@ -203,18 +203,25 @@ Primary question: does typed within-bucket retrieval help?
 Bridge question: how much of the gain comes from uncapping memory rather
 than from the retrieval rule itself?
 
-| Condition | max_slots | Retrieval |
-|-----------|-----------|-----------|
-| softmax_all_32 | 32 | softmax over all (current baseline) |
-| softmax_all_uncapped | unlimited | softmax over all |
-| mean_uncapped | unlimited | bucket mean |
-| recent_uncapped | unlimited | most recent k=8 in bucket |
-| topk_32_8 | 32 | top-8 in bucket |
-| topk_uncapped_4 | unlimited | top-4 in bucket |
-| topk_uncapped_8 | unlimited | top-8 in bucket |
-| topk_uncapped_16 | unlimited | top-16 in bucket |
+| Condition | max_slots | Retrieval | Notes |
+|-----------|-----------|-----------|-------|
+| softmax_all_32 | 32 | softmax over all | Prior-architecture reference (legacy write path) |
+| softmax_all_uncapped | unlimited | softmax over all | May timeout — tests whether global attention scales |
+| mean_uncapped | unlimited | bucket mean | |
+| recent_uncapped | unlimited | most recent k=8 in bucket | |
+| topk_8k_8 | 8192 | top-8 in bucket | One step's worth of tokens |
+| topk_uncapped_4 | unlimited | top-4 in bucket | |
+| topk_uncapped_8 | unlimited | top-8 in bucket | |
+| topk_uncapped_16 | unlimited | top-16 in bucket | |
 
 8 conditions x 7 seeds = 56 runs
+
+Per-run timeout: 2.5x budget. If softmax_all_uncapped exceeds this,
+the failure is recorded as data (global attention doesn't scale).
+
+softmax_all_32 uses legacy buffer_mode (surprise-gated writes, not
+per-token append). It is a prior-architecture reference point, not
+a controlled ablation partner for the append_only conditions.
 
 #### T3: Wernicke structure (param-matched)
 
@@ -235,9 +242,21 @@ perfectly identical.
 
 5 conditions x 7 seeds = 35 runs
 
+#### Reference baseline (bare_ssm)
+
+Run bare_ssm (no memory, no Wernicke) alongside T2/T3 in Phase A to
+provide an early absolute reference point. Without this, Phase A can
+only tell us which typed-buffer variant wins, not whether any of them
+beat the baseline. Avoids waiting for Phase C (T6) to learn the answer.
+
+1 condition x 7 seeds = 7 runs
+
+**Phase A total: 98 runs** (56 T2 + 35 T3 + 7 reference)
+
 ### Phase B: Claim 2 (developmental + maintenance)
 
-Run only if Claim 1 shows positive results.
+Run only if Claim 1 shows positive results (any T2 append_only
+condition beats bare_ssm reference from Phase A).
 
 #### T4: Append-only vs online defrag
 
@@ -422,10 +441,10 @@ Then optionally rerun with `freeze_adaptation=False` as the streaming metric.
 
 | Phase | Runs | Batches (8 GPU) | Wall time |
 |-------|------|----------------|-----------|
-| A (T2+T3) | 91 | 12 | ~120 min |
+| A (T2+T3+ref) | 98 | 13 | ~130 min |
 | B (T5 core) | 35 | 5 | ~50 min |
 | C (T6+T7) | 58 | 8 | ~80 min |
-| **Total** | **184** | **25** | **~4.2 hours** |
+| **Total** | **191** | **26** | **~4.3 hours** |
 
 T4 and Phase D are separate follow-ups and are excluded from these
 totals. Phase A is the core experiment. B is contingent. C requires A

@@ -170,9 +170,9 @@ T3_CONDITIONS = {
     ),
 }
 
-# -- T6: Composition (exploratory) --
+# -- Reference baseline (run in Phase A for early signal) --
 
-T6_CONDITIONS = {
+REFERENCE_CONDITIONS = {
     "bare_ssm": {
         "model_type": "ssm",
         "vocab_size": 256, "model_dim": 128, "num_layers": 4,
@@ -182,6 +182,12 @@ T6_CONDITIONS = {
         "outer_model_dim": 0,
         "wernicke_enabled": False,
     },
+}
+
+# -- T6: Composition (exploratory) --
+
+T6_CONDITIONS = {
+    "bare_ssm": REFERENCE_CONDITIONS["bare_ssm"],
     "transformer": {
         "model_type": "transformer",
         "vocab_size": 256, "model_dim": 128, "num_layers": 4,
@@ -625,11 +631,13 @@ def main():
             cond["batch_size"] = args.batch_size
         for cond in T3_CONDITIONS.values():
             cond["batch_size"] = args.batch_size
+        for cond in REFERENCE_CONDITIONS.values():
+            cond["batch_size"] = args.batch_size
         for cond in T6_CONDITIONS.values():
             cond["batch_size"] = args.batch_size
 
     if args.phase in ("A", "all"):
-        conditions_a = {**T2_CONDITIONS, **T3_CONDITIONS}
+        conditions_a = {**T2_CONDITIONS, **T3_CONDITIONS, **REFERENCE_CONDITIONS}
         if args.dry_run:
             print(f"\n  Phase A: {len(conditions_a)} conditions x {len(SWEEP_SEEDS)} seeds = {len(conditions_a) * len(SWEEP_SEEDS)} runs")
             for name in conditions_a:
@@ -642,6 +650,8 @@ def main():
             print_summary(T2_CONDITIONS, "T2 Retrieval Mode x Capacity")
             run_grid(T3_CONDITIONS, SWEEP_SEEDS, args.data_path, args.budget, args.num_gpus, "T3")
             print_summary(T3_CONDITIONS, "T3 Wernicke Structure")
+            run_grid(REFERENCE_CONDITIONS, SWEEP_SEEDS, args.data_path, args.budget, args.num_gpus, "REF")
+            print_summary({**T2_CONDITIONS, **T3_CONDITIONS, **REFERENCE_CONDITIONS}, "Phase A (all conditions vs bare_ssm)")
             print(f"\n  Phase A wall time: {(time.time() - t0)/60:.1f} min")
 
     if args.phase == "B":
@@ -661,6 +671,11 @@ def main():
         # Inject dynamic T6 conditions from Phase A results
         print("\n  Injecting dynamic T6 conditions from Phase A results...")
         inject_dynamic_t6_conditions()
+
+        # Re-apply batch_size override to dynamically injected conditions
+        if args.batch_size is not None:
+            for cond in T6_CONDITIONS.values():
+                cond["batch_size"] = args.batch_size
 
         run_grid(T6_CONDITIONS, SWEEP_SEEDS, args.data_path, args.budget, args.num_gpus, "T6")
         print_summary(T6_CONDITIONS, "T6 Composition")
