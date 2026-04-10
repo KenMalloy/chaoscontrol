@@ -13,6 +13,7 @@ Key concepts:
 from __future__ import annotations
 
 import math
+import random
 from typing import Any
 
 import torch
@@ -392,6 +393,7 @@ def evaluate_warming_curve(
     score_tokens: int = 1024,
     segment_len: int | None = None,
     segment_starts: list[int] | None = None,
+    max_segments: int = 10,
     device: torch.device | None = None,
 ) -> dict[int, float]:
     """Evaluate bpb warming curve following the TTT evaluation contract.
@@ -437,6 +439,11 @@ def evaluate_warming_curve(
             pos += segment_len
         if not segment_starts:
             segment_starts = [0]
+
+    # Cap segments to avoid O(hours) eval on large val data
+    if max_segments > 0 and len(segment_starts) > max_segments:
+        rng = random.Random(42)
+        segment_starts = sorted(rng.sample(segment_starts, max_segments))
 
     was_training = model.training
     model.eval()
@@ -511,6 +518,7 @@ def causal_slot_eval(
     slot_steps: int = 24,
     segment_starts: list[int] | None = None,
     segment_len: int | None = None,
+    max_segments: int = 10,
     freeze_during_scoring: bool = True,
     device: torch.device | None = None,
 ) -> dict[str, dict[int, float]]:
@@ -563,6 +571,11 @@ def causal_slot_eval(
             pos += segment_len
         if not segment_starts:
             segment_starts = [0]
+
+    # Cap segments to avoid O(hours) eval on large val data
+    if max_segments > 0 and len(segment_starts) > max_segments:
+        rng = random.Random(42)
+        segment_starts = sorted(rng.sample(segment_starts, max_segments))
 
     was_training = model.training
     model.eval()
