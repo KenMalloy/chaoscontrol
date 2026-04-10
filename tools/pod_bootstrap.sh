@@ -51,10 +51,10 @@ PIP="pip3"
 echo "Python: $($PYTHON --version 2>&1)"
 
 # ---------------------------------------------------------------------------
-# 3. Install PyTorch with CUDA 12.4 support
+# 3. Install PyTorch — auto-detect CUDA version, code is CUDA-agnostic
 # ---------------------------------------------------------------------------
 echo ""
-echo "=== Installing PyTorch (CUDA 12.4) ==="
+echo "=== Installing PyTorch ==="
 
 # Check if torch is already installed with CUDA support
 TORCH_OK=false
@@ -64,8 +64,9 @@ if $PYTHON -c "import torch; assert torch.cuda.is_available(); print(f'torch {to
 fi
 
 if [ "$TORCH_OK" = false ]; then
-    echo "Installing PyTorch with CUDA 12.4..."
-    $PIP install torch --index-url https://download.pytorch.org/whl/cu124
+    # Let pip pick the right CUDA build for whatever the pod has
+    echo "Installing PyTorch (auto-detect CUDA)..."
+    $PIP install torch
 fi
 
 # ---------------------------------------------------------------------------

@@ -149,8 +149,8 @@ steps/sec). Pick the largest that doesn't slow the step. Batch size
 is a hardware knob, not a science knob — benchmark once, lock across
 all ablation conditions.
 
-**Runtime environment:** Pin CUDA 12.x + PyTorch 2.x for H100 support
-(fp8 kernels, efficient attention). Specify in pod bootstrap script.
+**Runtime environment:** Code is CUDA-agnostic. Bootstrap script auto-
+detects the pod's CUDA version and installs the matching PyTorch.
 
 ## Engineering Changes (Claim 1)
 
