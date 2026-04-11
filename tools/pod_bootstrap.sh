@@ -136,12 +136,15 @@ else
 fi
 
 # Check for SP8192 tokenized binary shards (needed by Exp 15+)
+# Contract from cached_challenge_fineweb.py --variant sp8192:
+#   datasets/fineweb10B_sp8192/fineweb_train_*.bin, fineweb_val_*.bin
+#   tokenizers/fineweb_8192_bpe.model
 echo ""
 echo "=== Data: SP8192 tokenized shards ==="
-SP_DATA_DIR="$REPO/baselines/parameter_golf/datasets/sp8192"
+SP_DATA_DIR="$REPO/baselines/parameter_golf/datasets/fineweb10B_sp8192"
 SP_TRAIN_SHARD=$(find "$SP_DATA_DIR" -name "fineweb_train_*.bin" 2>/dev/null | head -1)
 SP_VAL_SHARD=$(find "$SP_DATA_DIR" -name "fineweb_val_*.bin" 2>/dev/null | head -1)
-SP_MODEL=$(find "$REPO/baselines/parameter_golf/datasets" -name "sp8192.model" 2>/dev/null | head -1)
+SP_MODEL="$REPO/baselines/parameter_golf/tokenizers/fineweb_8192_bpe.model"
 
 if [ -n "$SP_TRAIN_SHARD" ] && [ -n "$SP_VAL_SHARD" ]; then
     echo "SP8192 shards found at $SP_DATA_DIR"
@@ -150,14 +153,15 @@ if [ -n "$SP_TRAIN_SHARD" ] && [ -n "$SP_VAL_SHARD" ]; then
 else
     echo "WARNING: SP8192 tokenized shards not found in $SP_DATA_DIR"
     echo "  Exp 17/18 require pre-tokenized SP8192 .bin shards."
-    echo "  Run: cd $REPO/baselines/parameter_golf && python cached_challenge_fineweb.py --variant sp8192"
+    echo "  Run: cd $REPO/baselines/parameter_golf && python cached_challenge_fineweb.py --variant sp8192 --train-shards 80"
 fi
 
-if [ -n "$SP_MODEL" ]; then
+if [ -f "$SP_MODEL" ]; then
     echo "SP8192 model: $SP_MODEL"
 else
-    echo "WARNING: sp8192.model not found. Required for Exp 17/18 bpb scoring."
-    echo "  Should be at $REPO/baselines/parameter_golf/datasets/sp8192/sp8192.model"
+    echo "WARNING: fineweb_8192_bpe.model not found at $SP_MODEL"
+    echo "  Required for Exp 17/18 bpb scoring."
+    echo "  Run: cd $REPO/baselines/parameter_golf && python cached_challenge_fineweb.py --variant sp8192 --train-shards 80"
 fi
 
 # ---------------------------------------------------------------------------

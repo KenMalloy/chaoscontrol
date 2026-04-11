@@ -36,7 +36,7 @@ from chaoscontrol.data import (  # noqa: E402
     resolve_device,
     resolve_param_dtype,
 )
-from chaoscontrol.core import get_diag_recurrence_backend  # noqa: E402
+from chaoscontrol.core import verify_diag_recurrence  # noqa: E402
 from chaoscontrol.evaluation import compute_bpb  # noqa: E402
 from runner_exp15 import (  # noqa: E402
     build_model,
@@ -144,7 +144,7 @@ def assert_runtime_compatibility(
 
     info: dict[str, Any] = {
         "python_version": f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}",
-        "diag_recurrence": get_diag_recurrence_backend(),
+        "diag_recurrence": verify_diag_recurrence(),
         "smoke": smoke,
     }
     if smoke:

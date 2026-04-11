@@ -147,7 +147,8 @@ def run_phase_a(
             seed_cfg["model_config"] = dict(cfg["model_config"], seed=seed)
             pending.append((condition_name, seed_cfg, seed))
 
-    run_timeout = budget_s * TIMEOUT_MULTIPLIER
+    # Floor at 60s: subprocess startup + torch import is fixed overhead
+    run_timeout = max(budget_s * TIMEOUT_MULTIPLIER, 60.0)
     gpu_cursor = 0
     while pending or active:
         while pending and len(active) < max(num_gpus, 1):
@@ -169,7 +170,7 @@ def run_phase_a(
             gpu_cursor += 1
 
         next_active: list[tuple] = []
-        for proc, tmp_cfg, condition_name, seed, out_path, t0, log_fh in active:
+        for i, (proc, tmp_cfg, condition_name, seed, out_path, t0, log_fh) in enumerate(active):
             ret = proc.poll()
             elapsed = time.monotonic() - t0
             if ret is None and elapsed < run_timeout:
@@ -184,7 +185,7 @@ def run_phase_a(
                 except subprocess.TimeoutExpired:
                     proc.kill()
                 tmp_cfg.unlink(missing_ok=True)
-                _cleanup_active(next_active)
+                _cleanup_active(next_active + list(active[i + 1:]))
                 raise RuntimeError(
                     f"{condition_name} seed={seed} TIMEOUT after {elapsed:.0f}s "
                     f"(budget={budget_s}s, limit={run_timeout:.0f}s)"
@@ -196,7 +197,7 @@ def run_phase_a(
                 if log_path.exists():
                     lines = log_path.read_text().splitlines()
                     tail = "\n".join(lines[-20:])
-                _cleanup_active(next_active)
+                _cleanup_active(next_active + list(active[i + 1:]))
                 raise RuntimeError(
                     f"{condition_name} seed={seed} failed with exit code {ret}\n"
                     f"--- last 20 lines of {log_path} ---\n{tail}"

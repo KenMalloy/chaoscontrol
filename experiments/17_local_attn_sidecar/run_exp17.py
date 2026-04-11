@@ -101,7 +101,8 @@ def launch_matrix(
             tmp.write_text(yaml.safe_dump(seed_cfg, sort_keys=False))
             queue.append((condition_name, seed, tmp))
 
-    run_timeout = budget * TIMEOUT_MULTIPLIER
+    # Floor at 60s: subprocess startup + torch import is fixed overhead
+    run_timeout = max(budget * TIMEOUT_MULTIPLIER, 60.0)
     # Each active entry: (proc, cfg_path, condition_name, seed, t0, log_fh)
     active: list[tuple[subprocess.Popen[str], Path, str, int, float, Any]] = []
     gpu_cursor = 0
@@ -135,7 +136,7 @@ def launch_matrix(
             active.append((proc, cfg_path, condition_name, seed, time.monotonic(), log_fh))
 
         next_active: list[tuple[subprocess.Popen[str], Path, str, int, float, Any]] = []
-        for proc, cfg_path, condition_name, seed, t0, log_fh in active:
+        for i, (proc, cfg_path, condition_name, seed, t0, log_fh) in enumerate(active):
             ret = proc.poll()
             elapsed = time.monotonic() - t0
             if ret is None and elapsed < run_timeout:
@@ -150,7 +151,8 @@ def launch_matrix(
                 except subprocess.TimeoutExpired:
                     proc.kill()
                 cfg_path.unlink(missing_ok=True)
-                _cleanup_active(next_active)
+                # Kill visited survivors + unvisited remainder
+                _cleanup_active(next_active + list(active[i + 1:]))
                 raise RuntimeError(
                     f"{condition_name} seed={seed} TIMEOUT after {elapsed:.0f}s "
                     f"(budget={budget}s, limit={run_timeout:.0f}s)"
@@ -162,7 +164,7 @@ def launch_matrix(
                 if log_path.exists():
                     lines = log_path.read_text().splitlines()
                     tail = "\n".join(lines[-20:])
-                _cleanup_active(next_active)
+                _cleanup_active(next_active + list(active[i + 1:]))
                 raise RuntimeError(
                     f"{condition_name} seed={seed} failed with exit code {ret}\n"
                     f"--- last 20 lines of {log_path} ---\n{tail}"

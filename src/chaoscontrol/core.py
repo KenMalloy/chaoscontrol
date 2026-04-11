@@ -77,6 +77,19 @@ def get_diag_recurrence_backend() -> dict[str, str]:
     }
 
 
+def verify_diag_recurrence(device: torch.device | None = None) -> dict[str, str]:
+    """Resolve backend AND execute a tiny forward pass to confirm it works.
+
+    Returns the backend info after execution, so the reported backend
+    reflects reality (e.g. "python" if compile fell back at runtime).
+    """
+    dev = device if device is not None else torch.device("cpu")
+    probe_decay = torch.zeros(1, 4, 8, device=dev)
+    probe_update = torch.ones(1, 4, 8, device=dev)
+    _diag_recurrence(probe_decay, probe_update)
+    return get_diag_recurrence_backend()
+
+
 def _diag_recurrence(decay: torch.Tensor, update: torch.Tensor) -> torch.Tensor:
     global _diag_recurrence_impl, _diag_recurrence_backend, _diag_recurrence_note
     impl = _resolve_diag_recurrence_impl()

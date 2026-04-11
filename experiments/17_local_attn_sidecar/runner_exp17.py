@@ -31,7 +31,7 @@ from chaoscontrol.data import (
     resolve_device,
     resolve_param_dtype,
 )
-from chaoscontrol.core import get_diag_recurrence_backend
+from chaoscontrol.core import verify_diag_recurrence
 from chaoscontrol.evaluation import compute_bpb
 from chaoscontrol.model import ChaosSSMBlock, ChaosSSMHybridBlock, ChaosStudentLM
 from chaoscontrol.training import train_chaoscontrol_for_budget
@@ -94,7 +94,7 @@ def assert_runtime_compatibility(
         )
     info: dict[str, Any] = {
         "python_version": f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}",
-        "diag_recurrence": get_diag_recurrence_backend(),
+        "diag_recurrence": verify_diag_recurrence(device),
     }
     if device.type == "cuda":
         if not torch.cuda.is_available():
