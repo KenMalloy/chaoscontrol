@@ -3,7 +3,7 @@ name = "semanticengine-ssm"
 version = "0.2.0"
 description = "Biologically-inspired SSM with typed semantic routing, episodic/semantic memory, structured sleep consolidation, and metabolic gating"
 requires-python = ">=3.11"
-dependencies = ["torch>=2.0", "numpy", "pyyaml"]
+dependencies = ["torch>=2.0", "numpy", "pyyaml", "sentencepiece"]
 
 [project.optional-dependencies]
 mamba = ["mamba-ssm>=2.3.0"]

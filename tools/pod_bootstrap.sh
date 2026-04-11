@@ -105,7 +105,7 @@ fi
 echo ""
 echo "=== Installing project dependencies ==="
 
-$PIP install pyyaml numpy
+$PIP install pyyaml numpy sentencepiece
 
 if [ -d "$REPO" ]; then
     echo "Installing chaoscontrol in dev mode..."
@@ -133,6 +133,31 @@ else
     echo "  Run prep_data.sh on a CPU pod first to download and extract FineWeb."
     echo "  The GPU pod expects the data to already be on the network disk."
     DATA_PATH="$FINEWEB_DIR"
+fi
+
+# Check for SP8192 tokenized binary shards (needed by Exp 15+)
+echo ""
+echo "=== Data: SP8192 tokenized shards ==="
+SP_DATA_DIR="$REPO/baselines/parameter_golf/datasets/sp8192"
+SP_TRAIN_SHARD=$(find "$SP_DATA_DIR" -name "fineweb_train_*.bin" 2>/dev/null | head -1)
+SP_VAL_SHARD=$(find "$SP_DATA_DIR" -name "fineweb_val_*.bin" 2>/dev/null | head -1)
+SP_MODEL=$(find "$REPO/baselines/parameter_golf/datasets" -name "sp8192.model" 2>/dev/null | head -1)
+
+if [ -n "$SP_TRAIN_SHARD" ] && [ -n "$SP_VAL_SHARD" ]; then
+    echo "SP8192 shards found at $SP_DATA_DIR"
+    echo "  train: $SP_TRAIN_SHARD"
+    echo "  val:   $SP_VAL_SHARD"
+else
+    echo "WARNING: SP8192 tokenized shards not found in $SP_DATA_DIR"
+    echo "  Exp 17/18 require pre-tokenized SP8192 .bin shards."
+    echo "  Run: cd $REPO/baselines/parameter_golf && python cached_challenge_fineweb.py --variant sp8192"
+fi
+
+if [ -n "$SP_MODEL" ]; then
+    echo "SP8192 model: $SP_MODEL"
+else
+    echo "WARNING: sp8192.model not found. Required for Exp 17/18 bpb scoring."
+    echo "  Should be at $REPO/baselines/parameter_golf/datasets/sp8192/sp8192.model"
 fi
 
 # ---------------------------------------------------------------------------
@@ -223,5 +248,8 @@ echo "Repo path:  $REPO"
 echo ""
 echo "Run experiments with:"
 echo "  cd $REPO"
-echo "  python experiments/14_vram_buffer/run_exp14.py --data-path $DATA_PATH --budget 600 --num-gpus \$(nvidia-smi -L | wc -l) --phase A"
+echo "  # Exp 17 (local attention sidecar):"
+echo "  python experiments/17_local_attn_sidecar/run_exp17.py --data-path $SP_DATA_DIR --sp-model-path \$SP_MODEL --budget 600 --num-gpus \$(nvidia-smi -L | wc -l)"
+echo "  # Exp 18 (throughput advantage):"
+echo "  python experiments/18_throughput_advantage/run_exp18.py --phase0-summary <path> --budget 600 --num-gpus \$(nvidia-smi -L | wc -l)"
 echo ""

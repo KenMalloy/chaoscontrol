@@ -20,7 +20,9 @@ EXPERIMENT = Path(__file__).resolve().parent
 RESULTS = EXPERIMENT / "results"
 
 sys.path.insert(0, str(REPO / "experiments" / "09_revised_architecture"))
+sys.path.insert(0, str(EXPERIMENT))
 from stats import bootstrap_ci, sem, welch_ttest
+from runner_exp17 import build_child_env, validate_gpu_concurrency
 
 
 SWEEP_SEEDS = [1337, 2674, 4011, 5348, 6685, 8022, 9359]
@@ -57,6 +59,26 @@ CONDITIONS = {
 }
 
 
+def _cleanup_active(active: list) -> None:
+    for entry in active:
+        proc, cfg_path = entry[0], entry[1]
+        if proc.poll() is None:
+            proc.terminate()
+        cfg_path.unlink(missing_ok=True)
+    for entry in active:
+        proc = entry[0]
+        if proc.poll() is None:
+            try:
+                proc.wait(timeout=5.0)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+        if len(entry) > 5:
+            entry[5].close()
+
+
+TIMEOUT_MULTIPLIER = 2.5
+
+
 def launch_matrix(
     *,
     data_path: str,
@@ -66,6 +88,8 @@ def launch_matrix(
     conditions: dict[str, dict[str, Any]],
 ) -> None:
     RESULTS.mkdir(parents=True, exist_ok=True)
+    if num_gpus > 0:
+        validate_gpu_concurrency(num_gpus)
     queue: list[tuple[str, int, Path]] = []
     for condition_name, cfg in conditions.items():
         for seed in SWEEP_SEEDS:
@@ -77,7 +101,9 @@ def launch_matrix(
             tmp.write_text(yaml.safe_dump(seed_cfg, sort_keys=False))
             queue.append((condition_name, seed, tmp))
 
-    active: list[tuple[subprocess.Popen[str], Path, str, int]] = []
+    run_timeout = budget * TIMEOUT_MULTIPLIER
+    # Each active entry: (proc, cfg_path, condition_name, seed, t0, log_fh)
+    active: list[tuple[subprocess.Popen[str], Path, str, int, float, Any]] = []
     gpu_cursor = 0
 
     while queue or active:
@@ -85,11 +111,13 @@ def launch_matrix(
             condition_name, seed, cfg_path = queue.pop(0)
             out_path = RESULTS / f"{condition_name}_s{seed}.json"
             env = os.environ.copy()
-            if num_gpus > 0:
-                env["CUDA_VISIBLE_DEVICES"] = str(gpu_cursor % num_gpus)
+            env = build_child_env(gpu_slot=(gpu_cursor % num_gpus) if num_gpus > 0 else None, base_env=env)
             gpu_cursor += 1
+            log_path = RESULTS / f"{condition_name}_s{seed}.log"
+            log_fh = open(log_path, "w")
             cmd = [
                 sys.executable,
+                "-u",
                 str(EXPERIMENT / "runner_exp17.py"),
                 "--config",
                 str(cfg_path),
@@ -102,19 +130,43 @@ def launch_matrix(
                 "--output-json",
                 str(out_path),
             ]
-            print(f"Launching {condition_name} seed={seed}")
-            proc = subprocess.Popen(cmd, env=env, text=True)
-            active.append((proc, cfg_path, condition_name, seed))
+            print(f"Launching {condition_name} seed={seed}", flush=True)
+            proc = subprocess.Popen(cmd, env=env, text=True, stdout=log_fh, stderr=subprocess.STDOUT)
+            active.append((proc, cfg_path, condition_name, seed, time.monotonic(), log_fh))
 
-        next_active: list[tuple[subprocess.Popen[str], Path, str, int]] = []
-        for proc, cfg_path, condition_name, seed in active:
+        next_active: list[tuple[subprocess.Popen[str], Path, str, int, float, Any]] = []
+        for proc, cfg_path, condition_name, seed, t0, log_fh in active:
             ret = proc.poll()
-            if ret is None:
-                next_active.append((proc, cfg_path, condition_name, seed))
+            elapsed = time.monotonic() - t0
+            if ret is None and elapsed < run_timeout:
+                next_active.append((proc, cfg_path, condition_name, seed, t0, log_fh))
                 continue
+            log_fh.close()
+            if ret is None:
+                print(f"TIMEOUT: {condition_name} seed={seed} after {elapsed:.0f}s (limit {run_timeout:.0f}s)", flush=True)
+                proc.terminate()
+                try:
+                    proc.wait(timeout=10.0)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                cfg_path.unlink(missing_ok=True)
+                _cleanup_active(next_active)
+                raise RuntimeError(
+                    f"{condition_name} seed={seed} TIMEOUT after {elapsed:.0f}s "
+                    f"(budget={budget}s, limit={run_timeout:.0f}s)"
+                )
             cfg_path.unlink(missing_ok=True)
             if ret != 0:
-                raise RuntimeError(f"{condition_name} seed={seed} failed with exit code {ret}")
+                log_path = RESULTS / f"{condition_name}_s{seed}.log"
+                tail = ""
+                if log_path.exists():
+                    lines = log_path.read_text().splitlines()
+                    tail = "\n".join(lines[-20:])
+                _cleanup_active(next_active)
+                raise RuntimeError(
+                    f"{condition_name} seed={seed} failed with exit code {ret}\n"
+                    f"--- last 20 lines of {log_path} ---\n{tail}"
+                )
         active = next_active
         if active:
             time.sleep(2.0)
