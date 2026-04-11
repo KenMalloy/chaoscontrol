@@ -1,0 +1,4125 @@
+{
+  "config": {
+    "a_mode": "diag",
+    "base_lr": 0.002,
+    "batch_size": 32,
+    "crit_target_coupling": 0.92,
+    "ff_mult": 2,
+    "model_dim": 192,
+    "model_type": "ssm",
+    "num_layers": 4,
+    "seed": 6685,
+    "seq_len": 512,
+    "stride": 256,
+    "vocab_size": 8192
+  },
+  "train": {
+    "steps": 393,
+    "history": [
+      {
+        "step": 0.0,
+        "loss": 9.18815803527832,
+        "forked": false
+      },
+      {
+        "step": 1.0,
+        "loss": 8.936769485473633,
+        "forked": false
+      },
+      {
+        "step": 2.0,
+        "loss": 8.66573715209961,
+        "forked": false
+      },
+      {
+        "step": 3.0,
+        "loss": 8.287881851196289,
+        "forked": false
+      },
+      {
+        "step": 4.0,
+        "loss": 7.9871110916137695,
+        "forked": false
+      },
+      {
+        "step": 5.0,
+        "loss": 7.7547760009765625,
+        "forked": false
+      },
+      {
+        "step": 6.0,
+        "loss": 7.635089874267578,
+        "forked": false
+      },
+      {
+        "step": 7.0,
+        "loss": 7.469976425170898,
+        "forked": false
+      },
+      {
+        "step": 8.0,
+        "loss": 7.321868896484375,
+        "forked": false
+      },
+      {
+        "step": 9.0,
+        "loss": 7.318229675292969,
+        "forked": false
+      },
+      {
+        "step": 10.0,
+        "loss": 7.226798057556152,
+        "forked": false
+      },
+      {
+        "step": 11.0,
+        "loss": 7.2228546142578125,
+        "forked": false
+      },
+      {
+        "step": 12.0,
+        "loss": 7.165632247924805,
+        "forked": false
+      },
+      {
+        "step": 13.0,
+        "loss": 7.208723545074463,
+        "forked": false
+      },
+      {
+        "step": 14.0,
+        "loss": 7.110269546508789,
+        "forked": false
+      },
+      {
+        "step": 15.0,
+        "loss": 7.189305782318115,
+        "forked": false
+      },
+      {
+        "step": 16.0,
+        "loss": 7.1992573738098145,
+        "forked": false
+      },
+      {
+        "step": 17.0,
+        "loss": 7.077741622924805,
+        "forked": false
+      },
+      {
+        "step": 18.0,
+        "loss": 7.078890323638916,
+        "forked": false
+      },
+      {
+        "step": 19.0,
+        "loss": 7.092170715332031,
+        "forked": false
+      },
+      {
+        "step": 20.0,
+        "loss": 7.007834434509277,
+        "forked": false
+      },
+      {
+        "step": 21.0,
+        "loss": 7.110095500946045,
+        "forked": false
+      },
+      {
+        "step": 22.0,
+        "loss": 7.065319538116455,
+        "forked": false
+      },
+      {
+        "step": 23.0,
+        "loss": 6.919248580932617,
+        "forked": false
+      },
+      {
+        "step": 24.0,
+        "loss": 7.005721569061279,
+        "forked": false
+      },
+      {
+        "step": 25.0,
+        "loss": 6.948895454406738,
+        "forked": false
+      },
+      {
+        "step": 26.0,
+        "loss": 7.036595344543457,
+        "forked": false
+      },
+      {
+        "step": 27.0,
+        "loss": 6.903304100036621,
+        "forked": false
+      },
+      {
+        "step": 28.0,
+        "loss": 6.952130317687988,
+        "forked": false
+      },
+      {
+        "step": 29.0,
+        "loss": 6.942624092102051,
+        "forked": false
+      },
+      {
+        "step": 30.0,
+        "loss": 6.857695579528809,
+        "forked": false
+      },
+      {
+        "step": 31.0,
+        "loss": 6.76793098449707,
+        "forked": false
+      },
+      {
+        "step": 32.0,
+        "loss": 6.792787551879883,
+        "forked": false
+      },
+      {
+        "step": 33.0,
+        "loss": 6.841453552246094,
+        "forked": false
+      },
+      {
+        "step": 34.0,
+        "loss": 6.889741897583008,
+        "forked": false
+      },
+      {
+        "step": 35.0,
+        "loss": 6.776555061340332,
+        "forked": false
+      },
+      {
+        "step": 36.0,
+        "loss": 6.847002983093262,
+        "forked": false
+      },
+      {
+        "step": 37.0,
+        "loss": 6.738480567932129,
+        "forked": false
+      },
+      {
+        "step": 38.0,
+        "loss": 6.6928606033325195,
+        "forked": false
+      },
+      {
+        "step": 39.0,
+        "loss": 6.781402587890625,
+        "forked": false
+      },
+      {
+        "step": 40.0,
+        "loss": 6.655588150024414,
+        "forked": false
+      },
+      {
+        "step": 41.0,
+        "loss": 6.5832319259643555,
+        "forked": false
+      },
+      {
+        "step": 42.0,
+        "loss": 6.7425994873046875,
+        "forked": false
+      },
+      {
+        "step": 43.0,
+        "loss": 6.613540172576904,
+        "forked": false
+      },
+      {
+        "step": 44.0,
+        "loss": 6.72969913482666,
+        "forked": false
+      },
+      {
+        "step": 45.0,
+        "loss": 6.577142238616943,
+        "forked": false
+      },
+      {
+        "step": 46.0,
+        "loss": 6.6553263664245605,
+        "forked": false
+      },
+      {
+        "step": 47.0,
+        "loss": 6.652256965637207,
+        "forked": false
+      },
+      {
+        "step": 48.0,
+        "loss": 6.608783721923828,
+        "forked": false
+      },
+      {
+        "step": 49.0,
+        "loss": 6.521659851074219,
+        "forked": false
+      },
+      {
+        "step": 50.0,
+        "loss": 6.574182033538818,
+        "forked": false
+      },
+      {
+        "step": 51.0,
+        "loss": 6.518728733062744,
+        "forked": false
+      },
+      {
+        "step": 52.0,
+        "loss": 6.615714073181152,
+        "forked": false
+      },
+      {
+        "step": 53.0,
+        "loss": 6.547628402709961,
+        "forked": false
+      },
+      {
+        "step": 54.0,
+        "loss": 6.491045951843262,
+        "forked": false
+      },
+      {
+        "step": 55.0,
+        "loss": 6.626101493835449,
+        "forked": false
+      },
+      {
+        "step": 56.0,
+        "loss": 6.494003772735596,
+        "forked": false
+      },
+      {
+        "step": 57.0,
+        "loss": 6.544368267059326,
+        "forked": false
+      },
+      {
+        "step": 58.0,
+        "loss": 6.429410457611084,
+        "forked": false
+      },
+      {
+        "step": 59.0,
+        "loss": 6.518934726715088,
+        "forked": false
+      },
+      {
+        "step": 60.0,
+        "loss": 6.564421653747559,
+        "forked": false
+      },
+      {
+        "step": 61.0,
+        "loss": 6.430759429931641,
+        "forked": false
+      },
+      {
+        "step": 62.0,
+        "loss": 6.431024074554443,
+        "forked": false
+      },
+      {
+        "step": 63.0,
+        "loss": 6.443174362182617,
+        "forked": false
+      },
+      {
+        "step": 64.0,
+        "loss": 6.3767499923706055,
+        "forked": false
+      },
+      {
+        "step": 65.0,
+        "loss": 6.506941795349121,
+        "forked": false
+      },
+      {
+        "step": 66.0,
+        "loss": 6.336356163024902,
+        "forked": false
+      },
+      {
+        "step": 67.0,
+        "loss": 6.290444850921631,
+        "forked": false
+      },
+      {
+        "step": 68.0,
+        "loss": 6.448796272277832,
+        "forked": false
+      },
+      {
+        "step": 69.0,
+        "loss": 6.345559597015381,
+        "forked": false
+      },
+      {
+        "step": 70.0,
+        "loss": 6.420368671417236,
+        "forked": false
+      },
+      {
+        "step": 71.0,
+        "loss": 6.26279354095459,
+        "forked": false
+      },
+      {
+        "step": 72.0,
+        "loss": 6.306905746459961,
+        "forked": false
+      },
+      {
+        "step": 73.0,
+        "loss": 6.334165573120117,
+        "forked": false
+      },
+      {
+        "step": 74.0,
+        "loss": 6.3902130126953125,
+        "forked": false
+      },
+      {
+        "step": 75.0,
+        "loss": 6.303112506866455,
+        "forked": false
+      },
+      {
+        "step": 76.0,
+        "loss": 6.3767805099487305,
+        "forked": false
+      },
+      {
+        "step": 77.0,
+        "loss": 6.315560340881348,
+        "forked": false
+      },
+      {
+        "step": 78.0,
+        "loss": 6.239422798156738,
+        "forked": false
+      },
+      {
+        "step": 79.0,
+        "loss": 6.285395622253418,
+        "forked": false
+      },
+      {
+        "step": 80.0,
+        "loss": 6.237677574157715,
+        "forked": false
+      },
+      {
+        "step": 81.0,
+        "loss": 6.157965660095215,
+        "forked": false
+      },
+      {
+        "step": 82.0,
+        "loss": 6.246758460998535,
+        "forked": false
+      },
+      {
+        "step": 83.0,
+        "loss": 6.2212347984313965,
+        "forked": false
+      },
+      {
+        "step": 84.0,
+        "loss": 6.225981712341309,
+        "forked": false
+      },
+      {
+        "step": 85.0,
+        "loss": 6.221968173980713,
+        "forked": false
+      },
+      {
+        "step": 86.0,
+        "loss": 6.226551055908203,
+        "forked": false
+      },
+      {
+        "step": 87.0,
+        "loss": 6.232417583465576,
+        "forked": false
+      },
+      {
+        "step": 88.0,
+        "loss": 6.107571601867676,
+        "forked": false
+      },
+      {
+        "step": 89.0,
+        "loss": 6.11899471282959,
+        "forked": false
+      },
+      {
+        "step": 90.0,
+        "loss": 6.308720588684082,
+        "forked": false
+      },
+      {
+        "step": 91.0,
+        "loss": 6.168141841888428,
+        "forked": false
+      },
+      {
+        "step": 92.0,
+        "loss": 6.082475662231445,
+        "forked": false
+      },
+      {
+        "step": 93.0,
+        "loss": 6.145785808563232,
+        "forked": false
+      },
+      {
+        "step": 94.0,
+        "loss": 6.07858943939209,
+        "forked": false
+      },
+      {
+        "step": 95.0,
+        "loss": 6.178205966949463,
+        "forked": false
+      },
+      {
+        "step": 96.0,
+        "loss": 6.185554504394531,
+        "forked": false
+      },
+      {
+        "step": 97.0,
+        "loss": 6.073568344116211,
+        "forked": false
+      },
+      {
+        "step": 98.0,
+        "loss": 6.159210205078125,
+        "forked": false
+      },
+      {
+        "step": 99.0,
+        "loss": 6.113926887512207,
+        "forked": false
+      },
+      {
+        "step": 100.0,
+        "loss": 6.0641584396362305,
+        "forked": false
+      },
+      {
+        "step": 101.0,
+        "loss": 6.0287017822265625,
+        "forked": false
+      },
+      {
+        "step": 102.0,
+        "loss": 6.140456676483154,
+        "forked": false
+      },
+      {
+        "step": 103.0,
+        "loss": 6.128876686096191,
+        "forked": false
+      },
+      {
+        "step": 104.0,
+        "loss": 6.021385192871094,
+        "forked": false
+      },
+      {
+        "step": 105.0,
+        "loss": 6.092459678649902,
+        "forked": false
+      },
+      {
+        "step": 106.0,
+        "loss": 6.042763710021973,
+        "forked": false
+      },
+      {
+        "step": 107.0,
+        "loss": 5.985639572143555,
+        "forked": false
+      },
+      {
+        "step": 108.0,
+        "loss": 5.977138042449951,
+        "forked": false
+      },
+      {
+        "step": 109.0,
+        "loss": 5.954904556274414,
+        "forked": false
+      },
+      {
+        "step": 110.0,
+        "loss": 6.090157508850098,
+        "forked": false
+      },
+      {
+        "step": 111.0,
+        "loss": 6.046643257141113,
+        "forked": false
+      },
+      {
+        "step": 112.0,
+        "loss": 5.986956596374512,
+        "forked": false
+      },
+      {
+        "step": 113.0,
+        "loss": 6.087206840515137,
+        "forked": false
+      },
+      {
+        "step": 114.0,
+        "loss": 5.904845237731934,
+        "forked": false
+      },
+      {
+        "step": 115.0,
+        "loss": 6.060256004333496,
+        "forked": false
+      },
+      {
+        "step": 116.0,
+        "loss": 6.041581153869629,
+        "forked": false
+      },
+      {
+        "step": 117.0,
+        "loss": 6.162623405456543,
+        "forked": false
+      },
+      {
+        "step": 118.0,
+        "loss": 6.003299236297607,
+        "forked": false
+      },
+      {
+        "step": 119.0,
+        "loss": 6.011699676513672,
+        "forked": false
+      },
+      {
+        "step": 120.0,
+        "loss": 5.884637832641602,
+        "forked": false
+      },
+      {
+        "step": 121.0,
+        "loss": 5.991330146789551,
+        "forked": false
+      },
+      {
+        "step": 122.0,
+        "loss": 5.882864475250244,
+        "forked": false
+      },
+      {
+        "step": 123.0,
+        "loss": 6.022127151489258,
+        "forked": false
+      },
+      {
+        "step": 124.0,
+        "loss": 5.885221481323242,
+        "forked": false
+      },
+      {
+        "step": 125.0,
+        "loss": 5.812560081481934,
+        "forked": false
+      },
+      {
+        "step": 126.0,
+        "loss": 5.944854259490967,
+        "forked": false
+      },
+      {
+        "step": 127.0,
+        "loss": 5.960676193237305,
+        "forked": false
+      },
+      {
+        "step": 128.0,
+        "loss": 6.000290870666504,
+        "forked": false
+      },
+      {
+        "step": 129.0,
+        "loss": 5.972328186035156,
+        "forked": false
+      },
+      {
+        "step": 130.0,
+        "loss": 5.867108345031738,
+        "forked": false
+      },
+      {
+        "step": 131.0,
+        "loss": 5.85790491104126,
+        "forked": false
+      },
+      {
+        "step": 132.0,
+        "loss": 5.845107555389404,
+        "forked": false
+      },
+      {
+        "step": 133.0,
+        "loss": 5.949888706207275,
+        "forked": false
+      },
+      {
+        "step": 134.0,
+        "loss": 5.955714702606201,
+        "forked": false
+      },
+      {
+        "step": 135.0,
+        "loss": 5.874605655670166,
+        "forked": false
+      },
+      {
+        "step": 136.0,
+        "loss": 5.920187950134277,
+        "forked": false
+      },
+      {
+        "step": 137.0,
+        "loss": 5.956301689147949,
+        "forked": false
+      },
+      {
+        "step": 138.0,
+        "loss": 5.9735188484191895,
+        "forked": false
+      },
+      {
+        "step": 139.0,
+        "loss": 5.912480354309082,
+        "forked": false
+      },
+      {
+        "step": 140.0,
+        "loss": 5.849615097045898,
+        "forked": false
+      },
+      {
+        "step": 141.0,
+        "loss": 5.872280597686768,
+        "forked": false
+      },
+      {
+        "step": 142.0,
+        "loss": 5.805516242980957,
+        "forked": false
+      },
+      {
+        "step": 143.0,
+        "loss": 5.853732585906982,
+        "forked": false
+      },
+      {
+        "step": 144.0,
+        "loss": 5.849897384643555,
+        "forked": false
+      },
+      {
+        "step": 145.0,
+        "loss": 5.818324089050293,
+        "forked": false
+      },
+      {
+        "step": 146.0,
+        "loss": 5.826426029205322,
+        "forked": false
+      },
+      {
+        "step": 147.0,
+        "loss": 6.058242321014404,
+        "forked": false
+      },
+      {
+        "step": 148.0,
+        "loss": 5.882165908813477,
+        "forked": false
+      },
+      {
+        "step": 149.0,
+        "loss": 5.910200119018555,
+        "forked": false
+      },
+      {
+        "step": 150.0,
+        "loss": 5.818167686462402,
+        "forked": false
+      },
+      {
+        "step": 151.0,
+        "loss": 5.879060745239258,
+        "forked": false
+      },
+      {
+        "step": 152.0,
+        "loss": 5.846921920776367,
+        "forked": false
+      },
+      {
+        "step": 153.0,
+        "loss": 5.7985005378723145,
+        "forked": false
+      },
+      {
+        "step": 154.0,
+        "loss": 5.857548236846924,
+        "forked": false
+      },
+      {
+        "step": 155.0,
+        "loss": 5.835400581359863,
+        "forked": false
+      },
+      {
+        "step": 156.0,
+        "loss": 5.956645965576172,
+        "forked": false
+      },
+      {
+        "step": 157.0,
+        "loss": 5.790964126586914,
+        "forked": false
+      },
+      {
+        "step": 158.0,
+        "loss": 5.787906169891357,
+        "forked": false
+      },
+      {
+        "step": 159.0,
+        "loss": 5.897480010986328,
+        "forked": false
+      },
+      {
+        "step": 160.0,
+        "loss": 5.758879661560059,
+        "forked": false
+      },
+      {
+        "step": 161.0,
+        "loss": 5.835443496704102,
+        "forked": false
+      },
+      {
+        "step": 162.0,
+        "loss": 5.810911178588867,
+        "forked": false
+      },
+      {
+        "step": 163.0,
+        "loss": 5.791468620300293,
+        "forked": false
+      },
+      {
+        "step": 164.0,
+        "loss": 5.714720249176025,
+        "forked": false
+      },
+      {
+        "step": 165.0,
+        "loss": 5.835321426391602,
+        "forked": false
+      },
+      {
+        "step": 166.0,
+        "loss": 5.750014305114746,
+        "forked": false
+      },
+      {
+        "step": 167.0,
+        "loss": 5.749722957611084,
+        "forked": false
+      },
+      {
+        "step": 168.0,
+        "loss": 5.763237953186035,
+        "forked": false
+      },
+      {
+        "step": 169.0,
+        "loss": 5.87994384765625,
+        "forked": false
+      },
+      {
+        "step": 170.0,
+        "loss": 5.732109069824219,
+        "forked": false
+      },
+      {
+        "step": 171.0,
+        "loss": 5.711738586425781,
+        "forked": false
+      },
+      {
+        "step": 172.0,
+        "loss": 5.830399513244629,
+        "forked": false
+      },
+      {
+        "step": 173.0,
+        "loss": 5.791799068450928,
+        "forked": false
+      },
+      {
+        "step": 174.0,
+        "loss": 5.784186363220215,
+        "forked": false
+      },
+      {
+        "step": 175.0,
+        "loss": 5.667985916137695,
+        "forked": false
+      },
+      {
+        "step": 176.0,
+        "loss": 5.701440334320068,
+        "forked": false
+      },
+      {
+        "step": 177.0,
+        "loss": 5.722635269165039,
+        "forked": false
+      },
+      {
+        "step": 178.0,
+        "loss": 5.754905700683594,
+        "forked": false
+      },
+      {
+        "step": 179.0,
+        "loss": 5.714978218078613,
+        "forked": false
+      },
+      {
+        "step": 180.0,
+        "loss": 5.693410873413086,
+        "forked": false
+      },
+      {
+        "step": 181.0,
+        "loss": 5.710727691650391,
+        "forked": false
+      },
+      {
+        "step": 182.0,
+        "loss": 5.682832717895508,
+        "forked": false
+      },
+      {
+        "step": 183.0,
+        "loss": 5.752306938171387,
+        "forked": false
+      },
+      {
+        "step": 184.0,
+        "loss": 5.722087860107422,
+        "forked": false
+      },
+      {
+        "step": 185.0,
+        "loss": 5.630545139312744,
+        "forked": false
+      },
+      {
+        "step": 186.0,
+        "loss": 5.7749786376953125,
+        "forked": false
+      },
+      {
+        "step": 187.0,
+        "loss": 5.693437576293945,
+        "forked": false
+      },
+      {
+        "step": 188.0,
+        "loss": 5.696955680847168,
+        "forked": false
+      },
+      {
+        "step": 189.0,
+        "loss": 5.707100868225098,
+        "forked": false
+      },
+      {
+        "step": 190.0,
+        "loss": 5.741885662078857,
+        "forked": false
+      },
+      {
+        "step": 191.0,
+        "loss": 5.748448371887207,
+        "forked": false
+      },
+      {
+        "step": 192.0,
+        "loss": 5.627763271331787,
+        "forked": false
+      },
+      {
+        "step": 193.0,
+        "loss": 5.668573379516602,
+        "forked": false
+      },
+      {
+        "step": 194.0,
+        "loss": 5.690793991088867,
+        "forked": false
+      },
+      {
+        "step": 195.0,
+        "loss": 5.6128458976745605,
+        "forked": false
+      },
+      {
+        "step": 196.0,
+        "loss": 5.727108001708984,
+        "forked": false
+      },
+      {
+        "step": 197.0,
+        "loss": 5.6886444091796875,
+        "forked": false
+      },
+      {
+        "step": 198.0,
+        "loss": 5.635231971740723,
+        "forked": false
+      },
+      {
+        "step": 199.0,
+        "loss": 5.704211235046387,
+        "forked": false
+      },
+      {
+        "step": 200.0,
+        "loss": 5.617944717407227,
+        "forked": false
+      },
+      {
+        "step": 201.0,
+        "loss": 5.610021114349365,
+        "forked": false
+      },
+      {
+        "step": 202.0,
+        "loss": 5.584648132324219,
+        "forked": false
+      },
+      {
+        "step": 203.0,
+        "loss": 5.696231842041016,
+        "forked": false
+      },
+      {
+        "step": 204.0,
+        "loss": 5.642199516296387,
+        "forked": false
+      },
+      {
+        "step": 205.0,
+        "loss": 5.6726155281066895,
+        "forked": false
+      },
+      {
+        "step": 206.0,
+        "loss": 5.690088272094727,
+        "forked": false
+      },
+      {
+        "step": 207.0,
+        "loss": 5.639493942260742,
+        "forked": false
+      },
+      {
+        "step": 208.0,
+        "loss": 5.5652875900268555,
+        "forked": false
+      },
+      {
+        "step": 209.0,
+        "loss": 5.601585388183594,
+        "forked": false
+      },
+      {
+        "step": 210.0,
+        "loss": 5.716500282287598,
+        "forked": false
+      },
+      {
+        "step": 211.0,
+        "loss": 5.6008453369140625,
+        "forked": false
+      },
+      {
+        "step": 212.0,
+        "loss": 5.735739231109619,
+        "forked": false
+      },
+      {
+        "step": 213.0,
+        "loss": 5.61461877822876,
+        "forked": false
+      },
+      {
+        "step": 214.0,
+        "loss": 5.605874061584473,
+        "forked": false
+      },
+      {
+        "step": 215.0,
+        "loss": 5.659692764282227,
+        "forked": false
+      },
+      {
+        "step": 216.0,
+        "loss": 5.5480122566223145,
+        "forked": false
+      },
+      {
+        "step": 217.0,
+        "loss": 5.605094909667969,
+        "forked": false
+      },
+      {
+        "step": 218.0,
+        "loss": 5.639586448669434,
+        "forked": false
+      },
+      {
+        "step": 219.0,
+        "loss": 5.542628288269043,
+        "forked": false
+      },
+      {
+        "step": 220.0,
+        "loss": 5.586209297180176,
+        "forked": false
+      },
+      {
+        "step": 221.0,
+        "loss": 5.569855690002441,
+        "forked": false
+      },
+      {
+        "step": 222.0,
+        "loss": 5.648149490356445,
+        "forked": false
+      },
+      {
+        "step": 223.0,
+        "loss": 5.689949035644531,
+        "forked": false
+      },
+      {
+        "step": 224.0,
+        "loss": 5.5428466796875,
+        "forked": false
+      },
+      {
+        "step": 225.0,
+        "loss": 5.580845832824707,
+        "forked": false
+      },
+      {
+        "step": 226.0,
+        "loss": 5.535993576049805,
+        "forked": false
+      },
+      {
+        "step": 227.0,
+        "loss": 5.618760108947754,
+        "forked": false
+      },
+      {
+        "step": 228.0,
+        "loss": 5.6046600341796875,
+        "forked": false
+      },
+      {
+        "step": 229.0,
+        "loss": 5.702335834503174,
+        "forked": false
+      },
+      {
+        "step": 230.0,
+        "loss": 5.577592849731445,
+        "forked": false
+      },
+      {
+        "step": 231.0,
+        "loss": 5.656261444091797,
+        "forked": false
+      },
+      {
+        "step": 232.0,
+        "loss": 5.541207313537598,
+        "forked": false
+      },
+      {
+        "step": 233.0,
+        "loss": 5.64554500579834,
+        "forked": false
+      },
+      {
+        "step": 234.0,
+        "loss": 5.4911580085754395,
+        "forked": false
+      },
+      {
+        "step": 235.0,
+        "loss": 5.475609302520752,
+        "forked": false
+      },
+      {
+        "step": 236.0,
+        "loss": 5.5963592529296875,
+        "forked": false
+      },
+      {
+        "step": 237.0,
+        "loss": 5.617518424987793,
+        "forked": false
+      },
+      {
+        "step": 238.0,
+        "loss": 5.539619445800781,
+        "forked": false
+      },
+      {
+        "step": 239.0,
+        "loss": 5.599963188171387,
+        "forked": false
+      },
+      {
+        "step": 240.0,
+        "loss": 5.615630626678467,
+        "forked": false
+      },
+      {
+        "step": 241.0,
+        "loss": 5.501692771911621,
+        "forked": false
+      },
+      {
+        "step": 242.0,
+        "loss": 5.594973087310791,
+        "forked": false
+      },
+      {
+        "step": 243.0,
+        "loss": 5.554015636444092,
+        "forked": false
+      },
+      {
+        "step": 244.0,
+        "loss": 5.523571491241455,
+        "forked": false
+      },
+      {
+        "step": 245.0,
+        "loss": 5.5404510498046875,
+        "forked": false
+      },
+      {
+        "step": 246.0,
+        "loss": 5.590993404388428,
+        "forked": false
+      },
+      {
+        "step": 247.0,
+        "loss": 5.40976619720459,
+        "forked": false
+      },
+      {
+        "step": 248.0,
+        "loss": 5.510982036590576,
+        "forked": false
+      },
+      {
+        "step": 249.0,
+        "loss": 5.54625129699707,
+        "forked": false
+      },
+      {
+        "step": 250.0,
+        "loss": 5.515442848205566,
+        "forked": false
+      },
+      {
+        "step": 251.0,
+        "loss": 5.569736957550049,
+        "forked": false
+      },
+      {
+        "step": 252.0,
+        "loss": 5.483343124389648,
+        "forked": false
+      },
+      {
+        "step": 253.0,
+        "loss": 5.430461883544922,
+        "forked": false
+      },
+      {
+        "step": 254.0,
+        "loss": 5.493346691131592,
+        "forked": false
+      },
+      {
+        "step": 255.0,
+        "loss": 5.561873912811279,
+        "forked": false
+      },
+      {
+        "step": 256.0,
+        "loss": 5.6372857093811035,
+        "forked": false
+      },
+      {
+        "step": 257.0,
+        "loss": 5.493625164031982,
+        "forked": false
+      },
+      {
+        "step": 258.0,
+        "loss": 5.589542388916016,
+        "forked": false
+      },
+      {
+        "step": 259.0,
+        "loss": 5.49223518371582,
+        "forked": false
+      },
+      {
+        "step": 260.0,
+        "loss": 5.423620700836182,
+        "forked": false
+      },
+      {
+        "step": 261.0,
+        "loss": 5.499566078186035,
+        "forked": false
+      },
+      {
+        "step": 262.0,
+        "loss": 5.526372909545898,
+        "forked": false
+      },
+      {
+        "step": 263.0,
+        "loss": 5.49015998840332,
+        "forked": false
+      },
+      {
+        "step": 264.0,
+        "loss": 5.447599411010742,
+        "forked": false
+      },
+      {
+        "step": 265.0,
+        "loss": 5.466270446777344,
+        "forked": false
+      },
+      {
+        "step": 266.0,
+        "loss": 5.473471641540527,
+        "forked": false
+      },
+      {
+        "step": 267.0,
+        "loss": 5.448829650878906,
+        "forked": false
+      },
+      {
+        "step": 268.0,
+        "loss": 5.514449119567871,
+        "forked": false
+      },
+      {
+        "step": 269.0,
+        "loss": 5.505444049835205,
+        "forked": false
+      },
+      {
+        "step": 270.0,
+        "loss": 5.542278289794922,
+        "forked": false
+      },
+      {
+        "step": 271.0,
+        "loss": 5.571534633636475,
+        "forked": false
+      },
+      {
+        "step": 272.0,
+        "loss": 5.504528999328613,
+        "forked": false
+      },
+      {
+        "step": 273.0,
+        "loss": 5.528913497924805,
+        "forked": false
+      },
+      {
+        "step": 274.0,
+        "loss": 5.468757629394531,
+        "forked": false
+      },
+      {
+        "step": 275.0,
+        "loss": 5.445709228515625,
+        "forked": false
+      },
+      {
+        "step": 276.0,
+        "loss": 5.403280258178711,
+        "forked": false
+      },
+      {
+        "step": 277.0,
+        "loss": 5.472454071044922,
+        "forked": false
+      },
+      {
+        "step": 278.0,
+        "loss": 5.428227424621582,
+        "forked": false
+      },
+      {
+        "step": 279.0,
+        "loss": 5.482908248901367,
+        "forked": false
+      },
+      {
+        "step": 280.0,
+        "loss": 5.443586349487305,
+        "forked": false
+      },
+      {
+        "step": 281.0,
+        "loss": 5.405019760131836,
+        "forked": false
+      },
+      {
+        "step": 282.0,
+        "loss": 5.39996337890625,
+        "forked": false
+      },
+      {
+        "step": 283.0,
+        "loss": 5.439448833465576,
+        "forked": false
+      },
+      {
+        "step": 284.0,
+        "loss": 5.521732330322266,
+        "forked": false
+      },
+      {
+        "step": 285.0,
+        "loss": 5.372195720672607,
+        "forked": false
+      },
+      {
+        "step": 286.0,
+        "loss": 5.444462776184082,
+        "forked": false
+      },
+      {
+        "step": 287.0,
+        "loss": 5.430741310119629,
+        "forked": false
+      },
+      {
+        "step": 288.0,
+        "loss": 5.375703811645508,
+        "forked": false
+      },
+      {
+        "step": 289.0,
+        "loss": 5.425161361694336,
+        "forked": false
+      },
+      {
+        "step": 290.0,
+        "loss": 5.471123218536377,
+        "forked": false
+      },
+      {
+        "step": 291.0,
+        "loss": 5.3936920166015625,
+        "forked": false
+      },
+      {
+        "step": 292.0,
+        "loss": 5.374759674072266,
+        "forked": false
+      },
+      {
+        "step": 293.0,
+        "loss": 5.438956260681152,
+        "forked": false
+      },
+      {
+        "step": 294.0,
+        "loss": 5.417999744415283,
+        "forked": false
+      },
+      {
+        "step": 295.0,
+        "loss": 5.342817306518555,
+        "forked": false
+      },
+      {
+        "step": 296.0,
+        "loss": 5.419407367706299,
+        "forked": false
+      },
+      {
+        "step": 297.0,
+        "loss": 5.3537468910217285,
+        "forked": false
+      },
+      {
+        "step": 298.0,
+        "loss": 5.403342247009277,
+        "forked": false
+      },
+      {
+        "step": 299.0,
+        "loss": 5.350120544433594,
+        "forked": false
+      },
+      {
+        "step": 300.0,
+        "loss": 5.4316020011901855,
+        "forked": false
+      },
+      {
+        "step": 301.0,
+        "loss": 5.369293689727783,
+        "forked": false
+      },
+      {
+        "step": 302.0,
+        "loss": 5.369453430175781,
+        "forked": false
+      },
+      {
+        "step": 303.0,
+        "loss": 5.46124267578125,
+        "forked": false
+      },
+      {
+        "step": 304.0,
+        "loss": 5.458188056945801,
+        "forked": false
+      },
+      {
+        "step": 305.0,
+        "loss": 5.401364326477051,
+        "forked": false
+      },
+      {
+        "step": 306.0,
+        "loss": 5.401395320892334,
+        "forked": false
+      },
+      {
+        "step": 307.0,
+        "loss": 5.453342914581299,
+        "forked": false
+      },
+      {
+        "step": 308.0,
+        "loss": 5.44345760345459,
+        "forked": false
+      },
+      {
+        "step": 309.0,
+        "loss": 5.446043968200684,
+        "forked": false
+      },
+      {
+        "step": 310.0,
+        "loss": 5.543524265289307,
+        "forked": false
+      },
+      {
+        "step": 311.0,
+        "loss": 5.407981872558594,
+        "forked": false
+      },
+      {
+        "step": 312.0,
+        "loss": 5.458427906036377,
+        "forked": false
+      },
+      {
+        "step": 313.0,
+        "loss": 5.272804260253906,
+        "forked": false
+      },
+      {
+        "step": 314.0,
+        "loss": 5.468481540679932,
+        "forked": false
+      },
+      {
+        "step": 315.0,
+        "loss": 5.387935638427734,
+        "forked": false
+      },
+      {
+        "step": 316.0,
+        "loss": 5.362800598144531,
+        "forked": false
+      },
+      {
+        "step": 317.0,
+        "loss": 5.35297155380249,
+        "forked": false
+      },
+      {
+        "step": 318.0,
+        "loss": 5.375584602355957,
+        "forked": false
+      },
+      {
+        "step": 319.0,
+        "loss": 5.365592002868652,
+        "forked": false
+      },
+      {
+        "step": 320.0,
+        "loss": 5.335760116577148,
+        "forked": false
+      },
+      {
+        "step": 321.0,
+        "loss": 5.450105667114258,
+        "forked": false
+      },
+      {
+        "step": 322.0,
+        "loss": 5.389978408813477,
+        "forked": false
+      },
+      {
+        "step": 323.0,
+        "loss": 5.322661399841309,
+        "forked": false
+      },
+      {
+        "step": 324.0,
+        "loss": 5.3057332038879395,
+        "forked": false
+      },
+      {
+        "step": 325.0,
+        "loss": 5.3523268699646,
+        "forked": false
+      },
+      {
+        "step": 326.0,
+        "loss": 5.410604000091553,
+        "forked": false
+      },
+      {
+        "step": 327.0,
+        "loss": 5.313840866088867,
+        "forked": false
+      },
+      {
+        "step": 328.0,
+        "loss": 5.420446395874023,
+        "forked": false
+      },
+      {
+        "step": 329.0,
+        "loss": 5.470778465270996,
+        "forked": false
+      },
+      {
+        "step": 330.0,
+        "loss": 5.412448883056641,
+        "forked": false
+      },
+      {
+        "step": 331.0,
+        "loss": 5.4144744873046875,
+        "forked": false
+      },
+      {
+        "step": 332.0,
+        "loss": 5.360288619995117,
+        "forked": false
+      },
+      {
+        "step": 333.0,
+        "loss": 5.45511531829834,
+        "forked": false
+      },
+      {
+        "step": 334.0,
+        "loss": 5.3471479415893555,
+        "forked": false
+      },
+      {
+        "step": 335.0,
+        "loss": 5.382585525512695,
+        "forked": false
+      },
+      {
+        "step": 336.0,
+        "loss": 5.364983558654785,
+        "forked": false
+      },
+      {
+        "step": 337.0,
+        "loss": 5.294952392578125,
+        "forked": false
+      },
+      {
+        "step": 338.0,
+        "loss": 5.270310401916504,
+        "forked": false
+      },
+      {
+        "step": 339.0,
+        "loss": 5.245998382568359,
+        "forked": false
+      },
+      {
+        "step": 340.0,
+        "loss": 5.183228969573975,
+        "forked": false
+      },
+      {
+        "step": 341.0,
+        "loss": 5.402924537658691,
+        "forked": false
+      },
+      {
+        "step": 342.0,
+        "loss": 5.284123420715332,
+        "forked": false
+      },
+      {
+        "step": 343.0,
+        "loss": 5.372407913208008,
+        "forked": false
+      },
+      {
+        "step": 344.0,
+        "loss": 5.343580722808838,
+        "forked": false
+      },
+      {
+        "step": 345.0,
+        "loss": 5.446720123291016,
+        "forked": false
+      },
+      {
+        "step": 346.0,
+        "loss": 5.348341941833496,
+        "forked": false
+      },
+      {
+        "step": 347.0,
+        "loss": 5.265381813049316,
+        "forked": false
+      },
+      {
+        "step": 348.0,
+        "loss": 5.419305801391602,
+        "forked": false
+      },
+      {
+        "step": 349.0,
+        "loss": 5.262317657470703,
+        "forked": false
+      },
+      {
+        "step": 350.0,
+        "loss": 5.307664394378662,
+        "forked": false
+      },
+      {
+        "step": 351.0,
+        "loss": 5.36436653137207,
+        "forked": false
+      },
+      {
+        "step": 352.0,
+        "loss": 5.346539497375488,
+        "forked": false
+      },
+      {
+        "step": 353.0,
+        "loss": 5.308534622192383,
+        "forked": false
+      },
+      {
+        "step": 354.0,
+        "loss": 5.346787929534912,
+        "forked": false
+      },
+      {
+        "step": 355.0,
+        "loss": 5.34434700012207,
+        "forked": false
+      },
+      {
+        "step": 356.0,
+        "loss": 5.325826644897461,
+        "forked": false
+      },
+      {
+        "step": 357.0,
+        "loss": 5.269522666931152,
+        "forked": false
+      },
+      {
+        "step": 358.0,
+        "loss": 5.348732948303223,
+        "forked": false
+      },
+      {
+        "step": 359.0,
+        "loss": 5.371429443359375,
+        "forked": false
+      },
+      {
+        "step": 360.0,
+        "loss": 5.260458946228027,
+        "forked": false
+      },
+      {
+        "step": 361.0,
+        "loss": 5.3687920570373535,
+        "forked": false
+      },
+      {
+        "step": 362.0,
+        "loss": 5.389476776123047,
+        "forked": false
+      },
+      {
+        "step": 363.0,
+        "loss": 5.351226329803467,
+        "forked": false
+      },
+      {
+        "step": 364.0,
+        "loss": 5.267532825469971,
+        "forked": false
+      },
+      {
+        "step": 365.0,
+        "loss": 5.189136505126953,
+        "forked": false
+      },
+      {
+        "step": 366.0,
+        "loss": 5.329010009765625,
+        "forked": false
+      },
+      {
+        "step": 367.0,
+        "loss": 5.240546226501465,
+        "forked": false
+      },
+      {
+        "step": 368.0,
+        "loss": 5.250619888305664,
+        "forked": false
+      },
+      {
+        "step": 369.0,
+        "loss": 5.3172712326049805,
+        "forked": false
+      },
+      {
+        "step": 370.0,
+        "loss": 5.339507579803467,
+        "forked": false
+      },
+      {
+        "step": 371.0,
+        "loss": 5.240979194641113,
+        "forked": false
+      },
+      {
+        "step": 372.0,
+        "loss": 5.2827043533325195,
+        "forked": false
+      },
+      {
+        "step": 373.0,
+        "loss": 5.242090225219727,
+        "forked": false
+      },
+      {
+        "step": 374.0,
+        "loss": 5.330848217010498,
+        "forked": false
+      },
+      {
+        "step": 375.0,
+        "loss": 5.1919026374816895,
+        "forked": false
+      },
+      {
+        "step": 376.0,
+        "loss": 5.296009540557861,
+        "forked": false
+      },
+      {
+        "step": 377.0,
+        "loss": 5.334174633026123,
+        "forked": false
+      },
+      {
+        "step": 378.0,
+        "loss": 5.286953926086426,
+        "forked": false
+      },
+      {
+        "step": 379.0,
+        "loss": 5.239047050476074,
+        "forked": false
+      },
+      {
+        "step": 380.0,
+        "loss": 5.306190013885498,
+        "forked": false
+      },
+      {
+        "step": 381.0,
+        "loss": 5.176538467407227,
+        "forked": false
+      },
+      {
+        "step": 382.0,
+        "loss": 5.372124671936035,
+        "forked": false
+      },
+      {
+        "step": 383.0,
+        "loss": 5.216859817504883,
+        "forked": false
+      },
+      {
+        "step": 384.0,
+        "loss": 5.330195426940918,
+        "forked": false
+      },
+      {
+        "step": 385.0,
+        "loss": 5.232961177825928,
+        "forked": false
+      },
+      {
+        "step": 386.0,
+        "loss": 5.217608451843262,
+        "forked": false
+      },
+      {
+        "step": 387.0,
+        "loss": 5.298133850097656,
+        "forked": false
+      },
+      {
+        "step": 388.0,
+        "loss": 5.251558303833008,
+        "forked": false
+      },
+      {
+        "step": 389.0,
+        "loss": 5.305538177490234,
+        "forked": false
+      },
+      {
+        "step": 390.0,
+        "loss": 5.333630561828613,
+        "forked": false
+      },
+      {
+        "step": 391.0,
+        "loss": 5.267618656158447,
+        "forked": false
+      },
+      {
+        "step": 392.0,
+        "loss": 5.321615219116211,
+        "forked": false
+      }
+    ],
+    "elapsed_s": 601.3517380831763,
+    "fork_count": 0,
+    "extra_params": 0,
+    "structured_proj": null,
+    "spectral_snapshots": [
+      {
+        "step": 0,
+        "power_spectrum": [
+          6000.04296875,
+          895.1867065429688,
+          758.857421875,
+          738.3309936523438,
+          697.0866088867188,
+          688.27880859375,
+          684.697265625,
+          672.758544921875,
+          735.8810424804688,
+          729.3600463867188,
+          673.31005859375,
+          650.4663696289062,
+          701.4701538085938,
+          613.5701904296875,
+          657.891845703125,
+          652.384765625,
+          669.4288940429688,
+          642.54833984375,
+          653.4396362304688,
+          621.850830078125,
+          617.634765625,
+          643.1944580078125,
+          634.5361328125,
+          631.4090576171875,
+          635.019775390625,
+          626.85302734375,
+          609.1492309570312,
+          639.4891967773438,
+          645.20361328125,
+          677.9527587890625,
+          619.604736328125,
+          606.347412109375,
+          600.651611328125,
+          617.4547119140625,
+          620.88232421875,
+          615.9544677734375,
+          607.863037109375,
+          620.9949951171875,
+          619.239013671875,
+          605.1895751953125,
+          616.5003662109375,
+          624.2278442382812,
+          583.262451171875,
+          609.69287109375,
+          584.2723999023438,
+          581.2091064453125,
+          587.7802124023438,
+          584.7388916015625,
+          583.0242919921875,
+          595.8944091796875,
+          613.5552978515625,
+          627.8072509765625,
+          614.7144775390625,
+          624.7593383789062,
+          621.608154296875,
+          589.3944702148438,
+          590.189208984375,
+          621.27734375,
+          602.2960815429688,
+          599.2928466796875,
+          585.0133666992188,
+          567.7984619140625,
+          575.0093383789062,
+          616.58154296875,
+          595.2312622070312,
+          584.153076171875,
+          593.755126953125,
+          574.7437744140625,
+          599.0736083984375,
+          550.1663818359375,
+          545.7598266601562,
+          563.69873046875,
+          556.7281494140625,
+          567.8096313476562,
+          572.16064453125,
+          591.1875,
+          592.64404296875,
+          557.9779663085938,
+          584.9178466796875,
+          577.7833862304688,
+          586.9298095703125,
+          574.3024291992188,
+          570.4091796875,
+          575.1796875,
+          572.9971923828125,
+          553.6823120117188,
+          586.1259155273438,
+          577.7689208984375,
+          574.2588500976562,
+          592.8787841796875,
+          609.8043823242188,
+          554.855712890625,
+          603.8170166015625,
+          621.1072998046875,
+          587.14990234375,
+          571.0404052734375,
+          554.0200805664062,
+          559.22509765625,
+          572.5553588867188,
+          581.9892578125,
+          561.0262451171875,
+          574.93994140625,
+          567.32763671875,
+          548.357421875,
+          595.2664794921875,
+          565.8885498046875,
+          590.4437866210938,
+          563.499267578125,
+          581.55712890625,
+          592.6055908203125,
+          565.9781494140625,
+          559.1451416015625,
+          572.810791015625,
+          569.2130126953125,
+          583.8195190429688,
+          564.0464477539062,
+          564.1641845703125,
+          575.8035888671875,
+          597.9686279296875,
+          613.7013549804688,
+          573.6163940429688,
+          588.7626953125,
+          579.0929565429688,
+          576.6205444335938,
+          575.9288330078125,
+          573.19970703125,
+          578.7947998046875,
+          584.7631225585938,
+          610.2787475585938,
+          549.79638671875,
+          571.5068969726562,
+          557.7567138671875,
+          558.299560546875,
+          578.469482421875,
+          558.4998779296875,
+          564.000732421875,
+          575.3429565429688,
+          596.6610107421875,
+          571.88037109375,
+          584.3682250976562,
+          571.6708374023438,
+          558.0413818359375,
+          606.24365234375,
+          588.861083984375,
+          552.8297119140625,
+          569.302978515625,
+          577.69482421875,
+          597.4609375,
+          554.5438232421875,
+          577.2882690429688,
+          576.30322265625,
+          612.7070922851562,
+          563.3580932617188,
+          584.107421875,
+          586.9581909179688,
+          593.965087890625,
+          605.6525268554688,
+          565.071533203125,
+          592.3619384765625,
+          554.0421752929688,
+          580.7752685546875,
+          544.9356689453125,
+          560.1319580078125,
+          578.853515625,
+          614.4140625,
+          567.9019775390625,
+          572.5675659179688,
+          564.8431396484375,
+          559.7692260742188,
+          589.8870849609375,
+          585.7474975585938,
+          568.959716796875,
+          587.8443603515625,
+          583.0887451171875,
+          569.3760375976562,
+          590.1797485351562,
+          558.7582397460938,
+          581.81787109375,
+          586.499267578125,
+          569.731201171875,
+          555.544921875,
+          593.2526245117188,
+          572.2904663085938,
+          572.7415771484375,
+          588.8807983398438,
+          582.7095947265625,
+          585.3473510742188,
+          557.5371704101562,
+          567.5834350585938,
+          569.3544921875,
+          592.9185180664062,
+          574.5997314453125,
+          553.796630859375,
+          560.0361328125,
+          585.0763549804688,
+          552.775390625,
+          549.3336791992188,
+          561.789306640625,
+          556.1822509765625,
+          582.9559326171875,
+          563.727294921875,
+          566.3515625,
+          571.936279296875,
+          576.7338256835938,
+          588.1478271484375,
+          559.05126953125,
+          594.4263916015625,
+          583.09716796875,
+          591.8212890625,
+          591.275390625,
+          552.2161865234375,
+          567.8539428710938,
+          565.5552978515625,
+          562.6109008789062,
+          581.189208984375,
+          573.774658203125,
+          593.1251220703125,
+          555.54296875,
+          572.8614501953125,
+          545.7182006835938,
+          558.9518432617188,
+          572.53515625,
+          546.55322265625,
+          559.663330078125,
+          544.2005615234375,
+          573.6939697265625,
+          557.9293212890625,
+          553.6878662109375,
+          604.56005859375,
+          570.2984619140625,
+          584.4215698242188,
+          564.31494140625,
+          586.8306274414062,
+          606.0493774414062,
+          581.19140625,
+          554.2188110351562,
+          571.51708984375,
+          585.8590087890625,
+          578.5149536132812,
+          575.1926879882812,
+          582.8427734375,
+          587.9661865234375,
+          580.7855224609375,
+          563.7200927734375,
+          571.3579711914062,
+          576.38623046875,
+          570.430908203125,
+          565.4539184570312,
+          571.5689697265625,
+          581.1874389648438,
+          578.0576171875,
+          562.7787475585938,
+          562.7877807617188,
+          569.478759765625,
+          559.9590454101562,
+          570.533447265625,
+          554.5889892578125
+        ],
+        "dominant_freq": 1,
+        "lambda_max": 0.0,
+        "sv_log_var": 0.0
+      },
+      {
+        "step": 50,
+        "power_spectrum": [
+          1472464.0,
+          28393.87890625,
+          12537.435546875,
+          12375.5,
+          10206.1318359375,
+          10797.384765625,
+          7131.1015625,
+          6538.0634765625,
+          8002.86865234375,
+          8198.6484375,
+          7095.033203125,
+          6492.0849609375,
+          6021.86669921875,
+          6887.5810546875,
+          6120.275390625,
+          5587.6943359375,
+          5457.12451171875,
+          4801.646484375,
+          5637.68896484375,
+          4147.57177734375,
+          4347.0380859375,
+          4271.556640625,
+          3972.078857421875,
+          4202.0556640625,
+          4454.404296875,
+          3700.975341796875,
+          4239.35107421875,
+          3896.048583984375,
+          3743.873779296875,
+          4193.9736328125,
+          3846.37890625,
+          4011.28857421875,
+          4202.2216796875,
+          3376.169677734375,
+          3409.91796875,
+          3476.752685546875,
+          3443.59912109375,
+          2876.324951171875,
+          3827.05078125,
+          3658.22998046875,
+          3810.93701171875,
+          3530.979248046875,
+          3213.77685546875,
+          3469.82470703125,
+          3149.869873046875,
+          3663.745849609375,
+          3240.46630859375,
+          3319.12646484375,
+          2920.557373046875,
+          3744.443115234375,
+          3536.57373046875,
+          2706.68603515625,
+          3257.99365234375,
+          2580.920166015625,
+          3159.9580078125,
+          3202.28466796875,
+          2957.75927734375,
+          3161.28466796875,
+          3264.0732421875,
+          2975.701904296875,
+          2919.5234375,
+          3134.528076171875,
+          2901.486328125,
+          3104.4931640625,
+          2805.669921875,
+          3126.435546875,
+          2866.73583984375,
+          3217.76904296875,
+          2461.81103515625,
+          2674.52587890625,
+          2804.24462890625,
+          2664.047607421875,
+          2789.0126953125,
+          2481.08740234375,
+          2757.580810546875,
+          2594.80322265625,
+          3009.760498046875,
+          2322.1640625,
+          2771.0390625,
+          2720.19189453125,
+          2288.6591796875,
+          2540.28857421875,
+          2514.3408203125,
+          2996.539794921875,
+          2641.646240234375,
+          2972.566162109375,
+          2399.41552734375,
+          2790.10009765625,
+          2715.81689453125,
+          2316.291259765625,
+          2807.752685546875,
+          2684.80419921875,
+          2367.576904296875,
+          2736.873779296875,
+          2664.603271484375,
+          2401.232177734375,
+          2317.48193359375,
+          2364.5791015625,
+          2632.93994140625,
+          2463.261962890625,
+          2553.34765625,
+          2719.4287109375,
+          2643.742431640625,
+          2499.6083984375,
+          2615.66357421875,
+          2514.22509765625,
+          2594.651123046875,
+          2783.927734375,
+          2217.55224609375,
+          2546.09521484375,
+          2346.0908203125,
+          2391.928955078125,
+          2973.611328125,
+          2448.5546875,
+          2607.099609375,
+          2419.55078125,
+          2680.49365234375,
+          2602.78466796875,
+          2375.376708984375,
+          2379.7060546875,
+          2438.098876953125,
+          2406.86376953125,
+          2272.5224609375,
+          2765.13232421875,
+          2666.727294921875,
+          2800.776123046875,
+          2440.852294921875,
+          2824.33251953125,
+          2474.4716796875,
+          2463.754638671875,
+          2718.44970703125,
+          2508.956787109375,
+          2599.201904296875,
+          2309.92919921875,
+          3075.03466796875,
+          2258.080078125,
+          2468.808349609375,
+          3230.73974609375,
+          2813.078125,
+          2581.42529296875,
+          2724.241455078125,
+          2638.197021484375,
+          2442.45703125,
+          2562.11767578125,
+          2522.484130859375,
+          2166.56494140625,
+          2522.569580078125,
+          2239.778076171875,
+          2347.2265625,
+          2520.4072265625,
+          2505.341552734375,
+          2219.212890625,
+          3014.27099609375,
+          2752.07568359375,
+          2436.8427734375,
+          2435.026123046875,
+          2305.641357421875,
+          2601.527099609375,
+          2367.9990234375,
+          2106.368896484375,
+          2696.474853515625,
+          2312.300537109375,
+          2102.21044921875,
+          2428.723876953125,
+          2029.510498046875,
+          2705.74462890625,
+          2612.1123046875,
+          2544.810791015625,
+          3055.74755859375,
+          2373.61669921875,
+          2320.683349609375,
+          2253.94091796875,
+          2523.2138671875,
+          2377.8984375,
+          2234.783935546875,
+          2269.4287109375,
+          2075.7451171875,
+          2770.906982421875,
+          2730.727294921875,
+          2267.013427734375,
+          2483.196533203125,
+          2435.448974609375,
+          2175.94384765625,
+          2168.722900390625,
+          2213.726318359375,
+          2006.100341796875,
+          2256.47705078125,
+          2747.119873046875,
+          2355.78515625,
+          2501.770263671875,
+          2272.36962890625,
+          2953.290771484375,
+          2380.98828125,
+          2388.11474609375,
+          2414.06591796875,
+          2476.35595703125,
+          2498.929443359375,
+          2456.056640625,
+          2317.98583984375,
+          2157.95703125,
+          2198.5654296875,
+          2581.57568359375,
+          2464.811279296875,
+          2307.686767578125,
+          2266.60205078125,
+          2192.418701171875,
+          2410.156982421875,
+          2460.216796875,
+          2236.212890625,
+          2395.328857421875,
+          2144.74853515625,
+          2061.046875,
+          2507.71044921875,
+          2328.99609375,
+          2117.238037109375,
+          2221.3779296875,
+          2255.15966796875,
+          2311.46240234375,
+          2316.68359375,
+          2235.96044921875,
+          2146.884033203125,
+          2362.786376953125,
+          2667.41943359375,
+          2367.319091796875,
+          2165.670654296875,
+          2206.155029296875,
+          2435.1982421875,
+          2420.82666015625,
+          2408.76171875,
+          2447.870849609375,
+          2354.27392578125,
+          2254.572998046875,
+          2245.66650390625,
+          2028.067138671875,
+          2370.96728515625,
+          1998.3232421875,
+          2154.77587890625,
+          2214.54931640625,
+          2057.46728515625,
+          2467.703125,
+          2276.799560546875,
+          2191.748046875,
+          2303.089599609375,
+          2306.5693359375,
+          1943.9276123046875,
+          2413.324951171875,
+          2401.427490234375,
+          2075.154052734375,
+          2361.5126953125,
+          2196.888916015625,
+          2171.65673828125,
+          2480.1689453125,
+          2533.15966796875,
+          1860.99658203125,
+          2249.79443359375,
+          2282.2255859375,
+          2290.8623046875
+        ],
+        "dominant_freq": 1,
+        "lambda_max": 0.0,
+        "sv_log_var": 0.0
+      },
+      {
+        "step": 100,
+        "power_spectrum": [
+          418286.4375,
+          15419.3359375,
+          11451.1318359375,
+          6496.126953125,
+          7176.7236328125,
+          5006.572265625,
+          5976.2744140625,
+          5582.8427734375,
+          5202.28564453125,
+          4169.52685546875,
+          3900.86328125,
+          4381.580078125,
+          3595.354248046875,
+          3447.943359375,
+          3748.0361328125,
+          4286.1884765625,
+          4116.25,
+          3810.98291015625,
+          3469.3115234375,
+          3584.1328125,
+          3629.071044921875,
+          3316.24853515625,
+          3388.4140625,
+          2983.6875,
+          3703.0517578125,
+          3528.70263671875,
+          3195.1259765625,
+          2896.289794921875,
+          3288.9208984375,
+          3004.84326171875,
+          3226.203125,
+          3420.875732421875,
+          2924.61083984375,
+          2844.75,
+          3049.615966796875,
+          2903.7275390625,
+          2772.94970703125,
+          2811.93359375,
+          2792.49462890625,
+          2927.563232421875,
+          2941.286865234375,
+          2844.52734375,
+          2936.12255859375,
+          3073.380859375,
+          2641.007080078125,
+          2667.42919921875,
+          2679.98095703125,
+          2752.02392578125,
+          2811.50830078125,
+          2679.96630859375,
+          2697.95849609375,
+          2685.89453125,
+          2482.93994140625,
+          2802.341796875,
+          2712.4130859375,
+          2605.342529296875,
+          2660.486083984375,
+          2714.81005859375,
+          2303.12060546875,
+          2446.2880859375,
+          2300.566650390625,
+          2279.80712890625,
+          2776.92138671875,
+          2458.486328125,
+          2393.720703125,
+          2480.31982421875,
+          2208.653076171875,
+          2138.6328125,
+          2262.847900390625,
+          2478.8583984375,
+          2245.017333984375,
+          2350.502685546875,
+          2361.88671875,
+          2313.451171875,
+          2098.297607421875,
+          2238.413818359375,
+          2595.32666015625,
+          2193.76904296875,
+          2478.29296875,
+          2234.6064453125,
+          2086.21142578125,
+          2068.564208984375,
+          2087.4541015625,
+          2192.38623046875,
+          2060.953125,
+          2280.1123046875,
+          2431.5302734375,
+          2248.0166015625,
+          1997.545654296875,
+          2239.856689453125,
+          2210.3212890625,
+          2150.678955078125,
+          2085.64892578125,
+          1760.734130859375,
+          2133.934326171875,
+          2254.19091796875,
+          2391.663818359375,
+          1938.1312255859375,
+          2163.071044921875,
+          1936.984619140625,
+          2072.1298828125,
+          1870.4979248046875,
+          2174.035888671875,
+          2098.85302734375,
+          2183.828857421875,
+          1814.2548828125,
+          2459.535888671875,
+          2406.25830078125,
+          2068.343505859375,
+          2180.529296875,
+          1983.97119140625,
+          2170.204345703125,
+          2112.921875,
+          2062.166015625,
+          2204.399169921875,
+          2051.18310546875,
+          2126.943359375,
+          2356.764892578125,
+          1976.7705078125,
+          1987.549072265625,
+          1879.7498779296875,
+          2148.4765625,
+          2046.2314453125,
+          2168.54541015625,
+          1903.974853515625,
+          2033.9423828125,
+          2037.308349609375,
+          2030.4931640625,
+          1992.822021484375,
+          1974.9189453125,
+          2166.359130859375,
+          2156.2685546875,
+          1923.9300537109375,
+          1946.354248046875,
+          1958.826416015625,
+          1993.607421875,
+          1984.390380859375,
+          1828.578125,
+          2033.692626953125,
+          1918.74072265625,
+          2335.52197265625,
+          2166.482421875,
+          1885.511474609375,
+          2278.070556640625,
+          2058.05419921875,
+          1884.388671875,
+          1912.5931396484375,
+          1689.5023193359375,
+          2078.998046875,
+          1964.539306640625,
+          1716.6942138671875,
+          2057.81787109375,
+          1895.319091796875,
+          1979.307373046875,
+          1859.503662109375,
+          1826.9710693359375,
+          1869.5078125,
+          1821.1331787109375,
+          1755.8798828125,
+          1839.1263427734375,
+          1907.0111083984375,
+          1980.040771484375,
+          2033.4505615234375,
+          1687.345947265625,
+          2031.133544921875,
+          2122.1416015625,
+          1835.404296875,
+          1989.48583984375,
+          1816.2923583984375,
+          1605.523193359375,
+          1937.667724609375,
+          1730.629638671875,
+          1919.1844482421875,
+          1895.3763427734375,
+          1850.8486328125,
+          1878.4593505859375,
+          1795.8245849609375,
+          1718.437255859375,
+          1787.4842529296875,
+          1742.686279296875,
+          1812.1962890625,
+          1667.4476318359375,
+          1712.5712890625,
+          1903.431640625,
+          1824.7900390625,
+          1901.2137451171875,
+          1761.279541015625,
+          1650.0277099609375,
+          1658.822265625,
+          1844.583251953125,
+          1859.6566162109375,
+          1699.8812255859375,
+          1798.917236328125,
+          1953.5242919921875,
+          1636.3626708984375,
+          1797.5234375,
+          1610.43310546875,
+          1618.8231201171875,
+          1686.103271484375,
+          1588.55615234375,
+          1883.9794921875,
+          1653.2806396484375,
+          1829.931884765625,
+          1756.3861083984375,
+          1596.072265625,
+          1756.133544921875,
+          1667.5439453125,
+          1869.724609375,
+          1718.5247802734375,
+          1634.5872802734375,
+          1547.9925537109375,
+          1888.6058349609375,
+          1711.684326171875,
+          1751.2669677734375,
+          1588.174560546875,
+          1686.28076171875,
+          1710.860595703125,
+          1617.9814453125,
+          1559.267578125,
+          1599.5906982421875,
+          1833.0662841796875,
+          1606.3203125,
+          1589.3114013671875,
+          1717.6195068359375,
+          1588.268310546875,
+          1885.5537109375,
+          1732.4075927734375,
+          1625.216796875,
+          1694.169677734375,
+          1675.32470703125,
+          1834.6171875,
+          1737.564208984375,
+          1725.8289794921875,
+          1771.380615234375,
+          1789.909912109375,
+          1853.5960693359375,
+          1718.7239990234375,
+          1558.4769287109375,
+          1711.900390625,
+          1780.849853515625,
+          1787.7412109375,
+          1722.919921875,
+          1883.6712646484375,
+          1739.357177734375,
+          1608.9715576171875,
+          1620.072998046875,
+          1830.097412109375,
+          1693.1630859375,
+          1608.940185546875,
+          1681.804443359375,
+          1633.282470703125,
+          1770.971435546875,
+          1727.6024169921875,
+          1689.377685546875,
+          1561.763427734375,
+          1671.6785888671875,
+          1607.73046875
+        ],
+        "dominant_freq": 1,
+        "lambda_max": 0.0,
+        "sv_log_var": 0.0
+      },
+      {
+        "step": 150,
+        "power_spectrum": [
+          380156.9375,
+          12880.95703125,
+          9799.1123046875,
+          7185.8427734375,
+          6341.24951171875,
+          6015.26953125,
+          4602.64453125,
+          3768.728271484375,
+          4450.72265625,
+          4677.54248046875,
+          3962.154052734375,
+          3349.487060546875,
+          3380.855224609375,
+          4274.0205078125,
+          3351.08056640625,
+          3007.04296875,
+          3474.83935546875,
+          3675.880859375,
+          3813.015625,
+          3659.203125,
+          3115.675537109375,
+          2815.41650390625,
+          3177.81689453125,
+          3207.48876953125,
+          2690.891845703125,
+          2952.91162109375,
+          2522.6005859375,
+          2972.006591796875,
+          2934.795654296875,
+          2604.35205078125,
+          2579.7373046875,
+          2833.565185546875,
+          3011.70703125,
+          2624.507568359375,
+          2587.14453125,
+          2513.9443359375,
+          2592.726318359375,
+          2546.542724609375,
+          2498.90966796875,
+          2513.37646484375,
+          2654.668701171875,
+          2527.66943359375,
+          2434.53955078125,
+          2318.99169921875,
+          2433.531494140625,
+          2591.43896484375,
+          2599.290771484375,
+          2248.9326171875,
+          2374.311279296875,
+          2196.4892578125,
+          2296.427734375,
+          2418.280517578125,
+          2471.710205078125,
+          2242.72314453125,
+          2077.575439453125,
+          2642.134765625,
+          2392.180908203125,
+          2241.1044921875,
+          2363.3486328125,
+          2214.54248046875,
+          2354.696044921875,
+          2215.5107421875,
+          2339.499755859375,
+          2259.33740234375,
+          2170.350341796875,
+          1973.160888671875,
+          2216.7685546875,
+          2128.94677734375,
+          2003.38330078125,
+          2135.0908203125,
+          2234.0751953125,
+          1951.5179443359375,
+          2014.623779296875,
+          2071.1630859375,
+          1998.76220703125,
+          2097.210693359375,
+          2152.3916015625,
+          2012.9935302734375,
+          1839.224365234375,
+          2075.43603515625,
+          2125.02490234375,
+          1874.6697998046875,
+          2032.7406005859375,
+          1959.8564453125,
+          2166.807373046875,
+          1837.717041015625,
+          1996.997802734375,
+          1972.79296875,
+          1933.360595703125,
+          1952.239990234375,
+          2040.0833740234375,
+          2026.322021484375,
+          2029.548828125,
+          2140.00634765625,
+          1883.298583984375,
+          2008.079833984375,
+          2017.787841796875,
+          1894.65771484375,
+          2000.5618896484375,
+          1991.292724609375,
+          1765.7454833984375,
+          2071.1982421875,
+          1827.776123046875,
+          2041.5091552734375,
+          1964.43408203125,
+          1806.703369140625,
+          1827.78369140625,
+          1783.80615234375,
+          1814.459716796875,
+          1694.15234375,
+          1908.9755859375,
+          1800.921142578125,
+          1724.711181640625,
+          1937.014404296875,
+          1869.3714599609375,
+          1831.27490234375,
+          1867.5091552734375,
+          1952.8226318359375,
+          2066.134765625,
+          1882.7294921875,
+          1760.300537109375,
+          1965.705078125,
+          1845.106201171875,
+          1966.825927734375,
+          2084.237060546875,
+          1709.18603515625,
+          1789.33203125,
+          1700.7864990234375,
+          1820.5096435546875,
+          1940.151611328125,
+          1919.300537109375,
+          1749.5023193359375,
+          1760.36669921875,
+          1841.376708984375,
+          1736.429443359375,
+          1810.4921875,
+          1729.860595703125,
+          1756.9609375,
+          1728.989013671875,
+          1581.420654296875,
+          1881.976806640625,
+          1719.828857421875,
+          1757.1322021484375,
+          1695.2542724609375,
+          1901.150390625,
+          1729.9443359375,
+          1658.958984375,
+          1731.654296875,
+          1730.6337890625,
+          1778.6253662109375,
+          1701.6317138671875,
+          1652.702880859375,
+          1647.7103271484375,
+          1859.70703125,
+          1665.86376953125,
+          1788.628173828125,
+          1569.9603271484375,
+          1733.2337646484375,
+          1793.1639404296875,
+          1753.291748046875,
+          1845.1136474609375,
+          1799.30078125,
+          1628.0784912109375,
+          1719.064453125,
+          1711.0213623046875,
+          1873.417236328125,
+          1757.28564453125,
+          1683.2332763671875,
+          1715.3984375,
+          1706.8984375,
+          1695.27734375,
+          1741.010498046875,
+          1564.12939453125,
+          1685.7294921875,
+          1706.837158203125,
+          1631.498779296875,
+          1638.469482421875,
+          1817.61328125,
+          1559.557373046875,
+          1619.269287109375,
+          1689.9178466796875,
+          1562.5120849609375,
+          1608.7132568359375,
+          1607.1175537109375,
+          1657.854736328125,
+          1537.639892578125,
+          1661.6351318359375,
+          1692.325927734375,
+          1733.9443359375,
+          1577.4599609375,
+          1561.1845703125,
+          1686.509033203125,
+          1704.8880615234375,
+          1641.6966552734375,
+          1715.7010498046875,
+          1606.9417724609375,
+          1529.506591796875,
+          1475.9046630859375,
+          1599.731201171875,
+          1660.813232421875,
+          1457.5927734375,
+          1724.7666015625,
+          1679.3505859375,
+          1533.75244140625,
+          1707.7939453125,
+          1617.427734375,
+          1620.26513671875,
+          1650.91796875,
+          1699.2518310546875,
+          1472.46875,
+          1613.2874755859375,
+          1645.4027099609375,
+          1641.3359375,
+          1602.7239990234375,
+          1499.344482421875,
+          1588.9906005859375,
+          1594.669921875,
+          1573.899658203125,
+          1551.2567138671875,
+          1445.1302490234375,
+          1531.087158203125,
+          1514.138916015625,
+          1588.2474365234375,
+          1488.81005859375,
+          1510.7371826171875,
+          1566.1951904296875,
+          1661.277099609375,
+          1612.6761474609375,
+          1457.891357421875,
+          1583.8701171875,
+          1494.2747802734375,
+          1515.13720703125,
+          1465.681396484375,
+          1574.734619140625,
+          1499.96728515625,
+          1587.96484375,
+          1631.79150390625,
+          1418.726806640625,
+          1563.2498779296875,
+          1559.647216796875,
+          1593.8701171875,
+          1533.9794921875,
+          1564.944091796875,
+          1437.7958984375,
+          1479.9427490234375,
+          1484.299072265625,
+          1477.5882568359375,
+          1488.2425537109375,
+          1473.2431640625,
+          1459.6884765625,
+          1447.115234375,
+          1578.303466796875,
+          1571.6331787109375,
+          1545.36572265625,
+          1500.1552734375,
+          1489.431640625,
+          1694.4111328125
+        ],
+        "dominant_freq": 1,
+        "lambda_max": 0.0,
+        "sv_log_var": 0.0
+      },
+      {
+        "step": 200,
+        "power_spectrum": [
+          304804.1875,
+          7224.0869140625,
+          6162.71875,
+          5616.1953125,
+          5131.2900390625,
+          4852.8408203125,
+          4429.27099609375,
+          4498.93115234375,
+          4016.037841796875,
+          4555.931640625,
+          3638.921875,
+          3919.00146484375,
+          3314.513671875,
+          3524.330078125,
+          3050.735107421875,
+          3215.83447265625,
+          3436.14599609375,
+          2933.996826171875,
+          2830.76513671875,
+          2965.010498046875,
+          2421.86474609375,
+          2912.95458984375,
+          2665.2978515625,
+          2786.6806640625,
+          2757.41552734375,
+          2634.9150390625,
+          2873.935546875,
+          2749.830078125,
+          2517.1669921875,
+          2841.547607421875,
+          2323.531982421875,
+          2851.541015625,
+          2744.86669921875,
+          3180.94482421875,
+          2607.43017578125,
+          2548.400146484375,
+          2581.830078125,
+          2600.69287109375,
+          2523.88623046875,
+          2443.50830078125,
+          2305.496826171875,
+          2305.7529296875,
+          2452.54638671875,
+          2652.529296875,
+          2438.75732421875,
+          2501.302734375,
+          2477.1279296875,
+          2149.81591796875,
+          2334.510986328125,
+          2339.83203125,
+          2471.312255859375,
+          2243.66552734375,
+          2199.53515625,
+          2213.6337890625,
+          2141.367919921875,
+          2231.3173828125,
+          2212.74853515625,
+          2143.443603515625,
+          2123.76123046875,
+          2187.6083984375,
+          2103.98388671875,
+          2177.7841796875,
+          2245.7685546875,
+          1990.8006591796875,
+          2003.044921875,
+          2176.52099609375,
+          2132.31298828125,
+          2174.09716796875,
+          1973.279296875,
+          2063.9990234375,
+          1935.5927734375,
+          2114.80859375,
+          1891.5498046875,
+          1964.52197265625,
+          1869.7972412109375,
+          1849.6201171875,
+          2041.915771484375,
+          1925.92724609375,
+          1985.5638427734375,
+          1959.809326171875,
+          1761.602783203125,
+          1939.343505859375,
+          2104.948486328125,
+          1928.723388671875,
+          1768.6357421875,
+          1833.5526123046875,
+          1848.596435546875,
+          1989.9716796875,
+          1881.0166015625,
+          1893.583740234375,
+          1824.3779296875,
+          1793.788818359375,
+          1941.6693115234375,
+          1893.06640625,
+          1952.642333984375,
+          1959.840576171875,
+          1921.6141357421875,
+          1943.6810302734375,
+          1789.806396484375,
+          1754.4554443359375,
+          1916.514404296875,
+          1998.64404296875,
+          1829.134765625,
+          1772.654541015625,
+          1935.4725341796875,
+          1855.34375,
+          1792.1693115234375,
+          1878.7196044921875,
+          1827.735595703125,
+          1801.203369140625,
+          1710.54736328125,
+          1724.35107421875,
+          1783.9603271484375,
+          1775.245361328125,
+          1891.794921875,
+          1947.859130859375,
+          1838.9486083984375,
+          1766.223876953125,
+          1865.078857421875,
+          1736.5286865234375,
+          2024.251708984375,
+          1784.5419921875,
+          1770.20361328125,
+          1752.2674560546875,
+          1753.701904296875,
+          1800.2445068359375,
+          1920.319580078125,
+          1799.527099609375,
+          2162.91162109375,
+          1826.913818359375,
+          1797.915283203125,
+          1940.123046875,
+          1950.838623046875,
+          1789.42626953125,
+          1675.507568359375,
+          1559.435791015625,
+          1730.8489990234375,
+          1747.980224609375,
+          1777.6820068359375,
+          1681.338134765625,
+          1898.578857421875,
+          1750.49658203125,
+          1545.662841796875,
+          1765.645263671875,
+          1651.36083984375,
+          1702.5244140625,
+          1705.7596435546875,
+          1629.134521484375,
+          1716.72705078125,
+          1771.794921875,
+          1691.790771484375,
+          2104.811767578125,
+          1608.0784912109375,
+          1747.747802734375,
+          1676.2874755859375,
+          1659.923583984375,
+          1588.381591796875,
+          1626.5032958984375,
+          1695.386474609375,
+          1682.14990234375,
+          1568.0927734375,
+          1636.846435546875,
+          1527.304443359375,
+          1867.36767578125,
+          1632.92578125,
+          1651.8363037109375,
+          1629.2005615234375,
+          1694.111328125,
+          1597.0830078125,
+          1683.947509765625,
+          1705.998046875,
+          1750.39501953125,
+          1629.869873046875,
+          1617.435546875,
+          1486.4241943359375,
+          1602.0784912109375,
+          1625.6268310546875,
+          1684.782470703125,
+          1618.8763427734375,
+          1596.7025146484375,
+          1515.2669677734375,
+          1646.9241943359375,
+          1617.6240234375,
+          1621.54638671875,
+          1604.4964599609375,
+          1528.7080078125,
+          1567.719970703125,
+          1534.322021484375,
+          1558.5257568359375,
+          1593.20654296875,
+          1553.5921630859375,
+          1634.31396484375,
+          1584.97314453125,
+          1567.150634765625,
+          1468.9730224609375,
+          1652.4261474609375,
+          1586.859130859375,
+          1667.549560546875,
+          1604.29833984375,
+          1470.792236328125,
+          1645.625732421875,
+          1632.6697998046875,
+          1461.5335693359375,
+          1541.2899169921875,
+          1498.4505615234375,
+          1533.6776123046875,
+          1478.8017578125,
+          1536.1024169921875,
+          1635.301025390625,
+          1615.631591796875,
+          1491.2142333984375,
+          1546.33642578125,
+          1455.443115234375,
+          1558.8779296875,
+          1692.212646484375,
+          1567.3880615234375,
+          1581.528076171875,
+          1601.9345703125,
+          1381.705810546875,
+          1605.684326171875,
+          1577.830810546875,
+          1516.956787109375,
+          1493.373779296875,
+          1582.422119140625,
+          1597.534912109375,
+          1585.79736328125,
+          1504.1058349609375,
+          1582.548583984375,
+          1444.761962890625,
+          1564.8963623046875,
+          1448.09375,
+          1421.7572021484375,
+          1529.9481201171875,
+          1467.6180419921875,
+          1559.7230224609375,
+          1510.510498046875,
+          1395.8890380859375,
+          1555.995361328125,
+          1475.0150146484375,
+          1572.7117919921875,
+          1415.60009765625,
+          1457.534912109375,
+          1462.2431640625,
+          1493.2685546875,
+          1526.3642578125,
+          1470.966796875,
+          1560.391357421875,
+          1489.7109375,
+          1667.2982177734375,
+          1560.332763671875,
+          1493.8822021484375,
+          1374.7177734375,
+          1538.994873046875,
+          1599.424560546875,
+          1519.1357421875,
+          1495.819091796875,
+          1563.7806396484375
+        ],
+        "dominant_freq": 1,
+        "lambda_max": 0.0,
+        "sv_log_var": 0.0
+      },
+      {
+        "step": 250,
+        "power_spectrum": [
+          292662.875,
+          16266.162109375,
+          6867.2099609375,
+          5501.65576171875,
+          4909.19140625,
+          3876.775146484375,
+          3714.481201171875,
+          3369.05859375,
+          3527.21875,
+          3299.6953125,
+          2984.231201171875,
+          2859.8359375,
+          3020.426513671875,
+          3196.833740234375,
+          3225.36669921875,
+          2719.014404296875,
+          2667.072998046875,
+          2783.629638671875,
+          2891.714599609375,
+          2513.263427734375,
+          2545.718505859375,
+          2530.3828125,
+          2385.49560546875,
+          2631.66357421875,
+          2668.3447265625,
+          2532.25439453125,
+          2723.0205078125,
+          2586.54150390625,
+          2345.11669921875,
+          2543.82080078125,
+          2435.88330078125,
+          2205.834716796875,
+          2447.09814453125,
+          2221.3203125,
+          2479.950927734375,
+          2431.6875,
+          2588.033203125,
+          2291.06982421875,
+          2226.9658203125,
+          2359.287109375,
+          2341.99267578125,
+          2307.39208984375,
+          2152.56494140625,
+          2091.6279296875,
+          2309.759765625,
+          2056.806884765625,
+          2402.89453125,
+          2366.6884765625,
+          2362.43798828125,
+          2194.247802734375,
+          2149.6611328125,
+          2379.8916015625,
+          2033.194091796875,
+          2119.018310546875,
+          2139.48779296875,
+          1988.2640380859375,
+          1970.7259521484375,
+          1997.962890625,
+          1942.6455078125,
+          2086.866943359375,
+          2188.614501953125,
+          2006.9407958984375,
+          1994.22900390625,
+          2073.41796875,
+          2006.0418701171875,
+          2039.4453125,
+          2036.547607421875,
+          1915.185302734375,
+          1964.9345703125,
+          2225.31787109375,
+          2342.726318359375,
+          2238.65185546875,
+          2068.6494140625,
+          1915.4658203125,
+          1906.150390625,
+          1934.7254638671875,
+          1936.7646484375,
+          1839.7381591796875,
+          1731.0872802734375,
+          1855.154052734375,
+          1914.74560546875,
+          1751.3187255859375,
+          1807.8740234375,
+          1963.64208984375,
+          1815.962890625,
+          1670.327392578125,
+          1793.962646484375,
+          1815.556396484375,
+          1827.2493896484375,
+          1792.267333984375,
+          2005.2239990234375,
+          1854.753662109375,
+          1875.7440185546875,
+          1918.004638671875,
+          1964.9407958984375,
+          1847.31982421875,
+          1940.593994140625,
+          1779.62109375,
+          1890.745361328125,
+          1825.611083984375,
+          1795.720703125,
+          1846.327880859375,
+          1835.0408935546875,
+          1779.9554443359375,
+          1690.867431640625,
+          1839.143310546875,
+          1671.877685546875,
+          1748.762451171875,
+          1648.817138671875,
+          1718.21875,
+          1784.4686279296875,
+          1632.352294921875,
+          1639.973876953125,
+          1653.33984375,
+          1648.7694091796875,
+          1792.4921875,
+          1782.214111328125,
+          1696.64892578125,
+          1731.0111083984375,
+          1789.532958984375,
+          1745.91015625,
+          1542.77490234375,
+          1713.533447265625,
+          1616.0087890625,
+          1786.636962890625,
+          1657.5198974609375,
+          1766.255859375,
+          1752.271728515625,
+          1612.1077880859375,
+          1586.399169921875,
+          1746.5546875,
+          1671.2080078125,
+          1587.7181396484375,
+          1725.453125,
+          1605.9765625,
+          1605.8330078125,
+          1661.1688232421875,
+          1745.2049560546875,
+          1677.9530029296875,
+          1652.4202880859375,
+          1646.708984375,
+          1778.521728515625,
+          1737.501708984375,
+          1735.022216796875,
+          1621.0438232421875,
+          1726.850341796875,
+          1587.619140625,
+          1580.5693359375,
+          1685.2181396484375,
+          1584.3603515625,
+          1615.572265625,
+          1504.62548828125,
+          1667.66796875,
+          1582.43359375,
+          1604.83056640625,
+          1603.750244140625,
+          1576.8450927734375,
+          1688.3275146484375,
+          1561.7396240234375,
+          1579.3612060546875,
+          1505.3016357421875,
+          1635.901611328125,
+          1674.934326171875,
+          1789.390625,
+          1617.021484375,
+          1612.4033203125,
+          1497.1875,
+          1577.51123046875,
+          1667.643310546875,
+          1535.2645263671875,
+          1618.501953125,
+          1516.8177490234375,
+          1590.7734375,
+          1518.2509765625,
+          1649.63525390625,
+          1587.204345703125,
+          1652.0673828125,
+          1686.312255859375,
+          1564.808349609375,
+          1684.5374755859375,
+          1508.597412109375,
+          1614.875732421875,
+          1558.27392578125,
+          1641.7591552734375,
+          1506.387451171875,
+          1623.3349609375,
+          1553.668701171875,
+          1560.1878662109375,
+          1522.45361328125,
+          1489.9287109375,
+          1480.264892578125,
+          1497.43359375,
+          1620.324462890625,
+          1569.9530029296875,
+          1560.2664794921875,
+          1579.2655029296875,
+          1448.99169921875,
+          1418.0960693359375,
+          1471.81201171875,
+          1488.127197265625,
+          1467.27099609375,
+          1350.16259765625,
+          1507.549560546875,
+          1484.900390625,
+          1365.16748046875,
+          1528.157958984375,
+          1502.1708984375,
+          1557.452880859375,
+          1624.6131591796875,
+          1588.717529296875,
+          1590.03125,
+          1489.0244140625,
+          1559.11376953125,
+          1512.28466796875,
+          1463.4569091796875,
+          1416.044921875,
+          1563.3275146484375,
+          1539.597412109375,
+          1501.1507568359375,
+          1458.580810546875,
+          1405.8114013671875,
+          1508.1131591796875,
+          1511.9114990234375,
+          1366.4197998046875,
+          1360.5150146484375,
+          1450.972412109375,
+          1517.031982421875,
+          1432.3662109375,
+          1365.88818359375,
+          1424.541015625,
+          1478.892333984375,
+          1562.030029296875,
+          1722.086669921875,
+          1660.4837646484375,
+          1674.8026123046875,
+          1427.8494873046875,
+          1396.849609375,
+          1432.6175537109375,
+          1418.849853515625,
+          1398.790283203125,
+          1395.0927734375,
+          1388.1634521484375,
+          1517.013916015625,
+          1326.6864013671875,
+          1389.9779052734375,
+          1501.8206787109375,
+          1448.0648193359375,
+          1549.609375,
+          1453.7572021484375,
+          1435.36328125,
+          1478.1865234375,
+          1348.116943359375,
+          1417.877197265625,
+          1496.081787109375,
+          1394.9130859375,
+          1369.05859375,
+          1443.97412109375
+        ],
+        "dominant_freq": 1,
+        "lambda_max": 0.0,
+        "sv_log_var": 0.0
+      },
+      {
+        "step": 300,
+        "power_spectrum": [
+          276437.34375,
+          18554.26171875,
+          8963.2099609375,
+          6601.1572265625,
+          5192.673828125,
+          4430.24609375,
+          3832.47998046875,
+          3896.34228515625,
+          3102.7890625,
+          3668.4736328125,
+          3740.15087890625,
+          3500.8408203125,
+          3029.52197265625,
+          3702.86279296875,
+          3104.1630859375,
+          2891.27734375,
+          2996.490234375,
+          3201.072265625,
+          2807.90576171875,
+          2906.6123046875,
+          2779.66748046875,
+          2715.5185546875,
+          2776.53759765625,
+          2681.642333984375,
+          2702.066162109375,
+          2398.785888671875,
+          2473.61083984375,
+          2460.13671875,
+          2354.61376953125,
+          2336.563232421875,
+          2376.14453125,
+          2349.59814453125,
+          2334.080078125,
+          2427.723876953125,
+          2266.357177734375,
+          2145.721435546875,
+          2103.974609375,
+          2383.084228515625,
+          2195.60205078125,
+          2470.398681640625,
+          2332.636474609375,
+          2347.03466796875,
+          2049.6484375,
+          2481.57275390625,
+          2062.0830078125,
+          2006.748046875,
+          2160.295654296875,
+          2162.5087890625,
+          2169.400146484375,
+          1969.8460693359375,
+          2149.85205078125,
+          2075.43017578125,
+          2154.2451171875,
+          2060.71484375,
+          1971.5428466796875,
+          1895.5078125,
+          2046.8729248046875,
+          1966.6136474609375,
+          2052.52099609375,
+          2111.59912109375,
+          2102.9970703125,
+          1995.916259765625,
+          1975.781005859375,
+          2027.087890625,
+          2181.4609375,
+          1878.9144287109375,
+          2190.53955078125,
+          1945.0986328125,
+          1960.1875,
+          2067.8369140625,
+          1981.009521484375,
+          1888.4798583984375,
+          1911.493896484375,
+          2061.14697265625,
+          1974.3095703125,
+          1785.390380859375,
+          1817.7811279296875,
+          1867.89453125,
+          1862.00439453125,
+          1872.0277099609375,
+          1928.369140625,
+          2063.05029296875,
+          1733.328857421875,
+          1925.239013671875,
+          1838.218994140625,
+          1718.994873046875,
+          1874.9749755859375,
+          1783.203857421875,
+          1841.7431640625,
+          1750.082763671875,
+          1777.185791015625,
+          1845.5531005859375,
+          1766.3916015625,
+          1921.330078125,
+          1738.3372802734375,
+          1699.04248046875,
+          1726.48095703125,
+          1764.634521484375,
+          1702.234130859375,
+          1795.733642578125,
+          1752.18359375,
+          1708.6673583984375,
+          1793.251220703125,
+          1928.674072265625,
+          1856.0234375,
+          1694.9935302734375,
+          1799.96337890625,
+          1794.973388671875,
+          1716.2386474609375,
+          1707.355224609375,
+          1735.221435546875,
+          1853.859619140625,
+          1704.33447265625,
+          1765.600341796875,
+          1696.1014404296875,
+          1575.830078125,
+          1654.533935546875,
+          1759.2938232421875,
+          1767.6884765625,
+          1751.0091552734375,
+          1661.017578125,
+          1644.46337890625,
+          1667.305908203125,
+          1694.1416015625,
+          1818.550048828125,
+          1735.285400390625,
+          1720.0863037109375,
+          1678.488037109375,
+          1566.37744140625,
+          1556.048583984375,
+          1651.20068359375,
+          1739.1531982421875,
+          1548.8359375,
+          1712.978515625,
+          1596.9793701171875,
+          1620.5374755859375,
+          1554.4852294921875,
+          1667.440673828125,
+          1653.132080078125,
+          1645.839111328125,
+          1684.4495849609375,
+          1535.4705810546875,
+          1578.926513671875,
+          1692.0784912109375,
+          1661.568115234375,
+          1577.899658203125,
+          1647.629638671875,
+          1679.841796875,
+          1551.2537841796875,
+          1710.2298583984375,
+          1687.1932373046875,
+          1565.314208984375,
+          1546.714111328125,
+          1770.4609375,
+          1673.963134765625,
+          1566.408203125,
+          1630.0281982421875,
+          1725.6932373046875,
+          1517.6986083984375,
+          1533.6268310546875,
+          1541.3505859375,
+          1559.7366943359375,
+          1546.9700927734375,
+          1605.7523193359375,
+          1487.702880859375,
+          1532.7001953125,
+          1571.3148193359375,
+          1688.7572021484375,
+          1626.219482421875,
+          1443.3154296875,
+          1600.654052734375,
+          1587.626953125,
+          1570.6844482421875,
+          1551.1318359375,
+          1581.20361328125,
+          1527.709716796875,
+          1636.6781005859375,
+          1701.592529296875,
+          1574.7659912109375,
+          1537.2327880859375,
+          1566.7001953125,
+          1424.715576171875,
+          1435.87841796875,
+          1457.41015625,
+          1518.51025390625,
+          1452.960693359375,
+          1543.1849365234375,
+          1429.759765625,
+          1368.1683349609375,
+          1444.2459716796875,
+          1493.417724609375,
+          1462.388671875,
+          1447.749267578125,
+          1460.3177490234375,
+          1496.918701171875,
+          1484.503662109375,
+          1437.753662109375,
+          1523.788818359375,
+          1486.2353515625,
+          1520.423095703125,
+          1407.715576171875,
+          1432.4193115234375,
+          1433.1044921875,
+          1463.357666015625,
+          1497.363037109375,
+          1421.607421875,
+          1377.3642578125,
+          1464.986328125,
+          1543.6741943359375,
+          1435.6160888671875,
+          1549.68798828125,
+          1422.1434326171875,
+          1398.701171875,
+          1471.4554443359375,
+          1396.891357421875,
+          1445.12158203125,
+          1449.253662109375,
+          1489.400146484375,
+          1518.6361083984375,
+          1468.5384521484375,
+          1394.497802734375,
+          1464.935546875,
+          1443.505615234375,
+          1390.176513671875,
+          1494.87890625,
+          1332.1385498046875,
+          1361.5360107421875,
+          1437.297119140625,
+          1450.989501953125,
+          1439.2054443359375,
+          1324.5570068359375,
+          1426.461669921875,
+          1377.697021484375,
+          1420.78955078125,
+          1420.55322265625,
+          1408.823974609375,
+          1452.48193359375,
+          1461.511474609375,
+          1485.934814453125,
+          1462.708740234375,
+          1511.6663818359375,
+          1420.3505859375,
+          1384.1917724609375,
+          1411.1712646484375,
+          1415.3173828125,
+          1466.16015625,
+          1382.40625,
+          1434.3460693359375,
+          1374.9261474609375,
+          1394.8720703125,
+          1416.037841796875,
+          1331.9970703125,
+          1329.3060302734375,
+          1501.0653076171875,
+          1363.918701171875,
+          1320.8143310546875,
+          1465.748046875
+        ],
+        "dominant_freq": 1,
+        "lambda_max": 0.0,
+        "sv_log_var": 0.0
+      },
+      {
+        "step": 350,
+        "power_spectrum": [
+          280721.84375,
+          13363.134765625,
+          8306.361328125,
+          6287.4560546875,
+          5333.96044921875,
+          4393.5546875,
+          5499.8916015625,
+          3970.775390625,
+          4120.203125,
+          3743.82373046875,
+          3715.611083984375,
+          3364.01904296875,
+          3833.06982421875,
+          3312.176513671875,
+          3337.932373046875,
+          3050.13818359375,
+          3236.5205078125,
+          2891.54296875,
+          3020.781005859375,
+          2810.35205078125,
+          2879.0302734375,
+          2470.2265625,
+          2788.653076171875,
+          2615.541015625,
+          2684.2744140625,
+          2507.849365234375,
+          2491.412841796875,
+          2580.390380859375,
+          2647.723388671875,
+          2334.2568359375,
+          2361.1708984375,
+          2313.806396484375,
+          2536.289794921875,
+          2544.83349609375,
+          2245.48779296875,
+          2479.0224609375,
+          2578.650390625,
+          2398.822265625,
+          2444.755615234375,
+          2161.506591796875,
+          2180.009521484375,
+          2077.91162109375,
+          2153.677490234375,
+          2132.826904296875,
+          2356.292724609375,
+          2069.87060546875,
+          2029.811279296875,
+          2307.3291015625,
+          2143.6953125,
+          1988.333984375,
+          2279.9609375,
+          2098.392333984375,
+          2119.676513671875,
+          2122.22900390625,
+          2087.64501953125,
+          1873.4525146484375,
+          2110.726318359375,
+          2021.51220703125,
+          2159.448486328125,
+          2225.0390625,
+          2037.6453857421875,
+          1957.8743896484375,
+          1994.958740234375,
+          1902.4007568359375,
+          1970.0716552734375,
+          1934.2391357421875,
+          1857.36083984375,
+          1864.4163818359375,
+          1851.084716796875,
+          1840.6497802734375,
+          2035.6015625,
+          1898.7972412109375,
+          2104.80517578125,
+          1888.650146484375,
+          1821.9393310546875,
+          1652.2689208984375,
+          1819.3260498046875,
+          1925.363037109375,
+          1981.44775390625,
+          1956.807373046875,
+          2080.8525390625,
+          1880.9033203125,
+          1953.6751708984375,
+          1870.897705078125,
+          2105.91796875,
+          1760.1162109375,
+          1730.16796875,
+          1898.9324951171875,
+          1735.822998046875,
+          2008.8291015625,
+          1916.1663818359375,
+          1730.63818359375,
+          1911.7161865234375,
+          1864.6702880859375,
+          1753.751953125,
+          1710.9495849609375,
+          1895.1971435546875,
+          1725.4091796875,
+          1835.8309326171875,
+          1819.04736328125,
+          1626.1507568359375,
+          1723.1064453125,
+          1674.11083984375,
+          1691.02490234375,
+          1698.6839599609375,
+          1587.6962890625,
+          1742.7698974609375,
+          1865.1722412109375,
+          1638.986328125,
+          1738.67578125,
+          1719.4071044921875,
+          1668.528076171875,
+          1690.02099609375,
+          1728.2288818359375,
+          1655.536376953125,
+          1584.244873046875,
+          1606.0833740234375,
+          1583.448974609375,
+          1693.0819091796875,
+          1639.0673828125,
+          1608.801025390625,
+          1692.2283935546875,
+          1609.4124755859375,
+          1573.4765625,
+          1788.999755859375,
+          1624.205322265625,
+          1775.610107421875,
+          1711.2587890625,
+          1903.857666015625,
+          1653.0570068359375,
+          1507.653076171875,
+          1681.1702880859375,
+          1767.1663818359375,
+          1582.156982421875,
+          1585.9246826171875,
+          1600.986083984375,
+          1741.8779296875,
+          1751.189453125,
+          1542.0048828125,
+          1549.628173828125,
+          1620.879150390625,
+          1660.01708984375,
+          1573.966552734375,
+          1537.3919677734375,
+          1625.888427734375,
+          1672.4110107421875,
+          1698.9716796875,
+          1591.443603515625,
+          1605.7611083984375,
+          1716.0892333984375,
+          1697.1014404296875,
+          1673.3701171875,
+          1573.573974609375,
+          1548.6907958984375,
+          1663.0545654296875,
+          1617.921142578125,
+          1575.2825927734375,
+          1652.174072265625,
+          1559.1610107421875,
+          1597.50634765625,
+          1648.26953125,
+          1552.3447265625,
+          1617.9676513671875,
+          1702.947021484375,
+          1566.927978515625,
+          1541.150390625,
+          1618.8216552734375,
+          1566.726318359375,
+          1602.2738037109375,
+          1456.4798583984375,
+          1530.931396484375,
+          1536.980224609375,
+          1530.701171875,
+          1586.8304443359375,
+          1551.441162109375,
+          1451.14501953125,
+          1494.6722412109375,
+          1394.3017578125,
+          1413.4749755859375,
+          1456.990234375,
+          1496.9871826171875,
+          1577.927734375,
+          1573.957763671875,
+          1493.51123046875,
+          1410.61572265625,
+          1459.27783203125,
+          1481.050537109375,
+          1497.82080078125,
+          1509.1234130859375,
+          1505.5311279296875,
+          1533.376220703125,
+          1360.692626953125,
+          1512.4755859375,
+          1460.97265625,
+          1350.11865234375,
+          1277.142333984375,
+          1383.891845703125,
+          1367.81640625,
+          1471.27734375,
+          1484.6953125,
+          1465.702880859375,
+          1549.1575927734375,
+          1516.75244140625,
+          1470.5126953125,
+          1474.0380859375,
+          1427.9306640625,
+          1459.434326171875,
+          1510.486328125,
+          1567.6693115234375,
+          1327.5096435546875,
+          1482.4549560546875,
+          1494.6829833984375,
+          1399.522216796875,
+          1384.552734375,
+          1448.55419921875,
+          1450.36279296875,
+          1345.2301025390625,
+          1370.6268310546875,
+          1411.098876953125,
+          1473.176513671875,
+          1409.602294921875,
+          1420.11669921875,
+          1399.251708984375,
+          1335.87255859375,
+          1389.097412109375,
+          1422.545654296875,
+          1451.00927734375,
+          1411.8798828125,
+          1396.03662109375,
+          1393.7255859375,
+          1359.398193359375,
+          1426.091552734375,
+          1473.9827880859375,
+          1394.2489013671875,
+          1312.0045166015625,
+          1438.22802734375,
+          1304.84814453125,
+          1393.9056396484375,
+          1383.5888671875,
+          1419.5560302734375,
+          1400.73193359375,
+          1396.2698974609375,
+          1332.52685546875,
+          1452.9359130859375,
+          1413.6904296875,
+          1409.1224365234375,
+          1444.046630859375,
+          1392.4974365234375,
+          1371.5330810546875,
+          1289.5841064453125,
+          1462.177490234375,
+          1426.076171875,
+          1443.870849609375,
+          1494.817138671875,
+          1391.26025390625,
+          1326.1875,
+          1347.221923828125
+        ],
+        "dominant_freq": 1,
+        "lambda_max": 0.0,
+        "sv_log_var": 0.0
+      }
+    ],
+    "bucket_snapshots": [],
+    "regret_table": null,
+    "sleep_cycles": 0,
+    "peak_vram_mb": 2304.55615234375
+  },
+  "eval": {
+    "loss": 5.2671307027339935,
+    "bpb": 2.0318967898556743,
+    "tokens": 524288.0,
+    "total_ce_nats": 2761493.421875,
+    "total_scored_bytes": 1960726
+  },
+  "params": 4475328,
+  "artifact_bytes": 8950656
+}

@@ -102,6 +102,7 @@ def build_sentencepiece_luts(
 
 def load_sp_data(
     data_dir: str,
+    vocab_size: int = 8192,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Load pre-tokenized SP shards. Full val split used for evaluation.
 
@@ -110,8 +111,18 @@ def load_sp_data(
     SP and byte conditions are evaluated on comparable data (byte path via
     prepare_fineweb_splits also uses the full docs_val_raw.txt). Phase B
     warming curves can split a test set from train when needed.
+
+    Clamps token IDs to [0, vocab_size-1] to handle shard header contamination.
+    Binary shards have a 1024-byte header (512 uint16 values) that
+    _concat_shards_mmap reads as token data. These junk values can be
+    negative (int16 view of large uint16) or exceed vocab_size, crashing
+    nn.Embedding. Clamping is safe: the contamination is ~0.0005% of tokens
+    and affects all conditions equally.
     """
     train_tokens, val_tokens = load_fineweb_tokens(data_dir)
+    # Clamp header junk to valid token range
+    train_tokens = train_tokens.clamp(0, vocab_size - 1)
+    val_tokens = val_tokens.clamp(0, vocab_size - 1)
     test_tokens = train_tokens[:0]  # empty tensor, same dtype
     print(f"  SP data: train={train_tokens.numel():,} val={val_tokens.numel():,} tokens")
     return train_tokens, val_tokens, test_tokens
@@ -359,7 +370,7 @@ def run_single(
 
     # -- Load data --
     if is_sp:
-        train_tokens, val_tokens, test_tokens = load_sp_data(data_path)
+        train_tokens, val_tokens, test_tokens = load_sp_data(data_path, vocab_size)
         # Build byte LUT
         import sentencepiece as spm
         sp = spm.SentencePieceProcessor()
