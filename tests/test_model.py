@@ -151,10 +151,22 @@ class TestChaosStudentLMHybrid(unittest.TestCase):
             local_attn_window=8, local_attn_heads=1, local_attn_dim=16,
         )
         states = model.init_state(2)
+        kv_caches = model.init_kv_caches()
         token = torch.randint(0, 64, (2, 1))
-        logits, hidden, new_states = model.step(token, states)
+        logits, hidden, new_states = model.step(token, states, kv_caches=kv_caches)
         assert logits.shape == (2, 64)
         assert len(new_states) == 4
+
+    def test_student_lm_hybrid_step_raises_without_kv_caches(self) -> None:
+        model = ChaosStudentLM(
+            vocab_size=64, dim=32, num_layers=4, ff_mult=2,
+            a_mode="diag", outer_model_dim=0, wernicke_enabled=False,
+            local_attn_window=8, local_attn_heads=1, local_attn_dim=16,
+        )
+        states = model.init_state(2)
+        token = torch.randint(0, 64, (2, 1))
+        with self.assertRaises(RuntimeError):
+            model.step(token, states)
 
     def test_student_lm_hybrid_dream_step(self) -> None:
         model = ChaosStudentLM(
@@ -163,10 +175,25 @@ class TestChaosStudentLMHybrid(unittest.TestCase):
             local_attn_window=8, local_attn_heads=1, local_attn_dim=16,
         )
         states = model.init_state(2)
+        kv_caches = model.init_kv_caches()
         token = torch.randint(0, 64, (2, 1))
-        logits, hidden, new_states = model.dream_step(token, states)
+        logits, hidden, new_states = model.dream_step(token, states, kv_caches=kv_caches)
         assert logits.shape == (2, 64)
         assert len(new_states) == 4
+
+    def test_hybrid_block_jacobian_stats_returns_zeros(self) -> None:
+        from chaoscontrol.model import ChaosSSMHybridBlock
+        block = ChaosSSMHybridBlock(
+            dim=32, ff_mult=2, a_mode="diag",
+            local_attn_window=8, local_attn_heads=1, local_attn_dim=16,
+        )
+        x = torch.randn(2, 6, 32)
+        y, stats = block(x, return_jacobian_stats=True)
+        assert y.shape == (2, 6, 32)
+        assert "lambda_max" in stats
+        assert "sv_log_var" in stats
+        # Hybrid block returns zeros (documented limitation)
+        assert stats["lambda_max"].item() == 0.0
 
     def test_student_lm_no_hybrid_by_default(self) -> None:
         model = ChaosStudentLM(

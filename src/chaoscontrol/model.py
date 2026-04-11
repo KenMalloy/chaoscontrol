@@ -144,12 +144,15 @@ class ChaosSSMHybridBlock(nn.Module):
         x_ssm = x + y
 
         if kv_cache is not None:
+            # Write K/V from clean trunk output BEFORE gate mixing,
+            # so the cache contains pure SSM features, not self-referential
+            # attention outputs.
+            kv_cache.write(self.k_proj(x_ssm), self.v_proj(x_ssm))
             keys, values, mask = kv_cache.last(self.local_attn_window)
             if mask.any():
                 attn_out = self.local_attn(x_ssm, keys, values, mask)
                 gate = torch.sigmoid(self.gate_proj(x_ssm) + self.gate_bias)
                 x_ssm = x_ssm + gate * attn_out
-            kv_cache.write(self.k_proj(x_ssm), self.v_proj(x_ssm))
 
         x_out = x_ssm + self.ff(self.ff_norm(x_ssm))
         return x_out, new_state
@@ -160,7 +163,14 @@ class ChaosSSMHybridBlock(nn.Module):
         *,
         return_jacobian_stats: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, dict]:
-        """Sequence-level forward. Processes token-by-token for KV cache."""
+        """Sequence-level forward. Processes token-by-token for KV cache.
+
+        Note: return_jacobian_stats returns zeros for this block because the
+        step-by-step recurrence doesn't expose the core's full-sequence Jacobian.
+        When averaged with real stats from ChaosSSMBlock layers, this dilutes
+        the aggregate — acceptable for Phase A but should be revisited if
+        Jacobian monitoring becomes critical for hybrid models.
+        """
         batch, seq, dim = x.shape
         kv_cache = self._init_kv_cache()
         state = x.new_zeros((batch, dim))
@@ -363,20 +373,23 @@ class ChaosStudentLM(nn.Module):
         self.dynamic_crit_per_layer = dynamic_crit_per_layer
 
     def init_state(self, batch_size: int) -> list[torch.Tensor]:
-        """Initialize recurrence states for all layers and KV caches for hybrid blocks."""
+        """Initialize recurrence states for all layers."""
         device = self.embed.weight.device
         dtype = self.embed.weight.dtype
-        # Initialize KV caches for any hybrid blocks
-        self._kv_caches: list[RollingKVCache | None] = [
+        return [torch.zeros(batch_size, self.dim, device=device, dtype=dtype) for _ in range(len(self.layers))]
+
+    def init_kv_caches(self) -> list[RollingKVCache | None]:
+        """Initialize KV caches for hybrid blocks. Returns one entry per layer (None for pure SSM blocks)."""
+        return [
             layer._init_kv_cache() if isinstance(layer, ChaosSSMHybridBlock) else None
             for layer in self.layers
         ]
-        return [torch.zeros(batch_size, self.dim, device=device, dtype=dtype) for _ in range(len(self.layers))]
 
     def step(
         self,
         token_ids: torch.Tensor,
         states: list[torch.Tensor],
+        kv_caches: list[RollingKVCache | None] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, list[torch.Tensor]]:
         """Single-token forward step through the SSM recurrence only.
 
@@ -391,6 +404,8 @@ class ChaosStudentLM(nn.Module):
         Args:
             token_ids: (batch, 1) — single token ids
             states: list of (batch, dim) per layer
+            kv_caches: from init_kv_caches(), required when local_attn_window > 0.
+                Mutated in place (rolling buffer accumulates K/V entries).
 
         Returns:
             (logits, hidden, new_states)
@@ -400,10 +415,16 @@ class ChaosStudentLM(nn.Module):
         """
         x = self.embed(token_ids).squeeze(1)  # (batch, dim)
 
-        kv_caches = getattr(self, "_kv_caches", [None] * len(self.layers))
+        if kv_caches is None:
+            kv_caches = [None] * len(self.layers)
         new_states = []
         for i, layer in enumerate(self.layers):
             if isinstance(layer, ChaosSSMHybridBlock):
+                if kv_caches[i] is None:
+                    raise RuntimeError(
+                        f"Layer {i} is a hybrid block but no KV cache provided. "
+                        "Call init_kv_caches() and pass the result to step()."
+                    )
                 x, new_s = layer.step(x, states[i], kv_cache=kv_caches[i])
             else:
                 x, new_s = layer.step(x, states[i])
@@ -419,6 +440,7 @@ class ChaosStudentLM(nn.Module):
         self,
         token_ids: torch.Tensor,
         states: list[torch.Tensor],
+        kv_caches: list[RollingKVCache | None] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, list[torch.Tensor]]:
         """Full-tier single-token forward step for REM dream generation.
 
@@ -430,6 +452,8 @@ class ChaosStudentLM(nn.Module):
         Args:
             token_ids: (batch, 1) — single token ids
             states: list of (batch, dim) per layer
+            kv_caches: from init_kv_caches(), required when local_attn_window > 0.
+                Mutated in place (rolling buffer accumulates K/V entries).
 
         Returns:
             (logits, hidden, new_states)
@@ -459,10 +483,16 @@ class ChaosStudentLM(nn.Module):
             x = x + self.semantic_tier.read(x.size(0))
 
         # SSM recurrence — use ChaosSSMBlock.step()
-        kv_caches = getattr(self, "_kv_caches", [None] * len(self.layers))
+        if kv_caches is None:
+            kv_caches = [None] * len(self.layers)
         new_states = []
         for i, layer in enumerate(self.layers):
             if isinstance(layer, ChaosSSMHybridBlock):
+                if kv_caches[i] is None:
+                    raise RuntimeError(
+                        f"Layer {i} is a hybrid block but no KV cache provided. "
+                        "Call init_kv_caches() and pass the result to dream_step()."
+                    )
                 x, new_s = layer.step(x, states[i], kv_cache=kv_caches[i])
             else:
                 x, new_s = layer.step(x, states[i])
