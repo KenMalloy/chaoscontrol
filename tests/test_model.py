@@ -133,6 +133,51 @@ class TestChaosStudentLM(unittest.TestCase):
         assert model.posterior is None
 
 
+class TestChaosStudentLMHybrid(unittest.TestCase):
+    def test_student_lm_with_hybrid_top_block(self) -> None:
+        model = ChaosStudentLM(
+            vocab_size=64, dim=32, num_layers=4, ff_mult=2,
+            a_mode="diag", outer_model_dim=0, wernicke_enabled=False,
+            local_attn_window=8, local_attn_heads=1, local_attn_dim=16,
+        )
+        x = torch.randint(0, 64, (2, 10))
+        out = model(x)
+        assert out["logits"].shape == (2, 10, 64)
+
+    def test_student_lm_hybrid_step(self) -> None:
+        model = ChaosStudentLM(
+            vocab_size=64, dim=32, num_layers=4, ff_mult=2,
+            a_mode="diag", outer_model_dim=0, wernicke_enabled=False,
+            local_attn_window=8, local_attn_heads=1, local_attn_dim=16,
+        )
+        states = model.init_state(2)
+        token = torch.randint(0, 64, (2, 1))
+        logits, hidden, new_states = model.step(token, states)
+        assert logits.shape == (2, 64)
+        assert len(new_states) == 4
+
+    def test_student_lm_hybrid_dream_step(self) -> None:
+        model = ChaosStudentLM(
+            vocab_size=64, dim=32, num_layers=4, ff_mult=2,
+            a_mode="diag", outer_model_dim=0, wernicke_enabled=False,
+            local_attn_window=8, local_attn_heads=1, local_attn_dim=16,
+        )
+        states = model.init_state(2)
+        token = torch.randint(0, 64, (2, 1))
+        logits, hidden, new_states = model.dream_step(token, states)
+        assert logits.shape == (2, 64)
+        assert len(new_states) == 4
+
+    def test_student_lm_no_hybrid_by_default(self) -> None:
+        model = ChaosStudentLM(
+            vocab_size=64, dim=32, num_layers=4, ff_mult=2,
+            a_mode="diag", outer_model_dim=0, wernicke_enabled=False,
+        )
+        # All layers should be plain SSM blocks
+        for layer in model.layers:
+            assert isinstance(layer, ChaosSSMBlock)
+
+
 class TestChaosSSMHybridBlock(unittest.TestCase):
     def test_hybrid_block_forward_shape(self) -> None:
         from chaoscontrol.model import ChaosSSMHybridBlock

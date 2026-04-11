@@ -224,10 +224,14 @@ class ChaosStudentLM(nn.Module):
         posterior_mode: str = "none",
         posterior_lr: float = 0.01,
         residual_cache_k: int = 4,
+        local_attn_window: int = 0,
+        local_attn_heads: int = 1,
+        local_attn_dim: int = 64,
     ) -> None:
         super().__init__()
         self.vocab_size = vocab_size
         self.dim = dim
+        self.local_attn_window = local_attn_window
         self.embed = nn.Embedding(vocab_size, dim)
 
         # Typed KV buffer config
@@ -259,20 +263,35 @@ class ChaosStudentLM(nn.Module):
                     expert_dim=wernicke_expert_dim if wernicke_expert_dim > 0 else None,
                 )
 
-        self.layers = nn.ModuleList([
-            ChaosSSMBlock(
-                dim,
-                ff_mult,
+        ssm_block_kwargs = dict(
+            a_mode=a_mode,
+            a_full_rank=a_full_rank,
+            a_full_gamma=a_full_gamma,
+            rich_b_mode=rich_b_mode,
+            rich_b_bottleneck=rich_b_bottleneck,
+            rich_b_num_subnets=rich_b_num_subnets,
+            rich_b_settling_steps=rich_b_settling_steps,
+        )
+        if local_attn_window > 0:
+            ssm_layers = [
+                ChaosSSMBlock(dim, ff_mult, **ssm_block_kwargs)
+                for _ in range(num_layers - 1)
+            ]
+            hybrid_layer = ChaosSSMHybridBlock(
+                dim, ff_mult,
                 a_mode=a_mode,
                 a_full_rank=a_full_rank,
                 a_full_gamma=a_full_gamma,
-                rich_b_mode=rich_b_mode,
-                rich_b_bottleneck=rich_b_bottleneck,
-                rich_b_num_subnets=rich_b_num_subnets,
-                rich_b_settling_steps=rich_b_settling_steps,
+                local_attn_window=local_attn_window,
+                local_attn_heads=local_attn_heads,
+                local_attn_dim=local_attn_dim,
             )
-            for _ in range(num_layers)
-        ])
+            self.layers = nn.ModuleList(ssm_layers + [hybrid_layer])
+        else:
+            self.layers = nn.ModuleList([
+                ChaosSSMBlock(dim, ff_mult, **ssm_block_kwargs)
+                for _ in range(num_layers)
+            ])
         self.final_norm = RMSNorm(dim)
         self.lm_head = nn.Linear(dim, vocab_size, bias=False)
         self.outer_model_type = outer_model_type
@@ -344,9 +363,14 @@ class ChaosStudentLM(nn.Module):
         self.dynamic_crit_per_layer = dynamic_crit_per_layer
 
     def init_state(self, batch_size: int) -> list[torch.Tensor]:
-        """Initialize recurrence states for all layers."""
+        """Initialize recurrence states for all layers and KV caches for hybrid blocks."""
         device = self.embed.weight.device
         dtype = self.embed.weight.dtype
+        # Initialize KV caches for any hybrid blocks
+        self._kv_caches: list[RollingKVCache | None] = [
+            layer._init_kv_cache() if isinstance(layer, ChaosSSMHybridBlock) else None
+            for layer in self.layers
+        ]
         return [torch.zeros(batch_size, self.dim, device=device, dtype=dtype) for _ in range(len(self.layers))]
 
     def step(
@@ -376,9 +400,13 @@ class ChaosStudentLM(nn.Module):
         """
         x = self.embed(token_ids).squeeze(1)  # (batch, dim)
 
+        kv_caches = getattr(self, "_kv_caches", [None] * len(self.layers))
         new_states = []
         for i, layer in enumerate(self.layers):
-            x, new_s = layer.step(x, states[i])
+            if isinstance(layer, ChaosSSMHybridBlock):
+                x, new_s = layer.step(x, states[i], kv_cache=kv_caches[i])
+            else:
+                x, new_s = layer.step(x, states[i])
             new_states.append(new_s)
 
         hidden = x
@@ -431,9 +459,13 @@ class ChaosStudentLM(nn.Module):
             x = x + self.semantic_tier.read(x.size(0))
 
         # SSM recurrence — use ChaosSSMBlock.step()
+        kv_caches = getattr(self, "_kv_caches", [None] * len(self.layers))
         new_states = []
         for i, layer in enumerate(self.layers):
-            x, new_s = layer.step(x, states[i])
+            if isinstance(layer, ChaosSSMHybridBlock):
+                x, new_s = layer.step(x, states[i], kv_cache=kv_caches[i])
+            else:
+                x, new_s = layer.step(x, states[i])
             new_states.append(new_s)
 
         hidden = x
