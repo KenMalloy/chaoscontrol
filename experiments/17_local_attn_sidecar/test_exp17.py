@@ -14,7 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from chaoscontrol.model import ChaosSSMBlock, ChaosSSMHybridBlock
 import run_exp17
-from runner_exp17 import build_model
+from runner_exp17 import build_child_env, build_model, resolve_visible_cuda_devices, validate_gpu_concurrency
 
 
 def test_build_model_bare_fast_ssm():
@@ -62,6 +62,17 @@ def test_hybrid_model_forward_shape():
     ids = torch.randint(0, 64, (2, 10))
     out = model(ids)
     assert out["logits"].shape == (2, 10, 64)
+
+
+def test_build_child_env_respects_parent_mask():
+    env = build_child_env(gpu_slot=1, base_env={"CUDA_VISIBLE_DEVICES": "2,4,6"})
+    assert env["CUDA_VISIBLE_DEVICES"] == "4"
+    assert resolve_visible_cuda_devices({"CUDA_VISIBLE_DEVICES": "2,4,6"}) == ["2", "4", "6"]
+
+
+def test_validate_gpu_concurrency_uses_visible_mask():
+    visible = validate_gpu_concurrency(2, {"CUDA_VISIBLE_DEVICES": "1,3,5"})
+    assert visible == ["1", "3", "5"]
 
 
 def test_summarize_results_prefers_best_passing_local(tmp_path):

@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import math
+import os
+import warnings
 from typing import Any
 
 import torch
@@ -28,9 +30,71 @@ def _diag_recurrence_inner(decay: torch.Tensor, update: torch.Tensor) -> torch.T
     return torch.stack(outputs, dim=1)
 
 
-# torch.compile fuses the per-step kernel launches on CUDA,
-# giving ~10-20x speedup over the Python loop without numerical issues.
-_diag_recurrence = torch.compile(_diag_recurrence_inner, dynamic=False)
+_diag_recurrence_impl = None
+_diag_recurrence_backend = "python"
+_diag_recurrence_note = "fallback"
+
+
+def _resolve_diag_recurrence_impl():
+    """Resolve the fastest available diag recurrence backend.
+
+    We avoid compiling at import time so a mismatched Inductor/CUDA/toolchain
+    stack does not make the whole package fail before argument parsing.
+    """
+    global _diag_recurrence_impl, _diag_recurrence_backend, _diag_recurrence_note
+    if _diag_recurrence_impl is not None:
+        return _diag_recurrence_impl
+
+    if os.environ.get("CHAOSCONTROL_DISABLE_TORCH_COMPILE", "").strip() == "1":
+        _diag_recurrence_impl = _diag_recurrence_inner
+        _diag_recurrence_backend = "python"
+        _diag_recurrence_note = "disabled by CHAOSCONTROL_DISABLE_TORCH_COMPILE=1"
+        return _diag_recurrence_impl
+
+    try:
+        _diag_recurrence_impl = torch.compile(_diag_recurrence_inner, dynamic=False)
+        _diag_recurrence_backend = "compile"
+        _diag_recurrence_note = "torch.compile(dynamic=False)"
+    except Exception as exc:  # pragma: no cover - only triggers on mismatched stacks
+        _diag_recurrence_impl = _diag_recurrence_inner
+        _diag_recurrence_backend = "python"
+        _diag_recurrence_note = f"compile unavailable: {exc.__class__.__name__}: {exc}"
+        warnings.warn(
+            "torch.compile unavailable for diag recurrence; falling back to the Python loop. "
+            f"Reason: {_diag_recurrence_note}",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+    return _diag_recurrence_impl
+
+
+def get_diag_recurrence_backend() -> dict[str, str]:
+    """Report which diag recurrence backend is active."""
+    _resolve_diag_recurrence_impl()
+    return {
+        "backend": _diag_recurrence_backend,
+        "note": _diag_recurrence_note,
+    }
+
+
+def _diag_recurrence(decay: torch.Tensor, update: torch.Tensor) -> torch.Tensor:
+    global _diag_recurrence_impl, _diag_recurrence_backend, _diag_recurrence_note
+    impl = _resolve_diag_recurrence_impl()
+    try:
+        return impl(decay, update)
+    except Exception as exc:  # pragma: no cover - only triggers on mismatched stacks
+        if impl is _diag_recurrence_inner:
+            raise
+        _diag_recurrence_impl = _diag_recurrence_inner
+        _diag_recurrence_backend = "python"
+        _diag_recurrence_note = f"compile runtime failure: {exc.__class__.__name__}: {exc}"
+        warnings.warn(
+            "torch.compile failed during diag recurrence execution; falling back to the Python loop. "
+            f"Reason: {_diag_recurrence_note}",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return _diag_recurrence_inner(decay, update)
 
 
 class RMSNorm(nn.Module):

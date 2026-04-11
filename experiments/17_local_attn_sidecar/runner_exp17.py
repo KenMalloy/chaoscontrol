@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import random
 import sys
 from pathlib import Path
@@ -30,9 +31,95 @@ from chaoscontrol.data import (
     resolve_device,
     resolve_param_dtype,
 )
+from chaoscontrol.core import get_diag_recurrence_backend
 from chaoscontrol.evaluation import compute_bpb
 from chaoscontrol.model import ChaosSSMBlock, ChaosSSMHybridBlock, ChaosStudentLM
 from chaoscontrol.training import train_chaoscontrol_for_budget
+
+MIN_PYTHON = (3, 10)
+
+
+def resolve_visible_cuda_devices(env: dict[str, str] | None = None) -> list[str]:
+    env_map = os.environ if env is None else env
+    mask = env_map.get("CUDA_VISIBLE_DEVICES", "").strip()
+    if mask:
+        return [piece.strip() for piece in mask.split(",") if piece.strip()]
+    if torch.cuda.is_available():
+        return [str(i) for i in range(torch.cuda.device_count())]
+    return []
+
+
+def validate_gpu_concurrency(num_gpus: int, env: dict[str, str] | None = None) -> list[str]:
+    if num_gpus <= 0:
+        raise ValueError(f"num_gpus must be positive, got {num_gpus}")
+    visible = resolve_visible_cuda_devices(env)
+    if not visible:
+        raise RuntimeError(
+            "No visible CUDA devices. Check the pod allocation, CUDA_VISIBLE_DEVICES, and driver/runtime setup."
+        )
+    if num_gpus > len(visible):
+        raise RuntimeError(
+            f"Requested num_gpus={num_gpus}, but only {len(visible)} CUDA slots are visible "
+            f"({','.join(visible)})."
+        )
+    return visible
+
+
+def build_child_env(
+    *,
+    gpu_slot: int | None,
+    base_env: dict[str, str] | None = None,
+) -> dict[str, str]:
+    env = dict(os.environ if base_env is None else base_env)
+    if gpu_slot is None:
+        return env
+    visible = resolve_visible_cuda_devices(env)
+    if gpu_slot < 0 or gpu_slot >= len(visible):
+        raise RuntimeError(
+            f"GPU slot {gpu_slot} is out of range for visible CUDA devices {visible}."
+        )
+    env["CUDA_VISIBLE_DEVICES"] = visible[gpu_slot]
+    return env
+
+
+def assert_runtime_compatibility(
+    *,
+    device: torch.device,
+    sp_model_path: str,
+) -> dict[str, Any]:
+    if sys.version_info < MIN_PYTHON:
+        raise RuntimeError(
+            f"Experiment 17 requires Python {MIN_PYTHON[0]}.{MIN_PYTHON[1]}+, "
+            f"found {sys.version_info.major}.{sys.version_info.minor}."
+        )
+    info: dict[str, Any] = {
+        "python_version": f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}",
+        "diag_recurrence": get_diag_recurrence_backend(),
+    }
+    if device.type == "cuda":
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA device requested, but torch.cuda.is_available() is false.")
+        visible = resolve_visible_cuda_devices()
+        info["visible_cuda_devices"] = visible
+        info["cuda_device_count"] = torch.cuda.device_count()
+        bf16_supported = bool(getattr(torch.cuda, "is_bf16_supported", lambda: False)())
+        info["bf16_supported"] = bf16_supported
+        if not bf16_supported:
+            raise RuntimeError(
+                "CUDA is visible, but torch reports bf16 is unsupported. "
+                "Check the pod image, PyTorch build, and driver/runtime compatibility."
+            )
+
+    try:
+        import sentencepiece as spm
+    except Exception as exc:
+        raise RuntimeError("sentencepiece is required for Experiment 17, but import failed.") from exc
+    sp = spm.SentencePieceProcessor()
+    loaded = sp.Load(sp_model_path)
+    if not loaded:
+        raise RuntimeError(f"Failed to load SentencePiece model: {sp_model_path}")
+    info["sentencepiece_model"] = sp_model_path
+    return info
 
 
 def build_sentencepiece_luts(
@@ -71,7 +158,7 @@ def load_sp_data(data_dir: str, vocab_size: int = 8192) -> tuple[torch.Tensor, t
     train_tokens = train_tokens.clamp(0, vocab_size - 1)
     val_tokens = val_tokens.clamp(0, vocab_size - 1)
     test_tokens = train_tokens[:0]
-    print(f"  SP data: train={train_tokens.numel():,} val={val_tokens.numel():,} tokens")
+    print(f"  SP data: train={train_tokens.numel():,} val={val_tokens.numel():,} tokens", flush=True)
     return train_tokens, val_tokens, test_tokens
 
 
@@ -185,6 +272,7 @@ def run_single(
     if device.type == "cuda":
         torch.backends.cudnn.benchmark = True
         torch.set_float32_matmul_precision("high")
+    runtime = assert_runtime_compatibility(device=device, sp_model_path=sp_model_path)
 
     seed = int(config.get("seed", 1337))
     random.seed(seed)
@@ -216,7 +304,8 @@ def run_single(
     print(
         f"Model: dim={config['model_dim']} | layers={config['num_layers']} | "
         f"window={config.get('local_attn_window', 0)} | params={model_params:,} | "
-        f"artifact={artifact_bytes:,} bytes ({artifact_bytes / 1e6:.1f} MB)"
+        f"artifact={artifact_bytes:,} bytes ({artifact_bytes / 1e6:.1f} MB)",
+        flush=True,
     )
 
     train_result = train_chaoscontrol_for_budget(
@@ -256,6 +345,7 @@ def run_single(
         "artifact_bytes": artifact_bytes,
         "train": train_summary,
         "eval": eval_result,
+        "runtime": runtime,
         "model_shape": {
             "hybrid_enabled": bool(config.get("local_attn_window", 0) > 0),
             "num_hybrid_layers": int(sum(isinstance(layer, ChaosSSMHybridBlock) for layer in model.layers)),
@@ -264,11 +354,15 @@ def run_single(
     }
 
     if output_json:
-        Path(output_json).write_text(json.dumps(result, indent=2, default=str))
+        out_path = Path(output_json)
+        tmp_path = out_path.with_suffix(".tmp")
+        tmp_path.write_text(json.dumps(result, indent=2, default=str))
+        tmp_path.rename(out_path)
 
     print(
         f"Done: bpb={eval_result['bpb']:.4f} | steps={train_summary['steps']} | "
-        f"steps/s={train_summary['steps_per_second']:.2f} | peak_vram={train_summary['peak_vram_mb']:.1f} MB"
+        f"steps/s={train_summary['steps_per_second']:.2f} | peak_vram={train_summary['peak_vram_mb']:.1f} MB",
+        flush=True,
     )
     return result
 
@@ -280,13 +374,19 @@ if __name__ == "__main__":
     parser.add_argument("--sp-model-path", required=True)
     parser.add_argument("--budget", type=float, default=600.0)
     parser.add_argument("--output-json", default=None)
+    parser.add_argument("--preflight-only", action="store_true")
     args = parser.parse_args()
 
     config = yaml.safe_load(Path(args.config).read_text())
-    run_single(
-        config,
-        data_path=args.data_path,
-        budget_seconds=args.budget,
-        sp_model_path=args.sp_model_path,
-        output_json=args.output_json,
-    )
+    if args.preflight_only:
+        device = resolve_device(config.get("device", "auto"))
+        info = assert_runtime_compatibility(device=device, sp_model_path=args.sp_model_path)
+        print(json.dumps(info, indent=2))
+    else:
+        run_single(
+            config,
+            data_path=args.data_path,
+            budget_seconds=args.budget,
+            sp_model_path=args.sp_model_path,
+            output_json=args.output_json,
+        )
