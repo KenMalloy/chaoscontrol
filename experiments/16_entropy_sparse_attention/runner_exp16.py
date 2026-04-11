@@ -250,7 +250,7 @@ def collect_oracle_examples(
             buffers: list[list[torch.Tensor]] = [[] for _ in model.layers]
             buffer_token_ids: list[list[int]] = [[] for _ in model.layers]
             for pos in range(seq_len):
-                token_id = window[pos].view(1, 1).to(device)
+                token_id = window[pos].view(1, 1).to(device=device, dtype=torch.long)
                 x = model.embed(token_id).squeeze(1)
 
                 for li, layer in enumerate(model.layers):
