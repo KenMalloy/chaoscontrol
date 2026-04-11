@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -155,7 +156,8 @@ def summarize_results(conditions: dict[str, dict[str, Any]]) -> dict[str, Any]:
     rows: list[dict[str, Any]] = []
 
     for condition_name in conditions:
-        files = sorted(RESULTS.glob(f"{condition_name}_s*.json"))
+        pattern = re.compile(rf"^{re.escape(condition_name)}_s\d+\.json$")
+        files = sorted(file for file in RESULTS.iterdir() if pattern.match(file.name))
         if not files:
             continue
         mass_values: list[float] = []
