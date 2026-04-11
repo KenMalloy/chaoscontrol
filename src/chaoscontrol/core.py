@@ -119,30 +119,44 @@ class ChaosSSMCore(nn.Module):
         gate = torch.sigmoid(self.gate_proj(x))
         return decay, update, gate
 
-    def _forward_diag_scan(self, x: torch.Tensor) -> torch.Tensor:
-        """Vectorized diag recurrence using cumprod/cumsum instead of a Python loop.
+    def _forward_diag_scan(self, x: torch.Tensor, chunk_size: int = 32) -> torch.Tensor:
+        """Chunked vectorized diag recurrence.
 
         For the elementwise recurrence
 
             state_t = decay_t * state_{t-1} + update_t,  state_{-1}=0
 
-        the closed form is
+        the closed form within a chunk starting at state_init is
 
-            state_t = prefix_t * sum_{i<=t} update_i / prefix_i
+            state_t = prefix_t * state_init + prefix_t * cumsum(update / prefix)_t
 
-        where prefix_t = prod_{j<=t} decay_j.
+        where prefix_t = prod_{j=0}^{t} decay_j (within the chunk).
 
-        The computation is carried out in float32 for stability, then cast
-        back to the input dtype before the output projection.
+        Processing in short chunks (default 32) keeps prefix products
+        numerically stable in float32. State is carried between chunks.
         """
         decay, update, gate = self._diag_terms(x)
-        decay_f = decay.float().clamp_min(1e-8)
-        update_f = update.float()
+        batch, seq, dim = x.shape
 
-        log_prefix = torch.cumsum(torch.log(decay_f), dim=1)
-        prefix = torch.exp(log_prefix)
-        state = prefix * torch.cumsum(update_f / prefix, dim=1)
-        out = gate * state.to(dtype=x.dtype)
+        state = torch.zeros(batch, dim, dtype=torch.float32, device=x.device)
+        all_states = []
+
+        for start in range(0, seq, chunk_size):
+            end = min(start + chunk_size, seq)
+            chunk_decay = decay[:, start:end].float().clamp_min(1e-8)
+            chunk_update = update[:, start:end].float()
+
+            log_prefix = torch.cumsum(torch.log(chunk_decay), dim=1)
+            prefix = torch.exp(log_prefix)
+            carried = prefix * state.unsqueeze(1)
+            new_contribution = prefix * torch.cumsum(chunk_update / prefix, dim=1)
+            chunk_states = carried + new_contribution
+
+            all_states.append(chunk_states)
+            state = chunk_states[:, -1]
+
+        states = torch.cat(all_states, dim=1)
+        out = gate * states.to(dtype=x.dtype)
         return self.out_proj(out)
 
     def step(
