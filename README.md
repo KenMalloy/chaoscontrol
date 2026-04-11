@@ -86,7 +86,7 @@ The active question is no longer "can elaborate consolidation help?" but:
 
 | Finding | Evidence |
 |---|---|
-| **Bare SSM is the current 600s A40 winner** | Baseline sweep summary in `experiments/OVERNIGHT_SUMMARY.md` |
+| **Bare SSM is the current 600s A40 winner** | Baseline sweep summary in `experiments/baselines/results/baseline_summary.json` |
 | **`n3_only` is the only sleep payload that helps at 600s** | `experiments/11_sleep_cycle/REPORT_exp11.md` |
 | **Metabolic gating hurts on memoryless checkpoints** | `experiments/09_revised_architecture/REPORT_phase2.md` |
 | **`crit_target_coupling=0.92` and `outer_max_slots=32` look like the strongest constant improvements** | `experiments/13_constants_validation/REPORT_exp13.md` |
