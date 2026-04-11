@@ -1,0 +1,292 @@
+#!/usr/bin/env python3
+"""Single-run engine for Experiment 17 Phase A.
+
+Trains a fast SP8192 SSM with an optional local-attention sidecar in the
+top block, then evaluates competition-correct bpb.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import random
+import sys
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+import torch
+import torch.nn.functional as F
+import yaml
+
+REPO = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(REPO / "src"))
+
+from chaoscontrol.data import (
+    batch_from_starts,
+    build_lm_starts,
+    choose_eval_starts,
+    load_fineweb_tokens,
+    maybe_autocast,
+    resolve_device,
+    resolve_param_dtype,
+)
+from chaoscontrol.evaluation import compute_bpb
+from chaoscontrol.model import ChaosSSMBlock, ChaosSSMHybridBlock, ChaosStudentLM
+from chaoscontrol.training import train_chaoscontrol_for_budget
+
+
+def build_sentencepiece_luts(
+    sp,
+    vocab_size: int,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Replicate the competition byte LUT logic used in Exp 15/16."""
+    sp_vocab_size = int(sp.vocab_size())
+    table_size = max(sp_vocab_size, vocab_size)
+    base_bytes_np = np.zeros((table_size,), dtype=np.int16)
+    has_leading_space_np = np.zeros((table_size,), dtype=np.bool_)
+    is_boundary_token_np = np.ones((table_size,), dtype=np.bool_)
+    for token_id in range(sp_vocab_size):
+        if sp.is_control(token_id) or sp.is_unknown(token_id) or sp.is_unused(token_id):
+            continue
+        is_boundary_token_np[token_id] = False
+        if sp.is_byte(token_id):
+            base_bytes_np[token_id] = 1
+            continue
+        piece = sp.id_to_piece(token_id)
+        if piece.startswith("\u2581"):
+            has_leading_space_np[token_id] = True
+            piece = piece[1:]
+        base_bytes_np[token_id] = len(piece.encode("utf-8"))
+    return (
+        torch.tensor(base_bytes_np, dtype=torch.int16, device=device),
+        torch.tensor(has_leading_space_np, dtype=torch.bool, device=device),
+        torch.tensor(is_boundary_token_np, dtype=torch.bool, device=device),
+    )
+
+
+def load_sp_data(data_dir: str, vocab_size: int = 8192) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Load pre-tokenized SP shards and clamp header contamination."""
+    train_tokens, val_tokens = load_fineweb_tokens(data_dir)
+    train_tokens = train_tokens.clamp(0, vocab_size - 1)
+    val_tokens = val_tokens.clamp(0, vocab_size - 1)
+    test_tokens = train_tokens[:0]
+    print(f"  SP data: train={train_tokens.numel():,} val={val_tokens.numel():,} tokens")
+    return train_tokens, val_tokens, test_tokens
+
+
+def evaluate_bpb_sp(
+    model: Any,
+    *,
+    tokens: torch.Tensor,
+    eval_starts: list[int],
+    batch_size: int,
+    seq_len: int,
+    device: torch.device,
+    base_bytes_lut: torch.Tensor,
+    has_leading_space_lut: torch.Tensor,
+    is_boundary_token_lut: torch.Tensor,
+) -> dict[str, float]:
+    """Competition-correct SP bpb computation."""
+    was_training = model.training
+    model.eval()
+    total_ce_nats = 0.0
+    total_bytes = 0
+    total_tokens = 0
+    vocab_size = model.vocab_size
+
+    with torch.no_grad():
+        for idx in range(0, len(eval_starts), batch_size):
+            batch_starts = eval_starts[idx : idx + batch_size]
+            inputs, targets = batch_from_starts(tokens, batch_starts, seq_len, device)
+            autocast_dtype = next(model.parameters()).dtype if device.type == "cuda" else torch.float32
+            with maybe_autocast(device, autocast_dtype):
+                out = model(inputs)
+                logits = out["logits"]
+            batch_ce = float(
+                F.cross_entropy(
+                    logits.float().reshape(-1, vocab_size),
+                    targets.reshape(-1),
+                    reduction="sum",
+                ).item()
+            )
+            total_ce_nats += batch_ce
+            total_tokens += int(targets.numel())
+
+            prev_ids = inputs.reshape(-1)
+            tgt_ids = targets.reshape(-1)
+            token_bytes = base_bytes_lut[tgt_ids].to(dtype=torch.int16)
+            token_bytes += (
+                has_leading_space_lut[tgt_ids] & ~is_boundary_token_lut[prev_ids]
+            ).to(dtype=torch.int16)
+            total_bytes += int(token_bytes.to(torch.int64).sum().item())
+
+    if was_training:
+        model.train()
+
+    return {
+        "loss": float(total_ce_nats / max(total_tokens, 1)),
+        "bpb": compute_bpb(total_ce_nats, total_bytes),
+        "tokens": float(total_tokens),
+        "total_ce_nats": total_ce_nats,
+        "total_scored_bytes": total_bytes,
+    }
+
+
+def build_model(config: dict[str, Any], device: torch.device, param_dtype: torch.dtype) -> ChaosStudentLM:
+    """Build bare or hybrid fast SP-SSM for Exp 17."""
+    model = ChaosStudentLM(
+        vocab_size=config["vocab_size"],
+        dim=config["model_dim"],
+        num_layers=config["num_layers"],
+        ff_mult=config.get("ff_mult", 2),
+        a_mode=config.get("a_mode", "diag"),
+        a_full_rank=config.get("a_full_rank", 8),
+        a_full_gamma=config.get("a_full_gamma", 0.05),
+        outer_model_dim=0,
+        wernicke_enabled=False,
+        local_attn_window=int(config.get("local_attn_window", 0)),
+        local_attn_heads=int(config.get("local_attn_heads", 1)),
+        local_attn_dim=int(config.get("local_attn_dim", 64)),
+    )
+    model = model.to(device)
+    if device.type == "cuda":
+        model = model.to(dtype=param_dtype)
+    return model
+
+
+def summarize_train_result(train_result: dict[str, Any]) -> dict[str, float]:
+    """Keep per-run JSON compact; omit long loss histories."""
+    history = train_result.get("history", [])
+    final_loss = float(history[-1]["loss"]) if history else float("nan")
+    elapsed_s = float(train_result["elapsed_s"])
+    steps = int(train_result["steps"])
+    return {
+        "steps": steps,
+        "elapsed_s": elapsed_s,
+        "steps_per_second": float(steps / max(elapsed_s, 1e-9)),
+        "final_loss": final_loss,
+        "peak_vram_mb": float(train_result.get("peak_vram_mb", 0.0)),
+    }
+
+
+def run_single(
+    config: dict[str, Any],
+    *,
+    data_path: str,
+    budget_seconds: float,
+    sp_model_path: str,
+    output_json: str | None = None,
+) -> dict[str, Any]:
+    """Run one Exp 17 train/eval condition."""
+    device = resolve_device(config.get("device", "auto"))
+    param_dtype = resolve_param_dtype(config.get("dtype", "bf16"), device)
+
+    if device.type == "cuda":
+        torch.backends.cudnn.benchmark = True
+        torch.set_float32_matmul_precision("high")
+
+    seed = int(config.get("seed", 1337))
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+
+    train_tokens, val_tokens, _ = load_sp_data(data_path, config["vocab_size"])
+
+    import sentencepiece as spm
+
+    sp = spm.SentencePieceProcessor()
+    sp.Load(sp_model_path)
+    base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(
+        sp, config["vocab_size"], device
+    )
+
+    seq_len = int(config["seq_len"])
+    stride = int(config.get("stride", seq_len // 2))
+    batch_size = int(config["batch_size"])
+    eval_batches = int(config.get("eval_batches", 16))
+
+    train_starts = build_lm_starts(int(train_tokens.numel()), seq_len, stride)
+    val_starts = build_lm_starts(int(val_tokens.numel()), seq_len, stride)
+    eval_starts = choose_eval_starts(val_starts, batch_size=batch_size, eval_batches=eval_batches, seed=seed)
+
+    model = build_model(config, device, param_dtype)
+    model_params = sum(p.numel() for p in model.parameters())
+    artifact_bytes = model.artifact_bytes()
+    print(
+        f"Model: dim={config['model_dim']} | layers={config['num_layers']} | "
+        f"window={config.get('local_attn_window', 0)} | params={model_params:,} | "
+        f"artifact={artifact_bytes:,} bytes ({artifact_bytes / 1e6:.1f} MB)"
+    )
+
+    train_result = train_chaoscontrol_for_budget(
+        model,
+        train_tokens=train_tokens,
+        train_starts=train_starts,
+        seq_len=seq_len,
+        batch_size=batch_size,
+        device=device,
+        param_dtype=param_dtype,
+        budget_seconds=budget_seconds,
+        base_lr=config.get("base_lr", 2e-3),
+        weight_decay=config.get("weight_decay", 1e-2),
+        grad_clip_norm=config.get("grad_clip_norm", 1.0),
+        seed=seed,
+        crit_reg_alpha=config.get("crit_reg_alpha", 0.01),
+        crit_reg_beta=config.get("crit_reg_beta", 0.001),
+        crit_target_coupling=config.get("crit_target_coupling", 0.92),
+    )
+    train_summary = summarize_train_result(train_result)
+
+    eval_result = evaluate_bpb_sp(
+        model,
+        tokens=val_tokens,
+        eval_starts=eval_starts,
+        batch_size=batch_size,
+        seq_len=seq_len,
+        device=device,
+        base_bytes_lut=base_bytes_lut,
+        has_leading_space_lut=has_leading_space_lut,
+        is_boundary_token_lut=is_boundary_token_lut,
+    )
+
+    result = {
+        "config": config,
+        "params": model_params,
+        "artifact_bytes": artifact_bytes,
+        "train": train_summary,
+        "eval": eval_result,
+        "model_shape": {
+            "hybrid_enabled": bool(config.get("local_attn_window", 0) > 0),
+            "num_hybrid_layers": int(sum(isinstance(layer, ChaosSSMHybridBlock) for layer in model.layers)),
+            "num_pure_ssm_layers": int(sum(isinstance(layer, ChaosSSMBlock) for layer in model.layers)),
+        },
+    }
+
+    if output_json:
+        Path(output_json).write_text(json.dumps(result, indent=2, default=str))
+
+    print(
+        f"Done: bpb={eval_result['bpb']:.4f} | steps={train_summary['steps']} | "
+        f"steps/s={train_summary['steps_per_second']:.2f} | peak_vram={train_summary['peak_vram_mb']:.1f} MB"
+    )
+    return result
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Exp 17 runner: local attention sidecar on fast SP-SSM")
+    parser.add_argument("--config", required=True, help="YAML config path")
+    parser.add_argument("--data-path", required=True)
+    parser.add_argument("--sp-model-path", required=True)
+    parser.add_argument("--budget", type=float, default=600.0)
+    parser.add_argument("--output-json", default=None)
+    args = parser.parse_args()
+
+    config = yaml.safe_load(Path(args.config).read_text())
+    run_single(
+        config,
+        data_path=args.data_path,
+        budget_seconds=args.budget,
+        sp_model_path=args.sp_model_path,
+        output_json=args.output_json,
+    )
