@@ -141,18 +141,20 @@ class ChaosSSMHybridBlock(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         normed = self.input_norm(x)
         y, new_state = self.core.step(normed, state)
-        x_ssm = x + y
+        x_ssm_base = x + y
+        x_ssm = x_ssm_base
 
         if kv_cache is not None:
-            # Write K/V from clean trunk output BEFORE gate mixing,
-            # so the cache contains pure SSM features, not self-referential
-            # attention outputs.
-            kv_cache.write(self.k_proj(x_ssm), self.v_proj(x_ssm))
             keys, values, mask = kv_cache.last(self.local_attn_window)
             if mask.any():
                 attn_out = self.local_attn(x_ssm, keys, values, mask)
                 gate = torch.sigmoid(self.gate_proj(x_ssm) + self.gate_bias)
                 x_ssm = x_ssm + gate * attn_out
+            # Write K/V from clean trunk output AFTER the read so retrieval
+            # remains causal (current token cannot attend to itself), and so
+            # the cache contains pure SSM features rather than mixed attention
+            # outputs.
+            kv_cache.write(self.k_proj(x_ssm_base), self.v_proj(x_ssm_base))
 
         x_out = x_ssm + self.ff(self.ff_norm(x_ssm))
         return x_out, new_state

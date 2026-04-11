@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import unittest
+from unittest import mock
 
 import torch
 import torch.nn.functional as F
@@ -236,6 +237,21 @@ class TestChaosSSMHybridBlock(unittest.TestCase):
         )
         # gate_bias initialized to -4, sigmoid(-4) ~ 0.018
         assert block.gate_bias.item() < -3.0
+
+    def test_hybrid_block_first_step_is_causal(self) -> None:
+        from chaoscontrol.model import ChaosSSMHybridBlock
+        block = ChaosSSMHybridBlock(
+            dim=32, ff_mult=2, a_mode="diag",
+            local_attn_window=8, local_attn_heads=1, local_attn_dim=16,
+        )
+        cache = block._init_kv_cache()
+        state = torch.zeros(2, 32)
+        x = torch.randn(2, 32)
+        with mock.patch.object(block.local_attn, "forward", wraps=block.local_attn.forward) as attn_forward:
+            out, new_state = block.step(x, state, kv_cache=cache)
+        assert out.shape == (2, 32)
+        assert new_state.shape == (2, 32)
+        assert attn_forward.call_count == 0
 
 
 if __name__ == "__main__":
