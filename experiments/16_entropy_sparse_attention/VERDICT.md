@@ -12,13 +12,13 @@ effective_connections ≤ 2k.
 
 | Feature source | mean mass@k | eff_conn | interpretation |
 |---|---|---|---|
-| x_state | 0.735 | 1.27 | baseline (residual + recurrence) |
+| x_state | 0.732 | 1.28 | baseline (residual + recurrence) |
 | x_only | 0.724 | 1.20 | **matches or beats x_state** |
-| state_only | 0.636 | 25.4 | diffuse, much worse |
+| state_only | 0.631 | 25.6 | diffuse, much worse |
 
-- x_only vs x_state: delta = -0.043 (p=0.017). Adding recurrence
-  state slightly **hurts** the selector.
-- state_only vs x_state: delta = +0.051 (p=0.009). Recurrence state
+- x_only vs x_state: delta = -0.008 (p=0.339). Adding recurrence
+  state does **not** provide a clear selector benefit.
+- state_only vs x_state: delta = -0.101 (p=2.8e-6). Recurrence state
   alone is significantly worse.
 - The selector works. The attention is naturally sparse. But the
   recurrence state adds no retrieval value beyond the residual stream.

@@ -13,8 +13,8 @@ Experiment 16 proved three things:
 2. Attention over recent tokens is extremely concentrated
    (effective_connections ~1.2 — almost all mass on 1-2 positions).
 3. The residual stream carries the retrieval signal, not the
-   recurrence state (x_only matches x_state, p=0.017; state_only
-   is significantly worse, p=0.009).
+   recurrence state (`x_only` is statistically indistinguishable from
+   `x_state` at buf128_k8, while `state_only` is significantly worse).
 
 The remaining gap to the matched transformer (1.59 bpb) may be
 closeable with a small, cheap local attention path — not a second
@@ -43,6 +43,24 @@ The hard constraint is preserving the SSM's advantages:
 
 If the attention sidecar gets too big, we've rebuilt a worse
 transformer. If it stays tiny and still helps, that's interesting.
+
+### What Exp 16 Actually Falsified
+
+Exp 16 does **not** say "attention is unnecessary" or "SSMs cannot do
+language." It says something narrower and more useful:
+
+- `state_only` is a bad retrieval oracle.
+- Increasing retrieval horizon beyond ~64 recent positions did not help.
+- `x_state` did not clearly beat `x_only`, so recurrence state is not the
+  main source of retrieval signal.
+
+That yields a cleaner target for Exp 17:
+
+```text
+Keep the SSM as the base model for cheap sequential compression.
+Add the smallest local retrieval sidecar that measurably closes the
+remaining gap.
+```
 
 ## Architecture
 
@@ -100,7 +118,13 @@ new stage sitting on top of the model.
 Adding a post-stack retrieval block (option B) confounds three things:
 more depth, more parameters, and retrieval capability. If it wins,
 you don't know which factor helped. Replacing the top SSM block with
-a hybrid keeps depth and parameter count matched.
+a hybrid keeps depth fixed and keeps the interpretation clean.
+
+Strict parameter matching is optional in Phase A. The hybrid block adds
+only ~65K params on a ~6.5M model, so the first pass can tolerate the
+small overhead. If the sidecar helps, a near-isoparametric follow-up can
+shrink the hybrid block FF width slightly to verify the gain is coming
+from retrieval rather than from a tiny parameter increase.
 
 The question "should retrieval be a separate post-stack block?" is
 valid but belongs in Exp 18, after Exp 17 establishes whether
@@ -145,6 +169,12 @@ the 16MB artifact budget.
 | local_w32 | 32 | dense | 64 | 1 |
 | local_w64 | 64 | dense | 64 | 1 |
 
+Optional validation control if Phase A wins:
+
+| Condition | window | attention | note |
+|---|---|---|---|
+| local_w64_iso | 64 | dense | Reduce top-block FF width to offset sidecar params |
+
 All conditions:
 
 - vocab_size=8192 (SP8192)
@@ -160,6 +190,15 @@ All conditions:
 `bare_fast_ssm` is the control — same model as Exp 15/16 but with the
 compiled diag scan. This gives the honest ~14K-step baseline bpb.
 
+The initial comparison is intentionally capability-first, not
+parameter-golf-first:
+
+- Does tiny local retrieval help at all?
+- Which is the smallest useful window?
+- Is the throughput cost acceptable?
+
+If one condition passes, a tighter parameter-matched follow-up is easy.
+
 ## Go / No-Go
 
 Phase A gates:
@@ -171,6 +210,14 @@ Phase A gates:
 3. Artifact bytes stays under 16MB.
 
 All three must pass for Phase B.
+
+Interpretation:
+
+- If `local_w16` wins, retrieval is very local and should stay tiny.
+- If `local_w64` wins but `local_w16`/`local_w32` do not, retrieval helps
+  but window size is doing real work.
+- If no local window wins, the remaining gap is probably not a short-range
+  retrieval problem and Exp 18 should not run.
 
 ## Phase B (Contingent on Phase A Pass)
 
