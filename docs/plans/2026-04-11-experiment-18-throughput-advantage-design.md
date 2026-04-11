@@ -24,7 +24,7 @@ is O(seq_len² × batch), so scaling batch costs proportional compute.
 
 ### The SSM's Actual Throughput Advantage
 
-FLOP analysis for our model (4L, dim=256, SP8192, one GPU):
+FLOP analysis for our model (4L, dim=256, SP8192, **single GPU**):
 
 | Component | FLOPs/seq (fwd) | Notes |
 |---|---|---|
@@ -35,7 +35,7 @@ FLOP analysis for our model (4L, dim=256, SP8192, one GPU):
 | **Total forward** | **~4.6G** | |
 | **Total fwd+bwd** | **~13.7G** | |
 
-Scaling by batch (single GPU, 30% utilization of 990 TFLOPS):
+Scaling by batch (**single GPU**, 30% utilization of 990 TFLOPS):
 
 | Batch | FLOPs/step | Matmul time | Tokens/step | Tokens/600s |
 |---|---|---|---|---|
@@ -48,12 +48,30 @@ Scaling by batch (single GPU, 30% utilization of 990 TFLOPS):
 At larger batch, matmul time catches up and the scan overhead becomes
 a smaller fraction. Crossover at approximately batch=3000.
 
-With 4 GPUs (data parallel): ~26B tokens in 600s.
+### GPU Assumptions
 
-**The full dataset is 10B tokens. We can see it 2.5 times over.**
+**Phase 0 benchmarks single-GPU throughput.** The current training
+stack (`src/chaoscontrol/training.py`) is single-device. Phase A
+runs one model per GPU (same as Exp 15/16 orchestrators — round-robin
+GPU assignment, independent processes). Data-parallel multi-GPU
+training would multiply throughput but requires distributed training
+code we do not have. It is explicitly out of scope for Exp 18.
 
-Currently we see 230M tokens — 2.3% of the dataset. We are leaving
-approximately **100x throughput** on the table by running at batch=32.
+**Single-GPU feasibility (conservative estimate):**
+
+At batch=1024 on 1 GPU: ~6.7B tokens/600s. The full dataset is 10B
+tokens. One GPU can cover ~67% in a single sweep, or 100% in ~900s.
+To sweep all 10B in ≤ 400s on one GPU, we need batch ≥ ~2500 (depends
+on Phase 0 measurements).
+
+If single-GPU sweep of 10B tokens is infeasible within 400s, the
+experiment should either:
+- Accept partial coverage (e.g., 5B tokens = 50%) and test whether
+  even partial-informed targeting beats random sampling, or
+- Use a smaller dataset subset as the "full" sweep target.
+
+Currently we see 230M tokens (2.3% of 10B). Even 50% coverage would
+be a 20x improvement and enough to test the targeting hypothesis.
 
 ### Why This Matters
 
@@ -74,9 +92,12 @@ structural throughput advantage that transformers cannot match.
 
 ## Design
 
-### Phase 0: Throughput Benchmark (10 minutes on pod)
+### Phase 0: Throughput Benchmark + LR Stability Screen (~30 min on pod)
 
-Before the experiment, verify the FLOP analysis empirically:
+Before the experiment, verify the FLOP analysis and LR regime
+empirically. All measurements are **single-GPU**.
+
+**Part 1 — Throughput curve:**
 
 ```python
 for batch_size in [32, 128, 256, 512, 1024, 2048, 4096]:
@@ -84,48 +105,77 @@ for batch_size in [32, 128, 256, 512, 1024, 2048, 4096]:
     # - wall time per step (ms)
     # - tokens per second
     # - peak GPU memory (GB)
-    # - projected seconds for full 10B token sweep
+    # - projected seconds for full 10B token sweep (1 GPU)
 ```
 
-Measure on 1 GPU first, then 4 GPU data parallel.
+**Part 2 — LR stability screen:**
 
-**Go/no-go:** Full 10B sweep in ≤ 400s at some feasible batch size,
-leaving ≥ 200s for targeted training.
+At the largest feasible batch size from Part 1, run 200 training
+steps with 3 LR candidates:
+
+- Linear-scaled: base_lr × (large_batch / 32)
+- Square-root-scaled: base_lr × sqrt(large_batch / 32)
+- Fixed: base_lr (no scaling)
+
+Check for: NaN, loss divergence, loss that fails to decrease.
+This takes ~3 minutes and prevents wasting a full Phase A run on
+a broken LR regime.
+
+**Go/no-go:**
+1. Full 10B sweep in ≤ 400s on 1 GPU at some feasible batch size,
+   OR partial sweep (≥ 50% coverage) in ≤ 400s with a clear path
+   to testing the targeting hypothesis.
+2. At least one LR candidate produces stable, decreasing loss at
+   the large batch size for 200 steps.
 
 ### Phase A: Sweep + Target
 
 The model is the existing fast SP8192 + diag SSM with compiled scan.
 No architecture changes. The only variable is data strategy.
 
-**Step 1 — Sweep (large batch, full dataset, ~400s)**
+**Step 1 — Sweep (large batch, ~400s)**
 
-- Set batch to the largest size from Phase 0 that fits in VRAM
-- Process all 10B tokens in one pass with normal training (gradients
-  on, optimizer stepping)
-- Record per-sequence loss at end of sweep
+- Set batch to the largest feasible size from Phase 0
+- Use LR regime validated in Phase 0 Part 2
+- Process the full dataset (or largest feasible fraction) with
+  gradients on, optimizer stepping
 - The model is partially trained after this — it has seen everything
-  once
+  (or most of it) once
 
-Learning rate scaling: follow the linear scaling rule. If base LR is
-2e-3 at batch=32, then at batch=1024 use LR = 2e-3 × (1024/32) =
-6.4e-2, with proportional warmup.
+**Step 1.5 — Rescore (frozen model, ~30-60s)**
+
+After the sweep, freeze the model and do a fast forward-only pass
+over all training sequences at maximum batch size. Record per-sequence
+loss using the **end-of-sweep model weights**. This eliminates
+time-bias: losses from early-sweep sequences were scored by a weaker
+model. Rescoring with the final snapshot ensures all sequences are
+ranked by the same model.
+
+The rescore pass is forward-only (no gradients), so it runs faster
+than the sweep. At the same batch size, ~50% of sweep time (no
+backward pass). Budget accordingly.
 
 **Step 2 — Target (normal batch, hard examples, remaining time)**
 
-- Rank all sequences by loss from Step 1
+- Rank all sequences by rescored loss (Step 1.5)
 - Filter: keep sequences where loss > threshold (top N%)
 - Train on this subset at batch=32 with base LR for remaining time
 - Normal training with gradient clipping, same as current recipe
+
+**Coverage definition:** "See all 10B tokens" means generating
+non-overlapping start indices with stride=seq_len (512), producing
+~19.5M windows of 512 tokens each. No overlapping windows during
+the sweep. Coverage is measured as unique prediction targets scored.
 
 **Conditions (5 conditions × 7 seeds = 35 runs):**
 
 | Condition | Description |
 |---|---|
 | baseline_b32 | Standard training, batch=32, 600s, random sampling |
-| sweep_only | Large batch, full dataset, 600s, no targeting phase |
-| sweep_target_top25 | Sweep + retrain on top 25% by loss |
-| sweep_target_top10 | Sweep + retrain on top 10% by loss |
-| sweep_target_top5 | Sweep + retrain on top 5% by loss |
+| sweep_only | Large batch, full dataset, sweep fills 600s. If sweep finishes early, continue training on the same data in a second pass (no targeting, no idle time). |
+| sweep_target_top25 | Sweep + rescore + retrain on top 25% by rescored loss |
+| sweep_target_top10 | Sweep + rescore + retrain on top 10% by rescored loss |
+| sweep_target_top5 | Sweep + rescore + retrain on top 5% by rescored loss |
 
 All conditions: same model, same total wall time (600s), same SP8192
 data, 7 seeds.
@@ -152,11 +202,13 @@ data, 7 seeds.
 
 | Risk | Mitigation |
 |---|---|
-| Large batch hurts convergence | Linear LR scaling rule; sweep_only condition tests this directly |
+| Large batch hurts convergence | Phase 0 Part 2 screens 3 LR candidates; sweep_only condition tests this directly |
 | High-loss sequences are noise | Compare targeting percentages; if top5 is worse than top25, aggressive targeting overfits to noise |
-| Sweep takes > 400s | Phase 0 benchmark gates this; don't proceed if infeasible |
-| LR scaling is wrong for SSMs | Phase 0 can test a few LR values at large batch |
+| Sweep takes > 400s on 1 GPU | Phase 0 benchmark gates this; accept partial coverage if full sweep is infeasible |
+| LR scaling is wrong for SSMs | Phase 0 Part 2 tests linear, sqrt, and fixed scaling before committing |
 | Memory overflow at large batch | Phase 0 measures VRAM; gradient checkpointing if needed |
+| Time-biased loss scoring | Post-sweep rescore pass with frozen model eliminates model-age confound |
+| Rescore pass takes too long | Forward-only at max batch; budget ~30-60s; if too slow, reduce rescore coverage to 50% |
 
 ### What Exp 16 Told Us About This
 
