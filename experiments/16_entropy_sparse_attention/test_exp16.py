@@ -2,6 +2,7 @@
 """Tests for the Experiment 16 Phase A scaffold."""
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 
@@ -17,6 +18,7 @@ from runner_exp16 import (
     collect_oracle_examples,
     train_selector_probe,
 )
+import run_exp16
 
 
 def test_build_model_shapes():
@@ -164,3 +166,41 @@ def test_content_oracle_selector_masks_invalid_slots():
     scores = selector(queries, keys, mask)
     assert torch.isfinite(scores[:, :2]).all()
     assert (scores[0, 2:] < -1e8).all()
+
+
+def test_summarize_results_prefers_best_passing_condition(tmp_path):
+    original_results = run_exp16.RESULTS
+    run_exp16.RESULTS = tmp_path
+    try:
+        conditions = {
+            "raw_mass_winner_fails_gate": {"sparse_attn_k": 8},
+            "lower_mass_but_passes": {"sparse_attn_k": 8},
+        }
+        failing_probe = {
+            "selector_mass_capture_at_k": 0.72,
+            "selector_recall_at_k": 0.70,
+            "effective_connections": 8.0,
+            "recent_mass_capture_at_k": 0.60,
+            "token_keyed_mass_capture_at_k": 0.75,
+        }
+        passing_probe = {
+            "selector_mass_capture_at_k": 0.68,
+            "selector_recall_at_k": 0.66,
+            "effective_connections": 5.0,
+            "recent_mass_capture_at_k": 0.50,
+            "token_keyed_mass_capture_at_k": 0.52,
+        }
+        for seed in run_exp16.SWEEP_SEEDS[:3]:
+            (tmp_path / f"raw_mass_winner_fails_gate_s{seed}.json").write_text(
+                json.dumps({"oracle_probe": failing_probe})
+            )
+            (tmp_path / f"lower_mass_but_passes_s{seed}.json").write_text(
+                json.dumps({"oracle_probe": passing_probe})
+            )
+
+        summary = run_exp16.summarize_results(conditions)
+        assert summary["_decision"]["best_condition"] == "lower_mass_but_passes"
+        assert summary["_decision"]["n_passing_conditions"] == 1
+        assert summary["_decision"]["all_gates_pass"] is True
+    finally:
+        run_exp16.RESULTS = original_results

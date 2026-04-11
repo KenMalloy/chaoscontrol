@@ -65,10 +65,21 @@ def _base(**overrides: Any) -> dict[str, Any]:
 
 
 CONDITIONS = {
+    # Buffer size × k sweep (all x_state)
     "oracle_buf64_k4": _base(sparse_attn_buffer_size=64, sparse_attn_k=4),
     "oracle_buf64_k8": _base(sparse_attn_buffer_size=64, sparse_attn_k=8),
     "oracle_buf128_k4": _base(sparse_attn_buffer_size=128, sparse_attn_k=4),
     "oracle_buf128_k8": _base(sparse_attn_buffer_size=128, sparse_attn_k=8),
+    # Feature-source ablations at buf128_k8: answers the central question
+    # "does recurrent state add selector value beyond non-SSM features?"
+    "oracle_buf128_k8_xonly": _base(
+        sparse_attn_buffer_size=128, sparse_attn_k=8,
+        oracle_query_source="x", oracle_write_source="x",
+    ),
+    "oracle_buf128_k8_stateonly": _base(
+        sparse_attn_buffer_size=128, sparse_attn_k=8,
+        oracle_query_source="state", oracle_write_source="state",
+    ),
 }
 
 
@@ -135,6 +146,10 @@ def launch_matrix(
             time.sleep(2.0)
 
 
+def _mean(vals: list[float]) -> float:
+    return sum(vals) / len(vals) if vals else 0.0
+
+
 def summarize_results(conditions: dict[str, dict[str, Any]]) -> dict[str, Any]:
     summary: dict[str, Any] = {}
     rows: list[dict[str, Any]] = []
@@ -146,64 +161,128 @@ def summarize_results(conditions: dict[str, dict[str, Any]]) -> dict[str, Any]:
         mass_values: list[float] = []
         recall_values: list[float] = []
         eff_values: list[float] = []
+        recent_mass_values: list[float] = []
         tk_mass_values: list[float] = []
-        tk_recall_values: list[float] = []
+        # Per-seed deltas: selector minus baseline
+        delta_recent: list[float] = []
+        delta_tk: list[float] = []
         for file in files:
             data = json.loads(file.read_text())
             probe = data["oracle_probe"]
-            mass_values.append(float(probe["selector_mass_capture_at_k"]))
+            sel_mass = float(probe["selector_mass_capture_at_k"])
+            rec_mass = float(probe.get("recent_mass_capture_at_k", 0.0))
+            tk_mass = float(probe.get("token_keyed_mass_capture_at_k", 0.0))
+            mass_values.append(sel_mass)
             recall_values.append(float(probe["selector_recall_at_k"]))
             eff_values.append(float(probe["effective_connections"]))
-            tk_mass_values.append(float(probe.get("token_keyed_mass_capture_at_k", 0.0)))
-            tk_recall_values.append(float(probe.get("token_keyed_recall_at_k", 0.0)))
-        mean_mass = sum(mass_values) / len(mass_values)
+            recent_mass_values.append(rec_mass)
+            tk_mass_values.append(tk_mass)
+            delta_recent.append(sel_mass - rec_mass)
+            delta_tk.append(sel_mass - tk_mass)
         ci = bootstrap_ci(mass_values)
         rows.append({
             "name": condition_name,
-            "mean_mass": mean_mass,
+            "mean_mass": _mean(mass_values),
             "se_mass": sem(mass_values),
             "ci": ci,
             "mass_values": mass_values,
             "recall_values": recall_values,
             "eff_values": eff_values,
+            "recent_mass_values": recent_mass_values,
             "tk_mass_values": tk_mass_values,
-            "tk_recall_values": tk_recall_values,
+            "delta_recent": delta_recent,
+            "delta_tk": delta_tk,
         })
 
     rows.sort(key=lambda row: row["mean_mass"], reverse=True)
     if not rows:
         return summary
 
-    print("\nRanked by selector mass capture@k")
-    print("  condition              mean_mass    sem               95% CI        mean_recall   mean_eff_conn  tk_mass@k")
+    # --- Table 1: per-condition selector mass and baseline deltas ---
+    print("\nPer-condition results (ranked by selector mass capture@k)")
+    print(f"  {'condition':<30} {'sel_mass':>9} {'recent':>9} {'tk':>9} "
+          f"{'sel-recent':>11} {'sel-tk':>11} {'eff_conn':>9}")
     for row in rows:
-        mean_recall = sum(row["recall_values"]) / len(row["recall_values"])
-        mean_eff = sum(row["eff_values"]) / len(row["eff_values"])
-        mean_tk_mass = sum(row["tk_mass_values"]) / len(row["tk_mass_values"])
+        mean_sel = row["mean_mass"]
+        mean_rec = _mean(row["recent_mass_values"])
+        mean_tk = _mean(row["tk_mass_values"])
+        mean_dr = _mean(row["delta_recent"])
+        mean_dt = _mean(row["delta_tk"])
+        mean_eff = _mean(row["eff_values"])
         print(
-            f"  {row['name']:<20} {row['mean_mass']:9.4f} {row['se_mass']:7.4f} "
-            f"[{row['ci'][0]:.4f}, {row['ci'][1]:.4f}] {mean_recall:12.4f} "
-            f"{mean_eff:14.4f} {mean_tk_mass:10.4f}"
+            f"  {row['name']:<30} {mean_sel:9.4f} {mean_rec:9.4f} {mean_tk:9.4f} "
+            f"{mean_dr:+11.4f} {mean_dt:+11.4f} {mean_eff:9.2f}"
         )
         summary[row["name"]] = {
-            "mean_mass_capture_at_k": row["mean_mass"],
+            "mean_mass_capture_at_k": mean_sel,
             "sem_mass_capture_at_k": row["se_mass"],
             "ci_95_mass_capture_at_k": row["ci"],
-            "mean_recall_at_k": mean_recall,
+            "mean_recall_at_k": _mean(row["recall_values"]),
             "mean_effective_connections": mean_eff,
-            "mean_token_keyed_mass_capture_at_k": mean_tk_mass,
-            "mean_token_keyed_recall_at_k": sum(row["tk_recall_values"]) / len(row["tk_recall_values"]),
+            "mean_recent_mass_capture_at_k": mean_rec,
+            "mean_token_keyed_mass_capture_at_k": mean_tk,
+            "mean_delta_vs_recent": mean_dr,
+            "mean_delta_vs_token_keyed": mean_dt,
             "n_seeds": len(row["mass_values"]),
         }
 
-    if len(rows) > 1:
-        _, p = welch_ttest(rows[0]["mass_values"], rows[1]["mass_values"])
-        summary["_decision"] = {
-            "winner": rows[0]["name"],
-            "runner_up": rows[1]["name"],
-            "winner_vs_runner_up_p": p,
-        }
-        print(f"\nWinner vs runner-up p-value: {p:.4g}")
+    # --- Selector vs baseline significance tests ---
+    print("\nSelector vs baseline tests (paired per-seed deltas)")
+    for row in rows:
+        name = row["name"]
+        if not row["delta_recent"]:
+            continue
+        dr = row["delta_recent"]
+        dt = row["delta_tk"]
+        # One-sample test: is the per-seed delta > 0?
+        if len(dr) >= 3:
+            _, p_rec = welch_ttest(dr, [0.0] * len(dr))
+            print(f"  {name:<30} sel-recent: {_mean(dr):+.4f} (p={p_rec:.4g})")
+        if len(dt) >= 3:
+            _, p_tk = welch_ttest(dt, [0.0] * len(dt))
+            print(f"  {'':<30} sel-tk:     {_mean(dt):+.4f} (p={p_tk:.4g})")
+
+    # --- Feature-source comparison (if ablations ran) ---
+    xstate_rows = [r for r in rows if "xonly" not in r["name"] and "stateonly" not in r["name"]]
+    xonly_rows = [r for r in rows if "xonly" in r["name"]]
+    stateonly_rows = [r for r in rows if "stateonly" in r["name"]]
+    if xstate_rows and (xonly_rows or stateonly_rows):
+        print("\nFeature-source ablation (buf128_k8)")
+        ref = next((r for r in xstate_rows if "buf128_k8" in r["name"]), xstate_rows[0])
+        for ablation in xonly_rows + stateonly_rows:
+            if len(ref["mass_values"]) >= 3 and len(ablation["mass_values"]) >= 3:
+                _, p = welch_ttest(ref["mass_values"], ablation["mass_values"])
+                diff = ref["mean_mass"] - ablation["mean_mass"]
+                print(f"  x_state vs {ablation['name'].split('_')[-1]}: "
+                      f"delta={diff:+.4f} (p={p:.4g})")
+
+    # --- Go/no-go decision ---
+    gated_rows: list[dict[str, Any]] = []
+    for row in rows:
+        k = conditions[row["name"]].get("sparse_attn_k", 8)
+        gate_mass = row["mean_mass"] >= 0.60
+        gate_beats_recent = _mean(row["delta_recent"]) > 0
+        gate_beats_tk = _mean(row["delta_tk"]) > 0
+        gate_eff_conn = _mean(row["eff_values"]) <= 2 * k
+        if gate_mass and gate_beats_recent and gate_beats_tk and gate_eff_conn:
+            gated_rows.append(row)
+
+    best = gated_rows[0] if gated_rows else rows[0]
+    gate_mass = best["mean_mass"] >= 0.60
+    gate_beats_recent = _mean(best["delta_recent"]) > 0
+    gate_beats_tk = _mean(best["delta_tk"]) > 0
+    gate_eff_conn = _mean(best["eff_values"]) <= 2 * conditions[best["name"]].get("sparse_attn_k", 8)
+    summary["_decision"] = {
+        "best_condition": best["name"],
+        "gate_mass_capture_ge_0.60": gate_mass,
+        "gate_beats_recent_k": gate_beats_recent,
+        "gate_beats_token_keyed": gate_beats_tk,
+        "gate_effective_connections": gate_eff_conn,
+        "n_passing_conditions": len(gated_rows),
+        "all_gates_pass": gate_mass and gate_beats_recent and gate_beats_tk and gate_eff_conn,
+    }
+    print(f"\nGo/no-go: mass>={0.60}: {gate_mass} | beats recent: {gate_beats_recent} | "
+          f"beats token_keyed: {gate_beats_tk} | eff_conn: {gate_eff_conn}")
     return summary
 
 

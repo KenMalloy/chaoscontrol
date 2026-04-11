@@ -100,6 +100,51 @@ class ChaosSSMCore(nn.Module):
         A_c = S - gamma * torch.eye(self.dim, device=S.device, dtype=S.dtype) + self.U @ self.V.T
         return A_c
 
+    def _diag_terms(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Compute per-timestep decay, update, and output gate terms for diag mode.
+
+        This helper is used by the vectorized scan backend for the common
+        `rich_b is None` path. The recurrence is:
+
+            state_t = decay_t * state_{t-1} + update_t
+
+        with `state_{-1} = 0`.
+        """
+        a_base = torch.sigmoid(self.log_a).to(dtype=x.dtype)[None, None, :]
+        delta = F.softplus(self.delta_proj(x)).clamp_min(1e-4)
+        decay = torch.exp(-delta * a_base)
+        select = torch.sigmoid(self.select_proj(x))
+        candidate = torch.tanh(self.in_proj(x))
+        update = select * candidate
+        gate = torch.sigmoid(self.gate_proj(x))
+        return decay, update, gate
+
+    def _forward_diag_scan(self, x: torch.Tensor) -> torch.Tensor:
+        """Vectorized diag recurrence using cumprod/cumsum instead of a Python loop.
+
+        For the elementwise recurrence
+
+            state_t = decay_t * state_{t-1} + update_t,  state_{-1}=0
+
+        the closed form is
+
+            state_t = prefix_t * sum_{i<=t} update_i / prefix_i
+
+        where prefix_t = prod_{j<=t} decay_j.
+
+        The computation is carried out in float32 for stability, then cast
+        back to the input dtype before the output projection.
+        """
+        decay, update, gate = self._diag_terms(x)
+        decay_f = decay.float().clamp_min(1e-8)
+        update_f = update.float()
+
+        log_prefix = torch.cumsum(torch.log(decay_f), dim=1)
+        prefix = torch.exp(log_prefix)
+        state = prefix * torch.cumsum(update_f / prefix, dim=1)
+        out = gate * state.to(dtype=x.dtype)
+        return self.out_proj(out)
+
     def step(
         self,
         inp: torch.Tensor,
@@ -187,6 +232,11 @@ class ChaosSSMCore(nn.Module):
         outputs = []
 
         if self.a_mode == "diag":
+            if rich_b is None:
+                y = self._forward_diag_scan(x)
+                if return_jacobian_stats:
+                    return y, {"lambda_max": torch.tensor(0.0), "sv_log_var": torch.tensor(0.0)}
+                return y
             a_base = torch.sigmoid(self.log_a).to(dtype=x.dtype)[None, :]
             for idx in range(seq):
                 inp = x[:, idx, :]

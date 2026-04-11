@@ -23,6 +23,31 @@ class TestChaosSSMCore(unittest.TestCase):
         y2 = core(x)
         assert torch.allclose(y1, y2)
 
+    def test_diag_scan_matches_closed_loop_reference(self) -> None:
+        """Vectorized diag path should match an explicit recurrence rollout."""
+        torch.manual_seed(7)
+        core = ChaosSSMCore(dim=16, a_mode="diag")
+        x = torch.randn(3, 11, 16)
+
+        y_scan = core(x)
+
+        a_base = torch.sigmoid(core.log_a)[None, :]
+        state = torch.zeros(3, 16)
+        outputs = []
+        for idx in range(x.shape[1]):
+            inp = x[:, idx, :]
+            delta = torch.nn.functional.softplus(core.delta_proj(inp)).clamp_min(1e-4)
+            decay = torch.exp(-delta * a_base)
+            select = torch.sigmoid(core.select_proj(inp))
+            candidate = torch.tanh(core.in_proj(inp))
+            update = select * candidate
+            state = decay * state + update
+            out = torch.sigmoid(core.gate_proj(inp)) * state
+            outputs.append(core.out_proj(out))
+        y_ref = torch.stack(outputs, dim=1)
+
+        assert torch.allclose(y_scan, y_ref, atol=1e-5), f"max diff: {(y_scan - y_ref).abs().max()}"
+
     def test_paired_output_shape(self) -> None:
         core = ChaosSSMCore(dim=16, a_mode="paired")
         x = torch.randn(2, 8, 16)
@@ -152,6 +177,38 @@ class TestChaosSSMCoreStep(unittest.TestCase):
         out, new_state = core.step(inp, state)
         assert out.shape == (2, 16)
         assert new_state.shape == (2, 16)
+
+    def test_diag_scan_gradient_matches_step_reference(self):
+        """Diag scan backend should preserve gradients for the common bare path."""
+        torch.manual_seed(123)
+        core_scan = ChaosSSMCore(dim=8, a_mode="diag")
+        core_ref = ChaosSSMCore(dim=8, a_mode="diag")
+        core_ref.load_state_dict(core_scan.state_dict())
+
+        x_scan = torch.randn(2, 6, 8, requires_grad=True)
+        x_ref = x_scan.detach().clone().requires_grad_(True)
+
+        y_scan = core_scan(x_scan)
+        loss_scan = y_scan.pow(2).mean()
+        loss_scan.backward()
+
+        state = torch.zeros(2, 8)
+        outputs = []
+        for t in range(x_ref.shape[1]):
+            out, state = core_ref.step(x_ref[:, t, :], state)
+            outputs.append(out)
+        y_ref = torch.stack(outputs, dim=1)
+        loss_ref = y_ref.pow(2).mean()
+        loss_ref.backward()
+
+        assert torch.allclose(x_scan.grad, x_ref.grad, atol=1e-5), \
+            f"input grad max diff: {(x_scan.grad - x_ref.grad).abs().max()}"
+        for name, p_scan in core_scan.named_parameters():
+            p_ref = dict(core_ref.named_parameters())[name]
+            assert p_scan.grad is not None
+            assert p_ref.grad is not None
+            assert torch.allclose(p_scan.grad, p_ref.grad, atol=1e-5), \
+                f"{name} grad max diff: {(p_scan.grad - p_ref.grad).abs().max()}"
 
 
 if __name__ == "__main__":

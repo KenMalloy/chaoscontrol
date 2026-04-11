@@ -460,13 +460,15 @@ def train_selector_probe(
 
     selector.eval()
     with torch.no_grad():
-        scores = selector(
-            queries.to(device),
-            candidate_keys.to(device),
-            mask.to(device),
-        )
-        metrics = _batched_metrics(scores, target_probs.to(device), mask.to(device), k=k)
+        q_val = queries[val_idx].to(device)
+        k_val = candidate_keys[val_idx].to(device)
+        m_val = mask[val_idx].to(device)
+        tgt_val = target_probs[val_idx].to(device)
+        scores = selector(q_val, k_val, m_val)
+        metrics = _batched_metrics(scores, tgt_val, m_val, k=k)
     metrics["val_kl"] = best_val
+    metrics["n_train_examples"] = len(train_idx)
+    metrics["n_val_examples"] = len(val_idx)
     return metrics
 
 
@@ -597,6 +599,8 @@ def run_single(
             "selector_mass_capture_at_k": selector_metrics["mass_capture_at_k"],
             "oracle_entropy": selector_metrics["oracle_entropy"],
             "selector_val_kl": selector_metrics["val_kl"],
+            "selector_n_train_examples": selector_metrics["n_train_examples"],
+            "selector_n_val_examples": selector_metrics["n_val_examples"],
         },
         "implemented_metrics": [
             "bare_eval_bpb",

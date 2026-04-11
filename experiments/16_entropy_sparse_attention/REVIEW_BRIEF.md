@@ -287,10 +287,15 @@ The clean reporting standard is:
 Provisional criteria:
 
 1. `selector_mass_capture_at_k >= 0.60` for at least one condition,
-2. `selector_mass_capture_at_k > recent_mass_capture_at_k`,
-3. `effective_connections <= 2 * k`,
-4. ideally, the strongest recurrent-state variant also beats at least one
-   cheap non-SSM baseline.
+2. `selector_mass_capture_at_k > recent_mass_capture_at_k` (beats recency),
+3. `selector_mass_capture_at_k > token_keyed_mass_capture_at_k` (beats
+   token identity),
+4. `effective_connections <= 2 * k`.
+
+The summary reports paired per-seed deltas (`selector - recent_k`,
+`selector - token_keyed`) with significance tests. The feature-source
+ablation (`x_state` vs `x_only` vs `state_only` at buf128_k8) directly
+tests whether recurrent state adds selector value.
 
 ### For the later online architecture
 

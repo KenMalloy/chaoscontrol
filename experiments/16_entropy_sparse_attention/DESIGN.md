@@ -263,14 +263,22 @@ survives contact with data.
 
 ## Phase A Conditions
 
-The matrix launcher scaffolds the originally proposed four conditions:
+The matrix launcher runs six conditions: four sweep buffer size × k at the
+default `x_state` feature source, and two ablate the feature source at the
+largest operating point to answer the central question.
 
-| Condition | buffer_size | k |
-|---|---:|---:|
-| `oracle_buf64_k4` | 64 | 4 |
-| `oracle_buf64_k8` | 64 | 8 |
-| `oracle_buf128_k4` | 128 | 4 |
-| `oracle_buf128_k8` | 128 | 8 |
+| Condition | buffer_size | k | query/write source |
+|---|---:|---:|---|
+| `oracle_buf64_k4` | 64 | 4 | x_state |
+| `oracle_buf64_k8` | 64 | 8 | x_state |
+| `oracle_buf128_k4` | 128 | 4 | x_state |
+| `oracle_buf128_k8` | 128 | 8 | x_state |
+| `oracle_buf128_k8_xonly` | 128 | 8 | x (post-SSM residual only) |
+| `oracle_buf128_k8_stateonly` | 128 | 8 | state (recurrence only) |
+
+The `x_only` vs `state_only` vs `x_state` comparison at matched buf/k
+directly answers whether recurrent state adds selector value beyond
+non-SSM features.
 
 All conditions inherit the Exp 15 winner backbone:
 
@@ -288,9 +296,15 @@ Because the current runner measures oracle quality rather than LM lift, the
 Phase A scaffold uses probe-level criteria:
 
 1. `selector_mass_capture_at_k >= 0.60` for at least one condition
-2. `selector_mass_capture_at_k > recent_mass_capture_at_k` for at least one
-   condition
-3. `effective_connections <= 2 * k` for at least one promising condition
+2. `selector_mass_capture_at_k > recent_mass_capture_at_k` (selector beats
+   recency baseline)
+3. `selector_mass_capture_at_k > token_keyed_mass_capture_at_k` (selector
+   beats token-identity baseline)
+4. `effective_connections <= 2 * k` for at least one promising condition
+
+The summary logic reports per-seed paired deltas (`selector - recent_k`,
+`selector - token_keyed`) with significance tests, not just raw mass
+capture rankings across conditions.
 
 These are provisional gate criteria for the probe stage. Once the sparse
 attention path is integrated into the model, we can reinstate the original
