@@ -167,7 +167,22 @@ non-overlapping start indices with stride=seq_len (512), producing
 ~19.5M windows of 512 tokens each. No overlapping windows during
 the sweep. Coverage is measured as unique prediction targets scored.
 
-**Conditions (5 conditions × 7 seeds = 35 runs):**
+**Budget accounting:** All phases count against the 600s wall clock.
+No free bookkeeping time. A practical budget shape:
+
+```
+~400s  sweep (large batch, gradients on)
+ ~45s  post-sweep rescore (frozen, forward-only, max batch)
+  ~5s  rank/filter/build subset
+~150s  retarget (batch=32, base LR)
+-----
+ 600s  total
+```
+
+If rescoring costs more than expected, that is a real finding about
+the strategy's overhead, not an inconvenience to work around.
+
+**Conditions (6 conditions × 7 seeds = 42 runs):**
 
 | Condition | Description |
 |---|---|
@@ -176,6 +191,14 @@ the sweep. Coverage is measured as unique prediction targets scored.
 | sweep_target_top25 | Sweep + rescore + retrain on top 25% by rescored loss |
 | sweep_target_top10 | Sweep + rescore + retrain on top 10% by rescored loss |
 | sweep_target_top5 | Sweep + rescore + retrain on top 5% by rescored loss |
+| sweep_random_retrain | Sweep + rescore + retrain on a **random** 10% subset (same size as top10, same overhead) |
+
+`sweep_random_retrain` is the critical control. It pays the same
+wall-clock cost as `sweep_target_top10` (sweep + rescore + filter +
+retrain) but selects a random subset instead of the hardest examples.
+If `sweep_target_top10` beats `sweep_random_retrain`, the hardness
+signal itself is earning its keep. If both beat `sweep_only` equally,
+the value is in the two-phase structure, not in targeting.
 
 All conditions: same model, same total wall time (600s), same SP8192
 data, 7 seeds.
@@ -186,6 +209,7 @@ data, 7 seeds.
 |---|---|
 | sweep_only vs baseline_b32 | Does seeing all data once beat random sampling? |
 | sweep_target_* vs sweep_only | Does curriculum focus add value beyond coverage? |
+| sweep_target_top10 vs sweep_random_retrain | Does **hardness selection** matter, or just the two-phase structure? |
 | top25 vs top10 vs top5 | How aggressive should targeting be? |
 | baseline_b32 vs all others | Is the entire throughput strategy better than standard training? |
 
