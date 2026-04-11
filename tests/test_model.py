@@ -133,5 +133,38 @@ class TestChaosStudentLM(unittest.TestCase):
         assert model.posterior is None
 
 
+class TestChaosSSMHybridBlock(unittest.TestCase):
+    def test_hybrid_block_forward_shape(self) -> None:
+        from chaoscontrol.model import ChaosSSMHybridBlock
+        block = ChaosSSMHybridBlock(
+            dim=32, ff_mult=2, a_mode="diag",
+            local_attn_window=8, local_attn_heads=1, local_attn_dim=16,
+        )
+        x = torch.randn(2, 12, 32)
+        y = block(x)
+        assert y.shape == (2, 12, 32)
+
+    def test_hybrid_block_step_shape(self) -> None:
+        from chaoscontrol.model import ChaosSSMHybridBlock
+        block = ChaosSSMHybridBlock(
+            dim=32, ff_mult=2, a_mode="diag",
+            local_attn_window=8, local_attn_heads=1, local_attn_dim=16,
+        )
+        state = torch.zeros(2, 32)
+        x = torch.randn(2, 32)
+        out, new_state = block.step(x, state)
+        assert out.shape == (2, 32)
+        assert new_state.shape == (2, 32)
+
+    def test_hybrid_block_gate_starts_near_zero(self) -> None:
+        from chaoscontrol.model import ChaosSSMHybridBlock
+        block = ChaosSSMHybridBlock(
+            dim=32, ff_mult=2, a_mode="diag",
+            local_attn_window=8, local_attn_heads=1, local_attn_dim=16,
+        )
+        # gate_bias initialized to -4, sigmoid(-4) ~ 0.018
+        assert block.gate_bias.item() < -3.0
+
+
 if __name__ == "__main__":
     unittest.main()

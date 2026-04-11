@@ -7,6 +7,7 @@ import torch
 import torch.nn as nn
 
 from chaoscontrol.core import RMSNorm, FeedForward, ChaosSSMCore
+from chaoscontrol.local_attn import LocalAttention, RollingKVCache
 from chaoscontrol.routing import RichBNN, DistributedB
 from chaoscontrol.memory import OuterModel, MultiSlotOuterModel, SemanticTier, BucketPrototypes
 from chaoscontrol.posterior import GlobalDelta, BucketDelta, ResidualCache
@@ -87,6 +88,90 @@ class ChaosSSMBlock(nn.Module):
         if return_jacobian_stats:
             return x, stats
         return x
+
+
+class ChaosSSMHybridBlock(nn.Module):
+    """SSM block with local attention sidecar.
+
+    Structure: input_norm -> SSM -> local_attn (gated) -> ff_norm -> FF -> residual.
+    The attention sidecar queries a rolling KV cache of recent positions.
+    Gate initialized near-zero so the block starts as a pure SSM block.
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        ff_mult: int = 2,
+        *,
+        a_mode: str = "diag",
+        a_full_rank: int = 8,
+        a_full_gamma: float = 0.05,
+        local_attn_window: int = 64,
+        local_attn_heads: int = 1,
+        local_attn_dim: int = 64,
+    ) -> None:
+        super().__init__()
+        self.input_norm = RMSNorm(dim)
+        self.ff_norm = RMSNorm(dim)
+        self.ff = FeedForward(dim, ff_mult)
+        self.core = ChaosSSMCore(
+            dim, a_mode=a_mode, a_full_rank=a_full_rank,
+            a_full_gamma=a_full_gamma,
+        )
+        self.rich_b = None  # compatibility with ChaosSSMBlock
+
+        # Local attention sidecar
+        self.local_attn_window = local_attn_window
+        self.local_attn_dim = local_attn_dim
+        self.local_attn = LocalAttention(dim, local_attn_dim, local_attn_heads)
+        self.k_proj = nn.Linear(dim, local_attn_dim, bias=False)
+        self.v_proj = nn.Linear(dim, local_attn_dim, bias=False)
+        self.gate_proj = nn.Linear(dim, 1, bias=False)
+        self.gate_bias = nn.Parameter(torch.tensor(-4.0))
+
+    def _init_kv_cache(self) -> RollingKVCache:
+        return RollingKVCache(self.local_attn_window, self.local_attn_dim)
+
+    def step(
+        self,
+        x: torch.Tensor,
+        state: torch.Tensor,
+        *,
+        kv_cache: RollingKVCache | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        normed = self.input_norm(x)
+        y, new_state = self.core.step(normed, state)
+        x_ssm = x + y
+
+        if kv_cache is not None:
+            keys, values, mask = kv_cache.last(self.local_attn_window)
+            if mask.any():
+                attn_out = self.local_attn(x_ssm, keys, values, mask)
+                gate = torch.sigmoid(self.gate_proj(x_ssm) + self.gate_bias)
+                x_ssm = x_ssm + gate * attn_out
+            kv_cache.write(self.k_proj(x_ssm), self.v_proj(x_ssm))
+
+        x_out = x_ssm + self.ff(self.ff_norm(x_ssm))
+        return x_out, new_state
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        *,
+        return_jacobian_stats: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, dict]:
+        """Sequence-level forward. Processes token-by-token for KV cache."""
+        batch, seq, dim = x.shape
+        kv_cache = self._init_kv_cache()
+        state = x.new_zeros((batch, dim))
+        outputs = []
+        for t in range(seq):
+            out, state = self.step(x[:, t], state, kv_cache=kv_cache)
+            outputs.append(out)
+        y = torch.stack(outputs, dim=1)
+        if return_jacobian_stats:
+            return y, {"lambda_max": torch.tensor(0.0), "sv_log_var": torch.tensor(0.0)}
+        return y
 
 
 class ChaosStudentLM(nn.Module):
