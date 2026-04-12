@@ -220,6 +220,72 @@ def evaluate_bpb_sp(
     }
 
 
+def compute_gate_stats(
+    model: Any,
+    *,
+    tokens: torch.Tensor,
+    eval_starts: list[int],
+    batch_size: int,
+    seq_len: int,
+    device: torch.device,
+) -> list[dict[str, float]]:
+    """Compute gate statistics for each hybrid block.
+
+    Records final gate_bias and mean sigmoid(gate_proj(x_ssm) + gate_bias)
+    on a single eval batch. Used to distinguish "gate never opened"
+    (gate stays near sigmoid(-4) = 0.018) from "attention learned to
+    activate" cases when interpreting top-k results.
+    """
+    hybrid_layers = [
+        (i, layer)
+        for i, layer in enumerate(model.layers)
+        if isinstance(layer, ChaosSSMHybridBlock)
+    ]
+    if not hybrid_layers:
+        return []
+
+    # Grab first eval batch for a representative gate sample
+    batch_starts = eval_starts[:batch_size]
+    if not batch_starts:
+        return [
+            {
+                "layer_idx": i,
+                "final_gate_bias": float(layer.gate_bias.item()),
+                "mean_gate_value": float("nan"),
+            }
+            for i, layer in hybrid_layers
+        ]
+    inputs, _ = batch_from_starts(tokens, batch_starts, seq_len, device)
+
+    stats: list[dict[str, float]] = []
+    was_training = model.training
+    model.eval()
+    with torch.no_grad():
+        # Run forward through early layers to compute x_ssm at each hybrid block
+        x = model.embed(inputs)
+        for i, layer in enumerate(model.layers):
+            if isinstance(layer, ChaosSSMHybridBlock):
+                normed = layer.input_norm(x)
+                ssm_out = layer.core.forward(normed)
+                x_ssm = x + ssm_out
+                gate = torch.sigmoid(
+                    layer.gate_proj(x_ssm) + layer.gate_bias
+                )
+                stats.append({
+                    "layer_idx": i,
+                    "final_gate_bias": float(layer.gate_bias.item()),
+                    "mean_gate_value": float(gate.mean().item()),
+                    "max_gate_value": float(gate.max().item()),
+                })
+                # Continue propagation through this layer for downstream hybrid blocks
+                x = layer(x)
+            else:
+                x = layer(x)
+    if was_training:
+        model.train()
+    return stats
+
+
 def build_model(config: dict[str, Any], device: torch.device, param_dtype: torch.dtype) -> ChaosStudentLM:
     """Build bare or hybrid fast SP-SSM for Exp 17."""
     model = ChaosStudentLM(
@@ -341,6 +407,15 @@ def run_single(
         is_boundary_token_lut=is_boundary_token_lut,
     )
 
+    gate_stats = compute_gate_stats(
+        model,
+        tokens=val_tokens,
+        eval_starts=eval_starts,
+        batch_size=batch_size,
+        seq_len=seq_len,
+        device=device,
+    )
+
     result = {
         "config": config,
         "params": model_params,
@@ -348,6 +423,7 @@ def run_single(
         "train": train_summary,
         "eval": eval_result,
         "runtime": runtime,
+        "gate_stats": gate_stats,
         "model_shape": {
             "hybrid_enabled": bool(config.get("local_attn_window", 0) > 0),
             "num_hybrid_layers": int(sum(isinstance(layer, ChaosSSMHybridBlock) for layer in model.layers)),

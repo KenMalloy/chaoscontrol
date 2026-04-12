@@ -278,6 +278,69 @@ class TestChaosSSMHybridBlock(unittest.TestCase):
                 f"window={window}: parallel vs sequential max diff {max_diff:.2e} exceeds 1e-4"
             )
 
+    def test_topk_is_causal_future_perturbation(self) -> None:
+        """Regression: top-k by score must be strictly causal.
+
+        Perturbing future tokens must not change past outputs. Probes the
+        subtle -1e9 invariant in the score-topk branch where threshold can
+        be -1e9 on early rows but non-causal positions still carry -1e9
+        scores so they don't affect softmax.
+        """
+        from chaoscontrol.model import ChaosSSMHybridBlock
+        for topk in (8, 16):
+            torch.manual_seed(42)
+            block = ChaosSSMHybridBlock(
+                dim=32, ff_mult=2, a_mode="diag",
+                local_attn_window=64, local_attn_heads=1, local_attn_dim=16,
+                local_attn_topk=topk, local_attn_topk_random=False,
+            )
+            block.eval()
+            x1 = torch.randn(2, 24, 32)
+            x2 = x1.clone()
+            # Perturb the future (positions >= split)
+            split = 12
+            x2[:, split:] = torch.randn(2, 24 - split, 32)
+            with torch.no_grad():
+                y1 = block(x1)
+                y2 = block(x2)
+            past_diff = (y1[:, :split] - y2[:, :split]).abs().max().item()
+            assert past_diff < 1e-5, (
+                f"topk={topk}: past outputs changed after future perturbation "
+                f"(max diff {past_diff:.2e}) — causality violated"
+            )
+
+    def test_topk_random_is_causal_future_perturbation(self) -> None:
+        """Regression: top-k random must also be strictly causal.
+
+        Same property test for the random selection branch, which picks
+        k random causal positions per forward call.
+        """
+        from chaoscontrol.model import ChaosSSMHybridBlock
+        for topk in (8, 16):
+            torch.manual_seed(42)
+            block = ChaosSSMHybridBlock(
+                dim=32, ff_mult=2, a_mode="diag",
+                local_attn_window=64, local_attn_heads=1, local_attn_dim=16,
+                local_attn_topk=topk, local_attn_topk_random=True,
+            )
+            block.eval()
+            x1 = torch.randn(2, 24, 32)
+            x2 = x1.clone()
+            split = 12
+            x2[:, split:] = torch.randn(2, 24 - split, 32)
+            # Use same random seed for both calls so the selection mask is identical,
+            # isolating causality from random variation.
+            with torch.no_grad():
+                torch.manual_seed(777)
+                y1 = block(x1)
+                torch.manual_seed(777)
+                y2 = block(x2)
+            past_diff = (y1[:, :split] - y2[:, :split]).abs().max().item()
+            assert past_diff < 1e-5, (
+                f"topk_random={topk}: past outputs changed after future perturbation "
+                f"(max diff {past_diff:.2e}) — causality violated"
+            )
+
 
 if __name__ == "__main__":
     unittest.main()
