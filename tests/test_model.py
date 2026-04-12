@@ -253,6 +253,31 @@ class TestChaosSSMHybridBlock(unittest.TestCase):
         assert new_state.shape == (2, 32)
         assert attn_forward.call_count == 0
 
+    def test_hybrid_parallel_forward_matches_sequential_step(self) -> None:
+        """Regression: parallel forward() must match sequential step() loop."""
+        from chaoscontrol.model import ChaosSSMHybridBlock
+        for window in (8, 16, 32):
+            torch.manual_seed(42)
+            block = ChaosSSMHybridBlock(
+                dim=32, ff_mult=2, a_mode="diag",
+                local_attn_window=window, local_attn_heads=1, local_attn_dim=16,
+            )
+            block.eval()
+            x = torch.randn(2, 24, 32)
+            with torch.no_grad():
+                y_parallel = block(x)
+                kv_cache = block._init_kv_cache()
+                state = x.new_zeros(2, 32)
+                outputs = []
+                for t in range(24):
+                    out, state = block.step(x[:, t], state, kv_cache=kv_cache)
+                    outputs.append(out)
+                y_sequential = torch.stack(outputs, dim=1)
+            max_diff = (y_parallel - y_sequential).abs().max().item()
+            assert max_diff < 1e-4, (
+                f"window={window}: parallel vs sequential max diff {max_diff:.2e} exceeds 1e-4"
+            )
+
 
 if __name__ == "__main__":
     unittest.main()
