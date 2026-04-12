@@ -165,22 +165,33 @@ class ChaosSSMHybridBlock(nn.Module):
         *,
         return_jacobian_stats: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, dict]:
-        """Sequence-level forward. Processes token-by-token for KV cache.
+        """Parallel sequence-level forward.
 
-        Note: return_jacobian_stats returns zeros for this block because the
-        step-by-step recurrence doesn't expose the core's full-sequence Jacobian.
-        When averaged with real stats from ChaosSSMBlock layers, this dilutes
-        the aggregate — acceptable for Phase A but should be revisited if
-        Jacobian monitoring becomes critical for hybrid models.
+        SSM runs the compiled diag scan over the full sequence, then local
+        attention is computed as a parallel causal sliding-window operation.
+        No sequential Python loop — matches pure ChaosSSMBlock throughput
+        plus a small attention matmul overhead.
+
+        The step() method with RollingKVCache is still available for
+        autoregressive inference.
         """
-        batch, seq, dim = x.shape
-        kv_cache = self._init_kv_cache()
-        state = x.new_zeros((batch, dim))
-        outputs = []
-        for t in range(seq):
-            out, state = self.step(x[:, t], state, kv_cache=kv_cache)
-            outputs.append(out)
-        y = torch.stack(outputs, dim=1)
+        # 1. SSM: parallel over full sequence (compiled diag scan)
+        normed = self.input_norm(x)
+        ssm_out = self.core.forward(normed)
+        x_ssm = x + ssm_out  # residual
+
+        # 2. Local attention: parallel sliding window
+        K = self.k_proj(x_ssm)  # (batch, seq, attn_dim)
+        V = self.v_proj(x_ssm)  # (batch, seq, attn_dim)
+        attn_out = self.local_attn.forward_sequence(
+            x_ssm, K, V, window=self.local_attn_window,
+        )
+        gate = torch.sigmoid(self.gate_proj(x_ssm) + self.gate_bias)
+        x_ssm = x_ssm + gate * attn_out
+
+        # 3. FF: parallel
+        y = x_ssm + self.ff(self.ff_norm(x_ssm))
+
         if return_jacobian_stats:
             return y, {"lambda_max": torch.tensor(0.0), "sv_log_var": torch.tensor(0.0)}
         return y

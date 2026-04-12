@@ -69,7 +69,8 @@ class LocalAttention(nn.Module):
         values: torch.Tensor,
         mask: torch.Tensor,
     ) -> torch.Tensor:
-        """
+        """Single-token attention (used by step() path).
+
         Args:
             query: (batch, model_dim)
             keys: (batch, w, attn_dim) — pre-projected
@@ -90,4 +91,52 @@ class LocalAttention(nn.Module):
         weights = F.softmax(scores, dim=-1)
         out = torch.matmul(weights, v)  # (B, nh, 1, hd)
         out = out.view(B, nh * hd)
+        return self.out_proj(out)
+
+    def forward_sequence(
+        self,
+        query_seq: torch.Tensor,
+        keys_seq: torch.Tensor,
+        values_seq: torch.Tensor,
+        window: int,
+    ) -> torch.Tensor:
+        """Parallel sliding-window attention over a full sequence.
+
+        Args:
+            query_seq: (batch, seq, model_dim) — full sequence queries
+            keys_seq: (batch, seq, attn_dim) — pre-projected keys
+            values_seq: (batch, seq, attn_dim) — pre-projected values
+            window: attention window size (attend to positions [t-w, t-1])
+        Returns:
+            (batch, seq, model_dim)
+        """
+        B, S, _ = query_seq.shape
+        nh, hd = self.num_heads, self.head_dim
+
+        q = self.q_proj(query_seq)  # (B, S, attn_dim)
+        q = q.view(B, S, nh, hd).permute(0, 2, 1, 3)  # (B, nh, S, hd)
+        k = keys_seq.view(B, S, nh, hd).permute(0, 2, 1, 3)
+        v = values_seq.view(B, S, nh, hd).permute(0, 2, 1, 3)
+
+        scores = torch.matmul(q, k.transpose(-2, -1)) / (hd ** 0.5)  # (B, nh, S, S)
+
+        # Causal sliding window mask: position t attends to [t-w, t-1]
+        # (strictly causal — token cannot attend to itself)
+        row = torch.arange(S, device=query_seq.device)
+        col = torch.arange(S, device=query_seq.device)
+        causal = col.unsqueeze(0) < row.unsqueeze(1)          # col < row (strict causal)
+        in_window = row.unsqueeze(1) - col.unsqueeze(0) <= window  # row - col <= w
+        mask = causal & in_window  # (S, S)
+
+        scores = scores.masked_fill(~mask.unsqueeze(0).unsqueeze(0), -1e9)
+        weights = F.softmax(scores, dim=-1)
+        out = torch.matmul(weights, v)  # (B, nh, S, hd)
+
+        # Zero out positions with no valid keys (e.g. t=0 has no causal history).
+        # Without this, softmax over all-masked scores produces uniform weights
+        # yielding a small non-zero output instead of the expected zero.
+        has_valid = mask.any(dim=-1)  # (S,)
+        out = out * has_valid.view(1, 1, S, 1)
+
+        out = out.permute(0, 2, 1, 3).reshape(B, S, nh * hd)
         return self.out_proj(out)
