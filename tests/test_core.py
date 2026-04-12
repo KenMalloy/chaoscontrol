@@ -100,6 +100,106 @@ class TestChaosSSMCore(unittest.TestCase):
         )
 
 
+class TestChunkedDiagScan(unittest.TestCase):
+    """Exp 18 Test 0: parity test for the chunked vectorized diag scan backend.
+
+    The chunked backend must produce bit-identical-to-float32-noise output
+    compared to the sequential Python loop across a range of sequence lengths,
+    decay magnitudes, and chunk sizes. This is the prerequisite gate for
+    Exp 18 Test 1 (throughput bench) — if parity fails, we can't use the
+    chunked backend regardless of how fast it is.
+    """
+
+    def test_chunked_matches_loop_at_realistic_decay(self) -> None:
+        from chaoscontrol.core import _diag_recurrence_chunked, _diag_recurrence_inner
+
+        torch.manual_seed(42)
+        # Realistic training regime: decay in [0.65, 0.95]
+        decay = torch.rand(2, 512, 64) * 0.3 + 0.65
+        update = torch.randn(2, 512, 64) * 0.1
+        y_loop = _diag_recurrence_inner(decay, update)
+        y_chunked = _diag_recurrence_chunked(decay, update, chunk_size=32)
+        max_diff = (y_loop - y_chunked).abs().max().item()
+        assert max_diff < 1e-4, f"chunked backend diverges from loop: {max_diff:.2e}"
+
+    def test_chunked_handles_extreme_decay(self) -> None:
+        """Even at decay=0.01 (where naive cumprod underflows), chunking stays stable."""
+        from chaoscontrol.core import _diag_recurrence_chunked, _diag_recurrence_inner
+
+        for decay_val in (0.01, 0.1, 0.5, 0.95):
+            decay = torch.full((2, 512, 32), decay_val)
+            update = torch.randn(2, 512, 32) * 0.1
+            y_loop = _diag_recurrence_inner(decay, update)
+            y_chunked = _diag_recurrence_chunked(decay, update, chunk_size=32)
+            max_diff = (y_loop - y_chunked).abs().max().item()
+            assert max_diff < 1e-4, (
+                f"chunked diverges at decay={decay_val}: {max_diff:.2e}"
+            )
+
+    def test_chunked_handles_non_multiple_seq_lengths(self) -> None:
+        """Chunked scan must pad correctly for T not divisible by chunk_size."""
+        from chaoscontrol.core import _diag_recurrence_chunked, _diag_recurrence_inner
+
+        for T in (7, 100, 257, 513, 1023):
+            torch.manual_seed(T)
+            decay = torch.rand(2, T, 16) * 0.3 + 0.65
+            update = torch.randn(2, T, 16) * 0.1
+            y_loop = _diag_recurrence_inner(decay, update)
+            y_chunked = _diag_recurrence_chunked(decay, update, chunk_size=32)
+            assert y_chunked.shape == y_loop.shape
+            max_diff = (y_loop - y_chunked).abs().max().item()
+            assert max_diff < 1e-4, f"chunked diverges at T={T}: {max_diff:.2e}"
+
+    def test_chunked_matches_across_chunk_sizes(self) -> None:
+        """Different chunk sizes must produce identical results (within noise)."""
+        from chaoscontrol.core import _diag_recurrence_chunked
+
+        torch.manual_seed(1)
+        decay = torch.rand(2, 256, 32) * 0.3 + 0.65
+        update = torch.randn(2, 256, 32) * 0.1
+        results = [
+            _diag_recurrence_chunked(decay, update, chunk_size=K)
+            for K in (8, 16, 32, 64, 128)
+        ]
+        baseline = results[0]
+        for K, result in zip((8, 16, 32, 64, 128), results):
+            max_diff = (baseline - result).abs().max().item()
+            assert max_diff < 1e-5, f"chunk_size={K} diverges from chunk_size=8: {max_diff:.2e}"
+
+    def test_chunked_backend_selectable_via_env(self) -> None:
+        """CHAOSCONTROL_DIAG_SCAN_BACKEND=chunked should route _diag_recurrence to chunked."""
+        import importlib
+        import os
+        import sys
+
+        old_env = os.environ.get("CHAOSCONTROL_DIAG_SCAN_BACKEND")
+        os.environ["CHAOSCONTROL_DIAG_SCAN_BACKEND"] = "chunked"
+        try:
+            # Reload to reset cached backend resolution
+            if "chaoscontrol.core" in sys.modules:
+                importlib.reload(sys.modules["chaoscontrol.core"])
+            import chaoscontrol.core as core
+
+            info = core.get_diag_recurrence_backend()
+            assert info["backend"] == "chunked", f"expected chunked backend, got {info}"
+
+            torch.manual_seed(5)
+            decay = torch.rand(2, 128, 16) * 0.3 + 0.65
+            update = torch.randn(2, 128, 16) * 0.1
+            y_env = core._diag_recurrence(decay, update)
+            y_loop = core._diag_recurrence_inner(decay, update)
+            max_diff = (y_env - y_loop).abs().max().item()
+            assert max_diff < 1e-4
+        finally:
+            if old_env is None:
+                os.environ.pop("CHAOSCONTROL_DIAG_SCAN_BACKEND", None)
+            else:
+                os.environ["CHAOSCONTROL_DIAG_SCAN_BACKEND"] = old_env
+            # Reload again so other tests see the default backend
+            if "chaoscontrol.core" in sys.modules:
+                importlib.reload(sys.modules["chaoscontrol.core"])
+
+
 class TestCriticalityRegularizer(unittest.TestCase):
     def test_crit_loss_is_scalar(self) -> None:
         core = ChaosSSMCore(dim=16, a_mode="full", a_full_rank=4)
