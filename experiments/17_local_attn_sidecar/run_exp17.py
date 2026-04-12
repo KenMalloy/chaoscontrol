@@ -56,6 +56,8 @@ CONDITIONS = {
     "local_w16": _base(local_attn_window=16, local_attn_heads=1, local_attn_dim=64),
     "local_w32": _base(local_attn_window=32, local_attn_heads=1, local_attn_dim=64),
     "local_w64": _base(local_attn_window=64, local_attn_heads=1, local_attn_dim=64),
+    "topk_8": _base(local_attn_window=64, local_attn_heads=1, local_attn_dim=64, local_attn_topk=8),
+    "topk_32": _base(local_attn_window=64, local_attn_heads=1, local_attn_dim=64, local_attn_topk=32),
 }
 
 

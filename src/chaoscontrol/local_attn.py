@@ -113,26 +113,45 @@ class LocalAttention(nn.Module):
             self._mask_cache_key = cache_key
         return self._mask_cache
 
+    def _get_causal_mask(
+        self, seq_len: int, device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Strict causal mask (no window constraint). Cached."""
+        cache_key = ("causal", seq_len, device)
+        if not hasattr(self, "_causal_cache") or self._causal_cache_key != cache_key:
+            row = torch.arange(seq_len, device=device)
+            col = torch.arange(seq_len, device=device)
+            mask = col.unsqueeze(0) < row.unsqueeze(1)  # (S, S)
+            has_valid = mask.any(dim=-1)  # (S,)
+            self._causal_cache = (mask, has_valid)
+            self._causal_cache_key = cache_key
+        return self._causal_cache
+
     def forward_sequence(
         self,
         query_seq: torch.Tensor,
         keys_seq: torch.Tensor,
         values_seq: torch.Tensor,
         window: int,
+        topk: int = 0,
     ) -> torch.Tensor:
-        """Parallel sliding-window attention over a full sequence.
+        """Parallel attention over a full sequence.
+
+        Modes (controlled by window and topk):
+            window > 0, topk == 0: causal sliding-window (local)
+            window > 0, topk > 0:  top-k by score within causal past (selective)
+            window == 0:           no-op (returns zeros)
 
         Args:
             query_seq: (batch, seq, model_dim) — full sequence queries
             keys_seq: (batch, seq, attn_dim) — pre-projected keys
             values_seq: (batch, seq, attn_dim) — pre-projected values
-            window: attention window size (attend to positions [t-w, t-1])
+            window: attention window size (attend to positions [t-w, t-1]).
+                    Ignored when topk > 0.
+            topk: if > 0, attend to the k highest-scoring causal positions
+                  instead of a fixed window. This is selective retrieval.
         Returns:
             (batch, seq, model_dim)
-
-        Note: this is dense O(S²) attention with a band mask, not O(S*w).
-        At current settings (S=512, w<=64) this is fine. If sequence length
-        grows, consider F.scaled_dot_product_attention with a sparse mask.
         """
         B, S, _ = query_seq.shape
         nh, hd = self.num_heads, self.head_dim
@@ -144,8 +163,21 @@ class LocalAttention(nn.Module):
 
         scores = torch.matmul(q, k.transpose(-2, -1)) / (hd ** 0.5)  # (B, nh, S, S)
 
-        mask, has_valid = self._get_sliding_window_mask(S, window, query_seq.device)
-        scores = scores.masked_fill(~mask.unsqueeze(0).unsqueeze(0), -1e9)
+        if topk > 0:
+            # Selective retrieval: top-k by score within causal past
+            causal_mask, has_valid = self._get_causal_mask(S, query_seq.device)
+            scores = scores.masked_fill(~causal_mask.unsqueeze(0).unsqueeze(0), -1e9)
+            # Keep only top-k scores per query position, mask the rest
+            if topk < S:
+                kth, _ = scores.topk(topk, dim=-1)
+                threshold = kth[..., -1:] # (B, nh, S, 1)
+                topk_mask = scores >= threshold
+                scores = scores.masked_fill(~topk_mask, -1e9)
+        else:
+            # Local window
+            mask, has_valid = self._get_sliding_window_mask(S, window, query_seq.device)
+            scores = scores.masked_fill(~mask.unsqueeze(0).unsqueeze(0), -1e9)
+
         weights = F.softmax(scores, dim=-1)
         out = torch.matmul(weights, v)  # (B, nh, S, hd)
 

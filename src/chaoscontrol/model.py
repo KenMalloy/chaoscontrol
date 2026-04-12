@@ -109,6 +109,7 @@ class ChaosSSMHybridBlock(nn.Module):
         local_attn_window: int = 64,
         local_attn_heads: int = 1,
         local_attn_dim: int = 64,
+        local_attn_topk: int = 0,
     ) -> None:
         super().__init__()
         self.input_norm = RMSNorm(dim)
@@ -120,9 +121,10 @@ class ChaosSSMHybridBlock(nn.Module):
         )
         self.rich_b = None  # compatibility with ChaosSSMBlock
 
-        # Local attention sidecar
+        # Attention sidecar (local window or top-k selective)
         self.local_attn_window = local_attn_window
         self.local_attn_dim = local_attn_dim
+        self.local_attn_topk = local_attn_topk
         self.local_attn = LocalAttention(dim, local_attn_dim, local_attn_heads)
         self.k_proj = nn.Linear(dim, local_attn_dim, bias=False)
         self.v_proj = nn.Linear(dim, local_attn_dim, bias=False)
@@ -180,11 +182,12 @@ class ChaosSSMHybridBlock(nn.Module):
         ssm_out = self.core.forward(normed)
         x_ssm = x + ssm_out  # residual
 
-        # 2. Local attention: parallel sliding window
+        # 2. Attention sidecar: local window or top-k selective
         K = self.k_proj(x_ssm)  # (batch, seq, attn_dim)
         V = self.v_proj(x_ssm)  # (batch, seq, attn_dim)
         attn_out = self.local_attn.forward_sequence(
             x_ssm, K, V, window=self.local_attn_window,
+            topk=self.local_attn_topk,
         )
         gate = torch.sigmoid(self.gate_proj(x_ssm) + self.gate_bias)
         x_ssm = x_ssm + gate * attn_out
@@ -250,6 +253,7 @@ class ChaosStudentLM(nn.Module):
         local_attn_window: int = 0,
         local_attn_heads: int = 1,
         local_attn_dim: int = 64,
+        local_attn_topk: int = 0,
     ) -> None:
         super().__init__()
         self.vocab_size = vocab_size
@@ -308,6 +312,7 @@ class ChaosStudentLM(nn.Module):
                 local_attn_window=local_attn_window,
                 local_attn_heads=local_attn_heads,
                 local_attn_dim=local_attn_dim,
+                local_attn_topk=local_attn_topk,
             )
             self.layers = nn.ModuleList(ssm_layers + [hybrid_layer])
         else:

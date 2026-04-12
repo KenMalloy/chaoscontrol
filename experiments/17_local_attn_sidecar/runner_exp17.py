@@ -235,6 +235,7 @@ def build_model(config: dict[str, Any], device: torch.device, param_dtype: torch
         local_attn_window=int(config.get("local_attn_window", 0)),
         local_attn_heads=int(config.get("local_attn_heads", 1)),
         local_attn_dim=int(config.get("local_attn_dim", 64)),
+        local_attn_topk=int(config.get("local_attn_topk", 0)),
     )
     model = model.to(device)
     if device.type == "cuda":
