@@ -56,8 +56,13 @@ CONDITIONS = {
     "local_w16": _base(local_attn_window=16, local_attn_heads=1, local_attn_dim=64),
     "local_w32": _base(local_attn_window=32, local_attn_heads=1, local_attn_dim=64),
     "local_w64": _base(local_attn_window=64, local_attn_heads=1, local_attn_dim=64),
+    # Top-k by score: selective retrieval
     "topk_8": _base(local_attn_window=64, local_attn_heads=1, local_attn_dim=64, local_attn_topk=8),
+    "topk_16": _base(local_attn_window=64, local_attn_heads=1, local_attn_dim=64, local_attn_topk=16),
     "topk_32": _base(local_attn_window=64, local_attn_heads=1, local_attn_dim=64, local_attn_topk=32),
+    # Top-k random: control for topk — tests whether selection matters vs distant access
+    "topk_random_8": _base(local_attn_window=64, local_attn_heads=1, local_attn_dim=64, local_attn_topk=8, local_attn_topk_random=True),
+    "topk_random_32": _base(local_attn_window=64, local_attn_heads=1, local_attn_dim=64, local_attn_topk=32, local_attn_topk_random=True),
 }
 
 

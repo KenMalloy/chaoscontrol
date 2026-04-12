@@ -134,13 +134,19 @@ class LocalAttention(nn.Module):
         values_seq: torch.Tensor,
         window: int,
         topk: int = 0,
+        topk_random: bool = False,
     ) -> torch.Tensor:
         """Parallel attention over a full sequence.
 
-        Modes (controlled by window and topk):
-            window > 0, topk == 0: causal sliding-window (local)
-            window > 0, topk > 0:  top-k by score within causal past (selective)
-            window == 0:           no-op (returns zeros)
+        Modes (controlled by window, topk, topk_random):
+            window > 0, topk == 0:                     causal sliding-window (local)
+            window > 0, topk > 0, topk_random == False: top-k by score (selective)
+            window > 0, topk > 0, topk_random == True:  k random causal positions
+                                                         (control for topk — tests
+                                                          whether score-based selection
+                                                          does real work vs random
+                                                          distant access)
+            window == 0:                               no-op (returns zeros)
 
         Args:
             query_seq: (batch, seq, model_dim) — full sequence queries
@@ -148,8 +154,12 @@ class LocalAttention(nn.Module):
             values_seq: (batch, seq, attn_dim) — pre-projected values
             window: attention window size (attend to positions [t-w, t-1]).
                     Ignored when topk > 0.
-            topk: if > 0, attend to the k highest-scoring causal positions
-                  instead of a fixed window. This is selective retrieval.
+            topk: if > 0, attend to k causal positions (selected by score or random).
+            topk_random: if True with topk > 0, pick positions randomly instead of
+                         by score. Fresh random per forward call. Same O(S²)
+                         compute path as topk — the only difference is the
+                         selection criterion, isolating "selection matters" vs
+                         "distant access matters".
         Returns:
             (batch, seq, model_dim)
         """
@@ -164,15 +174,34 @@ class LocalAttention(nn.Module):
         scores = torch.matmul(q, k.transpose(-2, -1)) / (hd ** 0.5)  # (B, nh, S, S)
 
         if topk > 0:
-            # Selective retrieval: top-k by score within causal past
+            # Selective retrieval: k causal positions, by score or random
             causal_mask, has_valid = self._get_causal_mask(S, query_seq.device)
-            scores = scores.masked_fill(~causal_mask.unsqueeze(0).unsqueeze(0), -1e9)
-            # Keep only top-k scores per query position, mask the rest
-            if topk < S:
-                kth, _ = scores.topk(topk, dim=-1)
-                threshold = kth[..., -1:] # (B, nh, S, 1)
-                topk_mask = scores >= threshold
-                scores = scores.masked_fill(~topk_mask, -1e9)
+            causal_mask_b = causal_mask.unsqueeze(0).unsqueeze(0)  # (1, 1, S, S)
+
+            if topk_random:
+                # Generate random scores, mask non-causal, pick top-k.
+                # This yields k random causal positions per (batch, head, query).
+                # Fresh every forward call — no learned pattern.
+                rand = torch.rand(B, nh, S, S, device=query_seq.device)
+                rand = rand.masked_fill(~causal_mask_b, float("-inf"))
+                if topk < S:
+                    _, idx = rand.topk(topk, dim=-1)
+                    select_mask = torch.zeros_like(rand, dtype=torch.bool)
+                    select_mask.scatter_(-1, idx, True)
+                    # AND with causal to drop any -inf picks (early positions
+                    # where fewer than k causal slots exist).
+                    select_mask = select_mask & causal_mask_b
+                else:
+                    select_mask = causal_mask_b.expand_as(scores)
+                scores = scores.masked_fill(~select_mask, -1e9)
+            else:
+                # Top-k by score within causal past
+                scores = scores.masked_fill(~causal_mask_b, -1e9)
+                if topk < S:
+                    kth, _ = scores.topk(topk, dim=-1)
+                    threshold = kth[..., -1:]  # (B, nh, S, 1)
+                    topk_mask = scores >= threshold
+                    scores = scores.masked_fill(~topk_mask, -1e9)
         else:
             # Local window
             mask, has_valid = self._get_sliding_window_mask(S, window, query_seq.device)
