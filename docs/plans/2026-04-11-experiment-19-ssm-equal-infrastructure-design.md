@@ -77,10 +77,18 @@ Each SOTA technique was designed for attention. Do they transfer to SSMs?
 - **Depth recurrence** — does sharing SSM layers (like transformer layers 3-5)
   help? SSM state is persistent across steps; sharing changes what that means.
 - **Parallel residuals** — do split lanes work when the "attention" lane is SSM?
-- **Muon on SSM params** — Muon uses matrix orthogonalization on weight updates.
-  SSM A/B/C matrices have different structure than attention Q/K/V. Does it help?
-- **Legal TTT for SSM** — updating recurrence state on the val stream. Novel
-  territory — no prior work exists on SSM-specific TTT.
+- **Muon on SSM params** — moved to Exp 18 as a throughput lever (learning
+  efficiency per token). Exp 19 inherits whichever optimizer wins Exp 18.
+
+**Test-time training (TTT) is out of scope for Exp 19.** It's been moved to
+Exp 20 as its own experiment. Rationale: the SSM's internal state already
+evolves during eval, so "apply TTT on frozen weights" isn't a clean drop-in
+like it is for transformers. The substrate question — what space do you
+build the cache over when the hidden state is itself a cumulative
+running memory — is a real research question, not a switch to flip. See
+`2026-04-12-experiment-20-ssm-test-time-training-stub.md` for the open
+questions. Exp 19 ships a submission with **no** TTT; Exp 20 is the
+follow-up lever if we still need more bpb before April 30.
 
 ## Competition context
 
