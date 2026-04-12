@@ -93,6 +93,26 @@ class LocalAttention(nn.Module):
         out = out.view(B, nh * hd)
         return self.out_proj(out)
 
+    def _get_sliding_window_mask(
+        self, seq_len: int, window: int, device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Build or return cached causal sliding-window mask.
+
+        Returns (mask, has_valid) where mask is (S, S) bool and
+        has_valid is (S,) bool indicating which rows have any valid keys.
+        """
+        cache_key = (seq_len, window, device)
+        if not hasattr(self, "_mask_cache") or self._mask_cache_key != cache_key:
+            row = torch.arange(seq_len, device=device)
+            col = torch.arange(seq_len, device=device)
+            causal = col.unsqueeze(0) < row.unsqueeze(1)
+            in_window = row.unsqueeze(1) - col.unsqueeze(0) <= window
+            mask = causal & in_window
+            has_valid = mask.any(dim=-1)
+            self._mask_cache = (mask, has_valid)
+            self._mask_cache_key = cache_key
+        return self._mask_cache
+
     def forward_sequence(
         self,
         query_seq: torch.Tensor,
@@ -109,6 +129,10 @@ class LocalAttention(nn.Module):
             window: attention window size (attend to positions [t-w, t-1])
         Returns:
             (batch, seq, model_dim)
+
+        Note: this is dense O(S²) attention with a band mask, not O(S*w).
+        At current settings (S=512, w<=64) this is fine. If sequence length
+        grows, consider F.scaled_dot_product_attention with a sparse mask.
         """
         B, S, _ = query_seq.shape
         nh, hd = self.num_heads, self.head_dim
@@ -120,22 +144,12 @@ class LocalAttention(nn.Module):
 
         scores = torch.matmul(q, k.transpose(-2, -1)) / (hd ** 0.5)  # (B, nh, S, S)
 
-        # Causal sliding window mask: position t attends to [t-w, t-1]
-        # (strictly causal — token cannot attend to itself)
-        row = torch.arange(S, device=query_seq.device)
-        col = torch.arange(S, device=query_seq.device)
-        causal = col.unsqueeze(0) < row.unsqueeze(1)          # col < row (strict causal)
-        in_window = row.unsqueeze(1) - col.unsqueeze(0) <= window  # row - col <= w
-        mask = causal & in_window  # (S, S)
-
+        mask, has_valid = self._get_sliding_window_mask(S, window, query_seq.device)
         scores = scores.masked_fill(~mask.unsqueeze(0).unsqueeze(0), -1e9)
         weights = F.softmax(scores, dim=-1)
         out = torch.matmul(weights, v)  # (B, nh, S, hd)
 
-        # Zero out positions with no valid keys (e.g. t=0 has no causal history).
-        # Without this, softmax over all-masked scores produces uniform weights
-        # yielding a small non-zero output instead of the expected zero.
-        has_valid = mask.any(dim=-1)  # (S,)
+        # Zero out positions with no valid keys (t=0 has no causal history).
         out = out * has_valid.view(1, 1, S, 1)
 
         out = out.permute(0, 2, 1, 3).reshape(B, S, nh * hd)
