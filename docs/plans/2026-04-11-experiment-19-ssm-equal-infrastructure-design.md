@@ -107,6 +107,35 @@ thesis is viable.
   batch sizes — directly validates the throughput thesis before we invest in
   the full fork.
 
+## Follow-up hypothesis: pre-SSM KV source
+
+If Exp 17 topk conditions show topk ≈ topk_random (selection isn't doing real
+work), or if topk is comparable to bare_fast_ssm, one compelling explanation
+is that the post-SSM features have been too homogenized for the K projection
+to distinguish tokens by identity. The SSM blends past information into a
+compressed state; once a token passes through the SSM, its K projection
+reflects "current blended state at this timestep" rather than "identity of
+this original token."
+
+**Hypothesis:** Source K/V from the **pre-SSM residual stream** (the block's
+input embedding or mid-stack activations before SSM mixing) instead of
+post-SSM features. This gives the attention path un-blended token
+representations to retrieve by identity, while the SSM continues to handle
+smooth contextual mixing on its own path. The two mechanisms then serve
+complementary roles:
+- SSM: compressed summary of full context (smooth, positional, blended)
+- Attention: exact retrieval of specific high-information past tokens (sharp,
+  identity-preserving)
+
+This is a natural variant to test in Exp 19 if the Exp 17 topk results
+suggest the selection mechanism is fighting against feature homogenization.
+Cost: one new hybrid variant, same infrastructure as the existing forward
+path.
+
+**What would falsify it:** If pre-SSM KV also shows no improvement, the
+problem isn't feature homogenization — it's that the SSM simply doesn't
+benefit from exact token retrieval at this scale.
+
 ## Timeline (19 days)
 
 | Phase | Days | Deliverable |
