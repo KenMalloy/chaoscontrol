@@ -199,6 +199,49 @@ class TestChunkedDiagScan(unittest.TestCase):
             if "chaoscontrol.core" in sys.modules:
                 importlib.reload(sys.modules["chaoscontrol.core"])
 
+    def test_chunked_backend_gradients_match_loop(self) -> None:
+        """Exp 18 Test 1 follow-up: backward gradients must match the Python loop.
+
+        The chunked forward pass uses cumprod / cumsum and float64 intermediates,
+        which trace a different computational graph than the 512-step sequential
+        muladd loop. Autograd through those different graphs could in principle
+        produce different gradients. This test verifies that backward gradients
+        agree to within float32 numerical noise at a realistic sequence length.
+
+        Without this, a "faster scan" could silently train a different model
+        and Test 1's throughput gain would be meaningless or harmful.
+        """
+        from chaoscontrol.core import _diag_recurrence_inner, _diag_recurrence_chunked
+
+        torch.manual_seed(1)
+        # Realistic scale: B=2, T=512, D=64, decay in typical training range
+        decay_base = torch.rand(2, 512, 64) * 0.3 + 0.65
+        update_base = torch.randn(2, 512, 64) * 0.1
+
+        d_loop = decay_base.clone().detach().requires_grad_(True)
+        u_loop = update_base.clone().detach().requires_grad_(True)
+        d_chunked = decay_base.clone().detach().requires_grad_(True)
+        u_chunked = update_base.clone().detach().requires_grad_(True)
+
+        # Scalar loss depending on all positions / channels, exercising the
+        # full backward graph.
+        (_diag_recurrence_inner(d_loop, u_loop) ** 2).sum().backward()
+        (_diag_recurrence_chunked(d_chunked, u_chunked, chunk_size=32) ** 2).sum().backward()
+
+        decay_grad_diff = (d_loop.grad - d_chunked.grad).abs().max().item()
+        update_grad_diff = (u_loop.grad - u_chunked.grad).abs().max().item()
+
+        # Relative tolerance: diff normalized by gradient magnitude
+        decay_rel = decay_grad_diff / (d_loop.grad.abs().max().item() + 1e-12)
+        update_rel = update_grad_diff / (u_loop.grad.abs().max().item() + 1e-12)
+
+        assert decay_rel < 1e-5, (
+            f"decay gradient drift: abs={decay_grad_diff:.2e}, rel={decay_rel:.2e}"
+        )
+        assert update_rel < 1e-5, (
+            f"update gradient drift: abs={update_grad_diff:.2e}, rel={update_rel:.2e}"
+        )
+
 
 class TestCriticalityRegularizer(unittest.TestCase):
     def test_crit_loss_is_scalar(self) -> None:
