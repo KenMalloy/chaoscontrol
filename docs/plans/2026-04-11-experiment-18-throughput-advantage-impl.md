@@ -1,4 +1,26 @@
-# Exp 18: Throughput Advantage — Implementation Plan
+# [DEPRECATED] Exp 18: Throughput Advantage — Implementation Plan
+
+> **⚠ DEPRECATED 2026-04-12.**
+>
+> This implementation plan has been superseded. See
+> `docs/plans/2026-04-12-experiment-18-throughput-levers-design.md`
+> for the new direction.
+>
+> **Why deprecated:** This plan targeted a "sweep → rescore → targeted
+> retrain" workflow that Phase 0 benchmarks (run overnight 2026-04-11→12)
+> rendered moot. At peak throughput (bs=1024 on 8×H100 DDP, ~786K tok/s),
+> we see only ~4.7% of the 10B-token corpus in 600s — not enough coverage
+> for "hardest N%" subset selection to be a meaningful axis.
+>
+> Phase 0 infrastructure (`bench_throughput.py`, runner, tests) remains
+> valid. Phase A conditions (`baseline_b32`, `sweep_only`, `sweep_target_*`,
+> `sweep_random_retrain`) are no longer planned.
+>
+> Keep this doc as historical context for the "sweep-and-target" framing
+> and the preflight/expensive boundary discussion, both of which apply
+> equally to the new design.
+
+---
 
 > **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 

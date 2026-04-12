@@ -101,11 +101,21 @@ thesis is viable.
 
 ## Prerequisites from Exp 17/18
 
-- **Exp 17** results tell us whether local attention sidecar helps. If so, a
-  lightweight hybrid (SSM + tiny local window) is a candidate variant for Exp 19.
-- **Exp 18 Phase 0** benchmarks give us the SSM throughput curve at various
-  batch sizes — directly validates the throughput thesis before we invest in
-  the full fork.
+- **Exp 17** (complete, 2026-04-12): local attention and top-k retrieval
+  variants all fail vs bare SSM. `topk_random_8` ties bare (p=0.71), all
+  other retrieval variants are significantly worse. Score-based selection
+  is actively adversarial (~0.065 bpb worse than random at matched k).
+  No signal for including attention in Exp 19 unless the research assistant
+  lit search surfaces a specific variant we haven't tested.
+- **Exp 18** (redesigned 2026-04-12, see
+  `2026-04-12-experiment-18-throughput-levers-design.md`): replaces the
+  old "sweep → rescore → targeted retrain" framing with a throughput
+  lever stack (mamba scan kernel, DDP validation, seq_len sweep,
+  optimizer swap). Exp 18 will hand off a validated peak throughput
+  config (kernel, optimizer, batch, seq_len, DDP world size) plus a
+  baseline bpb at that throughput. Exp 19 inherits that config as its
+  starting point and adds architecture / quantization / submission dials
+  on top.
 
 ## Follow-up hypothesis: pre-SSM KV source
 

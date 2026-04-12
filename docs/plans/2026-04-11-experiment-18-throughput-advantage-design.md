@@ -1,4 +1,37 @@
-# Experiment 18: SSM Throughput Advantage — Full-Dataset Sweep + Targeted Depth Training
+# [DEPRECATED] Experiment 18: SSM Throughput Advantage — Full-Dataset Sweep + Targeted Depth Training
+
+> **⚠ DEPRECATED 2026-04-12.**
+>
+> This design has been superseded by
+> `docs/plans/2026-04-12-experiment-18-throughput-levers-design.md`.
+>
+> **Why deprecated:** Phase 0 benchmark (run overnight 2026-04-11→12) measured
+> peak single-GPU throughput at ~98K tok/s at bs=1024 (96% VRAM). Scaled to
+> 8×H100 DDP, that's ~786K tok/s — which in the 600s budget yields only
+> ~470M tokens, or **4.7% of the 10B corpus**. The original "sweep → rescore
+> → targeted retrain on hardest N%" framing was predicated on seeing enough
+> of the corpus to have a meaningful distribution to target. At <5% coverage,
+> "hardest 10% of 5%" is not a meaningful subset selection — it's just a
+> small sample with a bpb-weighted filter.
+>
+> Also superseded: the comparison against transformers assumed both run at
+> bs=32, seq=512, AdamW, compiled scan. In reality, the SOTA transformer
+> with flash-attention-3 at seq=2048 hits ~760K tok/s per GPU — ~7.8× our
+> measured single-GPU SSM throughput. Our SSM is under-optimized on the
+> scan kernel (torch.compile fallback vs the native `mamba_ssm` CUDA kernel)
+> and we're leaving multiple levers unpulled (Muon optimizer, seq_len scaling,
+> large-batch LR screens at DDP scale).
+>
+> The new design reframes Exp 18 as **throughput lever maximization** —
+> stacking the mamba scan kernel, DDP validation, sequence length scaling,
+> and optimizer swap to push tokens-per-wall-second as high as possible,
+> under the framing that Exp 19 is "submission tuning" and Exp 18 is
+> "training throughput tuning."
+>
+> Phase 0 results, infrastructure (orchestrator, runner, tests), and the
+> SSM-vs-attention FLOP analysis below remain valid reference material.
+
+---
 
 ## Status
 
