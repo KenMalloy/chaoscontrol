@@ -147,6 +147,33 @@ def train_chaoscontrol_for_budget(
             "single-device (world_size=1) with metabolic_fork/mcts."
         )
 
+    # Guard: only the main ``model`` is wrapped in DistributedDataParallel
+    # below. ``structured_proj`` (created when generation_mode="structured")
+    # and ``tokenizer`` (when a trainable tokenizer is passed in) contribute
+    # parameters to the optimizer but are NOT wrapped. Under DDP, gradients
+    # on those parameters would stay rank-local — every rank updates them
+    # with its own data shard's gradient, and the modules drift out of sync
+    # across ranks with no explicit error. The Exp 18 bare-SSM config has
+    # both disabled, so this is safe for the immediate throughput lever
+    # stack. Any future caller that wants DDP plus trainable auxiliaries
+    # needs to either (a) wrap those modules in DDP explicitly too, or
+    # (b) route their gradients through an explicit all_reduce. Fail fast
+    # here rather than producing silent divergence.
+    if ddp_active and (generation_mode == "structured" or tokenizer is not None):
+        reason = []
+        if generation_mode == "structured":
+            reason.append("generation_mode='structured' (creates structured_proj)")
+        if tokenizer is not None:
+            reason.append("a trainable tokenizer is attached")
+        raise NotImplementedError(
+            f"DDP (world_size={world_size}) with {' and '.join(reason)} is not "
+            "supported: only the main model is wrapped in DistributedDataParallel, "
+            "so auxiliary trainable modules (structured_proj, tokenizer) would "
+            "receive rank-local gradients and drift out of sync across ranks. "
+            "Fix: either wrap those modules in DDP explicitly, or disable them "
+            "under DDP (generation_mode='noise', tokenizer=None)."
+        )
+
     # Set up structured projections if requested (before optimizer so its params are included)
     structured_proj = None
     if generation_mode == "structured":

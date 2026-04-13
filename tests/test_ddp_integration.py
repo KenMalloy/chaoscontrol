@@ -629,5 +629,114 @@ class TestMetabolicDDPGuard(unittest.TestCase):
             pass
 
 
+class TestDDPAuxModuleGuard(unittest.TestCase):
+    """Guard: only the main model is DDP-wrapped, so trainable auxiliary
+    modules (structured_proj, tokenizer) are incompatible with DDP.
+
+    Under DDP, only parameters inside the wrapped module get gradient
+    all-reduce hooks. structured_proj is created outside the wrap and
+    tokenizer parameters are added to the optimizer without being wrapped
+    — both would receive rank-local gradients and drift across ranks
+    silently. The Exp 18 bare-SSM path has both disabled, but a future
+    caller with a trainable tokenizer or structured generation under DDP
+    would hit this bug. The guard raises NotImplementedError at function
+    entry so the incompatibility is caught at call time, not discovered
+    as a silent quality drop.
+    """
+
+    def _call_with_aux(
+        self,
+        *,
+        generation_mode: str = "noise",
+        tokenizer: object = None,
+        world_size: int = 2,
+        budget_seconds: float = 2.0,
+    ) -> None:
+        seed = 42
+        model = _build_model(seed)
+        tokens = _build_tokens(seed)
+        kwargs = {**TRAIN_KWARGS, "budget_seconds": budget_seconds}
+        train_chaoscontrol_for_budget(
+            model,
+            train_tokens=tokens,
+            train_starts=list(TRAIN_STARTS),
+            seed=seed,
+            rank=0,
+            world_size=world_size,
+            generation_mode=generation_mode,
+            tokenizer=tokenizer,
+            **kwargs,
+        )
+
+    def test_ddp_with_structured_generation_raises(self) -> None:
+        """world_size > 1 + generation_mode='structured' must raise fast."""
+        with self.assertRaises(NotImplementedError) as ctx:
+            self._call_with_aux(generation_mode="structured")
+        msg = str(ctx.exception)
+        self.assertIn("structured", msg)
+        self.assertIn("DDP", msg)
+
+    def test_ddp_with_trainable_tokenizer_raises(self) -> None:
+        """world_size > 1 + trainable tokenizer must raise fast.
+
+        A minimal stand-in with .parameters() is enough to trip the
+        "tokenizer is not None" check. The guard does not introspect the
+        tokenizer's structure — it checks the caller's intent signal.
+        """
+        fake_tokenizer = torch.nn.Linear(4, 4)
+        with self.assertRaises(NotImplementedError) as ctx:
+            self._call_with_aux(tokenizer=fake_tokenizer)
+        msg = str(ctx.exception)
+        self.assertIn("tokenizer", msg)
+        self.assertIn("DDP", msg)
+
+    def test_ddp_with_both_aux_modules_names_both_in_error(self) -> None:
+        """Both aux modules at once — error message cites both causes."""
+        fake_tokenizer = torch.nn.Linear(4, 4)
+        with self.assertRaises(NotImplementedError) as ctx:
+            self._call_with_aux(
+                generation_mode="structured", tokenizer=fake_tokenizer
+            )
+        msg = str(ctx.exception)
+        self.assertIn("structured", msg)
+        self.assertIn("tokenizer", msg)
+
+    def test_single_device_with_structured_generation_does_not_hit_guard(self) -> None:
+        """Sanity: the guard is DDP-specific.
+
+        generation_mode='structured' at world_size=1 must not trigger this
+        guard. The training call may fail later for other reasons (e.g.
+        structured projection setup on the toy model), but it must not
+        raise our *specific* DDP+structured NotImplementedError.
+        """
+        try:
+            self._call_with_aux(
+                generation_mode="structured",
+                world_size=1,
+                budget_seconds=0.05,
+            )
+        except NotImplementedError as exc:
+            msg = str(exc)
+            if "DDP" in msg and "structured" in msg:
+                self.fail(f"Guard incorrectly fired at world_size=1: {exc}")
+        except Exception:
+            # Any non-guard exception is fine — the guard didn't over-fire.
+            pass
+
+    def test_ddp_without_aux_modules_does_not_hit_guard(self) -> None:
+        """Sanity: bare SSM at world_size=2 must not hit this guard.
+
+        With generation_mode='noise' and tokenizer=None (both Exp 18
+        defaults), this guard is skipped and the next guard fires — the
+        existing RuntimeError about torch.distributed not being
+        initialized.
+        """
+        with self.assertRaises(RuntimeError) as ctx:
+            self._call_with_aux()
+        # Must be the torch.distributed init error, not our guard's NotImplementedError.
+        self.assertIn("torch.distributed", str(ctx.exception))
+        self.assertNotIsInstance(ctx.exception, NotImplementedError)
+
+
 if __name__ == "__main__":
     unittest.main()
