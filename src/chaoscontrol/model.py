@@ -225,8 +225,8 @@ class ChaosAttentionBlock(nn.Module):
     in ChaosStudentLM via the ``block_type`` constructor flag.
 
     Architecture (mirrors ChaosSSMBlock's pre-norm + two-residual shape):
-      - input_norm (RMSNorm) -> Q/K/V projection -> causal SDPA -> out_proj
-        -> residual
+      - input_norm (RMSNorm) -> Q/K/V projection -> RoPE on Q/K -> causal SDPA
+        -> out_proj -> residual
       - ff_norm (RMSNorm) -> FeedForward -> residual
 
     Attention uses torch.nn.functional.scaled_dot_product_attention with
@@ -234,12 +234,28 @@ class ChaosAttentionBlock(nn.Module):
     fast paths on H100 (including FlashAttention v2 under the hood when the
     shapes/dtypes are supported).
 
+    Positional signal: Rotary Position Embeddings (RoPE, Su et al., RoFormer,
+    2021) applied to Q and K only (not V). Parameter-free — cos/sin tables
+    are derived from position indices and a base constant (10000) and stored
+    as non-persistent buffers so checkpoints are unaffected. This matches the
+    way ChaosSSMBlock's SSM recurrence gets position "for free" from the
+    state-transition dynamics: no learned positional parameters enter the
+    comparison on either side. Rationale: without any position signal,
+    self-attention is permutation-equivariant (modulo the causal mask),
+    whereas the SSM recurrence is intrinsically positional. Codex review
+    2026-04-13 flagged this as a High-severity fairness issue for the
+    Exp 19 Phase 2 control.
+
     Parameter footprint at dim=256, ff_mult=2, num_heads=8:
       - QKV projection (fused): 3 * dim^2 = 196,608
       - out_proj:              dim^2     = 65,536
       - FF (fc + proj):        2 * dim * (dim * ff_mult) = 262,144
       - RMSNorm weights:       2 * dim   = 512
       - total:                              ~524,800 parameters
+
+    RoPE contributes ZERO learnable parameters; the cos/sin buffers are
+    registered with ``persistent=False`` and do not show up in
+    ``sum(p.numel() for p in block.parameters())`` or in the state_dict.
 
     This is ~1 * dim^2 FEWER params than ChaosSSMBlock's core (which has
     in/select/gate/delta/out = 5 projections). Exp 19 Phase 2 compares
@@ -255,16 +271,27 @@ class ChaosAttentionBlock(nn.Module):
         *,
         num_heads: int = 8,
         attn_dropout: float = 0.0,
+        rope_base: float = 10000.0,
     ) -> None:
         super().__init__()
         if dim % num_heads != 0:
             raise ValueError(
                 f"dim ({dim}) must be divisible by num_heads ({num_heads})"
             )
+        head_dim = dim // num_heads
+        # RoPE pairs adjacent channels (2i, 2i+1) into a complex rotation, so
+        # head_dim must be even. Without this assertion, odd head_dim would
+        # silently drop the last channel and produce subtly wrong rotations.
+        if head_dim % 2 != 0:
+            raise ValueError(
+                f"head_dim ({head_dim}) must be even for RoPE; "
+                f"got dim={dim}, num_heads={num_heads}"
+            )
         self.dim = dim
         self.num_heads = num_heads
-        self.head_dim = dim // num_heads
+        self.head_dim = head_dim
         self.attn_dropout = attn_dropout
+        self.rope_base = rope_base
 
         self.input_norm = RMSNorm(dim)
         self.ff_norm = RMSNorm(dim)
@@ -275,6 +302,94 @@ class ChaosAttentionBlock(nn.Module):
         self.qkv_proj = nn.Linear(dim, 3 * dim, bias=False)
         self.out_proj = nn.Linear(dim, dim, bias=False)
 
+        # RoPE cos/sin cache. Non-persistent buffers: they are not saved in
+        # the state_dict, do not bloat checkpoints, and are lazily rebuilt on
+        # the first forward pass (or any later forward with a longer sequence
+        # than the cache covers). Stored in float32 for precision; cast to
+        # the input dtype at application time (same pattern as RMSNorm).
+        # Initial shape is (0, head_dim) — zero-length sentinel so the first
+        # forward triggers a real build. We cannot know the target device at
+        # __init__ time; buffers will move with .to(device) alongside the
+        # module, and the cache-extend path handles device/dtype transitions.
+        self.register_buffer(
+            "_rope_cos",
+            torch.empty(0, head_dim, dtype=torch.float32),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_rope_sin",
+            torch.empty(0, head_dim, dtype=torch.float32),
+            persistent=False,
+        )
+
+    def _ensure_rope_cache(self, seq_len: int, device: torch.device) -> None:
+        """Lazily (re)build the RoPE cos/sin cache when needed.
+
+        Rebuilds if the cache is shorter than ``seq_len`` or on a different
+        device. Stored in float32; dtype conversion happens at application
+        time. Cheap to rebuild — O(seq_len * head_dim).
+        """
+        cache_len = self._rope_cos.shape[0]
+        same_device = self._rope_cos.device == device
+        if cache_len >= seq_len and same_device:
+            return
+        # Rotation frequencies: 1 / base^(2i / head_dim) for i in [0, head_dim/2).
+        # Each pair (2i, 2i+1) shares the same frequency.
+        half = self.head_dim // 2
+        freqs = torch.arange(0, half, dtype=torch.float32, device=device)
+        inv_freq = 1.0 / (self.rope_base ** (2.0 * freqs / self.head_dim))
+        positions = torch.arange(seq_len, dtype=torch.float32, device=device)
+        # angles[t, i] = t * inv_freq[i], shape (seq_len, half)
+        angles = torch.einsum("t,i->ti", positions, inv_freq)
+        # Expand to (seq_len, head_dim) by repeating each freq for the pair.
+        # cos/sin are the same for both channels of a (2i, 2i+1) pair; the
+        # interleaved application math in ``apply_rope`` reads only the even
+        # indices of these tensors per pair (see below).
+        cos = torch.repeat_interleave(torch.cos(angles), 2, dim=-1)
+        sin = torch.repeat_interleave(torch.sin(angles), 2, dim=-1)
+        self._rope_cos = cos
+        self._rope_sin = sin
+
+    @staticmethod
+    def apply_rope(
+        x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
+    ) -> torch.Tensor:
+        """Apply interleaved rotary embedding to the last dim of ``x``.
+
+        Math (interleaved pairs; RoFormer paper form):
+            x_rot[..., 0::2] = x[..., 0::2] * cos_pair - x[..., 1::2] * sin_pair
+            x_rot[..., 1::2] = x[..., 1::2] * cos_pair + x[..., 0::2] * sin_pair
+        where cos_pair[..., i] = cos(theta_i) for i in [0, head_dim/2).
+
+        ``cos`` and ``sin`` are shape (seq_len, head_dim) with each frequency
+        repeated twice along the last axis (cos = [c0, c0, c1, c1, ...]), so
+        the even/odd slices pick the same cos_pair/sin_pair for the
+        corresponding channel of each rotation pair.
+
+        ``x`` has shape (..., seq_len, head_dim); the cos/sin broadcast over
+        the leading axes. Result is the same dtype as ``x``.
+
+        This is defined as a staticmethod so tests can exercise the rotation
+        math in isolation without instantiating the block, and so the
+        numerical-parity test has a single source of truth it can call.
+        """
+        # Cast cos/sin to input dtype for the multiplication. The underlying
+        # buffers are float32; we match x's dtype here so bf16 forward passes
+        # stay in bf16 for the actual multiply.
+        cos = cos.to(dtype=x.dtype)
+        sin = sin.to(dtype=x.dtype)
+        x_even = x[..., 0::2]
+        x_odd = x[..., 1::2]
+        cos_pair = cos[..., 0::2]
+        sin_pair = sin[..., 0::2]
+        rot_even = x_even * cos_pair - x_odd * sin_pair
+        rot_odd = x_odd * cos_pair + x_even * sin_pair
+        # Re-interleave into the original shape.
+        out = torch.empty_like(x)
+        out[..., 0::2] = rot_even
+        out[..., 1::2] = rot_odd
+        return out
+
     def _attn(self, x: torch.Tensor) -> torch.Tensor:
         """Run pre-norm causal self-attention over the sequence dim."""
         batch, seq, dim = x.shape
@@ -284,6 +399,16 @@ class ChaosAttentionBlock(nn.Module):
         q = q.view(batch, seq, self.num_heads, self.head_dim).transpose(1, 2)
         k = k.view(batch, seq, self.num_heads, self.head_dim).transpose(1, 2)
         v = v.view(batch, seq, self.num_heads, self.head_dim).transpose(1, 2)
+        # Apply RoPE to Q and K (not V) after the QKV reshape and before SDPA.
+        # V carries no positional rotation — this is the standard RoFormer
+        # formulation. step() hits this path with seq=1, where cos=1 and
+        # sin=0 for every frequency at position 0, so the rotation collapses
+        # to the identity and no step-specific branch is needed.
+        self._ensure_rope_cache(seq, x.device)
+        cos = self._rope_cos[:seq]  # (seq, head_dim)
+        sin = self._rope_sin[:seq]
+        q = self.apply_rope(q, cos, sin)
+        k = self.apply_rope(k, cos, sin)
         # SDPA with is_causal=True installs the upper-triangular mask internally.
         # Dropout is only applied in training mode.
         dropout_p = self.attn_dropout if self.training else 0.0
