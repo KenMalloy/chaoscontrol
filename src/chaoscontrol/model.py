@@ -1,10 +1,19 @@
-"""ChaosSSMBlock and ChaosStudentLM — full model assembly."""
+"""ChaosSSMBlock, ChaosSSMHybridBlock, ChaosAttentionBlock and ChaosStudentLM — full model assembly.
+
+ChaosAttentionBlock is a scientific control for Exp 19 Phase 2: it provides a
+causal-attention sibling to ChaosSSMBlock sharing the same block interface so
+an apples-to-apples comparison can be run inside a single ChaosStudentLM via
+the ``block_type`` constructor flag. It is not a submission candidate and
+does not participate in the hybrid SSM+local-attention path used by
+ChaosSSMHybridBlock — the two are independent choices.
+"""
 from __future__ import annotations
 
 from typing import Any
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from chaoscontrol.core import RMSNorm, FeedForward, ChaosSSMCore
 from chaoscontrol.local_attn import LocalAttention, RollingKVCache
@@ -203,6 +212,152 @@ class ChaosSSMHybridBlock(nn.Module):
         return y
 
 
+class ChaosAttentionBlock(nn.Module):
+    """Causal multi-head self-attention sibling to ChaosSSMBlock.
+
+    Scientific control for Exp 19 Phase 2's "SSM vs Attention under equal
+    infrastructure" comparison. Not a submission candidate and NOT related to
+    ChaosSSMHybridBlock's local-attention sidecar — this is pure attention,
+    used when the whole model runs as a transformer for the controlled
+    comparison against the pure-SSM path.
+
+    Matches ChaosSSMBlock's block interface exactly so the two can be swapped
+    in ChaosStudentLM via the ``block_type`` constructor flag.
+
+    Architecture (mirrors ChaosSSMBlock's pre-norm + two-residual shape):
+      - input_norm (RMSNorm) -> Q/K/V projection -> causal SDPA -> out_proj
+        -> residual
+      - ff_norm (RMSNorm) -> FeedForward -> residual
+
+    Attention uses torch.nn.functional.scaled_dot_product_attention with
+    is_causal=True. No Flash Attention dependency; PyTorch's SDPA has native
+    fast paths on H100 (including FlashAttention v2 under the hood when the
+    shapes/dtypes are supported).
+
+    Parameter footprint at dim=256, ff_mult=2, num_heads=8:
+      - QKV projection (fused): 3 * dim^2 = 196,608
+      - out_proj:              dim^2     = 65,536
+      - FF (fc + proj):        2 * dim * (dim * ff_mult) = 262,144
+      - RMSNorm weights:       2 * dim   = 512
+      - total:                              ~524,800 parameters
+
+    This is ~1 * dim^2 FEWER params than ChaosSSMBlock's core (which has
+    in/select/gate/delta/out = 5 projections). Exp 19 Phase 2 compares
+    per-token learning efficiency at matched block count, not matched
+    per-block parameter count — the difference is documented honestly in
+    the review brief.
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        ff_mult: int = 2,
+        *,
+        num_heads: int = 8,
+        attn_dropout: float = 0.0,
+    ) -> None:
+        super().__init__()
+        if dim % num_heads != 0:
+            raise ValueError(
+                f"dim ({dim}) must be divisible by num_heads ({num_heads})"
+            )
+        self.dim = dim
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        self.attn_dropout = attn_dropout
+
+        self.input_norm = RMSNorm(dim)
+        self.ff_norm = RMSNorm(dim)
+        self.ff = FeedForward(dim, ff_mult)
+
+        # Fused QKV projection matches the ChaosSSMCore convention of bias=False
+        # and keeps the per-block parameter footprint compact.
+        self.qkv_proj = nn.Linear(dim, 3 * dim, bias=False)
+        self.out_proj = nn.Linear(dim, dim, bias=False)
+
+    def _attn(self, x: torch.Tensor) -> torch.Tensor:
+        """Run pre-norm causal self-attention over the sequence dim."""
+        batch, seq, dim = x.shape
+        qkv = self.qkv_proj(x)  # (batch, seq, 3*dim)
+        q, k, v = qkv.chunk(3, dim=-1)
+        # (batch, seq, num_heads, head_dim) -> (batch, num_heads, seq, head_dim)
+        q = q.view(batch, seq, self.num_heads, self.head_dim).transpose(1, 2)
+        k = k.view(batch, seq, self.num_heads, self.head_dim).transpose(1, 2)
+        v = v.view(batch, seq, self.num_heads, self.head_dim).transpose(1, 2)
+        # SDPA with is_causal=True installs the upper-triangular mask internally.
+        # Dropout is only applied in training mode.
+        dropout_p = self.attn_dropout if self.training else 0.0
+        attn_out = F.scaled_dot_product_attention(
+            q, k, v, is_causal=True, dropout_p=dropout_p
+        )
+        # (batch, num_heads, seq, head_dim) -> (batch, seq, dim)
+        attn_out = attn_out.transpose(1, 2).contiguous().view(batch, seq, dim)
+        return self.out_proj(attn_out)
+
+    def step(
+        self,
+        x: torch.Tensor,
+        state: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Single-token step through the block.
+
+        This interface exists so ChaosAttentionBlock is drop-in compatible with
+        ChaosSSMBlock in ChaosStudentLM.step() / dream_step(). Because single-
+        token attention has no history (we intentionally do NOT maintain a KV
+        cache — the task forbids hybrid SSM+attention paths here), this
+        collapses to a pass through V + out_proj (the causal mask makes the
+        softmax over a single position a no-op: q_0 attends to k_0 only,
+        weighted 1.0).
+
+        The returned "new_state" is a zero tensor of the same shape as the
+        incoming state, preserving the shape contract that lets ChaosStudentLM
+        iterate blocks uniformly. Attention has no cross-token state; this
+        method is NOT valid for incremental decoding — it exists only so
+        ChaosStudentLM.step() / dream_step() do not crash when
+        block_type="attention".
+
+        Args:
+            x: (batch, dim) — single token
+            state: (batch, dim) — ignored, carried for interface parity
+
+        Returns:
+            (output, new_state) — output is (batch, dim), new_state is zeros
+            of the same shape as the incoming state.
+        """
+        normed = self.input_norm(x)
+        # Promote (batch, dim) -> (batch, 1, dim), attend, drop the seq dim.
+        y_seq = self._attn(normed.unsqueeze(1)).squeeze(1)
+        x = x + y_seq
+        x = x + self.ff(self.ff_norm(x))
+        new_state = torch.zeros_like(state)
+        return x, new_state
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        *,
+        return_jacobian_stats: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, dict]:
+        """Sequence forward pass. Shape: (batch, seq, dim) -> (batch, seq, dim).
+
+        return_jacobian_stats is accepted for interface parity with
+        ChaosSSMBlock. Attention has no per-step Jacobian in the SSM sense, so
+        we return dummy zero stats matching the SSM diag-mode contract (see
+        ChaosSSMCore.forward around the ``return_jacobian_stats`` branch).
+        """
+        normed = self.input_norm(x)
+        y = self._attn(normed)
+        x = x + y
+        x = x + self.ff(self.ff_norm(x))
+        if return_jacobian_stats:
+            stats = {
+                "lambda_max": torch.tensor(0.0, device=x.device),
+                "sv_log_var": torch.tensor(0.0, device=x.device),
+            }
+            return x, stats
+        return x
+
+
 class ChaosStudentLM(nn.Module):
     """Full ChaosControl student language model wiring all components."""
 
@@ -213,6 +368,9 @@ class ChaosStudentLM(nn.Module):
         dim: int,
         num_layers: int,
         ff_mult: int = 2,
+        block_type: str = "ssm",
+        attention_num_heads: int = 8,
+        attention_dropout: float = 0.0,
         a_mode: str = "diag",
         a_full_rank: int = 8,
         a_full_gamma: float = 0.05,
@@ -294,37 +452,60 @@ class ChaosStudentLM(nn.Module):
                     expert_dim=wernicke_expert_dim if wernicke_expert_dim > 0 else None,
                 )
 
-        ssm_block_kwargs = dict(
-            a_mode=a_mode,
-            a_full_rank=a_full_rank,
-            a_full_gamma=a_full_gamma,
-            rich_b_mode=rich_b_mode,
-            rich_b_bottleneck=rich_b_bottleneck,
-            rich_b_num_subnets=rich_b_num_subnets,
-            rich_b_settling_steps=rich_b_settling_steps,
-        )
-        if local_attn_window > 0:
-            ssm_layers = [
-                ChaosSSMBlock(dim, ff_mult, **ssm_block_kwargs)
-                for _ in range(num_layers - 1)
-            ]
-            hybrid_layer = ChaosSSMHybridBlock(
-                dim, ff_mult,
+        self.block_type = block_type
+        if block_type == "attention":
+            # Pure-attention scientific control for Exp 19 Phase 2. All layers
+            # are ChaosAttentionBlock; local_attn_window / hybrid-SSM kwargs
+            # are ignored in this path because the comparison is "full SSM
+            # stack vs full attention stack", not "SSM with sidecar vs
+            # attention with sidecar". If the comparison is ever widened, the
+            # ChaosSSMHybridBlock sidecar is still the right mechanism for
+            # mixed configurations and should not be conflated with this flag.
+            self.layers = nn.ModuleList([
+                ChaosAttentionBlock(
+                    dim,
+                    ff_mult,
+                    num_heads=attention_num_heads,
+                    attn_dropout=attention_dropout,
+                )
+                for _ in range(num_layers)
+            ])
+        elif block_type == "ssm":
+            ssm_block_kwargs = dict(
                 a_mode=a_mode,
                 a_full_rank=a_full_rank,
                 a_full_gamma=a_full_gamma,
-                local_attn_window=local_attn_window,
-                local_attn_heads=local_attn_heads,
-                local_attn_dim=local_attn_dim,
-                local_attn_topk=local_attn_topk,
-                local_attn_topk_random=local_attn_topk_random,
+                rich_b_mode=rich_b_mode,
+                rich_b_bottleneck=rich_b_bottleneck,
+                rich_b_num_subnets=rich_b_num_subnets,
+                rich_b_settling_steps=rich_b_settling_steps,
             )
-            self.layers = nn.ModuleList(ssm_layers + [hybrid_layer])
+            if local_attn_window > 0:
+                ssm_layers = [
+                    ChaosSSMBlock(dim, ff_mult, **ssm_block_kwargs)
+                    for _ in range(num_layers - 1)
+                ]
+                hybrid_layer = ChaosSSMHybridBlock(
+                    dim, ff_mult,
+                    a_mode=a_mode,
+                    a_full_rank=a_full_rank,
+                    a_full_gamma=a_full_gamma,
+                    local_attn_window=local_attn_window,
+                    local_attn_heads=local_attn_heads,
+                    local_attn_dim=local_attn_dim,
+                    local_attn_topk=local_attn_topk,
+                    local_attn_topk_random=local_attn_topk_random,
+                )
+                self.layers = nn.ModuleList(ssm_layers + [hybrid_layer])
+            else:
+                self.layers = nn.ModuleList([
+                    ChaosSSMBlock(dim, ff_mult, **ssm_block_kwargs)
+                    for _ in range(num_layers)
+                ])
         else:
-            self.layers = nn.ModuleList([
-                ChaosSSMBlock(dim, ff_mult, **ssm_block_kwargs)
-                for _ in range(num_layers)
-            ])
+            raise ValueError(
+                f"unsupported block_type: {block_type!r} (expected 'ssm' or 'attention')"
+            )
         self.final_norm = RMSNorm(dim)
         self.lm_head = nn.Linear(dim, vocab_size, bias=False)
         self.outer_model_type = outer_model_type
