@@ -4,12 +4,14 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import random
 import time
 from pathlib import Path
 from typing import Any
 
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 
 from chaoscontrol.config import ChaosControlConfig
@@ -20,6 +22,38 @@ from chaoscontrol.memory import MultiSlotOuterModel
 from chaoscontrol.posterior import GlobalDelta, BucketDelta, ResidualCache
 from chaoscontrol.wake_cache import WakeCache
 from chaoscontrol.sleep import SleepConfig, SleepCycle
+
+
+def _resolve_ddp_context(
+    rank: int | None,
+    world_size: int | None,
+) -> tuple[int, int]:
+    """Resolve (rank, world_size) from explicit args or env vars.
+
+    Precedence:
+        1. Explicit args (both must be provided together).
+        2. torch.distributed if initialized.
+        3. Env vars RANK / WORLD_SIZE (set by torchrun).
+        4. Fallback (0, 1) — single device.
+
+    Returns (rank, world_size) where world_size == 1 means the single-device
+    path. In that case no DDP wrapping or barriers happen, which keeps the
+    pre-DDP training loop bit-identical to its prior behavior.
+    """
+    if rank is not None and world_size is not None:
+        return int(rank), int(world_size)
+    if rank is not None or world_size is not None:
+        raise ValueError(
+            "rank and world_size must both be provided, or both be None. "
+            f"Got rank={rank}, world_size={world_size}."
+        )
+    if dist.is_available() and dist.is_initialized():
+        return int(dist.get_rank()), int(dist.get_world_size())
+    env_rank = os.environ.get("RANK")
+    env_world = os.environ.get("WORLD_SIZE")
+    if env_rank is not None and env_world is not None:
+        return int(env_rank), int(env_world)
+    return 0, 1
 
 
 def train_chaoscontrol_for_budget(
@@ -75,8 +109,44 @@ def train_chaoscontrol_for_budget(
     # Typed KV buffer: "append_only" writes per-token to Wernicke buckets; "legacy" uses consolidation
     buffer_mode: str = "legacy",
     wernicke_enabled: bool = False,
+    # DDP integration — when world_size == 1 (default, via _resolve_ddp_context
+    # resolving to single-device), this code path is bit-identical to the
+    # pre-DDP training loop: no DDP wrap, no barriers, no data sharding.
+    rank: int | None = None,
+    world_size: int | None = None,
 ) -> dict[str, Any]:
-    """Train ChaosStudentLM for a time budget with optional criticality regularization."""
+    """Train ChaosStudentLM for a time budget with optional criticality regularization.
+
+    DDP semantics:
+        When ``world_size > 1`` (resolved from explicit args, torch.distributed
+        state, or ``RANK``/``WORLD_SIZE`` env vars) the model is wrapped in
+        ``torch.nn.parallel.DistributedDataParallel`` after ``.to(device)`` but
+        before the optimizer is constructed. The data loader RNG is seeded with
+        ``seed + rank`` and ``train_starts`` is sharded across ranks by stride.
+        Model-init seeds must be set identically across ranks by the caller so
+        DDP broadcasts a consistent initial state. Prints and file writes
+        performed inside this function are already safe (none of them touch the
+        filesystem), and all collective waits are handled in
+        ``dist.barrier()`` calls at sync points below.
+    """
+    rank, world_size = _resolve_ddp_context(rank, world_size)
+    ddp_active = world_size > 1
+
+    # Guard: metabolic_fork and micro_mcts take the RAW model, bypassing DDP's
+    # gradient all-reduce hook (which only fires on the wrapped module's
+    # forward). Under DDP this would either hang waiting for an all-reduce
+    # that never triggers, or silently skip gradient sync on fork steps.
+    # Fail fast here rather than producing silent correctness bugs mid-run.
+    if ddp_active and metabolic_gate and metabolic_mode in ("fork", "mcts"):
+        raise NotImplementedError(
+            f"metabolic_gate=True with metabolic_mode={metabolic_mode!r} is "
+            f"incompatible with DDP (world_size={world_size}). The metabolic_fork "
+            "and micro_mcts forwards take the raw model, bypassing DDP's gradient "
+            "all-reduce hook — which would cause hangs or silently skipped gradient "
+            "syncs on fork steps. Use either DDP with metabolic_gate=False, or "
+            "single-device (world_size=1) with metabolic_fork/mcts."
+        )
+
     # Set up structured projections if requested (before optimizer so its params are included)
     structured_proj = None
     if generation_mode == "structured":
@@ -86,13 +156,65 @@ def train_chaoscontrol_for_budget(
             k=metabolic_k,
         ).to(device)
 
+    # DDP wrap. Critically we keep ``model`` as the unwrapped module so all
+    # attribute access downstream (model.vocab_size, model.wernicke,
+    # model.outer_model, model.posterior, model.semantic_tier, ...) keeps
+    # working. Only the training-step forward call uses ``ddp_model`` so the
+    # gradient all-reduce hook fires on ``loss.backward()``. When
+    # world_size == 1 we assign ddp_model = model so the single-device path is
+    # bit-identical to the pre-change version.
+    if ddp_active:
+        if not (dist.is_available() and dist.is_initialized()):
+            raise RuntimeError(
+                f"DDP training requested (world_size={world_size}, rank={rank}) "
+                "but torch.distributed is not initialized. The caller must call "
+                "torch.distributed.init_process_group(...) before invoking "
+                "train_chaoscontrol_for_budget."
+            )
+        # device_ids / output_device are only meaningful for CUDA DDP. On
+        # CPU (gloo backend) they must be None. For CUDA, the device must
+        # have an explicit index — callers who pass torch.device("cuda")
+        # without an index would otherwise send None through here and hit
+        # a cryptic DDP error. Resolve that here by falling back to the
+        # current CUDA device (which torchrun + torch.cuda.set_device()
+        # should have set in the caller).
+        if device.type == "cuda":
+            idx = device.index if device.index is not None else torch.cuda.current_device()
+            ddp_kwargs = dict(device_ids=[idx], output_device=idx)
+        else:
+            ddp_kwargs = dict(device_ids=None, output_device=None)
+        ddp_model = torch.nn.parallel.DistributedDataParallel(
+            model,
+            find_unused_parameters=False,
+            **ddp_kwargs,
+        )
+    else:
+        ddp_model = model
+
+    # Note: DDP.parameters() iterates the wrapped module's parameters, so both
+    # forms work. We keep ``model.parameters()`` to match the pre-DDP behavior
+    # exactly when world_size == 1.
     all_params = list(model.parameters())
     if structured_proj is not None:
         all_params += list(structured_proj.parameters())
     if tokenizer is not None:
         all_params += list(tokenizer.parameters())
     optimizer = torch.optim.AdamW(all_params, lr=base_lr, weight_decay=weight_decay)
-    rng = random.Random(seed)
+
+    # Rank-aware data sampler: stride the start-index list so each rank sees a
+    # disjoint shard. ``seed + rank`` diverges each rank's RNG sequence so they
+    # pick different windows from their shards within the same training step.
+    if ddp_active:
+        sharded_train_starts = [
+            s for i, s in enumerate(train_starts) if i % world_size == rank
+        ]
+        if len(sharded_train_starts) < 1:
+            raise ValueError(
+                f"DDP rank {rank}/{world_size}: sharded train_starts is empty. "
+                f"Input had {len(train_starts)} starts; need at least world_size."
+            )
+        train_starts = sharded_train_starts
+    rng = random.Random(seed + rank)
     history: list[dict[str, float]] = []
     start_time = time.perf_counter()
     steps = 0
@@ -245,7 +367,12 @@ def train_chaoscontrol_for_budget(
                 # Cheap deterministic pass (always — MC mode uses this as the base)
                 # Typed buffer path: pass memory_write_mode to control per-token buffer writes
                 _write_mode = "append_only" if buffer_mode == "append_only" else "none"
-                out = model(inputs, return_jacobian_stats=use_crit, memory_write_mode=_write_mode)
+                # ddp_model is the DDP wrapper when world_size > 1, otherwise
+                # ddp_model is model (same object). This is the one forward
+                # that needs the DDP hook so the backward all-reduce fires;
+                # metabolic_fork / micro_mcts / stats forwards above are
+                # under torch.no_grad() and don't need grad sync.
+                out = ddp_model(inputs, return_jacobian_stats=use_crit, memory_write_mode=_write_mode)
 
             # Monte Carlo path: sample the possibility space on surprise,
             # use distributional stats to weight the gradient — no winner picked
@@ -596,6 +723,14 @@ def train_chaoscontrol_for_budget(
 
     maybe_sync_cuda(device)
 
+    # DDP sync point: wait for all ranks to finish training before the caller
+    # can run eval or tear down the process group. Using dist.barrier() here
+    # avoids the classic DDP bug where one rank starts eval while another is
+    # still iterating train_starts, and the collective from eval blocks on
+    # training forward state.
+    if ddp_active:
+        dist.barrier()
+
     # VRAM high-water mark — catches unbounded buffer growth before it OOMs
     peak_vram_mb = 0.0
     if device.type == "cuda":
@@ -613,6 +748,8 @@ def train_chaoscontrol_for_budget(
         "regret_table": regret_table,
         "sleep_cycles": sleep_cycles_run,
         "peak_vram_mb": peak_vram_mb,
+        "ddp_rank": rank,
+        "ddp_world_size": world_size,
     }
 
 
@@ -744,18 +881,23 @@ def run_chaoscontrol_matrix(
             **eval_result,
         }
         results.append(result)
-        print(
-            f"[{i+1}/{total}] {cell['a_mode']:>6} {cell['label']:<20} "
-            f"bpb={eval_result['bpb']:.4f}  steps={train_result['steps']}  "
-            f"elapsed={train_result['elapsed_s']:.1f}s"
-        )
+        # Rank-0 guard: matrix prints and checkpoint writes race at
+        # world_size > 1. Resolve the DDP context lazily here so the
+        # single-device path (rank 0, world 1) behaves exactly as before.
+        _rank, _ = _resolve_ddp_context(None, None)
+        if _rank == 0:
+            print(
+                f"[{i+1}/{total}] {cell['a_mode']:>6} {cell['label']:<20} "
+                f"bpb={eval_result['bpb']:.4f}  steps={train_result['steps']}  "
+                f"elapsed={train_result['elapsed_s']:.1f}s"
+            )
 
-        # Checkpoint after every cell so partial results survive crashes
-        if cfg.output_json:
-            _checkpoint_path = Path(cfg.output_json)
-            _checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
-            with open(_checkpoint_path, "w") as _f:
-                json.dump(results, _f, indent=2, default=str)
+            # Checkpoint after every cell so partial results survive crashes
+            if cfg.output_json:
+                _checkpoint_path = Path(cfg.output_json)
+                _checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+                with open(_checkpoint_path, "w") as _f:
+                    json.dump(results, _f, indent=2, default=str)
 
     return results
 

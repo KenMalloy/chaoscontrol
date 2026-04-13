@@ -16,6 +16,7 @@ from typing import Any
 
 import numpy as np
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 import yaml
 
@@ -37,6 +38,22 @@ from chaoscontrol.model import ChaosSSMBlock, ChaosSSMHybridBlock, ChaosStudentL
 from chaoscontrol.training import train_chaoscontrol_for_budget
 
 MIN_PYTHON = (3, 10)
+
+
+def _resolve_rank_world() -> tuple[int, int]:
+    """Resolve (rank, world_size) from torch.distributed or env vars.
+
+    Returns (0, 1) when distributed is not set up. This keeps the
+    single-device Exp 17 path bit-identical: no branches taken, no
+    new env lookups fail, nothing changes.
+    """
+    if dist.is_available() and dist.is_initialized():
+        return int(dist.get_rank()), int(dist.get_world_size())
+    env_rank = os.environ.get("RANK")
+    env_world = os.environ.get("WORLD_SIZE")
+    if env_rank is not None and env_world is not None:
+        return int(env_rank), int(env_world)
+    return 0, 1
 
 
 def resolve_visible_cuda_devices(env: dict[str, str] | None = None) -> list[str]:
@@ -158,7 +175,9 @@ def load_sp_data(data_dir: str, vocab_size: int = 8192) -> tuple[torch.Tensor, t
     train_tokens = train_tokens.clamp(0, vocab_size - 1)
     val_tokens = val_tokens.clamp(0, vocab_size - 1)
     test_tokens = train_tokens[:0]
-    print(f"  SP data: train={train_tokens.numel():,} val={val_tokens.numel():,} tokens", flush=True)
+    rank, _ = _resolve_rank_world()
+    if rank == 0:
+        print(f"  SP data: train={train_tokens.numel():,} val={val_tokens.numel():,} tokens", flush=True)
     return train_tokens, val_tokens, test_tokens
 
 
@@ -333,7 +352,20 @@ def run_single(
     sp_model_path: str,
     output_json: str | None = None,
 ) -> dict[str, Any]:
-    """Run one Exp 17 train/eval condition."""
+    """Run one Exp 17 train/eval condition.
+
+    DDP-safe: when this script is launched via torchrun with world_size > 1
+    (or with explicit RANK/WORLD_SIZE env vars), the runner will apply
+    rank-aware seeding, guard prints and file writes to rank 0, and insert
+    distributed barriers around the eval phase. In the default single-device
+    path (no distributed env vars, no init_process_group call) the behavior is
+    bit-identical to the pre-DDP version — rank=0, world_size=1, no barriers,
+    no new branches taken.
+    """
+    rank, world_size = _resolve_rank_world()
+    is_rank0 = rank == 0
+    ddp_active = world_size > 1
+
     device = resolve_device(config.get("device", "auto"))
     param_dtype = resolve_param_dtype(config.get("dtype", "bf16"), device)
 
@@ -342,10 +374,21 @@ def run_single(
         torch.set_float32_matmul_precision("high")
     runtime = assert_runtime_compatibility(device=device, sp_model_path=sp_model_path)
 
+    # Model-init seeds must match across ranks so DDP broadcasts a consistent
+    # initial state. The data loader RNG inside train_chaoscontrol_for_budget
+    # picks up seed + rank itself; we only need the process-level init seed
+    # (torch/numpy/random) to be identical across ranks.
     seed = int(config.get("seed", 1337))
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
+
+    # Per-rank compile warmup — must run on every rank before the first
+    # training step to avoid torch.compile stagger (one rank compiling while
+    # others start the collective and block). verify_diag_recurrence is
+    # idempotent and fast; calling it here costs nothing but guarantees the
+    # chunked-scan backend is resolved before DDP initialization effects.
+    verify_diag_recurrence(device)
 
     train_tokens, val_tokens, _ = load_sp_data(data_path, config["vocab_size"])
 
@@ -369,12 +412,13 @@ def run_single(
     model = build_model(config, device, param_dtype)
     model_params = sum(p.numel() for p in model.parameters())
     artifact_bytes = model.artifact_bytes()
-    print(
-        f"Model: dim={config['model_dim']} | layers={config['num_layers']} | "
-        f"window={config.get('local_attn_window', 0)} | params={model_params:,} | "
-        f"artifact={artifact_bytes:,} bytes ({artifact_bytes / 1e6:.1f} MB)",
-        flush=True,
-    )
+    if is_rank0:
+        print(
+            f"Model: dim={config['model_dim']} | layers={config['num_layers']} | "
+            f"window={config.get('local_attn_window', 0)} | params={model_params:,} | "
+            f"artifact={artifact_bytes:,} bytes ({artifact_bytes / 1e6:.1f} MB)",
+            flush=True,
+        )
 
     train_result = train_chaoscontrol_for_budget(
         model,
@@ -395,26 +439,39 @@ def run_single(
     )
     train_summary = summarize_train_result(train_result)
 
-    eval_result = evaluate_bpb_sp(
-        model,
-        tokens=val_tokens,
-        eval_starts=eval_starts,
-        batch_size=batch_size,
-        seq_len=seq_len,
-        device=device,
-        base_bytes_lut=base_bytes_lut,
-        has_leading_space_lut=has_leading_space_lut,
-        is_boundary_token_lut=is_boundary_token_lut,
-    )
+    # Eval is identical across ranks (data-parallel eval on the same val_starts
+    # would be a waste — rank 0 runs the full eval while other ranks wait at
+    # the barrier). Wrap the eval phase in barriers so stragglers don't
+    # overlap the collective state when we return.
+    if ddp_active:
+        dist.barrier()
 
-    gate_stats = compute_gate_stats(
-        model,
-        tokens=val_tokens,
-        eval_starts=eval_starts,
-        batch_size=batch_size,
-        seq_len=seq_len,
-        device=device,
-    )
+    if is_rank0:
+        eval_result = evaluate_bpb_sp(
+            model,
+            tokens=val_tokens,
+            eval_starts=eval_starts,
+            batch_size=batch_size,
+            seq_len=seq_len,
+            device=device,
+            base_bytes_lut=base_bytes_lut,
+            has_leading_space_lut=has_leading_space_lut,
+            is_boundary_token_lut=is_boundary_token_lut,
+        )
+        gate_stats = compute_gate_stats(
+            model,
+            tokens=val_tokens,
+            eval_starts=eval_starts,
+            batch_size=batch_size,
+            seq_len=seq_len,
+            device=device,
+        )
+    else:
+        eval_result = {}
+        gate_stats = []
+
+    if ddp_active:
+        dist.barrier()
 
     result = {
         "config": config,
@@ -431,17 +488,19 @@ def run_single(
         },
     }
 
-    if output_json:
+    if is_rank0 and output_json:
         out_path = Path(output_json)
         tmp_path = out_path.with_suffix(".tmp")
         tmp_path.write_text(json.dumps(result, indent=2, default=str))
         tmp_path.rename(out_path)
 
-    print(
-        f"Done: bpb={eval_result['bpb']:.4f} | steps={train_summary['steps']} | "
-        f"steps/s={train_summary['steps_per_second']:.2f} | peak_vram={train_summary['peak_vram_mb']:.1f} MB",
-        flush=True,
-    )
+    if is_rank0:
+        bpb_display = eval_result.get("bpb", float("nan"))
+        print(
+            f"Done: bpb={bpb_display:.4f} | steps={train_summary['steps']} | "
+            f"steps/s={train_summary['steps_per_second']:.2f} | peak_vram={train_summary['peak_vram_mb']:.1f} MB",
+            flush=True,
+        )
     return result
 
 
