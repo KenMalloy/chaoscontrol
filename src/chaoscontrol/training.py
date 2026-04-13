@@ -369,9 +369,16 @@ def train_chaoscontrol_for_budget(
                 _write_mode = "append_only" if buffer_mode == "append_only" else "none"
                 # ddp_model is the DDP wrapper when world_size > 1, otherwise
                 # ddp_model is model (same object). This is the one forward
-                # that needs the DDP hook so the backward all-reduce fires;
-                # metabolic_fork / micro_mcts / stats forwards above are
-                # under torch.no_grad() and don't need grad sync.
+                # that needs the DDP hook so the backward all-reduce fires.
+                # metabolic_fork / micro_mcts take the raw model and ARE
+                # grad-tracked (no torch.no_grad wrapper at their call sites);
+                # they are incompatible with DDP and blocked at function entry.
+                # The jacobian-stats passes above are under torch.no_grad() and
+                # the monte_carlo pass below is also under torch.no_grad() —
+                # the MC pass returns detached uncertainty weights that scale
+                # per-token CE on the ``out`` tensor produced by this
+                # ddp_model forward, so loss.backward() still routes through
+                # the DDP wrapper and monte_carlo is DDP-safe.
                 out = ddp_model(inputs, return_jacobian_stats=use_crit, memory_write_mode=_write_mode)
 
             # Monte Carlo path: sample the possibility space on surprise,
