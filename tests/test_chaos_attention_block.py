@@ -241,6 +241,35 @@ class TestChaosStudentLMWithAttentionBlock(unittest.TestCase):
                 block_type="lstm",
             )
 
+    def test_student_lm_attention_step_shape(self) -> None:
+        """ChaosStudentLM.step() must work when block_type='attention'.
+
+        The attention block's step() is degenerate (single token, no history),
+        but it exists so ChaosStudentLM.step() / dream_step() iteration code
+        does not crash. This test pins the shape contract so future refactors
+        of the ``isinstance(layer, ChaosSSMHybridBlock)`` branching or the
+        attention block's step() signature are caught automatically.
+        """
+        model = ChaosStudentLM(
+            vocab_size=64,
+            dim=32,
+            num_layers=2,
+            ff_mult=2,
+            block_type="attention",
+            attention_num_heads=4,
+        )
+        model.eval()
+        states = model.init_state(batch_size=2)
+        ids = torch.randint(0, 64, (2, 1))
+        logits, hidden, new_states = model.step(ids, states)
+        assert logits.shape == (2, 64)
+        assert hidden.shape == (2, 32)
+        assert len(new_states) == 2
+        assert all(s.shape == (2, 32) for s in new_states)
+        # ChaosAttentionBlock.step returns zero new_state (no cross-token
+        # state by design — see the docstring on ChaosAttentionBlock.step).
+        assert all(s.abs().sum().item() == 0.0 for s in new_states)
+
     def test_student_lm_attention_causality(self) -> None:
         """Full LM is causal when ChaosAttentionBlock is used.
 
