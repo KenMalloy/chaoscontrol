@@ -317,5 +317,83 @@ class TestDepthRecurrenceValidation(unittest.TestCase):
             )
 
 
+class TestDepthRecurrenceStepGuards(unittest.TestCase):
+    """Guards: step() and dream_step() are forward()-only for depth recurrence.
+
+    forward() iterates the virtual layer schedule, but step() and dream_step()
+    iterate physical layers once. Calling step()/dream_step() with
+    depth_recurrence_count > 1 would silently run a shallower model than
+    forward() trained. Both methods raise NotImplementedError in that case
+    so the incompatibility is caught at call time, not discovered as a
+    silent quality drop during rollout.
+    """
+
+    def _make_recurrent_model(self, count: int) -> ChaosStudentLM:
+        torch.manual_seed(0)
+        return _make_model(
+            depth_recurrence_shared_layers=[1, 2],
+            depth_recurrence_count=count,
+        )
+
+    def test_step_raises_when_count_greater_than_one(self) -> None:
+        model = self._make_recurrent_model(count=2)
+        model.eval()
+        token_ids = torch.randint(0, model.vocab_size, (2, 1))
+        states = [torch.zeros(2, model.embed.embedding_dim) for _ in range(len(model.layers))]
+        with self.assertRaises(NotImplementedError) as ctx:
+            model.step(token_ids, states)
+        msg = str(ctx.exception)
+        self.assertIn("depth_recurrence_count=2", msg)
+        self.assertIn("step()", msg)
+
+    def test_step_raises_when_count_is_three(self) -> None:
+        """Cover the other common non-trivial count to protect against
+        off-by-one guard logic."""
+        model = self._make_recurrent_model(count=3)
+        model.eval()
+        token_ids = torch.randint(0, model.vocab_size, (2, 1))
+        states = [torch.zeros(2, model.embed.embedding_dim) for _ in range(len(model.layers))]
+        with self.assertRaises(NotImplementedError):
+            model.step(token_ids, states)
+
+    def test_dream_step_raises_when_count_greater_than_one(self) -> None:
+        model = self._make_recurrent_model(count=2)
+        model.eval()
+        token_ids = torch.randint(0, model.vocab_size, (2, 1))
+        states = [torch.zeros(2, model.embed.embedding_dim) for _ in range(len(model.layers))]
+        with self.assertRaises(NotImplementedError) as ctx:
+            model.dream_step(token_ids, states)
+        msg = str(ctx.exception)
+        self.assertIn("depth_recurrence_count=2", msg)
+        self.assertIn("dream_step()", msg)
+
+    def test_step_does_not_raise_at_count_one(self) -> None:
+        """Sanity: the guard fires only when count > 1. At count=1 the
+        single-token step path must still work — depth recurrence with
+        count=1 is a no-op and equivalent to the non-recurrent path."""
+        model = self._make_recurrent_model(count=1)
+        model.eval()
+        token_ids = torch.randint(0, model.vocab_size, (2, 1))
+        states = [torch.zeros(2, model.embed.embedding_dim) for _ in range(len(model.layers))]
+        try:
+            logits, hidden, new_states = model.step(token_ids, states)
+        except NotImplementedError as exc:
+            self.fail(f"Guard incorrectly fired at count=1: {exc}")
+        self.assertEqual(logits.shape, (2, model.vocab_size))
+
+    def test_step_does_not_raise_on_non_recurrent_baseline(self) -> None:
+        """Sanity: default (no depth recurrence args) must not hit the
+        guard. Default depth_recurrence_count is 1."""
+        torch.manual_seed(0)
+        model = _make_model()
+        model.eval()
+        token_ids = torch.randint(0, model.vocab_size, (2, 1))
+        states = [torch.zeros(2, model.embed.embedding_dim) for _ in range(len(model.layers))]
+        try:
+            model.step(token_ids, states)
+        except NotImplementedError as exc:
+            self.fail(f"Guard incorrectly fired on non-recurrent baseline: {exc}")
+
+
 if __name__ == "__main__":
     unittest.main()

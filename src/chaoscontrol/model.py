@@ -476,6 +476,26 @@ class ChaosStudentLM(nn.Module):
             hidden: (batch, dim)
             new_states: list of (batch, dim) per layer
         """
+        # Guard: depth recurrence is only wired into forward(), not step().
+        # step() iterates physical layers once regardless of the virtual
+        # layer schedule, so calling step() with count > 1 would silently
+        # run a different (shallower) model than forward() did on the same
+        # weights. Exp 19 Phase 1 trains full sequences via forward() — if
+        # a future caller wants recurrent single-token rollout (MCTS
+        # planning, autoregressive generation), they need to either update
+        # this method to iterate `self._virtual_layer_indices` with
+        # per-virtual-step state management, or explicitly accept that the
+        # rollout runs a different architecture than training did.
+        if self.depth_recurrence_count > 1:
+            raise NotImplementedError(
+                "ChaosStudentLM.step() does not implement depth recurrence. "
+                f"depth_recurrence_count={self.depth_recurrence_count} is set, "
+                "but step() iterates physical layers once — calling it would "
+                "silently run a shallower model than forward(). Use forward() "
+                "for full-sequence inference, or update step() to handle "
+                "virtual-layer rollout with per-virtual-step state management."
+            )
+
         x = self.embed(token_ids).squeeze(1)  # (batch, dim)
 
         if kv_caches is None:
@@ -524,6 +544,20 @@ class ChaosStudentLM(nn.Module):
             hidden: (batch, dim)
             new_states: list of (batch, dim) per layer
         """
+        # Guard: depth recurrence is only wired into forward(), not dream_step().
+        # See step()'s guard for the full rationale — same failure mode, same
+        # fix story. REM dream rollout with count > 1 would silently run a
+        # shallower model than forward() trained.
+        if self.depth_recurrence_count > 1:
+            raise NotImplementedError(
+                "ChaosStudentLM.dream_step() does not implement depth recurrence. "
+                f"depth_recurrence_count={self.depth_recurrence_count} is set, "
+                "but dream_step() iterates physical layers once — calling it would "
+                "silently run a shallower model than forward(). Use forward() "
+                "for full-sequence REM replay, or update dream_step() to handle "
+                "virtual-layer rollout with per-virtual-step state management."
+            )
+
         x = self.embed(token_ids).squeeze(1)  # (batch, dim)
 
         # Wernicke (NOT skipped, unlike step)
