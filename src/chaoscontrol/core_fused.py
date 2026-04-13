@@ -50,6 +50,25 @@ Design notes:
   scan backend — both are validated by their own tests
   (`tests/test_core.py`). The fused path wraps the scan as an opaque
   primitive, consuming only its output tensor.
+
+Limitations / follow-ups:
+
+- No `step()` method. The unfused `ChaosSSMBlock.step()` is used for
+  single-token autoregressive inference (MCTS rollout, sampling).
+  FusedChaosSSMBlock targets the training forward pass only, where the
+  post-scan block cost is visible in tok/s. Single-token inference
+  should continue to use `ChaosSSMBlock` or a dedicated fused step
+  implementation — do NOT drop FusedChaosSSMBlock into an inference
+  path until a step method is added.
+
+- Maintenance coupling with `core.RMSNorm` and `core.FeedForward`.
+  `_post_scan_fused_eager` inlines their operations as raw
+  `F.rms_norm` / `F.linear` / `F.silu` calls so torch.compile can
+  trace them in a single Python function. If RMSNorm or FeedForward
+  is ever changed (e.g. adding a gate to FF, swapping activation),
+  the fused function MUST be updated in lockstep. The parity test
+  will detect drift immediately, but the coupling is not obvious
+  from `core.py` — flag it in any PR that touches those modules.
 """
 from __future__ import annotations
 
