@@ -258,6 +258,8 @@ class ChaosStudentLM(nn.Module):
         local_attn_dim: int = 64,
         local_attn_topk: int = 0,
         local_attn_topk_random: bool = False,
+        depth_recurrence_shared_layers: list[int] | None = None,
+        depth_recurrence_count: int = 1,
     ) -> None:
         super().__init__()
         self.vocab_size = vocab_size
@@ -325,6 +327,44 @@ class ChaosStudentLM(nn.Module):
                 ChaosSSMBlock(dim, ff_mult, **ssm_block_kwargs)
                 for _ in range(num_layers)
             ])
+
+        # Weight-tied depth recurrence: indices of physical layers that form
+        # the "shared group" are replayed `depth_recurrence_count` times in
+        # the forward loop. Because the same nn.Module object is re-used, no
+        # new parameters are introduced — autograd accumulates gradients on
+        # the shared weights across passes. At count=1 (default) the virtual
+        # sequence equals list(range(num_layers)), i.e. bit-identical to the
+        # non-recurrent path.
+        shared = list(depth_recurrence_shared_layers or [])
+        self.depth_recurrence_shared_layers: list[int] = shared
+        self.depth_recurrence_count: int = int(depth_recurrence_count)
+        if self.depth_recurrence_count < 1:
+            raise ValueError(
+                f"depth_recurrence_count must be >= 1, got {self.depth_recurrence_count}"
+            )
+        if shared:
+            if any(not (0 <= i < len(self.layers)) for i in shared):
+                raise ValueError(
+                    f"depth_recurrence_shared_layers indices out of range "
+                    f"[0, {len(self.layers)}): {shared}"
+                )
+            if sorted(shared) != shared:
+                raise ValueError(
+                    f"depth_recurrence_shared_layers must be sorted ascending: {shared}"
+                )
+            if any(shared[i] + 1 != shared[i + 1] for i in range(len(shared) - 1)):
+                raise ValueError(
+                    f"depth_recurrence_shared_layers must be contiguous: {shared}"
+                )
+            a, b = shared[0], shared[-1]
+            prefix = list(range(0, a))
+            suffix = list(range(b + 1, len(self.layers)))
+            self._virtual_layer_indices: list[int] = (
+                prefix + shared * self.depth_recurrence_count + suffix
+            )
+        else:
+            self._virtual_layer_indices = list(range(len(self.layers)))
+
         self.final_norm = RMSNorm(dim)
         self.lm_head = nn.Linear(dim, vocab_size, bias=False)
         self.outer_model_type = outer_model_type
@@ -608,8 +648,15 @@ class ChaosStudentLM(nn.Module):
             semantic_bias = self.semantic_tier.read(x.size(0))
             x = x + semantic_bias.unsqueeze(1).to(dtype=x.dtype)
 
+        # Iterate over virtual layer indices so weight-tied depth recurrence
+        # replays the shared group N times against the same physical modules.
+        # When recurrence is disabled this sequence is list(range(num_layers))
+        # and the behavior is bit-identical to the non-recurrent path.
+        # NOTE: at count > 1, all_stats and per_layer_jacobian_stats contain
+        # one entry per virtual step (not per physical layer).
         all_stats: list[dict] = []
-        for layer in self.layers:
+        for layer_idx in self._virtual_layer_indices:
+            layer = self.layers[layer_idx]
             result = layer(x, return_jacobian_stats=return_jacobian_stats)
             if return_jacobian_stats:
                 x, stats = result
