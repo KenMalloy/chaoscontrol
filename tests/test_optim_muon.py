@@ -27,44 +27,78 @@ def _standard_loss(layer: nn.Linear, x: torch.Tensor, y: torch.Tensor) -> torch.
 
 
 class TestNewtonSchulz(unittest.TestCase):
-    def test_square_matrix_is_nearly_orthogonal(self) -> None:
+    """Newton-Schulz 5-step isometry characteristics on random inputs.
+
+    NS5 with the tuned quintic constants ``(3.4445, -4.7750, 2.0315)`` is an
+    *approximation*, not an exact orthogonalization. Five steps on random
+    fp32 inputs lands singular values in roughly ``[0.5, 1.5]`` with
+    ``||U U^T - I||_max`` around ``0.3-0.5`` on square/rectangular shapes.
+    The competition SOTA Muon uses the same constants and produces
+    identical output (verified by Codex review 2026-04-13). The meaningful
+    test is therefore that singular values are bounded in the NS5 target
+    range, not that ``U U^T`` is near identity.
+    """
+
+    def _assert_sv_bounded(self, out: torch.Tensor) -> None:
+        """NS5 5-step pulls singular values toward 1.0 but not exactly to 1.0.
+
+        All SVs must land in ``[0.5, 1.5]`` — wide enough to cover the
+        empirical NS5 residual on random inputs, tight enough to catch a
+        broken iteration that returns the input unchanged or explodes.
+        """
+        sv = torch.linalg.svdvals(out)
+        self.assertTrue(
+            (sv > 0.5).all(),
+            msg=f"NS5 produced SVs below 0.5 (min={sv.min().item():.4f})",
+        )
+        self.assertTrue(
+            (sv < 1.5).all(),
+            msg=f"NS5 produced SVs above 1.5 (max={sv.max().item():.4f})",
+        )
+
+    def test_square_matrix_is_bounded_isometry(self) -> None:
         torch.manual_seed(0)
         grad = torch.randn(8, 8)
         out = newton_schulz_orthogonalize(grad, steps=5, compute_dtype=torch.float32)
-        eye = torch.eye(8)
-        # NS5 in float32 lands very close to an isometry.
-        max_dev = (out @ out.mT - eye).abs().max().item()
-        self.assertLess(max_dev, 1e-3)
+        self.assertFalse(torch.isnan(out).any())
+        self.assertFalse(torch.isinf(out).any())
+        self._assert_sv_bounded(out)
 
-    def test_rectangular_wide_matrix_left_isometry(self) -> None:
+    def test_rectangular_wide_matrix_bounded_left_isometry(self) -> None:
         torch.manual_seed(1)
         grad = torch.randn(5, 9)  # rows < cols, not transposed internally
         out = newton_schulz_orthogonalize(grad, steps=6, compute_dtype=torch.float32)
-        eye = torch.eye(5)
-        max_dev = (out @ out.mT - eye).abs().max().item()
-        self.assertLess(max_dev, 1e-3)
+        self.assertFalse(torch.isnan(out).any())
+        self._assert_sv_bounded(out)
 
-    def test_rectangular_tall_matrix_right_isometry(self) -> None:
+    def test_rectangular_tall_matrix_bounded_right_isometry(self) -> None:
         torch.manual_seed(2)
         grad = torch.randn(9, 5)  # rows > cols, transposed internally then untransposed
         out = newton_schulz_orthogonalize(grad, steps=6, compute_dtype=torch.float32)
-        eye = torch.eye(5)
-        # For tall matrices, U.T @ U ≈ I.
-        max_dev = (out.mT @ out - eye).abs().max().item()
-        self.assertLess(max_dev, 1e-3)
+        self.assertFalse(torch.isnan(out).any())
+        self._assert_sv_bounded(out)
 
     def test_batched_matrices(self) -> None:
         torch.manual_seed(3)
         grad = torch.randn(3, 7, 7)
         out = newton_schulz_orthogonalize(grad, steps=5, compute_dtype=torch.float32)
         self.assertEqual(out.shape, (3, 7, 7))
-        eye = torch.eye(7).expand_as(out)
-        max_dev = (out @ out.mT - eye).abs().max().item()
-        self.assertLess(max_dev, 1e-3)
+        self.assertFalse(torch.isnan(out).any())
+        # SV bounds on each batch element.
+        for b in range(out.shape[0]):
+            self._assert_sv_bounded(out[b])
 
 
 class TestMuonMatrixPath(unittest.TestCase):
-    def test_single_matrix_step_produces_near_orthogonal_update_direction(self) -> None:
+    def test_single_matrix_step_produces_bounded_isometric_update_direction(self) -> None:
+        """A single Muon step on a square matrix applies an NS5-orthogonalized update.
+
+        For a square matrix, the rectangular scale factor ``max(1, rows/cols)**0.5``
+        equals 1, so the applied update direction should have the same
+        singular-value characteristics as raw NS5 output — bounded in
+        ``[0.5, 1.5]``, not exactly orthogonal. See ``TestNewtonSchulz``
+        docstring for why strict orthogonality is the wrong assertion.
+        """
         torch.manual_seed(42)
         w = torch.randn(6, 6, requires_grad=True)
         w.grad = torch.randn(6, 6)
@@ -74,10 +108,12 @@ class TestMuonMatrixPath(unittest.TestCase):
         w_before = w.detach().clone()
         opt.step()
         delta = (w_before - w.detach()) / 0.01  # undo -lr scaling
-        # The applied update should itself be a near-orthogonal factor (scale=1 for square).
-        eye = torch.eye(6)
-        max_dev = (delta @ delta.mT - eye).abs().max().item()
-        self.assertLess(max_dev, 5e-3)
+        self.assertFalse(torch.isnan(delta).any())
+        sv = torch.linalg.svdvals(delta)
+        self.assertTrue(
+            (sv > 0.5).all() and (sv < 1.5).all(),
+            msg=f"Muon update SVs out of range (min={sv.min().item():.4f}, max={sv.max().item():.4f})",
+        )
 
     def test_matrix_path_respects_rectangular_scale(self) -> None:
         torch.manual_seed(7)

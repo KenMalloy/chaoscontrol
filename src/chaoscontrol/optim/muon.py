@@ -83,7 +83,11 @@ class Muon(torch.optim.Optimizer):
             adamw_weight_decay=weight_decay if adamw_weight_decay is None else adamw_weight_decay,
         )
         super().__init__(params, defaults)
-        self._matrix_param_names = set(matrix_param_names) if matrix_param_names else None
+        # Note: explicit `is not None` check — an empty set() is a legitimate
+        # override meaning "no params are matrix params, run everything through
+        # AdamW." Using plain truthiness would collapse set() to None and
+        # silently route matrix-shaped params into the Newton-Schulz path.
+        self._matrix_param_names = set(matrix_param_names) if matrix_param_names is not None else None
         self._is_matrix_fn = is_matrix if is_matrix is not None else _default_is_matrix
         self._compute_dtype = compute_dtype
         # Id-keyed lookup from param tensor -> optional name for the classifier.
