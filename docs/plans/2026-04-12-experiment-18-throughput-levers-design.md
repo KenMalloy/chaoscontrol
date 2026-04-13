@@ -1,360 +1,236 @@
 # Experiment 18: Throughput Lever Stack
 
-**Date:** 2026-04-12
-**Status:** Design approved, implementation pending
-**Supersedes:** `2026-04-11-experiment-18-throughput-advantage-design.md` and
-`2026-04-11-experiment-18-throughput-advantage-impl.md`
+**Date:** 2026-04-12 (rewritten 2026-04-13 after Phase 1 implementation landed)
+**Status:** Test 1 complete. Tests 2-10 designed. Phase 1 feature branches ready for review.
+**Supersedes:** `2026-04-11-experiment-18-throughput-advantage-design.md` and `-impl.md`
+
+## Scope rule (load-bearing principle)
+
+**Any lever that increases corpus-per-600s is in scope for Exp 18.** That's the single filter. Tokenizer compression (more bytes per token), scan kernel speed, batch size, sequence length, DDP parallelism, and kernel fusion all qualify because they move tokens-per-wall-second or bytes-per-token upward. Optimizer changes are in scope when they increase learning-per-token at fixed wall time.
+
+Out of scope: architectural capacity changes (depth recurrence → Exp 19), retrieval mechanisms (falsified in Exp 09/14/17 + lit review), post-training quantization (Exp 19 submission path), TTT (Exp 20 stub).
 
 ## Role in the experiment sequence
 
-The Apr 11 Exp 18 design framed throughput as a data-coverage problem
-("see more of the corpus, pick the hardest windows, retrain on them").
-Phase 0 benchmarks falsified the premise: even at maximum single-GPU
-throughput (bs=1024, ~98K tok/s, 96% VRAM) scaled to 8×H100 DDP
-(~786K tok/s theoretical ceiling), the 600s budget sees only ~4.7% of
-the 10B corpus. Targeted subset selection over 4.7% is not a meaningful
-axis.
+- **Exp 18 = training throughput tuning.** Deliverable: a validated training config (kernel, optimizer, batch, seq_len, LR, DDP world size, tokenizer) plus a baseline bpb measured at peak throughput.
+- **Exp 19 = submission tuning.** With Exp 18's validated stack, dial in final architecture (depth recurrence, ChaosAttentionBlock control, dim/layers/ff_mult sweep), post-training quantization, final 3-seed submission runs.
 
-The reframing splits what remains:
-
-- **Exp 18 = training throughput tuning.** Maximize tokens-per-wall-second,
-  and learning-signal-per-token, on the training side. Every lever that
-  multiplies useful tokens seen in the 600s budget belongs here.
-- **Exp 19 = submission tuning.** With the throughput Exp 18 establishes,
-  dial in the final architecture choices (depth recurrence, quantization,
-  final dim/layers/ff_mult, LR schedule, seeds) that fit 16MB and hit the
-  best possible bpb.
-
-Exp 18 is **not** where we make architectural commitments. It's where we
-find out how much we can feed the training loop.
-
-## The 10B-token reality check
-
-The submission target is "as much learning as possible on FineWeb in
-600s on 8×H100." Raw numbers from Phase 0:
-
-| Scenario | tok/s | 600s total | % of 10B |
-|---|---|---|---|
-| Current single GPU, bs=1024, AdamW | 98,299 | 59M | 0.59% |
-| Naive 8× DDP | ~786K | 471M | 4.7% |
-| SOTA transformer (flash-attn 3, seq=2048) | ~760K × 8 | 3.65B | 36.5% |
-| Optimistic stack (all Exp 18 wins) | ~5.6M | 3.4B | 34% |
-
-**The SOTA transformer sees 7.8× more tokens per GPU than our current
-SSM.** We're not slower because SSMs are slow — we're slower because our
-diag scan is going through `torch.compile` fallback while transformers
-have hand-tuned flash-attention kernels. Closing this gap is the biggest
-single thing Exp 18 can do.
+Exp 18 is not where we make architectural commitments. It's where we find out how much we can feed the training loop.
 
 ## Core thesis
 
-A pure SSM trained with SOTA-level infrastructure (optimized scan kernel,
-large-batch optimizer, maximum batch × seq_len in fixed VRAM, 8×H100 DDP)
-can reach throughput comparable to transformers while preserving the
-structural advantage that attention can't match: **linear cost in sequence
-length.** Within the 600s / 16MB constraints, that translates into either
-more tokens seen at fixed model size, or a larger model at fixed tokens
-seen — whichever shape Exp 19 benefits from most.
+A pure SSM trained with optimized infrastructure (fast scan kernel, large-batch optimizer, maximum batch × seq_len in fixed VRAM, 8×H100 DDP, fused block hot path) can reach throughput comparable to transformers while preserving linear cost in sequence length. Within the 600s / 16MB constraints, that translates into either more tokens seen at fixed model size or a larger model at fixed tokens — whichever shape Exp 19 benefits from most.
 
-## Lever inventory
+## Implementation status (2026-04-13)
 
-Ordered by estimated impact on tokens-of-useful-learning-per-600s.
+Test 1 landed directly on `exp-17-local-attn-sidecar` at commits `713d313` + `69e05d4`. Four Exp 18 feature branches are committed, locally tested, and ready for review. Each branches off `69e05d4` and is independent of the others.
 
-### Tier 1 — highest leverage
+| Branch | Tip | Lever | Tests |
+|---|---|---|---|
+| `feat/ddp-integration` | `5b080b4` | DDP 8× wrap + rank-aware sharding + rank-0 guards + `metabolic_fork`/`mcts` guard + `runner_exp18.py` entry point | 9 DDP tests + 427 full-suite pass on CPU |
+| `feat/muon-optimizer` | `6202154` | Newton-Schulz matrix orthogonalization + AdamW fallback for non-matrix params | parity tests present |
+| `feat/lamb-optimizer` | `f6c9bdb` | Per-layer trust ratio, scale-invariant at large batch | 14 CPU tests pass |
+| `feat/block-kernel-fusion` | `6a562d7` | Post-scan RMSNorm + residual + FF + residual fused via `torch.compile` | 9 parity tests pass (bit-exact at fp32, <1e-3 at bf16) |
 
-**L1. Mamba scan kernel swap.**
-The official `mamba_ssm` package ships a fused CUDA kernel for the
-diagonal scan with tensor-core-native reductions and fused softplus/exp.
-Reported 1.5-3× faster than compiled-scan implementations. Our current
-path goes through `torch.compile`, which fails on some CUDA/Inductor
-stacks and falls back to a Python loop. Swapping in `mamba_ssm.ops`
-should yield a clean throughput multiplier with identical numerical
-semantics.
+Three additional branches from the same dispatch round are Exp 19 Phase 1 scope (not Exp 18) and are called out here only because the Codex review should see them together:
 
-**Expected impact:** 1.5-3× tokens/sec per GPU. Single biggest lever.
+| Branch | Tip | Exp 19 lever |
+|---|---|---|
+| `feat/depth-recurrence` | `bc9ebf3` | Weight-tied virtual layers in `ChaosStudentLM`, bit-identical at `count=1` to baseline |
+| `feat/gptq-quantization` | `e8d4711` | int6 GPTQ + AR self-gen calibration + LZMA preset=9 packaging |
+| `feat/chaos-attention-block` | `3ca1f63` | Pre-norm SDPA block, Exp 19 Phase 2 SSM-vs-attention control |
 
-**Risk:** Correctness — need to verify the kernel's diag semantics match
-our `ChaosSSMCore._forward_diag_scan` exactly (decay parameterization,
-gate application, delta projection). A numerical parity test against our
-current implementation gates this.
+## Test 1: Chunked scan backend — COMPLETE
 
-**L2. Large-batch optimizer (Muon, LAMB, or Sophia).**
-AdamW is a bad fit for the large-batch regime we want to operate in.
-Competition SOTA uses Muon with momentum 0.97 and reports ~2× efficiency
-vs AdamW. LAMB is specifically designed for large-batch training (our
-target: global batch 8192+ via bs=1024 × 8 DDP). Sophia is a second-order
-method designed for LM training. All three are drop-in replacements.
+**Result:** 763K tok/s single-GPU at bs=512 on chunked backend, 7.77× over torch.compile baseline (and 13-77× at smaller batches). Gradient-parity verified to float32 noise floor against the Python loop reference. Bit-identical loss trajectories under AdamW for 30 steps at fixed seed. See `memory/project_exp18_test1_chunked_scan_2026-04-12.md`.
 
-**Expected impact:** 1.5-2× learning-per-token. At fixed wall time,
-equivalent to 1.5-2× more tokens seen.
+The chunked scan is the default backend for all subsequent Exp 18 tests. The original L1 "mamba kernel swap" plan was replaced by this simpler chunked cumprod+cumsum implementation — same gate target (≥1.5× at bs=1024), passed by 9-50×.
 
-**Risk:** Implementation correctness and LR scaling. Muon needs Newton-
-Schulz matrix orthogonalization in the update step; we'd lift from the
-competition SOTA `train_gpt.py` which has a reference implementation.
-LAMB is simpler but we'd need to tune separately.
+**Residual open question:** whether the chunked backend plays cleanly with DDP 8× all-reduce under real gradient load. Addressed in Test 4.
 
-**L3. DDP 8× validation.**
-We have measured single-GPU throughput. We have **not** measured
-real-world DDP overhead at global batch 8192. At our model size (~13MB
-before quantization), all-reduce should be cheap, but gradient variance
-at this batch scale might force us to re-tune LR (our current linear-
-scaling LR was validated only up to bs=1024 on a single GPU).
+## Test 2: Tokenizer revisit — SP8192 vs SP16384 on chunked backend
 
-**Expected impact:** 7-8× tokens/sec (near-linear DDP scaling, assumed).
-Measuring confirms what we're already assuming.
+**Hypothesis (alternative):** at matched 600s wall-clock on the chunked backend, SP16384 produces lower bpb than SP8192.
+**Null:** the two tokenizers are statistically indistinguishable.
 
-**Risk:** LR stability at large global batch. Our Phase 0 LR screen
-tested linear=0.064, sqrt=0.011, fixed=0.002 at bs=1024 single-GPU;
-only linear was stable. Global batch 8192 might require either a
-smaller LR, longer warmup, or gradient clipping adjustment.
+**Context.** SP16384 won Exp 15 SSM configs (1.959 vs SP8192 1.967) then was shelved after a single OOM at bs=1024 on the old torch.compile backend. That shelving decision was never retested with the chunked scan. Flagged as a missing throughput question in the 2026-04-13 review.
 
-### Tier 2 — meaningful but smaller
+**Conditions:**
+1. `bare_fast_ssm_sp8192_d256_L4` on chunked backend
+2. `bare_fast_ssm_sp16384_d256_L4` on chunked backend
 
-**L4. Sequence length scaling.**
-We have trained SSMs exclusively at seq_len=512. The SSM recurrence
-cost is linear in seq_len, and the SSM state is fixed-size. At fixed
-VRAM, going from seq_len=512 to seq_len=2048 should cost the same
-memory (SSM state is fixed) and produce 4× more tokens per step — if
-step time scales linearly. SOTA uses seq_len=2048. We need to sweep.
+**Within-test control:** matched seeds (Exp 17 set: 1337, 2674, 4011, 5348, 6685, 8022, 9359), matched dim/layers/LR/step count, paired t-test across 7 seeds.
 
-**Expected impact:** 1-4× tokens/sec depending on how step time scales
-with seq_len at fixed batch. Might also affect per-token learning
-efficiency (longer sequences give more context per prediction).
+**Power.** Exp 17 per-condition std ≈0.004 bpb → 7 seeds detects ≥0.008 bpb effect at 80% power. The Exp 15 gap was exactly 0.008 bpb. This test is powered to rediscover it if the new throughput preserves the advantage. Flagged explicitly: effects <0.004 bpb will produce false-null readings at this sample size.
 
-**Risk:** Longer sequences may not deliver proportional learning gain
-(tokens at the end of long sequences are more predictable than tokens
-at the start). Need to measure both tok/s and per-token loss.
+**Gate.** SP16384 beats SP8192 at p<0.05 paired → SP16384 becomes the Exp 19 submission tokenizer. Otherwise SP8192 stays. No goalpost moving, no "marginal" calls at p<0.10.
 
-**L5. fp8 mixed precision.**
-H100 has native fp8 tensor cores. Training in fp8 would halve memory
-(doubling max batch or enabling longer sequences at fixed batch) and
-speed up matmul. This is active research territory — training stability
-in fp8 is not yet solved for all architectures.
+**Budget:** single spot H100, ~4 GPU-hours, ~$8.
 
-**Expected impact:** 1.5-2× throughput at fixed VRAM, via larger batch
-or longer sequences.
+**Branches used:** none new. Uses `exp-17-local-attn-sidecar` chunked backend directly.
 
-**Risk:** Training divergence. fp8 dynamic range is small and SSM
-recurrences may accumulate drift. Scope a 2-hour exploration; if it
-destabilizes easily, defer.
+## Test 3: Activation checkpointing — push batch ceiling
 
-### Tier 3 — infrastructure
+**Hypothesis:** `torch.utils.checkpoint` on the block stack lets us push from bs=512 (chunked backend VRAM ceiling, bound by fp64 cumprod intermediates) to bs=1024 or higher on single H100.
 
-**L6. DDP all-reduce profiling / gradient compression.**
-If DDP overhead turns out larger than expected (>10-15% at global batch
-8192), gradient compression or bf16 all-reduce could recover it. Only
-becomes relevant if L3 measurement shows real overhead.
+**Conditions:** (no-ckpt, bs=512), (ckpt, bs=1024), (ckpt, bs=2048).
 
-**L7. Data pipeline instrumentation.**
-Confirmed non-bottleneck at single-GPU scale (step time grew 42% from
-bs=32 to bs=1024 while batch grew 32×, so compute dominates). At 8×DDP
-with workers hitting the same shards, I/O might become a constraint.
-Instrument and confirm, don't optimize preemptively.
+**Gate:** ckpt/bs=1024 must deliver ≥1.3× tok/s over no-ckpt/bs=512, accounting for the ~30% recompute overhead per step. Below: park the lever.
 
-### What's deliberately NOT in Exp 18
+**Corpus-rule justification:** bigger batch → more tokens per step at fixed wall time.
+**SSM-native justification:** architecture-agnostic memory/compute trade. Not a transformer borrow.
 
-**Depth recurrence / weight sharing.** This is a capacity lever
-(trades throughput for effective depth at fixed param count), not a
-throughput lever. It belongs in Exp 19 as a submission dial.
+**Budget:** ~1 GPU-hour on single spot, ~$2.
 
-**GPTQ int6 quantization.** Post-training quantization, applied only
-to the final artifact. Doesn't affect training throughput. Exp 19.
+**Branches used:** none new — implemented inline during the test.
 
-**Architecture search (dim, layers, ff_mult, vocab_size).** Submission
-dials, Exp 19.
+## Test 4: DDP 8× scaling validation
 
-**Retrieval / attention / memory / Wernicke.** Four prior experiments
-show it doesn't help in the strong-baseline regime. Not revisited
-unless the research assistant lit search surfaces a specific variant
-we haven't tried.
+**Hypothesis:** the chunked backend's 763K tok/s per-GPU scales to 8× DDP with ≥85% efficiency.
 
-**TTT (test-time training).** Inference-time adaptation. Not a training
-throughput concern.
+**Launch:** `torchrun --standalone --nproc_per_node=8 experiments/18_throughput_levers/runner_exp18.py --config ... --data-path ... --sp-model-path ...`
 
-## Test plan
+**Conditions:** bs=1024 per GPU × seq=512 × 8 ranks. Run 200 steps (long enough for stable timing, short enough to be cheap).
 
-Each test is scoped for a clean measurement in minimum pod time. Tests
-run sequentially; later tests use winners from earlier tests as the base
-config.
+**Metric:** actual tokens/sec vs 8× single-GPU extrapolation. Gradient variance at global batch 8192 vs single-GPU bs=1024.
 
-### Test 0: Mamba kernel parity (preflight, local or cheap CUDA)
+**Gate:** DDP efficiency ≥85% of linear (≥670K per GPU vs 763K single-GPU ideal). Below: debug all-reduce overhead or gradient compression.
 
-Before swapping in `mamba_ssm`, verify numerical parity with our current
-`_forward_diag_scan`. Build a test that compares output tensors on
-random inputs across a range of (batch, seq, dim) shapes. Tolerance:
-1e-4 max diff (bf16 numerical noise floor).
+**Budget:** ~20 min on grant-funded 8×H100.
 
-**Gate:** if parity fails, drop L1 and investigate upstream — either
-our core has a non-standard recurrence that `mamba_ssm` doesn't match,
-or we need a custom kernel variant. Either outcome is informative.
+**Branches used:** `feat/ddp-integration`. DDP wrap, rank-aware seed + data sharding, rank-0 guards on prints and file writes, `dist.barrier()` around eval, `verify_diag_recurrence` per-rank warmup. Single-device path preserved bit-identically at `world_size=1` (load-bearing regression test passes).
 
-### Test 1: Single-GPU throughput with mamba kernel
+**Known limitation guarded:** `metabolic_gate=True` with `metabolic_mode ∈ {fork, mcts}` is explicitly blocked at function entry because those paths take the raw model and bypass DDP's gradient all-reduce hook. Fails fast with `NotImplementedError`. Monte_carlo mode verified DDP-safe (under `torch.no_grad()`, main forward still goes through `ddp_model`).
 
-Re-run Phase 0 `bench_throughput.py` with the mamba kernel active,
-matched batch sweep {32, 128, 256, 512, 1024}. Produces a direct
-comparison against the existing Phase 0 curve.
+## Test 5: LR stability screen at DDP scale
 
-**Metric:** tok/s at each batch size, peak VRAM, step time.
-**Budget:** ~30 min on single H100.
-**Gate:** mamba kernel must beat torch.compile by ≥1.5× at bs=1024 or
-L1 is dropped from the stack.
+**Conditions:** at global batch 8192, screen three LRs — linear-scaled from single-GPU (0.064), linear/2, linear/4. 200 steps each.
 
-### Test 2: DDP 8× scaling
+**Gate:** at least one LR stable (no NaN, no divergence). Below: extend warmup or reduce grad clip.
 
-Run single-condition training at bs=1024 per GPU, seq=512, AdamW, on
-8×H100 DDP. Measure global tok/s, all-reduce overhead, per-step wall
-time. Run for 200 steps (long enough to get stable timing, short
-enough to be cheap).
-
-**Metric:** actual tokens/sec vs 8× single-GPU extrapolation. Gradient
-variance at global batch 8192 vs single-GPU bs=1024.
-**Budget:** ~20 min on 8×H100.
-**Gate:** DDP efficiency must be ≥85% of linear (≥670K tok/s actual
-vs 786K ideal) or we need to debug.
-
-### Test 3: LR stability screen at DDP scale
-
-At global batch 8192 (bs=1024 × 8), screen three LR candidates:
-linear-scaled from Phase 0, linear/2, linear/4. 200 steps each. Same
-NaN/stability checks as Phase 0's `_lr_screen`.
-
-**Metric:** which LR converges stably at global batch 8192.
 **Budget:** ~30 min on 8×H100.
-**Gate:** at least one LR must be stable. If none, escalate — possibly
-need gradient clipping changes or warmup extension.
 
-### Test 4: Sequence length sweep
+## Test 6: Sequence length sweep
 
-At winning batch × optimizer from tests 1-3, vary seq_len ∈
-{512, 1024, 2048} at a fixed (batch, VRAM) envelope. For SSMs, longer
-seq_len at fixed batch should cost similar VRAM but more compute. Key
-unknown: does step time grow linearly (1×, 2×, 4×) or sublinearly with
-seq_len? And does per-token loss improve with longer context?
+**Conditions:** at winning (batch, LR) from Tests 4-5, vary `seq_len ∈ {512, 1024, 2048}` at fixed (batch, VRAM) envelope.
 
-**Metric:** tok/s, step time, per-token loss (first 200 steps).
-**Budget:** ~1 hour on 8×H100 (3 seq_len × 10 min per run, with some
-setup overhead).
-**Gate:** pick the seq_len that maximizes tok/s × learning-rate-of-loss
-(ad hoc metric: `(bpb_0 - bpb_200) / wall_time`).
+**Key unknown:** does step time grow linearly or sub-linearly with seq_len on the chunked backend? The scan is theoretically O(N) but kernel launch overhead and fp64 cumprod allocation can shift the real curve.
 
-### Test 5: Optimizer swap (Muon vs AdamW)
+**Metric:** tok/s, step time, per-token loss at fixed step count.
 
-At winning (batch, seq_len, DDP) from tests 1-4, compare Muon against
-AdamW for 1000 steps. Check both throughput (Muon's Newton-Schulz has
-some overhead) and convergence speed (Muon's main benefit).
+**Gate:** pick seq_len maximizing `tok/s × learning-rate-of-loss` (ad-hoc metric: `(bpb_0 - bpb_200) / wall_time`).
 
-**Metric:** loss curve vs steps, loss curve vs wall time. Muon's value
-is learning-per-token, so the wall-time curve is what matters.
-**Budget:** ~45 min on 8×H100.
-**Gate:** Muon must show visibly faster loss decrease vs wall time to
-earn inclusion. If loss curves are similar, stick with AdamW (simpler).
+**Budget:** ~1 hour on 8×H100.
 
-### Optional Test 6: fp8 exploration
+## Test 7: Optimizer ablation — 3-way AdamW / Muon / LAMB
 
-Time-boxed to 2 hours on 8×H100. Enable fp8 mixed precision (via
-`torch.nn.functional.scaled_mm` or equivalent). Attempt same config as
-winner. Watch for training divergence.
+**Hypothesis:** at global batch 8192+, a large-batch-aware optimizer beats AdamW on learning-per-token for SSMs.
 
-**Metric:** does it run to completion? What's the new tok/s?
-**Gate:** if divergence or corruption in 200 steps, shut down and
-defer. No pod time on fp8 debugging.
+**Conditions:**
+- **AdamW** — current baseline.
+- **Muon** — Newton-Schulz orthogonalization, competition-proven on transformers. SSM behavior untested; this test measures whether the trick transfers.
+- **LAMB** — per-layer trust ratio, first-principles large-batch choice, architecture-agnostic.
 
-### Test 7: Composition — stacked winners
+**Why 3-way, not Muon-only.** Muon is the leaderboard choice but is borrowed from transformers. LAMB is the first-principles choice for the large-batch regime regardless of architecture. Running both against AdamW is the scientifically honest version of "does optimizer matter here?" — falsifies transformer-borrow reasoning if Muon underperforms, and gives us a fallback if LAMB wins.
 
-Run the winning configuration from all tests (kernel + DDP + optimizer
-+ seq_len + optional fp8) for a full 600s training run. Measure final
-tok/s, total tokens seen, and bpb on a small held-out slice.
+**Metric:** loss curve vs steps AND vs wall time. Wall-time curve is what matters (bpb per 600s is the target).
 
-**Metric:** "what would the submission look like if we trained it
-today at peak throughput?" This is the handoff to Exp 19.
-**Budget:** ~15 min on 8×H100 (600s training + overhead).
+**Gate:** any alternative must show visibly faster loss decrease vs wall time to earn inclusion in Test 9. Otherwise AdamW.
+
+**Budget:** ~1 hour on 8×H100 (3 optimizers × 20 min each).
+
+**Branches used:** `feat/muon-optimizer` and `feat/lamb-optimizer`.
+
+## Test 8: Kernel fusion for SSM block hot path
+
+**Hypothesis:** fusing RMSNorm + residual + FF + residual around the chunked scan saves 5-15% of block latency at small batch, less at large batch. The fusion is launch-overhead reduction, not algorithmic acceleration.
+
+**Conditions:** unfused baseline vs `FusedChaosSSMBlock` at bs ∈ {32, 128, 512}, seq=512.
+
+**Gate:** ≥5% tok/s improvement at any batch config, AND gradient parity to float32 noise at bs=128, 30 steps. Below 5% or any parity drift: park the branch and use unfused.
+
+**Honest caveat from the implementing subagent:** *"this is kernel-launch bookkeeping, not algorithmic acceleration. If the H100 benchmark shows <5% on any batch config, this is worth deprioritizing relative to higher-leverage throughput work."*
+
+**Budget:** ~30 min on single grant-pod GPU.
+
+**Branches used:** `feat/block-kernel-fusion`. Benchmark script at `benchmarks/bench_fused_block.py` ready to run.
+
+## Test 9: Combined integration run
+
+**Run:** full 600s training at winning `(kernel + tokenizer + DDP + optimizer + seq_len + checkpointing + fusion)` configuration. Measure final tok/s, total tokens seen, and bpb on a small held-out slice.
+
+**Deliverable:** "what would the submission look like if we trained it today at peak throughput?" This is the baseline Exp 19 starts from.
+
+**Budget:** ~15 min on 8×H100 (600s training + eval overhead).
+
+## Test 10 (optional): fp8 exploration
+
+Time-boxed to 2 hours. Enable fp8 mixed precision, attempt same config as Test 9 winner. Watch for divergence.
+
+**Gate:** if divergence or corruption in first 200 steps, shut down. No pod time on fp8 debugging. Defer post-deadline if needed.
+
+**Budget:** ~2h on 8×H100, ~$48.
+
+## Runner preflight audit (2026-04-13)
+
+Short audit of `training.py` + `runner_exp17.py` + `data.py` for silent corpus leaks under the 600s budget. **Bottom line: no significant corpus leaks on the bare SSM winning path.**
+
+- **Eval is out-of-budget.** ✓ `runner_exp17.py:398` calls `evaluate_bpb_sp` AFTER `train_chaoscontrol_for_budget` returns.
+- **Warmup is pre-training.** ✓ `verify_diag_recurrence(device)` called at `runner_exp17.py:343` before the training timer.
+- **No padding in the training loader.** ✓ `batch_from_starts` slices fixed-length windows; every position carries signal.
+- **Metabolic / Wernicke / outer_model / CFR / sleep / polyphasic bookkeeping** all gated on features disabled in the bare SSM winning config.
+- **Final `maybe_sync_cuda`.** ✓ Runs at loop exit for accurate time accounting.
+
+Minor leaks worth noting, none blocking Test 2 launch:
+
+1. Per-step `float(ce_loss.detach().cpu())` at `training.py:331` forces a GPU→CPU sync every step. ~0.025-0.1% overhead over 14K steps. Could be batched to sync at `spectral_log_interval`.
+2. No async data prefetch in `batch_from_starts`. Negligible at current scale; may become measurable at 8×H100 DDP with larger batches (fix: pinned memory + `non_blocking=True`).
+3. Partial first-step warmup — only the scan kernel is warmed. RMSNorm/FF/out_proj lazy-init on first step. ~100ms saved with a full forward+backward dummy pass; 0.02%.
 
 ## Total budget estimate
 
-| Test | GPUs | Duration | Cost est |
+| Test | Hardware | Duration | Cost |
 |---|---|---|---|
-| 0. Mamba parity | 1 | 5 min | $0.20 |
-| 1. Kernel throughput | 1 | 30 min | $1.20 |
-| 2. DDP scaling | 8 | 20 min | ~$8 |
-| 3. LR screen | 8 | 30 min | ~$12 |
-| 4. Seq_len sweep | 8 | 60 min | ~$24 |
-| 5. Optimizer swap | 8 | 45 min | ~$18 |
-| 6. fp8 (optional) | 8 | 120 min | ~$48 |
-| 7. Stacked composition | 8 | 15 min | ~$6 |
-| **Total (no fp8)** | | **~3.5 hours** | **~$70** |
-| **Total (with fp8)** | | **~5.5 hours** | **~$118** |
+| Test 1 — chunked scan | 1 GPU | **complete** | — |
+| Test 2 — tokenizer | 1 spot | 4h | ~$8 |
+| Test 3 — activation ckpt | 1 spot | 1h | ~$2 |
+| Test 4 — DDP 8× | 8 grant | 20min | ~$8 |
+| Test 5 — LR screen | 8 grant | 30min | ~$12 |
+| Test 6 — seq_len | 8 grant | 1h | ~$24 |
+| Test 7 — optimizer 3-way | 8 grant | 1h | ~$27 |
+| Test 8 — fusion | 1 grant | 30min | ~$3 |
+| Test 9 — integration | 8 grant | 15min | ~$6 |
+| Test 10 — fp8 (optional) | 8 grant | 2h | ~$48 |
+| **Total (no fp8)** | | **~8h** | **~$90** |
+| **Total (with fp8)** | | **~10h** | **~$138** |
 
-Assumes $23/hr for 8×H100 SXM. Conservative — actual tests may run
-faster with short warmup windows.
+Tests 2, 3, 8 run on cheap single-GPU spot (~$13 total). Tests 4-7, 9, 10 gate on grant-funded pod availability.
 
 ## Go/no-go gates summary
 
-- **L1 (mamba kernel) <1.5× speedup:** drop L1, investigate why.
-  Throughput ceiling stays at ~98K/GPU.
-- **L2 (Muon) shows no wall-clock convergence advantage:** stick with
-  AdamW, save optimizer implementation cost.
-- **L3 (DDP) <85% efficiency:** pause before large-batch training,
-  profile all-reduce, consider gradient compression.
-- **L4 (seq_len) no improvement past 512:** fix at 512, use bench
-  results.
-- **L5 (fp8) unstable in 200 steps:** defer, revisit post-April 30.
-- **Stacked test final tok/s <2× baseline:** something is leaving
-  throughput on the floor. Investigate before committing to Exp 19.
+| Test | Gate |
+|---|---|
+| 1 chunked scan | ✓ passed (9-50× over threshold) |
+| 2 tokenizer | SP16384 beats SP8192 at p<0.05 paired, or SP8192 stays |
+| 3 checkpoint | ≥1.3× tok/s at larger batch, or park |
+| 4 DDP 8× | ≥85% scaling efficiency, or debug all-reduce |
+| 5 LR screen | at least one stable LR, or extend warmup |
+| 6 seq_len | pick winner on tok/s × loss-rate |
+| 7 optimizer | alternative must beat AdamW on wall-time curve |
+| 8 fusion | ≥5% at any batch config, or park |
+| 9 integration | real peak tok/s + baseline bpb for Exp 19 |
+| 10 fp8 | no divergence in 200 steps, or shut down |
 
-## What we'll know at the end of Exp 18
+## What Exp 19 inherits
 
-Regardless of which levers pay off:
+1. A validated peak-throughput training config `(backend, tokenizer, batch, seq_len, LR, optimizer, DDP, fusion)`.
+2. A baseline bpb from Test 9 — this is Exp 19's starting point, replacing the stale Exp 17 single-GPU 1.6277 reference.
+3. Infrastructure already lifted and tested: Muon, LAMB, DDP wrapper, fused block, chunked scan.
+4. Known limitations: metabolic fork/mcts + DDP guard, kernel fusion parity dependencies on `core.FeedForward` / `RMSNorm`.
 
-1. **Realistic peak tok/s for our SSM at 600s / 8×H100.** This is the
-   throughput ceiling Exp 19 has to work within. All submission
-   decisions downstream depend on this number.
-2. **Whether SSM + SOTA infrastructure closes the per-GPU gap against
-   transformers.** If our stacked winner is within 2× of SOTA tok/s
-   (380K+), the pure-SSM thesis is strong. If not, we need to
-   understand why (profiling, probably the scan kernel).
-3. **Which optimizer to use in Exp 19.** A single yes/no on Muon.
-4. **Which (batch, seq_len) shape to use in Exp 19.** A single best
-   point on the throughput curve.
-5. **Whether fp8 is a viable submission direction.** A single yes/no.
+## Pending main-session work (post-Codex review)
 
-## Implementation notes
-
-- **Fork point:** Exp 18 work happens on a new branch,
-  `exp-18-throughput-levers`, based on `main` after the Exp 17 finalize.
-- **Test infrastructure:** Extend `bench_throughput.py` with `--kernel`,
-  `--optimizer`, `--seq-len`, `--world-size` flags. Each test is a
-  single script invocation with the right flags.
-- **Parity test:** New unit test `tests/test_mamba_kernel_parity.py`
-  that compares `ChaosSSMCore._forward_diag_scan` against
-  `mamba_ssm.ops.selective_scan_fn` with matched parameters. Runs in
-  CI as a guard against future regressions.
-- **DDP wrapper:** Either use `torch.nn.parallel.DistributedDataParallel`
-  directly in a small wrapper around `runner_exp18.py`, or lift the
-  DDP setup from the SOTA `train_gpt.py`. The latter is fewer lines of
-  code and already validated at the same scale.
-- **Muon implementation:** Lift the Newton-Schulz optimizer from SOTA
-  `train_gpt.py` (it's ~100 lines, self-contained). Add a
-  `--optimizer` flag to the runner.
-
-## Pending: research assistant lit search
-
-A lit search is in flight on whether SSM + retrieval mechanisms have
-ever helped at compact (sub-hour) training budgets. The result feeds
-Exp 19's architecture choice (pure SSM vs SSM+retrieval variant), not
-Exp 18 directly. Exp 18's plan is independent of the RA output.
-
-## How this feeds Exp 19
-
-Exp 19 inherits from Exp 18:
-- A validated maximum-throughput training config (kernel, optimizer,
-  batch, seq_len, LR, DDP world size).
-- A baseline bpb on the stacked-winners composition run (Test 7).
-- A clear understanding of which levers matter and which don't, so
-  Exp 19 doesn't re-litigate them.
-
-Exp 19 then adds:
-- Architecture search (dim, layers, ff_mult, vocab_size).
-- Depth recurrence / weight sharing at fixed parameter budget.
-- INT6 GPTQ + zstd post-training quantization.
-- Final artifact packaging (must fit in 16MB).
-- Final 3-seed submission runs.
+- Update `memory/project_experiment_plan_2026-04-12.md` with current status (Test 1 complete, Phase 1 branches ready).
+- Merge strategy for the 7 feature branches onto `exp-17-local-attn-sidecar` or a new `exp-18-integration` branch (after Codex review lands).
+- Per-token loss stratification diagnostic (task #14) — runs between Test 2 and Exp 19 Phase 3.
+- Individual Test 2 and Test 3 pre-registration design docs (tasks #6 and #8) — small, run after Codex approves the overall plan.
