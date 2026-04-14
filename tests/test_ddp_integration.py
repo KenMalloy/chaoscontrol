@@ -396,6 +396,57 @@ class TestSingleDevicePath(unittest.TestCase):
                 os.environ["WORLD_SIZE"] = old_world
 
 
+class TestSingleDeviceOptimizerBranches(unittest.TestCase):
+    """One-step smoke per optimizer choice on the single-device code path.
+
+    These confirm the optimizer kwarg takes the expected branch when the
+    DDP path resolves to world_size=1 (no wrapping, no barriers). The
+    multi-process DDP optimizer smoke is deferred to real 8xH100 runs
+    because CPU gloo adds process-spawning overhead that is not worth
+    paying for a 3x Muon + LAMB + AdamW check when the branches are
+    already exercised here.
+    """
+
+    def _run_one_opt(self, opt_name: str) -> dict:
+        seed = 321
+        model = _build_model(seed)
+        tokens = _build_tokens(seed)
+        return train_chaoscontrol_for_budget(
+            model,
+            train_tokens=tokens,
+            train_starts=list(TRAIN_STARTS),
+            seed=seed,
+            rank=0,
+            world_size=1,
+            optimizer=opt_name,
+            **{**TRAIN_KWARGS, "budget_seconds": 2.0},
+        )
+
+    def test_adamw_branch_single_device(self) -> None:
+        result = self._run_one_opt("adamw")
+        self.assertEqual(result["optimizer_type"], "AdamW")
+        self.assertEqual(result["optimizer_name"], "adamw")
+        self.assertGreaterEqual(result["steps"], 1)
+        first_loss = float(result["history"][0]["loss"])
+        self.assertFalse(first_loss != first_loss, msg="NaN loss on adamw step 0")
+
+    def test_muon_branch_single_device(self) -> None:
+        result = self._run_one_opt("muon")
+        self.assertEqual(result["optimizer_type"], "Muon")
+        self.assertEqual(result["optimizer_name"], "muon")
+        self.assertGreaterEqual(result["steps"], 1)
+        first_loss = float(result["history"][0]["loss"])
+        self.assertFalse(first_loss != first_loss, msg="NaN loss on muon step 0")
+
+    def test_lamb_branch_single_device(self) -> None:
+        result = self._run_one_opt("lamb")
+        self.assertEqual(result["optimizer_type"], "LAMB")
+        self.assertEqual(result["optimizer_name"], "lamb")
+        self.assertGreaterEqual(result["steps"], 1)
+        first_loss = float(result["history"][0]["loss"])
+        self.assertFalse(first_loss != first_loss, msg="NaN loss on lamb step 0")
+
+
 class TestMultiProcessDDP(unittest.TestCase):
     """CPU+gloo multi-process DDP smoke tests.
 

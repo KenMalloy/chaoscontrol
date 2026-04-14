@@ -52,6 +52,79 @@ class TestTraining(unittest.TestCase):
         assert not torch.allclose(initial_state, model.outer_model.state)
 
 
+class TestOptimizerSelection(unittest.TestCase):
+    """CPU smoke tests that the optimizer kwarg routes to the right class.
+
+    Each test trains a tiny model for a few steps and asserts: (a) no NaN
+    in the loss trajectory, (b) ``train_result['optimizer_type']`` matches
+    the expected class name so the branch taken is observable from the
+    return value (not just inferred from side effects).
+    """
+
+    def _build_model(self) -> ChaosStudentLM:
+        torch.manual_seed(0)
+        return ChaosStudentLM(
+            vocab_size=64, dim=16, num_layers=2, ff_mult=2,
+            a_mode="diag", rich_b_mode="none", outer_model_dim=0,
+        )
+
+    def _train(self, optimizer: str) -> dict:
+        model = self._build_model()
+        tokens = torch.randint(0, 64, (256,))
+        starts = list(range(0, 200, 8))
+        return train_chaoscontrol_for_budget(
+            model, train_tokens=tokens, train_starts=starts,
+            seq_len=8, batch_size=2, device=torch.device("cpu"),
+            param_dtype=torch.float32, budget_seconds=1.5,
+            base_lr=1e-3, weight_decay=0.0, grad_clip_norm=1.0,
+            seed=42, crit_reg_alpha=0.0, crit_reg_beta=0.0,
+            optimizer=optimizer,
+        )
+
+    def _assert_trajectory_finite(self, history: list[dict]) -> None:
+        losses = [float(h["loss"]) for h in history]
+        self.assertTrue(len(losses) >= 1)
+        for i, loss in enumerate(losses):
+            self.assertFalse(
+                loss != loss,  # NaN check
+                msg=f"step {i}: NaN loss in optimizer trajectory",
+            )
+            self.assertFalse(
+                loss == float("inf") or loss == float("-inf"),
+                msg=f"step {i}: inf loss in optimizer trajectory",
+            )
+
+    def test_adamw_branch(self) -> None:
+        result = self._train("adamw")
+        self.assertEqual(result["optimizer_type"], "AdamW")
+        self.assertEqual(result["optimizer_name"], "adamw")
+        self._assert_trajectory_finite(result["history"])
+
+    def test_muon_branch(self) -> None:
+        result = self._train("muon")
+        self.assertEqual(result["optimizer_type"], "Muon")
+        self.assertEqual(result["optimizer_name"], "muon")
+        self._assert_trajectory_finite(result["history"])
+
+    def test_lamb_branch(self) -> None:
+        result = self._train("lamb")
+        self.assertEqual(result["optimizer_type"], "LAMB")
+        self.assertEqual(result["optimizer_name"], "lamb")
+        self._assert_trajectory_finite(result["history"])
+
+    def test_unknown_optimizer_raises(self) -> None:
+        model = self._build_model()
+        with self.assertRaises(ValueError):
+            train_chaoscontrol_for_budget(
+                model, train_tokens=torch.zeros(64, dtype=torch.long),
+                train_starts=[0, 8, 16, 24],
+                seq_len=4, batch_size=2, device=torch.device("cpu"),
+                param_dtype=torch.float32, budget_seconds=0.1,
+                base_lr=1e-3, weight_decay=0.0, grad_clip_norm=1.0,
+                seed=1, optimizer="sgd",
+            )
+
+
 class TestMatrixRunner(unittest.TestCase):
     def test_matrix_generates_all_cells(self) -> None:
         cells = build_chaoscontrol_matrix()
