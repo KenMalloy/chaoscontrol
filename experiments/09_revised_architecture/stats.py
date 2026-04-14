@@ -153,6 +153,36 @@ def welch_ttest(a: list[float], b: list[float]) -> tuple[float, float]:
     return (t_stat, p)
 
 
+def paired_ttest(a: list[float], b: list[float]) -> tuple[float, float]:
+    """Paired (dependent-samples) t-test on a[i] - b[i].
+
+    Returns (t_statistic, two_tailed_p_value). Requires paired inputs
+    (len(a) == len(b) >= 2). Matches scipy.stats.ttest_rel to within
+    floating-point precision.
+
+    Pathological cases (match scipy):
+        - n < 2 or mismatched lengths -> (nan, nan)
+        - var(diffs) == 0 and mean(diffs) == 0 -> (nan, nan); fully null sample
+        - var(diffs) == 0 and mean(diffs) != 0 -> (+/-inf, 0.0); perfect separation
+    """
+    if len(a) != len(b) or len(a) < 2:
+        return (float("nan"), float("nan"))
+    n = len(a)
+    diffs = [x - y for x, y in zip(a, b)]
+    m = _mean(diffs)
+    v = _var(diffs)
+    if v == 0:
+        if m == 0:
+            return (float("nan"), float("nan"))
+        return (math.inf if m > 0 else -math.inf, 0.0)
+    se = math.sqrt(v / n)
+    t_stat = m / se
+    df = n - 1
+    p = 2.0 * (1.0 - _t_cdf(abs(t_stat), df))
+    p = max(0.0, min(1.0, p))
+    return (t_stat, p)
+
+
 # -- Bootstrap CI --
 
 
