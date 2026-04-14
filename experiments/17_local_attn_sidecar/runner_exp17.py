@@ -437,6 +437,7 @@ def run_single(
         crit_reg_alpha=config.get("crit_reg_alpha", 0.01),
         crit_reg_beta=config.get("crit_reg_beta", 0.001),
         crit_target_coupling=config.get("crit_target_coupling", 0.92),
+        optimizer=config.get("optimizer", "adamw"),
     )
     train_summary = summarize_train_result(train_result)
 
