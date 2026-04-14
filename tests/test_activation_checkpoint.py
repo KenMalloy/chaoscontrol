@@ -57,7 +57,32 @@ def _clone_with_flag(ref: ChaosStudentLM, activation_checkpoint: bool) -> ChaosS
 
 
 class TestActivationCheckpointForwardParity(unittest.TestCase):
-    def test_forward_logits_match_bs4_seq32_fp32(self) -> None:
+    def test_forward_parity_train_mode_bs4_seq32_fp32(self) -> None:
+        """Train mode + grad enabled: the alt model actually invokes
+        ``torch.utils.checkpoint.checkpoint`` (use_ckpt=True branch).
+        """
+        ref = _make_model(seed=0, activation_checkpoint=False)
+        alt = _clone_with_flag(ref, activation_checkpoint=True)
+
+        input_ids = torch.randint(0, 64, (4, 32))
+
+        ref.train()
+        alt.train()
+        out_ref = ref(input_ids)["logits"]
+        out_alt = alt(input_ids)["logits"]
+
+        self.assertTrue(out_alt.requires_grad)
+        diff = (out_ref - out_alt).abs().max().item()
+        self.assertLess(diff, 1e-6, msg=f"train-mode logits drift: {diff}")
+
+    def test_forward_parity_eval_mode_skip_path(self) -> None:
+        """Eval + no_grad: the checkpoint skip path must not drift. This
+        is a separate guard from the train-mode parity test because the
+        skip condition (``torch.is_grad_enabled() and x.requires_grad``)
+        is evaluated per-forward and a bug that flipped it the wrong way
+        would show up as eval-time drift before it showed up as a train
+        bug.
+        """
         ref = _make_model(seed=0, activation_checkpoint=False)
         alt = _clone_with_flag(ref, activation_checkpoint=True)
 
@@ -67,11 +92,10 @@ class TestActivationCheckpointForwardParity(unittest.TestCase):
         alt.eval()
         with torch.no_grad():
             out_ref = ref(input_ids)["logits"]
-        with torch.no_grad():
             out_alt = alt(input_ids)["logits"]
 
         diff = (out_ref - out_alt).abs().max().item()
-        self.assertLess(diff, 1e-6, msg=f"logits drift: {diff}")
+        self.assertLess(diff, 1e-6, msg=f"eval-mode logits drift: {diff}")
 
     def test_forward_parity_with_jacobian_stats(self) -> None:
         ref = _make_model(seed=1, activation_checkpoint=False)
@@ -86,23 +110,28 @@ class TestActivationCheckpointForwardParity(unittest.TestCase):
 
         self.assertIn("jacobian_stats", out_ref)
         self.assertIn("jacobian_stats", out_alt)
+        self.assertTrue(out_alt["logits"].requires_grad)
         logits_diff = (out_ref["logits"] - out_alt["logits"]).abs().max().item()
         self.assertLess(logits_diff, 1e-5, msg=f"logits drift with stats: {logits_diff}")
 
     def test_forward_parity_hybrid_block(self) -> None:
+        """Train-mode parity check on the ChaosSSMHybridBlock path. Uses the
+        checkpoint branch (use_ckpt=True) actively because the hybrid block
+        has more internal operations than the pure SSM block and would be
+        the first place a checkpoint-recompute determinism drift shows up.
+        """
         torch.manual_seed(2)
         ref = _make_hybrid_model(seed=2, activation_checkpoint=False)
         alt = _clone_with_flag(ref, activation_checkpoint=True)
 
         input_ids = torch.randint(0, 64, (4, 16))
 
-        ref.eval()
-        alt.eval()
-        with torch.no_grad():
-            out_ref = ref(input_ids)["logits"]
-        with torch.no_grad():
-            out_alt = alt(input_ids)["logits"]
+        ref.train()
+        alt.train()
+        out_ref = ref(input_ids)["logits"]
+        out_alt = alt(input_ids)["logits"]
 
+        self.assertTrue(out_alt.requires_grad)
         diff = (out_ref - out_alt).abs().max().item()
         self.assertLess(diff, 1e-5, msg=f"hybrid logits drift: {diff}")
 
