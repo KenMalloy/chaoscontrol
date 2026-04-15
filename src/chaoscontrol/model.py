@@ -14,6 +14,7 @@ from typing import Any
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint as _checkpoint
 
 from chaoscontrol.core import RMSNorm, FeedForward, ChaosSSMCore
 from chaoscontrol.local_attn import LocalAttention, RollingKVCache
@@ -543,10 +544,12 @@ class ChaosStudentLM(nn.Module):
         local_attn_topk_random: bool = False,
         depth_recurrence_shared_layers: list[int] | None = None,
         depth_recurrence_count: int = 1,
+        activation_checkpoint: bool = False,
     ) -> None:
         super().__init__()
         self.vocab_size = vocab_size
         self.dim = dim
+        self.activation_checkpoint = bool(activation_checkpoint)
         self.local_attn_window = local_attn_window
         self.embed = nn.Embedding(vocab_size, dim)
 
@@ -996,10 +999,29 @@ class ChaosStudentLM(nn.Module):
         # and the behavior is bit-identical to the non-recurrent path.
         # NOTE: at count > 1, all_stats and per_layer_jacobian_stats contain
         # one entry per virtual step (not per physical layer).
+        #
+        # Activation checkpointing wraps each virtual-layer call, not each
+        # physical layer. Under depth recurrence this means the recomputed
+        # backward pass re-runs the shared block once per virtual step, which
+        # is what we want — the autograd graph of the original forward has the
+        # same structure. Gradient accumulation on the weight-tied shared
+        # parameters happens via the usual autograd mechanism; checkpointing
+        # is orthogonal. Skipped entirely when ``x`` has no grad (eval /
+        # torch.no_grad) because checkpointing a no-grad path is a no-op at
+        # best and a warning-emitting behavior drift at worst.
+        use_ckpt = self.activation_checkpoint and torch.is_grad_enabled() and x.requires_grad
         all_stats: list[dict] = []
         for layer_idx in self._virtual_layer_indices:
             layer = self.layers[layer_idx]
-            result = layer(x, return_jacobian_stats=return_jacobian_stats)
+            if use_ckpt:
+                result = _checkpoint(
+                    layer,
+                    x,
+                    return_jacobian_stats=return_jacobian_stats,
+                    use_reentrant=False,
+                )
+            else:
+                result = layer(x, return_jacobian_stats=return_jacobian_stats)
             if return_jacobian_stats:
                 x, stats = result
                 all_stats.append(stats)

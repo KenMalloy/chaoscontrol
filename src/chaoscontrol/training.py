@@ -19,6 +19,7 @@ from chaoscontrol.core import criticality_loss
 from chaoscontrol.data import batch_from_starts, maybe_autocast, maybe_sync_cuda
 from chaoscontrol.metabolic import metabolic_fork, metabolic_monte_carlo, StructuredProjections
 from chaoscontrol.memory import MultiSlotOuterModel
+from chaoscontrol.optim import LAMB, Muon
 from chaoscontrol.posterior import GlobalDelta, BucketDelta, ResidualCache
 from chaoscontrol.wake_cache import WakeCache
 from chaoscontrol.sleep import SleepConfig, SleepCycle
@@ -114,6 +115,7 @@ def train_chaoscontrol_for_budget(
     # pre-DDP training loop: no DDP wrap, no barriers, no data sharding.
     rank: int | None = None,
     world_size: int | None = None,
+    optimizer: str = "adamw",
 ) -> dict[str, Any]:
     """Train ChaosStudentLM for a time budget with optional criticality regularization.
 
@@ -226,7 +228,39 @@ def train_chaoscontrol_for_budget(
         all_params += list(structured_proj.parameters())
     if tokenizer is not None:
         all_params += list(tokenizer.parameters())
-    optimizer = torch.optim.AdamW(all_params, lr=base_lr, weight_decay=weight_decay)
+
+    optimizer_name = optimizer
+    if optimizer_name == "adamw":
+        optimizer = torch.optim.AdamW(all_params, lr=base_lr, weight_decay=weight_decay)
+    elif optimizer_name == "muon":
+        # Muon's internal classifier routes 2D params through Newton-Schulz
+        # and scalar/vector params through a decoupled-AdamW fallback. Bind
+        # names from model.named_parameters() so the classifier can use
+        # tensor names when needed (the default ndim==2 check covers our
+        # case but name binding keeps the door open for explicit overrides
+        # if a future caller hand-specifies matrix_param_names).
+        optimizer = Muon(
+            all_params,
+            lr=base_lr,
+            weight_decay=weight_decay,
+            adamw_lr=base_lr,
+            adamw_weight_decay=weight_decay,
+        )
+        named = list(model.named_parameters())
+        if structured_proj is not None:
+            named += [
+                (f"structured_proj.{n}", p) for n, p in structured_proj.named_parameters()
+            ]
+        if tokenizer is not None:
+            named += [(f"tokenizer.{n}", p) for n, p in tokenizer.named_parameters()]
+        optimizer.bind_param_names(named)
+    elif optimizer_name == "lamb":
+        optimizer = LAMB(all_params, lr=base_lr, weight_decay=weight_decay)
+    else:
+        raise ValueError(
+            f"Unknown optimizer: {optimizer_name!r}. "
+            "Expected one of {'adamw', 'muon', 'lamb'}."
+        )
 
     # Rank-aware data sampler: stride the start-index list so each rank sees a
     # disjoint shard. ``seed + rank`` diverges each rank's RNG sequence so they
@@ -784,6 +818,8 @@ def train_chaoscontrol_for_budget(
         "peak_vram_mb": peak_vram_mb,
         "ddp_rank": rank,
         "ddp_world_size": world_size,
+        "optimizer_type": type(optimizer).__name__,
+        "optimizer_name": optimizer_name,
     }
 
 
