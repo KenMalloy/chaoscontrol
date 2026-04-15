@@ -102,7 +102,7 @@ def _base(seq_len: int, base_lr: float, **overrides: Any) -> dict[str, Any]:
         "ff_mult": 2,
         "seq_len": seq_len,
         "stride": seq_len // 2,
-        "batch_size": 1024,
+        "batch_size": 512,  # see Test 4 _base comment for the bs=1024 OOM history
         "eval_batches": 16,
         "a_mode": "diag",
         "crit_target_coupling": 0.92,

@@ -79,12 +79,16 @@ TEST4_WS1_CONDITION = "ws1"  # matches run_exp18_test4.CONDITIONS key
 SWEEP_SEEDS = [1337, 2674, 4011, 5348]
 
 # LR values derived from linear scaling off single-GPU 2e-3 baseline at
-# bs=32: the global_batch ratio for ws=2/bs=1024 is 2048/32 = 64, giving
-# linear LR = 0.128. Halving and quartering handle the common failure
-# modes where linear is too aggressive at scale.
-LR_LINEAR = 0.128
-LR_HALF = 0.064
-LR_QUARTER = 0.032
+# bs=32. At ws=2 × bs_per_rank=512 the global batch is 1024, so linear
+# LR = 2e-3 × (1024/32) = 0.064. Halving and quartering handle the
+# common failure modes where linear is too aggressive at scale.
+#
+# bs_per_rank was dropped from 1024 to 512 after the second Exp 18 pod
+# launch OOM'd in loss.backward() on bs=1024 × V=16384 — see
+# memory/feedback_v16384_bs_ceiling.md and Test 4's _base comment.
+LR_LINEAR = 0.064
+LR_HALF = 0.032
+LR_QUARTER = 0.016
 
 
 def _base(base_lr: float, **overrides: Any) -> dict[str, Any]:
@@ -96,7 +100,7 @@ def _base(base_lr: float, **overrides: Any) -> dict[str, Any]:
         "ff_mult": 2,
         "seq_len": 512,
         "stride": 256,
-        "batch_size": 1024,
+        "batch_size": 512,  # see Test 4 _base comment for the bs=1024 OOM history
         "eval_batches": 16,
         "a_mode": "diag",
         "crit_target_coupling": 0.92,
