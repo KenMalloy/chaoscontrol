@@ -292,8 +292,12 @@ def _pairwise_paired(
     a_paired = [a["bpb_by_seed"][s] for s in shared_seeds]
     b_paired = [b["bpb_by_seed"][s] for s in shared_seeds]
     # (a, b): positive t-stat means a > b in bpb, so b is the better optimizer.
+    # Delta must use the same paired sample set as the p-value, not all-seed
+    # means, otherwise under partial reruns the printed delta and the b_beats_a
+    # gate would come from a different cohort than the t-test they're reported
+    # alongside.
     t, p = paired_ttest(a_paired, b_paired)
-    delta = a["mean_bpb"] - b["mean_bpb"]
+    delta = sum(a_paired) / len(a_paired) - sum(b_paired) / len(b_paired)
     return {
         "a_name": a_name,
         "b_name": b_name,
