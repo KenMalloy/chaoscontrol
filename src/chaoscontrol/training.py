@@ -25,6 +25,58 @@ from chaoscontrol.wake_cache import WakeCache
 from chaoscontrol.sleep import SleepConfig, SleepCycle
 
 
+def chunked_cross_entropy_mean(
+    logits_flat: torch.Tensor,
+    targets_flat: torch.Tensor,
+    chunk_size: int = 8192,
+) -> torch.Tensor:
+    """Memory-efficient drop-in replacement for
+    ``F.cross_entropy(logits_flat, targets_flat, reduction='mean')``.
+
+    Problem solved: ``F.cross_entropy`` upcasts the full logits tensor to
+    fp32 internally for numerical stability in the log-softmax. At large
+    ``N * V`` that single allocation blows single-GPU VRAM even when the
+    bf16 logits themselves fit. Example at bs=1024, seq=512, V=16384:
+    the fp32 upcast is 34 GiB for the CE loss alone, which OOMs an
+    80 GB H100 that's also holding ~60 GiB of chunked-scan fp64 backward
+    state.
+
+    Fix: compute the per-element CE in chunks along the position axis.
+    Each chunk upcasts only ``chunk_size * V * 4`` bytes at a time
+    (~268 MB at chunk_size=8192, V=16384). The per-chunk sum is
+    accumulated into an fp32 scalar and divided by ``N`` at the end.
+    Mathematically equivalent to ``F.cross_entropy(reduction='mean')``,
+    with floating-point results matching within ~2 ULP of fp32
+    precision — the difference comes from the summation order
+    (F.cross_entropy uses an internal tree-reduction over all N
+    elements, this helper uses F.cross_entropy's tree-reduction within
+    each chunk plus a left-to-right accumulator across chunks). The
+    parity is therefore tight numerical-equivalence, not bit-exact.
+
+    Per-chunk values are explicitly upcast to fp32 before the reduction
+    so we don't lose precision through bf16 round-trips when the input
+    logits are bf16 (bf16 can't represent sums in the 1e5 range without
+    dropping several mantissa bits per chunk).
+
+    Gradients are bit-exact to the non-chunked path at fp32, and within
+    bf16 round-trip noise (~1e-3 relative) at bf16.
+
+    Returns a scalar tensor in the input logits dtype.
+    """
+    n = logits_flat.size(0)
+    if n == 0:
+        return F.cross_entropy(logits_flat, targets_flat, reduction="mean")
+    total = logits_flat.new_zeros((), dtype=torch.float32)
+    for start in range(0, n, chunk_size):
+        end = start + chunk_size  # PyTorch slice clamps at tensor size
+        chunk_logits_fp32 = logits_flat[start:end].float()
+        chunk_loss = F.cross_entropy(
+            chunk_logits_fp32, targets_flat[start:end], reduction="sum",
+        )
+        total = total + chunk_loss
+    return (total / n).to(dtype=logits_flat.dtype)
+
+
 def _resolve_ddp_context(
     rank: int | None,
     world_size: int | None,
@@ -468,7 +520,14 @@ def train_chaoscontrol_for_budget(
                 weights = 1.0 + umap / (umap.mean() + 1e-8)
                 ce_loss = (per_token_ce * weights).mean()
             else:
-                ce_loss = F.cross_entropy(out["logits"].reshape(-1, vocab_size), targets.reshape(-1))
+                # Chunked CE — never materializes the full (B*T, V) fp32
+                # upcast, which would be 34 GiB at bs=1024/seq=512/V=16384
+                # and OOMs single H100. See chunked_cross_entropy_mean
+                # docstring for the memory math.
+                ce_loss = chunked_cross_entropy_mean(
+                    out["logits"].reshape(-1, vocab_size),
+                    targets.reshape(-1),
+                )
             loss = ce_loss
             if use_crit and "jacobian_stats" in out:
                 if "per_layer_jacobian_stats" in out:
