@@ -67,9 +67,16 @@ class TestChunkedCrossEntropyForward:
         # while the chunked path sums fp32 per-chunk scalars. Both are
         # mathematically equivalent but floating-point summation order
         # can differ in the last bit of bf16 precision.
+        #
+        # The helper returns fp32 scalar unconditionally (matches autocast
+        # contract); stock F.cross_entropy returns bf16 for bf16 input
+        # outside autocast. Upcast the reference to compare.
         logits, targets = _make_inputs(n=1024, v=128, dtype=torch.bfloat16, seed=3)
-        full = F.cross_entropy(logits, targets, reduction="mean")
+        full = F.cross_entropy(logits, targets, reduction="mean").float()
         chunked = chunked_cross_entropy_mean(logits, targets, chunk_size=64)
+        assert chunked.dtype == torch.float32, (
+            f"helper should return fp32 unconditionally; got {chunked.dtype}"
+        )
         # bf16 unit-in-last-place at loss magnitudes ~4-5 is ~1/64 ≈ 0.015
         assert torch.allclose(full, chunked, atol=2e-2, rtol=1e-2), (
             f"bf16: full={full.item()}, chunked={chunked.item()}, "
@@ -127,6 +134,67 @@ class TestChunkedCrossEntropyGradient:
         assert max_diff < 5e-3, (
             f"bf16 grad max_diff={max_diff}, full_loss={full_loss.item()}, "
             f"chunked_loss={chunked_loss.item()}"
+        )
+
+
+class TestChunkedCrossEntropyAutocast:
+    """The drop-in-under-autocast contract that the Exp 18 training loop
+    actually relies on.
+
+    Inside ``torch.autocast(dtype=torch.bfloat16)``, stock F.cross_entropy
+    upcasts its scalar loss to fp32 even when the input logits are bf16.
+    The helper must behave the same way so the caller at training.py:472
+    (which runs under maybe_autocast) gets a consistently-typed scalar
+    loss regardless of which path it's using. Catches any future edit
+    that accidentally reintroduces a ``.to(dtype=logits_flat.dtype)``
+    downcast at the end of the helper.
+    """
+
+    def test_helper_returns_fp32_scalar_under_autocast(self) -> None:
+        logits, targets = _make_inputs(n=512, v=128, dtype=torch.float32, seed=9)
+        with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+            chunked = chunked_cross_entropy_mean(logits, targets, chunk_size=64)
+        assert chunked.dtype == torch.float32, (
+            f"expected fp32 scalar under autocast, got {chunked.dtype}"
+        )
+
+    def test_helper_matches_stock_ce_under_autocast(self) -> None:
+        # Both operations are wrapped in autocast(bf16). Stock F.cross_entropy
+        # returns fp32 under autocast; the helper also returns fp32
+        # unconditionally. They should agree to numerical-equivalence
+        # tolerance on both forward and gradient.
+        logits_a, targets_a = _make_inputs(n=512, v=128, dtype=torch.float32, seed=10)
+        logits_b = logits_a.clone()
+        logits_a = logits_a.detach().requires_grad_(True)
+        logits_b = logits_b.detach().requires_grad_(True)
+
+        with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+            full_loss = F.cross_entropy(logits_a, targets_a, reduction="mean")
+            chunked_loss = chunked_cross_entropy_mean(
+                logits_b, targets_a, chunk_size=64,
+            )
+
+        assert full_loss.dtype == torch.float32, (
+            f"stock F.cross_entropy should return fp32 under autocast, "
+            f"got {full_loss.dtype}"
+        )
+        assert chunked_loss.dtype == torch.float32, (
+            f"helper should return fp32 under autocast, got {chunked_loss.dtype}"
+        )
+        # Forward values match within bf16 noise — both paths compute the
+        # softmax in bf16 internally under autocast.
+        forward_diff = (full_loss - chunked_loss).abs().item()
+        assert forward_diff < 5e-2, (
+            f"autocast forward diff {forward_diff} exceeds bf16 noise floor; "
+            f"full={full_loss.item()}, chunked={chunked_loss.item()}"
+        )
+
+        # Gradients should match within bf16 gradient noise.
+        full_grad = torch.autograd.grad(full_loss, logits_a, retain_graph=True)[0]
+        chunked_grad = torch.autograd.grad(chunked_loss, logits_b)[0]
+        grad_diff = (full_grad.float() - chunked_grad.float()).abs().max().item()
+        assert grad_diff < 5e-3, (
+            f"autocast gradient max diff {grad_diff} exceeds bf16 noise floor"
         )
 
 

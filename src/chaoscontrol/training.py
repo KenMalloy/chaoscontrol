@@ -42,16 +42,18 @@ def chunked_cross_entropy_mean(
     state.
 
     Fix: compute the per-element CE in chunks along the position axis.
-    Each chunk upcasts only ``chunk_size * V * 4`` bytes at a time
-    (~268 MB at chunk_size=8192, V=16384). The per-chunk sum is
-    accumulated into an fp32 scalar and divided by ``N`` at the end.
-    Mathematically equivalent to ``F.cross_entropy(reduction='mean')``,
-    with floating-point results matching within ~2 ULP of fp32
-    precision — the difference comes from the summation order
-    (F.cross_entropy uses an internal tree-reduction over all N
-    elements, this helper uses F.cross_entropy's tree-reduction within
-    each chunk plus a left-to-right accumulator across chunks). The
-    parity is therefore tight numerical-equivalence, not bit-exact.
+    Each chunk upcasts only ``chunk_size * V * 4`` bytes at a time —
+    at the default ``chunk_size=8192`` with V=16384 that's **~512 MiB**
+    per chunk, ~64x smaller than the non-chunked 32 GiB upcast. The
+    per-chunk sum is accumulated into an fp32 scalar and divided by
+    ``N`` at the end. Mathematically equivalent to
+    ``F.cross_entropy(reduction='mean')``, with floating-point results
+    matching within ~2 ULP of fp32 precision — the difference comes
+    from the summation order (F.cross_entropy uses an internal tree-
+    reduction over all N elements, this helper uses F.cross_entropy's
+    tree-reduction within each chunk plus a left-to-right accumulator
+    across chunks). The parity is therefore tight numerical-equivalence,
+    not bit-exact.
 
     Per-chunk values are explicitly upcast to fp32 before the reduction
     so we don't lose precision through bf16 round-trips when the input
@@ -61,7 +63,13 @@ def chunked_cross_entropy_mean(
     Gradients are bit-exact to the non-chunked path at fp32, and within
     bf16 round-trip noise (~1e-3 relative) at bf16.
 
-    Returns a scalar tensor in the input logits dtype.
+    **Return dtype: always fp32 scalar.** This matches the behavior of
+    stock ``F.cross_entropy`` when invoked inside ``torch.autocast`` (the
+    standard Exp 18 training path), which upcasts the loss to fp32 even
+    for bf16 logits. Downcasting the scalar back to bf16 here would
+    drop ~1% of loss precision for the history log and break parity
+    with the autocast caller. The ~4 bytes of fp32 vs bf16 for the
+    final scalar has no material memory cost.
     """
     n = logits_flat.size(0)
     if n == 0:
@@ -74,7 +82,7 @@ def chunked_cross_entropy_mean(
             chunk_logits_fp32, targets_flat[start:end], reduction="sum",
         )
         total = total + chunk_loss
-    return (total / n).to(dtype=logits_flat.dtype)
+    return total / n
 
 
 def _resolve_ddp_context(
