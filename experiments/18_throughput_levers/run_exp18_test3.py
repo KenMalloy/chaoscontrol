@@ -56,6 +56,10 @@ from _harness import _is_oom_failure, build_launch_cmd, validate_data_paths  # n
 SWEEP_SEEDS = [1337, 2674, 4011, 5348]
 TIMEOUT_MULTIPLIER = 2.5
 
+# Populated by main() from launch_matrix's return value so the summary
+# can annotate which VRAM-ceiling conditions were OOM-skipped.
+_OOM_SKIPPED: list[str] = []
+
 
 def _base(**overrides: Any) -> dict[str, Any]:
     """Matched config envelope. Only ``batch_size`` and
@@ -364,7 +368,13 @@ def summarize_results(conditions: dict[str, dict[str, Any]]) -> dict[str, Any]:
     summary["_decision"] = {
         "winner": winner,
         "pair_results": pair_results,
+        "oom_skipped_conditions": list(_OOM_SKIPPED),
     }
+    if _OOM_SKIPPED:
+        print(
+            f"\nOOM-skipped conditions (near-ceiling pushes that failed): "
+            f"{_OOM_SKIPPED}"
+        )
     print(
         f"\nGate: ckpt condition adopted iff bpb beats baseline at paired p<0.05 -> "
         f"winner={winner}"
@@ -386,13 +396,14 @@ def main() -> None:
     args = parser.parse_args()
 
     if not args.summarize_only:
-        launch_matrix(
+        skipped = launch_matrix(
             data_path=args.data_path,
             sp_model_path=args.sp_model_path,
             budget=args.budget,
             num_gpus=args.num_gpus,
             conditions=CONDITIONS,
         )
+        _OOM_SKIPPED.extend(skipped)
 
     summary = summarize_results(CONDITIONS)
     RESULTS.mkdir(parents=True, exist_ok=True)
