@@ -114,14 +114,28 @@ def build_launch_cmd(
 
 
 def build_env_with_gpu_mask(gpu_ids: list[int]) -> dict[str, str]:
-    """Clone os.environ and pin CUDA_VISIBLE_DEVICES to the given GPU list.
+    """Clone os.environ and pin CUDA_VISIBLE_DEVICES to the given GPU list,
+    plus isolate torchelastic's per-slot file-system side channels.
 
-    Used when launching multiple concurrent DDP groups on the same host:
-    each slot sees only its own 2 GPUs via this mask, so torchrun's
+    Used when launching multiple concurrent DDP groups on the same host.
+    Each slot sees only its own GPUs via the CUDA mask, so torchrun's
     LOCAL_RANK maps to the correct physical device within the mask.
+
+    Concurrent ``torch.distributed.run`` groups on one host use distinct
+    rendezvous ports + ids (see build_launch_cmd) so the c10d store keys
+    don't collide. But torchelastic also writes agent error logs to
+    ``TORCHELASTIC_ERROR_FILE`` and per-run temp dirs; neither is
+    overridden by our launch args. Two groups sharing the default path
+    can corrupt each other's error traces or race on the temp dir.
+    Set an explicit per-slot path derived from the GPU mask so each
+    slot gets its own file.
     """
     env = os.environ.copy()
     env["CUDA_VISIBLE_DEVICES"] = ",".join(str(g) for g in gpu_ids)
+    # Per-slot torchelastic error file: derived from the GPU mask so
+    # two concurrent slots with disjoint masks get distinct paths.
+    slot_tag = "_".join(str(g) for g in gpu_ids)
+    env["TORCHELASTIC_ERROR_FILE"] = f"/tmp/torchelastic_error_slot{slot_tag}.json"
     return env
 
 

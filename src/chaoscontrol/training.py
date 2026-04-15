@@ -25,13 +25,15 @@ from chaoscontrol.wake_cache import WakeCache
 from chaoscontrol.sleep import SleepConfig, SleepCycle
 
 
-def chunked_cross_entropy_mean(
+def chunked_cross_entropy(
     logits_flat: torch.Tensor,
     targets_flat: torch.Tensor,
     chunk_size: int = 8192,
+    reduction: str = "mean",
 ) -> torch.Tensor:
     """Memory-efficient drop-in replacement for
-    ``F.cross_entropy(logits_flat, targets_flat, reduction='mean')``.
+    ``F.cross_entropy(logits_flat, targets_flat, reduction=...)`` with
+    ``reduction`` in {"mean", "sum"}.
 
     Problem solved: ``F.cross_entropy`` upcasts the full logits tensor to
     fp32 internally for numerical stability in the log-softmax. At large
@@ -71,9 +73,14 @@ def chunked_cross_entropy_mean(
     with the autocast caller. The ~4 bytes of fp32 vs bf16 for the
     final scalar has no material memory cost.
     """
+    if reduction not in ("mean", "sum"):
+        raise ValueError(
+            f"chunked_cross_entropy: reduction must be 'mean' or 'sum', "
+            f"got {reduction!r}"
+        )
     n = logits_flat.size(0)
     if n == 0:
-        return F.cross_entropy(logits_flat, targets_flat, reduction="mean")
+        return F.cross_entropy(logits_flat, targets_flat, reduction=reduction)
     total = logits_flat.new_zeros((), dtype=torch.float32)
     for start in range(0, n, chunk_size):
         end = start + chunk_size  # PyTorch slice clamps at tensor size
@@ -82,7 +89,20 @@ def chunked_cross_entropy_mean(
             chunk_logits_fp32, targets_flat[start:end], reduction="sum",
         )
         total = total + chunk_loss
-    return total / n
+    if reduction == "mean":
+        return total / n
+    return total  # sum
+
+
+def chunked_cross_entropy_mean(
+    logits_flat: torch.Tensor,
+    targets_flat: torch.Tensor,
+    chunk_size: int = 8192,
+) -> torch.Tensor:
+    """Backwards-compat alias — use ``chunked_cross_entropy`` directly."""
+    return chunked_cross_entropy(
+        logits_flat, targets_flat, chunk_size=chunk_size, reduction="mean",
+    )
 
 
 def _resolve_ddp_context(
@@ -530,9 +550,9 @@ def train_chaoscontrol_for_budget(
             else:
                 # Chunked CE — never materializes the full (B*T, V) fp32
                 # upcast, which would be 34 GiB at bs=1024/seq=512/V=16384
-                # and OOMs single H100. See chunked_cross_entropy_mean
+                # and OOMs single H100. See chunked_cross_entropy
                 # docstring for the memory math.
-                ce_loss = chunked_cross_entropy_mean(
+                ce_loss = chunked_cross_entropy(
                     out["logits"].reshape(-1, vocab_size),
                     targets.reshape(-1),
                 )

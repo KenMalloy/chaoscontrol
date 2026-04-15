@@ -170,10 +170,28 @@ def build_sentencepiece_luts(
 
 
 def load_sp_data(data_dir: str, vocab_size: int = 8192) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Load pre-tokenized SP shards and clamp header contamination."""
+    """Load pre-tokenized SP shards and verify vocab compatibility.
+
+    A silent ``clamp`` used to live here, which would remap any
+    out-of-range token id (e.g. from a SP16384 data dir being loaded
+    with vocab_size=8192) onto ``vocab_size - 1``. That silently
+    corrupted training and produced meaningless bpb numbers with no
+    diagnostic. Replaced with an explicit assertion so a config/data
+    mismatch fails loudly at data-load time, before any training
+    compute is spent.
+    """
     train_tokens, val_tokens = load_fineweb_tokens(data_dir)
-    train_tokens = train_tokens.clamp(0, vocab_size - 1)
-    val_tokens = val_tokens.clamp(0, vocab_size - 1)
+    train_max = int(train_tokens.max().item())
+    val_max = int(val_tokens.max().item())
+    if train_max >= vocab_size or val_max >= vocab_size:
+        raise ValueError(
+            f"load_sp_data: tokenizer/data mismatch at {data_dir}. "
+            f"Expected max token id < vocab_size={vocab_size}, got "
+            f"train_max={train_max}, val_max={val_max}. The pre-tokenized "
+            f"shards were almost certainly generated with a different "
+            f"SentencePiece model than the runtime vocab_size implies. "
+            f"Check that --data-path matches --sp-model-path."
+        )
     test_tokens = train_tokens[:0]
     rank, _ = _resolve_rank_world()
     if rank == 0:
@@ -209,9 +227,17 @@ def evaluate_bpb_sp(
             with maybe_autocast(device, autocast_dtype):
                 out = model(inputs)
                 logits = out["logits"]
+            # Chunked CE sum — the non-chunked path calls
+            # ``logits.float().reshape(-1, V)`` which eagerly materializes
+            # a (B*T, V) fp32 tensor. At Exp 18 bs=1024/seq=512/V=16384
+            # that single allocation is 34 GiB and OOMs single H100 just
+            # like the training-side bug fixed in src/chaoscontrol/
+            # training.py:chunked_cross_entropy. The helper handles
+            # reduction="sum" for the eval accumulator.
+            from chaoscontrol.training import chunked_cross_entropy
             batch_ce = float(
-                F.cross_entropy(
-                    logits.float().reshape(-1, vocab_size),
+                chunked_cross_entropy(
+                    logits.reshape(-1, vocab_size),
                     targets.reshape(-1),
                     reduction="sum",
                 ).item()

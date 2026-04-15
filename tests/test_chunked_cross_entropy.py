@@ -13,7 +13,7 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
-from chaoscontrol.training import chunked_cross_entropy_mean
+from chaoscontrol.training import chunked_cross_entropy, chunked_cross_entropy_mean
 
 
 def _make_inputs(
@@ -135,6 +135,59 @@ class TestChunkedCrossEntropyGradient:
             f"bf16 grad max_diff={max_diff}, full_loss={full_loss.item()}, "
             f"chunked_loss={chunked_loss.item()}"
         )
+
+
+class TestChunkedCrossEntropySumReduction:
+    """Parity for the reduction='sum' variant used by the eval path in
+    ``runner_exp17.evaluate_bpb_sp``. Eval accumulates per-batch CE nats
+    across many batches and can't use the mean reduction directly.
+    """
+
+    def test_sum_matches_stock_ce_fp32(self) -> None:
+        logits, targets = _make_inputs(n=1024, v=128, dtype=torch.float32, seed=11)
+        full = F.cross_entropy(logits, targets, reduction="sum")
+        chunked = chunked_cross_entropy(
+            logits, targets, reduction="sum", chunk_size=64,
+        )
+        # Same ULP tolerance as the mean tests — sum-path precision is
+        # driven by the same fp32 reduction semantics.
+        assert torch.allclose(full, chunked, atol=0.0, rtol=1e-5), (
+            f"fp32 sum: full={full.item()}, chunked={chunked.item()}, "
+            f"diff={(full - chunked).item()}"
+        )
+
+    def test_sum_equals_mean_times_n_fp32(self) -> None:
+        # Consistency check: sum reduction equals mean reduction * N.
+        logits, targets = _make_inputs(n=512, v=64, dtype=torch.float32, seed=12)
+        mean_val = chunked_cross_entropy(logits, targets, reduction="mean", chunk_size=64)
+        sum_val = chunked_cross_entropy(logits, targets, reduction="sum", chunk_size=64)
+        n = logits.size(0)
+        assert torch.allclose(sum_val, mean_val * n, atol=0.0, rtol=1e-6), (
+            f"sum={sum_val.item()} should equal mean * n = {mean_val.item() * n}"
+        )
+
+    def test_sum_matches_stock_ce_bf16(self) -> None:
+        logits, targets = _make_inputs(n=1024, v=128, dtype=torch.bfloat16, seed=13)
+        full = F.cross_entropy(logits, targets, reduction="sum").float()
+        chunked = chunked_cross_entropy(
+            logits, targets, reduction="sum", chunk_size=64,
+        )
+        assert chunked.dtype == torch.float32
+        # bf16 sum at ~5 per element × 1024 elements = ~5000, ulp ~16
+        # across the sum; chunked path should stay within a few ULPs.
+        assert torch.allclose(full, chunked, atol=50.0, rtol=1e-2), (
+            f"bf16 sum: full={full.item()}, chunked={chunked.item()}, "
+            f"diff={(full - chunked).item()}"
+        )
+
+    def test_sum_reduction_rejects_invalid(self) -> None:
+        logits, targets = _make_inputs(n=16, v=8, dtype=torch.float32, seed=14)
+        try:
+            chunked_cross_entropy(logits, targets, reduction="none")
+        except ValueError as e:
+            assert "reduction" in str(e)
+        else:
+            raise AssertionError("should have raised on reduction='none'")
 
 
 class TestChunkedCrossEntropyAutocast:

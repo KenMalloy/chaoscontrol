@@ -85,25 +85,45 @@ TIMEOUT_MULTIPLIER = 2.5
 # world-size condition is at its linearly-scaled target, not at a
 # single flat LR that would under-train the higher-ws conditions and
 # make the bpb gate measure LR appropriateness instead of DDP scaling.
+#
+# **CAP at ws=4.** Linear scaling says ws=4 (global batch 4096) should
+# run at LR = 0.256, which is 128x the Exp 17 anchor. That is outside
+# the regime linear scaling is known to hold — literature (Goyal 2017,
+# OpenAI scaling laws) shows linear scaling breaks at global batches
+# past ~8k without careful warmup, and 128x-scaled LRs diverge on most
+# SSM configurations without stability tricks we haven't implemented.
+# If ws=4 diverged, the runner's non-finite guard would hard-fail the
+# whole matrix mid-run and we'd lose Tests 3/5/6/7 too (they sit
+# behind Test 4 in the sequential chain). So we cap ws=4's LR at
+# ws=2's value (0.128) — the last known-good-ish linear scale — and
+# document that the scaling measurement at ws=4 is "matched-LR
+# scaling", not "linear-LR scaling". This is a conservative science
+# choice: we lose the "does linear scaling work at 128x" data point
+# (flagged post-run as a follow-up if anyone cares) in exchange for
+# actually landing Test 4 ws=4 and the downstream tests.
 LR_ANCHOR_BASE = 2e-3
 LR_ANCHOR_BATCH = 32
+LR_CAP = 0.128  # matches ws=2 linear; applied to ws >= 4
 
 
 def _linear_scaled_lr(global_batch: int) -> float:
-    return LR_ANCHOR_BASE * (global_batch / LR_ANCHOR_BATCH)
+    linear = LR_ANCHOR_BASE * (global_batch / LR_ANCHOR_BATCH)
+    return min(linear, LR_CAP)
 
 
 BATCH_PER_RANK = 1024
 
 
 def _base(world_size: int, **overrides: Any) -> dict[str, Any]:
-    """Per-rank config with world-size-aware linear LR scaling.
+    """Per-rank config with world-size-aware LR scaling.
 
-    ``world_size`` is used both as a sidecar the orchestrator reads to
-    decide the launch pattern AND to compute the condition's LR via
-    linear scaling from the phase0 anchor. torchrun's env vars still
-    carry WORLD_SIZE/RANK at runtime; this argument exists so the
-    orchestrator can set the right LR per condition at yaml-write time.
+    LR is linearly scaled from (bs=32, lr=2e-3) and then capped at
+    ``LR_CAP`` (0.128 = the ws=2 linear target). ``world_size`` is used
+    both as a sidecar the orchestrator reads to decide the launch
+    pattern AND to compute the condition's LR. torchrun's env vars
+    still carry WORLD_SIZE/RANK at runtime; this argument exists so
+    the orchestrator can set the right LR per condition at
+    yaml-write time.
     """
     global_batch = BATCH_PER_RANK * world_size
     cfg = {
@@ -128,10 +148,11 @@ def _base(world_size: int, **overrides: Any) -> dict[str, Any]:
 
 
 # The (condition_name -> (world_size, config)) mapping.
-# Per-condition LRs (bs=1024 per rank, linearly scaled from bs=32):
-#   ws=1: global 1024 -> LR 0.064
-#   ws=2: global 2048 -> LR 0.128
-#   ws=4: global 4096 -> LR 0.256
+# Per-condition LRs (bs=1024 per rank, linearly scaled from bs=32
+# and capped at LR_CAP=0.128):
+#   ws=1: global 1024 -> LR 0.064  (pure linear)
+#   ws=2: global 2048 -> LR 0.128  (pure linear, hits cap)
+#   ws=4: global 4096 -> LR 0.128  (linear would be 0.256, capped)
 CONDITIONS: dict[str, tuple[int, dict[str, Any]]] = {
     "ws1":       (1, _base(world_size=1)),
     "ws2_ddp":   (2, _base(world_size=2)),
