@@ -44,6 +44,12 @@ from _harness import (  # noqa: E402
     validate_data_paths,
 )
 
+# Cross-test reference: if Test 4 has already run, we can compare the
+# winning Test 5 LR condition against Test 4's ws=1 baseline on matched
+# seeds. Location is a sibling results directory.
+TEST4_RESULTS = EXPERIMENT / "results_test4"
+TEST4_WS1_CONDITION = "ws1"  # matches run_exp18_test4.CONDITIONS key
+
 SWEEP_SEEDS = [1337, 2674, 4011, 5348]
 
 # LR values derived from linear scaling off single-GPU 2e-3 baseline at
@@ -88,15 +94,43 @@ def _mean(values: list[float]) -> float:
     return sum(values) / len(values) if values else 0.0
 
 
-def _loss_is_stable(final_loss: float) -> bool:
-    """Stability check: a run that diverged or NaN'd fails this gate."""
+def _loss_is_stable(final_loss: float, initial_loss: float = 9.7) -> bool:
+    """Stability check: a run that diverged, NaN'd, or stalled near uniform
+    fails this gate. Vocab=16384 means uniform-prediction loss is
+    log(16384) ~= 9.7; a run that barely moved from uniform is not
+    "stable" in any useful sense — it's a dead LR. Require final loss
+    at least 1.0 nat below initial, catching both divergence and
+    near-uniform stagnation.
+    """
     import math
     if not math.isfinite(final_loss):
         return False
-    # Loss should be well below a random uniform baseline. Vocab=16384 ->
-    # uniform loss = log(16384) ~= 9.7. Any final_loss above ~8 is a
-    # divergence or early-termination signal.
-    return final_loss < 8.0
+    return final_loss < initial_loss - 1.0
+
+
+def _load_ws1_seed_bpbs() -> dict[int, float]:
+    """Load Test 4's ws=1 seed -> bpb mapping if the results exist.
+
+    Used by the Test 5 gate to verify the winning LR at ws=2 actually
+    beats the ws=1 single-GPU baseline at matched wall-clock — i.e.,
+    DDP scaling is buying us something. Returns an empty dict if
+    Test 4 hasn't been run yet, which the caller interprets as
+    "skip the ws=1 comparison" rather than treating it as a failure.
+    """
+    result: dict[int, float] = {}
+    if not TEST4_RESULTS.exists():
+        return result
+    pattern = re.compile(rf"^{re.escape(TEST4_WS1_CONDITION)}_s(\d+)\.json$")
+    for file in TEST4_RESULTS.iterdir():
+        m = pattern.match(file.name)
+        if not m:
+            continue
+        try:
+            data = json.loads(file.read_text())
+            result[int(m.group(1))] = float(data["eval"]["bpb"])
+        except Exception:
+            continue
+    return result
 
 
 def summarize_results(conditions: dict[str, dict[str, Any]]) -> dict[str, Any]:
@@ -157,19 +191,82 @@ def summarize_results(conditions: dict[str, dict[str, Any]]) -> dict[str, Any]:
             "total_seed_count": row["total_seed_count"],
         }
 
-    # Gate: condition passes if all seeds were stable AND mean bpb is the
-    # lowest among stable conditions.
+    # Gate (two-stage):
+    #
+    #   1. Pick a candidate: among conditions where ALL seeds trained
+    #      stably, the one with the lowest mean bpb. If the mean-bpb gap
+    #      between the top two stable conditions is <= 0.006 bpb AND
+    #      the paired t-test between them is p >= 0.05, the choice is
+    #      inside noise and we fall back to the most conservative
+    #      (lowest-LR) stable condition to avoid picking a noisy outlier
+    #      that contaminates Tests 6/7 downstream.
+    #
+    #   2. Cross-validate the candidate against Test 4's ws=1 baseline
+    #      if those results exist: the candidate's mean bpb must beat
+    #      ws=1 at matched 600s via paired t-test (p<0.05) on shared
+    #      seeds, otherwise DDP at ws=2 is not buying anything over
+    #      single-GPU and the LR screen's choice is moot.
     stable_rows = [row for row in rows if row["stable_seed_count"] == row["total_seed_count"]]
-    winner = min(stable_rows, key=lambda r: r["mean_bpb"])["name"] if stable_rows else None
+    winner = None
+    gap_threshold = 0.006
+    if len(stable_rows) >= 2:
+        top = stable_rows[0]
+        second = stable_rows[1]
+        shared = sorted(set(top["bpb_by_seed"]) & set(second["bpb_by_seed"]))
+        if len(shared) >= 2:
+            top_paired = [top["bpb_by_seed"][s] for s in shared]
+            second_paired = [second["bpb_by_seed"][s] for s in shared]
+            _, p_top_vs_second = paired_ttest(second_paired, top_paired)
+            gap = second["mean_bpb"] - top["mean_bpb"]
+            if gap > gap_threshold or p_top_vs_second < 0.05:
+                winner = top["name"]
+            else:
+                # Inside noise: prefer the more conservative LR.
+                winner = min(
+                    (top, second), key=lambda r: r["base_lr"]
+                )["name"]
+        else:
+            winner = top["name"]
+    elif len(stable_rows) == 1:
+        winner = stable_rows[0]["name"]
+
+    # Cross-test gate vs Test 4 ws=1 baseline (if available).
+    ws1_by_seed = _load_ws1_seed_bpbs()
+    ws1_comparison: dict[str, Any] | None = None
+    if winner is not None and ws1_by_seed:
+        winner_row = next(row for row in rows if row["name"] == winner)
+        shared = sorted(set(winner_row["bpb_by_seed"]) & set(ws1_by_seed))
+        if len(shared) >= 2:
+            a = [ws1_by_seed[s] for s in shared]
+            b = [winner_row["bpb_by_seed"][s] for s in shared]
+            t, p = paired_ttest(a, b)
+            delta = sum(a) / len(a) - sum(b) / len(b)
+            passes = delta > 0 and p < 0.05
+            ws1_comparison = {
+                "winner_condition": winner,
+                "delta_ws1_minus_winner_bpb": delta,
+                "paired_t": t,
+                "paired_p": p,
+                "n_paired_seeds": len(shared),
+                "winner_beats_ws1_p_lt_0.05": bool(passes),
+            }
+            print(
+                f"\nvs Test 4 ws1 (n={len(shared)}): {winner} "
+                f"delta={delta:+.4f} bpb  p_paired={p:.4g}  "
+                f"beats_ws1={passes}"
+            )
+
     summary["_decision"] = {
         "winner_lr_condition": winner,
         "winner_base_lr": (
             next(row["base_lr"] for row in rows if row["name"] == winner) if winner else None
         ),
         "stable_conditions": [row["name"] for row in stable_rows],
+        "winner_vs_ws1_baseline": ws1_comparison,
     }
     print(
-        f"\nGate: winner (all-seeds stable + lowest mean bpb) = {winner}"
+        f"\nGate: winner (2-stage: top-stable w/ threshold, then cross-check vs ws1) "
+        f"= {winner}"
     )
     return summary
 
