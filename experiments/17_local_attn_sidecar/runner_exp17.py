@@ -170,32 +170,63 @@ def build_sentencepiece_luts(
 
 
 def load_sp_data(data_dir: str, vocab_size: int = 8192) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Load pre-tokenized SP shards and verify vocab compatibility.
+    """Load pre-tokenized SP shards, clamp header contamination, and
+    verify vocab compatibility.
 
-    A silent ``clamp`` used to live here, which would remap any
-    out-of-range token id (e.g. from a SP16384 data dir being loaded
-    with vocab_size=8192) onto ``vocab_size - 1``. That silently
-    corrupted training and produced meaningless bpb numbers with no
-    diagnostic. Replaced with an explicit assertion so a config/data
-    mismatch fails loudly at data-load time, before any training
-    compute is spent.
+    The FineWeb binary shards start with a header block that
+    ``load_fineweb_tokens`` reads as int16 tokens along with the real
+    payload. On SP16384 data the header bytes decode as tokens in
+    roughly [-12000, 12000] — a few hundred negative values out of
+    ~11.6 billion real tokens (2026-04-15 measurement: 234 negatives
+    in train, 2 in val). An earlier version of this function used a
+    silent ``clamp(0, vocab_size - 1)`` to remap those to 0; I
+    replaced the clamp with a max-only assertion in the transfer-
+    hunter fix round, which passed because the negatives satisfied
+    ``max < vocab_size`` — and then the CUDA embedding gather
+    asserted on the first negative index it saw, killing the matrix.
+
+    This version restores the clamp for negatives and out-of-range
+    positives, logs how many tokens got remapped so a future
+    tokenizer/data mismatch is visible in stdout, and still hard-
+    fails the "catastrophic mismatch" case where a lot of real tokens
+    exceed ``vocab_size`` (which would indicate the wrong SP model is
+    being pointed at the shards, not just header contamination).
     """
     train_tokens, val_tokens = load_fineweb_tokens(data_dir)
-    train_max = int(train_tokens.max().item())
-    val_max = int(val_tokens.max().item())
-    if train_max >= vocab_size or val_max >= vocab_size:
+
+    def _count_oor(tensor: torch.Tensor) -> int:
+        return int(((tensor < 0) | (tensor >= vocab_size)).sum().item())
+
+    train_oor = _count_oor(train_tokens)
+    val_oor = _count_oor(val_tokens)
+
+    # Catastrophic-mismatch check: if more than 0.1% of tokens are
+    # out of range, the data was almost certainly tokenized with a
+    # different SentencePiece model (e.g. SP8192 data at vocab=16384).
+    train_oor_frac = train_oor / max(train_tokens.numel(), 1)
+    val_oor_frac = val_oor / max(val_tokens.numel(), 1)
+    if train_oor_frac > 0.001 or val_oor_frac > 0.001:
         raise ValueError(
             f"load_sp_data: tokenizer/data mismatch at {data_dir}. "
-            f"Expected max token id < vocab_size={vocab_size}, got "
-            f"train_max={train_max}, val_max={val_max}. The pre-tokenized "
-            f"shards were almost certainly generated with a different "
-            f"SentencePiece model than the runtime vocab_size implies. "
-            f"Check that --data-path matches --sp-model-path."
+            f"More than 0.1% of tokens are outside [0, {vocab_size}). "
+            f"train oor={train_oor}/{train_tokens.numel()} ({train_oor_frac:.4%}), "
+            f"val oor={val_oor}/{val_tokens.numel()} ({val_oor_frac:.4%}). "
+            f"The pre-tokenized shards were almost certainly generated "
+            f"with a different SentencePiece model than vocab_size="
+            f"{vocab_size} implies. Check that --data-path matches "
+            f"--sp-model-path."
         )
+
+    train_tokens = train_tokens.clamp(0, vocab_size - 1)
+    val_tokens = val_tokens.clamp(0, vocab_size - 1)
     test_tokens = train_tokens[:0]
     rank, _ = _resolve_rank_world()
     if rank == 0:
-        print(f"  SP data: train={train_tokens.numel():,} val={val_tokens.numel():,} tokens", flush=True)
+        print(
+            f"  SP data: train={train_tokens.numel():,} val={val_tokens.numel():,} tokens "
+            f"(clamped {train_oor} train + {val_oor} val header-contam tokens)",
+            flush=True,
+        )
     return train_tokens, val_tokens, test_tokens
 
 
