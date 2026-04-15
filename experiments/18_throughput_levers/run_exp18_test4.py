@@ -56,6 +56,7 @@ sys.path.insert(0, str(REPO / "experiments" / "09_revised_architecture"))
 sys.path.insert(0, str(EXPERIMENT))
 from stats import bootstrap_ci, paired_ttest, sem  # noqa: E402
 from _harness import (  # noqa: E402
+    _is_oom_failure,
     build_env_with_gpu_mask,
     build_launch_cmd,
     pick_free_port,
@@ -102,6 +103,14 @@ CONDITIONS: dict[str, tuple[int, dict[str, Any]]] = {
 
 
 def _cleanup_active(active: list) -> None:
+    """Terminate any still-running procs and close their log file handles.
+
+    Entries here are 6-tuples ``(proc, cfg_path, seed, t0, log_fh, slot_id)``.
+    The ``log_fh`` is at index 4 and is always closed unconditionally —
+    the previous ``len(entry) > 5`` guard was dead code because tuples
+    from this caller have exactly 6 elements with log_fh at position 4,
+    so it never fired.
+    """
     for entry in active:
         proc, cfg_path = entry[0], entry[1]
         if proc.poll() is None:
@@ -114,8 +123,9 @@ def _cleanup_active(active: list) -> None:
                 proc.wait(timeout=5.0)
             except subprocess.TimeoutExpired:
                 proc.kill()
-        if len(entry) > 5:
-            entry[5].close()
+        log_fh = entry[4]
+        if not log_fh.closed:
+            log_fh.close()
 
 
 def _run_condition_group(
@@ -129,8 +139,18 @@ def _run_condition_group(
     num_gpus_total: int,
 ) -> None:
     """Run all seeds of one condition with slot parallelism appropriate to
-    its ``world_size``. The function blocks until every seed for this
-    condition has either produced a result JSON or failed hard."""
+    its ``world_size``. Blocks until every seed for this condition has
+    either produced a result JSON or failed hard.
+
+    Slot accounting uses an explicit free-slot set, not a ``slot_cursor
+    % max_slots`` round-robin. The cursor scheme silently aliases two
+    concurrent runs to the same GPU mask whenever runs finish out-of-
+    order (a near-certainty for Test 5/6/7 where per-step costs differ
+    across conditions). Test 4's ws=4 case has max_slots=1 so the bug
+    wouldn't trigger there, but ws=1 (max_slots=4) and ws=2 (max_slots=2)
+    are both exposed; fixing all three code paths uniformly is cheaper
+    than reasoning about which ones are safe.
+    """
     max_slots = max(num_gpus_total // world_size, 1)
     run_timeout = max(budget * TIMEOUT_MULTIPLIER, 60.0)
 
@@ -150,21 +170,20 @@ def _run_condition_group(
         flush=True,
     )
 
-    active: list = []
-    slot_cursor = 0  # round-robins assignment of runs to slots 0..max_slots-1
+    free_slots: list[int] = list(range(max_slots))
+    active: list = []  # (proc, cfg_path, seed, t0, log_fh, slot_id)
+    oom_seen = False
 
     while queue or active:
-        while queue and len(active) < max_slots:
+        while queue and free_slots and not oom_seen:
             seed, cfg_path = queue.pop(0)
             out_path = RESULTS / f"{condition_name}_s{seed}.json"
             log_path = RESULTS / f"{condition_name}_s{seed}.log"
             log_fh = open(log_path, "w")
-            slot_id = slot_cursor % max_slots
-            slot_cursor += 1
-            # Assign contiguous GPU ids to this slot.
+            slot_id = free_slots.pop(0)  # smallest free
             gpu_ids = [slot_id * world_size + i for i in range(world_size)]
+            env = build_env_with_gpu_mask(gpu_ids)
             if world_size == 1:
-                env = build_env_with_gpu_mask(gpu_ids)
                 cmd = build_launch_cmd(
                     num_gpus=1,
                     cfg_path=cfg_path,
@@ -174,7 +193,6 @@ def _run_condition_group(
                     out_path=out_path,
                 )
             else:
-                env = build_env_with_gpu_mask(gpu_ids)
                 rdzv = pick_free_port()
                 cmd = build_launch_cmd(
                     num_gpus=world_size,
@@ -186,22 +204,28 @@ def _run_condition_group(
                     rdzv_port=rdzv,
                 )
             print(
-                f"Launching {condition_name} seed={seed} gpus={gpu_ids}",
+                f"Launching {condition_name} seed={seed} slot={slot_id} "
+                f"gpus={gpu_ids}",
                 flush=True,
             )
             proc = subprocess.Popen(
                 cmd, env=env, text=True, stdout=log_fh, stderr=subprocess.STDOUT,
             )
-            active.append((proc, cfg_path, seed, time.monotonic(), log_fh))
+            active.append(
+                (proc, cfg_path, seed, time.monotonic(), log_fh, slot_id)
+            )
 
         next_active: list = []
-        for i, (proc, cfg_path, seed, t0, log_fh) in enumerate(active):
+        for i, entry in enumerate(active):
+            proc, cfg_path, seed, t0, log_fh, slot_id = entry
             ret = proc.poll()
             elapsed = time.monotonic() - t0
             if ret is None and elapsed < run_timeout:
-                next_active.append((proc, cfg_path, seed, t0, log_fh))
+                next_active.append(entry)
                 continue
             log_fh.close()
+            free_slots.append(slot_id)
+            free_slots.sort()
             if ret is None:
                 print(
                     f"TIMEOUT: {condition_name} seed={seed} after {elapsed:.0f}s",
@@ -220,6 +244,25 @@ def _run_condition_group(
             cfg_path.unlink(missing_ok=True)
             if ret != 0:
                 log_path = RESULTS / f"{condition_name}_s{seed}.log"
+                if _is_oom_failure(log_path):
+                    # Test 4 doesn't have a "this condition is at the VRAM
+                    # ceiling" framing — all three conditions use bs=1024
+                    # per rank, which already fits comfortably. An OOM
+                    # here is a real signal that DDP at this world size
+                    # is misconfigured. Drop remaining seeds for this
+                    # condition and let the summary flag it, rather than
+                    # killing the whole test.
+                    oom_seen = True
+                    remaining: list[tuple[int, Path]] = []
+                    for qs, qp in queue:
+                        qp.unlink(missing_ok=True)
+                    queue.clear()
+                    print(
+                        f"OOM_SKIP: {condition_name} seed={seed} OOM'd at "
+                        f"ws={world_size}; dropping remaining seeds",
+                        flush=True,
+                    )
+                    continue
                 tail = ""
                 if log_path.exists():
                     lines = log_path.read_text().splitlines()

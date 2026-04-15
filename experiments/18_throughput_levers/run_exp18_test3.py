@@ -47,7 +47,7 @@ RESULTS = EXPERIMENT / "results_test3"
 sys.path.insert(0, str(REPO / "experiments" / "09_revised_architecture"))
 sys.path.insert(0, str(EXPERIMENT))
 from stats import bootstrap_ci, paired_ttest, sem  # noqa: E402
-from _harness import build_launch_cmd, validate_data_paths  # noqa: E402
+from _harness import _is_oom_failure, build_launch_cmd, validate_data_paths  # noqa: E402
 
 # Four seeds per condition fill a 4-slot parallel-single-GPU matrix cleanly
 # (3 conditions x 4 seeds = 12 runs -> 3 waves of 4). Exp 17 per-condition
@@ -115,9 +115,19 @@ def launch_matrix(
     budget: float,
     num_gpus: int,
     conditions: dict[str, dict[str, Any]],
-) -> None:
+) -> list[str]:
     """Parallel-single-GPU launch. Each run pinned to one GPU via
-    ``CUDA_VISIBLE_DEVICES``. Up to ``num_gpus`` concurrent children."""
+    ``CUDA_VISIBLE_DEVICES``. Up to ``num_gpus`` concurrent children.
+
+    Slot accounting uses an explicit free-GPU set, not a monotonic
+    cursor — runs can finish out-of-order (different conditions have
+    different VRAM footprints and therefore different eval times) and
+    a ``gpu_cursor % num_gpus`` scheme would silently alias a new run
+    to a GPU still held by an earlier one.
+
+    Returns the list of condition names that were OOM-skipped so the
+    caller can surface them in the summary.
+    """
     RESULTS.mkdir(parents=True, exist_ok=True)
     validate_data_paths(data_path, sp_model_path)
 
@@ -133,17 +143,33 @@ def launch_matrix(
             queue.append((condition_name, seed, tmp))
 
     run_timeout = max(budget * TIMEOUT_MULTIPLIER, 60.0)
-    active: list = []
-    gpu_cursor = 0
+    free_gpus: list[int] = list(range(max(num_gpus, 1)))
+    active: list = []  # (proc, cfg_path, condition_name, seed, t0, log_fh, gpu_id)
+    skipped_conditions: list[str] = []
+
+    def _drop_condition_from_queue(name: str) -> int:
+        dropped = 0
+        remaining: list[tuple[str, int, Path]] = []
+        for entry in queue:
+            if entry[0] == name:
+                entry[2].unlink(missing_ok=True)
+                dropped += 1
+            else:
+                remaining.append(entry)
+        queue[:] = remaining
+        return dropped
 
     while queue or active:
-        while queue and len(active) < max(num_gpus, 1):
+        while queue and free_gpus:
             condition_name, seed, cfg_path = queue.pop(0)
+            if condition_name in skipped_conditions:
+                cfg_path.unlink(missing_ok=True)
+                continue
             out_path = RESULTS / f"{condition_name}_s{seed}.json"
+            gpu_id = free_gpus.pop(0)  # smallest free
             env = os.environ.copy()
             if num_gpus > 0:
-                env["CUDA_VISIBLE_DEVICES"] = str(gpu_cursor % num_gpus)
-            gpu_cursor += 1
+                env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
             log_path = RESULTS / f"{condition_name}_s{seed}.log"
             log_fh = open(log_path, "w")
             cmd = build_launch_cmd(
@@ -154,18 +180,28 @@ def launch_matrix(
                 budget=budget,
                 out_path=out_path,
             )
-            print(f"Launching {condition_name} seed={seed}", flush=True)
-            proc = subprocess.Popen(cmd, env=env, text=True, stdout=log_fh, stderr=subprocess.STDOUT)
-            active.append((proc, cfg_path, condition_name, seed, time.monotonic(), log_fh))
+            print(
+                f"Launching {condition_name} seed={seed} gpu={gpu_id}",
+                flush=True,
+            )
+            proc = subprocess.Popen(
+                cmd, env=env, text=True, stdout=log_fh, stderr=subprocess.STDOUT,
+            )
+            active.append(
+                (proc, cfg_path, condition_name, seed, time.monotonic(), log_fh, gpu_id)
+            )
 
         next_active: list = []
-        for i, (proc, cfg_path, condition_name, seed, t0, log_fh) in enumerate(active):
+        for i, entry in enumerate(active):
+            proc, cfg_path, condition_name, seed, t0, log_fh, gpu_id = entry
             ret = proc.poll()
             elapsed = time.monotonic() - t0
             if ret is None and elapsed < run_timeout:
-                next_active.append((proc, cfg_path, condition_name, seed, t0, log_fh))
+                next_active.append(entry)
                 continue
             log_fh.close()
+            free_gpus.append(gpu_id)
+            free_gpus.sort()
             if ret is None:
                 print(
                     f"TIMEOUT: {condition_name} seed={seed} after {elapsed:.0f}s "
@@ -186,6 +222,21 @@ def launch_matrix(
             cfg_path.unlink(missing_ok=True)
             if ret != 0:
                 log_path = RESULTS / f"{condition_name}_s{seed}.log"
+                if _is_oom_failure(log_path):
+                    # bs=2048 is deliberately a VRAM ceiling push; a
+                    # legitimate OOM on that condition just means the
+                    # lever didn't earn its place, not that the whole
+                    # matrix should die. Drop its remaining seeds and
+                    # continue.
+                    dropped = _drop_condition_from_queue(condition_name)
+                    if condition_name not in skipped_conditions:
+                        skipped_conditions.append(condition_name)
+                    print(
+                        f"OOM_SKIP: {condition_name} seed={seed} OOM'd; "
+                        f"dropped {dropped} remaining seeds of this condition",
+                        flush=True,
+                    )
+                    continue
                 tail = ""
                 if log_path.exists():
                     lines = log_path.read_text().splitlines()
@@ -198,6 +249,8 @@ def launch_matrix(
         active = next_active
         if active:
             time.sleep(2.0)
+
+    return skipped_conditions
 
 
 def _mean(values: list[float]) -> float:

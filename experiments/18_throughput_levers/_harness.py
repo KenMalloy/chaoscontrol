@@ -159,6 +159,25 @@ def _cleanup_active(active: list) -> None:
             entry[5].close()
 
 
+def _is_oom_failure(log_path: Path) -> bool:
+    """Grep the log tail for a CUDA OOM signature. Used by callers that
+    want to skip OOM-ing conditions (ceiling-push tests) instead of
+    hard-failing the entire matrix on the first near-ceiling run."""
+    if not log_path.exists():
+        return False
+    try:
+        tail = log_path.read_text()[-8192:]
+    except Exception:
+        return False
+    needles = (
+        "CUDA out of memory",
+        "torch.cuda.OutOfMemoryError",
+        "OutOfMemoryError",
+        "CUDA error: out of memory",
+    )
+    return any(n in tail for n in needles)
+
+
 def run_parallel_ddp_matrix(
     *,
     conditions: dict[str, dict[str, Any]],
@@ -170,7 +189,8 @@ def run_parallel_ddp_matrix(
     budget: float,
     results_dir: Path,
     timeout_multiplier: float = 2.5,
-) -> None:
+    skip_oom_conditions: bool = False,
+) -> list[str]:
     """Launch ``conditions x seeds`` under parallel DDP groups.
 
     Each slot owns a disjoint set of ``ws_per_slot`` GPUs pinned via
@@ -178,9 +198,25 @@ def run_parallel_ddp_matrix(
     ``num_slots * ws_per_slot`` must not exceed the pod's GPU count;
     the caller is responsible for validating this.
 
+    **Slot accounting correctness.** Slots are tracked by an explicit
+    free-set, not a monotonic cursor. When a run launches, it claims
+    the smallest-index free slot; when it completes, its slot returns
+    to the free-set. This is correct under arbitrary completion order
+    — a monotonic ``cursor % num_slots`` scheme silently aliases two
+    concurrent runs to the same GPU mask when runs finish out-of-order,
+    which is the default case whenever conditions have different
+    per-step costs (e.g., different optimizers, LRs, or seq_lens).
+
     Idempotent: any ``{condition}_s{seed}.json`` that already exists in
     ``results_dir`` is skipped, so re-launches after partial completion
     only run the missing seeds.
+
+    **OOM handling.** When ``skip_oom_conditions=True``, a run that
+    exits non-zero with an OOM signature in its log tail causes the
+    orchestrator to drop *all remaining seeds of that condition* from
+    the queue and continue with other conditions, rather than hard-
+    failing the entire matrix. Returns the list of condition names
+    that were skipped so the caller can note them in the summary.
     """
     results_dir.mkdir(parents=True, exist_ok=True)
     run_timeout = max(budget * timeout_multiplier, 60.0)
@@ -196,17 +232,36 @@ def run_parallel_ddp_matrix(
             tmp.write_text(yaml.safe_dump(seed_cfg, sort_keys=False))
             queue.append((condition_name, seed, tmp))
 
-    active: list = []
-    slot_cursor = 0
+    # Explicit free-slot set. `free_slots` stores slot_ids currently idle;
+    # `active` entries carry their owning slot_id so completion frees the
+    # right slot regardless of completion order.
+    free_slots: list[int] = list(range(num_slots))
+    active: list = []  # tuples: (proc, cfg_path, condition_name, seed, t0, log_fh, slot_id)
+    skipped_conditions: list[str] = []
+
+    def _drop_condition_from_queue(name: str) -> int:
+        """Drop all unstarted seeds of ``name`` from the queue. Returns count."""
+        dropped = 0
+        remaining: list[tuple[str, int, Path]] = []
+        for entry in queue:
+            if entry[0] == name:
+                entry[2].unlink(missing_ok=True)
+                dropped += 1
+            else:
+                remaining.append(entry)
+        queue[:] = remaining
+        return dropped
 
     while queue or active:
-        while queue and len(active) < num_slots:
+        while queue and free_slots:
             condition_name, seed, cfg_path = queue.pop(0)
+            if condition_name in skipped_conditions:
+                cfg_path.unlink(missing_ok=True)
+                continue
             out_path = results_dir / f"{condition_name}_s{seed}.json"
             log_path = results_dir / f"{condition_name}_s{seed}.log"
             log_fh = open(log_path, "w")
-            slot_id = slot_cursor % num_slots
-            slot_cursor += 1
+            slot_id = free_slots.pop(0)  # smallest free slot
             gpu_ids = [slot_id * ws_per_slot + i for i in range(ws_per_slot)]
             env = build_env_with_gpu_mask(gpu_ids)
             rdzv = pick_free_port()
@@ -220,22 +275,28 @@ def run_parallel_ddp_matrix(
                 rdzv_port=rdzv,
             )
             print(
-                f"Launching {condition_name} seed={seed} gpus={gpu_ids} rdzv=:{rdzv}",
+                f"Launching {condition_name} seed={seed} slot={slot_id} "
+                f"gpus={gpu_ids} rdzv=:{rdzv}",
                 flush=True,
             )
             proc = subprocess.Popen(
                 cmd, env=env, text=True, stdout=log_fh, stderr=subprocess.STDOUT,
             )
-            active.append((proc, cfg_path, condition_name, seed, time.monotonic(), log_fh))
+            active.append(
+                (proc, cfg_path, condition_name, seed, time.monotonic(), log_fh, slot_id)
+            )
 
         next_active: list = []
-        for i, (proc, cfg_path, condition_name, seed, t0, log_fh) in enumerate(active):
+        for i, entry in enumerate(active):
+            proc, cfg_path, condition_name, seed, t0, log_fh, slot_id = entry
             ret = proc.poll()
             elapsed = time.monotonic() - t0
             if ret is None and elapsed < run_timeout:
-                next_active.append((proc, cfg_path, condition_name, seed, t0, log_fh))
+                next_active.append(entry)
                 continue
             log_fh.close()
+            free_slots.append(slot_id)
+            free_slots.sort()
             if ret is None:
                 print(
                     f"TIMEOUT: {condition_name} seed={seed} after {elapsed:.0f}s",
@@ -254,6 +315,17 @@ def run_parallel_ddp_matrix(
             cfg_path.unlink(missing_ok=True)
             if ret != 0:
                 log_path = results_dir / f"{condition_name}_s{seed}.log"
+                if skip_oom_conditions and _is_oom_failure(log_path):
+                    # Drop this condition's remaining seeds and continue.
+                    dropped = _drop_condition_from_queue(condition_name)
+                    if condition_name not in skipped_conditions:
+                        skipped_conditions.append(condition_name)
+                    print(
+                        f"OOM_SKIP: {condition_name} seed={seed} OOM'd; "
+                        f"dropped {dropped} remaining seeds of this condition",
+                        flush=True,
+                    )
+                    continue
                 tail = ""
                 if log_path.exists():
                     lines = log_path.read_text().splitlines()
@@ -266,3 +338,5 @@ def run_parallel_ddp_matrix(
         active = next_active
         if active:
             time.sleep(2.0)
+
+    return skipped_conditions
