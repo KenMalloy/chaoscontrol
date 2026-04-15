@@ -4,12 +4,19 @@
 Test 7 is the optimizer ablation called out in the Exp 18 design doc. It
 runs at the same ws=2 DDP regime as Tests 5 and 6 so that the three
 tests share a common large-batch baseline. Three optimizer conditions
-against the same bare-SSM config (bs=1024 per rank, seq=512, LR from
-Test 5 winner once that lands):
+against the same bare-SSM config (bs=1024 per rank, seq=512, LR
+inherited from the Test 5 winner):
 
     adamw_baseline  current default
     muon            Newton-Schulz matrix orthogonalization + AdamW fallback
     lamb            per-tensor trust ratio, architecture-agnostic large-batch
+
+**LR inheritance.** Test 7 reads Test 5's validated winning LR from
+``results_test5/test5_summary.json`` and refuses to run on a provisional
+or missing winner without an explicit ``--base-lr`` override. This
+matches Test 6's contract — all three tests (5/6/7) that claim to share
+the "ws=2 regime" must actually use the same LR, and that LR must be
+Test 5's Stage-2 cross-validated winner.
 
 Gate:
     Any alternative beats AdamW at paired p<0.05 on mean bpb across the
@@ -17,6 +24,12 @@ Gate:
     Otherwise AdamW stays. The per-pair comparison (muon vs adamw,
     lamb vs adamw, muon vs lamb) is printed for the full three-way
     picture, not just the winning pair.
+
+**Statistical power caveat:** at n=4 and per-condition noise ~0.004 bpb,
+the paired test is only powered for differences larger than ~0.008 bpb.
+Optimizer deltas at matched budget may be smaller than that. "No
+winner, AdamW stays" in this test could reflect low power as much as
+no real effect.
 
 Launch: parallel 2-slot DDP at ws=2 via ``_harness.run_parallel_ddp_matrix``.
 Four seeds per condition x three optimizers = 12 runs, 6 waves, ~60 min.
@@ -33,6 +46,7 @@ from typing import Any
 REPO = Path(__file__).resolve().parents[2]
 EXPERIMENT = Path(__file__).resolve().parent
 RESULTS = EXPERIMENT / "results_test7"
+TEST5_SUMMARY = EXPERIMENT / "results_test5" / "test5_summary.json"
 
 sys.path.insert(0, str(REPO / "experiments" / "09_revised_architecture"))
 sys.path.insert(0, str(EXPERIMENT))
@@ -45,7 +59,28 @@ from _harness import (  # noqa: E402
 SWEEP_SEEDS = [1337, 2674, 4011, 5348]
 
 
-def _base(optimizer: str, **overrides: Any) -> dict[str, Any]:
+def _read_test5_winning_lr() -> tuple[float | None, str]:
+    """Same contract as Test 6's helper. Returns (lr, status) where
+    status in {"ok", "provisional", "no_winner", "missing"}.
+    """
+    if not TEST5_SUMMARY.exists():
+        return None, "missing"
+    try:
+        data = json.loads(TEST5_SUMMARY.read_text())
+    except Exception:
+        return None, "missing"
+    decision = data.get("_decision", {}) or {}
+    lr = decision.get("winner_base_lr")
+    winner = decision.get("winner_lr_condition")
+    provisional = bool(decision.get("winner_is_provisional", False))
+    if winner is None or lr is None:
+        return None, "no_winner"
+    if provisional:
+        return float(lr), "provisional"
+    return float(lr), "ok"
+
+
+def _base(optimizer: str, base_lr: float, **overrides: Any) -> dict[str, Any]:
     cfg = {
         "model_type": "ssm",
         "vocab_size": 16384,
@@ -58,7 +93,7 @@ def _base(optimizer: str, **overrides: Any) -> dict[str, Any]:
         "eval_batches": 16,
         "a_mode": "diag",
         "crit_target_coupling": 0.92,
-        "base_lr": 0.064,
+        "base_lr": base_lr,
         "local_attn_window": 0,
         "local_attn_heads": 1,
         "local_attn_dim": 64,
@@ -68,11 +103,15 @@ def _base(optimizer: str, **overrides: Any) -> dict[str, Any]:
     return cfg
 
 
-CONDITIONS: dict[str, dict[str, Any]] = {
-    "adamw_baseline": _base(optimizer="adamw"),
-    "muon":           _base(optimizer="muon"),
-    "lamb":           _base(optimizer="lamb"),
-}
+def build_conditions(base_lr: float) -> dict[str, dict[str, Any]]:
+    return {
+        "adamw_baseline": _base(optimizer="adamw", base_lr=base_lr),
+        "muon":           _base(optimizer="muon",  base_lr=base_lr),
+        "lamb":           _base(optimizer="lamb",  base_lr=base_lr),
+    }
+
+
+CONDITIONS: dict[str, dict[str, Any]] = {}
 
 
 def _mean(values: list[float]) -> float:
@@ -213,6 +252,37 @@ def summarize_results(conditions: dict[str, dict[str, Any]]) -> dict[str, Any]:
     return summary
 
 
+def _resolve_base_lr(cli_override: float | None) -> float:
+    """Pick the LR Test 7 runs at. Matches Test 6's contract: explicit
+    override > non-provisional Test 5 winner > hard refuse."""
+    if cli_override is not None:
+        print(f"Test 7: using --base-lr override {cli_override}", flush=True)
+        return float(cli_override)
+    lr, status = _read_test5_winning_lr()
+    if status == "ok":
+        print(
+            f"Test 7: inherited base_lr={lr} from Test 5 winner "
+            f"(Stage 2 cross-check passed)",
+            flush=True,
+        )
+        return lr  # type: ignore[return-value]
+    if status == "provisional":
+        raise RuntimeError(
+            f"Test 5 emitted a PROVISIONAL winner at lr={lr}. "
+            f"Test 7 refuses to inherit an uncross-validated LR. "
+            f"Run Test 4 first or pass --base-lr explicitly."
+        )
+    if status == "no_winner":
+        raise RuntimeError(
+            "Test 5 ran but emitted no winner. Test 7 cannot inherit "
+            "an LR — re-run Test 5 or pass --base-lr explicitly."
+        )
+    raise RuntimeError(
+        f"Test 5 summary not found at {TEST5_SUMMARY}. Run Test 5 first "
+        f"or pass --base-lr explicitly."
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Exp 18 Test 7 launcher — AdamW vs Muon vs LAMB at ws=2 DDP"
@@ -222,8 +292,22 @@ def main() -> None:
     parser.add_argument("--budget", type=float, default=600.0)
     parser.add_argument("--num-slots", type=int, default=2,
                         help="Number of parallel DDP groups (each uses 2 GPUs)")
+    parser.add_argument(
+        "--base-lr",
+        type=float,
+        default=None,
+        help=(
+            "Override the Test 5-inherited LR. Normally Test 7 reads "
+            "Test 5's validated winner from results_test5/test5_summary.json; "
+            "pass this flag only when you explicitly want to bypass that."
+        ),
+    )
     parser.add_argument("--summarize-only", action="store_true")
     args = parser.parse_args()
+
+    base_lr = _resolve_base_lr(args.base_lr)
+    global CONDITIONS
+    CONDITIONS = build_conditions(base_lr)
 
     if not args.summarize_only:
         validate_data_paths(args.data_path, args.sp_model_path)
@@ -239,6 +323,7 @@ def main() -> None:
         )
 
     summary = summarize_results(CONDITIONS)
+    summary["_base_lr"] = base_lr
     RESULTS.mkdir(parents=True, exist_ok=True)
     (RESULTS / "test7_summary.json").write_text(json.dumps(summary, indent=2, default=str))
 

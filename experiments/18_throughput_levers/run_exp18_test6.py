@@ -1,27 +1,37 @@
 #!/usr/bin/env python3
 """Experiment 18 Test 6 launcher: sequence length sweep.
 
-At the winning ws=2 DDP config, vary ``seq_len ∈ {512, 1024, 2048}`` to
-see whether longer sequences buy better bpb per wall-clock. The chunked
-scan is O(N) theoretically but kernel launch overhead, fp64 cumprod
-allocation, and HBM traffic can make the real curve sub-linear or
-super-linear depending on where we land on the compute/memory tradeoff.
+At the ws=2 DDP regime from Tests 4/5, vary ``seq_len ∈ {512, 1024, 2048}``
+to see whether longer sequences buy better bpb per wall-clock. The
+chunked scan is O(N) theoretically but kernel launch overhead, fp64
+cumprod allocation, and HBM traffic can make the real curve sub-linear
+or super-linear.
 
-Three conditions at fixed (batch=1024 per rank, LR from Test 5 winner):
+Three conditions at fixed (batch=1024 per rank, LR inherited from Test 5
+winner):
 
     seq512   baseline (matches Tests 4/5 regime)
     seq1024  double length, half compute-per-position density
     seq2048  quadruple length, may hit VRAM ceiling on ws=2
 
+**LR inheritance.** This orchestrator reads the Test 5 winning LR from
+``results_test5/test5_summary.json`` at launch time. If Test 5 has not
+run, or emitted only a provisional winner (no Test 4 cross-check), or
+failed to emit a winner at all, Test 6 REFUSES to run without an
+explicit ``--base-lr`` CLI override. This is the "ws=2 regime contract"
+the reviewer flagged: Tests 5/6/7 must use the SAME LR because they
+claim to share the regime, and that LR has to be Test 5's validated
+winner — not a hardcoded guess.
+
 Gate (bpb at matched 600s):
-    Winner is the seq_len with the lowest mean_bpb. No statistical
-    preference for smaller seq_len — longer sequences are fine as long
-    as bpb drops.
+    Winner is the seq_len with the lowest mean_bpb. Paired t-test vs
+    seq512 is reported for each longer condition so we can see whether
+    the gap is statistically meaningful.
 
 Launch: parallel 2-slot DDP at ws=2 (same as Test 5). Four seeds per
-condition = 12 runs, 6 waves, ~60 min. Skips any condition that the
-runner reports OOMs on — VRAM ceiling at seq=2048 is the most likely
-failure and worth detecting rather than crashing the matrix.
+condition = 12 runs, 6 waves, ~60 min. seq=2048 may OOM at the ws=2
+VRAM ceiling — that condition is OOM-skipped and annotated in the
+summary rather than killing the whole matrix.
 """
 from __future__ import annotations
 
@@ -35,6 +45,7 @@ from typing import Any
 REPO = Path(__file__).resolve().parents[2]
 EXPERIMENT = Path(__file__).resolve().parent
 RESULTS = EXPERIMENT / "results_test6"
+TEST5_SUMMARY = EXPERIMENT / "results_test5" / "test5_summary.json"
 
 sys.path.insert(0, str(REPO / "experiments" / "09_revised_architecture"))
 sys.path.insert(0, str(EXPERIMENT))
@@ -52,7 +63,36 @@ SWEEP_SEEDS = [1337, 2674, 4011, 5348]
 _OOM_SKIPPED: list[str] = []
 
 
-def _base(seq_len: int, **overrides: Any) -> dict[str, Any]:
+def _read_test5_winning_lr() -> tuple[float | None, str]:
+    """Read Test 5's validated winning LR from its summary JSON.
+
+    Returns (lr, status) where status is:
+        "ok"           — Test 5 emitted a non-provisional winner; lr is valid
+        "provisional"  — Test 5 emitted a provisional winner (no Test 4
+                         cross-check); lr is the candidate but caller
+                         should refuse to use it without override
+        "no_winner"    — Test 5 ran but emitted no winner (Stage 1 or
+                         Stage 2 failed); lr is None
+        "missing"      — Test 5 summary doesn't exist; lr is None
+    """
+    if not TEST5_SUMMARY.exists():
+        return None, "missing"
+    try:
+        data = json.loads(TEST5_SUMMARY.read_text())
+    except Exception:
+        return None, "missing"
+    decision = data.get("_decision", {}) or {}
+    lr = decision.get("winner_base_lr")
+    winner = decision.get("winner_lr_condition")
+    provisional = bool(decision.get("winner_is_provisional", False))
+    if winner is None or lr is None:
+        return None, "no_winner"
+    if provisional:
+        return float(lr), "provisional"
+    return float(lr), "ok"
+
+
+def _base(seq_len: int, base_lr: float, **overrides: Any) -> dict[str, Any]:
     cfg = {
         "model_type": "ssm",
         "vocab_size": 16384,
@@ -65,7 +105,7 @@ def _base(seq_len: int, **overrides: Any) -> dict[str, Any]:
         "eval_batches": 16,
         "a_mode": "diag",
         "crit_target_coupling": 0.92,
-        "base_lr": 0.064,
+        "base_lr": base_lr,
         "local_attn_window": 0,
         "local_attn_heads": 1,
         "local_attn_dim": 64,
@@ -74,11 +114,19 @@ def _base(seq_len: int, **overrides: Any) -> dict[str, Any]:
     return cfg
 
 
-CONDITIONS: dict[str, dict[str, Any]] = {
-    "seq512":  _base(seq_len=512),
-    "seq1024": _base(seq_len=1024),
-    "seq2048": _base(seq_len=2048),
-}
+def build_conditions(base_lr: float) -> dict[str, dict[str, Any]]:
+    return {
+        "seq512":  _base(seq_len=512,  base_lr=base_lr),
+        "seq1024": _base(seq_len=1024, base_lr=base_lr),
+        "seq2048": _base(seq_len=2048, base_lr=base_lr),
+    }
+
+
+# Module-level CONDITIONS is constructed from whichever LR main() picked.
+# Before main() runs, it's populated with a sentinel that panics if used
+# directly — this catches code paths that import CONDITIONS without
+# going through main()'s LR resolution.
+CONDITIONS: dict[str, dict[str, Any]] = {}
 
 
 def _mean(values: list[float]) -> float:
@@ -194,6 +242,49 @@ def summarize_results(conditions: dict[str, dict[str, Any]]) -> dict[str, Any]:
     return summary
 
 
+def _resolve_base_lr(cli_override: float | None) -> float:
+    """Pick the LR Test 6 runs at.
+
+    Priority:
+      1. Explicit ``--base-lr`` CLI override (user asserts "I know what
+         I'm doing, ignore Test 5's winner").
+      2. Non-provisional Test 5 winner (Stage 2 cross-check passed).
+      3. Otherwise REFUSE to run. A provisional winner, missing summary,
+         or a Test 5 that couldn't pick a winner all indicate we don't
+         actually know what LR to run Test 6 at — hardcoding a guess
+         would make Test 6's comparison to Tests 5/7 incoherent.
+    """
+    if cli_override is not None:
+        print(f"Test 6: using --base-lr override {cli_override}", flush=True)
+        return float(cli_override)
+    lr, status = _read_test5_winning_lr()
+    if status == "ok":
+        print(
+            f"Test 6: inherited base_lr={lr} from Test 5 winner "
+            f"(Stage 2 cross-check passed)",
+            flush=True,
+        )
+        return lr  # type: ignore[return-value]
+    if status == "provisional":
+        raise RuntimeError(
+            f"Test 5 emitted a PROVISIONAL winner at lr={lr} "
+            f"(Test 4 ws=1 cross-check not performed). "
+            f"Test 6 refuses to inherit an uncross-validated LR. "
+            f"Either run Test 4 first, or pass --base-lr explicitly "
+            f"to acknowledge the risk."
+        )
+    if status == "no_winner":
+        raise RuntimeError(
+            f"Test 5 ran but emitted no winner (Stage 1 or Stage 2 "
+            f"failed). Test 6 cannot inherit an LR — re-run Test 5 or "
+            f"pass --base-lr explicitly."
+        )
+    raise RuntimeError(
+        f"Test 5 summary not found at {TEST5_SUMMARY}. Run Test 5 first "
+        f"or pass --base-lr explicitly."
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Exp 18 Test 6 launcher — seq_len sweep at ws=2 DDP"
@@ -202,8 +293,22 @@ def main() -> None:
     parser.add_argument("--sp-model-path", required=True)
     parser.add_argument("--budget", type=float, default=600.0)
     parser.add_argument("--num-slots", type=int, default=2)
+    parser.add_argument(
+        "--base-lr",
+        type=float,
+        default=None,
+        help=(
+            "Override the Test 5-inherited LR. Normally Test 6 reads "
+            "Test 5's validated winner from results_test5/test5_summary.json; "
+            "pass this flag only when you explicitly want to bypass that."
+        ),
+    )
     parser.add_argument("--summarize-only", action="store_true")
     args = parser.parse_args()
+
+    base_lr = _resolve_base_lr(args.base_lr)
+    global CONDITIONS
+    CONDITIONS = build_conditions(base_lr)
 
     if not args.summarize_only:
         validate_data_paths(args.data_path, args.sp_model_path)
@@ -221,6 +326,7 @@ def main() -> None:
         _OOM_SKIPPED.extend(skipped)
 
     summary = summarize_results(CONDITIONS)
+    summary["_base_lr"] = base_lr
     RESULTS.mkdir(parents=True, exist_ok=True)
     (RESULTS / "test6_summary.json").write_text(json.dumps(summary, indent=2, default=str))
 
