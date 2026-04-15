@@ -259,6 +259,30 @@ def run_ddp(
         "eval": eval_result,
     }
 
+    # Fail closed on numerically poisoned runs. A training step that
+    # produced NaN/Inf loss or an eval that returned non-finite bpb
+    # indicates the run diverged silently — the model is garbage and
+    # its "result" is not a datapoint any summary gate should ingest.
+    # Raise on rank 0 so the subprocess exits non-zero and the
+    # orchestrator hard-fails the run with its log tail visible.
+    import math
+    if is_rank0:
+        violations: list[str] = []
+        if not math.isfinite(train_summary["final_loss"]):
+            violations.append(
+                f"train.final_loss={train_summary['final_loss']} is not finite"
+            )
+        for key in ("bpb", "loss"):
+            if key in eval_result:
+                val = float(eval_result[key])
+                if not math.isfinite(val):
+                    violations.append(f"eval.{key}={val} is not finite")
+        if violations:
+            raise RuntimeError(
+                "runner_exp18: refusing to write poisoned result JSON — "
+                + "; ".join(violations)
+            )
+
     if is_rank0 and output_json:
         out_path = Path(output_json)
         out_path.parent.mkdir(parents=True, exist_ok=True)

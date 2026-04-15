@@ -142,6 +142,40 @@ def read_result_json(out_path: Path) -> dict[str, Any]:
     return json.loads(out_path.read_text())
 
 
+def result_is_finite(data: dict[str, Any]) -> bool:
+    """Check that a runner result JSON's numerically load-bearing fields
+    are all finite. A poisoned run — NaN loss, Inf bpb, etc. — should
+    never be treated as a valid datapoint by a summary gate.
+
+    The runner itself also refuses to write such results (raises before
+    the JSON hits disk) so in practice this is belt-and-suspenders:
+    an old pre-guard result or a hand-edited file shouldn't be able
+    to contaminate the summary either.
+
+    Returns False on any non-finite value, missing required field, or
+    malformed structure. The summarizer caller should drop such files
+    from its row collection and log the fact in the summary decision.
+    """
+    import math
+    try:
+        train = data.get("train") or {}
+        eval_ = data.get("eval") or {}
+        final_loss = float(train.get("final_loss", float("nan")))
+        if not math.isfinite(final_loss):
+            return False
+        bpb = float(eval_.get("bpb", float("nan")))
+        if not math.isfinite(bpb):
+            return False
+        # eval.loss is optional; only check if present
+        if "loss" in eval_:
+            loss = float(eval_["loss"])
+            if not math.isfinite(loss):
+                return False
+    except (TypeError, ValueError):
+        return False
+    return True
+
+
 def _cleanup_active(active: list) -> None:
     for entry in active:
         proc, cfg_path = entry[0], entry[1]
