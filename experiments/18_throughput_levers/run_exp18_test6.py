@@ -46,6 +46,11 @@ from _harness import (  # noqa: E402
 
 SWEEP_SEEDS = [1337, 2674, 4011, 5348]
 
+# Conditions that OOM'd during the run and should be annotated in the
+# summary rather than treated as "missing data". Populated by ``main()``
+# from the return value of ``run_parallel_ddp_matrix``.
+_OOM_SKIPPED: list[str] = []
+
 
 def _base(seq_len: int, **overrides: Any) -> dict[str, Any]:
     cfg = {
@@ -102,7 +107,10 @@ def summarize_results(conditions: dict[str, dict[str, Any]]) -> dict[str, Any]:
             bpb_by_seed[seed] = float(data["eval"]["bpb"])
             train = data["train"]
             cfg = conditions[condition_name]
-            tok_per_step = int(cfg["batch_size"]) * int(cfg["seq_len"]) * 2  # ws=2
+            # Read world_size from the result JSON rather than hardcoding;
+            # the runner_exp18 result stores ddp_world_size in train.
+            ws = int(train.get("ddp_world_size", 1))
+            tok_per_step = int(cfg["batch_size"]) * int(cfg["seq_len"]) * ws
             tok_per_s_values.append(
                 float(train["steps"]) * tok_per_step / max(float(train["elapsed_s"]), 1e-9)
             )
@@ -175,7 +183,13 @@ def summarize_results(conditions: dict[str, dict[str, Any]]) -> dict[str, Any]:
         "winner_condition": winner,
         "winner_seq_len": rows[0]["seq_len"],
         "pair_results": pair_results,
+        "oom_skipped_conditions": list(_OOM_SKIPPED),
     }
+    if _OOM_SKIPPED:
+        print(
+            f"\nOOM-skipped conditions (excluded from winner selection): "
+            f"{_OOM_SKIPPED}"
+        )
     print(f"\nGate: winner (lowest mean bpb) = {winner} (seq_len={rows[0]['seq_len']})")
     return summary
 
@@ -193,7 +207,7 @@ def main() -> None:
 
     if not args.summarize_only:
         validate_data_paths(args.data_path, args.sp_model_path)
-        run_parallel_ddp_matrix(
+        skipped = run_parallel_ddp_matrix(
             conditions=CONDITIONS,
             seeds=SWEEP_SEEDS,
             ws_per_slot=2,
@@ -202,7 +216,9 @@ def main() -> None:
             sp_model_path=args.sp_model_path,
             budget=args.budget,
             results_dir=RESULTS,
+            skip_oom_conditions=True,  # seq=2048 may hit VRAM ceiling
         )
+        _OOM_SKIPPED.extend(skipped)
 
     summary = summarize_results(CONDITIONS)
     RESULTS.mkdir(parents=True, exist_ok=True)
