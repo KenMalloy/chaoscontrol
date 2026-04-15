@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Experiment 18 Test 7 launcher: AdamW vs Muon vs LAMB on chunked scan backend.
+"""Experiment 18 Test 7 launcher: AdamW vs Muon vs LAMB under DDP.
 
 Test 7 is the optimizer ablation called out in the Exp 18 design doc
 (docs/plans/2026-04-12-experiment-18-throughput-levers-design.md). Three
@@ -10,16 +10,30 @@ large-batch choice). Any alternative must beat AdamW on bpb_at_elapsed_s_600
 with paired p<0.05 across matched seeds to earn inclusion in the Test 9
 integration run; otherwise AdamW stays.
 
+**DDP path, not single-process.** Test 7's hypothesis is about optimizer
+behavior at the large-global-batch regime produced by 8xH100 DDP — Tests
+4-6 establish that regime, Test 7 measures optimizer choice inside it. So
+this launcher spawns each (condition, seed) via
+``python -m torch.distributed.run --standalone --nproc_per_node=N``
+against ``runner_exp18.py``, the DDP-capable entry point that reads the
+optimizer kwarg from the config yaml and passes it through
+``train_chaoscontrol_for_budget``. Unlike Test 2's orchestrator (which
+runs 14 independent single-process jobs in parallel across all visible
+GPUs), Test 7 is strictly sequential: each run seizes all N GPUs under
+torchrun's rendezvous, and the next run can only start after the previous
+one tears down.
+
 Seed choice: the design doc budgets ~1h on 8xH100 (3 optimizers x 20 min
-each). To stay inside that envelope we run **3 seeds per condition**, not
-the Exp 17 7-seed set. Three seeds is low statistical power — a true
-~0.004 bpb effect will often miss p<0.05 — but the design gate is "visibly
-faster loss decrease vs wall time", which at per-condition std ~0.004 bpb
-still resolves a ~0.008 bpb or larger winner at n=3 (that is the Exp 15
-tokenizer effect size and would pass the paired t-test cleanly). The
-three-seed scientific contract is that we'll either see a strong winner
-or conclude the alternatives are indistinguishable from AdamW at this
-sample size; we do NOT get to declare a marginal winner at p<0.10.
+each). Three seeds per condition is low statistical power — a true
+~0.004 bpb effect will often miss p<0.05 — but still resolves a ~0.008 bpb
+or larger winner at n=3 (that is the Exp 15 tokenizer effect size and
+would pass the paired t-test cleanly). The three-seed scientific contract
+is that we'll either see a strong winner or conclude the alternatives are
+indistinguishable from AdamW at this sample size; we do NOT get to declare
+a marginal winner at p<0.10. Note the total wall-clock at 3 seeds is 3
+seeds x 3 optimizers x 20 min = ~3h, not the design doc's 1h line — that
+line assumed 1 seed, which doesn't permit any statistical test. The ~3h
+figure is the real cost of actually running paired comparisons.
 
 Launch convention (8xH100 grant pod):
 
@@ -29,9 +43,20 @@ Launch convention (8xH100 grant pod):
         --budget 600 \
         --num-gpus 8
 
+For local smoke / validation on fewer GPUs:
+
+    python experiments/18_throughput_levers/run_exp18_test7.py \
+        --data-path ... --sp-model-path ... --budget 600 --num-gpus 4
+
+When ``--num-gpus 1`` the launcher skips torchrun entirely and invokes
+``runner_exp18.py`` directly (runner_exp18 degrades cleanly to world_size=1
+when WORLD_SIZE is unset), so this script works as a single-device smoke
+without needing a distributed backend.
+
 All three conditions share dim=256, layers=4, seq_len=512, batch=32, LR=2e-3,
 the same Exp 17 bare fast SSM config used for Test 2's SP8192 baseline. The
-only varying axis is the optimizer flag.
+only varying axis is the ``optimizer`` config key, which
+``runner_exp18.py`` reads and threads through to the training loop.
 
 Gate (from 2026-04-12-experiment-18-throughput-levers-design.md Test 7):
     Any alternative beats AdamW at paired p<0.05 on mean bpb across seeds
@@ -41,7 +66,7 @@ Gate (from 2026-04-12-experiment-18-throughput-levers-design.md Test 7):
     (muon vs adamw, lamb vs adamw, muon vs lamb) so the reviewer sees the
     full ablation, not just the winning pair.
 
-Budget: ~1h on 8xH100 grant pod, ~$27.
+Budget: ~3h on 8xH100 grant pod, ~$60.
 """
 from __future__ import annotations
 
@@ -63,19 +88,19 @@ EXPERIMENT = Path(__file__).resolve().parent
 RESULTS = EXPERIMENT / "results_test7"
 
 sys.path.insert(0, str(REPO / "experiments" / "09_revised_architecture"))
-sys.path.insert(0, str(REPO / "experiments" / "17_local_attn_sidecar"))
 from stats import bootstrap_ci, paired_ttest, sem  # noqa: E402
-from runner_exp17 import build_child_env, validate_gpu_concurrency  # noqa: E402
 
 
-# Three-seed subset of the Exp 17 sweep (1337, 2674, 4011) to stay inside the
-# 1h grant-pod budget for 3 optimizers x 20 min each. Power argument in the
-# module docstring.
+# Three-seed subset of the Exp 17 sweep (1337, 2674, 4011). Power argument in
+# the module docstring.
 SWEEP_SEEDS = [1337, 2674, 4011]
 ARTIFACT_LIMIT_BYTES = 16 * 1024 * 1024
 TIMEOUT_MULTIPLIER = 2.5
 
-RUNNER_SCRIPT = REPO / "experiments" / "17_local_attn_sidecar" / "runner_exp17.py"
+# Test 7 goes through the DDP runner, NOT the Exp 17 single-process runner.
+# This is the whole point of the rewrite — optimizer behavior under DDP is
+# the question, and single-process can't answer it.
+RUNNER_SCRIPT = EXPERIMENT / "runner_exp18.py"
 
 
 def _base(**overrides: Any) -> dict[str, Any]:
@@ -114,21 +139,45 @@ CONDITIONS: dict[str, dict[str, Any]] = {
 }
 
 
-def _cleanup_active(active: list) -> None:
-    for entry in active:
-        proc, cfg_path = entry[0], entry[1]
-        if proc.poll() is None:
-            proc.terminate()
-        cfg_path.unlink(missing_ok=True)
-    for entry in active:
-        proc = entry[0]
-        if proc.poll() is None:
-            try:
-                proc.wait(timeout=5.0)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-        if len(entry) > 5:
-            entry[5].close()
+def build_launch_cmd(
+    *,
+    num_gpus: int,
+    cfg_path: Path,
+    data_path: str,
+    sp_model_path: str,
+    budget: float,
+    out_path: Path,
+) -> list[str]:
+    """Construct the subprocess argv for one (condition, seed) run.
+
+    Single-device (num_gpus=1): invoke ``runner_exp18.py`` directly under
+    the same Python interpreter. ``runner_exp18.py`` detects the absence of
+    ``WORLD_SIZE`` and takes the bit-identical single-device code path, so
+    this works for local CPU smokes and 1-GPU pods alike.
+
+    Multi-device (num_gpus>1): invoke ``python -m torch.distributed.run
+    --standalone --nproc_per_node=N`` against ``runner_exp18.py``. Each
+    rank binds to its own GPU via torchrun's LOCAL_RANK, runs the same
+    training step, and synchronizes gradients via DDP inside
+    ``train_chaoscontrol_for_budget``. Output JSON is written by rank 0
+    only (runner_exp18 already guards this).
+    """
+    common_tail = [
+        str(RUNNER_SCRIPT),
+        "--config", str(cfg_path),
+        "--data-path", data_path,
+        "--sp-model-path", sp_model_path,
+        "--budget", str(budget),
+        "--output-json", str(out_path),
+    ]
+    if num_gpus <= 1:
+        return [sys.executable, "-u"] + common_tail
+    return [
+        sys.executable,
+        "-m", "torch.distributed.run",
+        "--standalone",
+        f"--nproc_per_node={num_gpus}",
+    ] + common_tail
 
 
 def launch_matrix(
@@ -139,9 +188,14 @@ def launch_matrix(
     num_gpus: int,
     conditions: dict[str, dict[str, Any]],
 ) -> None:
+    """Launch every (condition, seed) sequentially under torchrun.
+
+    Each invocation seizes all ``num_gpus`` GPUs under torchrun, so runs are
+    strictly sequential — there's no per-GPU parallelism to exploit the way
+    Test 2 does, because the point of Test 7 is measuring optimizer
+    behavior at the DDP global batch, not at single-GPU small batch.
+    """
     RESULTS.mkdir(parents=True, exist_ok=True)
-    if num_gpus > 0:
-        validate_gpu_concurrency(num_gpus)
 
     if not Path(data_path).is_dir():
         raise FileNotFoundError(f"data dir {data_path} does not exist")
@@ -160,80 +214,56 @@ def launch_matrix(
             queue.append((condition_name, seed, tmp))
 
     run_timeout = max(budget * TIMEOUT_MULTIPLIER, 60.0)
-    active: list = []
-    gpu_cursor = 0
 
-    while queue or active:
-        while queue and len(active) < max(num_gpus, 1):
-            condition_name, seed, cfg_path = queue.pop(0)
-            out_path = RESULTS / f"{condition_name}_s{seed}.json"
-            env = os.environ.copy()
-            env = build_child_env(
-                gpu_slot=(gpu_cursor % num_gpus) if num_gpus > 0 else None,
-                base_env=env,
+    for condition_name, seed, cfg_path in queue:
+        out_path = RESULTS / f"{condition_name}_s{seed}.json"
+        log_path = RESULTS / f"{condition_name}_s{seed}.log"
+        cmd = build_launch_cmd(
+            num_gpus=num_gpus,
+            cfg_path=cfg_path,
+            data_path=data_path,
+            sp_model_path=sp_model_path,
+            budget=budget,
+            out_path=out_path,
+        )
+        print(
+            f"Launching {condition_name} seed={seed} nproc={num_gpus}",
+            flush=True,
+        )
+        t0 = time.monotonic()
+        with open(log_path, "w") as log_fh:
+            proc = subprocess.Popen(
+                cmd,
+                env=os.environ.copy(),
+                text=True,
+                stdout=log_fh,
+                stderr=subprocess.STDOUT,
             )
-            gpu_cursor += 1
-            log_path = RESULTS / f"{condition_name}_s{seed}.log"
-            log_fh = open(log_path, "w")
-            cmd = [
-                sys.executable,
-                "-u",
-                str(RUNNER_SCRIPT),
-                "--config",
-                str(cfg_path),
-                "--data-path",
-                data_path,
-                "--sp-model-path",
-                sp_model_path,
-                "--budget",
-                str(budget),
-                "--output-json",
-                str(out_path),
-            ]
-            print(f"Launching {condition_name} seed={seed}", flush=True)
-            proc = subprocess.Popen(cmd, env=env, text=True, stdout=log_fh, stderr=subprocess.STDOUT)
-            active.append((proc, cfg_path, condition_name, seed, time.monotonic(), log_fh))
-
-        next_active: list = []
-        for i, (proc, cfg_path, condition_name, seed, t0, log_fh) in enumerate(active):
-            ret = proc.poll()
-            elapsed = time.monotonic() - t0
-            if ret is None and elapsed < run_timeout:
-                next_active.append((proc, cfg_path, condition_name, seed, t0, log_fh))
-                continue
-            log_fh.close()
-            if ret is None:
-                print(
-                    f"TIMEOUT: {condition_name} seed={seed} after {elapsed:.0f}s "
-                    f"(limit {run_timeout:.0f}s)",
-                    flush=True,
-                )
+            try:
+                ret = proc.wait(timeout=run_timeout)
+            except subprocess.TimeoutExpired:
+                elapsed = time.monotonic() - t0
                 proc.terminate()
                 try:
                     proc.wait(timeout=10.0)
                 except subprocess.TimeoutExpired:
                     proc.kill()
                 cfg_path.unlink(missing_ok=True)
-                _cleanup_active(next_active + list(active[i + 1:]))
                 raise RuntimeError(
                     f"{condition_name} seed={seed} TIMEOUT after {elapsed:.0f}s "
                     f"(budget={budget}s, limit={run_timeout:.0f}s)"
                 )
-            cfg_path.unlink(missing_ok=True)
-            if ret != 0:
-                log_path = RESULTS / f"{condition_name}_s{seed}.log"
-                tail = ""
-                if log_path.exists():
-                    lines = log_path.read_text().splitlines()
-                    tail = "\n".join(lines[-20:])
-                _cleanup_active(next_active + list(active[i + 1:]))
-                raise RuntimeError(
-                    f"{condition_name} seed={seed} failed with exit code {ret}\n"
-                    f"--- last 20 lines of {log_path} ---\n{tail}"
-                )
-        active = next_active
-        if active:
-            time.sleep(2.0)
+
+        cfg_path.unlink(missing_ok=True)
+        if ret != 0:
+            tail = ""
+            if log_path.exists():
+                lines = log_path.read_text().splitlines()
+                tail = "\n".join(lines[-20:])
+            raise RuntimeError(
+                f"{condition_name} seed={seed} failed with exit code {ret}\n"
+                f"--- last 20 lines of {log_path} ---\n{tail}"
+            )
 
 
 def _mean(values: list[float]) -> float:
