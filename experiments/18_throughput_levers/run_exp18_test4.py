@@ -72,6 +72,7 @@ from _harness import (  # noqa: E402
     build_env_with_gpu_mask,
     build_launch_cmd,
     pick_free_port,
+    result_is_finite,
     validate_data_paths,
 )
 
@@ -339,6 +340,7 @@ def summarize_results(
 ) -> dict[str, Any]:
     summary: dict[str, Any] = {}
     rows: list[dict[str, Any]] = []
+    invalid_results: list[str] = []
 
     for condition_name, (ws, cfg) in conditions.items():
         pattern = re.compile(rf"^{re.escape(condition_name)}_s(\d+)\.json$")
@@ -355,6 +357,9 @@ def summarize_results(
         tok_per_s_values: list[float] = []
         for seed, file in matches:
             data = json.loads(file.read_text())
+            if not result_is_finite(data):
+                invalid_results.append(f"{condition_name}_s{seed}")
+                continue
             bpb_by_seed[seed] = float(data["eval"]["bpb"])
             train = data["train"]
             # Aggregate tok/s: (steps * per-rank batch * seq * world_size) / elapsed_s
@@ -447,7 +452,13 @@ def summarize_results(
         "best_passing_world_size": (
             max((row["world_size"] for row in rows if row["name"] in passing), default=1)
         ),
+        "invalid_result_files": invalid_results,
     }
+    if invalid_results:
+        print(
+            f"\nDropped {len(invalid_results)} non-finite result file(s): "
+            f"{invalid_results}"
+        )
     print(f"\nGate: passing conditions = {passing}")
     return summary
 

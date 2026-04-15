@@ -52,6 +52,7 @@ sys.path.insert(0, str(REPO / "experiments" / "09_revised_architecture"))
 sys.path.insert(0, str(EXPERIMENT))
 from stats import bootstrap_ci, paired_ttest, sem  # noqa: E402
 from _harness import (  # noqa: E402
+    result_is_finite,
     run_parallel_ddp_matrix,
     validate_data_paths,
 )
@@ -118,8 +119,12 @@ def _mean(values: list[float]) -> float:
     return sum(values) / len(values) if values else 0.0
 
 
+_INVALID_RESULTS: list[str] = []  # populated by _collect_rows on each call
+
+
 def _collect_rows(conditions: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
+    _INVALID_RESULTS.clear()
     for condition_name in conditions:
         pattern = re.compile(rf"^{re.escape(condition_name)}_s(\d+)\.json$")
         matches: list[tuple[int, Path]] = []
@@ -134,7 +139,12 @@ def _collect_rows(conditions: dict[str, dict[str, Any]]) -> list[dict[str, Any]]
         bpb_by_seed: dict[int, float] = {}
         for seed, file in matches:
             data = json.loads(file.read_text())
+            if not result_is_finite(data):
+                _INVALID_RESULTS.append(f"{condition_name}_s{seed}")
+                continue
             bpb_by_seed[seed] = float(data["eval"]["bpb"])
+        if not bpb_by_seed:
+            continue
         bpb_values = [bpb_by_seed[s] for s in sorted(bpb_by_seed)]
         rows.append({
             "name": condition_name,
@@ -244,7 +254,13 @@ def summarize_results(conditions: dict[str, dict[str, Any]]) -> dict[str, Any]:
         "lamb_beats_adamw_p_lt_0.05": lamb_passes,
         "winner": winner_name,
         "pair_results": pair_results,
+        "invalid_result_files": list(_INVALID_RESULTS),
     }
+    if _INVALID_RESULTS:
+        print(
+            f"\nDropped {len(_INVALID_RESULTS)} non-finite result file(s): "
+            f"{list(_INVALID_RESULTS)}"
+        )
     print(
         f"\nGate: alternative adopted iff it beats AdamW at paired p<0.05 -> "
         f"winner={winner_name}"

@@ -51,6 +51,7 @@ sys.path.insert(0, str(REPO / "experiments" / "09_revised_architecture"))
 sys.path.insert(0, str(EXPERIMENT))
 from stats import bootstrap_ci, paired_ttest, sem  # noqa: E402
 from _harness import (  # noqa: E402
+    result_is_finite,
     run_parallel_ddp_matrix,
     validate_data_paths,
 )
@@ -136,6 +137,7 @@ def _mean(values: list[float]) -> float:
 def summarize_results(conditions: dict[str, dict[str, Any]]) -> dict[str, Any]:
     summary: dict[str, Any] = {}
     rows: list[dict[str, Any]] = []
+    invalid_results: list[str] = []
 
     for condition_name in conditions:
         pattern = re.compile(rf"^{re.escape(condition_name)}_s(\d+)\.json$")
@@ -152,6 +154,9 @@ def summarize_results(conditions: dict[str, dict[str, Any]]) -> dict[str, Any]:
         tok_per_s_values: list[float] = []
         for seed, file in matches:
             data = json.loads(file.read_text())
+            if not result_is_finite(data):
+                invalid_results.append(f"{condition_name}_s{seed}")
+                continue
             bpb_by_seed[seed] = float(data["eval"]["bpb"])
             train = data["train"]
             cfg = conditions[condition_name]
@@ -232,7 +237,13 @@ def summarize_results(conditions: dict[str, dict[str, Any]]) -> dict[str, Any]:
         "winner_seq_len": rows[0]["seq_len"],
         "pair_results": pair_results,
         "oom_skipped_conditions": list(_OOM_SKIPPED),
+        "invalid_result_files": invalid_results,
     }
+    if invalid_results:
+        print(
+            f"\nDropped {len(invalid_results)} non-finite result file(s): "
+            f"{invalid_results}"
+        )
     if _OOM_SKIPPED:
         print(
             f"\nOOM-skipped conditions (excluded from winner selection): "

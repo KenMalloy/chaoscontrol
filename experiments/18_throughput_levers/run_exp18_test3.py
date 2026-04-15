@@ -47,7 +47,7 @@ RESULTS = EXPERIMENT / "results_test3"
 sys.path.insert(0, str(REPO / "experiments" / "09_revised_architecture"))
 sys.path.insert(0, str(EXPERIMENT))
 from stats import bootstrap_ci, paired_ttest, sem  # noqa: E402
-from _harness import _is_oom_failure, build_launch_cmd, validate_data_paths  # noqa: E402
+from _harness import _is_oom_failure, build_launch_cmd, result_is_finite, validate_data_paths  # noqa: E402
 
 # Four seeds per condition fill a 4-slot parallel-single-GPU matrix cleanly
 # (3 conditions x 4 seeds = 12 runs -> 3 waves of 4). Exp 17 per-condition
@@ -264,6 +264,7 @@ def _mean(values: list[float]) -> float:
 def summarize_results(conditions: dict[str, dict[str, Any]]) -> dict[str, Any]:
     summary: dict[str, Any] = {}
     rows: list[dict[str, Any]] = []
+    invalid_results: list[str] = []  # {condition}_s{seed} of files dropped as non-finite
 
     for condition_name in conditions:
         pattern = re.compile(rf"^{re.escape(condition_name)}_s(\d+)\.json$")
@@ -280,6 +281,9 @@ def summarize_results(conditions: dict[str, dict[str, Any]]) -> dict[str, Any]:
         tok_per_s_values: list[float] = []
         for seed, file in matches:
             data = json.loads(file.read_text())
+            if not result_is_finite(data):
+                invalid_results.append(f"{condition_name}_s{seed}")
+                continue
             bpb_by_seed[seed] = float(data["eval"]["bpb"])
             train = data["train"]
             # tok/s = (steps * batch * seq) / elapsed_s
@@ -369,7 +373,13 @@ def summarize_results(conditions: dict[str, dict[str, Any]]) -> dict[str, Any]:
         "winner": winner,
         "pair_results": pair_results,
         "oom_skipped_conditions": list(_OOM_SKIPPED),
+        "invalid_result_files": invalid_results,
     }
+    if invalid_results:
+        print(
+            f"\nDropped {len(invalid_results)} non-finite result file(s): "
+            f"{invalid_results}"
+        )
     if _OOM_SKIPPED:
         print(
             f"\nOOM-skipped conditions (near-ceiling pushes that failed): "

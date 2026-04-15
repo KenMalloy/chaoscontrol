@@ -65,6 +65,7 @@ sys.path.insert(0, str(REPO / "experiments" / "09_revised_architecture"))
 sys.path.insert(0, str(EXPERIMENT))
 from stats import bootstrap_ci, paired_ttest, sem  # noqa: E402
 from _harness import (  # noqa: E402
+    result_is_finite,
     run_parallel_ddp_matrix,
     validate_data_paths,
 )
@@ -161,6 +162,7 @@ def _load_ws1_seed_bpbs() -> dict[int, float]:
 def summarize_results(conditions: dict[str, dict[str, Any]]) -> dict[str, Any]:
     summary: dict[str, Any] = {}
     rows: list[dict[str, Any]] = []
+    invalid_results: list[str] = []
 
     for condition_name in conditions:
         pattern = re.compile(rf"^{re.escape(condition_name)}_s(\d+)\.json$")
@@ -177,6 +179,9 @@ def summarize_results(conditions: dict[str, dict[str, Any]]) -> dict[str, Any]:
         loss_by_seed: dict[int, float] = {}
         for seed, file in matches:
             data = json.loads(file.read_text())
+            if not result_is_finite(data):
+                invalid_results.append(f"{condition_name}_s{seed}")
+                continue
             bpb_by_seed[seed] = float(data["eval"]["bpb"])
             loss_by_seed[seed] = float(data["train"]["final_loss"])
         bpb_values = [bpb_by_seed[s] for s in sorted(bpb_by_seed)]
@@ -316,7 +321,13 @@ def summarize_results(conditions: dict[str, dict[str, Any]]) -> dict[str, Any]:
         "stage1_candidate": candidate,
         "stable_conditions": [row["name"] for row in stable_rows],
         "winner_vs_ws1_baseline": ws1_comparison,
+        "invalid_result_files": invalid_results,
     }
+    if invalid_results:
+        print(
+            f"\nDropped {len(invalid_results)} non-finite result file(s): "
+            f"{invalid_results}"
+        )
     print(
         f"\nGate: winner = {winner}"
         f"{' (PROVISIONAL)' if winner_is_provisional else ''}"
