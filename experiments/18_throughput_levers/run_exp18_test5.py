@@ -1,27 +1,52 @@
 #!/usr/bin/env python3
 """Experiment 18 Test 5 launcher: LR stability screen at DDP global batch.
 
-Once Test 4 establishes DDP scaling, the global batch jumps from ws=1's
-bs=1024 to ws=2's 2048 (or higher). Linear LR scaling from the single-GPU
-2e-3 baseline implies LR_target = 2e-3 * (global_batch / single_batch). At
-gb=2048 that's LR=4e-3. Whether the model trains stably at that LR, or
-needs sqrt-scaling / capped-scaling / warmup extension, is exactly the
-question Test 5 answers.
+Once Test 4 establishes DDP scaling at ws=2 (global batch = bs_per_rank *
+2 = 2048), we need a stable LR at that global batch that also beats
+single-GPU at matched wall-clock. Test 5 screens three LR values around
+the linearly-scaled target and picks the winner.
 
-Three LR conditions over the ws=2 DDP stack (matches Tests 6/7's regime):
+**Anchor.** Every LR in the Exp 18 stack is derived from the same
+calibrated reference: Exp 17 / Exp 18 phase0 established ``(bs=32,
+lr=2e-3)`` as a stable per-example learning rate. The linear scaling
+rule is ``LR = 2e-3 * (global_batch / 32)``. At ws=2 with bs_per_rank =
+1024, global_batch = 2048 and the linear-scaled target is ``2e-3 * 64 =
+0.128``. This matches the LR Test 4 uses for its ws=2 condition.
 
-    linear   LR = 2e-3 * (2048 / 32)  = 0.128   (aggressive)
-    linear/2 LR = 0.064                          (middle)
-    linear/4 LR = 0.032                          (conservative)
+Three conditions around that target:
 
-Scientific gate (stability + bpb):
-    At least one LR trains stably (no NaN, no divergence) AND produces
-    bpb-at-600s that beats the ws=1 reference at matched wall-clock. A
-    stable-but-worse LR is not a usable submission config; a
-    faster-but-diverging LR tells us linear scaling is too aggressive.
+    linear    LR = 0.128   (aggressive, may diverge at this global batch)
+    linear/2  LR = 0.064   (middle, phase0 bs=1024 single-GPU winner)
+    linear/4  LR = 0.032   (conservative)
+
+Scientific gate — **two stages, both required**:
+
+  Stage 1 (intra-test): pick a candidate among stable conditions
+    (all seeds trained without divergence or near-uniform stall). If
+    the mean-bpb gap between the top two stable conditions is inside
+    paired noise (< 0.006 bpb AND p_paired >= 0.05), fall back to the
+    more conservative LR to avoid picking a noise outlier that
+    contaminates Tests 6/7 downstream.
+
+  Stage 2 (cross-test vs Test 4): the candidate must beat Test 4's
+    ws=1 bpb-at-600s at matched seeds via paired t-test (p<0.05).
+    This is what "usable ws=2 submission regime" actually means —
+    DDP at ws=2 has to buy a real bpb improvement over single-GPU,
+    otherwise the whole ws=2 regime is pointless.
+
+If Test 4 results are absent, the Stage 2 check can't run and the
+winner is emitted as provisional (marked ``winner_is_provisional=True``
+in the summary). Tests 6 and 7 reading the Test 5 summary will refuse
+to inherit a provisional winner — they require Stage 2 to have passed.
 
 Launch: parallel 2-slot DDP at ws=2 (slot 0 -> GPUs [0,1], slot 1 ->
 GPUs [2,3]). Four seeds per condition = 12 runs in 6 waves = ~60 min.
+
+**Statistical power caveat:** at n=4 and per-condition noise ~0.004 bpb,
+Stage 1's paired test is only powered for differences larger than
+~0.008 bpb. A "no clear winner" outcome from Stage 1 may reflect low
+power as much as no effect; the Stage 1 fallback to the conservative
+LR is the safety measure when the screen can't discriminate.
 """
 from __future__ import annotations
 
@@ -191,23 +216,12 @@ def summarize_results(conditions: dict[str, dict[str, Any]]) -> dict[str, Any]:
             "total_seed_count": row["total_seed_count"],
         }
 
-    # Gate (two-stage):
-    #
-    #   1. Pick a candidate: among conditions where ALL seeds trained
-    #      stably, the one with the lowest mean bpb. If the mean-bpb gap
-    #      between the top two stable conditions is <= 0.006 bpb AND
-    #      the paired t-test between them is p >= 0.05, the choice is
-    #      inside noise and we fall back to the most conservative
-    #      (lowest-LR) stable condition to avoid picking a noisy outlier
-    #      that contaminates Tests 6/7 downstream.
-    #
-    #   2. Cross-validate the candidate against Test 4's ws=1 baseline
-    #      if those results exist: the candidate's mean bpb must beat
-    #      ws=1 at matched 600s via paired t-test (p<0.05) on shared
-    #      seeds, otherwise DDP at ws=2 is not buying anything over
-    #      single-GPU and the LR screen's choice is moot.
+    # Gate stage 1: pick a candidate from stable conditions with a
+    # noise-aware tiebreaker. Both the gap AND the p-value are computed
+    # from the same paired-seed cohort to avoid the sample-set drift bug
+    # where a partial rerun would make the two statistics disagree.
     stable_rows = [row for row in rows if row["stable_seed_count"] == row["total_seed_count"]]
-    winner = None
+    candidate: str | None = None
     gap_threshold = 0.006
     if len(stable_rows) >= 2:
         top = stable_rows[0]
@@ -217,56 +231,95 @@ def summarize_results(conditions: dict[str, dict[str, Any]]) -> dict[str, Any]:
             top_paired = [top["bpb_by_seed"][s] for s in shared]
             second_paired = [second["bpb_by_seed"][s] for s in shared]
             _, p_top_vs_second = paired_ttest(second_paired, top_paired)
-            gap = second["mean_bpb"] - top["mean_bpb"]
+            top_paired_mean = sum(top_paired) / len(top_paired)
+            second_paired_mean = sum(second_paired) / len(second_paired)
+            gap = second_paired_mean - top_paired_mean  # paired-cohort gap
             if gap > gap_threshold or p_top_vs_second < 0.05:
-                winner = top["name"]
+                candidate = top["name"]
             else:
-                # Inside noise: prefer the more conservative LR.
-                winner = min(
+                # Inside noise: fall back to the more conservative LR.
+                candidate = min(
                     (top, second), key=lambda r: r["base_lr"]
                 )["name"]
         else:
-            winner = top["name"]
+            candidate = top["name"]
     elif len(stable_rows) == 1:
-        winner = stable_rows[0]["name"]
+        candidate = stable_rows[0]["name"]
 
-    # Cross-test gate vs Test 4 ws=1 baseline (if available).
+    # Gate stage 2: candidate must beat Test 4 ws=1 baseline at matched
+    # seeds via paired t-test. If Test 4 results are absent the winner
+    # is marked provisional; if Test 4 results exist but the cross-check
+    # fails, winner is None and Tests 6/7 must not inherit it.
     ws1_by_seed = _load_ws1_seed_bpbs()
     ws1_comparison: dict[str, Any] | None = None
-    if winner is not None and ws1_by_seed:
-        winner_row = next(row for row in rows if row["name"] == winner)
-        shared = sorted(set(winner_row["bpb_by_seed"]) & set(ws1_by_seed))
-        if len(shared) >= 2:
+    winner: str | None = None
+    winner_is_provisional = False
+    if candidate is None:
+        print("\nStage 1: no stable candidate LR — no winner.")
+    elif not ws1_by_seed:
+        # Test 4 hasn't been run yet. Emit the Stage 1 candidate as
+        # provisional so a standalone Test 5 run still produces something
+        # usable, but flag it so Tests 6/7 can refuse to inherit it.
+        winner = candidate
+        winner_is_provisional = True
+        print(
+            f"\nStage 2: Test 4 ws=1 results not found; emitting "
+            f"{candidate} as PROVISIONAL (not cross-validated)."
+        )
+    else:
+        candidate_row = next(row for row in rows if row["name"] == candidate)
+        shared = sorted(set(candidate_row["bpb_by_seed"]) & set(ws1_by_seed))
+        if len(shared) < 2:
+            print(
+                f"\nStage 2: Test 4 ws=1 data found but shared-seed "
+                f"overlap with {candidate} is {len(shared)} < 2; "
+                f"cross-check skipped, emitting as PROVISIONAL."
+            )
+            winner = candidate
+            winner_is_provisional = True
+        else:
             a = [ws1_by_seed[s] for s in shared]
-            b = [winner_row["bpb_by_seed"][s] for s in shared]
+            b = [candidate_row["bpb_by_seed"][s] for s in shared]
             t, p = paired_ttest(a, b)
             delta = sum(a) / len(a) - sum(b) / len(b)
             passes = delta > 0 and p < 0.05
             ws1_comparison = {
-                "winner_condition": winner,
-                "delta_ws1_minus_winner_bpb": delta,
+                "candidate_condition": candidate,
+                "delta_ws1_minus_candidate_bpb": delta,
                 "paired_t": t,
                 "paired_p": p,
                 "n_paired_seeds": len(shared),
-                "winner_beats_ws1_p_lt_0.05": bool(passes),
+                "candidate_beats_ws1_p_lt_0.05": bool(passes),
             }
             print(
-                f"\nvs Test 4 ws1 (n={len(shared)}): {winner} "
+                f"\nStage 2 vs Test 4 ws1 (n={len(shared)}): {candidate} "
                 f"delta={delta:+.4f} bpb  p_paired={p:.4g}  "
                 f"beats_ws1={passes}"
             )
+            if passes:
+                winner = candidate
+            else:
+                print(
+                    f"Gate FAILED: {candidate} does not beat Test 4 ws=1 "
+                    f"at p<0.05; no winner emitted. Tests 6/7 must not "
+                    f"inherit this result."
+                )
+                winner = None
 
     summary["_decision"] = {
         "winner_lr_condition": winner,
+        "winner_is_provisional": winner_is_provisional,
         "winner_base_lr": (
-            next(row["base_lr"] for row in rows if row["name"] == winner) if winner else None
+            next(row["base_lr"] for row in rows if row["name"] == winner)
+            if winner else None
         ),
+        "stage1_candidate": candidate,
         "stable_conditions": [row["name"] for row in stable_rows],
         "winner_vs_ws1_baseline": ws1_comparison,
     }
     print(
-        f"\nGate: winner (2-stage: top-stable w/ threshold, then cross-check vs ws1) "
-        f"= {winner}"
+        f"\nGate: winner = {winner}"
+        f"{' (PROVISIONAL)' if winner_is_provisional else ''}"
     )
     return summary
 
