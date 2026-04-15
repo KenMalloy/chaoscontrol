@@ -1,35 +1,48 @@
 #!/usr/bin/env python3
 """Experiment 18 Test 4 launcher: DDP scaling efficiency.
 
-Test 4 measures whether DDP actually gives us proportionally better
-bpb-at-wall-clock. Three world-size conditions over the same per-rank
-config:
+Test 4 measures whether DDP actually translates extra hardware into
+better bpb-at-wall-clock. Three world-size conditions over the same
+per-rank batch size:
 
-    ws=1  single-device baseline           (global batch = bs*1)
-    ws=2  2-rank DDP on 2 GPUs              (global batch = bs*2)
-    ws=4  4-rank DDP on 4 GPUs              (global batch = bs*4)
+    ws=1  single-device baseline  (global batch = bs * 1 = 1024)
+    ws=2  2-rank DDP on 2 GPUs     (global batch = bs * 2 = 2048)
+    ws=4  4-rank DDP on 4 GPUs     (global batch = bs * 4 = 4096)
 
-Each run uses ``batch_size`` per rank, so the global batch scales linearly
-with world size. A DDP configuration that gives 85%+ per-GPU tok/s AND
-produces proportionally lower bpb-at-600s than the single-device baseline
-earns the efficiency gate; a configuration that scales tok/s but fails to
-translate the extra tokens into bpb improvement does not.
+**LR is linearly scaled per condition** from the Exp 17 / Exp 18 phase0
+anchor ``(bs=32, lr=2e-3)``. That means ``LR = 2e-3 * (global_batch / 32)``,
+so ws=1 runs at 0.064, ws=2 at 0.128, ws=4 at 0.256. Using a single flat
+LR across conditions would make the bpb-half of the gate measure "LR
+appropriateness" instead of "DDP scaling translates to learning". The
+per-ws LR is aggressive at ws=4 and may diverge — if it does, that is
+information about linear-scaling breakdown, not a Test 4 failure.
 
-**Seed parallelism differs by world size** because each DDP group claims
-all its GPUs for the duration of the run. On a 4-GPU pod:
-    - ws=1: 4 seeds fit in 1 wave  (4 concurrent single-GPU runs)
+A DDP configuration earns the gate when BOTH:
+    (a) per-GPU tok/s at ws=N is at least 85% of ws=1 per-GPU tok/s, AND
+    (b) mean bpb-at-600s at ws=N is statistically lower than ws=1 on
+        matched seeds (paired t-test, p<0.05).
+
+The gate is not a "proportional learning gain" claim; it is simply
+"did DDP produce statistically significant bpb improvement at matched
+wall-clock". Proportionality of learning gain to token gain is a
+separate, noisier measurement we do not attempt here.
+
+**OOM policy.** Unlike Tests 3 and 6 which deliberately push the VRAM
+ceiling, Test 4's conditions use the same bs=1024 per rank at every
+world size. An OOM at any ws is not a ceiling-push signal — it is a
+misconfiguration (typically DDP buffer allocation or gradient bucket
+sizing). Test 4 therefore **hard-fails on any non-zero exit**: the
+run is aborted and the whole matrix exits. We want to know about
+that loudly, not continue with garbage results.
+
+**Seed parallelism differs by world size** because each DDP group
+claims all its GPUs for the duration of the run. On a 4-GPU pod:
+    - ws=1: 4 seeds fit in 1 wave (4 concurrent single-GPU runs)
     - ws=2: 4 seeds fit in 2 waves (2 concurrent DDP groups x 2 GPUs)
-    - ws=4: 4 seeds run serially   (1 DDP group per wave)
+    - ws=4: 4 seeds run serially (1 DDP group per wave)
 
-The ws=4 sequential tax is a known cost — see project_experiment_plan
-memory. This orchestrator processes conditions in order ws=1 -> ws=2 ->
-ws=4 so the parallel cases finish first and only the serial ws=4 runs
-drag wall-clock at the end.
-
-Gate:
-    DDP per-GPU tok/s at each world size >= 85% of ws=1 single-GPU tok/s
-    AND
-    DDP bpb-at-600s lower than ws=1 bpb-at-600s (proportional to token gain)
+Conditions run in ascending world-size order so the parallel cases
+finish first and only the serial ws=4 runs drag wall-clock at the end.
 
 Budget: ~70 min wall-clock on a 4-GPU pod, ~$10.
 """
@@ -56,7 +69,6 @@ sys.path.insert(0, str(REPO / "experiments" / "09_revised_architecture"))
 sys.path.insert(0, str(EXPERIMENT))
 from stats import bootstrap_ci, paired_ttest, sem  # noqa: E402
 from _harness import (  # noqa: E402
-    _is_oom_failure,
     build_env_with_gpu_mask,
     build_launch_cmd,
     pick_free_port,
@@ -66,13 +78,33 @@ from _harness import (  # noqa: E402
 SWEEP_SEEDS = [1337, 2674, 4011, 5348]
 TIMEOUT_MULTIPLIER = 2.5
 
+# Linear LR scaling anchor: Exp 17 / Exp 18 phase0 established
+# (bs=32, lr=2e-3) as the stable per-example learning rate. Every LR
+# in this test is derived as 2e-3 * (global_batch / 32) so that each
+# world-size condition is at its linearly-scaled target, not at a
+# single flat LR that would under-train the higher-ws conditions and
+# make the bpb gate measure LR appropriateness instead of DDP scaling.
+LR_ANCHOR_BASE = 2e-3
+LR_ANCHOR_BATCH = 32
+
+
+def _linear_scaled_lr(global_batch: int) -> float:
+    return LR_ANCHOR_BASE * (global_batch / LR_ANCHOR_BATCH)
+
+
+BATCH_PER_RANK = 1024
+
 
 def _base(world_size: int, **overrides: Any) -> dict[str, Any]:
-    """Per-rank config. ``world_size`` is a sidecar the orchestrator reads
-    to decide the launch pattern — it's NOT passed into the training yaml
-    because torchrun's env vars (WORLD_SIZE, RANK) do that for DDP and the
-    single-device path takes a ws=1 code branch from missing env vars.
+    """Per-rank config with world-size-aware linear LR scaling.
+
+    ``world_size`` is used both as a sidecar the orchestrator reads to
+    decide the launch pattern AND to compute the condition's LR via
+    linear scaling from the phase0 anchor. torchrun's env vars still
+    carry WORLD_SIZE/RANK at runtime; this argument exists so the
+    orchestrator can set the right LR per condition at yaml-write time.
     """
+    global_batch = BATCH_PER_RANK * world_size
     cfg = {
         "model_type": "ssm",
         "vocab_size": 16384,
@@ -81,11 +113,11 @@ def _base(world_size: int, **overrides: Any) -> dict[str, Any]:
         "ff_mult": 2,
         "seq_len": 512,
         "stride": 256,
-        "batch_size": 1024,
+        "batch_size": BATCH_PER_RANK,
         "eval_batches": 16,
         "a_mode": "diag",
         "crit_target_coupling": 0.92,
-        "base_lr": 2e-3,
+        "base_lr": _linear_scaled_lr(global_batch),
         "local_attn_window": 0,
         "local_attn_heads": 1,
         "local_attn_dim": 64,
@@ -95,6 +127,10 @@ def _base(world_size: int, **overrides: Any) -> dict[str, Any]:
 
 
 # The (condition_name -> (world_size, config)) mapping.
+# Per-condition LRs (bs=1024 per rank, linearly scaled from bs=32):
+#   ws=1: global 1024 -> LR 0.064
+#   ws=2: global 2048 -> LR 0.128
+#   ws=4: global 4096 -> LR 0.256
 CONDITIONS: dict[str, tuple[int, dict[str, Any]]] = {
     "ws1":       (1, _base(world_size=1)),
     "ws2_ddp":   (2, _base(world_size=2)),
@@ -172,10 +208,9 @@ def _run_condition_group(
 
     free_slots: list[int] = list(range(max_slots))
     active: list = []  # (proc, cfg_path, seed, t0, log_fh, slot_id)
-    oom_seen = False
 
     while queue or active:
-        while queue and free_slots and not oom_seen:
+        while queue and free_slots:
             seed, cfg_path = queue.pop(0)
             out_path = RESULTS / f"{condition_name}_s{seed}.json"
             log_path = RESULTS / f"{condition_name}_s{seed}.log"
@@ -244,30 +279,16 @@ def _run_condition_group(
             cfg_path.unlink(missing_ok=True)
             if ret != 0:
                 log_path = RESULTS / f"{condition_name}_s{seed}.log"
-                if _is_oom_failure(log_path):
-                    # Test 4 doesn't have a "this condition is at the VRAM
-                    # ceiling" framing — all three conditions use bs=1024
-                    # per rank, which already fits comfortably. An OOM
-                    # here is a real signal that DDP at this world size
-                    # is misconfigured. Drop remaining seeds for this
-                    # condition and let the summary flag it, rather than
-                    # killing the whole test.
-                    oom_seen = True
-                    remaining: list[tuple[int, Path]] = []
-                    for qs, qp in queue:
-                        qp.unlink(missing_ok=True)
-                    queue.clear()
-                    print(
-                        f"OOM_SKIP: {condition_name} seed={seed} OOM'd at "
-                        f"ws={world_size}; dropping remaining seeds",
-                        flush=True,
-                    )
-                    continue
                 tail = ""
                 if log_path.exists():
                     lines = log_path.read_text().splitlines()
                     tail = "\n".join(lines[-20:])
                 _cleanup_active(next_active + list(active[i + 1:]))
+                # Test 4 hard-fails on any non-zero exit, including OOM.
+                # Unlike Tests 3 and 6 which deliberately push the VRAM
+                # ceiling, all Test 4 conditions run at bs=1024 per rank;
+                # an OOM here is a real DDP misconfiguration signal we
+                # want to know about loudly rather than silently skip.
                 raise RuntimeError(
                     f"{condition_name} seed={seed} failed with exit code {ret}\n"
                     f"--- last 20 lines of {log_path} ---\n{tail}"
