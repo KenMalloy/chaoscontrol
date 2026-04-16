@@ -913,6 +913,116 @@ class ChaosStudentLM(nn.Module):
     def artifact_bytes(self) -> int:
         return int(sum(p.numel() for p in self.parameters()) * 2)
 
+    def encode(self, input_ids: torch.Tensor) -> torch.Tensor:
+        """Run every pre-LM-head computation and return the hidden state.
+
+        Mirrors the encoder portion of ``forward()`` — embed → wernicke →
+        outer-model read → semantic tier → layers → posterior — and
+        returns the hidden ``(batch, seq, dim)`` tensor at the point
+        where ``forward()`` names ``hidden = x`` (currently model.py
+        around line 1051).
+
+        Introduced 2026-04-16 so ``train_ssm`` can run the encoder
+        once and then loop chunked forward/backward through the
+        LM head without materializing the full ``(B, T, V)`` logits
+        gradient. ``forward()`` is frozen for reproducibility of prior
+        experiments; any config that ``forward()`` supports should
+        produce an identical hidden state here.
+
+        Unlike ``forward()`` this method does not return Jacobian stats,
+        balance-loss, or bucket-ids. The bare-SSM path — the only path
+        ``train_ssm`` supports — produces none of those. Configs that
+        need them must continue to use ``forward()`` + ``training.py``.
+
+        Side effects: none. Unlike ``forward()`` this path never
+        performs memory writes (those live in ``forward()`` after
+        ``lm_head`` and only fire when ``memory_write_mode='append_only'``,
+        which is unused by the bare-SSM submission regime).
+        """
+        x = self.embed(input_ids)
+
+        # Wernicke layer: compose bytes into typed units before SSM recurrence
+        bucket_ids = None
+        if self.wernicke is not None:
+            x, bucket_ids, _balance_loss = self.wernicke(x)
+
+        # Buffer read path (mirrors forward() body 1-for-1 for the configs
+        # that wire an outer_model). For bare-SSM both branches are skipped
+        # because ``self.outer_model`` is None.
+        if self.outer_model is not None and self.buffer_mode == "append_only":
+            batch = x.size(0)
+            model_dim = x.size(2)
+            if isinstance(self.outer_model, MultiSlotOuterModel) and self.outer_model._slots:
+                if bucket_ids is not None:
+                    per_sample_buckets = bucket_ids.mode(dim=1).values
+                else:
+                    per_sample_buckets = torch.zeros(batch, dtype=torch.long, device=x.device)
+                outer_read = torch.zeros(batch, 1, model_dim, device=x.device, dtype=x.dtype)
+                for b_id in per_sample_buckets.unique():
+                    mask = per_sample_buckets == b_id
+                    cue = None
+                    if self.retrieval_mode in ("bucket_topk", "softmax_all"):
+                        cue = self.outer_model.cue_proj(
+                            x[mask].detach().mean(dim=1).to(dtype=self.outer_model.cue_proj.weight.dtype)
+                        )
+                    read = self.outer_model.read_bucket(
+                        int(mask.sum()), bucket_id=int(b_id.item()),
+                        mode=self.retrieval_mode, k=self.retrieval_k, cue=cue,
+                    )
+                    outer_read[mask] = read.unsqueeze(1).to(dtype=x.dtype)
+                x = x + outer_read
+
+            if self.bucket_prototypes_module is not None and bucket_ids is not None:
+                per_sample_buckets = bucket_ids.mode(dim=1).values
+                proto_bias = torch.zeros(batch, 1, model_dim, device=x.device, dtype=x.dtype)
+                for b_id in per_sample_buckets.unique():
+                    mask = per_sample_buckets == b_id
+                    proto = self.bucket_prototypes_module.read(int(mask.sum()), int(b_id.item()))
+                    proto_bias[mask] = proto.unsqueeze(1).to(dtype=x.dtype)
+                x = x + proto_bias
+
+        elif self.outer_model is not None:
+            if isinstance(self.outer_model, MultiSlotOuterModel):
+                cue = x.detach().mean(dim=1) if self.cue_projection else None
+                outer_read = self.outer_model.read(x.size(0), cue=cue)
+            else:
+                outer_read = self.outer_model.read(x.size(0))
+            x = x + outer_read.unsqueeze(1).to(dtype=x.dtype)
+
+        if self.semantic_tier is not None:
+            semantic_bias = self.semantic_tier.read(x.size(0))
+            x = x + semantic_bias.unsqueeze(1).to(dtype=x.dtype)
+
+        # Virtual-layer loop — weight-tied depth recurrence when configured;
+        # otherwise list(range(num_layers)). Matches forward() exactly.
+        use_ckpt = self.activation_checkpoint and torch.is_grad_enabled() and x.requires_grad
+        for layer_idx in self._virtual_layer_indices:
+            layer = self.layers[layer_idx]
+            if use_ckpt:
+                x = _checkpoint(layer, x, return_jacobian_stats=False, use_reentrant=False)
+            else:
+                x = layer(x, return_jacobian_stats=False)
+
+        # Posterior correction bias — bare-SSM path has self.posterior is None
+        # so the block is skipped.
+        if self.posterior is not None:
+            if isinstance(self.posterior, GlobalDelta):
+                posterior_bias = self.posterior.read(x.size(0))
+                x = x + posterior_bias.unsqueeze(1)
+            elif isinstance(self.posterior, BucketDelta) and bucket_ids is not None:
+                per_sample_buckets = bucket_ids.mode(dim=1).values
+                posterior_bias = torch.cat([
+                    self.posterior.read(bucket_id=int(per_sample_buckets[i].item()), batch_size=1)
+                    for i in range(x.size(0))
+                ], dim=0)
+                x = x + posterior_bias.unsqueeze(1)
+            elif isinstance(self.posterior, ResidualCache):
+                query = x.detach().mean(dim=1)
+                posterior_bias = self.posterior.read(query)
+                x = x + posterior_bias.unsqueeze(1)
+
+        return x
+
     def forward(
         self,
         input_ids: torch.Tensor,
