@@ -6,11 +6,6 @@ post-training parameters are identical across ranks. That identity is
 the signature of correct gradient all-reduce: if the new
 ``allreduce_grads`` or ``should_stop_now`` wiring had a bug, ranks
 would diverge within a handful of steps.
-
-Known flakiness on mp.spawn teardown (see feedback_mp_spawn_flake in
-memory): if the first run hangs at import it's the torch.compile cold
-start — re-run once. The test uses a generous wall-clock budget for
-this reason.
 """
 from __future__ import annotations
 
@@ -63,6 +58,19 @@ def _build_tokens(seed: int) -> torch.Tensor:
     return torch.randint(0, MODEL_KWARGS["vocab_size"], (N_TRAIN_TOKENS,), generator=g)
 
 
+class _DeterministicClock:
+    """Monotonic fake clock so budget-loop semantics don't depend on host speed."""
+
+    def __init__(self, *, start: float = 0.0, step: float = 0.25) -> None:
+        self._t = start
+        self._step = step
+
+    def __call__(self) -> float:
+        current = self._t
+        self._t += self._step
+        return current
+
+
 def _ddp_train_ssm_worker(
     rank: int,
     world_size: int,
@@ -93,6 +101,7 @@ def _ddp_train_ssm_worker(
             model = _build_model(seed)
             tokens = _build_tokens(seed)
             verify_diag_recurrence(torch.device("cpu"))
+            clock = _DeterministicClock(step=0.25)
 
             optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
             result = train_ssm_for_budget(
@@ -103,18 +112,19 @@ def _ddp_train_ssm_worker(
                 batch_size=4,
                 device=torch.device("cpu"),
                 optimizer=optimizer,
-                budget_seconds=1.5,
+                budget_seconds=1.1,
                 chunk_size=16,
                 seed=seed,
                 rank=rank,
                 world_size=world_size,
+                time_fn=clock,
             )
             # Assertions inside the worker show up in the log if they fire;
             # the parent also checks the same invariants post-spawn.
             assert result["rank"] == rank
             assert result["world_size"] == world_size
-            assert result["steps"] > 1
-            assert "elapsed_s" in result
+            assert result["steps"] == 4
+            assert result["elapsed_s"] == 1.5
 
             flat = torch.cat([p.detach().flatten() for p in model.parameters()])
             torch.save(flat, param_dump_paths[rank])

@@ -25,6 +25,19 @@ from chaoscontrol.training import chunked_cross_entropy
 from chaoscontrol.train_ssm import train_ssm_for_budget, train_ssm_step
 
 
+class _DeterministicClock:
+    """Monotonic fake clock for deterministic budget-loop tests."""
+
+    def __init__(self, *, start: float = 0.0, step: float = 0.25) -> None:
+        self._t = start
+        self._step = step
+
+    def __call__(self) -> float:
+        current = self._t
+        self._t += self._step
+        return current
+
+
 @pytest.fixture
 def bare_ssm_model() -> ChaosStudentLM:
     torch.manual_seed(2026)
@@ -173,22 +186,25 @@ class TestTrainSSMStepRejectsUnsupportedConfigs:
 
 
 class TestTrainSSMForBudget:
-    """Smoke test for the budget-bounded training loop wrapper.
+    """Deterministic test for the budget-bounded training loop wrapper.
 
-    The wall-clock loop itself is just the step function plus batch
-    construction, optimizer step, and DDP plumbing — the step function
-    already has per-gradient parity coverage above. This test is for
-    "the loop actually runs and makes progress", not for numeric
-    equivalence against the old path.
+    The step function already has per-gradient parity coverage above.
+    Here we care about loop bookkeeping and optimizer integration, so
+    the budget is driven by a fake monotonic clock rather than host
+    wall-clock speed.
     """
 
-    def test_single_process_loop_reduces_loss(self, bare_ssm_model: ChaosStudentLM) -> None:
+    def test_single_process_loop_has_deterministic_history(self, bare_ssm_model: ChaosStudentLM) -> None:
         # Deterministic fake corpus — enough tokens to form a handful of
         # batches of short sequences.
         g = torch.Generator().manual_seed(17)
         vocab = bare_ssm_model.vocab_size
         train_tokens = torch.randint(0, vocab, (256,), generator=g)
         train_starts = list(range(0, 256 - 16, 4))  # overlapping windows of 16
+        clock = _DeterministicClock(step=0.25)
+        initial_flat = torch.cat([
+            p.detach().flatten().clone() for p in bare_ssm_model.parameters()
+        ])
 
         optimizer = torch.optim.AdamW(bare_ssm_model.parameters(), lr=1e-3)
         result = train_ssm_for_budget(
@@ -199,24 +215,21 @@ class TestTrainSSMForBudget:
             batch_size=2,
             device=torch.device("cpu"),
             optimizer=optimizer,
-            budget_seconds=2.0,  # small but non-zero
+            budget_seconds=1.1,
             chunk_size=16,
             seed=0,
+            time_fn=clock,
         )
-        assert result["steps"] > 1, (
-            f"loop should run multiple steps in 2s, got {result['steps']}"
-        )
+        assert result["steps"] == 4
         assert result["world_size"] == 1
         assert result["rank"] == 0
-        # Result schema matches training.py's elapsed_s field name so any
-        # caller can read both paths with the same key.
-        assert "elapsed_s" in result and result["elapsed_s"] > 0
-        # Loss should generally decrease — not strictly monotonic on such a
-        # tiny model/corpus, but the final EMA should beat the initial loss.
-        losses = [r["loss"] for r in result["history"]]
-        first_quarter = sum(losses[: len(losses) // 4]) / max(1, len(losses) // 4)
-        last_quarter = sum(losses[-len(losses) // 4 :]) / max(1, len(losses) // 4)
-        assert last_quarter < first_quarter, (
-            f"loss should drop across the loop; "
-            f"first-quarter mean {first_quarter}, last-quarter mean {last_quarter}"
-        )
+        assert result["elapsed_s"] == pytest.approx(1.5)
+        assert len(result["history"]) == result["steps"]
+        assert [row["step"] for row in result["history"]] == [0.0, 1.0, 2.0, 3.0]
+        losses = [row["loss"] for row in result["history"]]
+        assert all(torch.isfinite(torch.tensor(losses)))
+        assert all(loss > 0.0 for loss in losses)
+
+        final_flat = torch.cat([p.detach().flatten() for p in bare_ssm_model.parameters()])
+        max_param_delta = (final_flat - initial_flat).abs().max().item()
+        assert max_param_delta > 0.0, "optimizer steps should update model parameters"

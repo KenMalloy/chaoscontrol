@@ -19,7 +19,7 @@ paper testbed, and every prior experiment must remain reproducible.
 from __future__ import annotations
 
 import time
-from typing import Any
+from typing import Any, Callable
 
 import torch
 import torch.distributed as dist
@@ -211,6 +211,7 @@ def train_ssm_for_budget(
     rank: int | None = None,
     world_size: int | None = None,
     seed: int = 0,
+    time_fn: Callable[[], float] = time.perf_counter,
 ) -> dict[str, Any]:
     """Bare-SSM wall-clock training loop.
 
@@ -222,6 +223,9 @@ def train_ssm_for_budget(
     DDP is optional — single-GPU is the ``world_size == 1`` path. When
     multi-rank, initial params are broadcast from rank 0 and the
     stop decision is synchronized across ranks via ``should_stop_now``.
+    ``time_fn`` defaults to ``time.perf_counter`` and exists so tests
+    can drive the budget loop deterministically without depending on
+    machine speed.
     """
     _reject_unsupported(model)
 
@@ -236,10 +240,10 @@ def train_ssm_for_budget(
     model.train()
     history: list[dict[str, Any]] = []
     steps = 0
-    start_time = time.perf_counter()
+    start_time = time_fn()
 
     while True:
-        elapsed = time.perf_counter() - start_time
+        elapsed = time_fn() - start_time
         local_stop = elapsed >= budget_seconds and steps > 0
         if should_stop_now(local_stop, device, ddp_active):
             break
@@ -278,7 +282,7 @@ def train_ssm_for_budget(
     return {
         "history": history,
         "steps": steps,
-        "elapsed_s": time.perf_counter() - start_time,
+        "elapsed_s": time_fn() - start_time,
         "rank": rank_,
         "world_size": world_size_,
     }
