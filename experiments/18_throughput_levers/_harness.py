@@ -62,31 +62,38 @@ def build_launch_cmd(
     budget: float,
     out_path: Path,
     rdzv_port: int | None = None,
+    runner_script: Path | None = None,
 ) -> list[str]:
-    """Construct the subprocess argv for one runner_exp18.py invocation.
+    """Construct the subprocess argv for one runner invocation.
 
     num_gpus <= 1:
-        Direct python invocation. runner_exp18 reads the absence of
+        Direct python invocation. The runner reads the absence of
         WORLD_SIZE and takes its single-device branch. Used for both
         local CPU smokes and 1-GPU pods.
 
     num_gpus > 1:
         ``python -m torch.distributed.run --nproc_per_node=N
-        --rdzv-endpoint=localhost:<port>``  against runner_exp18.py.
+        --rdzv-endpoint=localhost:<port>``  against the runner.
         torchrun spawns N ranks on this host, each binding to its own
-        LOCAL_RANK GPU. runner_exp18 wraps the model in DDP internally.
+        LOCAL_RANK GPU. The runner wraps the model in DDP internally.
 
         ``rdzv_port`` is required when ``num_gpus > 1`` and two or more
         DDP groups share a host — each concurrent torchrun needs a unique
         rendezvous port or the second one fails to bind. Pass a port from
         ``pick_free_port()`` per slot.
 
+    ``runner_script`` defaults to ``RUNNER_SCRIPT`` (``runner_exp18.py``)
+    when unset, so every pre-Test-5b caller continues to hit the frozen
+    runner without change. Test 5b and later pass
+    ``runner_exp18_ssm.py`` to route through the lean train_ssm path.
+
     Rationale for ``python -m torch.distributed.run`` over the ``torchrun``
     CLI: the module form is version-resilient and doesn't depend on
     whatever PATH the pod happens to have torchrun on.
     """
+    runner = runner_script if runner_script is not None else RUNNER_SCRIPT
     common_tail = [
-        str(RUNNER_SCRIPT),
+        str(runner),
         "--config", str(cfg_path),
         "--data-path", data_path,
         "--sp-model-path", sp_model_path,
@@ -104,7 +111,7 @@ def build_launch_cmd(
         f"--rdzv-endpoint=localhost:{rdzv_port}",
         f"--rdzv-backend=c10d",
         f"--rdzv-id=cc_exp18_{rdzv_port}",
-        str(RUNNER_SCRIPT),
+        str(runner),
         "--config", str(cfg_path),
         "--data-path", data_path,
         "--sp-model-path", sp_model_path,
@@ -238,6 +245,7 @@ def run_parallel_ddp_matrix(
     results_dir: Path,
     timeout_multiplier: float = 2.5,
     skip_oom_conditions: bool = False,
+    runner_script: Path | None = None,
 ) -> list[str]:
     """Launch ``conditions x seeds`` under parallel DDP groups.
 
@@ -321,6 +329,7 @@ def run_parallel_ddp_matrix(
                 budget=budget,
                 out_path=out_path,
                 rdzv_port=rdzv,
+                runner_script=runner_script,
             )
             print(
                 f"Launching {condition_name} seed={seed} slot={slot_id} "
