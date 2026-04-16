@@ -105,6 +105,28 @@ def chunked_cross_entropy_mean(
     )
 
 
+def _allreduce_grads(model: torch.nn.Module, world_size: int) -> None:
+    """Average all parameter gradients across DDP ranks.
+
+    Replaces ``DistributedDataParallel``'s autograd-hook gradient sync
+    with a single explicit pass after ``loss.backward()``.  DDP's hooks
+    fire per-bucket during backward, and the bucket-readiness ordering
+    can diverge across ranks when ``chunked_cross_entropy`` creates K
+    independent backward sub-graphs — leading to NCCL collective count
+    mismatches and deadlocks.  A post-backward all-reduce avoids the
+    ordering problem entirely.
+    """
+    for p in model.parameters():
+        if p.grad is not None:
+            dist.all_reduce(p.grad, op=dist.ReduceOp.AVG)
+
+
+def _broadcast_params(model: torch.nn.Module) -> None:
+    """Broadcast all parameters from rank 0 so every rank starts identical."""
+    for p in model.parameters():
+        dist.broadcast(p.data, src=0)
+
+
 def _resolve_ddp_context(
     rank: int | None,
     world_size: int | None,
@@ -265,13 +287,18 @@ def train_chaoscontrol_for_budget(
             k=metabolic_k,
         ).to(device)
 
-    # DDP wrap. Critically we keep ``model`` as the unwrapped module so all
-    # attribute access downstream (model.vocab_size, model.wernicke,
-    # model.outer_model, model.posterior, model.semantic_tier, ...) keeps
-    # working. Only the training-step forward call uses ``ddp_model`` so the
-    # gradient all-reduce hook fires on ``loss.backward()``. When
-    # world_size == 1 we assign ddp_model = model so the single-device path is
-    # bit-identical to the pre-change version.
+    # Manual DDP: no DistributedDataParallel wrapper.  Instead we use
+    # ``_allreduce_grads`` after ``loss.backward()`` for an explicit,
+    # post-backward gradient sync.  This avoids DDP's autograd-hook
+    # bucket-readiness mechanism, which desyncs across ranks when
+    # ``chunked_cross_entropy`` creates K independent backward sub-graphs
+    # (see commit history for the NCCL deadlock at ws=2/4).
+    #
+    # ``ddp_model`` is kept as an alias for ``model`` so the rest of the
+    # training loop doesn't need to branch on world_size — attribute
+    # access, forward calls, and parameter iteration all go through the
+    # plain module.
+    ddp_model = model
     if ddp_active:
         if not (dist.is_available() and dist.is_initialized()):
             raise RuntimeError(
@@ -280,29 +307,9 @@ def train_chaoscontrol_for_budget(
                 "torch.distributed.init_process_group(...) before invoking "
                 "train_chaoscontrol_for_budget."
             )
-        # device_ids / output_device are only meaningful for CUDA DDP. On
-        # CPU (gloo backend) they must be None. For CUDA, the device must
-        # have an explicit index — callers who pass torch.device("cuda")
-        # without an index would otherwise send None through here and hit
-        # a cryptic DDP error. Resolve that here by falling back to the
-        # current CUDA device (which torchrun + torch.cuda.set_device()
-        # should have set in the caller).
-        if device.type == "cuda":
-            idx = device.index if device.index is not None else torch.cuda.current_device()
-            ddp_kwargs = dict(device_ids=[idx], output_device=idx)
-        else:
-            ddp_kwargs = dict(device_ids=None, output_device=None)
-        ddp_model = torch.nn.parallel.DistributedDataParallel(
-            model,
-            find_unused_parameters=False,
-            **ddp_kwargs,
-        )
-    else:
-        ddp_model = model
+        _broadcast_params(model)
 
-    # Note: DDP.parameters() iterates the wrapped module's parameters, so both
-    # forms work. We keep ``model.parameters()`` to match the pre-DDP behavior
-    # exactly when world_size == 1.
+    # ``model.parameters()`` gives the plain module's params at all world sizes.
     all_params = list(model.parameters())
     if structured_proj is not None:
         all_params += list(structured_proj.parameters())
@@ -605,6 +612,8 @@ def train_chaoscontrol_for_budget(
                     loss = loss + align_weight * a_loss
 
         loss.backward()
+        if ddp_active:
+            _allreduce_grads(model, world_size)
         if grad_clip_norm > 0.0:
             torch.nn.utils.clip_grad_norm_(all_params, grad_clip_norm)
         optimizer.step()
