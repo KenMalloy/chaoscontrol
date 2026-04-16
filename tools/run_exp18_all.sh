@@ -78,19 +78,11 @@ run_test() {
     fi
 }
 
-run_test 4 "$TESTS_DIR/results_test4" \
-    "$TESTS_DIR/run_exp18_test4.py" \
-    --data-path "$DATA" \
-    --sp-model-path "$TOK" \
-    --num-gpus "$NUM_GPUS" \
-    --budget "$BUDGET"
-
-run_test 3 "$TESTS_DIR/results_test3" \
-    "$TESTS_DIR/run_exp18_test3.py" \
-    --data-path "$DATA" \
-    --sp-model-path "$TOK" \
-    --num-gpus "$NUM_GPUS" \
-    --budget "$BUDGET"
+# Test 4 is skipped: ws=1 and ws=2 results from the 2026-04-15 launch
+# are already on disk in results_test4/. Test 5 reads ws=1 seed JSONs
+# directly via _load_ws1_seed_bpbs. The ws=4 condition was dropped (see
+# run_exp18_test4.py CONDITIONS comment for the chunked-CE / DDP NCCL
+# deadlock). Test 3 was dropped from this matrix earlier.
 
 run_test 5 "$TESTS_DIR/results_test5" \
     "$TESTS_DIR/run_exp18_test5.py" \

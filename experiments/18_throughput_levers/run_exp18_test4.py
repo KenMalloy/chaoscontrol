@@ -2,12 +2,14 @@
 """Experiment 18 Test 4 launcher: DDP scaling efficiency.
 
 Test 4 measures whether DDP actually translates extra hardware into
-better bpb-at-wall-clock. Three world-size conditions over the same
+better bpb-at-wall-clock. Two world-size conditions over the same
 per-rank batch size:
 
-    ws=1  single-device baseline  (global batch = bs * 1 = 1024)
-    ws=2  2-rank DDP on 2 GPUs     (global batch = bs * 2 = 2048)
-    ws=4  4-rank DDP on 4 GPUs     (global batch = bs * 4 = 4096)
+    ws=1  single-device baseline  (global batch = bs * 1 = 512)
+    ws=2  2-rank DDP on 2 GPUs    (global batch = bs * 2 = 1024)
+
+(ws=4 was dropped after a chunked-CE / DDP NCCL deadlock — see the
+CONDITIONS comment below.)
 
 **LR is linearly scaled per condition** from the Exp 17 / Exp 18 phase0
 anchor ``(bs=32, lr=2e-3)``. That means ``LR = 2e-3 * (global_batch / 32)``,
@@ -147,11 +149,22 @@ def _base(world_size: int, **overrides: Any) -> dict[str, Any]:
 # Per-condition LRs (bs=512 per rank, linearly scaled from bs=32):
 #   ws=1: global  512 -> LR 0.032
 #   ws=2: global 1024 -> LR 0.064
-#   ws=4: global 2048 -> LR 0.128  (exactly at cap by coincidence)
+#
+# **ws=4 dropped (2026-04-15).** First pod launch's ws=4 condition
+# deadlocked inside the NCCL watchdog: ranks logged divergent NCCL work
+# counts (1656/1657/1658) before the collective timeout fired. The
+# suspected interaction is between ``chunked_cross_entropy``'s K
+# per-chunk autograd graphs (each producing a partial update to
+# ``logits.grad``) and DDP's gradient bucket readiness detection — the
+# K-way fan-in confuses the bucket-ready signal so different ranks
+# launch a different number of NCCL collectives in the same step. ws=1
+# (no NCCL) and ws=2 (only 4 GPUs to bucket across) both work; ws=4 is
+# the first regime where the bug surfaces. Dropping until the
+# chunked-CE / DDP interaction is debugged offline; Tests 5/6/7 all
+# run at ws=2 and are unaffected.
 CONDITIONS: dict[str, tuple[int, dict[str, Any]]] = {
     "ws1":       (1, _base(world_size=1)),
     "ws2_ddp":   (2, _base(world_size=2)),
-    "ws4_ddp":   (4, _base(world_size=4)),
 }
 
 
