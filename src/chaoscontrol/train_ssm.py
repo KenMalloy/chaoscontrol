@@ -22,6 +22,7 @@ import time
 from typing import Any
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 
@@ -72,6 +73,12 @@ def chunked_lm_head_backward(
         the gradient of a single mean-reduced loss over all tokens. The
         fp32 upcast matches the contract of ``training.chunked_cross_entropy``.
     """
+    if chunk_size <= 0:
+        raise ValueError(
+            f"chunked_lm_head_backward: chunk_size must be positive, got "
+            f"{chunk_size}. A non-positive value would wedge the time-chunk "
+            f"loop indefinitely rather than failing cleanly."
+        )
     if not hidden.requires_grad:
         raise ValueError(
             "chunked_lm_head_backward: ``hidden`` must have requires_grad=True "
@@ -261,10 +268,17 @@ def train_ssm_for_budget(
         history.append({"step": float(steps), "loss": float(loss.detach().cpu())})
         steps += 1
 
+    # DDP teardown barrier — same role as training.py:903. Without this, a
+    # faster rank can start eval / tear down the process group while a
+    # slower rank is still iterating, and the next collective blocks on
+    # mismatched state. Matches the frozen path's contract.
+    if ddp_active:
+        dist.barrier()
+
     return {
         "history": history,
         "steps": steps,
-        "elapsed_seconds": time.perf_counter() - start_time,
+        "elapsed_s": time.perf_counter() - start_time,
         "rank": rank_,
         "world_size": world_size_,
     }

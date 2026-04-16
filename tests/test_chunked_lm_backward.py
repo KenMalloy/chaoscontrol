@@ -236,6 +236,29 @@ class TestChunkedLMBackwardContract:
         assert loss.dtype == torch.float32, f"expected fp32 loss, got {loss.dtype}"
         assert loss.dim() == 0, f"expected scalar, got shape {tuple(loss.shape)}"
 
+    def test_rejects_zero_chunk_size(self) -> None:
+        # chunk_size <= 0 would cause the chunk loop to never advance,
+        # wedging the process until a timeout. Guard at entry so a bad
+        # config fails fast and surfaces clearly rather than hanging.
+        hidden, targets = _make_inputs(batch=1, seq=4, dim=4, vocab=8, dtype=torch.float32, seed=20)
+        norm, head = _build_head(dim=4, vocab=8, dtype=torch.float32, seed=50)
+        h = hidden.clone().detach().requires_grad_(True)
+        with pytest.raises(ValueError, match="chunk_size"):
+            chunked_lm_head_backward(
+                hidden=h, final_norm=norm, lm_head=head,
+                targets=targets, chunk_size=0,
+            )
+
+    def test_rejects_negative_chunk_size(self) -> None:
+        hidden, targets = _make_inputs(batch=1, seq=4, dim=4, vocab=8, dtype=torch.float32, seed=21)
+        norm, head = _build_head(dim=4, vocab=8, dtype=torch.float32, seed=51)
+        h = hidden.clone().detach().requires_grad_(True)
+        with pytest.raises(ValueError, match="chunk_size"):
+            chunked_lm_head_backward(
+                hidden=h, final_norm=norm, lm_head=head,
+                targets=targets, chunk_size=-4,
+            )
+
     def test_hidden_grad_populated_after_call(self) -> None:
         # After the call, the passed-in hidden tensor must have .grad populated
         # — the caller relies on this to feed gradient into the encoder.

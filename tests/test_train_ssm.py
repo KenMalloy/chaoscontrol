@@ -208,6 +208,9 @@ class TestTrainSSMForBudget:
         )
         assert result["world_size"] == 1
         assert result["rank"] == 0
+        # Result schema matches training.py's elapsed_s field name so any
+        # caller can read both paths with the same key.
+        assert "elapsed_s" in result and result["elapsed_s"] > 0
         # Loss should generally decrease — not strictly monotonic on such a
         # tiny model/corpus, but the final EMA should beat the initial loss.
         losses = [r["loss"] for r in result["history"]]
