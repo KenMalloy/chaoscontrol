@@ -110,6 +110,7 @@ def _base(seq_len: int, base_lr: float, **overrides: Any) -> dict[str, Any]:
         "local_attn_window": 0,
         "local_attn_heads": 1,
         "local_attn_dim": 64,
+        "activation_checkpoint": True,
     }
     cfg.update(overrides)
     return cfg
@@ -117,9 +118,9 @@ def _base(seq_len: int, base_lr: float, **overrides: Any) -> dict[str, Any]:
 
 def build_conditions(base_lr: float) -> dict[str, dict[str, Any]]:
     return {
-        "seq512":  _base(seq_len=512,  base_lr=base_lr),
-        "seq1024": _base(seq_len=1024, base_lr=base_lr),
-        "seq2048": _base(seq_len=2048, base_lr=base_lr),
+        "seq512_ckpt":  _base(seq_len=512,  base_lr=base_lr),
+        "seq1024_ckpt": _base(seq_len=1024, base_lr=base_lr),
+        "seq2048_ckpt": _base(seq_len=2048, base_lr=base_lr),
     }
 
 
@@ -205,11 +206,13 @@ def summarize_results(conditions: dict[str, dict[str, Any]]) -> dict[str, Any]:
     # Gate: winner by lowest mean_bpb. Additionally report the paired
     # test vs seq_len=512 for each longer sequence so we can see whether
     # the gap is statistically meaningful or within noise.
-    baseline = next((row for row in rows if row["name"] == "seq512"), None)
+    baseline = next(
+        (row for row in rows if row["name"] in ("seq512", "seq512_ckpt")), None,
+    )
     pair_results: list[dict[str, Any]] = []
     if baseline is not None:
         for row in rows:
-            if row["name"] == "seq512":
+            if row["name"] == baseline["name"]:
                 continue
             shared = sorted(set(baseline["bpb_by_seed"]) & set(row["bpb_by_seed"]))
             if len(shared) < 2:
