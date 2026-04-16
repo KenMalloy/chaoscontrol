@@ -1,23 +1,23 @@
 #!/usr/bin/env python3
 """Experiment 18 Test 5 launcher: LR stability screen at DDP global batch.
 
-Once Test 4 establishes DDP scaling at ws=2 (global batch = bs_per_rank *
-2 = 2048), we need a stable LR at that global batch that also beats
+Once Test 4 establishes DDP scaling at ws=2 (global batch = bs_per_rank
+* 2 = 1024), we need a stable LR at that global batch that also beats
 single-GPU at matched wall-clock. Test 5 screens three LR values around
 the linearly-scaled target and picks the winner.
 
 **Anchor.** Every LR in the Exp 18 stack is derived from the same
 calibrated reference: Exp 17 / Exp 18 phase0 established ``(bs=32,
 lr=2e-3)`` as a stable per-example learning rate. The linear scaling
-rule is ``LR = 2e-3 * (global_batch / 32)``. At ws=2 with bs_per_rank =
-1024, global_batch = 2048 and the linear-scaled target is ``2e-3 * 64 =
-0.128``. This matches the LR Test 4 uses for its ws=2 condition.
+rule is ``LR = 2e-3 * (global_batch / 32)``. At ws=2 with bs_per_rank
+= 512, global_batch = 1024 and the linear-scaled target is ``2e-3 *
+32 = 0.064``. This matches the LR Test 4 uses for its ws=2 condition.
 
 Three conditions around that target:
 
-    linear    LR = 0.128   (aggressive, may diverge at this global batch)
-    linear/2  LR = 0.064   (middle, phase0 bs=1024 single-GPU winner)
-    linear/4  LR = 0.032   (conservative)
+    linear    LR = 0.064   (linear rule from the bs=32 anchor)
+    linear/2  LR = 0.032   (half-linear — empirically the winner)
+    linear/4  LR = 0.016   (conservative)
 
 Scientific gate — **two stages, both required**:
 
