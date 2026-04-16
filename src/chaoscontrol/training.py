@@ -422,19 +422,21 @@ def train_chaoscontrol_for_budget(
 
     while True:
         elapsed = time.perf_counter() - start_time
-        if elapsed >= budget_seconds and steps > 0:
-            if ddp_active:
-                # All ranks must agree to stop at the same step, otherwise
-                # one rank exits the loop while the other starts another
-                # step's _allreduce_grads, desyncing NCCL collective counts.
-                stop = torch.ones(1, device=device)
-                dist.all_reduce(stop, op=dist.ReduceOp.MIN)
-            break
+        should_stop = elapsed >= budget_seconds and steps > 0
         if ddp_active and steps > 0:
-            stop = torch.zeros(1, device=device)
-            dist.all_reduce(stop, op=dist.ReduceOp.MIN)
-            if stop.item() > 0.5:
+            # All ranks must call the SAME all_reduce regardless of whether
+            # they individually want to stop. MAX means "if ANY rank wants
+            # to stop, ALL ranks stop together." The previous attempt had
+            # divergent code paths (stopping rank called one all_reduce,
+            # continuing rank called another) — same desync bug.
+            stop_flag = torch.tensor(
+                [1.0 if should_stop else 0.0], device=device,
+            )
+            dist.all_reduce(stop_flag, op=dist.ReduceOp.MAX)
+            if stop_flag.item() > 0.5:
                 break
+        elif should_stop:
+            break
 
         batch_starts = [train_starts[rng.randrange(len(train_starts))] for _ in range(batch_size)]
         inputs, targets = batch_from_starts(train_tokens, batch_starts, seq_len, device)
