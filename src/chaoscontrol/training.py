@@ -423,7 +423,18 @@ def train_chaoscontrol_for_budget(
     while True:
         elapsed = time.perf_counter() - start_time
         if elapsed >= budget_seconds and steps > 0:
+            if ddp_active:
+                # All ranks must agree to stop at the same step, otherwise
+                # one rank exits the loop while the other starts another
+                # step's _allreduce_grads, desyncing NCCL collective counts.
+                stop = torch.ones(1, device=device)
+                dist.all_reduce(stop, op=dist.ReduceOp.MIN)
             break
+        if ddp_active and steps > 0:
+            stop = torch.zeros(1, device=device)
+            dist.all_reduce(stop, op=dist.ReduceOp.MIN)
+            if stop.item() > 0.5:
+                break
 
         batch_starts = [train_starts[rng.randrange(len(train_starts))] for _ in range(batch_size)]
         inputs, targets = batch_from_starts(train_tokens, batch_starts, seq_len, device)
