@@ -327,10 +327,10 @@ def run_ddp(
         dist.barrier()
 
     history_final = train_result["history"][-1] if train_result["history"] else {}
-    peak_vram_mb = 0.0
-    if device.type == "cuda":
-        peak_vram_mb = torch.cuda.max_memory_allocated(device) / (1024 * 1024)
-
+    # Read peak_vram_mb from the training result, not from a
+    # post-eval measurement. The frozen runner reads it the same way
+    # (runner_exp18.py:250 <- training.py:911), so both paths' JSONs
+    # report "training-only peak memory" and are directly comparable.
     train_summary = {
         "steps": int(train_result["steps"]),
         "elapsed_s": float(train_result["elapsed_s"]),
@@ -338,7 +338,7 @@ def run_ddp(
             train_result["steps"] / max(train_result["elapsed_s"], 1e-9)
         ),
         "final_loss": float(history_final.get("loss", float("nan"))),
-        "peak_vram_mb": peak_vram_mb,
+        "peak_vram_mb": float(train_result.get("peak_vram_mb", 0.0)),
         "ddp_rank": int(train_result.get("rank", rank)),
         "ddp_world_size": int(train_result.get("world_size", world_size)),
     }

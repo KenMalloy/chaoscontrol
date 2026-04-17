@@ -33,10 +33,17 @@ Three conditions:
 
 **Gate.** Stage 1 only — pick a stable-condition winner by paired-seed
 mean-bpb with a 0.006-bpb / p<0.05 noise tiebreak. Stage 2 (cross-test
-vs Test 4 ws=1) is dropped for Test 5b because Test 4 ran at a
-different batch regime; the comparison would be confounded. A separate
-informational comparison vs Test 5's winner (0.032 at the old regime)
-is included in the summary for context, not as a gate.
+vs Test 4 ws=1) is dropped because Test 4 ran at a different batch
+regime; the comparison would be confounded.
+
+No cross-screen comparison against Test 5 is emitted. Test 5b differs
+from Test 5 on three axes simultaneously — batch size (intended
+change), optimizer (AdamW → Muon, locked from Test 7), and the
+presence of criticality regularization (train_ssm drops it) — so
+any "Test 5b bpb vs Test 5 bpb" delta would be a three-axis
+confound, not the single-lever signal it would need to be to
+support a causal claim. Interpretation lives at the paper level,
+not in this launcher's summary.
 
 Launch: same 2-slot parallel DDP pattern as Test 5, each slot runs
 ws=2. On a 4-GPU pod this schedules 3 conditions × 4 seeds = 12 runs
@@ -64,10 +71,6 @@ from _harness import (  # noqa: E402
     run_parallel_ddp_matrix,
     validate_data_paths,
 )
-
-# Reference to Test 5 for the informational winner-vs-winner comparison.
-TEST5_RESULTS = EXPERIMENT / "results_test5"
-TEST5_SUMMARY = TEST5_RESULTS / "test5_summary.json"
 
 SWEEP_SEEDS = [1337, 2674, 4011, 5348]
 
@@ -132,38 +135,6 @@ def _loss_is_stable(final_loss: float, initial_loss: float = 9.7) -> bool:
     if not math.isfinite(final_loss):
         return False
     return final_loss < initial_loss - 1.0
-
-
-def _load_test5_winner_bpbs() -> tuple[str | None, dict[int, float]]:
-    """Load Test 5's winning LR condition's seed→bpb mapping if present.
-
-    Returns (winner_name_or_none, seed_to_bpb_map). Used only for the
-    informational cross-regime comparison in the summary — NOT a gate.
-    Absence of Test 5 results is a no-op, not a failure.
-    """
-    if not TEST5_SUMMARY.exists():
-        return None, {}
-    try:
-        data = json.loads(TEST5_SUMMARY.read_text())
-    except Exception:
-        return None, {}
-    winner = data.get("_decision", {}).get("winner_lr_condition")
-    if not isinstance(winner, str):
-        return None, {}
-    result: dict[int, float] = {}
-    if not TEST5_RESULTS.exists():
-        return winner, result
-    pattern = re.compile(rf"^{re.escape(winner)}_s(\d+)\.json$")
-    for file in TEST5_RESULTS.iterdir():
-        m = pattern.match(file.name)
-        if not m:
-            continue
-        try:
-            entry = json.loads(file.read_text())
-            result[int(m.group(1))] = float(entry["eval"]["bpb"])
-        except Exception:
-            continue
-    return winner, result
 
 
 def summarize_results(conditions: dict[str, dict[str, Any]]) -> dict[str, Any]:
@@ -259,41 +230,10 @@ def summarize_results(conditions: dict[str, dict[str, Any]]) -> dict[str, Any]:
 
     winner = candidate  # Stage 1 is the only gate in 5b.
 
-    # Informational: compare winner vs Test 5's winner on matched seeds.
-    # This is NOT a gate — the two screens differ in batch size and the
-    # comparison is confounded — but it's the one number that tells us
-    # whether the new regime is actually giving us something. If Test 5b
-    # winner loses to Test 5 winner at matched wall-clock, the chunked
-    # backward's memory win isn't translating into a bpb win.
-    test5_winner_name, test5_winner_bpbs = _load_test5_winner_bpbs()
-    vs_test5: dict[str, Any] | None = None
-    if winner is not None and test5_winner_name and test5_winner_bpbs:
-        candidate_row = next(row for row in rows if row["name"] == winner)
-        shared = sorted(
-            set(candidate_row["bpb_by_seed"]) & set(test5_winner_bpbs)
-        )
-        if len(shared) >= 2:
-            a = [test5_winner_bpbs[s] for s in shared]
-            b = [candidate_row["bpb_by_seed"][s] for s in shared]
-            t, p = paired_ttest(a, b)
-            delta = sum(a) / len(a) - sum(b) / len(b)
-            vs_test5 = {
-                "test5_winner_condition": test5_winner_name,
-                "test5b_winner_condition": winner,
-                "delta_test5_minus_test5b_bpb": delta,
-                "paired_t": t,
-                "paired_p": p,
-                "n_paired_seeds": len(shared),
-                "note": (
-                    "INFORMATIONAL only — Test 5 ran at bs_per_rank=512 and "
-                    "Test 5b at 1024, so the comparison is confounded by "
-                    "batch size. Positive delta means Test 5b is better."
-                ),
-            }
-            print(
-                f"\nInformational vs Test 5 (n={len(shared)}): "
-                f"delta={delta:+.4f} bpb  p_paired={p:.4g}"
-            )
+    # No cross-screen comparison is emitted — see module docstring.
+    # Test 5 and Test 5b differ on batch size, optimizer, AND
+    # criticality-regularization presence, so any vs-Test-5 number
+    # would be a three-axis confound.
 
     summary["_decision"] = {
         "winner_lr_condition": winner,
@@ -303,7 +243,6 @@ def summarize_results(conditions: dict[str, dict[str, Any]]) -> dict[str, Any]:
         ),
         "stage1_candidate": candidate,
         "stable_conditions": [row["name"] for row in stable_rows],
-        "winner_vs_test5_informational": vs_test5,
         "invalid_result_files": invalid_results,
     }
     if invalid_results:

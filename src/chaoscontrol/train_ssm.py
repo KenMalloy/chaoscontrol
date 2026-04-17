@@ -242,6 +242,13 @@ def train_ssm_for_budget(
     steps = 0
     start_time = time_fn()
 
+    # Training-only peak-memory tracking: reset before the loop so the
+    # returned peak reflects training allocations only, not any prior
+    # setup or later eval. Matches training.py's contract so callers
+    # can read train_result["peak_vram_mb"] uniformly across both paths.
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
+
     while True:
         elapsed = time_fn() - start_time
         local_stop = elapsed >= budget_seconds and steps > 0
@@ -279,10 +286,15 @@ def train_ssm_for_budget(
     if ddp_active:
         dist.barrier()
 
+    peak_vram_mb = 0.0
+    if device.type == "cuda":
+        peak_vram_mb = torch.cuda.max_memory_allocated(device) / (1024 * 1024)
+
     return {
         "history": history,
         "steps": steps,
         "elapsed_s": time_fn() - start_time,
         "rank": rank_,
         "world_size": world_size_,
+        "peak_vram_mb": peak_vram_mb,
     }
