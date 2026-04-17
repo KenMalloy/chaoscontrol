@@ -183,9 +183,9 @@ def test_forward_matches_te_on_non_square(cuda_required) -> None:
 
 def test_backward_produces_weight_grad(cuda_required) -> None:
     """Backward through ``FusedFP8Linear`` must produce a non-NaN weight
-    gradient, matching stock TE's behavior. At scaffold stage this is
-    trivial (delegates to TE). Asserting the contract here ensures
-    Tasks 1B-2 / 1B-3 can't silently drop backward."""
+    gradient, matching stock TE's behavior. At scaffold stage this was
+    trivial (delegate); post-1B-2 this rides on ``_scaled_mm``'s native
+    autograd registration."""
     torch.manual_seed(0)
     bespoke = FusedFP8Linear.from_nn_linear(
         nn.Linear(256, 256, device="cuda", dtype=torch.bfloat16),
@@ -204,3 +204,123 @@ def test_backward_produces_weight_grad(cuda_required) -> None:
         assert torch.isfinite(bespoke.bias.grad).all(), (
             "bias.grad contains NaN or Inf"
         )
+
+
+# ---------------------------------------------------------------------------
+# Task 1B-2 additions — fused-path structural and performance checks.
+# ---------------------------------------------------------------------------
+
+
+def test_scaled_mm_path_used() -> None:
+    """Task 1B-2 removes the ``te.Linear`` scaffold delegate. The instance
+    must NOT expose ``_te_delegate`` anymore — that's our structural
+    proof that forward is running through ``torch._scaled_mm`` and not
+    silently falling back to the scaffold path."""
+    layer = FusedFP8Linear(256, 256)
+    assert not hasattr(layer, "_te_delegate"), (
+        "FusedFP8Linear still has a _te_delegate attribute — the Task 1B-2 "
+        "fused path should have removed it."
+    )
+
+
+def test_amax_buffers_registered() -> None:
+    """Amax history ring buffers must be persistent buffers so
+    checkpoints capture the scale-factor trajectory."""
+    layer = FusedFP8Linear(256, 256)
+    sd = layer.state_dict()
+    assert "x_amax_history" in sd, "x_amax_history missing from state_dict"
+    assert "w_amax_history" in sd, "w_amax_history missing from state_dict"
+    # Default length 16, fp32.
+    assert sd["x_amax_history"].shape == (16,)
+    assert sd["x_amax_history"].dtype == torch.float32
+    assert sd["w_amax_history"].shape == (16,)
+    assert sd["w_amax_history"].dtype == torch.float32
+
+
+def test_forward_still_matches_te_post_fusion(cuda_required) -> None:
+    """Post-fusion parity check — same bar as
+    ``test_forward_matches_te_on_submission_regime_shape`` but named
+    explicitly to make the Task 1B-2 success gate visible. If this
+    fails the scale-direction convention in ``_scaled_mm`` is almost
+    certainly flipped — verify empirically by constructing an identity
+    weight + unit input and inspecting the output before touching
+    anything else."""
+    torch.manual_seed(0)
+    ref = te.Linear(256, 256, device="cuda", params_dtype=torch.bfloat16)
+    bespoke = FusedFP8Linear.from_nn_linear(
+        nn.Linear(256, 256, device="cuda", dtype=torch.bfloat16),
+    )
+    with torch.no_grad():
+        bespoke.weight.data.copy_(ref.weight.data)
+        if ref.bias is not None and bespoke.bias is not None:
+            bespoke.bias.data.copy_(ref.bias.data)
+
+    x = torch.randn(32, 256, device="cuda", dtype=torch.bfloat16)
+    with te.fp8_autocast(enabled=True):
+        y_ref = ref(x)
+    y_new = bespoke(x)
+
+    assert torch.allclose(y_ref, y_new, rtol=3e-2, atol=3e-2), (
+        "post-fusion parity drift: max abs diff = "
+        f"{(y_ref - y_new).abs().max().item()}"
+    )
+
+
+@pytest.mark.slow
+def test_forward_no_sync_per_call(cuda_required) -> None:
+    """Throughput microbench — plan step 6.
+
+    Fused path must beat stock TE by at least 30% (``bespoke_time <
+    0.7 * te_time``) on the submission-regime shape. If this fails the
+    fusion isn't buying anything and the engineering isn't worth it.
+    Marked ``@pytest.mark.slow`` so CI skips it by default; runs
+    explicitly on the pod via ``pytest -m slow``.
+    """
+    import time
+
+    dim = 256
+    batch = 1024
+    iters = 200
+    warmup = 20
+
+    torch.manual_seed(0)
+    ref = te.Linear(dim, dim, device="cuda", params_dtype=torch.bfloat16)
+    bespoke = FusedFP8Linear.from_nn_linear(
+        nn.Linear(dim, dim, device="cuda", dtype=torch.bfloat16),
+    )
+    with torch.no_grad():
+        bespoke.weight.data.copy_(ref.weight.data)
+        if ref.bias is not None and bespoke.bias is not None:
+            bespoke.bias.data.copy_(ref.bias.data)
+
+    x = torch.randn(batch, dim, device="cuda", dtype=torch.bfloat16)
+
+    # Warmup — compile, autotune, amax history fill.
+    for _ in range(warmup):
+        with te.fp8_autocast(enabled=True):
+            _ = ref(x)
+        _ = bespoke(x)
+    torch.cuda.synchronize()
+
+    # Time stock TE.
+    torch.cuda.synchronize()
+    t0 = time.perf_counter()
+    for _ in range(iters):
+        with te.fp8_autocast(enabled=True):
+            _ = ref(x)
+    torch.cuda.synchronize()
+    te_time = time.perf_counter() - t0
+
+    # Time bespoke.
+    torch.cuda.synchronize()
+    t0 = time.perf_counter()
+    for _ in range(iters):
+        _ = bespoke(x)
+    torch.cuda.synchronize()
+    bespoke_time = time.perf_counter() - t0
+
+    assert bespoke_time < 0.7 * te_time, (
+        f"fused path not fast enough: bespoke={bespoke_time:.4f}s "
+        f"te={te_time:.4f}s ratio={bespoke_time / te_time:.3f} "
+        "(need < 0.7×)"
+    )

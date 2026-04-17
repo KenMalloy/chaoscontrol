@@ -10,6 +10,9 @@ mamba = ["mamba-ssm>=2.3.0"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "slow: marks tests as slow (deselect with '-m \"not slow\"'), used for GPU microbenches",
+]
 filterwarnings = [
     "ignore::DeprecationWarning:importlib._bootstrap",
     "ignore:builtin type Swig:DeprecationWarning",
