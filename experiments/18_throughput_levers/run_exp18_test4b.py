@@ -106,7 +106,7 @@ TEST5B_SUMMARY = EXPERIMENT / "results_test5b" / "test5b_summary.json"
 
 sys.path.insert(0, str(REPO / "experiments" / "09_revised_architecture"))
 sys.path.insert(0, str(EXPERIMENT))
-from stats import bootstrap_ci, sem  # noqa: E402
+from stats import bootstrap_ci, paired_ttest, sem  # noqa: E402
 from _harness import (  # noqa: E402
     result_is_finite,
     run_parallel_ddp_matrix,

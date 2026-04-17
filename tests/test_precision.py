@@ -21,12 +21,14 @@ from chaoscontrol.precision import (
 class TestAutocastContext:
     """Context-manager behavior for each supported precision dtype."""
 
-    def test_bf16_context_enters_and_runs_matmul(self) -> None:
-        # We're on CPU here and torch.amp.autocast(device_type="cuda",
-        # ...) on a CPU tensor is a no-op — the context enters cleanly
-        # but doesn't change dtype promotion. The contract we care
-        # about is "context manager that doesn't crash and yields
-        # control back to the caller"; the matmul is just proof-of-life.
+    def test_bf16_context_is_valid_context_manager(self) -> None:
+        # On CPU, autocast_context("bf16", device_type="cpu") returns a
+        # nullcontext by project convention (matches
+        # chaoscontrol.data.maybe_autocast: bf16 autocast is CUDA-only
+        # in this codebase). The test only verifies the context is a
+        # valid context manager that yields control to the caller.
+        # The actual bf16 autocast behavior is only exercised on CUDA
+        # pods — covered by end-to-end runner tests, not unit tests.
         with autocast_context("bf16", device_type="cpu"):
             result = torch.randn(2, 2) @ torch.randn(2, 2)
         assert result.shape == (2, 2)
