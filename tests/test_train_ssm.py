@@ -205,6 +205,91 @@ class TestTrainSSMStepEquivalence:
                 f"loss[{i}] drift too large: ref={lr} new={ln} diff={lr - ln}"
             )
 
+    def test_fused_muon_matches_unfused_trajectory(
+        self, bare_ssm_model: ChaosStudentLM,
+    ) -> None:
+        """End-to-end loss trajectory parity with fused_muon toggled.
+
+        Builds two Muon optimizers — one with ``fused=False`` iterating
+        params one-by-one, one with ``fused=True`` batching NS calls per
+        shape-group and coalescing AdamW over flat non-matrix buffers —
+        and drives five training steps through ``train_ssm_for_budget``
+        at the same seed. Losses agree within ``1e-4`` per step; the
+        drift comes from the batched NS's intra-shape reduction order
+        vs the per-param loop, same fp-reduction-noise regime as the
+        fused grad-clip trajectory test above.
+        """
+        from chaoscontrol.optim.muon import Muon
+
+        g = torch.Generator().manual_seed(31)
+        vocab = bare_ssm_model.vocab_size
+        train_tokens = torch.randint(0, vocab, (256,), generator=g)
+        train_starts = list(range(0, 256 - 16, 4))
+
+        model_ref = bare_ssm_model
+        model_new = copy.deepcopy(model_ref)
+
+        optimizer_ref = Muon(
+            list(model_ref.parameters()),
+            lr=0.005, adamw_lr=0.001,
+            compute_dtype=torch.float32,
+            fused=False,
+        )
+        optimizer_ref.bind_param_names(list(model_ref.named_parameters()))
+        result_ref = train_ssm_for_budget(
+            model=model_ref,
+            train_tokens=train_tokens,
+            train_starts=train_starts,
+            seq_len=16,
+            batch_size=2,
+            device=torch.device("cpu"),
+            optimizer=optimizer_ref,
+            budget_seconds=1e9,
+            chunk_size=16,
+            grad_clip_norm=0.0,
+            seed=0,
+            time_fn=_DeterministicClock(step=0.25),
+            max_steps=5,
+        )
+
+        optimizer_new = Muon(
+            list(model_new.parameters()),
+            lr=0.005, adamw_lr=0.001,
+            compute_dtype=torch.float32,
+            fused=True,
+        )
+        optimizer_new.bind_param_names(list(model_new.named_parameters()))
+        result_new = train_ssm_for_budget(
+            model=model_new,
+            train_tokens=train_tokens,
+            train_starts=train_starts,
+            seq_len=16,
+            batch_size=2,
+            device=torch.device("cpu"),
+            optimizer=optimizer_new,
+            budget_seconds=1e9,
+            chunk_size=16,
+            grad_clip_norm=0.0,
+            seed=0,
+            time_fn=_DeterministicClock(step=0.25),
+            max_steps=5,
+        )
+
+        assert result_ref["steps"] == result_new["steps"] == 5
+        losses_ref = [row["loss"] for row in result_ref["history"]]
+        losses_new = [row["loss"] for row in result_new["history"]]
+        # Step 0: both paths see identical grads BEFORE opt.step runs
+        # (forward/backward is fused-path-agnostic), so loss[0] is
+        # bit-identical regardless of optimizer batching.
+        assert losses_ref[0] == losses_new[0], (
+            f"loss[0] must match pre-step: ref={losses_ref[0]} new={losses_new[0]}"
+        )
+        for i, (lr_loss, ln_loss) in enumerate(zip(losses_ref, losses_new)):
+            assert abs(lr_loss - ln_loss) < 1e-4, (
+                f"fused-Muon loss[{i}] drift too large: "
+                f"ref={lr_loss} new={ln_loss} diff={lr_loss - ln_loss}"
+            )
+
     def test_grads_match_with_small_chunks(self, bare_ssm_model: ChaosStudentLM) -> None:
         # Exercise actual chunking: seq=16, chunk=4 → 4 chunks.
         # Reduction order differs from the old path (per-chunk sum / N then

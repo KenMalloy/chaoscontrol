@@ -72,6 +72,7 @@ class Muon(torch.optim.Optimizer):
         adamw_weight_decay: float | None = None,
         matrix_param_names: set[str] | None = None,
         is_matrix: Callable[[Tensor, str | None], bool] | None = None,
+        fused: bool = False,
         compute_dtype: torch.dtype | None = None,
     ) -> None:
         if lr <= 0.0 or ns_steps <= 0 or not 0.0 <= momentum < 1.0:
@@ -89,6 +90,7 @@ class Muon(torch.optim.Optimizer):
         # silently route matrix-shaped params into the Newton-Schulz path.
         self._matrix_param_names = set(matrix_param_names) if matrix_param_names is not None else None
         self._is_matrix_fn = is_matrix if is_matrix is not None else _default_is_matrix
+        self._fused = fused
         self._compute_dtype = compute_dtype
         # Id-keyed lookup from param tensor -> optional name for the classifier.
         self._param_name_by_id: dict[int, str] = {}
@@ -105,6 +107,9 @@ class Muon(torch.optim.Optimizer):
 
     @torch.no_grad()
     def step(self, closure: Callable[[], Tensor] | None = None) -> Tensor | None:
+        if self._fused:
+            return self._step_fused(closure)
+
         loss: Tensor | None = None
         if closure is not None:
             with torch.enable_grad():
@@ -160,5 +165,190 @@ class Muon(torch.optim.Optimizer):
                     if adamw_wd > 0.0:
                         p.data.mul_(1.0 - adamw_lr * adamw_wd)
                     p.data.addcdiv_(exp_avg, denom, value=-adamw_lr / bias1)
+
+        return loss
+
+    @torch.no_grad()
+    def _step_fused(self, closure: Callable[[], Tensor] | None = None) -> Tensor | None:
+        """Fused Muon step.
+
+        Matrix params are partitioned by exact ``(rows, cols)`` shape; each
+        shape-group's grads and momentum buffers are stacked into a single
+        ``[G, rows, cols]`` tensor and pushed through one Newton-Schulz
+        call (``newton_schulz_orthogonalize`` already handles a leading
+        batch dim; see ``muon.py:34-35``). Non-matrix params flatten into
+        three shared buffers (exp_avg, exp_avg_sq, grad) for a coalesced
+        in-place AdamW update.
+
+        Per-param ``self.state[p]`` entries are preserved so
+        ``optimizer.state_dict()`` serialization stays checkpoint-
+        compatible with the unfused path.
+        """
+        loss: Tensor | None = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
+        for group in self.param_groups:
+            lr = group["lr"]
+            momentum = group["momentum"]
+            nesterov = group["nesterov"]
+            ns_steps = group["ns_steps"]
+            wd = group["weight_decay"]
+            beta1, beta2 = group["adamw_betas"]
+            adamw_eps = group["adamw_eps"]
+            adamw_lr = group["adamw_lr"]
+            adamw_wd = group["adamw_weight_decay"]
+
+            matrix_groups: dict[tuple[int, int], list[Tensor]] = {}
+            nonmatrix_params: list[Tensor] = []
+
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+                if self._is_matrix_param(p):
+                    key = (int(p.shape[-2]), int(p.shape[-1]))
+                    matrix_groups.setdefault(key, []).append(p)
+                else:
+                    nonmatrix_params.append(p)
+
+            # ----- Matrix branch: one NS call per (rows, cols) shape-group.
+            for (rows, cols), params_in_group in matrix_groups.items():
+                # Ensure per-param momentum_buffer state exists first so
+                # per-param state dicts remain consistent for serialization.
+                bufs: list[Tensor] = []
+                grads: list[Tensor] = []
+                for p in params_in_group:
+                    state = self.state[p]
+                    if "momentum_buffer" not in state:
+                        state["momentum_buffer"] = torch.zeros_like(
+                            p, memory_format=torch.preserve_format
+                        )
+                    bufs.append(state["momentum_buffer"])
+                    grads.append(p.grad)
+
+                grad_stack = torch.stack(grads, dim=0)  # [G, rows, cols]
+                buf_stack = torch.stack(bufs, dim=0)
+
+                # Fused momentum update: buf = momentum * buf + grad
+                buf_stack.mul_(momentum).add_(grad_stack)
+                direction = (
+                    grad_stack.add(buf_stack, alpha=momentum) if nesterov else buf_stack
+                )
+                # Module-level lookup so monkeypatch.setattr on the module
+                # resolves to the patched callable (tests rely on this).
+                update_stack = newton_schulz_orthogonalize(
+                    direction, steps=ns_steps, compute_dtype=self._compute_dtype
+                )
+
+                # Rectangular-shape correction is constant across the group.
+                scale = max(1.0, rows / cols) ** 0.5
+
+                for i, p in enumerate(params_in_group):
+                    # Write the updated momentum buffer back into per-param
+                    # state so state_dict() keeps its per-param entries.
+                    # copy_ rather than reassign so any external aliases on
+                    # self.state[p]["momentum_buffer"] remain valid.
+                    self.state[p]["momentum_buffer"].copy_(buf_stack[i])
+                    if wd > 0.0:
+                        p.data.mul_(1.0 - lr * wd)
+                    p.data.add_(update_stack[i].to(dtype=p.dtype), alpha=-lr * scale)
+
+            # ----- Non-matrix branch: coalesced AdamW over flat buffers.
+            if not nonmatrix_params:
+                continue
+
+            # Initialize state for any uninitialized params and collect the
+            # per-param tensors. We deliberately keep per-param state dicts
+            # rather than one global (exp_avg, exp_avg_sq) buffer so
+            # state_dict() structure matches the unfused path.
+            exp_avgs: list[Tensor] = []
+            exp_avg_sqs: list[Tensor] = []
+            grads_flat: list[Tensor] = []
+            steps_before: list[int] = []
+            for p in nonmatrix_params:
+                state = self.state[p]
+                if "step" not in state:
+                    state["step"] = 0
+                    state["exp_avg"] = torch.zeros_like(
+                        p, memory_format=torch.preserve_format
+                    )
+                    state["exp_avg_sq"] = torch.zeros_like(
+                        p, memory_format=torch.preserve_format
+                    )
+                exp_avgs.append(state["exp_avg"])
+                exp_avg_sqs.append(state["exp_avg_sq"])
+                grads_flat.append(p.grad)
+                steps_before.append(state["step"])
+
+            # Defensive: if step counters are mixed (e.g., a param was added
+            # mid-training), fall back to per-param AdamW. The training loop
+            # creates the optimizer once so this should never fire; the
+            # assertion-style fallback exists to keep correctness under
+            # hand-edited state_dicts.
+            uniform_step = all(s == steps_before[0] for s in steps_before)
+            if not uniform_step:
+                for p in nonmatrix_params:
+                    state = self.state[p]
+                    state["step"] += 1
+                    t = state["step"]
+                    exp_avg = state["exp_avg"]
+                    exp_avg_sq = state["exp_avg_sq"]
+                    grad = p.grad
+                    exp_avg.mul_(beta1).add_(grad, alpha=1.0 - beta1)
+                    exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1.0 - beta2)
+                    bias1 = 1.0 - beta1 ** t
+                    bias2 = 1.0 - beta2 ** t
+                    denom = (exp_avg_sq.sqrt() / (bias2 ** 0.5)).add_(adamw_eps)
+                    if adamw_wd > 0.0:
+                        p.data.mul_(1.0 - adamw_lr * adamw_wd)
+                    p.data.addcdiv_(exp_avg, denom, value=-adamw_lr / bias1)
+                continue
+
+            # Uniform step-count path: coalesced update over flat buffers.
+            # We flatten views into a contiguous 1D buffer via the stdlib
+            # helper (reused from chaoscontrol.distributed.allreduce_grads'
+            # coalesce pattern). In-place ops on the flat buffer write
+            # through to the per-param tensors because _unflatten_dense_
+            # tensors returns views on the flat buffer.
+            from torch._utils import (
+                _flatten_dense_tensors,
+                _unflatten_dense_tensors,
+            )
+
+            # Flatten each tensor list. Each _flatten call concatenates a
+            # detached copy of the input tensors, so updates on the flat
+            # buffer will need to be copied back. This is the standard
+            # coalesce pattern — the same one allreduce_grads uses.
+            exp_avg_flat = _flatten_dense_tensors(exp_avgs)
+            exp_avg_sq_flat = _flatten_dense_tensors(exp_avg_sqs)
+            grad_flat = _flatten_dense_tensors(grads_flat)
+
+            t = steps_before[0] + 1
+            exp_avg_flat.mul_(beta1).add_(grad_flat, alpha=1.0 - beta1)
+            exp_avg_sq_flat.mul_(beta2).addcmul_(grad_flat, grad_flat, value=1.0 - beta2)
+            bias1 = 1.0 - beta1 ** t
+            bias2 = 1.0 - beta2 ** t
+            denom_flat = (exp_avg_sq_flat.sqrt() / (bias2 ** 0.5)).add_(adamw_eps)
+
+            # Copy the flat results back to per-param state, then apply the
+            # parameter update per-param (weight decay + addcdiv). Applying
+            # the update on the flat buffer would require matching dtypes
+            # across every param; per-param copy-back preserves the
+            # unfused path's dtype handling exactly.
+            exp_avg_views = _unflatten_dense_tensors(exp_avg_flat, exp_avgs)
+            exp_avg_sq_views = _unflatten_dense_tensors(exp_avg_sq_flat, exp_avg_sqs)
+            denom_views = _unflatten_dense_tensors(denom_flat, exp_avgs)
+
+            for i, p in enumerate(nonmatrix_params):
+                state = self.state[p]
+                state["exp_avg"].copy_(exp_avg_views[i])
+                state["exp_avg_sq"].copy_(exp_avg_sq_views[i])
+                state["step"] = t
+                if adamw_wd > 0.0:
+                    p.data.mul_(1.0 - adamw_lr * adamw_wd)
+                p.data.addcdiv_(
+                    state["exp_avg"], denom_views[i], value=-adamw_lr / bias1,
+                )
 
         return loss

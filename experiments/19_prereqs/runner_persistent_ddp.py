@@ -106,6 +106,41 @@ from runner_exp18_ssm import (  # noqa: E402
 )
 
 
+def _build_optimizer_with_fused_muon(
+    optimizer_name: str,
+    model: torch.nn.Module,
+    *,
+    base_lr: float,
+    weight_decay: float,
+    fused_muon: bool,
+) -> torch.optim.Optimizer:
+    """Wrapper around frozen ``_build_optimizer`` that honors ``fused_muon``.
+
+    ``_build_optimizer`` in ``runner_exp18_ssm`` is frozen (Exp 18
+    submission regime); editing it would break bit-equivalence between
+    persistent-DDP entries and the Exp 18 runs they inherit from.
+    This wrapper defers to the frozen helper for the default path and
+    rebuilds the Muon instance with ``fused=True`` only when the flag
+    is on. The ``bind_param_names`` call mirrors the frozen helper so
+    the classifier path stays identical.
+    """
+    optimizer = _build_optimizer(
+        optimizer_name, model, base_lr=base_lr, weight_decay=weight_decay,
+    )
+    if fused_muon and optimizer_name == "muon":
+        from chaoscontrol.optim.muon import Muon
+        optimizer = Muon(
+            list(model.parameters()),
+            lr=base_lr,
+            weight_decay=weight_decay,
+            adamw_lr=base_lr,
+            adamw_weight_decay=weight_decay,
+            fused=True,
+        )
+        optimizer.bind_param_names(list(model.named_parameters()))
+    return optimizer
+
+
 def _config_hash(config: dict[str, Any]) -> str:
     """Short stable hash of a config, for dry-run printout."""
     payload = json.dumps(config, sort_keys=True, default=str).encode("utf-8")
@@ -324,8 +359,10 @@ def run_one_seed(
         )
     base_lr = float(config.get("base_lr", 2e-3))
     weight_decay = float(config.get("weight_decay", 1e-2))
-    optimizer = _build_optimizer(
+    fused_muon = bool(config.get("fused_muon", False))
+    optimizer = _build_optimizer_with_fused_muon(
         optimizer_name, model, base_lr=base_lr, weight_decay=weight_decay,
+        fused_muon=fused_muon,
     )
     chunk_size = int(config.get("chunk_size", 64))
     grad_clip_norm = float(config.get("grad_clip_norm", 1.0))
@@ -369,8 +406,9 @@ def run_one_seed(
             )
 
         def _build_fresh_optimizer() -> torch.optim.Optimizer:
-            return _build_optimizer(
+            return _build_optimizer_with_fused_muon(
                 optimizer_name, model, base_lr=base_lr, weight_decay=weight_decay,
+                fused_muon=fused_muon,
             )
 
         optimizer = _warmup_and_restore(

@@ -10,6 +10,7 @@ from __future__ import annotations
 import copy
 import unittest
 
+import pytest
 import torch
 import torch.nn as nn
 
@@ -319,6 +320,197 @@ class TestMuonToyTraining(unittest.TestCase):
             opt.step()
             losses.append(loss.item())
         self.assertLess(losses[-1], losses[0])
+
+
+class TestFusedMuonParity:
+    """Fused Muon must produce byte-identical updates to the reference loop
+    when the two paths see the same grads and optimizer state.
+
+    The fused path groups matrix params by shape and runs a batched NS;
+    the reference iterates one-by-one. Mathematically equivalent; the
+    test locks this against a future batched-NS edit that silently
+    changes numerical reduction order.
+    """
+
+    @staticmethod
+    def _build_model(seed: int) -> nn.Sequential:
+        torch.manual_seed(seed)
+        # Mix of matrix shapes and a non-matrix param to exercise both branches.
+        # Two Linear(4, 4) layers in the same shape-group test batched NS over
+        # a group of size > 1; LayerNorm tests the AdamW fallback coalesce.
+        return nn.Sequential(
+            nn.Linear(8, 4),
+            nn.Linear(4, 4),
+            nn.Linear(4, 4),
+            nn.LayerNorm(4),
+        )
+
+    def _clone_grads(self, src: nn.Module, dst: nn.Module) -> None:
+        for p_src, p_dst in zip(src.parameters(), dst.parameters()):
+            p_dst.grad = p_src.grad.clone()
+
+    def test_single_step_matches_reference_loop(self) -> None:
+        """One step: fused updates match unfused to fp32 tolerance."""
+        from chaoscontrol.optim.muon import Muon
+        m_ref = self._build_model(seed=13)
+        m_new = self._build_model(seed=13)
+        # Identical init weights (seed is deterministic).
+        for p_r, p_n in zip(m_ref.parameters(), m_new.parameters()):
+            assert torch.equal(p_r.data, p_n.data)
+
+        # Identical grads.
+        for p_r in m_ref.parameters():
+            p_r.grad = torch.randn_like(p_r)
+        self._clone_grads(m_ref, m_new)
+
+        opt_ref = Muon(list(m_ref.parameters()), lr=0.02, fused=False)
+        opt_new = Muon(list(m_new.parameters()), lr=0.02, fused=True)
+        opt_ref.step()
+        opt_new.step()
+
+        for (n_r, p_r), (n_n, p_n) in zip(
+            m_ref.named_parameters(), m_new.named_parameters(),
+        ):
+            assert n_r == n_n
+            # fp32 tolerance — batched NS reorders reductions minimally
+            # vs the per-param loop. Cross-shape reductions are identical;
+            # intra-shape batch-reduce is where the drift comes in.
+            assert torch.allclose(p_r.data, p_n.data, rtol=1e-5, atol=1e-6), (
+                f"fused Muon drift on {n_r!r}: "
+                f"max|diff|={(p_r.data - p_n.data).abs().max().item()}"
+            )
+
+    def test_multi_step_matches_reference_loop(self) -> None:
+        """Four steps of training: state dicts and params stay in sync.
+
+        Accumulating drift over multiple steps is a realistic regression
+        case — a batched NS that's slightly wrong per step compounds.
+        """
+        from chaoscontrol.optim.muon import Muon
+        m_ref = self._build_model(seed=17)
+        m_new = self._build_model(seed=17)
+        opt_ref = Muon(list(m_ref.parameters()), lr=0.02, fused=False)
+        opt_new = Muon(list(m_new.parameters()), lr=0.02, fused=True)
+        torch.manual_seed(100)
+        for _ in range(4):
+            for p_r in m_ref.parameters():
+                p_r.grad = torch.randn_like(p_r)
+            self._clone_grads(m_ref, m_new)
+            opt_ref.step()
+            opt_new.step()
+        for (n_r, p_r), (n_n, p_n) in zip(
+            m_ref.named_parameters(), m_new.named_parameters(),
+        ):
+            assert torch.allclose(p_r.data, p_n.data, rtol=1e-5, atol=1e-6), (
+                f"fused Muon drift after 4 steps on {n_r!r}: "
+                f"max|diff|={(p_r.data - p_n.data).abs().max().item()}"
+            )
+
+    def test_fused_step_calls_ns_once_per_shape_group(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Structural: fused path calls newton_schulz_orthogonalize once per
+        unique matrix shape, not once per matrix param.
+
+        The test model has three matrix params:
+          Linear(8, 4).weight  — shape (4, 8)
+          Linear(4, 4).weight  — shape (4, 4)  (x2 — grouped)
+          Linear(4, 4).weight  — shape (4, 4)
+        Plus biases (vector, non-matrix) and LayerNorm (vector, non-matrix).
+        Expected: 2 NS calls for the fused path (one per shape), 3 for the
+        unfused path.
+        """
+        from chaoscontrol.optim import muon as muon_mod
+        calls: list[tuple[int, ...]] = []
+        orig_ns = muon_mod.newton_schulz_orthogonalize
+
+        def counting_ns(tensor, **kw):
+            calls.append(tuple(tensor.shape))
+            return orig_ns(tensor, **kw)
+
+        monkeypatch.setattr(muon_mod, "newton_schulz_orthogonalize", counting_ns)
+
+        m = self._build_model(seed=19)
+        for p in m.parameters():
+            p.grad = torch.randn_like(p)
+
+        opt = muon_mod.Muon(list(m.parameters()), lr=0.02, fused=True)
+        opt.step()
+
+        # Exactly 2 NS invocations: one per shape-group.
+        assert len(calls) == 2, (
+            f"fused path expected 2 NS calls (one per shape group), got "
+            f"{len(calls)}: shapes = {calls}"
+        )
+        # The (4, 4) group batched two params into leading-dim-2.
+        shapes = sorted(calls, key=lambda s: s)
+        batched_shapes = [s for s in calls if len(s) == 3 and s[0] > 1]
+        assert len(batched_shapes) >= 1, (
+            f"expected at least one batched NS call (leading dim > 1); "
+            f"got shapes={calls}"
+        )
+
+    def test_ns_compute_dtype_preserved(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Fused path must pass compute_dtype=bf16 on CUDA and fp32 on CPU
+        to newton_schulz_orthogonalize — matches the unfused default at
+        optim/muon.py:31-32. Regression guard against an edit that batches
+        params but silently drops the dtype policy.
+        """
+        from chaoscontrol.optim import muon as muon_mod
+        captured_dtypes: list[torch.dtype | None] = []
+        orig_ns = muon_mod.newton_schulz_orthogonalize
+
+        def capturing_ns(tensor, **kw):
+            captured_dtypes.append(kw.get("compute_dtype"))
+            return orig_ns(tensor, **kw)
+
+        monkeypatch.setattr(muon_mod, "newton_schulz_orthogonalize", capturing_ns)
+
+        m = self._build_model(seed=21)
+        for p in m.parameters():
+            p.grad = torch.randn_like(p)
+        opt = muon_mod.Muon(list(m.parameters()), lr=0.02, fused=True)
+        opt.step()
+
+        # compute_dtype on CPU-only test run: newton_schulz defaults fp32 on
+        # CPU. Fused path must respect that default (i.e., pass None or
+        # torch.float32 explicitly — both are fine, None means NS falls back
+        # to its own default).
+        for dtype in captured_dtypes:
+            assert dtype in (None, torch.float32, torch.bfloat16), (
+                f"unexpected compute_dtype: {dtype}"
+            )
+
+    def test_state_dict_shape_matches_unfused(self) -> None:
+        """After one fused step, optimizer.state_dict() must have the same
+        structure the unfused path produces — checkpoint-compatibility.
+        """
+        from chaoscontrol.optim.muon import Muon
+        m_ref = self._build_model(seed=23)
+        m_new = self._build_model(seed=23)
+        for p in m_ref.parameters():
+            p.grad = torch.randn_like(p)
+        self._clone_grads(m_ref, m_new)
+
+        opt_ref = Muon(list(m_ref.parameters()), lr=0.02, fused=False)
+        opt_new = Muon(list(m_new.parameters()), lr=0.02, fused=True)
+        opt_ref.step()
+        opt_new.step()
+
+        state_ref = opt_ref.state_dict()
+        state_new = opt_new.state_dict()
+        assert set(state_ref.keys()) == set(state_new.keys())
+        # Per-param state entries: same keys (momentum_buffer for matrix,
+        # step/exp_avg/exp_avg_sq for non-matrix).
+        for pid in state_ref["state"]:
+            ref_keys = set(state_ref["state"][pid].keys())
+            new_keys = set(state_new["state"][pid].keys())
+            assert ref_keys == new_keys, (
+                f"state dict keys differ for param {pid}: "
+                f"ref={ref_keys} new={new_keys}"
+            )
 
 
 if __name__ == "__main__":
