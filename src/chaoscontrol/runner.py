@@ -85,6 +85,20 @@ def build_model(cfg: ChaosControlConfig, device: torch.device, param_dtype: torc
     model = model.to(device)
     if device.type == "cuda":
         model = model.to(dtype=param_dtype)
+
+    # Exp 21: optional SGNS (or other) pretrained embedding init for model.embed.weight
+    if getattr(cfg, "embed_init_path", None):
+        embed_weights = torch.load(cfg.embed_init_path, map_location=device)
+        expected = model.embed.weight.shape
+        assert embed_weights.shape == expected, (
+            f"embed_init_path shape mismatch: got {tuple(embed_weights.shape)}, "
+            f"expected {tuple(expected)}"
+        )
+        embed_weights = embed_weights.to(
+            device=model.embed.weight.device, dtype=model.embed.weight.dtype
+        )
+        with torch.no_grad():
+            model.embed.weight.data.copy_(embed_weights)
     return model
 
 

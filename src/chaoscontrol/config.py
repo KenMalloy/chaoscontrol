@@ -135,6 +135,9 @@ class ChaosControlConfig:
     align_type: str = "none"  # "none", "contrastive", "distill", "diversity"
     align_weight: float = 0.05
 
+    # Exp 21: optional path to a (vocab_size, model_dim) .pt tensor used to init model.embed.weight
+    embed_init_path: str | None = None
+
     # Sleep cycle parameters
     sleep_enabled: bool = False
     sleep_stages: str = "full_cycle"  # "full_cycle", "n3_only", "rem_only", "n2_only"
