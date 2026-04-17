@@ -19,7 +19,12 @@
 #   - nvidia-cublas-cu13 is pinned EXPLICITLY because TE's pre-built
 #     libtransformer_engine.so is compiled against its specific cublasLt
 #     ABI. Letting pip resolve nvidia-cublas (generic, newer) breaks TE.
-#   - Idempotent: if TE already imports cleanly, skip the whole reinstall.
+#   - Idempotent: if EVERY required dep imports cleanly, skip the whole
+#     reinstall. Checking only TE was not enough — a pod with working TE
+#     but missing sentencepiece / pytest / editable chaoscontrol install
+#     would hit the fast-path, declare "Pod ready," and then immediately
+#     fail the first test import. The probe below covers every dep the
+#     full install below produces.
 #
 # Dead-ends we tried that did NOT work — do not copy from shell history:
 #   - transformer-engine==1.13 / 1.14 / 2.1 / 2.12 (source builds need
@@ -47,17 +52,31 @@ PIP_FLAGS=(--break-system-packages --only-binary=:all:)
 NVIDIA_INDEX="--extra-index-url https://pypi.nvidia.com"
 PYTORCH_CU130="--extra-index-url https://download.pytorch.org/whl/cu130"
 
-echo "==> checking whether TE already works (skip reinstall if so)"
-if python3 -c "import transformer_engine.pytorch as te; import torch; \
-    lin = te.Linear(16, 16, device='cuda' if torch.cuda.is_available() else 'cpu'); \
-    print('TE OK')" 2>/dev/null | grep -q "TE OK"; then
-    echo "    TE imports and constructs a Linear — skipping reinstall."
-    echo "    (delete the import or force-reinstall if you need a clean rebuild.)"
+echo "==> checking whether every required dep already works (skip reinstall if so)"
+# Probe every dep the full install below produces — torch, TE (with a
+# Linear construction smoke to catch broken cublas linking), sentencepiece,
+# numpy, pytest, and the editable chaoscontrol package. If ANY fails,
+# fall through to the full install. Fast-path declaring "Pod ready" with
+# missing deps would only be caught at first test import, wasting pod
+# time and obscuring which dep actually went missing.
+if python3 - <<'PROBE' 2>/dev/null
+import torch
+import transformer_engine.pytorch as te
+import sentencepiece  # noqa: F401
+import numpy  # noqa: F401
+import pytest  # noqa: F401
+import chaoscontrol  # noqa: F401 — editable install present
+_ = te.Linear(16, 16, device='cuda' if torch.cuda.is_available() else 'cpu')
+PROBE
+then
+    echo "    torch + TE + sentencepiece + numpy + pytest + chaoscontrol all import;"
+    echo "    TE Linear constructs — skipping reinstall."
+    echo "    (force-reinstall by removing one of the above imports from the pod.)"
     echo ""
     echo "Pod ready."
     exit 0
 fi
-echo "    TE not working; proceeding with install."
+echo "    one or more deps missing/broken; proceeding with full install."
 
 echo "==> 1/5 upgrading pip"
 pip install --break-system-packages --upgrade pip
