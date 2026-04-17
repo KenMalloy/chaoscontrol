@@ -87,6 +87,7 @@ REPO = Path(__file__).resolve().parents[2]
 EXPERIMENT = Path(__file__).resolve().parent
 RESULTS = EXPERIMENT / "results_test8"
 RUNNER_SSM = EXPERIMENT / "runner_exp18_ssm.py"
+TEST5B_SUMMARY = EXPERIMENT / "results_test5b" / "test5b_summary.json"
 
 sys.path.insert(0, str(REPO / "experiments" / "09_revised_architecture"))
 sys.path.insert(0, str(EXPERIMENT))
@@ -99,19 +100,69 @@ from _harness import (  # noqa: E402
 
 SWEEP_SEEDS = [1337, 2674, 4011, 5348]
 
-# Locked LR from Test 5b — see
-# memory/project_exp18_test5b_results_2026-04-16.md. Re-screening LR
-# inside a seq sweep would turn a single-axis test into a 2D screen
-# (seq × LR). We inherit instead and accept that the optimum LR may
-# shift slightly with seq; any surprise in Test 8 that suggests
-# LR/seq interaction is a signal to run a targeted follow-up, not a
-# reason to nest the screens here.
-LOCKED_LR = 0.064
+# Conditions that OOM'd during the run and should be annotated in the
+# summary rather than silently excluded from winner selection.
+# Populated by main() from the return value of run_parallel_ddp_matrix.
+_OOM_SKIPPED: list[str] = []
 
 SEQ_VALUES = (512, 1024, 2048)
 
 
-def _base(seq_len: int, **overrides: Any) -> dict[str, Any]:
+def _read_test5b_winning_lr() -> tuple[float | None, str]:
+    """Read Test 5b's winning LR from its summary JSON.
+
+    Returns (lr, status) where status is:
+        "ok"        — Test 5b emitted a winner; lr is valid
+        "no_winner" — Test 5b ran but emitted no winner
+        "missing"   — Test 5b summary doesn't exist
+    """
+    if not TEST5B_SUMMARY.exists():
+        return None, "missing"
+    try:
+        data = json.loads(TEST5B_SUMMARY.read_text())
+    except Exception:
+        return None, "missing"
+    decision = data.get("_decision", {}) or {}
+    lr = decision.get("winner_base_lr")
+    winner = decision.get("winner_lr_condition")
+    if winner is None or lr is None:
+        return None, "no_winner"
+    return float(lr), "ok"
+
+
+def _resolve_base_lr(cli_override: float | None) -> float:
+    """Pick the LR Test 8 runs at.
+
+    Priority:
+      1. Explicit ``--base-lr`` CLI override (user asserts they know
+         what they're doing, ignore Test 5b's winner).
+      2. Test 5b's validated winner from results_test5b/test5b_summary.json.
+      3. Otherwise REFUSE to run. A missing summary or a Test 5b that
+         couldn't pick a winner means we don't actually know what LR
+         to run Test 8 at — hardcoding a guess would make the regime
+         contract false.
+
+    Mirrors the pattern Test 6 uses for reading Test 5's winner
+    (run_exp18_test6.py:259).
+    """
+    if cli_override is not None:
+        print(f"Test 8: using --base-lr override {cli_override}", flush=True)
+        return float(cli_override)
+    lr, status = _read_test5b_winning_lr()
+    if status == "ok":
+        print(
+            f"Test 8: inherited base_lr={lr} from Test 5b winner",
+            flush=True,
+        )
+        return lr
+    raise RuntimeError(
+        f"Test 8 could not resolve base_lr (status={status!r}). Either run "
+        f"Test 5b first so its summary exists at {TEST5B_SUMMARY}, or pass "
+        f"--base-lr <value> to override."
+    )
+
+
+def _base(seq_len: int, base_lr: float, **overrides: Any) -> dict[str, Any]:
     cfg = {
         "model_type": "ssm",
         "vocab_size": 16384,
@@ -127,7 +178,7 @@ def _base(seq_len: int, **overrides: Any) -> dict[str, Any]:
         "batch_size": 1024,  # inherited from Test 5b — bs/rank at ws=2
         "eval_batches": 16,
         "a_mode": "diag",
-        "base_lr": LOCKED_LR,
+        "base_lr": base_lr,
         # Uniform checkpointing across all conditions so the seq
         # comparison isn't confounded by ckpt state. Costs ~30% compute
         # per step at seq=512 where ckpt isn't memory-necessary, but
@@ -143,9 +194,18 @@ def _base(seq_len: int, **overrides: Any) -> dict[str, Any]:
     return cfg
 
 
-CONDITIONS: dict[str, dict[str, Any]] = {
-    f"seq{seq}": _base(seq_len=seq) for seq in SEQ_VALUES
-}
+def build_conditions(base_lr: float) -> dict[str, dict[str, Any]]:
+    return {
+        f"seq{seq}": _base(seq_len=seq, base_lr=base_lr) for seq in SEQ_VALUES
+    }
+
+
+# Module-level CONDITIONS is constructed from whichever LR main() picked.
+# Populated in main() after _resolve_base_lr. Importers that rely on the
+# old static CONDITIONS attribute will see an empty dict — the intended
+# contract is that main() is the single entry point and everything
+# downstream (summarize_results) receives its conditions explicitly.
+CONDITIONS: dict[str, dict[str, Any]] = {}
 
 
 def _mean(values: list[float]) -> float:
@@ -267,12 +327,18 @@ def summarize_results(conditions: dict[str, dict[str, Any]]) -> dict[str, Any]:
         ),
         "stage1_candidate": candidate,
         "stable_conditions": [row["name"] for row in stable_rows],
+        "oom_skipped_conditions": list(_OOM_SKIPPED),
         "invalid_result_files": invalid_results,
     }
     if invalid_results:
         print(
             f"\nDropped {len(invalid_results)} non-finite result file(s): "
             f"{invalid_results}"
+        )
+    if _OOM_SKIPPED:
+        print(
+            f"\nOOM-skipped conditions (excluded from winner selection): "
+            f"{_OOM_SKIPPED}"
         )
     print(f"\nGate: winner = {winner}")
     return summary
@@ -289,16 +355,33 @@ def main() -> None:
         "--num-slots", type=int, default=2,
         help="Number of parallel DDP groups (each uses 2 GPUs)",
     )
+    parser.add_argument(
+        "--base-lr",
+        type=float,
+        default=None,
+        help=(
+            "Override the base LR. Defaults to Test 5b's winner "
+            "(read from results_test5b/test5b_summary.json); fails "
+            "fast if that summary is missing or doesn't have a winner."
+        ),
+    )
     parser.add_argument("--summarize-only", action="store_true")
     args = parser.parse_args()
+
+    base_lr = _resolve_base_lr(args.base_lr)
+    global CONDITIONS
+    CONDITIONS = build_conditions(base_lr)
 
     if not args.summarize_only:
         validate_data_paths(args.data_path, args.sp_model_path)
         # skip_oom_conditions=True so seq=2048 (most memory-hungry
         # condition) can OOM without wiping the results from seq=512
         # and seq=1024. The harness drops the remaining seeds of an
-        # OOMing condition and continues with the others.
-        run_parallel_ddp_matrix(
+        # OOMing condition and continues with the others. The skipped
+        # condition names are captured here and surfaced in the
+        # summary's oom_skipped_conditions field so a dropped condition
+        # never silently vanishes from the scientific record.
+        skipped = run_parallel_ddp_matrix(
             conditions=CONDITIONS,
             seeds=SWEEP_SEEDS,
             ws_per_slot=2,
@@ -310,8 +393,10 @@ def main() -> None:
             runner_script=RUNNER_SSM,
             skip_oom_conditions=True,
         )
+        _OOM_SKIPPED.extend(skipped)
 
     summary = summarize_results(CONDITIONS)
+    summary["_base_lr"] = base_lr
     RESULTS.mkdir(parents=True, exist_ok=True)
     (RESULTS / "test8_summary.json").write_text(
         json.dumps(summary, indent=2, default=str)
