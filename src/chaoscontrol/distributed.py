@@ -25,6 +25,7 @@ The gradient-sync design here is the outcome of three DDP bugs fixed on
 from __future__ import annotations
 
 import os
+from typing import Iterable
 
 import torch
 import torch.distributed as dist
@@ -62,6 +63,42 @@ def allreduce_grads(model: torch.nn.Module, world_size: int) -> None:
     synced = torch._utils._unflatten_dense_tensors(flat, grads)
     for g, s in zip(grads, synced):
         g.copy_(s)
+
+
+def clip_grad_norm_fused(
+    parameters: Iterable[torch.nn.Parameter],
+    max_norm: float,
+    norm_type: float = 2.0,
+) -> torch.Tensor:
+    """Coalesced L2 grad clip — byte-equivalent to torch.nn.utils.clip_grad_norm_.
+
+    Flattens every grad into one buffer, computes the global L2 norm via
+    a single kernel, and applies one in-place multiplicative clip factor
+    across the buffer. Avoids the per-param norm + stack + global-norm
+    dance the stdlib helper walks through in Python.
+
+    Grad tensor identity (.data_ptr()) is preserved — the clip writes
+    back into the original tensors via unflatten + copy_, matching the
+    contract allreduce_grads established on 2026-04-17.
+    """
+    if float(norm_type) != 2.0:
+        raise NotImplementedError(
+            "clip_grad_norm_fused only implements L2 (norm_type=2.0); "
+            "fall back to torch.nn.utils.clip_grad_norm_ for other norms."
+        )
+    grads = [p.grad for p in parameters if p.grad is not None]
+    if not grads:
+        return torch.zeros(())
+    flat = torch._utils._flatten_dense_tensors(grads)
+    total_norm = flat.norm(p=2)
+    clip_coef = max_norm / (total_norm + 1e-6)
+    clip_coef_clamped = torch.clamp(clip_coef, max=1.0)
+    if clip_coef_clamped.item() < 1.0:
+        flat.mul_(clip_coef_clamped)
+        synced = torch._utils._unflatten_dense_tensors(flat, grads)
+        for g, s in zip(grads, synced):
+            g.copy_(s)
+    return total_norm
 
 
 def should_stop_now(

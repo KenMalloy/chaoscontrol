@@ -30,6 +30,7 @@ from chaoscontrol.data import batch_from_starts
 from chaoscontrol.distributed import (
     allreduce_grads,
     broadcast_params,
+    clip_grad_norm_fused,
     resolve_ddp_context,
     should_stop_now,
 )
@@ -224,6 +225,7 @@ def train_ssm_for_budget(
     budget_seconds: float,
     chunk_size: int,
     grad_clip_norm: float = 0.0,
+    fused_grad_clip: bool = False,
     rank: int | None = None,
     world_size: int | None = None,
     seed: int = 0,
@@ -302,7 +304,10 @@ def train_ssm_for_budget(
             precision=precision,
         )
         if grad_clip_norm > 0.0:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
+            if fused_grad_clip:
+                clip_grad_norm_fused(model.parameters(), grad_clip_norm)
+            else:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
         optimizer.step()
 
         loss_tensors.append(loss.detach())

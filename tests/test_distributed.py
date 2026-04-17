@@ -21,6 +21,82 @@ import torch.nn as nn
 from chaoscontrol.distributed import allreduce_grads, resolve_ddp_context
 
 
+class TestClipGradNormFused:
+    """Byte-identical to torch.nn.utils.clip_grad_norm_ for the L2 norm case."""
+
+    @staticmethod
+    def _build_model_with_mixed_grads(seed: int) -> nn.Module:
+        torch.manual_seed(seed)
+        model = nn.Sequential(nn.Linear(8, 4), nn.Linear(4, 2))
+        for i, p in enumerate(model.parameters()):
+            p.grad = torch.randn_like(p) * (i + 1) + float(i)
+        return model
+
+    def test_matches_reference_on_clipping_regime(self) -> None:
+        """Grads well above max_norm — clipping must fire on both paths.
+
+        The stdlib path computes total_norm as
+        ``vector_norm(stack([norm(g) for g in grads]))`` — per-tensor
+        norms then one final reduction over the stack. The fused path
+        computes ``flat.norm()`` directly on the flattened buffer —
+        one global reduction. Both are mathematically equivalent L2
+        norms over the same values, but the reduction orders differ
+        so the results agree to fp32 tolerance, not bit-identity.
+        The clip coefficient inherits that tolerance, so clipped grads
+        match via allclose (not torch.equal).
+        """
+        from chaoscontrol.distributed import clip_grad_norm_fused
+        model_ref = self._build_model_with_mixed_grads(seed=7)
+        model_new = self._build_model_with_mixed_grads(seed=7)
+        max_norm = 0.1  # chosen to fire clipping on these grads
+        ref_total = torch.nn.utils.clip_grad_norm_(
+            model_ref.parameters(), max_norm,
+        )
+        new_total = clip_grad_norm_fused(model_new.parameters(), max_norm)
+        assert torch.allclose(ref_total, new_total, rtol=1e-6, atol=0.0), (
+            f"total_norm mismatch: ref={ref_total} new={new_total}"
+        )
+        for (n1, p1), (n2, p2) in zip(
+            model_ref.named_parameters(), model_new.named_parameters(),
+        ):
+            assert n1 == n2
+            assert torch.allclose(p1.grad, p2.grad, rtol=1e-6, atol=1e-7), (
+                f"clipped grad mismatch on {n1!r}: "
+                f"max abs diff = {(p1.grad - p2.grad).abs().max().item()}"
+            )
+
+    def test_matches_reference_below_clip_threshold(self) -> None:
+        """Grads below max_norm — both paths must be no-ops for values.
+
+        When clipping doesn't fire, no multiplicative scaling touches the
+        grads, so bit-identity IS preserved on both paths (the fused
+        path's ``if clip_coef_clamped.item() < 1.0`` short-circuits the
+        copy-back entirely). Stricter check than the clipping regime.
+        """
+        from chaoscontrol.distributed import clip_grad_norm_fused
+        model_ref = self._build_model_with_mixed_grads(seed=11)
+        model_new = self._build_model_with_mixed_grads(seed=11)
+        max_norm = 1e6  # above any realistic grad norm
+        torch.nn.utils.clip_grad_norm_(model_ref.parameters(), max_norm)
+        clip_grad_norm_fused(model_new.parameters(), max_norm)
+        for p1, p2 in zip(model_ref.parameters(), model_new.parameters()):
+            assert torch.equal(p1.grad, p2.grad)
+
+    def test_empty_params_is_no_op(self) -> None:
+        from chaoscontrol.distributed import clip_grad_norm_fused
+        total = clip_grad_norm_fused([], max_norm=1.0)
+        assert float(total) == 0.0
+
+    def test_grad_identity_preserved(self) -> None:
+        """p.grad tensor identity must survive — optimizer holds refs."""
+        from chaoscontrol.distributed import clip_grad_norm_fused
+        model = self._build_model_with_mixed_grads(seed=23)
+        ptrs_before = [p.grad.data_ptr() for p in model.parameters()]
+        clip_grad_norm_fused(model.parameters(), max_norm=0.1)
+        ptrs_after = [p.grad.data_ptr() for p in model.parameters()]
+        assert ptrs_before == ptrs_after
+
+
 class TestResolveDDPContext:
     def test_explicit_args_passed_through(self) -> None:
         assert resolve_ddp_context(rank=2, world_size=4) == (2, 4)

@@ -128,6 +128,83 @@ class TestTrainSSMStepEquivalence:
             f"max-abs diff {worst}. all diffs: {max_diff_by_param}"
         )
 
+    def test_fused_grad_clip_matches_stdlib_trajectory(
+        self, bare_ssm_model: ChaosStudentLM,
+    ) -> None:
+        """End-to-end loss trajectory parity with fused_grad_clip toggled.
+
+        Runs train_ssm_for_budget with the same seed and deterministic
+        clock under both paths (stdlib clip_grad_norm_ vs fused). The
+        fused path recomputes the global L2 norm via a single flat
+        reduction rather than the per-tensor-norm-then-stack reduction
+        the stdlib helper uses, so under fp32/CPU the loss trajectory
+        agrees to fp reduction-order tolerance, not bit-identity. The
+        diff is within the ~1e-6 relative noise of the norm computation
+        propagated through a handful of optimizer steps.
+        """
+        g = torch.Generator().manual_seed(29)
+        vocab = bare_ssm_model.vocab_size
+        train_tokens = torch.randint(0, vocab, (256,), generator=g)
+        train_starts = list(range(0, 256 - 16, 4))
+
+        model_ref = bare_ssm_model
+        model_new = copy.deepcopy(model_ref)
+
+        optimizer_ref = torch.optim.AdamW(model_ref.parameters(), lr=1e-3)
+        result_ref = train_ssm_for_budget(
+            model=model_ref,
+            train_tokens=train_tokens,
+            train_starts=train_starts,
+            seq_len=16,
+            batch_size=2,
+            device=torch.device("cpu"),
+            optimizer=optimizer_ref,
+            budget_seconds=1e9,  # max_steps gates the loop
+            chunk_size=16,
+            grad_clip_norm=0.1,  # small enough to fire clipping
+            fused_grad_clip=False,
+            seed=0,
+            time_fn=_DeterministicClock(step=0.25),
+            max_steps=5,
+        )
+
+        optimizer_new = torch.optim.AdamW(model_new.parameters(), lr=1e-3)
+        result_new = train_ssm_for_budget(
+            model=model_new,
+            train_tokens=train_tokens,
+            train_starts=train_starts,
+            seq_len=16,
+            batch_size=2,
+            device=torch.device("cpu"),
+            optimizer=optimizer_new,
+            budget_seconds=1e9,
+            chunk_size=16,
+            grad_clip_norm=0.1,
+            fused_grad_clip=True,
+            seed=0,
+            time_fn=_DeterministicClock(step=0.25),
+            max_steps=5,
+        )
+
+        assert result_ref["steps"] == result_new["steps"] == 5
+        losses_ref = [row["loss"] for row in result_ref["history"]]
+        losses_new = [row["loss"] for row in result_new["history"]]
+        # Step 0: both paths see identical grads (clip happens after
+        # backward), so loss[0] is bit-identical regardless of clip path.
+        assert losses_ref[0] == losses_new[0], (
+            f"loss[0] must match pre-clip: ref={losses_ref[0]} new={losses_new[0]}"
+        )
+        # Subsequent steps: clipped grads differ by fp reduction-order
+        # (see test_distributed.py::TestClipGradNormFused). That
+        # propagates through the optimizer into parameter values and
+        # onto the next forward's loss. The drift is bounded by the
+        # ~1e-6 relative norm difference compounded over a handful of
+        # steps — well under 1e-4 absolute on these scales.
+        for i, (lr, ln) in enumerate(zip(losses_ref, losses_new)):
+            assert abs(lr - ln) < 1e-4, (
+                f"loss[{i}] drift too large: ref={lr} new={ln} diff={lr - ln}"
+            )
+
     def test_grads_match_with_small_chunks(self, bare_ssm_model: ChaosStudentLM) -> None:
         # Exercise actual chunking: seq=16, chunk=4 → 4 chunks.
         # Reduction order differs from the old path (per-chunk sum / N then

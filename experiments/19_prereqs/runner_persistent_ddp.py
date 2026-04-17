@@ -329,6 +329,7 @@ def run_one_seed(
     )
     chunk_size = int(config.get("chunk_size", 64))
     grad_clip_norm = float(config.get("grad_clip_norm", 1.0))
+    fused_grad_clip = bool(config.get("fused_grad_clip", False))
 
     # Warmup-restore phase — matches Parameter Golf's pre-timer warmup
     # (baselines/parameter_golf/train_gpt.py lines 935-961). Runs
@@ -359,6 +360,7 @@ def run_one_seed(
                 budget_seconds=300.0,
                 chunk_size=chunk_size,
                 grad_clip_norm=grad_clip_norm,
+                fused_grad_clip=fused_grad_clip,
                 seed=seed,
                 rank=rank,
                 world_size=world_size,
@@ -392,6 +394,7 @@ def run_one_seed(
         budget_seconds=budget_seconds,
         chunk_size=chunk_size,
         grad_clip_norm=grad_clip_norm,
+        fused_grad_clip=fused_grad_clip,
         seed=seed,
         rank=rank,
         world_size=world_size,
