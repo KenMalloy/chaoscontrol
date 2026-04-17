@@ -5,7 +5,7 @@
 **Goal:** Close the Exp 18 → Exp 19 training-time underfit gap by removing every piece of per-step overhead that currently subtracts from steps-per-second at matched wall-clock, and unlock fp8 as a genuine throughput lever at our `dim=256` scale by replacing TransformerEngine's high-overhead kernel path with a bespoke cuBLASLt path.
 
 **Architecture:** Two parallel tracks that converge into one ablation matrix.
-- **Phase 1A (bf16 throughput, sequential):** fused grad clip, fused Muon step, full-path `torch.compile`. Each lands behind a config flag so the ablation can toggle it. TDD gates ensure each kernel produces byte-identical output to the reference it replaces before a throughput claim is made.
+- **Phase 1A (bf16 throughput, sequential):** fused grad clip, fused Muon step, full-path `torch.compile`. Each lands behind a config flag so the ablation can toggle it. TDD gates ensure each kernel produces numerically-equivalent output to the reference it replaces (parity via ``allclose`` at fp32 tolerance — reduction order changes, e.g. one flat norm vs per-tensor norms stacked, so byte equality is not the right bar) before a throughput claim is made.
 - **Phase 1B (bespoke fp8, parallel track):** cuBLASLt fused cast+GEMM+cast with deferred amax tracking, plumbed behind the existing `precision` abstraction. Numerical validation against stock TE confirms the kernel is arithmetically correct; bf16-matched-seed training trajectory validation confirms it trains.
 - **Phase 1C (ablation matrix):** One-at-a-time lever-leave-out matrix × {bf16, fp8} run via the persistent-DDP launcher. Summarizer reports tokens/sec, final_loss, bpb, and the marginal contribution of each lever.
 
@@ -50,7 +50,7 @@ Add to `tests/test_distributed.py`:
 
 ```python
 class TestClipGradNormFused:
-    """Byte-identical to torch.nn.utils.clip_grad_norm_ for the L2 norm case."""
+    """Numerical parity with torch.nn.utils.clip_grad_norm_ at fp32 tolerance."""
 
     @staticmethod
     def _build_model_with_mixed_grads(seed: int) -> nn.Module:
@@ -125,16 +125,13 @@ def clip_grad_norm_fused(
     max_norm: float,
     norm_type: float = 2.0,
 ) -> torch.Tensor:
-    """Coalesced L2 grad clip — byte-equivalent to torch.nn.utils.clip_grad_norm_.
+    """Coalesced L2 grad clip — numerical parity with torch.nn.utils.clip_grad_norm_ at fp32 tolerance.
 
-    Flattens every grad into one buffer, computes the global L2 norm via
-    a single kernel, and applies one in-place multiplicative clip factor
-    across the buffer. Avoids the per-param norm + stack + global-norm
-    dance the stdlib helper walks through in Python.
-
-    Grad tensor identity (.data_ptr()) is preserved — the clip writes
-    back into the original tensors via unflatten + copy_, matching the
-    contract allreduce_grads established on 2026-04-17.
+    Reduction order differs (one flat norm vs per-tensor norms stacked
+    and re-reduced), so results agree via ``allclose(rtol=1e-6, atol=1e-7)``,
+    not ``torch.equal``. Grad tensor identity (.data_ptr()) is preserved —
+    the clip writes back into the original tensors via unflatten + copy_,
+    matching the contract allreduce_grads established on 2026-04-17.
     """
     if float(norm_type) != 2.0:
         raise NotImplementedError(
@@ -148,11 +145,13 @@ def clip_grad_norm_fused(
     total_norm = flat.norm(p=2)
     clip_coef = max_norm / (total_norm + 1e-6)
     clip_coef_clamped = torch.clamp(clip_coef, max=1.0)
-    if clip_coef_clamped.item() < 1.0:
-        flat.mul_(clip_coef_clamped)
-        synced = torch._utils._unflatten_dense_tensors(flat, grads)
-        for g, s in zip(grads, synced):
-            g.copy_(s)
+    # Unconditional multiply — a .item() guard would force a GPU→CPU sync every
+    # step, defeating the whole point of Phase 1A. See torch's own
+    # _clip_grads_with_norm_ for the same motivation.
+    flat.mul_(clip_coef_clamped)
+    synced = torch._utils._unflatten_dense_tensors(flat, grads)
+    for g, s in zip(grads, synced):
+        g.copy_(s)
     return total_norm
 ```
 
@@ -212,8 +211,10 @@ Add to `tests/test_optim_muon.py`:
 
 ```python
 class TestFusedMuonParity:
-    """Fused Muon must produce byte-identical updates to the reference loop
-    when the two paths see the same grads and optimizer state.
+    """Fused Muon must produce numerically-equivalent updates to the reference
+    loop when the two paths see the same grads and optimizer state — match via
+    ``allclose`` (atol≈1e-6), since batching Newton-Schulz across shape-groups
+    changes reduction order vs one-by-one.
 
     The fused path groups matrix params by shape and runs a batched NS;
     the reference iterates one-by-one. Mathematically equivalent; the
@@ -338,11 +339,13 @@ class TestFullPathCompile:
     def test_compiled_step_matches_eager_on_small_batch(
         self, bare_ssm_model: ChaosStudentLM,
     ) -> None:
-        """Compiled and eager paths produce identical grads at fp32/CPU.
+        """Compiled and eager paths produce matching grads at fp32/CPU.
 
-        Eager and inductor are byte-identical for deterministic ops on
-        CPU; any drift > fp32 epsilon is a graph-break or a silent
-        fallback to a different reduction order.
+        Tolerance: ``abs().max() < 1e-5``. Inductor rewrites may reorder
+        reductions even on deterministic ops, so byte equality is not
+        the right bar — but drift much past fp32 epsilon usually means
+        a graph break fell back silently to a different kernel. Check
+        ``TORCH_LOGS=graph_breaks`` on any failure.
         """
         inputs, targets = _make_batch(batch=2, seq=16, vocab=64, seed=77)
 
@@ -736,7 +739,7 @@ Prerequisite: Track 1A bf16 levers meeting their +5% throughput gates (Task 1A-4
 
 | Change | Reference | Tolerance | Rationale |
 |---|---|---|---|
-| Fused grad clip (1A-1) | `torch.nn.utils.clip_grad_norm_` | bit-equal on CPU fp32 | Strict rewrite of same math |
+| Fused grad clip (1A-1) | `torch.nn.utils.clip_grad_norm_` | `allclose(rtol=1e-6, atol=1e-7)` on CPU fp32 | Same math, different reduction order (one flat norm vs per-tensor-norms stacked) |
 | Fused Muon (1A-2) | existing per-param Muon.step | rtol=1e-5 on CPU fp32 | Batched NS may reorder reductions minimally |
 | Full-path compile (1A-3) | eager train_ssm_step | 1e-5 on CPU fp32 | Inductor and eager should agree at fp32 |
 | Fused fp8 Linear (1B-2) | stock te.Linear under fp8_autocast | rtol=3e-2 on CUDA | fp8 representation granularity |
