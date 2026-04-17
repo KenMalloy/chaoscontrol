@@ -1,3 +1,13 @@
+[build-system]
+# setuptools supports hybrid pyproject + setup.py builds, which we need
+# because we ship a C++ extension (``src/chaoscontrol/kernels/_cublaslt``)
+# built via ``torch.utils.cpp_extension``. The ext_modules wiring lives
+# in repo-root ``setup.py``; project metadata (below) stays declarative
+# here. Editable installs on pods MUST pass ``--no-build-isolation`` so
+# torch is visible during the ext build.
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "semanticengine-ssm"
 version = "0.2.0"

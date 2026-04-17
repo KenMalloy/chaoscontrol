@@ -1,0 +1,37 @@
+Notices for chaoscontrol/kernels/_cublaslt
+============================================
+
+Upstream project
+----------------
+NVIDIA TransformerEngine, tag v2.13 (commit 287770466f0f4433052260a765db5ff7b8be1320),
+https://github.com/NVIDIA/TransformerEngine, licensed under the Apache License,
+Version 2.0. The full upstream license text is preserved in LICENSE_UPSTREAM.
+
+Scope of derivation
+-------------------
+This directory ships a single-file C++ extension that calls cuBLASLt
+`cublasLtMatmul` on fp8 operands. The C++ source was authored for this repo;
+no upstream TransformerEngine source files were copied or translated byte-for-byte.
+The design was informed by reading TE's v2.13 implementation, specifically:
+
+  transformer_engine/common/gemm/cublaslt_gemm.cu
+  transformer_engine/pytorch/csrc/extensions/gemm.cpp
+
+The cuBLASLt call sequence (descriptor creation, matrix-layout setup, fp8 scale-
+pointer attributes, FAST_ACCUM, heuristic selection, workspace caching) follows
+the public NVIDIA cuBLASLt API and the pattern documented there; those are API-
+level facts, not copyrightable expression. The workspace cache keyed on shape
+and a one-cublasLtHandle-per-process holder are independently implemented here.
+
+Modifications relative to upstream
+----------------------------------
+Everything below is a from-scratch rewrite. There are no surviving upstream
+lines. The "Modifications:" attribution that Apache 2.0 §4.b would require for
+a derived work is not applicable because no file in this directory is a
+derivative of a specific TE file; the closest upstream analog is acknowledged
+here in NOTICE and in the README instead.
+
+Later phases (backward kernel, deferred amax, Quantizer abstraction) may copy
+small, load-bearing utilities from TE directly. Those files will carry the
+original upstream copyright header alongside an explicit "Modifications:" line
+per Apache 2.0 §4.b.

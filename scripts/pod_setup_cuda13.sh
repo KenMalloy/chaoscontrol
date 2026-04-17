@@ -66,11 +66,17 @@ import sentencepiece  # noqa: F401
 import numpy  # noqa: F401
 import pytest  # noqa: F401
 import chaoscontrol  # noqa: F401 — editable install present
+# Bespoke cuBLASLt fp8 extension must be built. If missing the C-side
+# compiled module, the editable install needs to re-run so setup.py
+# builds ext_modules. Import the compiled _C directly rather than the
+# wrapper — the wrapper falls back gracefully to an ImportError at
+# call time, but here we want the probe to fire.
+from chaoscontrol.kernels._cublaslt import _C  # noqa: F401
 _ = te.Linear(16, 16, device='cuda' if torch.cuda.is_available() else 'cpu')
 PROBE
 then
     echo "    torch + TE + sentencepiece + numpy + pytest + chaoscontrol all import;"
-    echo "    TE Linear constructs — skipping reinstall."
+    echo "    cuBLASLt fp8 extension importable; TE Linear constructs — skipping reinstall."
     echo "    (force-reinstall by removing one of the above imports from the pod.)"
     echo ""
     echo "Pod ready."
@@ -129,6 +135,16 @@ if torch.cuda.is_available():
         x = torch.randn(4, 16, device="cuda")
         y = lin(x)
     print(f"fp8 smoke OK: y.shape={tuple(y.shape)}")
+
+    # Bespoke cuBLASLt fp8 extension smoke — confirms the ext_modules
+    # build happened during pip install -e . and the .so loads against
+    # the cu13 libcublasLt the training binary will use at runtime.
+    from chaoscontrol.kernels._cublaslt import cublaslt_fp8_matmul
+    a = torch.randn(16, 32, device="cuda", dtype=torch.bfloat16).to(torch.float8_e4m3fn)
+    b = torch.randn(16, 32, device="cuda", dtype=torch.bfloat16).to(torch.float8_e4m3fn).t()
+    scale = torch.tensor(1.0 / 448.0, device="cuda")
+    y = cublaslt_fp8_matmul(a, b, scale, scale, None, torch.bfloat16)
+    print(f"cublaslt fp8 smoke OK: y.shape={tuple(y.shape)} dtype={y.dtype}")
 else:
     print("no CUDA device visible; fp8 smoke skipped")
 PY
