@@ -233,3 +233,119 @@ class TestTrainSSMForBudget:
         final_flat = torch.cat([p.detach().flatten() for p in bare_ssm_model.parameters()])
         max_param_delta = (final_flat - initial_flat).abs().max().item()
         assert max_param_delta > 0.0, "optimizer steps should update model parameters"
+
+    def test_max_steps_caps_loop_below_budget(self, bare_ssm_model: ChaosStudentLM) -> None:
+        g = torch.Generator().manual_seed(23)
+        vocab = bare_ssm_model.vocab_size
+        train_tokens = torch.randint(0, vocab, (256,), generator=g)
+        train_starts = list(range(0, 256 - 16, 4))
+        clock = _DeterministicClock(step=0.25)
+
+        optimizer = torch.optim.AdamW(bare_ssm_model.parameters(), lr=1e-3)
+        result = train_ssm_for_budget(
+            model=bare_ssm_model,
+            train_tokens=train_tokens,
+            train_starts=train_starts,
+            seq_len=16,
+            batch_size=2,
+            device=torch.device("cpu"),
+            optimizer=optimizer,
+            budget_seconds=1000.0,
+            chunk_size=16,
+            seed=0,
+            time_fn=clock,
+            max_steps=3,
+        )
+        assert result["steps"] == 3
+
+
+class TestLossAccumulatorParity:
+    """Stacked end-of-loop loss transfer must match per-step ``.cpu()``.
+
+    The 2026-04-17 switch from per-step ``float(loss.detach().cpu())`` to
+    ``torch.stack(losses).cpu()`` is purely a throughput win (collapses N
+    GPU->CPU syncs into one). It must not drift the reported history
+    values — downstream summarizers, bpb conversions, and the paper's
+    figures read those numbers. This test locks the numerical equivalence
+    so a future edit to the accumulator contract can't silently skew
+    reported losses.
+    """
+
+    @staticmethod
+    def _per_step_history(
+        losses: list[torch.Tensor],
+    ) -> list[dict[str, float]]:
+        """The pre-2026-04-17 pattern — one ``.cpu()`` per step."""
+        return [
+            {"step": float(i), "loss": float(loss.detach().cpu())}
+            for i, loss in enumerate(losses)
+        ]
+
+    @staticmethod
+    def _stacked_history(
+        losses: list[torch.Tensor],
+    ) -> list[dict[str, float]]:
+        """The current train_ssm.train_ssm_for_budget pattern.
+
+        Mirrors lines 308-328 of ``src/chaoscontrol/train_ssm.py``: detach
+        per step, stack+transfer once at loop exit, build history from the
+        CPU-side tensor.
+        """
+        loss_tensors = [loss.detach() for loss in losses]
+        if not loss_tensors:
+            return []
+        stacked = torch.stack(loss_tensors).cpu()
+        return [
+            {"step": float(i), "loss": float(stacked[i])}
+            for i in range(len(loss_tensors))
+        ]
+
+    def test_stacked_matches_per_step_on_synthetic_losses(self) -> None:
+        """Arbitrary CPU scalars: stacked path must equal per-step path."""
+        torch.manual_seed(0)
+        losses = [torch.randn(()) for _ in range(25)]
+        per_step = self._per_step_history(losses)
+        stacked = self._stacked_history(losses)
+        assert per_step == stacked
+
+    def test_stacked_matches_per_step_with_degenerate_values(self) -> None:
+        """Edge cases the production loop can encounter.
+
+        Zero, huge, and tiny loss values all need to round-trip identically.
+        The CPU transfer path does not do any dtype promotion, so this is
+        primarily a check that ``float(tensor)`` of a stacked row equals
+        ``float(tensor)`` of the standalone row.
+        """
+        losses = [
+            torch.tensor(0.0),
+            torch.tensor(1e-30),
+            torch.tensor(1e30),
+            torch.tensor(4.2),
+        ]
+        per_step = self._per_step_history(losses)
+        stacked = self._stacked_history(losses)
+        assert per_step == stacked
+
+    def test_empty_losses_produce_empty_history(self) -> None:
+        """``train_ssm_for_budget`` returns ``history=[]`` if max_steps=0.
+
+        Pins the zero-training short-circuit against an edit that would
+        try to ``torch.stack([])`` (which raises).
+        """
+        assert self._stacked_history([]) == []
+
+    def test_detach_severs_autograd_graph(self) -> None:
+        """``loss.detach()`` must not keep a backward reference alive.
+
+        Test-coverage rationale: the loss accumulator holds one detached
+        scalar per training step. If ``.detach()`` ever stopped severing
+        the graph (extremely unlikely, but load-bearing for memory),
+        activations would pile up and the long-run OOM pattern would
+        return at scale. Cheap unit check; catches the regression without
+        needing a training run to blow up.
+        """
+        x = torch.randn(4, requires_grad=True)
+        loss = (x ** 2).sum()
+        detached = loss.detach()
+        assert detached.grad_fn is None
+        assert detached.requires_grad is False

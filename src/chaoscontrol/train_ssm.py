@@ -229,6 +229,7 @@ def train_ssm_for_budget(
     seed: int = 0,
     time_fn: Callable[[], float] = time.perf_counter,
     precision: str = "bf16",
+    max_steps: int | None = None,
 ) -> dict[str, Any]:
     """Bare-SSM wall-clock training loop.
 
@@ -258,7 +259,12 @@ def train_ssm_for_budget(
     rng = random.Random(seed + rank_)
 
     model.train()
-    history: list[dict[str, Any]] = []
+    # GPU-side loss accumulator: detached scalar tensors appended per step,
+    # stacked + transferred to CPU once at loop exit. Eliminates the per-step
+    # `.cpu()` sync that was forcing the Python dispatcher to wait on GPU
+    # completion every iteration. The single end-of-loop transfer lets the
+    # CPU dispatcher run ahead of the GPU during training.
+    loss_tensors: list[torch.Tensor] = []
     steps = 0
     start_time = time_fn()
 
@@ -271,7 +277,9 @@ def train_ssm_for_budget(
 
     while True:
         elapsed = time_fn() - start_time
-        local_stop = elapsed >= budget_seconds and steps > 0
+        budget_reached = elapsed >= budget_seconds and steps > 0
+        max_steps_reached = max_steps is not None and steps >= max_steps
+        local_stop = budget_reached or max_steps_reached
         if should_stop_now(local_stop, device, ddp_active):
             break
 
@@ -297,7 +305,7 @@ def train_ssm_for_budget(
             torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
         optimizer.step()
 
-        history.append({"step": float(steps), "loss": float(loss.detach().cpu())})
+        loss_tensors.append(loss.detach())
         steps += 1
 
     # DDP teardown barrier — same role as training.py:903. Without this, a
@@ -306,6 +314,18 @@ def train_ssm_for_budget(
     # mismatched state. Matches the frozen path's contract.
     if ddp_active:
         dist.barrier()
+
+    # Single GPU->CPU transfer for the whole trajectory — collapses N per-step
+    # syncs into one stack+copy, preserving the {"step", "loss"} history
+    # contract consumers rely on.
+    if loss_tensors:
+        stacked_losses = torch.stack(loss_tensors).cpu()
+        history: list[dict[str, Any]] = [
+            {"step": float(i), "loss": float(stacked_losses[i])}
+            for i in range(len(loss_tensors))
+        ]
+    else:
+        history = []
 
     peak_vram_mb = 0.0
     if device.type == "cuda":
