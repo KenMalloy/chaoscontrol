@@ -44,7 +44,13 @@ Error isolation:
 
 Idempotence:
     Entries whose output JSON already exists are skipped, so a relaunch
-    after partial completion only runs the missing entries.
+    after partial completion only runs the missing entries. The skip is
+    **config-sensitive**: the stored JSON's ``config`` field must byte-
+    match the requested entry. If they differ (e.g., the matrix was
+    edited and the output dir reused), the runner raises rather than
+    silently reusing stale results — filename-only idempotence would
+    otherwise contaminate the new matrix with results from a prior
+    different run.
 """
 from __future__ import annotations
 
@@ -104,6 +110,50 @@ def _config_hash(config: dict[str, Any]) -> str:
     """Short stable hash of a config, for dry-run printout."""
     payload = json.dumps(config, sort_keys=True, default=str).encode("utf-8")
     return hashlib.sha1(payload).hexdigest()[:8]
+
+
+def _require_config_match(
+    out_path: Path,
+    requested: dict[str, Any],
+) -> None:
+    """Raise if the stored output's config differs from what's requested.
+
+    Idempotent skip honors prior outputs by filename. Filename alone does
+    not encode the config, so a matrix edit (e.g., LR change) reusing
+    the same ``--output-dir`` would silently skip entries whose stale
+    JSONs answer a different question — scientific-validity poison that
+    would still look like a clean "successfully resumed" run.
+
+    Every rank reads the file independently; the pod's shared filesystem
+    guarantees every rank sees the same bytes, so every rank decides the
+    same way and either all raise or all proceed. No collective required.
+
+    Raises
+    ------
+    RuntimeError
+        If the stored JSON is unreadable or its ``config`` field differs
+        from ``requested``. The message names the file and the two
+        config hashes so ``rm`` / ``diff`` / fresh-output-dir recovery is
+        unambiguous.
+    """
+    try:
+        stored = json.loads(out_path.read_text())
+    except Exception as exc:
+        raise RuntimeError(
+            f"idempotent skip aborted: could not read stored JSON at "
+            f"{out_path}: {exc}. Delete or fix the file to re-run."
+        ) from exc
+    stored_config = stored.get("config")
+    if stored_config != requested:
+        stored_hash = _config_hash(stored_config or {})
+        requested_hash = _config_hash(requested)
+        raise RuntimeError(
+            f"idempotent skip aborted: config mismatch at {out_path}. "
+            f"Stored config hash={stored_hash} does not match requested "
+            f"hash={requested_hash}. A prior run with a different config "
+            f"wrote this filename. Delete the stale output or use a "
+            f"fresh --output-dir to re-run this entry."
+        )
 
 
 def _apply_seed(seed: int) -> None:
@@ -602,6 +652,10 @@ def main(argv: list[str] | None = None) -> int:
             dist.all_reduce(flag, op=dist.ReduceOp.MAX)
             any_exists = flag.item() > 0.5
         if any_exists:
+            # Config-sensitive skip: refuse to honor a stored JSON whose
+            # config differs from the current entry. Filename match alone
+            # would silently reuse stale results across matrix edits.
+            _require_config_match(out_path, entry)
             if is_rank0:
                 print(
                     f"[rank 0] skip {name}_s{seed} (output exists at {out_path})",
