@@ -33,6 +33,22 @@ def build_model(cfg: ChaosControlConfig, device: torch.device, param_dtype: torc
             vocab_size=cfg.vocab_size, dim=cfg.model_dim,
             num_layers=cfg.num_layers, num_heads=max(1, cfg.model_dim // 32),
         )
+    elif cfg.model_type == "transformer_nanogpt_lean":
+        # Exp 21 ablation A/B cell: modded-NanoGPT lean variant
+        # (RoPE + RMSNorm + ReLU^2 + SDPA + QK-norm, untied embed/LM-head).
+        # Mirrors the "transformer" branch's field reads; head count follows
+        # the same dim//32 convention so dim=256 -> 8 heads. For the design
+        # defaults (dim=256, heads=4), configs should set model_dim=256 and
+        # rely on the head count; the variant asserts dim % n_head == 0.
+        from chaoscontrol.baselines_nanogpt_lean import NanoGPTLeanLM
+        n_head = max(1, cfg.model_dim // 64)
+        model = NanoGPTLeanLM(
+            vocab_size=cfg.vocab_size,
+            d_model=cfg.model_dim,
+            n_head=n_head,
+            n_layer=cfg.num_layers,
+            ffn_mult=cfg.ff_mult,
+        )
     elif cfg.model_type == "mamba2":
         from chaoscontrol.baselines import Mamba2LM
         model = Mamba2LM(
