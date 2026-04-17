@@ -237,18 +237,21 @@ class TestRejectStaleSkipMarkers:
             [entry], tmp_path, te_probe=lambda: True,
         )
 
-    def test_error_message_points_to_deletion_path(
+    def test_error_message_enumerates_exact_stale_paths(
         self, tmp_path: Path,
     ) -> None:
-        """The error must tell a human how to recover.
+        """The error must name every stale file by exact path.
 
         A failed pre-flight at minute 0 of a multi-hour pod session must
-        leave the operator with an exact command to run — otherwise the
-        check optimizes for our theoretical model of 'don't silently
-        succeed' at the cost of a real-world stall-on-pod cost.
+        leave the operator with the exact paths to delete. The message
+        deliberately does not include a glob hint — globs break on paths
+        with spaces and miss custom-named fp8 entries (e.g., a matrix
+        using ``name="fp8_lr128"``). The enumerated paths above the hint
+        are already the authoritative recovery instruction.
         """
         entry = self._fp8_entry(1337)
-        (tmp_path / "fp8_s1337.json").write_text(json.dumps({
+        stale_path = tmp_path / "fp8_s1337.json"
+        stale_path.write_text(json.dumps({
             "config": entry,
             "error": "skipped: transformer_engine unavailable on pod",
         }))
@@ -257,8 +260,7 @@ class TestRejectStaleSkipMarkers:
                 [entry], tmp_path, te_probe=lambda: True,
             )
         msg = str(ctx.value)
-        assert "rm " in msg
-        assert "fp8" in msg
+        assert str(stale_path) in msg
 
     def test_previews_limit_at_five_with_count(self, tmp_path: Path) -> None:
         """Matrix with >5 stale markers shows first 5 and a count for the rest."""

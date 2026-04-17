@@ -71,6 +71,15 @@ _BENIGN_ERROR_PATTERNS: tuple[str, ...] = (
     "skipped: transformer_engine unavailable on pod",
 )
 
+# Subset of _BENIGN_ERROR_PATTERNS that specifically indicate
+# "transformer_engine was missing, so we never actually tried this entry."
+# reject_stale_skip_markers only treats these as stale on a TE-capable
+# pod — adding a non-TE benign pattern (e.g., OOM-skip) to the main
+# tuple must not cause those markers to be wrongly flagged as stale.
+_TE_UNAVAILABLE_PATTERNS: tuple[str, ...] = (
+    "skipped: transformer_engine unavailable on pod",
+)
+
 
 def _check_output_integrity(
     output_dir: Path,
@@ -232,7 +241,7 @@ def _te_is_available() -> bool:
 def reject_stale_skip_markers(
     entries: list[dict[str, Any]],
     output_dir: Path,
-    benign_error_patterns: tuple[str, ...] = _BENIGN_ERROR_PATTERNS,
+    te_unavailable_patterns: tuple[str, ...] = _TE_UNAVAILABLE_PATTERNS,
     te_probe: "callable[[], bool]" = _te_is_available,
 ) -> None:
     """Fail-closed if fp8 entries have stale TE-unavailable skip markers.
@@ -272,7 +281,7 @@ def reject_stale_skip_markers(
             # Malformed markers are caught downstream by _check_output_integrity.
             continue
         err_str = str(data.get("error", ""))
-        if any(pat in err_str for pat in benign_error_patterns):
+        if any(pat in err_str for pat in te_unavailable_patterns):
             stale.append(out_path)
     if stale:
         preview = "\n  ".join(str(p) for p in stale[:5])
@@ -282,7 +291,7 @@ def reject_stale_skip_markers(
             f"{len(stale)} fp8 entries in the matrix have stale skip markers "
             f"from a prior TE-less run. Honoring them would silently succeed "
             f"with rc=0 and zero fp8 results. Delete them to re-run fp8:\n  "
-            f"{preview}{more}\n\nOr run:  rm {output_dir}/fp8_s*.json"
+            f"{preview}{more}"
         )
 
 
