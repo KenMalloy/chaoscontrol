@@ -521,13 +521,23 @@ git commit -m "exp19(phase1a): bf16 microbenchmark + Phase 1A lever decisions"
 
 ---
 
-## Track 1B — bespoke fp8 matmul path (parallel track)
+## Track 1B — fp8 matmul kernel (fork of TransformerEngine)
 
-**Time estimate:** 3-5 days focused work. Track can run in a separate worktree in parallel with Track 1A; does not depend on 1A landing.
+**Status note (2026-04-17):** Initial pass used `torch._scaled_mm` from scratch. On H100 at the submission shape the bespoke kernel was 1.12× stock TE (not 0.7× as hoped). Reading TE's source showed they bypass `torch._scaled_mm` entirely and call `cublasLtMatmul` directly via a pybind11 C++ extension (`tex.generic_gemm`), with cached cuBLASLt workspace and fused backward+bias. Matching them through torch's public API is impossible. Pivot: **fork TE's kernels** (Apache 2.0, `github.com/NVIDIA/TransformerEngine` v2.13.0), strip to the single-GPU fp8 Linear subset, and customize with our deferred-amax + precision-abstraction plumbing. See `feedback_fork_before_reimplement.md`.
 
-**High-level architecture:** Replace the body of `te.Linear.forward` with a direct `torch.ops.aten._scaled_mm` call path that fuses cast + GEMM + cast into one cuBLASLt invocation and tracks amax in a deferred on-device buffer. The rest of the model sees the same `.forward(input) -> output` contract, so the precision abstraction and `maybe_promote_linears_to_te` plumbing stay intact. The new kernel lives behind a new precision flag `"fp8_fused"` (distinct from `"fp8"` which remains stock TE as the numerical reference).
+**Time estimate:** 1-2 days (fork-based). Running in the same `exp19-phase1a` worktree as Track 1A since both land Linear-level code.
 
-### Task 1B-1: cuBLASLt scaffold + numerical reference
+**High-level architecture:** Our fork lives at `src/chaoscontrol/kernels/_cublaslt/` — a stripped-down C++ extension derived from TE v2.13.0's `common/gemm/cublaslt_gemm.cpp` + `pytorch/csrc/extensions/gemm.cpp`, exposed as a small Python API (`cublaslt_fp8_matmul(a, b, scale_a, scale_b, bias, out_dtype)`). `FusedFP8Linear` swaps its `torch._scaled_mm` call for the fork. The `_FusedFP8LinearFn` autograd.Function structure (E5M2 backward grads × E4M3 forward operands, per-direction amax tracking, workspace cached per-device) stays. The precision abstraction routes `"fp8_fused"` through the forked kernel; `"fp8"` remains stock TE as the numerical reference.
+
+**License disposition:** Apache 2.0. We preserve TE's copyright headers, add our modification notices per §4.b/c, and mention the fork origin + upstream commit in the paper.
+
+### Task 1B-1: FusedFP8Linear scaffold + numerical reference — DONE (commits 0ea514b → c6e65c4)
+
+First-pass shipped as a `te.Linear`-delegating scaffold with the API mirror + parity test harness. See `src/chaoscontrol/kernels/fp8_linear.py`, `tests/test_fp8_linear.py` (9 tests, all green on H100). Kept intact — the fork-based kernel will drop in behind the existing Python API.
+
+Original writeup retained below for historical context:
+
+### Task 1B-1 (as originally planned): cuBLASLt scaffold + numerical reference
 
 **Files:**
 - Create: `src/chaoscontrol/kernels/fp8_linear.py` (the bespoke Linear class)
@@ -603,7 +613,36 @@ Land `FusedFP8Linear` as a thin subclass/wrapper that internally calls `te.Linea
 git commit -m "exp19(phase1b): FusedFP8Linear scaffold + stock-TE numerical reference"
 ```
 
-### Task 1B-2: Fused cast+GEMM+cast kernel
+### Task 1B-2 (REVISED): Fork TE's fp8 GEMM into a standalone C++ extension
+
+**Status (2026-04-17):** Initial `torch._scaled_mm` pass shipped (commits through `fc99977`) with full fp8 forward + fp8 backward via custom `autograd.Function`. 12/12 correctness tests green on H100. Throughput gate failed at 1.12× stock TE (need <0.7×). Pivoting to fork approach documented at the top of Track 1B.
+
+**Files:**
+- Create: `src/chaoscontrol/kernels/_cublaslt/` — the forked C++ extension tree (with `LICENSE_UPSTREAM`, `NOTICE`, `README.md`, `src/`, build hook).
+- Modify: `pyproject.toml` / `scripts/pod_setup_cuda13.sh` — register the extension build so `pip install -e .` compiles it.
+- Create: `tests/test_cublaslt_fp8.py` — parity vs stock TE + throughput microbench.
+
+**Why:** The Python-level `torch._scaled_mm` path carries torch-dispatch overhead (per-call dispatch, workspace allocation, scale tensor creation on the Python side). TE bypasses all of that with a direct pybind11 → cuBLASLt C++ path (`tex.generic_gemm`). Forking that subset of TE — MIT/Apache 2.0 — lets us match TE's fast path, then customize (deferred amax without per-call sync, integration with our precision abstraction).
+
+**Source to fork** (from `github.com/NVIDIA/TransformerEngine` at v2.13.0):
+- `transformer_engine/pytorch/csrc/extensions/gemm.cpp` — pybind11 binding.
+- `transformer_engine/common/gemm/cublaslt_gemm.cpp` + header — direct cuBLASLt wrapper.
+- Just enough of `transformer_engine.h` / `util.h` to compile the above.
+
+**Strip aggressively:** comm-overlap (AG+GEMM, GEMM+RS), grouped-gemm, MXFP8, debug quantizer, gelu fusion. Single-GPU fp8 Linear forward is the only path we need in this task.
+
+**Phase 1 (forward only) success criteria:**
+- Extension builds on the CUDA 13 pod via `pip install -e .` / `scripts/pod_setup_cuda13.sh`.
+- `cublaslt_fp8_matmul(a, b, scale_a, scale_b, bias, out_dtype)` produces output matching stock TE within `allclose(rtol=3e-2, atol=3e-2)` on submission shape (dim=256, batch=1024).
+- Throughput: `ours_time < 0.9 * te_time` minimum (10% faster). Stretch: `< 0.7 * te_time` (the original +30% plan goal).
+
+**Phase 2 (backward + deferred amax, follows after phase 1 wins)** — see Task 1B-3.
+
+**Phase 3 (swap into `FusedFP8Linear`)** — the existing Python API stays; only its internal matmul calls swap from `torch._scaled_mm` to `cublaslt_fp8_matmul`. The E5M2 backward + amax-per-direction plumbing from `fc99977` is reused as-is.
+
+Original from-scratch writeup retained below for context — NOT the path we're taking but documents what `torch._scaled_mm` can and cannot do:
+
+### Task 1B-2 (as originally planned, torch._scaled_mm only): Fused cast+GEMM+cast kernel
 
 **Files:**
 - Modify: `src/chaoscontrol/kernels/fp8_linear.py`
@@ -656,18 +695,24 @@ Inside `tests/test_fp8_linear.py` add a `pytest.mark.skip_in_ci` or `pytest.mark
 git commit -m "exp19(phase1b): _scaled_mm fused cast+GEMM+cast path + numerical parity"
 ```
 
-### Task 1B-3: Deferred amax tracking
+### Task 1B-3 (REVISED): Backward GEMMs in the fork + deferred amax
 
 **Files:**
-- Modify: `src/chaoscontrol/kernels/fp8_linear.py`
+- Modify: `src/chaoscontrol/kernels/_cublaslt/src/gemm.cpp` (add `cublaslt_fp8_matmul_backward`).
+- Modify: `src/chaoscontrol/kernels/_cublaslt/__init__.py` (expose backward entry points).
+- Modify: `src/chaoscontrol/kernels/fp8_linear.py` (swap `torch._scaled_mm` calls in `_FusedFP8LinearFn` for the forked calls; keep the autograd.Function shape).
 
-**Why:** TE's per-call amax update is a GPU→GPU reduction that forces a sync. Accumulate amax over N calls and sync once at the end of training iteration (or step). The tradeoff is slightly less accurate scale factors for up to N matmuls — acceptable for training, not for inference.
+**Why:** Phase 2 of the fork. TE's `tex.generic_gemm(grad=True, bias=...)` fuses backward matmul + bias_grad + (gelu_input) into a single C++ call; matching that lands another chunk of the win that the Python-level autograd.Function can't. Deferred amax update (write to a pinned host / device buffer without a sync per call; flush once per optimizer step) removes the last per-forward GPU→GPU reduction — this is the bit torch's `_scaled_mm` literally cannot express.
 
-**Step 1-4:** Implement a module-level amax history buffer. Every `.forward()` writes its per-tensor max into a ring buffer without syncing; a `flush_amax_history()` call (invoked once per optimizer step) reduces the buffer into the active scale factor. Document the semantic tradeoff in the module docstring.
+**Step 1-3:** Port TE's backward GEMM path (E5M2 × E4M3, with bias-grad reduction fused) from the same upstream source files stripped in 1B-2. Expose as `cublaslt_fp8_matmul_backward(grad_y, a, b, scale_gy, scale_a, scale_b, ...) -> (grad_a, grad_b, grad_bias)`.
 
-**Step 5: Test:** Training-dynamics parity — two training runs at the same seed, one with stock TE, one with the bespoke fused + deferred amax path, first 20 losses within 2% of each other. If they drift materially, the scale factor trajectory is materially different; investigate.
+**Step 4:** Replace the `_fp8_matmul` helper calls inside `_FusedFP8LinearFn.forward/backward` with the forked entry points. Autograd-Function scaffold, amax history buffers, E5M2 dtype choice all stay — only the GEMM primitive swaps.
 
-**Step 6: Commit**
+**Step 5:** Implement deferred amax. Forward writes `x_flat.abs().amax()` and `weight.abs().amax()` into the ring buffer WITHOUT a host sync; backward writes grad-amax the same way. A `flush_amax_history()` method rolls the buffers forward once per optimizer step. Document the lookback-vs-lookahead tradeoff inline.
+
+**Step 6: Test (training-dynamics parity):** Two short runs at the same seed — one with stock TE fp8, one with our forked `fp8_fused`. Assert first 20 training losses within 2% of each other. If they drift materially, the scale factor trajectory is materially different; investigate before moving on.
+
+**Step 7: Commit**
 
 ### Task 1B-4: Integrate via precision abstraction
 
