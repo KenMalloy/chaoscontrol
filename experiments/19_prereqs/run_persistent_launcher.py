@@ -473,11 +473,14 @@ def main() -> int:
 
     if not runnable:
         print(
-            "[launcher] nothing to run (all entries filtered by TE pre-flight). "
-            "Skip markers written; exiting.",
+            f"[launcher] FAIL: zero runnable entries after pre-flight. "
+            f"Requested {len(entries)} entries, all filtered out (e.g., by TE "
+            f"pre-flight on a pod without transformer_engine). "
+            f"Skip markers have been written for the filtered entries — "
+            f"an empty run is not a successful run, so exiting non-zero.",
             flush=True,
         )
-        return 0
+        return 1
 
     # ----- Write the matrix for the runner -----
     matrix_fd, matrix_path_str = tempfile.mkstemp(

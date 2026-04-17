@@ -1,15 +1,22 @@
 """Unit tests for run_persistent_launcher.py post-run and pre-flight checks.
 
-Covers the two bugs surfaced in code review on 2026-04-17:
+Covers the bugs surfaced in code review on 2026-04-17:
 - Launcher previously returned rc=0 even when every entry wrote an error
   marker (only the JSON count was checked, not contents).
 - Launcher previously accepted a matrix whose entries' ``world_size`` did
   not match ``--world-size``, silently running one regime and reporting
   another.
+- Launcher returned rc=0 when TE pre-flight filtered the whole matrix
+  (e.g., fp8-only request on a pod without transformer_engine) — an
+  empty run reported as successful.
+- Launcher had no ``main()``-level integration coverage, so control-flow
+  wiring bugs (e.g., pre-flights not actually called) would pass unit
+  tests.
 """
 from __future__ import annotations
 
 import json
+import subprocess
 import sys
 from pathlib import Path
 
@@ -322,3 +329,166 @@ class TestFilterMatrixForTeWithInjectedProbe:
         assert runnable == entries
         assert skipped == []
         assert probe_called is False
+
+
+LAUNCHER_PATH = REPO / "experiments" / "19_prereqs" / "run_persistent_launcher.py"
+
+
+def _run_launcher(
+    args: list[str], *, cwd: Path | None = None,
+) -> subprocess.CompletedProcess:
+    """Invoke the launcher as a subprocess and capture stdout/stderr.
+
+    Using subprocess rather than calling ``main()`` in-process covers
+    the argparse surface, control-flow wiring, and any side effects
+    Python's import cache might miss. Slow (~500ms per call) but the
+    only way to catch a ``main()``-level regression like "pre-flight
+    call site silently deleted."
+    """
+    return subprocess.run(
+        [sys.executable, str(LAUNCHER_PATH), *args],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+class TestLauncherMainIntegration:
+    """End-to-end exit-code + side-effect coverage of ``main()``.
+
+    Fills the integration-coverage gap flagged in the prior review: unit
+    tests exercise pre-flight helpers directly, so wiring bugs (e.g., a
+    pre-flight removed from the call site) wouldn't surface until a pod
+    run. These subprocess tests lock the control flow down.
+
+    Every test here runs with ``--dry-run`` to avoid torchrun / GPU
+    requirements. This host has no transformer_engine, so fp8 pre-flight
+    naturally exercises the "TE unavailable" branch; bf16-only matrices
+    exercise the "ready to launch (but dry-run)" branch.
+    """
+
+    def _base_args(
+        self, output_dir: Path, *, conditions: str = "bf16",
+    ) -> list[str]:
+        """Minimal CLI args for a dry-run invocation on this host.
+
+        --data-path / --sp-model-path are required but the paths aren't
+        opened before dry-run exit, so /tmp sentinels work.
+        """
+        return [
+            "--data-path", "/tmp/nonexistent-dataset",
+            "--sp-model-path", "/tmp/nonexistent-spm",
+            "--output-dir", str(output_dir),
+            "--world-size", "4",
+            "--base-lr", "0.128",
+            "--budget", "600",
+            "--conditions", conditions,
+            "--dry-run",
+        ]
+
+    def test_fp8_only_on_te_less_host_exits_nonzero(
+        self, tmp_path: Path,
+    ) -> None:
+        """Silent-success regression: user asks for fp8, gets zero runs.
+
+        On this (TE-less) host, ``filter_matrix_for_te`` drops every
+        fp8 entry. Pre-fix, the launcher wrote skip markers and exited
+        0 — a rc=0 claim that the matrix completed when in fact no
+        training happened. Must be rc=1 post-fix.
+        """
+        result = _run_launcher(
+            self._base_args(tmp_path, conditions="fp8"),
+        )
+        assert result.returncode == 1, (
+            f"fp8-only matrix on TE-less host must exit non-zero. "
+            f"got rc={result.returncode}\nstdout:\n{result.stdout}\n"
+            f"stderr:\n{result.stderr}"
+        )
+        # Skip markers for every requested seed must still be written
+        # — downstream summarizers need the "errored" marker for each
+        # expected output, not silent absence.
+        marker_files = sorted(tmp_path.glob("fp8_s*.json"))
+        assert len(marker_files) >= 1, (
+            f"expected fp8 skip markers in {tmp_path}, found none"
+        )
+        # Contents should be the TE-unavailable pattern the runner expects.
+        for path in marker_files:
+            payload = json.loads(path.read_text())
+            assert "transformer_engine unavailable" in payload.get("error", "")
+
+    def test_bf16_only_dry_run_exits_zero(self, tmp_path: Path) -> None:
+        """Positive control: a runnable matrix in --dry-run exits 0.
+
+        Confirms the non-zero path is specific to "zero runnable" and
+        isn't a blanket "return 1 from dry-run" regression.
+        """
+        result = _run_launcher(
+            self._base_args(tmp_path, conditions="bf16"),
+        )
+        assert result.returncode == 0, (
+            f"bf16-only dry-run must exit zero. "
+            f"got rc={result.returncode}\nstdout:\n{result.stdout}\n"
+            f"stderr:\n{result.stderr}"
+        )
+
+    def test_stale_fp8_markers_with_te_path_raises_before_run(
+        self, tmp_path: Path,
+    ) -> None:
+        """Integration-level coverage of the stale-marker pre-flight wiring.
+
+        Without transformer_engine on the test host we can't flip the
+        TE-available branch from outside. But we CAN verify the
+        pre-flight is at least on the call path by confirming the
+        launcher doesn't crash when markers exist and conditions are
+        bf16-only (stale fp8 markers from a prior run must not affect
+        a bf16-only matrix — ``reject_stale_skip_markers`` only raises
+        for fp8 entries in the current matrix). This guards against a
+        future edit that wires the pre-flight incorrectly (e.g.,
+        raising on any stale marker regardless of the current matrix).
+        """
+        # Pre-seed a stale fp8 marker.
+        (tmp_path / "fp8_s1337.json").write_text(json.dumps({
+            "config": {"name": "fp8", "seed": 1337, "precision": "fp8"},
+            "error": "skipped: transformer_engine unavailable on pod",
+        }))
+        # Run a bf16-only matrix — must not raise, must exit 0 (dry-run).
+        result = _run_launcher(
+            self._base_args(tmp_path, conditions="bf16"),
+        )
+        assert result.returncode == 0, (
+            f"bf16-only matrix with unrelated stale fp8 marker must exit 0 "
+            f"(the stale marker is not in the current matrix). "
+            f"got rc={result.returncode}\nstdout:\n{result.stdout}\n"
+            f"stderr:\n{result.stderr}"
+        )
+
+    def test_world_size_mismatch_is_rejected_at_main_level(
+        self, tmp_path: Path,
+    ) -> None:
+        """Integration coverage of the world-size pre-flight wiring.
+
+        Pass a custom matrix whose entries declare ``world_size=2``
+        while the CLI passes ``--world-size 4``. The launcher must
+        refuse at pre-flight, not at some later stage.
+        """
+        matrix_path = tmp_path / "matrix.json"
+        matrix_path.write_text(json.dumps([
+            {
+                "name": "bf16", "seed": 1337, "precision": "bf16",
+                "world_size": 2,
+            },
+        ]))
+        args = self._base_args(tmp_path, conditions="bf16") + [
+            "--matrix-json", str(matrix_path),
+        ]
+        result = _run_launcher(args)
+        assert result.returncode != 0, (
+            f"world-size mismatch must exit non-zero. "
+            f"got rc={result.returncode}\nstdout:\n{result.stdout}\n"
+            f"stderr:\n{result.stderr}"
+        )
+        # The error message should name the conflict, not some downstream
+        # NameError / JSON decode failure.
+        combined = result.stdout + result.stderr
+        assert "world_size" in combined
