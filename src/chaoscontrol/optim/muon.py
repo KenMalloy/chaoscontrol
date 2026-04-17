@@ -281,11 +281,12 @@ class Muon(torch.optim.Optimizer):
                 grads_flat.append(p.grad)
                 steps_before.append(state["step"])
 
-            # Defensive: if step counters are mixed (e.g., a param was added
-            # mid-training), fall back to per-param AdamW. The training loop
-            # creates the optimizer once so this should never fire; the
-            # assertion-style fallback exists to keep correctness under
-            # hand-edited state_dicts.
+            # If step counters disagree (hand-edited state_dict, or a
+            # non-matrix param added mid-training), fall through to the
+            # per-param path — the coalesced update assumes a single
+            # shared `t`. Graceful degradation: math still matches the
+            # unfused branch, we just lose the coalesce win for this
+            # step.
             uniform_step = all(s == steps_before[0] for s in steps_before)
             if not uniform_step:
                 for p in nonmatrix_params:
@@ -320,6 +321,25 @@ class Muon(torch.optim.Optimizer):
             # detached copy of the input tensors, so updates on the flat
             # buffer will need to be copied back. This is the standard
             # coalesce pattern — the same one allreduce_grads uses.
+            #
+            # _flatten_dense_tensors silently upcasts mixed-dtype inputs
+            # to the widest common dtype; the unfused AdamW branch
+            # operates on each param in its own dtype. Assert uniformity
+            # across grads AND state so a future mixed-dtype change
+            # (e.g. a bf16 bias alongside an fp32 LayerNorm gain) fails
+            # loud here instead of silently diverging from the unfused
+            # path over thousands of steps.
+            dtypes = (
+                {t.dtype for t in grads_flat}
+                | {t.dtype for t in exp_avgs}
+                | {t.dtype for t in exp_avg_sqs}
+            )
+            assert len(dtypes) == 1, (
+                f"fused AdamW coalesce requires uniform non-matrix dtypes "
+                f"across grads, exp_avg, and exp_avg_sq; got {dtypes}. "
+                f"Either add mixed-dtype support to _step_fused or fall "
+                f"through to per-param AdamW for non-uniform groups."
+            )
             exp_avg_flat = _flatten_dense_tensors(exp_avgs)
             exp_avg_sq_flat = _flatten_dense_tensors(exp_avg_sqs)
             grad_flat = _flatten_dense_tensors(grads_flat)

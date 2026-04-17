@@ -114,19 +114,16 @@ def _build_optimizer_with_fused_muon(
     weight_decay: float,
     fused_muon: bool,
 ) -> torch.optim.Optimizer:
-    """Wrapper around frozen ``_build_optimizer`` that honors ``fused_muon``.
+    """Build Muon with ``fused=True`` if requested; else delegate.
 
     ``_build_optimizer`` in ``runner_exp18_ssm`` is frozen (Exp 18
     submission regime); editing it would break bit-equivalence between
-    persistent-DDP entries and the Exp 18 runs they inherit from.
-    This wrapper defers to the frozen helper for the default path and
-    rebuilds the Muon instance with ``fused=True`` only when the flag
-    is on. The ``bind_param_names`` call mirrors the frozen helper so
-    the classifier path stays identical.
+    persistent-DDP entries and the Exp 18 runs they inherit from. The
+    fused-path kwargs below MIRROR that frozen helper — if it is ever
+    unfrozen, update both paths together so the classifier path stays
+    identical. The non-fused / non-Muon path delegates straight to the
+    frozen helper, which is authoritative.
     """
-    optimizer = _build_optimizer(
-        optimizer_name, model, base_lr=base_lr, weight_decay=weight_decay,
-    )
     if fused_muon and optimizer_name == "muon":
         from chaoscontrol.optim.muon import Muon
         optimizer = Muon(
@@ -138,7 +135,11 @@ def _build_optimizer_with_fused_muon(
             fused=True,
         )
         optimizer.bind_param_names(list(model.named_parameters()))
-    return optimizer
+        return optimizer
+    # Non-fused path OR non-Muon optimizer: frozen helper is authoritative.
+    return _build_optimizer(
+        optimizer_name, model, base_lr=base_lr, weight_decay=weight_decay,
+    )
 
 
 def _config_hash(config: dict[str, Any]) -> str:
