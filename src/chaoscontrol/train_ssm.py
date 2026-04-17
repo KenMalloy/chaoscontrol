@@ -197,18 +197,27 @@ def _train_ssm_step_impl(
     return loss
 
 
-@functools.lru_cache(maxsize=4)
-def _compiled_step_fn(fullgraph: bool) -> Callable[..., torch.Tensor]:
-    """Cache ``torch.compile(_train_ssm_step_impl, ...)`` per fullgraph setting.
+@functools.cache
+def _compiled_step_fn() -> Callable[..., torch.Tensor]:
+    """Compiled wrapper over ``_train_ssm_step_impl``, memoized so
+    ``torch.compile`` is invoked once per process rather than once per step.
 
-    dynamo recompiles on shape change regardless, but this cache keeps
-    us from re-invoking ``torch.compile`` every training step. ``dynamic
-    =False`` is the right default: static shapes let inductor pick
-    tighter kernels, and ``train_ssm_for_budget`` holds shapes constant
-    across the whole run.
+    ``fullgraph=True`` is load-bearing: it raises on graph break instead
+    of silently falling back to eager, so any "compiled" claim this
+    flag gates is genuine. ``dynamic=False`` opts into static shapes
+    for larger inductor speedup; dynamo will recompile on shape change.
+
+    Caveat on cache semantics: ``@cache`` returns the same
+    ``OptimizedModule`` regardless of which model is passed at call
+    time. dynamo itself keys its internal guard cache on argument
+    structure (including model identity), so different models correctly
+    trigger internal recompiles — but the cache here stores a single
+    wrapper. Fine for the intended one-model-per-process training flow;
+    revisit if a future eval/debug path instantiates multiple models in
+    the same process.
     """
     return torch.compile(
-        _train_ssm_step_impl, fullgraph=fullgraph, dynamic=False,
+        _train_ssm_step_impl, fullgraph=True, dynamic=False,
     )
 
 
@@ -255,7 +264,7 @@ def train_ssm_step(
     _reject_unsupported(model)
 
     if compile_full_path:
-        return _compiled_step_fn(fullgraph=True)(
+        return _compiled_step_fn()(
             model=model,
             inputs=inputs,
             targets=targets,

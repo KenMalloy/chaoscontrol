@@ -619,9 +619,16 @@ class TestFullPathCompile:
             )
         inputs, targets = _make_batch(batch=2, seq=16, vocab=64, seed=78)
         bare_ssm_model.zero_grad(set_to_none=True)
-        # If this raises, THAT is the useful signal — the test author's
-        # job is then to fix the graph break at the source, not loosen
-        # this assertion. Let the raise propagate.
+        # Intentionally no assertion and no pytest.raises: a successful
+        # return IS the pass condition. Any raise on a graph break is a
+        # USEFUL failure — it means fullgraph=True caught something to
+        # fix at the source of the break in the model code, not in this
+        # test.
+        #
+        # DO NOT "fix" a failing run of this test by wrapping the call
+        # in pytest.raises(...) or loosening fullgraph=True. That
+        # silently hides the exact regression this task was built to
+        # catch.
         train_ssm_step(
             model=bare_ssm_model,
             inputs=inputs,
