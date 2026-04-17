@@ -70,16 +70,25 @@ def clip_grad_norm_fused(
     max_norm: float,
     norm_type: float = 2.0,
 ) -> torch.Tensor:
-    """Coalesced L2 grad clip — byte-equivalent to torch.nn.utils.clip_grad_norm_.
+    """Coalesced L2 grad clip — numerical parity with torch.nn.utils.clip_grad_norm_ at fp32 tolerance.
+
+    Reduction order differs (one flat norm vs per-tensor norms stacked and
+    re-reduced), so results agree via allclose, not torch.equal. See
+    tests/test_distributed.py::TestClipGradNormFused for the tolerance
+    contract. The rest of the function body — flatten, norm, clip factor,
+    unflatten + in-place copy back — matches allreduce_grads' 2026-04-17
+    pattern and preserves grad tensor identity (.data_ptr()) so optimizer
+    references stay valid.
 
     Flattens every grad into one buffer, computes the global L2 norm via
     a single kernel, and applies one in-place multiplicative clip factor
     across the buffer. Avoids the per-param norm + stack + global-norm
-    dance the stdlib helper walks through in Python.
-
-    Grad tensor identity (.data_ptr()) is preserved — the clip writes
-    back into the original tensors via unflatten + copy_, matching the
-    contract allreduce_grads established on 2026-04-17.
+    dance the stdlib helper walks through in Python. The clip multiply
+    is unconditional — multiplying by ``clip_coef_clamped == 1.0`` when
+    the norm is under threshold is trivially cheap, while the
+    ``if clip_coef_clamped < 1.0:`` guard would force a GPU->CPU sync
+    every step (see torch's own ``_clip_grads_with_norm_`` for the same
+    motivation).
     """
     if float(norm_type) != 2.0:
         raise NotImplementedError(
@@ -93,11 +102,10 @@ def clip_grad_norm_fused(
     total_norm = flat.norm(p=2)
     clip_coef = max_norm / (total_norm + 1e-6)
     clip_coef_clamped = torch.clamp(clip_coef, max=1.0)
-    if clip_coef_clamped.item() < 1.0:
-        flat.mul_(clip_coef_clamped)
-        synced = torch._utils._unflatten_dense_tensors(flat, grads)
-        for g, s in zip(grads, synced):
-            g.copy_(s)
+    flat.mul_(clip_coef_clamped)
+    synced = torch._utils._unflatten_dense_tensors(flat, grads)
+    for g, s in zip(grads, synced):
+        g.copy_(s)
     return total_norm
 
 

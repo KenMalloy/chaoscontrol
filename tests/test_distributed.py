@@ -22,7 +22,13 @@ from chaoscontrol.distributed import allreduce_grads, resolve_ddp_context
 
 
 class TestClipGradNormFused:
-    """Byte-identical to torch.nn.utils.clip_grad_norm_ for the L2 norm case."""
+    """Numerical parity with torch.nn.utils.clip_grad_norm_ at fp32 tolerance.
+
+    Reduction order differs — stdlib uses per-tensor norms stacked and
+    re-reduced, fused path uses one flat norm over the concatenated
+    grads. Same math, same value to ~fp32 epsilon. Tests use allclose
+    (not torch.equal) for clipped-regime comparisons.
+    """
 
     @staticmethod
     def _build_model_with_mixed_grads(seed: int) -> nn.Module:
@@ -66,12 +72,14 @@ class TestClipGradNormFused:
             )
 
     def test_matches_reference_below_clip_threshold(self) -> None:
-        """Grads below max_norm — both paths must be no-ops for values.
+        """Grads below max_norm — clip is an identity scaling on both paths.
 
-        When clipping doesn't fire, no multiplicative scaling touches the
-        grads, so bit-identity IS preserved on both paths (the fused
-        path's ``if clip_coef_clamped.item() < 1.0`` short-circuits the
-        copy-back entirely). Stricter check than the clipping regime.
+        The fused path unconditionally multiplies by clip_coef_clamped (= 1.0
+        when the total norm is below threshold) to avoid a GPU->CPU sync; the
+        multiply is mathematically a no-op but the flatten/unflatten round-trip
+        inherits the fp32 reduction-order drift from the norm computation, so
+        allclose rather than torch.equal. Tolerance matches the clipping-regime
+        test so a real regression (wrong clip coef, wrong slice) still fails.
         """
         from chaoscontrol.distributed import clip_grad_norm_fused
         model_ref = self._build_model_with_mixed_grads(seed=11)
@@ -79,8 +87,14 @@ class TestClipGradNormFused:
         max_norm = 1e6  # above any realistic grad norm
         torch.nn.utils.clip_grad_norm_(model_ref.parameters(), max_norm)
         clip_grad_norm_fused(model_new.parameters(), max_norm)
-        for p1, p2 in zip(model_ref.parameters(), model_new.parameters()):
-            assert torch.equal(p1.grad, p2.grad)
+        for (n1, p1), (n2, p2) in zip(
+            model_ref.named_parameters(), model_new.named_parameters(),
+        ):
+            assert n1 == n2
+            assert torch.allclose(p1.grad, p2.grad, rtol=1e-6, atol=1e-7), (
+                f"below-threshold drift on {n1!r}: "
+                f"max|diff|={(p1.grad - p2.grad).abs().max().item()}"
+            )
 
     def test_empty_params_is_no_op(self) -> None:
         from chaoscontrol.distributed import clip_grad_norm_fused
@@ -95,6 +109,62 @@ class TestClipGradNormFused:
         clip_grad_norm_fused(model.parameters(), max_norm=0.1)
         ptrs_after = [p.grad.data_ptr() for p in model.parameters()]
         assert ptrs_before == ptrs_after
+
+    def test_nonfinite_grad_does_not_raise_and_matches_stdlib(self) -> None:
+        """inf / nan grads are not raised; total_norm is nonfinite; clip scales to ~0.
+
+        Matches stdlib's default error_if_nonfinite=False behavior. The training
+        loop's first bad batch hits this path — must not crash, must match the
+        stdlib's nonfinite handling so a trainer can drop the step the same way
+        regardless of which clip path is active.
+        """
+        from chaoscontrol.distributed import clip_grad_norm_fused
+        # Build two identical models, both with one infinite grad and one normal.
+        torch.manual_seed(41)
+        model_ref = nn.Sequential(nn.Linear(4, 4), nn.Linear(4, 4))
+        model_new = nn.Sequential(nn.Linear(4, 4), nn.Linear(4, 4))
+        # Copy weights so grads we set are the only source of divergence.
+        for pr, pn in zip(model_ref.parameters(), model_new.parameters()):
+            pn.data.copy_(pr.data)
+        params_ref = list(model_ref.parameters())
+        params_new = list(model_new.parameters())
+        for i, (pr, pn) in enumerate(zip(params_ref, params_new)):
+            if i == 0:
+                pr.grad = torch.full_like(pr, float("inf"))
+                pn.grad = torch.full_like(pn, float("inf"))
+            else:
+                g = torch.randn_like(pr)
+                pr.grad = g.clone()
+                pn.grad = g.clone()
+        ref_total = torch.nn.utils.clip_grad_norm_(params_ref, max_norm=1.0)
+        new_total = clip_grad_norm_fused(params_new, max_norm=1.0)
+        # Both paths report nonfinite total_norm — the training loop's bad-batch
+        # detector reads this field; behavior must agree across paths.
+        assert not torch.isfinite(ref_total)
+        assert not torch.isfinite(new_total)
+
+    def test_nan_grad_does_not_raise_and_matches_stdlib(self) -> None:
+        """Separate test for NaN grads — same contract, different nonfinite path."""
+        from chaoscontrol.distributed import clip_grad_norm_fused
+        torch.manual_seed(42)
+        model_ref = nn.Sequential(nn.Linear(4, 4), nn.Linear(4, 4))
+        model_new = nn.Sequential(nn.Linear(4, 4), nn.Linear(4, 4))
+        for pr, pn in zip(model_ref.parameters(), model_new.parameters()):
+            pn.data.copy_(pr.data)
+        params_ref = list(model_ref.parameters())
+        params_new = list(model_new.parameters())
+        for i, (pr, pn) in enumerate(zip(params_ref, params_new)):
+            if i == 0:
+                pr.grad = torch.full_like(pr, float("nan"))
+                pn.grad = torch.full_like(pn, float("nan"))
+            else:
+                g = torch.randn_like(pr)
+                pr.grad = g.clone()
+                pn.grad = g.clone()
+        ref_total = torch.nn.utils.clip_grad_norm_(params_ref, max_norm=1.0)
+        new_total = clip_grad_norm_fused(params_new, max_norm=1.0)
+        assert not torch.isfinite(ref_total)
+        assert not torch.isfinite(new_total)
 
 
 class TestResolveDDPContext:
