@@ -4,10 +4,12 @@
 # Reproduces the pod state used for Exp 18 Test 10 (2026-04-17):
 #   - torch 2.11.0+cu130 (from https://download.pytorch.org/whl/cu130)
 #   - transformer_engine[pytorch] 2.13.0 (from PyPI + pypi.nvidia.com)
-#   - nvidia-cublas-cu13 pinned to avoid the generic nvidia-cublas package
-#     (which has a newer cublasLt ABI that's missing symbols TE was built
-#     against — observed `cublasLtGroupedMatrixLayoutInit_internal` undefined
-#     when pip resolved to the generic)
+#   - nvidia-cublas pinned to ==13.4.0.1 so that the cuBLASLt symbols
+#     TE 2.13 was built against are actually present. torch 2.11's
+#     transitive dep resolves to 13.1.0.3 which is missing
+#     `cublasLtGroupedMatrixLayoutInit_internal@@libcublasLt.so.13`
+#     (added in a later 13.x cublas release). Observed on 2026-04-17:
+#     TE import crashes with "undefined symbol" on 13.1.0.3, works on 13.4.0.1.
 #   - sentencepiece, numpy, pytest, chaoscontrol (editable)
 #
 # Design notes:
@@ -16,9 +18,11 @@
 #   - --extra-index-url https://pypi.nvidia.com: nvidia-*-cu13 binary wheels
 #     live on NVIDIA's index, not default PyPI. Without this, pip either
 #     source-builds (we block that) or falls back to the generic package.
-#   - nvidia-cublas-cu13 is pinned EXPLICITLY because TE's pre-built
-#     libtransformer_engine.so is compiled against its specific cublasLt
-#     ABI. Letting pip resolve nvidia-cublas (generic, newer) breaks TE.
+#   - nvidia-cublas is pinned EXPLICITLY to 13.4.0.1. The `nvidia-cublas-cu13`
+#     package on pypi.nvidia.com is a 0.0.1 STUB (no library); the real cuBLAS
+#     lives in `nvidia-cublas`. Transitive resolution via torch 2.11 picks
+#     13.1.0.3, which doesn't yet expose every symbol TE 2.13 references at
+#     import time. Pinning 13.4.0.1 is the ABI-matching answer.
 #   - Idempotent: if EVERY required dep imports cleanly, skip the whole
 #     reinstall. Checking only TE was not enough — a pod with working TE
 #     but missing sentencepiece / pytest / editable chaoscontrol install
@@ -91,18 +95,29 @@ echo "==> 2/5 installing PyTorch 2.11.0 against CUDA 13"
 pip install "${PIP_FLAGS[@]}" $PYTORCH_CU130 \
     torch==2.11.0
 
-echo "==> 3/5 pinning nvidia-cublas-cu13 from NVIDIA index (TE ABI requirement)"
-# Must be pinned explicitly so pip doesn't upgrade to nvidia-cublas (generic,
-# newer, missing cublasLtGroupedMatrixLayoutInit_internal that TE expects).
+echo "==> 3/5 pinning nvidia-cublas to the TE-compatible version from NVIDIA index"
+# nvidia-cublas must be >=13.4.0.1 so libcublasLt.so.13 has
+# cublasLtGroupedMatrixLayoutInit_internal (TE 2.13 imports it at module load).
+# The older 13.1.0.3 pulled transitively by torch 2.11 is missing that symbol.
+# The cu13-suffixed package name on pypi.nvidia.com is a 0.0.1 stub, NOT the
+# library — don't be fooled by its pypi.nvidia.com presence.
 pip install "${PIP_FLAGS[@]}" $NVIDIA_INDEX \
-    nvidia-cublas-cu13 \
+    'nvidia-cublas==13.4.0.1' \
     nvidia-cudnn-cu13 \
     nvidia-cusparselt-cu13 \
     nvidia-nccl-cu13 \
     nvidia-nvshmem-cu13
 
 echo "==> 4/5 installing TransformerEngine 2.13.0 (with NVIDIA index for cu13 deps)"
-pip install "${PIP_FLAGS[@]}" $NVIDIA_INDEX \
+# transformer_engine_torch is an sdist-only pybind11 extension that wraps
+# libtransformer_engine (which lives in the prebuilt transformer_engine_cu13
+# wheel). No .cu files, no nvcc required — just g++ against TE's C headers.
+# Exempt that one package from --only-binary=:all: so the sdist is accepted.
+# MAX_JOBS uses every available vCPU for the C++ extension build; the default
+# is 1 (minutes per file × N files) and we have no reason to serialize it.
+MAX_JOBS=$(nproc) pip install --break-system-packages --only-binary=:all: \
+    --no-binary=transformer_engine_torch \
+    $NVIDIA_INDEX \
     'transformer-engine[pytorch]==2.13.0'
 
 echo "==> 5/5 registering CUDA 13 lib path for the dynamic loader"
