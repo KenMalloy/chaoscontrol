@@ -139,40 +139,37 @@ def _resolve_ws_and_lr(
     CLI-provided values win per-field, with the summary filling in the
     rest. Fails fast if a needed field isn't resolvable.
     """
+    # ws and base_lr are LINKED via the linear-with-global-batch rule
+    # (Test 5→5b evidence). Partial override is a scientifically-invalid
+    # regime — a bare ``--world-size 2`` would inherit Test 4b's LR
+    # calibrated for ws=4, producing a mis-calibrated fp8-vs-bf16
+    # comparison. Reject partial overrides up front.
+    partial_override = (cli_ws_override is None) != (cli_lr_override is None)
+    if partial_override:
+        raise RuntimeError(
+            "--world-size and --base-lr must be set TOGETHER or both "
+            "left unset. They are linked by the linear-with-global-batch "
+            "scaling rule (Test 5→5b); overriding only one produces a "
+            "mis-calibrated regime that invalidates the fp8-vs-bf16 "
+            "comparison. Unset both to inherit the coherent pair from "
+            "Test 4b, or set both to a known-good coherent pair."
+        )
+
     if cli_ws_override is not None and cli_lr_override is not None:
         print(
-            f"Test 10: using CLI overrides ws={cli_ws_override} "
-            f"base_lr={cli_lr_override}",
+            f"Test 10: using explicit CLI pair ws={cli_ws_override} "
+            f"base_lr={cli_lr_override} (user takes responsibility for "
+            f"coherence)",
             flush=True,
         )
         return int(cli_ws_override), float(cli_lr_override)
 
     summary_result, status = _read_test4b_winning_ws()
-    if cli_ws_override is not None or cli_lr_override is not None:
-        # Partial override: combine CLI with summary.
-        if status != "ok" or summary_result is None:
-            raise RuntimeError(
-                f"Test 10 received partial overrides (ws={cli_ws_override}, "
-                f"lr={cli_lr_override}) but Test 4b summary isn't usable "
-                f"(status={status!r}) so the missing field can't be resolved. "
-                f"Pass both --world-size and --base-lr, or run Test 4b first."
-            )
-        ws_sum, lr_sum = summary_result
-        ws = int(cli_ws_override) if cli_ws_override is not None else ws_sum
-        lr = float(cli_lr_override) if cli_lr_override is not None else lr_sum
-        print(
-            f"Test 10: partial override — ws={ws} (from "
-            f"{'CLI' if cli_ws_override is not None else 'Test 4b'}) "
-            f"base_lr={lr} (from "
-            f"{'CLI' if cli_lr_override is not None else 'Test 4b'})",
-            flush=True,
-        )
-        return ws, lr
-
     if status == "ok" and summary_result is not None:
         ws, lr = summary_result
         print(
-            f"Test 10: inherited ws={ws} base_lr={lr} from Test 4b winner",
+            f"Test 10: inherited coherent pair (ws={ws}, base_lr={lr}) "
+            f"from Test 4b winner",
             flush=True,
         )
         return ws, lr
@@ -180,7 +177,7 @@ def _resolve_ws_and_lr(
     raise RuntimeError(
         f"Test 10 could not resolve (world_size, base_lr) (status={status!r}). "
         f"Either run Test 4b first so its summary exists at {TEST4B_SUMMARY}, "
-        f"or pass --world-size and --base-lr explicitly."
+        f"or pass BOTH --world-size AND --base-lr as a coherent pair."
     )
 
 
@@ -266,6 +263,9 @@ def summarize_results(conditions: dict[str, dict[str, Any]]) -> dict[str, Any]:
         loss_by_seed: dict[int, float] = {}
         steps_by_seed: dict[int, int] = {}
         sps_by_seed: dict[int, float] = {}  # steps_per_second
+        base_lr_by_seed: dict[int, float] = {}
+        ws_by_seed: dict[int, int] = {}
+        precision_by_seed: dict[int, str] = {}
         for seed, file in matches:
             data = json.loads(file.read_text())
             if not result_is_finite(data):
@@ -275,22 +275,53 @@ def summarize_results(conditions: dict[str, dict[str, Any]]) -> dict[str, Any]:
             loss_by_seed[seed] = float(data["train"]["final_loss"])
             steps_by_seed[seed] = int(data["train"]["steps"])
             sps_by_seed[seed] = float(data["train"]["steps_per_second"])
+            # Read ACTUAL run parameters from the result JSON, not from
+            # the reconstructed condition. Otherwise --summarize-only
+            # after a Test 4b/5b rerun would silently relabel old results.
+            base_lr_by_seed[seed] = float(data["config"]["base_lr"])
+            ws_by_seed[seed] = int(
+                data["config"].get("world_size", cfg.get("world_size", 0))
+            )
+            precision_by_seed[seed] = str(
+                data["config"].get("precision", cfg.get("precision", "bf16"))
+            )
 
         bpb_values = [bpb_by_seed[s] for s in sorted(bpb_by_seed)]
         stable_count = sum(1 for v in loss_by_seed.values() if _loss_is_stable(v))
         bpb_by_condition_seed[condition_name] = dict(bpb_by_seed)
 
-        # Tokens per optimizer step = world_size * bs_per_rank * seq_len.
-        ws = int(cfg["world_size"])
+        # Guard against JSONs with mixed configs in the same condition dir.
+        for label, values in (
+            ("world_size", set(ws_by_seed.values())),
+            ("base_lr", set(base_lr_by_seed.values())),
+            ("precision", set(precision_by_seed.values())),
+        ):
+            if len(values) > 1:
+                raise RuntimeError(
+                    f"condition {condition_name!r} has result JSONs with "
+                    f"mixed {label} values {sorted(values)}; cannot "
+                    f"summarize. Clear {RESULTS} and rerun."
+                )
+
+        ws = int(next(iter(ws_by_seed.values()))) if ws_by_seed else int(cfg.get("world_size", 0))
+        actual_lr = (
+            float(next(iter(base_lr_by_seed.values())))
+            if base_lr_by_seed else float(cfg.get("base_lr", 0.0))
+        )
+        actual_precision = (
+            str(next(iter(precision_by_seed.values())))
+            if precision_by_seed else str(cfg.get("precision", "bf16"))
+        )
+
         tokens_per_step = ws * int(cfg["batch_size"]) * int(cfg["seq_len"])
         mean_sps = _mean(list(sps_by_seed.values()))
         aggregate_tokens_per_sec = mean_sps * tokens_per_step
 
         rows.append({
             "name": condition_name,
-            "precision": str(cfg.get("precision", "bf16")),
+            "precision": actual_precision,  # from JSON
             "world_size": ws,
-            "base_lr": float(cfg["base_lr"]),
+            "base_lr": actual_lr,  # from JSON
             "bpb_by_seed": bpb_by_seed,
             "bpb_values": bpb_values,
             "mean_bpb": _mean(bpb_values),
@@ -298,6 +329,7 @@ def summarize_results(conditions: dict[str, dict[str, Any]]) -> dict[str, Any]:
             "ci_bpb": bootstrap_ci(bpb_values) if bpb_values else (0.0, 0.0),
             "stable_seed_count": stable_count,
             "total_seed_count": len(bpb_values),
+            "expected_seed_count": len(SWEEP_SEEDS),
             "mean_steps_per_second": mean_sps,
             "tokens_per_step": tokens_per_step,
             "aggregate_tokens_per_sec": aggregate_tokens_per_sec,
@@ -344,7 +376,35 @@ def summarize_results(conditions: dict[str, dict[str, Any]]) -> dict[str, Any]:
 
     bf16_row = next((r for r in rows if r["name"] == "bf16"), None)
     fp8_row = next((r for r in rows if r["name"] == "fp8"), None)
-    if bf16_row and fp8_row:
+
+    # Handle fp8-missing case explicitly — "fp8 OOMed or errored before
+    # producing JSONs" is a decisive outcome ("submit at bf16"), not a
+    # quiet absence of recommendation. Same logic for the degenerate
+    # bf16-missing case (shouldn't happen in practice but handle it).
+    fp8_missing = (fp8_row is None) or (fp8_row.get("total_seed_count", 0) == 0)
+    bf16_missing = (bf16_row is None) or (bf16_row.get("total_seed_count", 0) == 0)
+    fp8_in_oom_skipped = "fp8" in _OOM_SKIPPED
+    bf16_in_oom_skipped = "bf16" in _OOM_SKIPPED
+
+    if bf16_missing and fp8_missing:
+        decision["recommendation"] = (
+            "NO DATA — both conditions missing; re-run Test 10"
+        )
+    elif fp8_missing:
+        reason = "OOMed" if fp8_in_oom_skipped else "errored or produced no JSONs"
+        decision["recommendation"] = (
+            f"fp8 {reason} — submit at bf16 (fp8 cannot complete at this regime)"
+        )
+    elif bf16_missing:
+        # Unusual — typically fp8 is the one that breaks. But be
+        # explicit rather than silent.
+        reason = "OOMed" if bf16_in_oom_skipped else "errored or produced no JSONs"
+        decision["recommendation"] = (
+            f"bf16 {reason} — cannot make a comparison; investigate bf16 "
+            f"before trusting any fp8-only data"
+        )
+
+    if bf16_row and fp8_row and not (bf16_missing or fp8_missing):
         # Throughput ratio: fp8 / bf16. >1.0 = fp8 wins; 1.3 is the
         # gate threshold for "meaningful" throughput speedup.
         if bf16_row["aggregate_tokens_per_sec"] > 0:
@@ -356,10 +416,6 @@ def summarize_results(conditions: dict[str, dict[str, Any]]) -> dict[str, Any]:
             throughput_ratio = 0.0
 
         # Paired t-test over seeds that completed under BOTH conditions.
-        # Paired is right here because each seed's initialization and
-        # batch ordering are identical across precision — the ONLY
-        # difference is the dtype, so per-seed bpb differences are the
-        # cleanest signal for "does fp8 degrade loss quality?".
         bf16_seeds = bpb_by_condition_seed.get("bf16", {})
         fp8_seeds = bpb_by_condition_seed.get("fp8", {})
         paired_seeds = sorted(set(bf16_seeds) & set(fp8_seeds))
@@ -377,29 +433,53 @@ def summarize_results(conditions: dict[str, dict[str, Any]]) -> dict[str, Any]:
             paired_p = float("nan")
             bpb_delta_paired = float("nan")
 
-        # Recommendation gate (ordered by severity — first hit wins).
-        bf16_all_stable = (
-            bf16_row["total_seed_count"] > 0
-            and bf16_row["stable_seed_count"] == bf16_row["total_seed_count"]
-        )
-        fp8_all_stable = (
-            fp8_row["total_seed_count"] > 0
-            and fp8_row["stable_seed_count"] == fp8_row["total_seed_count"]
-        )
+        # Recommendation gate. A row is "fully stable" only if it has
+        # ALL expected seeds AND all are stable. The previous gate only
+        # checked stable_count == total_count, which green-lights a
+        # partial 1-of-4 run. Require full coverage to gate a submission.
+        def _fully_stable(row: dict[str, Any]) -> bool:
+            expected = row.get("expected_seed_count", 0)
+            return (
+                row["total_seed_count"] == expected
+                and row["stable_seed_count"] == expected
+            )
+
+        bf16_all_stable = _fully_stable(bf16_row)
+        fp8_all_stable = _fully_stable(fp8_row)
         import math
-        if not (bf16_all_stable and fp8_all_stable):
-            recommendation = "fp8 UNSTABLE — submit at bf16"
+        if not bf16_all_stable and not fp8_all_stable:
+            recommendation = (
+                "BOTH conditions incomplete or unstable at ws×LR regime; "
+                "re-run before trusting a submission decision"
+            )
+        elif not fp8_all_stable:
+            recommendation = (
+                "fp8 UNSTABLE or incomplete — submit at bf16"
+            )
+        elif not bf16_all_stable:
+            recommendation = (
+                "bf16 UNSTABLE or incomplete — investigate before trusting fp8"
+            )
         elif throughput_ratio < 1.3:
-            recommendation = "fp8 throughput win insufficient — submit at bf16"
+            recommendation = (
+                f"fp8 throughput win insufficient ({throughput_ratio:.2f}× "
+                f"< 1.3× gate) — submit at bf16"
+            )
         elif (
             math.isfinite(bpb_delta_paired)
             and bpb_delta_paired > 0.02
             and math.isfinite(paired_p)
             and paired_p < 0.05
         ):
-            recommendation = "fp8 degrades bpb — submit at bf16"
+            recommendation = (
+                f"fp8 degrades bpb (+{bpb_delta_paired:.4f}, p={paired_p:.4g}) "
+                f"— submit at bf16 despite {throughput_ratio:.2f}× throughput"
+            )
         else:
-            recommendation = "fp8 winner — submit at fp8"
+            recommendation = (
+                f"fp8 winner — submit at fp8 ({throughput_ratio:.2f}× "
+                f"throughput, bpb delta {bpb_delta_paired:+.4f})"
+            )
 
         decision.update({
             "fp8_vs_bf16_throughput_ratio": throughput_ratio,

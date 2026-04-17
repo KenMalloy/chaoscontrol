@@ -235,6 +235,8 @@ def summarize_results(conditions: dict[str, dict[str, Any]]) -> dict[str, Any]:
         loss_by_seed: dict[int, float] = {}
         steps_by_seed: dict[int, int] = {}
         sps_by_seed: dict[int, float] = {}  # steps_per_second
+        base_lr_by_seed: dict[int, float] = {}  # read from JSON, not reconstructed
+        ws_by_seed: dict[int, int] = {}
         for seed, file in matches:
             data = json.loads(file.read_text())
             if not result_is_finite(data):
@@ -244,20 +246,48 @@ def summarize_results(conditions: dict[str, dict[str, Any]]) -> dict[str, Any]:
             loss_by_seed[seed] = float(data["train"]["final_loss"])
             steps_by_seed[seed] = int(data["train"]["steps"])
             sps_by_seed[seed] = float(data["train"]["steps_per_second"])
+            # Read the LR and ws that were ACTUALLY used from the result
+            # JSON's config, not from the reconstructed condition config.
+            # Otherwise --summarize-only after a Test 5b rerun would
+            # silently relabel old results with the newly-resolved LR.
+            base_lr_by_seed[seed] = float(data["config"]["base_lr"])
+            ws_by_seed[seed] = int(data["config"].get("world_size", cfg.get("world_size", 0)))
 
         bpb_values = [bpb_by_seed[s] for s in sorted(bpb_by_seed)]
         stable_count = sum(1 for v in loss_by_seed.values() if _loss_is_stable(v))
 
         # Tokens per optimizer step = world_size × bs_per_rank × seq_len.
-        ws = int(cfg["world_size"])
+        # Use the ws the run actually executed under (from JSON), not
+        # the reconstructed condition's ws, so re-summarization of old
+        # results with a different CLI override still reports accurately.
+        ws_values = set(ws_by_seed.values())
+        if len(ws_values) > 1:
+            # Guard against JSONs from mixed-ws runs landing in the same
+            # condition dir — shouldn't happen with the harness's
+            # file-naming, but fail loudly if it does.
+            raise RuntimeError(
+                f"condition {condition_name!r} has result JSONs with "
+                f"mixed world_size values {sorted(ws_values)}; cannot "
+                f"summarize. Clear {RESULTS} and rerun."
+            )
+        ws = int(ws_values.pop()) if ws_values else int(cfg.get("world_size", 0))
         tokens_per_step = ws * int(cfg["batch_size"]) * int(cfg["seq_len"])
         mean_sps = _mean(list(sps_by_seed.values()))
         aggregate_tokens_per_sec = mean_sps * tokens_per_step
 
+        lr_values = set(base_lr_by_seed.values())
+        if len(lr_values) > 1:
+            raise RuntimeError(
+                f"condition {condition_name!r} has result JSONs with "
+                f"mixed base_lr values {sorted(lr_values)}; cannot "
+                f"summarize. Clear {RESULTS} and rerun."
+            )
+        actual_lr = float(lr_values.pop()) if lr_values else float(cfg.get("base_lr", 0.0))
+
         rows.append({
             "name": condition_name,
             "world_size": ws,
-            "base_lr": float(cfg["base_lr"]),
+            "base_lr": actual_lr,  # from JSON, not reconstructed
             "bpb_by_seed": bpb_by_seed,
             "bpb_values": bpb_values,
             "mean_bpb": _mean(bpb_values),
@@ -265,6 +295,7 @@ def summarize_results(conditions: dict[str, dict[str, Any]]) -> dict[str, Any]:
             "ci_bpb": bootstrap_ci(bpb_values) if bpb_values else (0.0, 0.0),
             "stable_seed_count": stable_count,
             "total_seed_count": len(bpb_values),
+            "expected_seed_count": len(SWEEP_SEEDS),
             "mean_steps_per_second": mean_sps,
             "tokens_per_step": tokens_per_step,
             "aggregate_tokens_per_sec": aggregate_tokens_per_sec,
@@ -308,8 +339,22 @@ def summarize_results(conditions: dict[str, dict[str, Any]]) -> dict[str, Any]:
     }
     ws2 = next((r for r in rows if r["name"] == "ws2"), None)
     ws4 = next((r for r in rows if r["name"] == "ws4"), None)
-    if ws2 and ws4 and ws2["stable_seed_count"] == ws2["total_seed_count"] \
-            and ws4["stable_seed_count"] == ws4["total_seed_count"]:
+    # Only emit a recommendation when BOTH conditions have all expected
+    # seeds present AND stable. Previously the gate only required
+    # stable_count == total_count where total_count was "however many
+    # JSONs were found" — a partial run (e.g. seq=4 OOMs and the harness
+    # drops its seeds, or the pod dies mid-sweep) would still green-light
+    # a submission. Require full seed coverage.
+    def _fully_stable(row: dict[str, Any] | None) -> bool:
+        if row is None:
+            return False
+        expected = row.get("expected_seed_count", 0)
+        return (
+            row["total_seed_count"] == expected
+            and row["stable_seed_count"] == expected
+        )
+
+    if ws2 and ws4 and _fully_stable(ws2) and _fully_stable(ws4):
         # Per-GPU throughput (aggregate / ws) gives a fair scaling-efficiency
         # metric: 1.0 means perfect scaling. A 2× GPU count should deliver
         # 2× aggregate throughput → 1.0 per-GPU efficiency.
@@ -340,20 +385,45 @@ def summarize_results(conditions: dict[str, dict[str, Any]]) -> dict[str, Any]:
             if ws2["aggregate_tokens_per_sec"] > 0 else 0.0
         )
 
-        # Recommendation reflects the task framing ("most training data in
-        # 10 min on 8 GPUs"): more tokens always win unless ws=8 refuses
-        # to train. The gate flags scaling collapse (<1.2×) as a "prefer
-        # ws=4 unless Exp 19 evidence differs" — not a hard switch. Under
-        # 1.0× is the only truly degenerate case and we don't expect that
-        # on NVLink H100s.
-        all_stable = (
-            ws2["stable_seed_count"] == ws2["total_seed_count"]
-            and ws4["stable_seed_count"] == ws4["total_seed_count"]
-        )
-        if not all_stable:
+        # Paired-seed bpb comparison protects against the "both stable
+        # but ws=4 is meaningfully worse at matched wall-clock" case.
+        # A pure throughput-scaling gate would green-light ws=8 even
+        # when we're burning tokens on a mis-calibrated LR.
+        shared_seeds = sorted(set(ws2["bpb_by_seed"]) & set(ws4["bpb_by_seed"]))
+        paired_bpb_delta_ws4_minus_ws2 = None
+        paired_p = None
+        bpb_degraded_at_ws4 = False
+        BPB_DEGRADATION_THRESHOLD = 0.03  # nats; larger than screen noise
+        if len(shared_seeds) >= 2:
+            ws2_paired = [ws2["bpb_by_seed"][s] for s in shared_seeds]
+            ws4_paired = [ws4["bpb_by_seed"][s] for s in shared_seeds]
+            _, paired_p = paired_ttest(ws4_paired, ws2_paired)
+            paired_bpb_delta_ws4_minus_ws2 = (
+                sum(ws4_paired) / len(ws4_paired)
+                - sum(ws2_paired) / len(ws2_paired)
+            )
+            bpb_degraded_at_ws4 = (
+                paired_bpb_delta_ws4_minus_ws2 > BPB_DEGRADATION_THRESHOLD
+                and paired_p < 0.05
+            )
+
+        # Recommendation reflects the task framing ("most training data
+        # in 10 min on 8 GPUs") but guards against three failure modes:
+        # (1) stability — ws=4 can't deliver tokens that don't exist,
+        # (2) scaling collapse — >2× GPUs buying <1.2× throughput means
+        #     ws=4 isn't paying off, defer ws=8 decision,
+        # (3) quality degradation — stable + good scaling but meaningfully
+        #     worse bpb at ws=4 means the extra tokens are wasted on a
+        #     mis-calibrated LR. Fall back to ws=2 until an LR tiebreak
+        #     at ws=4 recovers bpb.
+        if bpb_degraded_at_ws4:
             recommendation = (
-                "UNSTABLE at scaling endpoint; submission should use the "
-                "stable ws"
+                f"ws=4 BPB DEGRADED at matched wall-clock "
+                f"(delta=+{paired_bpb_delta_ws4_minus_ws2:.4f} bpb, "
+                f"p={paired_p:.4g}). Likely LR=0.128 mis-calibrated at "
+                f"ws=4 (see bpb_at_ws4_confound_caveat). Submit at ws=2 "
+                f"until a targeted LR tiebreak at ws=4 recovers bpb; "
+                f"DO NOT submit at ws=8 on this data alone."
             )
         elif aggregate_scaling_2_to_4 < 1.2:
             recommendation = (
@@ -371,6 +441,10 @@ def summarize_results(conditions: dict[str, dict[str, Any]]) -> dict[str, Any]:
             "aggregate_scaling_2_to_4": aggregate_scaling_2_to_4,
             "per_gpu_efficiency_2_to_4": efficiency_2_to_4,
             "projections_ws8": projections,
+            "paired_bpb_delta_ws4_minus_ws2": paired_bpb_delta_ws4_minus_ws2,
+            "paired_p_ws4_vs_ws2_bpb": paired_p,
+            "n_paired_seeds": len(shared_seeds),
+            "bpb_degradation_threshold": BPB_DEGRADATION_THRESHOLD,
             "recommendation": recommendation,
             "bpb_at_ws4_confound_caveat": (
                 "LR=0.128 at ws=4 is the half-linear prediction from Test "
@@ -468,7 +542,17 @@ def main() -> None:
         _OOM_SKIPPED.extend(ws4_skipped)
 
     summary = summarize_results(CONDITIONS)
-    summary["_base_lr_ws2_anchor"] = base_lr_ws2
+    # Record BOTH the anchor main() resolved AND the anchor actually
+    # used by the runs on disk (read by summarize_results from the JSON).
+    # The "resolved" field is for traceability (what --base-lr or Test
+    # 5b inheritance gave us this time); the "actual" field reflects
+    # what ran. These can diverge when --summarize-only is invoked
+    # after a later Test 5b rerun — don't silently relabel old runs.
+    summary["_base_lr_ws2_anchor_resolved"] = base_lr_ws2
+    ws2_row_summary = summary.get("ws2") if isinstance(summary.get("ws2"), dict) else None
+    summary["_base_lr_ws2_anchor_actual"] = (
+        ws2_row_summary["base_lr"] if ws2_row_summary else None
+    )
     RESULTS.mkdir(parents=True, exist_ok=True)
     (RESULTS / "test4b_summary.json").write_text(
         json.dumps(summary, indent=2, default=str)
