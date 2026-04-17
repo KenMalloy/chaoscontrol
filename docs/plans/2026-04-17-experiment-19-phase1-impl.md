@@ -5,7 +5,7 @@
 **Goal:** Close the Exp 18 → Exp 19 training-time underfit gap by removing every piece of per-step overhead that currently subtracts from steps-per-second at matched wall-clock, and unlock fp8 as a genuine throughput lever at our `dim=256` scale by replacing TransformerEngine's high-overhead kernel path with a bespoke cuBLASLt path.
 
 **Architecture:** Two parallel tracks that converge into one ablation matrix.
-- **Phase 1A (bf16 throughput, sequential):** fused grad clip, fused Muon step, full-path `torch.compile`. Each lands behind a config flag so the ablation can toggle it. TDD gates ensure each kernel produces numerically-equivalent output to the reference it replaces (parity via ``allclose`` at fp32 tolerance — reduction order changes, e.g. one flat norm vs per-tensor norms stacked, so byte equality is not the right bar) before a throughput claim is made.
+- **Phase 1A (bf16 throughput, sequential):** fused grad clip, fused Muon step, encoder-forward `torch.compile` (narrowed from full-path; detach + chunked-CE backward + encoder backward run eager because dynamo under `fullgraph=True` rejects both `Tensor.requires_grad_()` and in-graph `.backward()`). Each lands behind a config flag so the ablation can toggle it. TDD gates ensure each kernel produces numerically-equivalent output to the reference it replaces (parity via ``allclose`` at fp32 tolerance — reduction order changes, e.g. one flat norm vs per-tensor norms stacked, so byte equality is not the right bar) before a throughput claim is made.
 - **Phase 1B (bespoke fp8, parallel track):** cuBLASLt fused cast+GEMM+cast with deferred amax tracking, plumbed behind the existing `precision` abstraction. Numerical validation against stock TE confirms the kernel is arithmetically correct; bf16-matched-seed training trajectory validation confirms it trains.
 - **Phase 1C (ablation matrix):** One-at-a-time lever-leave-out matrix × {bf16, fp8} run via the persistent-DDP launcher. Summarizer reports tokens/sec, final_loss, bpb, and the marginal contribution of each lever.
 
@@ -320,15 +320,17 @@ git commit -m "exp19(phase1a): fused Muon step (batched NS by shape + coalesced 
 
 ---
 
-### Task 1A-3: Full-path `torch.compile`
+### Task 1A-3: Encoder-forward `torch.compile` (narrowed from full-path)
 
 **Files:**
 - Modify: `src/chaoscontrol/train_ssm.py` (wrap `train_ssm_step` in `torch.compile` behind a flag)
 - Test: `tests/test_train_ssm.py` (new `TestFullPathCompile` class)
 
-**Why:** Currently only `core._diag_recurrence` is compiled (`src/chaoscontrol/core.py`). The rest of the forward pass (projection layers, norms, LM head) runs eager — every one of those ops pays Python dispatch overhead. `torch.compile`ing the whole step closes that gap.
+**Why:** Currently only `core._diag_recurrence` is compiled (`src/chaoscontrol/core.py`). The rest of the encoder forward (projection layers, norms, SSM layer loop) runs eager — every one of those ops pays Python dispatch overhead. `torch.compile`ing the encoder forward closes that gap on the dominant cost; the chunked-CE backward loop and the encoder backward stay eager by necessity and expected inductor speedup is bounded by the encoder's fraction of step time (~1.5-2%, not the 5% a hypothetical end-to-end compile would have delivered).
 
-**Risk:** Compile failures on the SSM path are documented in memory (`feedback_bf16_dtype_gotchas`, `project_criticality_status_2026-04-12`). A graph break inside `torch.compile(dynamic=False)` is a silent fallback to eager — the compile succeeds at torchlevel but individual ops drop back to Python. This task MUST include a graph-break audit.
+**Risk:** Compile failures on the SSM path are documented in memory (`feedback_bf16_dtype_gotchas`, `project_criticality_status_2026-04-12`). A graph break inside `torch.compile(dynamic=False)` is a silent fallback to eager — the compile succeeds at torchlevel but individual ops drop back to Python. `fullgraph=True` turns silent fallback into a loud error, so we use it. This task MUST include a graph-break audit on the encoder region.
+
+**Scope boundary (load-bearing):** dynamo under `fullgraph=True` rejects both `Tensor.requires_grad_()` and in-graph `.backward()`. The chunked-CE design relies on a `hidden.detach().requires_grad_(True)` boundary (otherwise the chunked loop builds one monolithic autograd graph and OOMs on logits.grad at submission shapes), and `chunked_lm_head_backward` calls `.backward()` K times per step. Both MUST remain eager. Compile scope is exactly `model.encode(inputs)`.
 
 **Step 1: Write the failing test**
 
@@ -409,20 +411,35 @@ Expected: `TypeError: train_ssm_step() got an unexpected keyword argument 'compi
 
 **Step 3: Implement**
 
-Add `compile_full_path: bool = False` to `train_ssm_step`. When True, wrap the body in a `torch.compile(dynamic=False, fullgraph=True)` closure. `fullgraph=True` raises on graph break instead of silently falling back — which is what we want for Phase 1A correctness gating.
+Add `compile_full_path: bool = False` to `train_ssm_step` (name kept for backward compatibility; semantics narrowed to "compile the encoder forward"). When True, wrap `model.encode(inputs)` ONLY — not the detach boundary, not the chunked CE loop, not the encoder backward — in a `torch.compile(dynamic=False, fullgraph=True)` closure. `fullgraph=True` raises on graph break in the compiled region, giving a genuine "zero graph breaks on the encoder forward" guarantee. The detach + `requires_grad_(True)` and every `.backward()` call MUST remain eager.
 
 ```python
-@functools.lru_cache(maxsize=4)
-def _compiled_step_fn(fullgraph: bool):
-    return torch.compile(_train_ssm_step_impl, fullgraph=fullgraph, dynamic=False)
+def _encode_only(model, inputs):
+    return model.encode(inputs)
+
+@functools.cache
+def _compiled_step_fn():
+    return torch.compile(_encode_only, fullgraph=True, dynamic=False)
 
 def train_ssm_step(..., compile_full_path: bool = False):
-    if compile_full_path:
-        return _compiled_step_fn(fullgraph=True)(...)
-    return _train_ssm_step_impl(...)
+    _reject_unsupported(model)
+    with autocast_context(precision, device_type=inputs.device.type):
+        hidden = (
+            _compiled_step_fn()(model, inputs)
+            if compile_full_path else model.encode(inputs)
+        )
+        hidden_for_ce = hidden.detach().requires_grad_(True)
+        loss = chunked_lm_head_backward(
+            hidden=hidden_for_ce, final_norm=model.final_norm,
+            lm_head=model.lm_head, targets=targets, chunk_size=chunk_size,
+        )
+        hidden.backward(gradient=hidden_for_ce.grad)
+    if ddp_active and world_size > 1:
+        allreduce_grads(model, world_size)
+    return loss
 ```
 
-Expect the `test_graph_break_free` assertion to fail the first time; address each graph break at the SSM model level (likely causes: Python-level dict accesses on model config, `.item()` calls in the loss chunker, Python-level branching on tensor shapes). Every fix is a small code change + test rerun.
+Expect the `test_graph_break_free` assertion to fail the first time if the encoder has any dynamo-unfriendly ops; address each graph break at the SSM model level (likely causes: Python-level dict accesses on model config, `.item()` calls, Python-level branching on tensor shapes). Every fix is a small code change + test rerun.
 
 **Step 4: Run tests**
 
@@ -741,13 +758,14 @@ Prerequisite: Track 1A bf16 levers meeting their +5% throughput gates (Task 1A-4
 |---|---|---|---|
 | Fused grad clip (1A-1) | `torch.nn.utils.clip_grad_norm_` | `allclose(rtol=1e-6, atol=1e-7)` on CPU fp32 | Same math, different reduction order (one flat norm vs per-tensor-norms stacked) |
 | Fused Muon (1A-2) | existing per-param Muon.step | rtol=1e-5 on CPU fp32 | Batched NS may reorder reductions minimally |
-| Full-path compile (1A-3) | eager train_ssm_step | 1e-5 on CPU fp32 | Inductor and eager should agree at fp32 |
+| Encoder compile (1A-3) | eager `model.encode` | `abs().max() < 1e-5` on CPU fp32 | Inductor and eager should agree at fp32; compile region is encoder forward only |
 | Fused fp8 Linear (1B-2) | stock te.Linear under fp8_autocast | rtol=3e-2 on CUDA | fp8 representation granularity |
 | Fused fp8 training (1B-5) | stock TE fp8 training, same seed | ΔΔ final_loss ≤ 0.05 | Matches Exp 18 Test 10 quality gate |
 
 ### Throughput gates
 
-- Per lever (1A): ≥ +5% tok/s on the submission regime, ±5% peak VRAM, Δ final_loss ≤ 0.02.
+- Per lever (1A-1 fused clip, 1A-2 fused Muon): ≥ +5% tok/s paired-Δ on the submission regime, ±5% peak VRAM, Δ final_loss ≤ 0.02.
+- 1A-3 encoder compile: **statistically significant positive marginal over baseline at paired-t p<0.05**, ±5% peak VRAM, Δ final_loss ≤ 0.02. Point-estimate is expected ~1.5-2% (bounded by encoder fraction of step time); a hard "+5%" bar would dismiss a real encoder-only win as a gate failure.
 - fp8_fused (1B): ≥ +50% tok/s vs stock TE fp8, within 20% of bf16 tok/s.
 
 ### Ablation matrix gates
@@ -764,7 +782,7 @@ Phase 1 lands when:
 1. Every lever in the Phase 1A matrix has a signed, significant marginal contribution (positive or documented-negative).
 2. If fp8_fused ships, it either wins vs bf16 on matched-wall-clock final_loss or it's explicitly parked with the measurements that justify parking.
 3. The "all levers on" condition's tokens/sec at ws=4 on the submission regime is measurably higher than the current Exp 18 Test 4b number (2.107× baseline; any improvement over that is the phase-win bar).
-4. `torch.compile(fullgraph=True)` reports zero graph breaks on the training step.
+4. `torch.compile(fullgraph=True)` reports zero graph breaks on the encoder forward (the compile scope); the detach + `requires_grad_(True)` boundary and chunked-CE backward run eager by design.
 5. All new tests pass; `git status` clean; commit messages stand alone for a public-repo reader.
 
 ---
