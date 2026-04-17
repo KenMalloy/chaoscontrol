@@ -722,10 +722,14 @@ Prerequisite: Track 1A bf16 levers meeting their +5% throughput gates (Task 1A-4
  bf16_no_fused_clip,
  bf16_no_fused_muon,
  bf16_no_compile,
- [fp8_stock, fp8_all, fp8_no_clip, ...] if fp8_fused ships)
+ [fp8_fused_stock,
+  fp8_fused_all,
+  fp8_fused_no_fused_clip,
+  fp8_fused_no_fused_muon,
+  fp8_fused_no_compile]  if fp8_fused ships)
 ```
 
-× 4 seeds = 20 entries (bf16-only) or 36 entries (with fp8_fused).
+× 4 seeds = 20 entries (bf16-only) or 40 entries (with fp8_fused). fp8 needs its own stock/all pair independent of bf16's — the lever marginals are computed *within* a precision (fp8_all vs fp8_no_X), not across precisions.
 
 **Step 1-4:** Write `build_matrix_phase1()` returning a list of config dicts compatible with `run_persistent_launcher.py --matrix-json`. Each entry sets the appropriate flags. Write unit tests covering: matrix size matches the expected count; each lever is toggled off in exactly one non-baseline condition; seed × condition is unique.
 
