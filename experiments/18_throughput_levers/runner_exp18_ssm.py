@@ -254,6 +254,15 @@ def run_ddp(
     # Catching a misconfigured wernicke/outer_model/posterior here
     # saves a few minutes of pod time per bad seed.
     _reject_unsupported(model)
+    precision = str(config.get("precision", "bf16"))
+    if precision == "fp8":
+        from chaoscontrol.precision import maybe_promote_linears_to_te
+        n_promoted = maybe_promote_linears_to_te(model, enabled=True)
+        if is_rank0:
+            print(
+                f"[rank 0] promoted {n_promoted} nn.Linear -> te.Linear for fp8",
+                flush=True,
+            )
     model_params = sum(p.numel() for p in model.parameters())
 
     if is_rank0:
@@ -295,6 +304,7 @@ def run_ddp(
         seed=seed,
         rank=rank,
         world_size=world_size,
+        precision=precision,
     )
 
     # train_ssm_for_budget installs its own teardown barrier when

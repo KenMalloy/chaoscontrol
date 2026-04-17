@@ -33,6 +33,7 @@ from chaoscontrol.distributed import (
     resolve_ddp_context,
     should_stop_now,
 )
+from chaoscontrol.precision import autocast_context
 
 
 def chunked_lm_head_backward(
@@ -152,6 +153,7 @@ def train_ssm_step(
     *,
     ddp_active: bool = False,
     world_size: int = 1,
+    precision: str = "bf16",
 ) -> torch.Tensor:
     """One forward + chunked-backward cycle for a bare-SSM model.
 
@@ -166,29 +168,43 @@ def train_ssm_step(
     — this function only computes gradients and leaves them on the
     parameters.
 
+    ``precision`` selects the autocast policy around the forward +
+    backward; see ``chaoscontrol.precision.autocast_context``. The
+    default "bf16" preserves the pre-2026-04-16 behavior (existing
+    callers don't pass the kwarg). "fp8" requires transformer_engine
+    and requires the caller to have pre-promoted nn.Linear -> te.Linear
+    via ``maybe_promote_linears_to_te``.
+
     Returns the total CE loss as an fp32 scalar (already backprop'd).
     """
     _reject_unsupported(model)
 
-    # Encoder forward — hidden has requires_grad via model params.
-    hidden = model.encode(inputs)
+    # One autocast block covering BOTH forward and backward. For bf16
+    # this is a documentation-level nicety (backward restores saved
+    # tensors to forward dtype regardless), but for fp8+TE the
+    # fp8_autocast context IS required during backward so TE's recipe
+    # tracker sees the backward-pass matmuls.
+    device_type = inputs.device.type
+    with autocast_context(precision, device_type=device_type):
+        # Encoder forward — hidden has requires_grad via model params.
+        hidden = model.encode(inputs)
 
-    # Detach to form a boundary between the chunked LM-head graph and
-    # the encoder graph. The chunked backward accumulates gradient
-    # into hidden_for_ce.grad; that gradient is then injected into the
-    # encoder by ``hidden.backward(gradient=hidden_for_ce.grad)``.
-    hidden_for_ce = hidden.detach().requires_grad_(True)
-    loss = chunked_lm_head_backward(
-        hidden=hidden_for_ce,
-        final_norm=model.final_norm,
-        lm_head=model.lm_head,
-        targets=targets,
-        chunk_size=chunk_size,
-    )
+        # Detach to form a boundary between the chunked LM-head graph and
+        # the encoder graph. The chunked backward accumulates gradient
+        # into hidden_for_ce.grad; that gradient is then injected into the
+        # encoder by ``hidden.backward(gradient=hidden_for_ce.grad)``.
+        hidden_for_ce = hidden.detach().requires_grad_(True)
+        loss = chunked_lm_head_backward(
+            hidden=hidden_for_ce,
+            final_norm=model.final_norm,
+            lm_head=model.lm_head,
+            targets=targets,
+            chunk_size=chunk_size,
+        )
 
-    # Single encoder backward — ``hidden_for_ce.grad`` is the complete
-    # downstream gradient that ``hidden`` should receive.
-    hidden.backward(gradient=hidden_for_ce.grad)
+        # Single encoder backward — ``hidden_for_ce.grad`` is the complete
+        # downstream gradient that ``hidden`` should receive.
+        hidden.backward(gradient=hidden_for_ce.grad)
 
     if ddp_active and world_size > 1:
         allreduce_grads(model, world_size)
@@ -212,6 +228,7 @@ def train_ssm_for_budget(
     world_size: int | None = None,
     seed: int = 0,
     time_fn: Callable[[], float] = time.perf_counter,
+    precision: str = "bf16",
 ) -> dict[str, Any]:
     """Bare-SSM wall-clock training loop.
 
@@ -226,6 +243,9 @@ def train_ssm_for_budget(
     ``time_fn`` defaults to ``time.perf_counter`` and exists so tests
     can drive the budget loop deterministically without depending on
     machine speed.
+
+    ``precision`` is threaded through to every ``train_ssm_step`` call;
+    see the step docstring for the autocast policy it selects.
     """
     _reject_unsupported(model)
 
@@ -271,6 +291,7 @@ def train_ssm_for_budget(
             chunk_size=chunk_size,
             ddp_active=ddp_active,
             world_size=world_size_,
+            precision=precision,
         )
         if grad_clip_norm > 0.0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)

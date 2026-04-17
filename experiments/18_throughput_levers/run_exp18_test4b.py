@@ -58,11 +58,29 @@ be at worst slightly lower than 2→4 on NVLink-connected H100s); if
 the 2→4 number is unexpectedly poor we flag that as evidence the
 submission regime should cap at ws=4.
 
-**Gate.** Two-axis: (1) both conditions stable (all 4 seeds reach
-``final_loss < 8.7``), (2) ws=4 delivers meaningful throughput over
-ws=2 (scaling_efficiency > 1.5x — below that, the 2× GPU count isn't
-paying off and ws=2 is the submission regime by default). Below the
-gate the launcher emits a recommendation, not a hard winner.
+**Gate.** For the "most training data in 10 min on 8 GPUs" framing,
+any aggregate scaling > 1.0x keeps ws=8 strictly preferable — more
+tokens always win unless ws=8 simply refuses to train. The launcher
+emits a recommendation reflecting this:
+
+    - If either condition has an unstable seed → "UNSTABLE at scaling
+      endpoint; submission should use the stable ws".
+    - If aggregate_scaling_2_to_4 < 1.2x → "scaling collapsing; ws=8
+      throughput gains likely marginal; default to ws=4 for
+      submission unless Exp 19 evidence says otherwise".
+    - Else → "submit at ws=8 pending first-step NCCL + loss-descent
+      check during Exp 19".
+
+The bpb column at ws=4 carries a caveat: LR=0.128 at ws=4 is the
+half-linear prediction from Test 5→5b; if ws=4 is stable but bpb is
+worse than ws=2, the result confounds "ws=4 is worse at learning"
+with "LR=0.128 is mis-calibrated at ws=4". Follow-up is a targeted
+LR tiebreak at ws=4, not a scaling failure.
+
+Projection band: the summary reports three ws=8 throughput
+projections (optimistic / realistic / pessimistic) at 100% / 85% /
+75% of the measured 2→4 per-GPU efficiency, so one number isn't
+load-bearing for a recommendation.
 
 Launch:
 
@@ -299,40 +317,83 @@ def summarize_results(conditions: dict[str, dict[str, Any]]) -> dict[str, Any]:
         tps_per_gpu_ws4 = ws4["aggregate_tokens_per_sec"] / 4.0
         efficiency_2_to_4 = tps_per_gpu_ws4 / tps_per_gpu_ws2 if tps_per_gpu_ws2 > 0 else 0.0
 
-        # Extrapolate ws=8: assume 4→8 efficiency matches 2→4 (slightly
-        # optimistic but on NVLink it's typically within a few %).
-        projected_tps_per_gpu_ws8 = tps_per_gpu_ws4 * efficiency_2_to_4
-        projected_aggregate_ws8 = projected_tps_per_gpu_ws8 * 8.0
-        projected_tokens_10min_ws8 = projected_aggregate_ws8 * 600.0
+        # Extrapolate ws=8 with a three-point band. Optimistic assumes 4→8
+        # efficiency matches 2→4 (geometric decay — same relative drop).
+        # Realistic applies an 85% discount to that per-GPU number (modest
+        # extra NVLink degradation across the 4→8 step). Pessimistic 75%.
+        # The band is better than a single-point projection because we
+        # only have ONE measurement of per-doubling efficiency, not two.
+        band_factors = {"optimistic": 1.00, "realistic": 0.85, "pessimistic": 0.75}
+        projections: dict[str, dict[str, float]] = {}
+        for label, factor in band_factors.items():
+            tps_per_gpu_ws8 = tps_per_gpu_ws4 * efficiency_2_to_4 * factor
+            aggregate_ws8 = tps_per_gpu_ws8 * 8.0
+            projections[label] = {
+                "per_gpu_efficiency_factor": factor,
+                "aggregate_tokens_per_sec_ws8": aggregate_ws8,
+                "tokens_seen_10min_ws8": aggregate_ws8 * 600.0,
+            }
 
-        # Aggregate-throughput scaling ratio: 2.0 = perfect, <1.5 = poor.
+        # Aggregate-throughput scaling ratio: 2.0 = perfect, <1.0 = degraded.
         aggregate_scaling_2_to_4 = (
             ws4["aggregate_tokens_per_sec"] / ws2["aggregate_tokens_per_sec"]
             if ws2["aggregate_tokens_per_sec"] > 0 else 0.0
         )
 
-        recommendation = (
-            "ws=8 expected to deliver meaningful throughput; submit at ws=8"
-            if aggregate_scaling_2_to_4 >= 1.5
-            else "scaling inefficient; submission may be better at ws=4"
+        # Recommendation reflects the task framing ("most training data in
+        # 10 min on 8 GPUs"): more tokens always win unless ws=8 refuses
+        # to train. The gate flags scaling collapse (<1.2×) as a "prefer
+        # ws=4 unless Exp 19 evidence differs" — not a hard switch. Under
+        # 1.0× is the only truly degenerate case and we don't expect that
+        # on NVLink H100s.
+        all_stable = (
+            ws2["stable_seed_count"] == ws2["total_seed_count"]
+            and ws4["stable_seed_count"] == ws4["total_seed_count"]
         )
+        if not all_stable:
+            recommendation = (
+                "UNSTABLE at scaling endpoint; submission should use the "
+                "stable ws"
+            )
+        elif aggregate_scaling_2_to_4 < 1.2:
+            recommendation = (
+                "scaling collapsing (aggregate 2→4 < 1.2×); ws=8 gains "
+                "likely marginal; default to ws=4 for submission unless "
+                "Exp 19 evidence says otherwise"
+            )
+        else:
+            recommendation = (
+                "submit at ws=8 pending first-step NCCL + loss-descent "
+                "check during Exp 19"
+            )
 
         decision.update({
             "aggregate_scaling_2_to_4": aggregate_scaling_2_to_4,
             "per_gpu_efficiency_2_to_4": efficiency_2_to_4,
-            "projected_aggregate_tokens_per_sec_ws8": projected_aggregate_ws8,
-            "projected_tokens_seen_10min_ws8": projected_tokens_10min_ws8,
+            "projections_ws8": projections,
             "recommendation": recommendation,
+            "bpb_at_ws4_confound_caveat": (
+                "LR=0.128 at ws=4 is the half-linear prediction from Test "
+                "5→5b; if ws=4 is stable but bpb is worse than ws=2, "
+                "rerun a targeted LR tiebreak at ws=4 before concluding "
+                "ws=4 is worse at learning."
+            ),
         })
 
+        realistic = projections["realistic"]
         print(
             f"\nScaling efficiency (ws=4 vs ws=2):"
             f"\n  aggregate tok/s ratio: {aggregate_scaling_2_to_4:.3f} "
             f"(2.0 = perfect)"
             f"\n  per-GPU efficiency:    {efficiency_2_to_4:.3f} "
             f"(1.0 = perfect)"
-            f"\n  projected ws=8 tok/s:  {projected_aggregate_ws8:,.0f}"
-            f"\n  projected 10min ws=8 tokens: {projected_tokens_10min_ws8:,.0f}"
+            f"\n  projected ws=8 tok/s (realistic 85%): "
+            f"{realistic['aggregate_tokens_per_sec_ws8']:,.0f}"
+            f"\n  projected 10min ws=8 tokens (realistic 85%): "
+            f"{realistic['tokens_seen_10min_ws8']:,.0f}"
+            f"\n  band: optimistic={projections['optimistic']['tokens_seen_10min_ws8']:,.0f} "
+            f"realistic={realistic['tokens_seen_10min_ws8']:,.0f} "
+            f"pessimistic={projections['pessimistic']['tokens_seen_10min_ws8']:,.0f}"
             f"\n  recommendation: {recommendation}"
         )
 
