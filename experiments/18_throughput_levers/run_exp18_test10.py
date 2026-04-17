@@ -548,6 +548,28 @@ def main() -> None:
     global CONDITIONS
     CONDITIONS = build_conditions(world_size, base_lr)
 
+    # Pre-flight TE availability check. If TE isn't importable, the fp8
+    # condition will hard-fail on every seed rather than OOM-skip cleanly
+    # (autocast_context("fp8") raises RuntimeError before training starts,
+    # not a CUDA OOM in torch allocator). Drop fp8 from the matrix up
+    # front, run bf16 only, and mark the fp8 skip in _OOM_SKIPPED so the
+    # summary reports "fp8 SKIPPED — TE unavailable on pod; submit at
+    # bf16" instead of crashing the entire matrix.
+    if not args.summarize_only and "fp8" in CONDITIONS:
+        try:
+            from chaoscontrol.precision import _check_te_available
+        except Exception:
+            _check_te_available = lambda: False  # type: ignore
+        if not _check_te_available():
+            print(
+                "Test 10: transformer_engine is NOT importable on this pod "
+                "(likely CUDA version mismatch). Dropping fp8 condition "
+                "from the matrix; running bf16 only.",
+                flush=True,
+            )
+            del CONDITIONS["fp8"]
+            _OOM_SKIPPED.append("fp8")
+
     if not args.summarize_only:
         validate_data_paths(args.data_path, args.sp_model_path)
 
