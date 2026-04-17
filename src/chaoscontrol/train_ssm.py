@@ -147,65 +147,52 @@ def _reject_unsupported(model: torch.nn.Module) -> None:
             )
 
 
-def _train_ssm_step_impl(
-    *,
+def _encode_only(
     model: torch.nn.Module,
     inputs: torch.Tensor,
-    targets: torch.Tensor,
-    chunk_size: int,
-    ddp_active: bool,
-    world_size: int,
-    precision: str,
 ) -> torch.Tensor:
-    """Compile target for ``train_ssm_step``.
+    """Compile target: encoder forward through ``model.encode``.
 
-    The body of ``train_ssm_step`` lives here so ``torch.compile`` can
-    wrap it as a single callable. ``_reject_unsupported`` runs in the
-    wrapper (above this function) because it inspects Python attributes
-    dynamo can't trace through cleanly.
+    This is the narrowed compile scope used by ``train_ssm_step`` when
+    ``compile_full_path=True``. Everything downstream of the encoder
+    (detach + ``requires_grad_``, chunked LM-head forward/backward,
+    encoder backward, DDP allreduce) is intentionally excluded because
+    dynamo under ``fullgraph=True`` rejects both ``Tensor.requires_grad_``
+    calls and in-graph ``.backward()`` — the two operations the chunked
+    CE algorithm's memory architecture requires at the detach boundary.
+    Compiling the encoder alone still captures the dominant cost of the
+    step (encoder matmuls + SSM recurrences) while leaving the
+    autograd-orchestration fragment eager.
+
+    Autocast is entered by the eager caller so this function inherits
+    whatever precision policy the outer ``autocast_context`` selected;
+    dynamo traces the matmuls inside it correctly.
     """
-    # One autocast block covering BOTH forward and backward. For bf16
-    # this is a documentation-level nicety (backward restores saved
-    # tensors to forward dtype regardless), but for fp8+TE the
-    # fp8_autocast context IS required during backward so TE's recipe
-    # tracker sees the backward-pass matmuls.
-    device_type = inputs.device.type
-    with autocast_context(precision, device_type=device_type):
-        # Encoder forward — hidden has requires_grad via model params.
-        hidden = model.encode(inputs)
-
-        # Detach to form a boundary between the chunked LM-head graph and
-        # the encoder graph. The chunked backward accumulates gradient
-        # into hidden_for_ce.grad; that gradient is then injected into the
-        # encoder by ``hidden.backward(gradient=hidden_for_ce.grad)``.
-        hidden_for_ce = hidden.detach().requires_grad_(True)
-        loss = chunked_lm_head_backward(
-            hidden=hidden_for_ce,
-            final_norm=model.final_norm,
-            lm_head=model.lm_head,
-            targets=targets,
-            chunk_size=chunk_size,
-        )
-
-        # Single encoder backward — ``hidden_for_ce.grad`` is the complete
-        # downstream gradient that ``hidden`` should receive.
-        hidden.backward(gradient=hidden_for_ce.grad)
-
-    if ddp_active and world_size > 1:
-        allreduce_grads(model, world_size)
-
-    return loss
+    return model.encode(inputs)
 
 
 @functools.cache
 def _compiled_step_fn() -> Callable[..., torch.Tensor]:
-    """Compiled wrapper over ``_train_ssm_step_impl``, memoized so
+    """Compiled wrapper over ``_encode_only``, memoized so
     ``torch.compile`` is invoked once per process rather than once per step.
 
-    ``fullgraph=True`` is load-bearing: it raises on graph break instead
-    of silently falling back to eager, so any "compiled" claim this
-    flag gates is genuine. ``dynamic=False`` opts into static shapes
-    for larger inductor speedup; dynamo will recompile on shape change.
+    ``fullgraph=True`` is load-bearing: it raises on any graph break
+    instead of silently falling back to eager, so the "zero graph breaks
+    on the encoder forward" claim this flag gates is genuine.
+    ``dynamic=False`` opts into static shapes for larger inductor
+    speedup; dynamo will recompile on shape change.
+
+    Scope note: the compiled region is the encoder forward only. The
+    detach + ``requires_grad_(True)`` boundary that sets up chunked
+    CE, every per-chunk ``.backward()`` inside
+    ``chunked_lm_head_backward``, and the single ``hidden.backward()``
+    that propagates accumulated gradient into the encoder all run eager
+    by design — dynamo rejects both ``Tensor.requires_grad_`` and
+    in-graph ``.backward()`` under ``fullgraph=True``, so the algorithm
+    cannot live inside the compiled graph. Expected inductor speedup
+    is therefore bounded by the encoder fraction of step time
+    (~1.5-2% at Phase 1 shapes) rather than the full-path 5% that a
+    hypothetical end-to-end compile would have delivered.
 
     Caveat on cache semantics: ``@cache`` returns the same
     ``OptimizedModule`` regardless of which model is passed at call
@@ -217,7 +204,7 @@ def _compiled_step_fn() -> Callable[..., torch.Tensor]:
     the same process.
     """
     return torch.compile(
-        _train_ssm_step_impl, fullgraph=True, dynamic=False,
+        _encode_only, fullgraph=True, dynamic=False,
     )
 
 
@@ -252,36 +239,61 @@ def train_ssm_step(
     and requires the caller to have pre-promoted nn.Linear -> te.Linear
     via ``maybe_promote_linears_to_te``.
 
-    ``compile_full_path`` wraps the whole step body under
-    ``torch.compile(fullgraph=True, dynamic=False)``. ``fullgraph=True``
-    is load-bearing — it raises on ANY graph break instead of silently
-    falling back to eager. Only the existing ``core._diag_recurrence``
-    compile ran before; the projections, norms, LM head, and chunked
-    backward otherwise paid Python dispatch overhead each step.
+    ``compile_full_path`` wraps the encoder forward
+    (``model.encode``) under ``torch.compile(fullgraph=True,
+    dynamic=False)``. The name is retained for backward compatibility
+    with callers and configs, but the compiled region is narrower than
+    the flag suggests: the detach + ``requires_grad_(True)`` boundary,
+    the chunked LM-head forward/backward loop, the encoder backward,
+    and the DDP allreduce all stay eager because dynamo under
+    ``fullgraph=True`` rejects both ``Tensor.requires_grad_`` and
+    in-graph ``.backward()``. ``fullgraph=True`` still gates a genuine
+    "zero graph breaks on the encoder forward" guarantee —
+    it raises on any break in that region rather than silently falling
+    back to eager. Expected inductor speedup is bounded by the encoder
+    fraction of step time at Phase 1 shapes.
 
     Returns the total CE loss as an fp32 scalar (already backprop'd).
     """
     _reject_unsupported(model)
 
-    if compile_full_path:
-        return _compiled_step_fn()(
-            model=model,
-            inputs=inputs,
+    # One autocast block covering BOTH forward and backward. For bf16
+    # this is a documentation-level nicety (backward restores saved
+    # tensors to forward dtype regardless), but for fp8+TE the
+    # fp8_autocast context IS required during backward so TE's recipe
+    # tracker sees the backward-pass matmuls. The compiled ``_encode_only``
+    # (when enabled) runs inside this context and inherits the policy.
+    device_type = inputs.device.type
+    with autocast_context(precision, device_type=device_type):
+        if compile_full_path:
+            hidden = _compiled_step_fn()(model, inputs)
+        else:
+            hidden = model.encode(inputs)
+
+        # Detach to form a boundary between the chunked LM-head graph and
+        # the encoder graph. The chunked backward accumulates gradient
+        # into hidden_for_ce.grad; that gradient is then injected into the
+        # encoder by ``hidden.backward(gradient=hidden_for_ce.grad)``.
+        # This step is eager by design — ``requires_grad_`` is unsupported
+        # under ``fullgraph=True``, as is the per-chunk ``.backward()``
+        # inside ``chunked_lm_head_backward``.
+        hidden_for_ce = hidden.detach().requires_grad_(True)
+        loss = chunked_lm_head_backward(
+            hidden=hidden_for_ce,
+            final_norm=model.final_norm,
+            lm_head=model.lm_head,
             targets=targets,
             chunk_size=chunk_size,
-            ddp_active=ddp_active,
-            world_size=world_size,
-            precision=precision,
         )
-    return _train_ssm_step_impl(
-        model=model,
-        inputs=inputs,
-        targets=targets,
-        chunk_size=chunk_size,
-        ddp_active=ddp_active,
-        world_size=world_size,
-        precision=precision,
-    )
+
+        # Single encoder backward — ``hidden_for_ce.grad`` is the complete
+        # downstream gradient that ``hidden`` should receive.
+        hidden.backward(gradient=hidden_for_ce.grad)
+
+    if ddp_active and world_size > 1:
+        allreduce_grads(model, world_size)
+
+    return loss
 
 
 def train_ssm_for_budget(

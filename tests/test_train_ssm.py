@@ -540,12 +540,19 @@ class TestLossAccumulatorParity:
 
 
 class TestFullPathCompile:
-    """Full-path compile of ``train_ssm_step``: no graph breaks, parity with eager.
+    """Encoder-forward compile under ``train_ssm_step``: no graph breaks, parity with eager.
+
+    The class name is a historical artifact — Phase 1A-3 originally aimed at
+    full-step compile but dynamo's ``fullgraph=True`` rejects both
+    ``Tensor.requires_grad_()`` and in-graph ``.backward()``, forcing the
+    detach boundary, chunked-CE backward, and encoder backward to run eager.
+    The compile region is now just ``model.encode(inputs)``; the ``fullgraph``
+    gate still bites on any break there.
 
     Runtime-skippable via ``_COMPILE_WORKS`` because dev macs hit a
     clang path-space bug that breaks ``torch.compile`` before inductor
     even runs. On a CUDA pod — or any env where compile functions —
-    these tests exercise the real ``fullgraph=True`` path.
+    these tests exercise the real ``fullgraph=True`` path on the encoder.
     """
 
     def test_compiled_step_matches_eager_on_small_batch(
@@ -700,11 +707,13 @@ class TestFullPathCompile:
         assert result_ref["steps"] == result_new["steps"] == 5
         losses_ref = [row["loss"] for row in result_ref["history"]]
         losses_new = [row["loss"] for row in result_new["history"]]
-        # Step 0: forward/backward math is identical between eager and
-        # inductor on CPU for deterministic ops, so loss[0] should be
-        # bit-equal. Subsequent steps carry whatever reduction-order
-        # noise inductor introduces through the optimizer, bounded well
-        # under 1e-4 on these small shapes.
+        # Step 0: only the encoder forward differs between the two paths
+        # (compile uses inductor kernels, eager uses aten); the chunked CE,
+        # encoder backward, and optimizer step are byte-identical. On CPU
+        # fp32 deterministic ops, inductor-vs-aten reductions are bit-equal,
+        # so loss[0] should match exactly. Subsequent steps carry whatever
+        # reduction-order noise inductor introduces through the optimizer,
+        # bounded well under 1e-4 on these small shapes.
         assert losses_ref[0] == losses_new[0], (
             f"loss[0] must match pre-step: "
             f"ref={losses_ref[0]} new={losses_new[0]}"
