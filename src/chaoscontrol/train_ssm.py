@@ -18,6 +18,7 @@ paper testbed, and every prior experiment must remain reproducible.
 """
 from __future__ import annotations
 
+import functools
 import time
 from typing import Any, Callable
 
@@ -146,40 +147,23 @@ def _reject_unsupported(model: torch.nn.Module) -> None:
             )
 
 
-def train_ssm_step(
+def _train_ssm_step_impl(
+    *,
     model: torch.nn.Module,
     inputs: torch.Tensor,
     targets: torch.Tensor,
     chunk_size: int,
-    *,
-    ddp_active: bool = False,
-    world_size: int = 1,
-    precision: str = "bf16",
+    ddp_active: bool,
+    world_size: int,
+    precision: str,
 ) -> torch.Tensor:
-    """One forward + chunked-backward cycle for a bare-SSM model.
+    """Compile target for ``train_ssm_step``.
 
-    Runs ``model.encode(inputs)`` to produce the hidden state, then
-    loops chunked forward/backward through ``final_norm + lm_head + CE``
-    accumulating gradients into the detached hidden tensor. A single
-    encoder backward propagates the accumulated hidden gradient into
-    encoder parameters. When DDP is active, per-parameter gradients
-    are all-reduced (AVG) before return.
-
-    The caller owns ``optimizer.step()`` and ``optimizer.zero_grad()``
-    — this function only computes gradients and leaves them on the
-    parameters.
-
-    ``precision`` selects the autocast policy around the forward +
-    backward; see ``chaoscontrol.precision.autocast_context``. The
-    default "bf16" preserves the pre-2026-04-16 behavior (existing
-    callers don't pass the kwarg). "fp8" requires transformer_engine
-    and requires the caller to have pre-promoted nn.Linear -> te.Linear
-    via ``maybe_promote_linears_to_te``.
-
-    Returns the total CE loss as an fp32 scalar (already backprop'd).
+    The body of ``train_ssm_step`` lives here so ``torch.compile`` can
+    wrap it as a single callable. ``_reject_unsupported`` runs in the
+    wrapper (above this function) because it inspects Python attributes
+    dynamo can't trace through cleanly.
     """
-    _reject_unsupported(model)
-
     # One autocast block covering BOTH forward and backward. For bf16
     # this is a documentation-level nicety (backward restores saved
     # tensors to forward dtype regardless), but for fp8+TE the
@@ -213,6 +197,84 @@ def train_ssm_step(
     return loss
 
 
+@functools.lru_cache(maxsize=4)
+def _compiled_step_fn(fullgraph: bool) -> Callable[..., torch.Tensor]:
+    """Cache ``torch.compile(_train_ssm_step_impl, ...)`` per fullgraph setting.
+
+    dynamo recompiles on shape change regardless, but this cache keeps
+    us from re-invoking ``torch.compile`` every training step. ``dynamic
+    =False`` is the right default: static shapes let inductor pick
+    tighter kernels, and ``train_ssm_for_budget`` holds shapes constant
+    across the whole run.
+    """
+    return torch.compile(
+        _train_ssm_step_impl, fullgraph=fullgraph, dynamic=False,
+    )
+
+
+def train_ssm_step(
+    model: torch.nn.Module,
+    inputs: torch.Tensor,
+    targets: torch.Tensor,
+    chunk_size: int,
+    *,
+    ddp_active: bool = False,
+    world_size: int = 1,
+    precision: str = "bf16",
+    compile_full_path: bool = False,
+) -> torch.Tensor:
+    """One forward + chunked-backward cycle for a bare-SSM model.
+
+    Runs ``model.encode(inputs)`` to produce the hidden state, then
+    loops chunked forward/backward through ``final_norm + lm_head + CE``
+    accumulating gradients into the detached hidden tensor. A single
+    encoder backward propagates the accumulated hidden gradient into
+    encoder parameters. When DDP is active, per-parameter gradients
+    are all-reduced (AVG) before return.
+
+    The caller owns ``optimizer.step()`` and ``optimizer.zero_grad()``
+    — this function only computes gradients and leaves them on the
+    parameters.
+
+    ``precision`` selects the autocast policy around the forward +
+    backward; see ``chaoscontrol.precision.autocast_context``. The
+    default "bf16" preserves the pre-2026-04-16 behavior (existing
+    callers don't pass the kwarg). "fp8" requires transformer_engine
+    and requires the caller to have pre-promoted nn.Linear -> te.Linear
+    via ``maybe_promote_linears_to_te``.
+
+    ``compile_full_path`` wraps the whole step body under
+    ``torch.compile(fullgraph=True, dynamic=False)``. ``fullgraph=True``
+    is load-bearing — it raises on ANY graph break instead of silently
+    falling back to eager. Only the existing ``core._diag_recurrence``
+    compile ran before; the projections, norms, LM head, and chunked
+    backward otherwise paid Python dispatch overhead each step.
+
+    Returns the total CE loss as an fp32 scalar (already backprop'd).
+    """
+    _reject_unsupported(model)
+
+    if compile_full_path:
+        return _compiled_step_fn(fullgraph=True)(
+            model=model,
+            inputs=inputs,
+            targets=targets,
+            chunk_size=chunk_size,
+            ddp_active=ddp_active,
+            world_size=world_size,
+            precision=precision,
+        )
+    return _train_ssm_step_impl(
+        model=model,
+        inputs=inputs,
+        targets=targets,
+        chunk_size=chunk_size,
+        ddp_active=ddp_active,
+        world_size=world_size,
+        precision=precision,
+    )
+
+
 def train_ssm_for_budget(
     model: torch.nn.Module,
     *,
@@ -231,6 +293,7 @@ def train_ssm_for_budget(
     seed: int = 0,
     time_fn: Callable[[], float] = time.perf_counter,
     precision: str = "bf16",
+    compile_full_path: bool = False,
     max_steps: int | None = None,
 ) -> dict[str, Any]:
     """Bare-SSM wall-clock training loop.
@@ -302,6 +365,7 @@ def train_ssm_for_budget(
             ddp_active=ddp_active,
             world_size=world_size_,
             precision=precision,
+            compile_full_path=compile_full_path,
         )
         if grad_clip_norm > 0.0:
             if fused_grad_clip:

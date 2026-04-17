@@ -368,6 +368,7 @@ def run_one_seed(
     chunk_size = int(config.get("chunk_size", 64))
     grad_clip_norm = float(config.get("grad_clip_norm", 1.0))
     fused_grad_clip = bool(config.get("fused_grad_clip", False))
+    compile_full_path = bool(config.get("compile_full_path", False))
 
     # Warmup-restore phase — matches Parameter Golf's pre-timer warmup
     # (baselines/parameter_golf/train_gpt.py lines 935-961). Runs
@@ -403,6 +404,7 @@ def run_one_seed(
                 rank=rank,
                 world_size=world_size,
                 precision=precision,
+                compile_full_path=compile_full_path,
                 max_steps=warmup_steps,
             )
 
@@ -438,6 +440,7 @@ def run_one_seed(
         rank=rank,
         world_size=world_size,
         precision=precision,
+        compile_full_path=compile_full_path,
     )
 
     if ddp_active:

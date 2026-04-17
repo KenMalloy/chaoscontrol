@@ -25,6 +25,32 @@ from chaoscontrol.training import chunked_cross_entropy
 from chaoscontrol.train_ssm import train_ssm_for_budget, train_ssm_step
 
 
+def _compile_works() -> bool:
+    """Probe ``torch.compile`` for functional compilation.
+
+    Returns True iff a trivial compiled function can execute without
+    raising. On macOS dev machines, ``torch.compile`` hits a clang
+    path-space bug when the repo lives under a directory containing
+    spaces (clang mis-parses ``-L`` and the compile throws before
+    inductor runs); on CI sandboxes without a C++ toolchain the
+    compile simply fails to load. This probe short-circuits cleanly
+    for both.
+
+    Tests below are skipped via a runtime check on this result rather
+    than a platform-pinned ``skipif`` so they run for real on a CUDA
+    pod (or any host where compile works) and skip honestly otherwise.
+    """
+    try:
+        fn = torch.compile(lambda x: x * 2, fullgraph=True, dynamic=False)
+        out = fn(torch.tensor([1.0]))
+        return bool(torch.equal(out, torch.tensor([2.0])))
+    except Exception:
+        return False
+
+
+_COMPILE_WORKS = _compile_works()
+
+
 class _DeterministicClock:
     """Monotonic fake clock for deterministic budget-loop tests."""
 
@@ -511,3 +537,173 @@ class TestLossAccumulatorParity:
         detached = loss.detach()
         assert detached.grad_fn is None
         assert detached.requires_grad is False
+
+
+class TestFullPathCompile:
+    """Full-path compile of ``train_ssm_step``: no graph breaks, parity with eager.
+
+    Runtime-skippable via ``_COMPILE_WORKS`` because dev macs hit a
+    clang path-space bug that breaks ``torch.compile`` before inductor
+    even runs. On a CUDA pod — or any env where compile functions —
+    these tests exercise the real ``fullgraph=True`` path.
+    """
+
+    def test_compiled_step_matches_eager_on_small_batch(
+        self, bare_ssm_model: ChaosStudentLM,
+    ) -> None:
+        """Compiled and eager paths produce identical grads at fp32/CPU.
+
+        Eager and inductor are byte-identical for deterministic ops on
+        CPU; any drift > fp32 epsilon is a graph break or a silent
+        fallback. Tight tolerance (``1e-5``) because this is fp32/CPU.
+        """
+        if not _COMPILE_WORKS:
+            pytest.skip(
+                "torch.compile not functional on this host (mac path-space "
+                "clang bug or missing C++ toolchain). Test will run on pod."
+            )
+        inputs, targets = _make_batch(batch=2, seq=16, vocab=64, seed=77)
+
+        model_eager = bare_ssm_model
+        model_comp = copy.deepcopy(model_eager)
+
+        model_eager.zero_grad(set_to_none=True)
+        train_ssm_step(
+            model=model_eager,
+            inputs=inputs,
+            targets=targets,
+            chunk_size=32,
+            compile_full_path=False,
+        )
+        eager_grads = {
+            n: p.grad.clone()
+            for n, p in model_eager.named_parameters() if p.grad is not None
+        }
+
+        model_comp.zero_grad(set_to_none=True)
+        train_ssm_step(
+            model=model_comp,
+            inputs=inputs,
+            targets=targets,
+            chunk_size=32,
+            compile_full_path=True,
+        )
+        comp_grads = {
+            n: p.grad.clone()
+            for n, p in model_comp.named_parameters() if p.grad is not None
+        }
+
+        assert set(eager_grads) == set(comp_grads)
+        for name in eager_grads:
+            diff = (eager_grads[name] - comp_grads[name]).abs().max().item()
+            assert diff < 1e-5, (
+                f"compile drift on {name!r}: {diff}. "
+                f"A graph break silently falling back to eager is the usual "
+                f"cause — check TORCH_LOGS=graph_breaks on the failing run."
+            )
+
+    def test_fullgraph_raises_on_break_rather_than_fallback(
+        self, bare_ssm_model: ChaosStudentLM,
+    ) -> None:
+        """``fullgraph=True`` must raise on any graph break, not silently
+        fall back to eager.
+
+        This is the correctness gate for the "zero graph breaks" claim.
+        If ``train_ssm_step`` has ANY graph break, ``fullgraph=True``
+        raises (``BackendCompilerFailed`` / a TorchDynamo graph-break
+        error). If the compile succeeds, the step is genuinely one graph.
+        """
+        if not _COMPILE_WORKS:
+            pytest.skip(
+                "torch.compile not functional on this host; test will run on pod."
+            )
+        inputs, targets = _make_batch(batch=2, seq=16, vocab=64, seed=78)
+        bare_ssm_model.zero_grad(set_to_none=True)
+        # If this raises, THAT is the useful signal — the test author's
+        # job is then to fix the graph break at the source, not loosen
+        # this assertion. Let the raise propagate.
+        train_ssm_step(
+            model=bare_ssm_model,
+            inputs=inputs,
+            targets=targets,
+            chunk_size=32,
+            compile_full_path=True,
+        )
+
+    def test_compiled_trajectory_matches_eager(
+        self, bare_ssm_model: ChaosStudentLM,
+    ) -> None:
+        """Multi-step training: compiled and eager produce matched loss
+        trajectories at the same seed.
+
+        A compile bug that's invisible on a single step can accumulate
+        over multiple steps. This mirrors the fused_grad_clip /
+        fused_muon trajectory tests above: two ``train_ssm_for_budget``
+        runs, one eager one compiled, same seed and deterministic
+        clock, losses agree within ``1e-4`` per step.
+        """
+        if not _COMPILE_WORKS:
+            pytest.skip(
+                "torch.compile not functional on this host; test will run on pod."
+            )
+        g = torch.Generator().manual_seed(41)
+        vocab = bare_ssm_model.vocab_size
+        train_tokens = torch.randint(0, vocab, (256,), generator=g)
+        train_starts = list(range(0, 256 - 16, 4))
+
+        model_ref = bare_ssm_model
+        model_new = copy.deepcopy(model_ref)
+
+        optimizer_ref = torch.optim.AdamW(model_ref.parameters(), lr=1e-3)
+        result_ref = train_ssm_for_budget(
+            model=model_ref,
+            train_tokens=train_tokens,
+            train_starts=train_starts,
+            seq_len=16,
+            batch_size=2,
+            device=torch.device("cpu"),
+            optimizer=optimizer_ref,
+            budget_seconds=1e9,
+            chunk_size=16,
+            grad_clip_norm=0.0,
+            seed=0,
+            time_fn=_DeterministicClock(step=0.25),
+            compile_full_path=False,
+            max_steps=5,
+        )
+
+        optimizer_new = torch.optim.AdamW(model_new.parameters(), lr=1e-3)
+        result_new = train_ssm_for_budget(
+            model=model_new,
+            train_tokens=train_tokens,
+            train_starts=train_starts,
+            seq_len=16,
+            batch_size=2,
+            device=torch.device("cpu"),
+            optimizer=optimizer_new,
+            budget_seconds=1e9,
+            chunk_size=16,
+            grad_clip_norm=0.0,
+            seed=0,
+            time_fn=_DeterministicClock(step=0.25),
+            compile_full_path=True,
+            max_steps=5,
+        )
+
+        assert result_ref["steps"] == result_new["steps"] == 5
+        losses_ref = [row["loss"] for row in result_ref["history"]]
+        losses_new = [row["loss"] for row in result_new["history"]]
+        # Step 0: forward/backward math is identical between eager and
+        # inductor on CPU for deterministic ops, so loss[0] should be
+        # bit-equal. Subsequent steps carry whatever reduction-order
+        # noise inductor introduces through the optimizer, bounded well
+        # under 1e-4 on these small shapes.
+        assert losses_ref[0] == losses_new[0], (
+            f"loss[0] must match pre-step: "
+            f"ref={losses_ref[0]} new={losses_new[0]}"
+        )
+        for i, (lr_loss, ln_loss) in enumerate(zip(losses_ref, losses_new)):
+            assert abs(lr_loss - ln_loss) < 1e-4, (
+                f"compiled loss[{i}] drift too large: "
+                f"ref={lr_loss} new={ln_loss} diff={lr_loss - ln_loss}"
+            )
