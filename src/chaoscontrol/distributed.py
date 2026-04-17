@@ -46,10 +46,22 @@ def allreduce_grads(model: torch.nn.Module, world_size: int) -> None:
     independent sub-graphs — leading to NCCL collective count
     mismatches and deadlocks. A post-backward all-reduce avoids the
     ordering problem entirely.
+
+    Coalesces every grad into a single flat buffer for one
+    ``dist.all_reduce`` call. N per-param NCCL launches would each pay
+    ~100-500µs of fixed-cost overhead regardless of tensor size; a
+    single coalesced call pays that cost once and reduces the whole
+    flattened buffer in one collective. Uses the flatten/unflatten
+    helpers torch's own ``DistributedDataParallel`` relies on.
     """
-    for p in model.parameters():
-        if p.grad is not None:
-            dist.all_reduce(p.grad, op=dist.ReduceOp.AVG)
+    grads = [p.grad for p in model.parameters() if p.grad is not None]
+    if not grads:
+        return
+    flat = torch._utils._flatten_dense_tensors(grads)
+    dist.all_reduce(flat, op=dist.ReduceOp.AVG)
+    synced = torch._utils._unflatten_dense_tensors(flat, grads)
+    for g, s in zip(grads, synced):
+        g.copy_(s)
 
 
 def should_stop_now(
