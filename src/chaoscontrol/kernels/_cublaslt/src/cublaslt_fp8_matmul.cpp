@@ -8,6 +8,12 @@
 // on the accumulator side), an optional bf16 [N] bias fused into the
 // epilogue, and a bf16 [M,N] output.
 //
+// Task 1B-3 additions: backward GEMM entry points for grad_x and grad_w,
+// the latter with optional BGRADB bias-gradient fusion. Backward GEMMs
+// disable CUBLASLT_MATMUL_DESC_FAST_ACCUM (matches TE's `grad`/
+// `use_split_accumulator` convention — fast-accum introduces error that
+// compounds across the backward pass).
+//
 // Why custom: at dim=256 batch=1024 on H100, `torch._scaled_mm` spends
 // measurable time in the torch dispatcher + aten kernel boundary that we
 // can elide by calling cublasLtMatmul ourselves with a cached handle and
@@ -31,8 +37,11 @@
 // computes (scale_a * A) @ (scale_b * B) on the accumulator side, same as
 // `torch._scaled_mm`'s own convention.
 //
-// Fast-accum: enabled (CUBLASLT_MATMUL_DESC_FAST_ACCUM=1) — tolerable for
-// forward-only Linear at our dim range; TE does the same for forward.
+// BGRADB (grad_w entry point): bias-grad of the matmul's "B" operand in
+// cuBLAS terms — which is torch `a`, i.e. `grad_y` in the grad_w path.
+// BGRADB reduces along k (here: along batch M) and emits a vector sized
+// to D_cublas's column count = N = out_features. That is exactly the
+// shape of `bias.grad` for an `nn.Linear(in_features, out_features)`.
 
 #include <cublasLt.h>
 #include <cuda_fp8.h>
@@ -44,8 +53,10 @@
 #include <c10/cuda/CUDAStream.h>
 
 #include <cstdint>
+#include <optional>
 #include <stdexcept>
 #include <string>
+#include <tuple>
 
 #include "workspace_cache.h"
 
@@ -73,15 +84,36 @@ inline uint32_t ptr_alignment(const void* p) {
     return a;
 }
 
-}  // namespace
+// --------------------------------------------------------------------------
+// Shared fp8 GEMM driver.
+//
+// Takes torch's (a, b) convention and wires it into cuBLASLt via the
+// swap described at the top of the file. Parameterized over:
+//   * bias_mode: NONE (no epilogue), FORWARD_BIAS (bias added to D,
+//     CUBLASLT_EPILOGUE_BIAS), BGRADB (bias-grad output, reduce B over k
+//     and write length-N vector into bias_ptr).
+//   * fast_accum: 1 for forward, 0 for backward. Matches TE's
+//     use_split_accumulator pattern for bwd GEMMs.
+//
+// Output tensor D is allocated here and returned, with optional bias-grad
+// allocated alongside when bias_mode == BGRADB.
+// --------------------------------------------------------------------------
+enum class BiasMode { None, ForwardBias, BGradB };
 
-at::Tensor cublaslt_fp8_matmul(
+struct GemmResult {
+    at::Tensor d;
+    std::optional<at::Tensor> bias_grad;
+};
+
+GemmResult fp8_matmul_impl(
     const at::Tensor& a,             // fp8 E4M3/E5M2, row-major [M, K]
     const at::Tensor& b,             // fp8 E4M3/E5M2, column-major [K, N]
     const at::Tensor& scale_a,       // fp32 scalar, device
     const at::Tensor& scale_b,       // fp32 scalar, device
-    const c10::optional<at::Tensor>& bias_opt,  // bf16 [N], device, or None
-    at::ScalarType out_dtype) {
+    const c10::optional<at::Tensor>& bias_in_opt,   // forward-only bias input
+    at::ScalarType out_dtype,
+    BiasMode bias_mode,
+    bool fast_accum) {
     TORCH_CHECK(a.is_cuda() && b.is_cuda(), "a and b must live on CUDA");
     TORCH_CHECK(scale_a.is_cuda() && scale_b.is_cuda(), "scales must live on CUDA");
     TORCH_CHECK(scale_a.scalar_type() == at::kFloat && scale_a.numel() == 1,
@@ -113,14 +145,29 @@ at::Tensor cublaslt_fp8_matmul(
     // terms that's [N,M] with ld=N — what we ask cuBLASLt to produce.
     auto d = at::empty({M, N}, a.options().dtype(out_dtype));
 
-    const at::Tensor* bias = nullptr;
-    if (bias_opt.has_value() && bias_opt->defined()) {
-        TORCH_CHECK(bias_opt->is_cuda(), "bias must live on CUDA");
-        TORCH_CHECK(bias_opt->scalar_type() == out_dtype,
+    // Forward-bias input tensor (consumed, read-only).
+    const at::Tensor* fwd_bias = nullptr;
+    if (bias_mode == BiasMode::ForwardBias) {
+        TORCH_CHECK(bias_in_opt.has_value() && bias_in_opt->defined(),
+                    "ForwardBias mode requires a bias tensor");
+        TORCH_CHECK(bias_in_opt->is_cuda(), "bias must live on CUDA");
+        TORCH_CHECK(bias_in_opt->scalar_type() == out_dtype,
                     "bias dtype must match out_dtype");
-        TORCH_CHECK(bias_opt->dim() == 1 && bias_opt->size(0) == N,
+        TORCH_CHECK(bias_in_opt->dim() == 1 && bias_in_opt->size(0) == N,
                     "bias must be 1-D with size N=", N);
-        bias = &bias_opt.value();
+        fwd_bias = &bias_in_opt.value();
+    }
+
+    // BGradB: allocate the bias-grad output. BGRADB docs say "the bias
+    // size corresponds to the number of columns of the matrix D", and
+    // "the reduction happens over the GEMM's k dimension". In our swap
+    // layout cuBLAS D is [N_func, M_func] col-major with ld=N_func, so
+    // its "number of columns" is M_func — the first dim of torch `a`.
+    // For the grad_w call (torch a = grad_y.t() [N_torch, M_torch]),
+    // M_func == N_torch == out_features. bf16 to match the bias dtype.
+    std::optional<at::Tensor> bias_grad;
+    if (bias_mode == BiasMode::BGradB) {
+        bias_grad = at::empty({M}, a.options().dtype(out_dtype));
     }
 
     auto& cache = WorkspaceCache::instance();
@@ -162,10 +209,12 @@ at::Tensor cublaslt_fp8_matmul(
                                                     &opB, sizeof(opB)),
                      "set TRANSB");
 
-        // Fp8 fast-accumulation (forward-safe at our dim range).
-        const int8_t fast_accum = 1;
+        // Fast-accumulation: ON for forward, OFF for backward. TE disables
+        // fast-accum on bwd GEMMs to avoid fp8 error compounding; we follow.
+        const int8_t fast_accum_flag = fast_accum ? 1 : 0;
         check_cublas(cublasLtMatmulDescSetAttribute(op_desc, CUBLASLT_MATMUL_DESC_FAST_ACCUM,
-                                                    &fast_accum, sizeof(fast_accum)),
+                                                    &fast_accum_flag,
+                                                    sizeof(fast_accum_flag)),
                      "set FAST_ACCUM");
 
         // Scale pointers. In cuBLASLt's nomenclature A_SCALE corresponds to
@@ -183,17 +232,28 @@ at::Tensor cublaslt_fp8_matmul(
                                                     &B_scale_ptr, sizeof(B_scale_ptr)),
                      "set B_SCALE_POINTER");
 
-        // Bias epilogue. cuBLASLt's bias is added to the output rows, which
-        // in our column-major D (N×M ld=N) means the bias must be length N
-        // and indexed along the leading dim — exactly the per-output-feature
-        // bias semantics of nn.Linear.
+        // Epilogue selection.
+        //   None:         DEFAULT, no bias read/write.
+        //   ForwardBias:  BIAS, bias tensor is ADDED to the output; bf16
+        //                 vector of length N = D's column count.
+        //   BGradB:       BGRADB, bias tensor is the REDUCTION output —
+        //                 dbias = sum_k(B_cublas)_n, which in torch terms is
+        //                 sum over batch of the B-operand (torch `a` in bwd
+        //                 grad_w call = grad_y.t()). Output length = N.
         cublasLtEpilogue_t epilogue = CUBLASLT_EPILOGUE_DEFAULT;
-        if (bias != nullptr) {
+        const void* bias_ptr_for_desc = nullptr;
+        if (bias_mode == BiasMode::ForwardBias) {
             epilogue = CUBLASLT_EPILOGUE_BIAS;
-            const void* bias_ptr = bias->data_ptr();
+            bias_ptr_for_desc = fwd_bias->data_ptr();
+        } else if (bias_mode == BiasMode::BGradB) {
+            epilogue = CUBLASLT_EPILOGUE_BGRADB;
+            bias_ptr_for_desc = bias_grad->data_ptr();
+        }
+        if (bias_ptr_for_desc != nullptr) {
             check_cublas(cublasLtMatmulDescSetAttribute(op_desc,
                                                         CUBLASLT_MATMUL_DESC_BIAS_POINTER,
-                                                        &bias_ptr, sizeof(bias_ptr)),
+                                                        &bias_ptr_for_desc,
+                                                        sizeof(bias_ptr_for_desc)),
                          "set BIAS_POINTER");
             const cudaDataType_t bias_dtype = dtype_d;
             check_cublas(cublasLtMatmulDescSetAttribute(op_desc,
@@ -280,7 +340,122 @@ at::Tensor cublaslt_fp8_matmul(
         throw;
     }
     cleanup();
-    return d;
+    return GemmResult{std::move(d), std::move(bias_grad)};
+}
+
+}  // namespace
+
+// --------------------------------------------------------------------------
+// Forward fp8 matmul. Public signature unchanged since 1B-3.
+// Fast-accum ON; optional CUBLASLT_EPILOGUE_BIAS fusion.
+// --------------------------------------------------------------------------
+at::Tensor cublaslt_fp8_matmul(
+    const at::Tensor& a,
+    const at::Tensor& b,
+    const at::Tensor& scale_a,
+    const at::Tensor& scale_b,
+    const c10::optional<at::Tensor>& bias_opt,
+    at::ScalarType out_dtype) {
+    const BiasMode mode = (bias_opt.has_value() && bias_opt->defined())
+                              ? BiasMode::ForwardBias
+                              : BiasMode::None;
+    auto result = fp8_matmul_impl(a, b, scale_a, scale_b, bias_opt,
+                                  out_dtype, mode, /*fast_accum=*/true);
+    return std::move(result.d);
+}
+
+// --------------------------------------------------------------------------
+// Backward GEMM: grad_x = grad_y @ W.
+//
+// Callers pass:
+//   grad_y_fp8 : E5M2, row-major [M, N]        (torch `a`)
+//   weight_fp8 : E4M3, col-major [N, K]        (torch `b`)
+//   scale_gy   : fp32 scalar, dequant multiplier for grad_y
+//   scale_w    : fp32 scalar, dequant multiplier for weight
+//   out_dtype  : bf16 (fp16 also accepted)
+//
+// Produces row-major [M, K] bf16 tensor = grad_x.
+// Fast-accum OFF (matches TE's split-accumulator convention for bwd).
+// --------------------------------------------------------------------------
+at::Tensor cublaslt_fp8_matmul_grad_x(
+    const at::Tensor& grad_y_fp8,
+    const at::Tensor& weight_fp8,
+    const at::Tensor& scale_gy,
+    const at::Tensor& scale_w,
+    at::ScalarType out_dtype) {
+    auto result = fp8_matmul_impl(grad_y_fp8, weight_fp8, scale_gy, scale_w,
+                                  /*bias_in=*/c10::nullopt, out_dtype,
+                                  BiasMode::None, /*fast_accum=*/false);
+    return std::move(result.d);
+}
+
+// --------------------------------------------------------------------------
+// Backward GEMM: grad_w = grad_y.t() @ x, with optional BGRADB bias-grad.
+//
+// Callers pass:
+//   grad_y_fp8_t : E5M2, row-major [N, M]      (torch `a`; already transposed)
+//   x_fp8        : E4M3, col-major [M, K]      (torch `b`)
+//   scale_gy     : fp32 scalar
+//   scale_x      : fp32 scalar
+//   out_dtype    : bf16
+//   compute_bias_grad : if true, attempt BGRADB epilogue fusion. On
+//     hardware/driver combos where BGRADB is unsupported for fp8 GEMMs
+//     (observed: cuBLAS 12.8.4 rejects both BGRADA and BGRADB with
+//     CUBLAS_STATUS_NOT_SUPPORTED for E5M2×E4M3), the kernel falls back
+//     to the DEFAULT epilogue and returns nullopt; the caller should
+//     then compute the bias-gradient eagerly (``grad_y.sum(0)``). The
+//     Python wrapper handles this fallback transparently.
+//
+// Produces:
+//   grad_w    : row-major [N, K] bf16
+//   grad_bias : length-[N] bf16 (filled by BGRADB) or nullopt if the
+//     epilogue fused path isn't supported and the caller must sum eagerly.
+//
+// BGRADB semantics walk-through:
+//   Torch view:  grad_w[N,K] = grad_y.t()[N,M] @ x[M,K]
+//   Our swap:    cuBLAS A = torch b = x;         cuBLAS B = torch a = grad_y.t()
+//   CuBLAS GEMM: D[m,n] = A^op[m,k] @ B^op[k,n]
+//                  with m = N_func (first dim of torch a after op=T) = N_torch
+//                       n = M_func? No — follow the code: we set transa=T,
+//                       transb=N and the cublas m/n fall out as:
+//                         m = A_cublas rows after op=T = N_arg = K_torch
+//                         n = B_cublas cols after op=N = M_arg = N_torch
+//                         k = K_arg = M_torch
+//   So cuBLAS D is [m, n] col-major = [K_torch, N_torch] col-major. Its
+//   "cols of D" (n) = N_torch = out_features. BGRADB writes a length-n
+//   vector = length N_torch. Exactly our dbias shape. The reduction is
+//   over cuBLAS k = M_torch, i.e. sum over batch of grad_y — correct.
+// --------------------------------------------------------------------------
+std::tuple<at::Tensor, std::optional<at::Tensor>> cublaslt_fp8_matmul_grad_w(
+    const at::Tensor& grad_y_fp8_t,
+    const at::Tensor& x_fp8,
+    const at::Tensor& scale_gy,
+    const at::Tensor& scale_x,
+    at::ScalarType out_dtype,
+    bool compute_bias_grad) {
+    if (compute_bias_grad) {
+        // Try BGRADB first. If the driver rejects it (observed on
+        // cuBLAS 12.8.4 with E5M2×E4M3), fall back to DEFAULT and let
+        // the Python side compute the bias-grad eagerly. The fallback
+        // is behavior-preserving at the API boundary.
+        try {
+            auto result = fp8_matmul_impl(grad_y_fp8_t, x_fp8, scale_gy, scale_x,
+                                          /*bias_in=*/c10::nullopt, out_dtype,
+                                          BiasMode::BGradB, /*fast_accum=*/false);
+            return std::make_tuple(std::move(result.d),
+                                   std::move(result.bias_grad));
+        } catch (const std::runtime_error& e) {
+            const std::string what = e.what();
+            if (what.find("heuristic") == std::string::npos) {
+                throw;   // Not a heuristic/support issue — re-raise.
+            }
+            // Fall through to DEFAULT path.
+        }
+    }
+    auto result = fp8_matmul_impl(grad_y_fp8_t, x_fp8, scale_gy, scale_x,
+                                  /*bias_in=*/c10::nullopt, out_dtype,
+                                  BiasMode::None, /*fast_accum=*/false);
+    return std::make_tuple(std::move(result.d), std::optional<at::Tensor>{});
 }
 
 }  // namespace cc_cublaslt
@@ -295,7 +470,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("bias") = py::none(),
           py::arg("out_dtype") = at::kBFloat16,
           R"doc(
-Fused cuBLASLt fp8 matmul.
+Fused cuBLASLt fp8 matmul (forward).
 
 Args:
   a: fp8 row-major [M, K].
@@ -311,5 +486,50 @@ Returns:
 Semantics match ``torch._scaled_mm(a, b, scale_a=..., scale_b=..., bias=...,
 out_dtype=...)`` — the scales are dequant multipliers applied on the
 accumulator side: output = (scale_a * a) @ (scale_b * b) + bias.
+Fast-accum ON; callers wanting split-accumulator semantics should use
+the grad_x / grad_w entry points instead.
+)doc");
+
+    m.def("cublaslt_fp8_matmul_grad_x", &cc_cublaslt::cublaslt_fp8_matmul_grad_x,
+          py::arg("grad_y_fp8"),
+          py::arg("weight_fp8"),
+          py::arg("scale_gy"),
+          py::arg("scale_w"),
+          py::arg("out_dtype") = at::kBFloat16,
+          R"doc(
+Backward fp8 matmul for grad_x = grad_y @ W.
+
+Args:
+  grad_y_fp8: fp8 E5M2 row-major [M, N].
+  weight_fp8: fp8 E4M3 column-major [N, K].
+  scale_gy: fp32 scalar device tensor.
+  scale_w: fp32 scalar device tensor.
+  out_dtype: bf16 by default.
+
+Returns:
+  Tensor of shape [M, K] in out_dtype. Fast-accum OFF.
+)doc");
+
+    m.def("cublaslt_fp8_matmul_grad_w", &cc_cublaslt::cublaslt_fp8_matmul_grad_w,
+          py::arg("grad_y_fp8_t"),
+          py::arg("x_fp8"),
+          py::arg("scale_gy"),
+          py::arg("scale_x"),
+          py::arg("out_dtype") = at::kBFloat16,
+          py::arg("compute_bias_grad") = false,
+          R"doc(
+Backward fp8 matmul for grad_w = grad_y.t() @ x, with optional fused bias_grad.
+
+Args:
+  grad_y_fp8_t: fp8 E5M2 row-major [N, M] (transpose already materialized).
+  x_fp8: fp8 E4M3 column-major [M, K].
+  scale_gy: fp32 scalar.
+  scale_x: fp32 scalar.
+  out_dtype: bf16.
+  compute_bias_grad: if True, fuse BGRADB epilogue and return dbias [N]
+    alongside grad_w.
+
+Returns:
+  Tuple (grad_w [N, K], grad_bias [N] or None). Fast-accum OFF.
 )doc");
 }

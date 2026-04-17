@@ -51,74 +51,112 @@ def build_ext_modules() -> list:
     src_dir = this_dir / "src"
     include_dirs = [str(src_dir)]
     library_dirs: List[str] = []
-    # We link against versioned libs directly (``-l:libcublasLt.so.13``)
-    # rather than unversioned ``-lcublasLt`` because the nvidia-cublas-cu13
-    # wheel ships only the versioned ``.so.13`` files — no unversioned
-    # symlinks. The ``-l:filename`` form is a GCC/GNU-ld extension that
-    # skips the ``lib<name>.so`` search and asks for the specific file
-    # directly. Libraries list is populated below once we know the CUDA
-    # layout (cu13 wheel vs. classic /usr/local/cuda).
     libraries: List[str] = []
 
-    # Find cuBLASLt headers. Prefer the cu13 wheel install (which matches
-    # torch cu130 ABI) over /usr/local/cuda (which on this pod is cu12.8).
-    cu13_candidates = [
+    # CUDA layout discovery — we support two layouts:
+    #   1. cu13 wheel: /usr/local/lib/python3.12/dist-packages/nvidia/cu13/
+    #      (single umbrella wheel, ships .so.13 versioned libs)
+    #   2. cu12 wheels (the default): per-component wheels under
+    #      /usr/local/lib/python3.12/dist-packages/nvidia/<component>/
+    #      (cublas/, cuda_runtime/, ...) shipping .so.12 libs
+    # We probe for cu13 first to match a cu13 torch build; fall back to
+    # cu12 wheels; fall back to /usr/local/cuda for a classic CUDA toolkit
+    # install. An explicit CC_CUBLAS_PREFIX env var overrides detection.
+    cu13_umbrella = [
         "/usr/local/lib/python3.12/dist-packages/nvidia/cu13",
         "/usr/local/lib/python3.10/dist-packages/nvidia/cu13",
     ]
     cu_prefix = None
-    for c in cu13_candidates:
+    cu_version = None  # 13 or 12 — selects the -l:libfoo.so.NN suffix.
+    for c in cu13_umbrella:
         if os.path.exists(os.path.join(c, "include", "cublasLt.h")):
             cu_prefix = c
+            cu_version = 13
             break
-    # Honor a manual override (useful if the cu-version wheel changes).
+    if cu_prefix is None:
+        # cu12 per-component layout: cublas/include/cublasLt.h lives in the
+        # cublas wheel; cuda_runtime is a separate wheel.
+        for dist in ("/usr/local/lib/python3.12/dist-packages/nvidia",
+                     "/usr/local/lib/python3.10/dist-packages/nvidia"):
+            cublas_inc = os.path.join(dist, "cublas", "include", "cublasLt.h")
+            if os.path.exists(cublas_inc):
+                # "prefix" here is synthetic — we aggregate include + lib
+                # dirs from multiple component wheels below.
+                cu_prefix = dist
+                cu_version = 12
+                break
     if os.environ.get("CC_CUBLAS_PREFIX"):
         cu_prefix = os.environ["CC_CUBLAS_PREFIX"]
+        # If the user overrides, assume cu13 layout unless
+        # CC_CUDA_VERSION is set.
+        cu_version = int(os.environ.get("CC_CUDA_VERSION", "13"))
     if cu_prefix is None and os.path.exists("/usr/local/cuda/include/cublasLt.h"):
         cu_prefix = "/usr/local/cuda"
+        # /usr/local/cuda is usually cu12.x on these pods; pin to 12
+        # unless overridden.
+        cu_version = int(os.environ.get("CC_CUDA_VERSION", "12"))
 
     if cu_prefix is None:
         # No cuBLASLt headers — skip the extension. Call sites get a
         # clean ImportError from __init__.py.
         return []
 
-    include_dirs.append(os.path.join(cu_prefix, "include"))
-    # Library path: cu13 wheel layout is lib/, classic CUDA layout is lib64/.
-    for lib_sub in ("lib", "lib64"):
-        lib_dir = os.path.join(cu_prefix, lib_sub)
-        if os.path.isdir(lib_dir):
-            library_dirs.append(lib_dir)
+    if cu_version == 13:
+        include_dirs.append(os.path.join(cu_prefix, "include"))
+        for lib_sub in ("lib", "lib64"):
+            lib_dir = os.path.join(cu_prefix, lib_sub)
+            if os.path.isdir(lib_dir):
+                library_dirs.append(lib_dir)
+    elif cu_version == 12 and cu_prefix.endswith("/nvidia"):
+        # cu12 per-component wheel layout.
+        for component, headers in (
+            ("cublas", True),
+            ("cuda_runtime", True),
+            ("cuda_cupti", False),
+        ):
+            comp_dir = os.path.join(cu_prefix, component)
+            if headers:
+                inc_dir = os.path.join(comp_dir, "include")
+                if os.path.isdir(inc_dir):
+                    include_dirs.append(inc_dir)
+            lib_dir = os.path.join(comp_dir, "lib")
+            if os.path.isdir(lib_dir):
+                library_dirs.append(lib_dir)
+    else:
+        # Classic /usr/local/cuda toolkit layout.
+        include_dirs.append(os.path.join(cu_prefix, "include"))
+        for lib_sub in ("lib64", "lib"):
+            lib_dir = os.path.join(cu_prefix, lib_sub)
+            if os.path.isdir(lib_dir):
+                library_dirs.append(lib_dir)
 
-    # The nvidia-*-cu13 wheel (/usr/local/lib/python3.12/dist-packages/nvidia/cu13)
-    # ships driver_types.h, which unconditionally does
-    #   #include "crt/host_defines.h"
-    # — but the wheel is missing the crt/ subdirectory. cu13's host_defines.h
-    # lives at the root of include/ instead. Add /usr/local/cuda/include
-    # (CUDA toolkit, always cu12.x on these pods) as a SECONDARY include
-    # path: cu13 takes precedence for everything except the crt/ shim,
-    # which is API-stable across minor CUDA versions. Dropping this line
-    # makes the build fail with "crt/host_defines.h: No such file".
+    # Cross-wheel crt/host_defines.h shim — the cu13 wheel ships
+    # driver_types.h that includes "crt/host_defines.h" but the wheel
+    # lacks the crt/ subdir. Adding /usr/local/cuda/include as a
+    # SECONDARY include path satisfies that unconditional include.
+    # Harmless on cu12 paths (they ship crt/ in-place).
     for fallback in ("/usr/local/cuda/include",
                      "/usr/local/cuda-12.8/targets/x86_64-linux/include"):
         if os.path.exists(os.path.join(fallback, "crt", "host_defines.h")):
-            include_dirs.append(fallback)
+            if fallback not in include_dirs:
+                include_dirs.append(fallback)
             break
 
     # `runtime_library_dirs` bakes the path into the .so's rpath so the
-    # dynamic loader finds libcublasLt.so.13 without needing LD_LIBRARY_PATH
-    # preset at import time.
+    # dynamic loader finds libcublasLt.so.<N> without needing
+    # LD_LIBRARY_PATH preset at import time.
     runtime_library_dirs = list(library_dirs)
 
     extra_compile_args = ["-O3", "-std=c++17"]
-    # Link directly against versioned libs. On cu13 the wheel is the only
-    # thing that ships libcublasLt.so.13, so we pin by filename. If someone
-    # later runs this on a box with stock /usr/local/cuda 12.x we'd need
-    # to flip to the unversioned ``-lcublasLt``, but that case isn't a
-    # pod we currently own.
+    # Link against versioned libs by filename — the nvidia-*-cuNN wheels
+    # only ship versioned .so.NN files (no unversioned symlinks). The
+    # ``-l:filename`` form is a GCC/GNU-ld extension that asks for a
+    # specific file rather than the libfoo.so search.
+    suffix = "so.13" if cu_version == 13 else "so.12"
     extra_link_args: List[str] = [
-        "-l:libcublasLt.so.13",
-        "-l:libcublas.so.13",
-        "-l:libcudart.so.13",
+        f"-l:libcublasLt.{suffix}",
+        f"-l:libcublas.{suffix}",
+        f"-l:libcudart.{suffix}",
     ]
 
     # Tell PyTorch's BUILD_ABI stays consistent with how torch was built.

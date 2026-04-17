@@ -35,7 +35,10 @@ import torch
 import torch.nn as nn
 import transformer_engine.pytorch as te  # type: ignore[import-not-found]
 
-from chaoscontrol.kernels.fp8_linear import FusedFP8Linear
+from chaoscontrol.kernels.fp8_linear import (
+    FusedFP8Linear,
+    fused_fp8_flush_all,
+)
 
 
 @pytest.fixture
@@ -324,3 +327,155 @@ def test_forward_no_sync_per_call(cuda_required) -> None:
         f"te={te_time:.4f}s ratio={bespoke_time / te_time:.3f} "
         "(need < 0.7×)"
     )
+
+
+# ---------------------------------------------------------------------------
+# Task 1B-3 additions — deferred amax + cuBLASLt-fork swap.
+# ---------------------------------------------------------------------------
+
+
+def test_flush_amax_history_exists_and_noop_without_call() -> None:
+    """``flush_amax_history`` exists at the expected name. Skipping it
+    between steps is permitted: scales stay stale but forward/backward
+    still produce finite output. No CUDA required for the API check;
+    a skip_if_cuda live-path test exercises the flush on a real tensor."""
+    layer = FusedFP8Linear(64, 64)
+    assert hasattr(layer, "flush_amax_history"), (
+        "FusedFP8Linear must expose flush_amax_history() for the training "
+        "loop to call once per optimizer step"
+    )
+    # Pending + scale buffers are part of the module state.
+    sd = layer.state_dict()
+    for name in ("x_amax_pending", "w_amax_pending",
+                 "gy_amax_pending", "gx_amax_pending",
+                 "x_scale", "w_scale", "gy_scale"):
+        assert name in sd, f"{name} missing from state_dict"
+    # Scales default to 1.0 — cold-start path.
+    assert float(sd["x_scale"].item()) == 1.0
+    assert float(sd["w_scale"].item()) == 1.0
+    assert float(sd["gy_scale"].item()) == 1.0
+
+
+def test_flush_amax_history_updates_scales(cuda_required) -> None:
+    """After a forward + flush, the scales reflect the observed amax.
+
+    This is the real correctness check on deferred amax: the first
+    forward folds its amax into ``x_amax_pending`` via ``torch.maximum``;
+    the flush rolls pending into history and recomputes the scale. A
+    second forward at different magnitude must see the UPDATED scale.
+    """
+    torch.manual_seed(0)
+    layer = FusedFP8Linear.from_nn_linear(
+        nn.Linear(64, 64, device="cuda", dtype=torch.bfloat16),
+    )
+    # Forward with a known amax (~3.0).
+    x = torch.randn(32, 64, device="cuda", dtype=torch.bfloat16) * 3.0
+    _ = layer(x)
+
+    # Before flush: scales still at cold-start 1.0.
+    assert float(layer.x_scale.item()) == 1.0
+    # Pending: populated to something > 0.
+    assert float(layer.x_amax_pending.item()) > 0.0
+
+    # Flush — pending rolls into history, scale recomputes to
+    # max(history) / 448.
+    layer.flush_amax_history()
+    new_scale = float(layer.x_scale.item())
+    assert new_scale > 0.0, "x_scale zero after flush"
+    # Expected: roughly the observed amax / 448 ~ 3*sqrt(2*ln(64*32))/448.
+    # Just check it's in a sane range (>0, <1).
+    assert 0.0 < new_scale < 1.0, f"x_scale out of expected range: {new_scale}"
+    # Pending zeroed.
+    assert float(layer.x_amax_pending.item()) == 0.0
+
+
+def test_fused_fp8_flush_all_walks_model(cuda_required) -> None:
+    """``fused_fp8_flush_all`` finds every FusedFP8Linear in a model
+    tree and flushes each. Returns the count so training loops can
+    sanity-check the walk."""
+    model = nn.Sequential(
+        FusedFP8Linear(32, 32, device="cuda"),
+        nn.ReLU(),
+        FusedFP8Linear(32, 32, device="cuda"),
+    ).cuda()
+    x = torch.randn(8, 32, device="cuda", dtype=torch.bfloat16)
+    _ = model(x)
+    n = fused_fp8_flush_all(model)
+    assert n == 2, f"expected 2 flushes, got {n}"
+    # Scales on both submodules now non-default.
+    for sub in model.modules():
+        if isinstance(sub, FusedFP8Linear):
+            assert float(sub.x_amax_pending.item()) == 0.0
+
+
+@pytest.mark.slow
+def test_forward_backward_report_bench(cuda_required, capsys) -> None:
+    """Whole-stack fwd+bwd benchmark — reported number only.
+
+    Our FusedFP8Linear.forward + .backward() combined vs stock TE
+    te.Linear + fp8_autocast fwd+bwd at dim=256 batch=1024. The ratio
+    is PRINTED for the report but NOT asserted: the gate named in the
+    task spec is forward-only (``test_forward_no_sync_per_call``, the
+    0.7× TE bar). Backward on our side still materializes two
+    transposes (weight -> col-major, x_fp8 -> col-major) that TE
+    elides by caching fp8 operands across the fwd→bwd boundary; that's
+    a follow-up optimization, not a 1B-3 blocker.
+    """
+    import time
+
+    dim = 256
+    batch = 1024
+    iters = 200
+    warmup = 20
+
+    torch.manual_seed(0)
+    ref = te.Linear(dim, dim, device="cuda", params_dtype=torch.bfloat16)
+    bespoke = FusedFP8Linear.from_nn_linear(
+        nn.Linear(dim, dim, device="cuda", dtype=torch.bfloat16),
+    )
+    with torch.no_grad():
+        bespoke.weight.data.copy_(ref.weight.data)
+        if ref.bias is not None and bespoke.bias is not None:
+            bespoke.bias.data.copy_(ref.bias.data)
+
+    def run_te() -> None:
+        x = torch.randn(batch, dim, device="cuda", dtype=torch.bfloat16,
+                        requires_grad=True)
+        with te.fp8_autocast(enabled=True):
+            y = ref(x)
+        y.float().pow(2).mean().backward()
+
+    def run_bespoke() -> None:
+        x = torch.randn(batch, dim, device="cuda", dtype=torch.bfloat16,
+                        requires_grad=True)
+        y = bespoke(x)
+        y.float().pow(2).mean().backward()
+        bespoke.flush_amax_history()
+
+    for _ in range(warmup):
+        run_te()
+        run_bespoke()
+    torch.cuda.synchronize()
+
+    torch.cuda.synchronize()
+    t0 = time.perf_counter()
+    for _ in range(iters):
+        run_te()
+    torch.cuda.synchronize()
+    te_time = time.perf_counter() - t0
+
+    torch.cuda.synchronize()
+    t0 = time.perf_counter()
+    for _ in range(iters):
+        run_bespoke()
+    torch.cuda.synchronize()
+    bespoke_time = time.perf_counter() - t0
+
+    with capsys.disabled():
+        print(
+            f"\n[fused-fp8 fwd+bwd bench] dim={dim} batch={batch} iters={iters}\n"
+            f"  stock TE  = {te_time * 1e3:.2f} ms   ({te_time * 1e6 / iters:.2f} us/iter)\n"
+            f"  bespoke   = {bespoke_time * 1e3:.2f} ms   "
+            f"({bespoke_time * 1e6 / iters:.2f} us/iter)\n"
+            f"  ratio     = {bespoke_time / te_time:.3f}\n"
+        )

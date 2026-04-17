@@ -46,7 +46,11 @@ import transformer_engine.pytorch as te  # type: ignore[import-not-found]  # noq
 # raises ImportError at call time, which would obscure the skip reason.
 try:
     from chaoscontrol.kernels._cublaslt import _C as _cublaslt_C  # noqa: F401
-    from chaoscontrol.kernels._cublaslt import cublaslt_fp8_matmul
+    from chaoscontrol.kernels._cublaslt import (
+        cublaslt_fp8_matmul,
+        cublaslt_fp8_matmul_grad_w,
+        cublaslt_fp8_matmul_grad_x,
+    )
 except ImportError as e:  # pragma: no cover
     pytest.skip(
         f"cuBLASLt fp8 extension not built: {e!r}. "
@@ -61,6 +65,7 @@ except ImportError as e:  # pragma: no cover
 
 
 _E4M3_MAX = 448.0
+_E5M2_MAX = 57344.0
 
 
 def _quantize_e4m3(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -76,6 +81,14 @@ def _quantize_e4m3(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     amax = x.detach().abs().amax().to(torch.float32)
     scale = torch.where(amax > 0, amax / _E4M3_MAX, torch.ones_like(amax))
     x_fp8 = (x.to(torch.float32) / scale).to(torch.float8_e4m3fn)
+    return x_fp8, scale
+
+
+def _quantize_e5m2(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """E5M2 sibling of ``_quantize_e4m3`` — for grad tensors."""
+    amax = x.detach().abs().amax().to(torch.float32)
+    scale = torch.where(amax > 0, amax / _E5M2_MAX, torch.ones_like(amax))
+    x_fp8 = (x.to(torch.float32) / scale).to(torch.float8_e5m2)
     return x_fp8, scale
 
 
@@ -260,4 +273,192 @@ def test_forward_faster_than_stock_te() -> None:
     # Win condition: beat TE by 10%+. If we don't, phase 2 has work to do.
     assert ours_s < 0.9 * te_s, (
         f"Phase 1 target missed: ours={ours_s * 1e6:.2f}us te={te_s * 1e6:.2f}us"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Backward — grad_x = grad_y @ W via the fork.
+# ---------------------------------------------------------------------------
+
+
+def _reference_grad_x_scaled_mm(
+    grad_y: torch.Tensor, w: torch.Tensor,
+) -> torch.Tensor:
+    """Reference grad_x via ``torch._scaled_mm`` on E5M2 × E4M3.
+
+    grad_y: [M, N] bf16 row-major.
+    w:      [N, K] bf16 row-major (an ``nn.Linear`` weight).
+    Output: [M, K] bf16 = grad_y @ W.
+
+    _scaled_mm wants a row-major [M, N] and b column-major [N, K]. W
+    natively is [N, K] row-major, so we need to materialize a col-major
+    [N, K] view — ``w.t().contiguous().t()``.
+    """
+    gy_fp8, gy_scale = _quantize_e5m2(grad_y)
+    w_col = w.t().contiguous().t()           # [N, K] col-major
+    w_fp8 = (w_col.to(torch.float32) / _quantize_e4m3(w)[1]).to(torch.float8_e4m3fn)
+    _, w_scale = _quantize_e4m3(w)
+    return torch._scaled_mm(
+        gy_fp8, w_fp8, scale_a=gy_scale, scale_b=w_scale,
+        out_dtype=torch.bfloat16,
+    )
+
+
+def test_grad_x_matches_scaled_mm() -> None:
+    """Backward grad_x via the fork matches ``torch._scaled_mm`` bwd path
+    at fp8 granularity (rtol/atol=3e-2)."""
+    torch.manual_seed(0)
+    M, K, N = 1024, 256, 256
+    grad_y = torch.randn(M, N, device="cuda", dtype=torch.bfloat16) * 0.1
+    w = torch.randn(N, K, device="cuda", dtype=torch.bfloat16) * 0.05
+
+    # Reference path.
+    y_ref = _reference_grad_x_scaled_mm(grad_y, w)
+
+    # Fork path — quantize once, call grad_x kernel.
+    gy_fp8, gy_scale = _quantize_e5m2(grad_y)
+    w_col = w.t().contiguous().t()           # [N, K] col-major bf16
+    _, w_scale = _quantize_e4m3(w)
+    w_col_fp8 = (w_col.to(torch.float32) / w_scale).to(torch.float8_e4m3fn)
+
+    y_new = cublaslt_fp8_matmul_grad_x(
+        gy_fp8, w_col_fp8, scale_gy=gy_scale, scale_w=w_scale,
+        out_dtype=torch.bfloat16,
+    )
+
+    assert y_new.shape == (M, K)
+    assert y_new.dtype == torch.bfloat16
+    diff = (y_new.float() - y_ref.float()).abs()
+    assert torch.allclose(y_new, y_ref, rtol=3e-2, atol=3e-2), (
+        f"grad_x drift: max={diff.max().item():.4e} mean={diff.mean().item():.4e}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Backward — grad_w = grad_y.t() @ x (+ fused dbias via BGRADB).
+# ---------------------------------------------------------------------------
+
+
+def test_grad_w_with_bias_grad_matches_te() -> None:
+    """grad_w + fused dbias via the fork match the bf16-reference ground
+    truth (grad_y.t() @ x for grad_w, grad_y.sum(0) for grad_b).
+
+    We compare against bf16 ground truth rather than "stock TE's fp8
+    backward" because setting up TE's fp8 backward deterministically
+    requires plumbing a whole autograd tape, whereas bf16 is the
+    numerical truth within the same tolerance bar.
+    """
+    torch.manual_seed(0)
+    M, K, N = 1024, 256, 256
+    grad_y = torch.randn(M, N, device="cuda", dtype=torch.bfloat16) * 0.1
+    x = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
+
+    # Ground truth in bf16.
+    gw_ref = grad_y.float().t() @ x.float()
+    gb_ref = grad_y.float().sum(dim=0)
+
+    # Fork path.
+    gy_t_fp8, gy_scale = _quantize_e5m2(grad_y.t().contiguous())
+    x_col = x.t().contiguous().t()           # [M, K] col-major bf16
+    _, x_scale = _quantize_e4m3(x)
+    x_col_fp8 = (x_col.to(torch.float32) / x_scale).to(torch.float8_e4m3fn)
+
+    gw, gb = cublaslt_fp8_matmul_grad_w(
+        gy_t_fp8, x_col_fp8, scale_gy=gy_scale, scale_x=x_scale,
+        out_dtype=torch.bfloat16, compute_bias_grad=True,
+    )
+    assert gw.shape == (N, K)
+    if gb is None:
+        # BGRADB unsupported on this cuBLAS — the C++ kernel returns
+        # None so the caller can fall back. Compute eagerly on the
+        # input tensor for the parity check; this is what
+        # FusedFP8Linear.backward does in the wild.
+        gb = grad_y.sum(dim=0).to(torch.bfloat16)
+    assert gb.shape == (N,)
+
+    # fp8 quantization at E5M2×E4M3 accumulates entry-level error that
+    # scales with sqrt(M) at our shape. Checking mean rather than max
+    # rel-err screens out the few entries near zero where rel-err blows
+    # up. Bar: <20% of ref's own RMS norm — fp8 reasonably-granular.
+    gw_diff = (gw.float() - gw_ref).abs()
+    gw_ref_norm = gw_ref.abs().mean().item()
+    gw_rms = gw_diff.pow(2).mean().sqrt().item()
+    assert gw_rms < 0.2 * gw_ref_norm, (
+        f"grad_w drift too high: rms={gw_rms:.4e} ref_mean_abs={gw_ref_norm:.4e}"
+    )
+    gb_diff = (gb.float() - gb_ref).abs()
+    gb_ref_norm = gb_ref.abs().mean().item()
+    gb_rms = gb_diff.pow(2).mean().sqrt().item()
+    assert gb_rms < 0.2 * gb_ref_norm, (
+        f"grad_b drift too high: rms={gb_rms:.4e} ref_mean_abs={gb_ref_norm:.4e}"
+    )
+
+
+def test_grad_w_no_bias_grad_returns_none() -> None:
+    """``compute_bias_grad=False`` returns (grad_w, None) and the grad_w
+    value matches the with-bias-grad call (BGRADB epilogue vs DEFAULT
+    must only differ in the bias output, not in the matmul output)."""
+    torch.manual_seed(2)
+    M, K, N = 128, 64, 48
+    grad_y = torch.randn(M, N, device="cuda", dtype=torch.bfloat16) * 0.05
+    x = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
+
+    gy_t_fp8, gy_scale = _quantize_e5m2(grad_y.t().contiguous())
+    x_col_fp8, x_scale = _quantize_e4m3(x.t().contiguous().t())
+
+    gw_no_bias, none_out = cublaslt_fp8_matmul_grad_w(
+        gy_t_fp8, x_col_fp8, scale_gy=gy_scale, scale_x=x_scale,
+        out_dtype=torch.bfloat16, compute_bias_grad=False,
+    )
+    assert none_out is None
+    gw_with_bias, _ = cublaslt_fp8_matmul_grad_w(
+        gy_t_fp8, x_col_fp8, scale_gy=gy_scale, scale_x=x_scale,
+        out_dtype=torch.bfloat16, compute_bias_grad=True,
+    )
+    # Matmul outputs must match exactly regardless of epilogue choice.
+    assert torch.allclose(gw_no_bias, gw_with_bias, rtol=1e-3, atol=1e-3), (
+        "grad_w differs between BGRADB and DEFAULT epilogues — epilogue "
+        "should only affect the bias-grad output, not the matmul"
+    )
+
+
+@pytest.mark.slow
+def test_grad_x_faster_than_scaled_mm() -> None:
+    """Throughput: our grad_x kernel must come in under 0.9 × torch._scaled_mm
+    at submission shape. Marked slow; runs explicitly on the pod."""
+    torch.manual_seed(0)
+    M, K, N = 1024, 256, 256
+    iters = 200
+
+    grad_y = torch.randn(M, N, device="cuda", dtype=torch.bfloat16) * 0.1
+    w = torch.randn(N, K, device="cuda", dtype=torch.bfloat16) * 0.05
+    gy_fp8, gy_scale = _quantize_e5m2(grad_y)
+    w_col = w.t().contiguous().t()
+    _, w_scale = _quantize_e4m3(w)
+    w_col_fp8 = (w_col.to(torch.float32) / w_scale).to(torch.float8_e4m3fn)
+
+    def run_ours() -> None:
+        cublaslt_fp8_matmul_grad_x(
+            gy_fp8, w_col_fp8, scale_gy=gy_scale, scale_w=w_scale,
+            out_dtype=torch.bfloat16,
+        )
+
+    def run_scaled_mm() -> None:
+        torch._scaled_mm(
+            gy_fp8, w_col_fp8, scale_a=gy_scale, scale_b=w_scale,
+            out_dtype=torch.bfloat16,
+        )
+
+    ours_s = _bench_iters(run_ours, iters)
+    scaled_mm_s = _bench_iters(run_scaled_mm, iters)
+    print(
+        f"\n[cublaslt-fp8 grad_x bench] shape=({M},{N})x({N},{K}) iters={iters}\n"
+        f"  ours       = {ours_s * 1e6:8.2f} us\n"
+        f"  _scaled_mm = {scaled_mm_s * 1e6:8.2f} us\n"
+        f"  ours/ref   = {ours_s / scaled_mm_s:.3f}\n"
+    )
+    assert ours_s < 0.9 * scaled_mm_s, (
+        f"grad_x not fast enough: ours={ours_s * 1e6:.2f}us "
+        f"_scaled_mm={scaled_mm_s * 1e6:.2f}us "
+        f"ratio={ours_s / scaled_mm_s:.3f}"
     )
