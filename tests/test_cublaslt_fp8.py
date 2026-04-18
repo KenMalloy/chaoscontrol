@@ -198,6 +198,62 @@ def test_no_bias_path() -> None:
     assert torch.isfinite(y).all(), "non-finite values in fp8 matmul output"
 
 
+def test_sliced_view_alignment_cache_safe() -> None:
+    """Regression for the descriptor-cache alignment fix documented in
+    ``docs/plans/2026-04-17-paper-status.md`` under "Important
+    implementation changes" #3.
+
+    Prior to the fix, the cache key was ``(shape, dtype, ...)`` and did
+    not include operand alignment, so a fresh 256B-aligned allocation's
+    heuristic could be reused for a sliced-but-layout-valid CUDA tensor
+    whose starting pointer was only 16B-aligned. This test warms the
+    cache with a fresh allocation, then calls the same shape with a
+    row-sliced view that has a different 256B-alignment bit, and
+    asserts the sliced path still matches the ``_scaled_mm`` reference.
+
+    Construction: ``K=64`` → row-stride 128 B, so offsetting by a single
+    row flips the 256 B-alignment bit of the base pointer regardless of
+    whether torch's caching allocator returned a 128 B- or 256 B-aligned
+    buffer.
+    """
+    torch.manual_seed(2)
+    M, K, N = 128, 64, 48
+    w = torch.randn(N, K, device="cuda", dtype=torch.bfloat16) * 0.05
+
+    # First call warms the cache at this shape with a fresh allocation.
+    x_fresh = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
+    fresh_align = x_fresh.data_ptr() % 256
+    y_fresh_ref = _reference_scaled_mm(x_fresh, w, bias=None)
+    y_fresh_new = _cublaslt_path(x_fresh, w, bias=None)
+    assert torch.allclose(y_fresh_new, y_fresh_ref, rtol=3e-2, atol=3e-2), (
+        "fresh-allocation fp8 matmul diverges from _scaled_mm reference "
+        "before the sliced-view test can exercise the alignment path"
+    )
+
+    # Second call: a row-sliced view with a different 256B-alignment.
+    big_buf = torch.randn(M + 3, K, device="cuda", dtype=torch.bfloat16)
+    for offset in range(1, 4):
+        x_sliced = big_buf[offset:offset + M]
+        if x_sliced.data_ptr() % 256 != fresh_align:
+            break
+    else:  # pragma: no cover — would only hit on an unusually uniform allocator
+        pytest.skip(
+            "no row-offset yielded a 256B-alignment different from the "
+            "fresh allocation; torch's caching allocator must be returning "
+            "identically aligned pointers on this device"
+        )
+    assert x_sliced.is_contiguous(), "sliced view must be layout-valid"
+
+    y_sliced_ref = _reference_scaled_mm(x_sliced, w, bias=None)
+    y_sliced_new = _cublaslt_path(x_sliced, w, bias=None)
+    assert torch.allclose(y_sliced_new, y_sliced_ref, rtol=3e-2, atol=3e-2), (
+        "sliced-view fp8 matmul diverges from _scaled_mm reference — the "
+        "descriptor cache may be reusing a heuristic across alignment "
+        f"classes. fresh_align={fresh_align}, "
+        f"slice_align={x_sliced.data_ptr() % 256}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Throughput.
 # ---------------------------------------------------------------------------
