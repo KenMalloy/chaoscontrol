@@ -13,13 +13,21 @@ class DocStreamer:
     with a persistent SP handle.
 
     Canonical SP shards are built with `append_eos=False` (see
-    scripts/build_sp_shards.py) — there is no EOS sentinel inside them, so we
-    must source from the raw JSONL that feeds the shard builder rather than
-    the .bin shards themselves. doc_id is zero-based, counted across the
+    `scripts/build_sp_shards.py:348`) — there is no EOS sentinel inside them,
+    so we must source from the raw JSONL that feeds the shard builder rather
+    than the .bin shards themselves. doc_id is zero-based, counted across the
     provided JSONL files in given order.
 
-    Eval-split disjointness vs Exp 19 train is enforced by the caller choosing
-    non-overlapping JSONL paths.
+    Doc filtering mirrors the shard builder's `_iter_docs` pipeline (blank
+    lines, JSONDecodeError, missing/empty `"text"` field) so our doc_id
+    sequence is consistent with training's. Diverging filters would silently
+    mis-align eval ordering.
+
+    Eval-split disjointness vs Exp 19 train is enforced by the caller
+    choosing non-overlapping JSONL paths.
+
+    Not safely re-iterable — each call to `__iter__` restarts doc_id at 0.
+    If you iterate twice, downstream doc_id-keyed metrics will collide.
     """
 
     def __init__(
@@ -36,11 +44,22 @@ class DocStreamer:
     def __iter__(self) -> Iterator[DocRecord]:
         doc_id = 0
         for p in self.jsonl_paths:
-            with open(p) as fh:
+            with open(p, "r", encoding="utf-8") as fh:
                 for line in fh:
-                    text = json.loads(line)["text"]
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        obj = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    text = obj.get("text", "")
+                    if not text:
+                        continue
                     tokens = self.sp.encode(text, out_type=int)
                     if not tokens:
+                        # SP could still produce [] on all-whitespace / unknowable input;
+                        # keep the guard so we don't yield a DocRecord with zero tokens.
                         continue
                     yield DocRecord(
                         doc_id=doc_id,

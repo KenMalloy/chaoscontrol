@@ -71,3 +71,37 @@ def test_empty_text_is_skipped(tmp_path, sp_model):
     docs = list(DocStreamer(jsonl_paths=[jsonl], sp_model_path=sp_model, max_docs=10))
     assert len(docs) == 1
     assert docs[0].doc_id == 0
+
+
+def test_malformed_json_line_is_skipped(tmp_path, sp_model):
+    jsonl = tmp_path / "docs.jsonl"
+    with jsonl.open("w") as fh:
+        fh.write(json.dumps({"text": "valid one"}) + "\n")
+        fh.write("not json at all\n")  # malformed, must be skipped
+        fh.write(json.dumps({"text": "valid two"}) + "\n")
+    docs = list(DocStreamer(jsonl_paths=[jsonl], sp_model_path=sp_model, max_docs=10))
+    assert len(docs) == 2
+    assert [d.doc_id for d in docs] == [0, 1]
+
+
+def test_missing_text_field_is_skipped(tmp_path, sp_model):
+    jsonl = tmp_path / "docs.jsonl"
+    with jsonl.open("w") as fh:
+        fh.write(json.dumps({"text": "has text"}) + "\n")
+        fh.write(json.dumps({"url": "no text field"}) + "\n")  # missing "text"
+        fh.write(json.dumps({"text": ""}) + "\n")  # empty "text"
+        fh.write(json.dumps({"text": "also has text"}) + "\n")
+    docs = list(DocStreamer(jsonl_paths=[jsonl], sp_model_path=sp_model, max_docs=10))
+    assert len(docs) == 2
+    assert [d.doc_id for d in docs] == [0, 1]
+
+
+def test_blank_lines_are_skipped(tmp_path, sp_model):
+    jsonl = tmp_path / "docs.jsonl"
+    with jsonl.open("w") as fh:
+        fh.write(json.dumps({"text": "before"}) + "\n")
+        fh.write("\n")  # blank line
+        fh.write("   \n")  # whitespace-only line
+        fh.write(json.dumps({"text": "after"}) + "\n")
+    docs = list(DocStreamer(jsonl_paths=[jsonl], sp_model_path=sp_model, max_docs=10))
+    assert len(docs) == 2
