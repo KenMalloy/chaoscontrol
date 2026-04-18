@@ -25,12 +25,14 @@ CELL_DIRS = {
     "four_cell": RESULTS_ROOT / "four_cell",
     "fullcov": RESULTS_ROOT / "fullcov",
     "shuffled": RESULTS_ROOT / "shuffled",
+    "zero": RESULTS_ROOT / "zero",
 }
 
 # Cell-name aliases between filename prefix and the paper-results condition
-# label. ``ssm_fullcov`` and ``ssm_shuffled`` files live in the control dirs;
-# ``A_transformer_random`` etc. live in the four_cell dir. They map 1:1 but
-# this table is explicit so a reader sees the full vocabulary at a glance.
+# label. ``ssm_fullcov`` / ``ssm_shuffled`` / ``ssm_zero`` files live in the
+# control dirs; ``A_transformer_random`` etc. live in the four_cell dir.
+# They map 1:1 but this table is explicit so a reader sees the full
+# vocabulary at a glance.
 CONDITION_NAMES = {
     "A_transformer_random",
     "B_transformer_sgns",
@@ -38,6 +40,7 @@ CONDITION_NAMES = {
     "D_ssm_sgns",
     "ssm_fullcov",
     "ssm_shuffled",
+    "ssm_zero",
 }
 
 FILENAME_RE = re.compile(r"^(?P<cell>[A-Za-z0-9_]+?)_s(?P<seed>\d+)\.json$")
@@ -83,6 +86,13 @@ def main() -> int:
             "wall_clock_s": float(train_block.get("elapsed_s", float("nan"))),
             "final_loss": float(train_block.get("final_loss", float("nan"))),
         }
+        # Divergent runs (e.g. zero-init floor) are preserved as
+        # datapoints by runner_exp21 with a ``nonfinite`` section and
+        # bpb=nan. Surface the flag as a first-class metric so registry
+        # consumers can filter without re-reading the per-run JSON.
+        nonfinite = data.get("nonfinite") or {}
+        if nonfinite.get("flag"):
+            metrics["nonfinite_flag"] = 1.0
         rec = register(
             experiment="exp21",
             condition=cell,
@@ -92,9 +102,11 @@ def main() -> int:
             config_hash=_config_hash(config),
             artifacts=[str(jpath.relative_to(REPO))],
         )
+        bpb_str = f"{bpb:.4f}" if bpb == bpb else "nan"  # nan != nan
+        flag = " [NONFINITE]" if nonfinite.get("flag") else ""
         print(
             f"  {rec.experiment}/{rec.condition} seed={rec.seed} "
-            f"bpb={bpb:.4f} dirty={rec.git_dirty}"
+            f"bpb={bpb_str}{flag} dirty={rec.git_dirty}"
         )
     return 0
 

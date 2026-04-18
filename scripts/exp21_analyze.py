@@ -24,6 +24,14 @@ Expected results-directory layout (matches Phase 5 orchestrators):
         ssm_fullcov_s{seed}.json
       shuffled/
         ssm_shuffled_s{seed}.json
+      zero/
+        ssm_zero_s{seed}.json
+
+The zero-init control tests whether random init itself is informative
+structure: zero vs random paired t (H1: zero bpb > random bpb). If
+training diverges on zero init, the runner writes a NaN result with
+``nonfinite.flag=True``; those seeds are dropped from the paired test
+by ``load_cell_bpbs``'s finite-value filter.
 
 Each per-run JSON is produced by runner_exp21.py and contains at least
 ``{"eval": {"bpb": <float>}}``.
@@ -195,6 +203,7 @@ def build_report(results_dir: Path) -> dict[str, Any]:
     four_cell_dir = results_dir / "four_cell"
     fullcov_dir = results_dir / "fullcov"
     shuffled_dir = results_dir / "shuffled"
+    zero_dir = results_dir / "zero"
 
     A_raw = load_cell_bpbs(four_cell_dir, "A_transformer_random")
     B_raw = load_cell_bpbs(four_cell_dir, "B_transformer_sgns")
@@ -251,6 +260,22 @@ def build_report(results_dir: Path) -> dict[str, Any]:
         else None
     )
 
+    # Zero-init floor vs random init (H1: zero bpb > random bpb).
+    # A significant delta here means random init is itself informative
+    # structure; insignificant means random is near-zero noise and any
+    # non-noise init (meanstd, shuffled, fullcov) is doing real work.
+    # load_cell_bpbs drops non-finite seeds automatically, so divergent
+    # zero runs simply shrink the paired N rather than poisoning the t-stat.
+    zero_raw = load_cell_bpbs(zero_dir, "ssm_zero")
+    zero_common = sorted(set(C_raw) & set(zero_raw))
+    C_zc = [C_raw[s] for s in zero_common]
+    Z_zc = [zero_raw[s] for s in zero_common]
+    p_zero_vs_random = (
+        paired_t_one_sided(Z_zc, C_zc, alternative="greater")
+        if len(zero_common) >= 2
+        else None
+    )
+
     controls_complete = (
         len(fullcov_common) >= 2
         and len(shuffled_common) >= 2
@@ -295,10 +320,13 @@ def build_report(results_dir: Path) -> dict[str, Any]:
         "thesis_weak": thesis_weak,
         "fullcov": _stats(list(fullcov_raw.values())),
         "shuffled": _stats(list(shuffled_raw.values())),
+        "zero": _stats(list(zero_raw.values())),
         "p_fullcov_vs_meanstd": p_fullcov_vs_meanstd,
         "n_fullcov_pairs": len(fullcov_common),
         "p_shuffled_vs_meanstd": p_shuffled_vs_meanstd,
         "n_shuffled_pairs": len(shuffled_common),
+        "p_zero_vs_random": p_zero_vs_random,
+        "n_zero_pairs": len(zero_common),
         "controls_complete": controls_complete,
         "controls_support_semantics": controls_support_semantics,
     }
@@ -350,7 +378,7 @@ def print_report(report: dict[str, Any]) -> None:
     print(f"  thesis-validating: {report['thesis_validating']}")
     print(f"  thesis-weak:       {report['thesis_weak']}")
 
-    if report["fullcov"]["n"] or report["shuffled"]["n"]:
+    if report["fullcov"]["n"] or report["shuffled"]["n"] or report["zero"]["n"]:
         print("\n== Controls ==")
         if report["fullcov"]["n"]:
             print(_fmt_cell("SSM × SGNS (full-cov)", report["fullcov"]))
@@ -367,6 +395,12 @@ def print_report(report: dict[str, Any]) -> None:
             print(
                 f"  shuffled vs meanstd (paired on {report['n_shuffled_pairs']} seeds, "
                 f"H1: shuffled bpb > meanstd bpb): p = {_fmt_p(report['p_shuffled_vs_meanstd'])}"
+            )
+        if report["zero"]["n"]:
+            print(_fmt_cell("SSM × zero-init floor", report["zero"]))
+            print(
+                f"  zero vs random (paired on {report['n_zero_pairs']} seeds, "
+                f"H1: zero bpb > random bpb): p = {_fmt_p(report['p_zero_vs_random'])}"
             )
         print(f"  controls-complete:         {report['controls_complete']}")
         print(f"  controls-support-semantics:{report['controls_support_semantics']}")

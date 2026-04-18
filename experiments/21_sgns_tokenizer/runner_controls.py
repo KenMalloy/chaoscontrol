@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Exp 21 controls — full-cov moment-match + shuffled-row sanity on the SSM arm.
+"""Exp 21 controls — full-cov + shuffled-row + zero-init on the SSM arm.
 
-Two conditions run only on the SSM arm (where the main signal is expected):
+Three control conditions on the SSM arm (where the main signal is expected):
 
   - ``ssm_fullcov``: SGNS embeddings matched to random init's full row
     covariance (Cholesky whiten+recolor). Stronger null than the
@@ -9,9 +9,17 @@ Two conditions run only on the SSM arm (where the main signal is expected):
     (semantic) signal. 5 seeds.
 
   - ``ssm_shuffled``: meanstd SGNS tensor with rows randomly permuted.
-    Preserves marginal distribution, destroys ID→vector mapping.
-    Any "SGNS helps" measurement must vanish here, else the effect is
-    distributional rather than semantic. 1 seed.
+    Preserves marginal distribution, destroys ID→vector mapping. At
+    N=5, distinguishes distributional from semantic benefit: shuffled≈
+    meanstd → distributional, shuffled midway → partly semantic.
+
+  - ``ssm_zero``: all-zero embedding (a deterministic floor). Tests
+    whether random init itself provides useful "structured noise" —
+    zero ≫ random would mean random is informative; zero ≈ random
+    would mean random is noise, so any non-noise init should help.
+    Training may diverge (symmetric); runner honors ``allow_nonfinite``
+    so the divergence is preserved as a datapoint rather than hard-
+    failing the matrix.
 
 Reuses the 4-cell SSM cell config; varies only the ``embed_init_path``.
 """
@@ -28,6 +36,7 @@ REPO = Path(__file__).resolve().parents[2]
 EXPERIMENT = Path(__file__).resolve().parent
 RESULTS_FULLCOV = EXPERIMENT / "results" / "fullcov"
 RESULTS_SHUFFLED = EXPERIMENT / "results" / "shuffled"
+RESULTS_ZERO = EXPERIMENT / "results" / "zero"
 RUNNER = EXPERIMENT / "runner_exp21.py"
 
 sys.path.insert(0, str(REPO / "experiments" / "18_throughput_levers"))
@@ -40,7 +49,11 @@ from runner_4cell import SSM_LR, _ssm_cell  # noqa: E402
 
 
 FULLCOV_SEEDS = [1337, 42, 123, 7, 8]
-SHUFFLED_SEEDS = [1337]
+# s1337 already ran before zero/fullcov extension; leave it excluded so
+# the harness's idempotency check doesn't matter here and the launcher
+# only queues the genuinely missing shuffled seeds.
+SHUFFLED_SEEDS = [42, 123, 7, 8]
+ZERO_SEEDS = [1337, 42, 123, 7, 8]
 
 FULLCOV_CONDITIONS = {
     "ssm_fullcov": _ssm_cell(
@@ -53,6 +66,27 @@ SHUFFLED_CONDITIONS = {
         base_lr=SSM_LR, embed_init_path="artifacts/sgns_init_shuffled.pt"
     ),
 }
+
+
+def _zero_cell() -> dict[str, Any]:
+    """SSM cell with the all-zero embedding init and nonfinite tolerance.
+
+    The zero init is the symmetric floor: every token maps to the same
+    embedding vector (the zero vector), so the first forward pass
+    cannot distinguish tokens and gradients may explode or NaN. The
+    ``allow_nonfinite`` flag tells ``runner_exp21`` to write the JSON
+    with a ``nonfinite`` section instead of raising, so divergence is
+    preserved as the datapoint rather than bleeding through into a
+    harness-level run failure.
+    """
+    cfg = _ssm_cell(
+        base_lr=SSM_LR, embed_init_path="artifacts/sgns_init_zero.pt"
+    )
+    cfg["allow_nonfinite"] = True
+    return cfg
+
+
+ZERO_CONDITIONS = {"ssm_zero": _zero_cell()}
 
 
 def _collect(conditions: dict[str, dict[str, Any]], results_dir: Path) -> dict[str, dict[int, float]]:
@@ -75,6 +109,7 @@ def _collect(conditions: dict[str, dict[str, Any]], results_dir: Path) -> dict[s
 def summarize_results() -> dict[str, Any]:
     fullcov_per = _collect(FULLCOV_CONDITIONS, RESULTS_FULLCOV)
     shuffled_per = _collect(SHUFFLED_CONDITIONS, RESULTS_SHUFFLED)
+    zero_per = _collect(ZERO_CONDITIONS, RESULTS_ZERO)
 
     def _print_block(label: str, per: dict[str, dict[int, float]]) -> None:
         print(f"\n{label}:")
@@ -84,21 +119,33 @@ def summarize_results() -> dict[str, Any]:
                 print(f"  {name}: (no results)")
                 continue
             bpbs = [by_seed[s] for s in seeds]
-            mean = sum(bpbs) / len(bpbs)
-            print(f"  {name:<16} n={len(seeds)} mean_bpb={mean:.4f}  seeds={seeds}")
+            # NaN-aware mean: show finite count separately so a divergent
+            # zero-init cell doesn't mask its own failure as a soft number.
+            finite = [b for b in bpbs if b == b and b not in (float("inf"), float("-inf"))]
+            if finite:
+                mean = sum(finite) / len(finite)
+                mean_str = f"{mean:.4f}"
+            else:
+                mean_str = "nan"
+            print(
+                f"  {name:<16} n={len(seeds)} (finite={len(finite)}) "
+                f"mean_bpb={mean_str}  seeds={seeds}"
+            )
 
     _print_block("Full-cov moment-match", fullcov_per)
     _print_block("Shuffled-row control", shuffled_per)
+    _print_block("Zero-init floor", zero_per)
 
     return {
         "fullcov": fullcov_per,
         "shuffled": shuffled_per,
+        "zero": zero_per,
     }
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Exp 21 controls — full-cov + shuffled-row"
+        description="Exp 21 controls — full-cov + shuffled-row + zero-init"
     )
     parser.add_argument("--data-path", required=True)
     parser.add_argument("--sp-model-path", required=True)
@@ -129,6 +176,17 @@ def main() -> None:
             sp_model_path=args.sp_model_path,
             budget=args.budget,
             results_dir=RESULTS_SHUFFLED,
+            runner_script=RUNNER,
+        )
+        run_parallel_ddp_matrix(
+            conditions=ZERO_CONDITIONS,
+            seeds=ZERO_SEEDS,
+            ws_per_slot=2,
+            num_slots=args.num_slots,
+            data_path=args.data_path,
+            sp_model_path=args.sp_model_path,
+            budget=args.budget,
+            results_dir=RESULTS_ZERO,
             runner_script=RUNNER,
         )
 

@@ -385,11 +385,27 @@ def run_ddp(
                 val = float(eval_result[key])
                 if not math.isfinite(val):
                     violations.append(f"eval.{key}={val} is not finite")
+        # Default: poisoned results are blocking — runner refuses to write a
+        # NaN/Inf JSON that could silently contaminate downstream summaries.
+        # Controls that study divergence on purpose (e.g. zero-init floor)
+        # set ``allow_nonfinite: true`` in the config so the run is
+        # preserved as a datapoint and a ``nonfinite`` flag is recorded.
         if violations:
-            raise RuntimeError(
-                "runner_exp21: refusing to write poisoned result JSON — "
-                + "; ".join(violations)
-            )
+            if bool(config.get("allow_nonfinite", False)):
+                result["nonfinite"] = {
+                    "flag": True,
+                    "violations": violations,
+                }
+                print(
+                    "[rank 0] allow_nonfinite=true — preserving divergent "
+                    f"run as datapoint: {'; '.join(violations)}",
+                    flush=True,
+                )
+            else:
+                raise RuntimeError(
+                    "runner_exp21: refusing to write poisoned result JSON — "
+                    + "; ".join(violations)
+                )
 
     if is_rank0 and output_json:
         out_path = Path(output_json)
