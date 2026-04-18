@@ -118,12 +118,17 @@ def _resolve_diag_recurrence_impl():
     """Resolve the fastest available diag recurrence backend.
 
     Backends (selectable via CHAOSCONTROL_DIAG_SCAN_BACKEND env var):
-        "python"  — sequential Python loop (_diag_recurrence_inner)
-        "compile" — torch.compile'd Python loop (default, fast on CUDA)
-        "chunked" — chunked vectorized scan (cumprod+cumsum, Exp 18 Test 1)
+        "python"   — sequential Python loop (_diag_recurrence_inner)
+        "compile"  — torch.compile'd Python loop (default, fast on CUDA)
+        "chunked"  — chunked vectorized scan (cumprod+cumsum, Exp 18 Test 1)
+        "ssm_scan" — hand-written CUDA kernel (forward-only; backward
+                     via autograd.Function fallback to the Python loop).
+                     Phase 1B-4 follow-up to the torch.compile regression.
 
     We avoid compiling at import time so a mismatched Inductor/CUDA/toolchain
     stack does not make the whole package fail before argument parsing.
+    ``ssm_scan`` falls through to ``chunked`` if the extension is not
+    importable (dev mac, non-CUDA env, partial pod setup).
     """
     global _diag_recurrence_impl, _diag_recurrence_backend, _diag_recurrence_note
     if _diag_recurrence_impl is not None:
@@ -145,6 +150,55 @@ def _resolve_diag_recurrence_impl():
         _diag_recurrence_impl = _diag_recurrence_chunked
         _diag_recurrence_backend = "chunked"
         _diag_recurrence_note = f"vectorized cumprod+cumsum, chunk_size={_DEFAULT_CHUNK_SIZE}"
+        return _diag_recurrence_impl
+
+    if requested == "ssm_scan":
+        # Two levels of availability: the Python package always imports
+        # (it's pure Python), but the C extension ``_C`` is only present
+        # when ``pip install -e .`` built it. Fall back to chunked on
+        # either missing — the package fully imports on dev macs where
+        # the extension cannot compile.
+        _ssm_scan_fn = None
+        _ssm_scan_err: Exception | None = None
+        try:
+            import chaoscontrol.kernels._ssm_scan as _ssm_ext
+
+            if getattr(_ssm_ext, "_C", None) is None:
+                _ssm_scan_err = ImportError(
+                    "chaoscontrol.kernels._ssm_scan._C not built"
+                )
+            else:
+                # Use getattr so a deleted attribute produces a clean
+                # ImportError-shaped fallback (see monkeypatch test).
+                _ssm_scan_fn = getattr(_ssm_ext, "ssm_scan", None)
+                if _ssm_scan_fn is None:
+                    _ssm_scan_err = ImportError(
+                        "chaoscontrol.kernels._ssm_scan.ssm_scan unavailable"
+                    )
+        except ImportError as exc:
+            _ssm_scan_err = exc
+
+        if _ssm_scan_fn is not None:
+            _diag_recurrence_impl = _ssm_scan_fn
+            _diag_recurrence_backend = "ssm_scan"
+            _diag_recurrence_note = (
+                "hand-written CUDA kernel (forward) + autograd fallback (backward)"
+            )
+        else:
+            _diag_recurrence_impl = _diag_recurrence_chunked
+            _diag_recurrence_backend = "chunked"
+            _diag_recurrence_note = (
+                f"ssm_scan requested but extension not importable "
+                f"({type(_ssm_scan_err).__name__}: {_ssm_scan_err}); "
+                f"falling back to chunked backend"
+            )
+            warnings.warn(
+                "CHAOSCONTROL_DIAG_SCAN_BACKEND=ssm_scan requested but "
+                f"the extension is not importable ({_ssm_scan_err}). "
+                "Falling back to the chunked backend.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
         return _diag_recurrence_impl
 
     # Default: try torch.compile, fall back to Python
