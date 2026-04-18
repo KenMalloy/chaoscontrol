@@ -46,5 +46,8 @@ class RunConfig:
     seed: int = 0
     max_docs: int = 50_000
     budget_seconds: float = 600.0
+    score_floor_seconds: float = 0.0
+    safety_margin_seconds: float = 0.0
     checkpoint_path: str = ""
     output_path: str = ""
+    summary_path: str = ""

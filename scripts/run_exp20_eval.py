@@ -27,6 +27,7 @@ from chaoscontrol.eval_stream.persistence import StateManager, attach_trainable_
 from chaoscontrol.eval_stream.ttt_runner import select_adapt_params, ADAPT_SET_PATTERNS
 from chaoscontrol.eval_stream.delta_mod import DeltaModulator
 from chaoscontrol.eval_stream.metrics import MetricsCollector
+from chaoscontrol.eval_stream.budget import BudgetTracker
 from chaoscontrol.evaluation import compute_bpb
 
 
@@ -114,6 +115,17 @@ def run(cfg: RunConfig, jsonl_paths: list[str], sp_model_path: str) -> None:
     state_mgr = StateManager(model, persistence_mode=cfg.persistence_mode)
     controller = LegalityController(model, loss_fn=_ce)
     collector = MetricsCollector(output_path=Path(cfg.output_path))
+    budget = BudgetTracker(
+        total_budget_seconds=cfg.budget_seconds,
+        score_floor_seconds=cfg.score_floor_seconds,
+        safety_margin_seconds=cfg.safety_margin_seconds,
+    )
+    score_only_mode = not optimizers or cfg.steps_per_chunk <= 0
+    docs_scored = 0
+    chunks_scored = 0
+    tokens_scored = 0
+    adapt_steps = 0
+    timed_out = False
 
     with DeltaModulator(model, delta_scale=cfg.delta_scale,
                         log_a_shift=cfg.log_a_shift,
@@ -121,6 +133,7 @@ def run(cfg: RunConfig, jsonl_paths: list[str], sp_model_path: str) -> None:
         run_start = time.monotonic()
         for doc in streamer:
             if time.monotonic() - run_start > cfg.budget_seconds:
+                timed_out = True
                 break
             if collector.collapsed:
                 break
@@ -143,9 +156,11 @@ def run(cfg: RunConfig, jsonl_paths: list[str], sp_model_path: str) -> None:
                 # carry state in, capture final_state out. An empty state list
                 # (pre-start_doc or no SSM cores) passes through as None.
                 prev_state = state_mgr.get_state()
+                score_t0 = time.monotonic()
                 loss_before, final_states = controller.score_chunk(
                     chunk, initial_states=prev_state if prev_state else None,
                 )
+                budget.add_score_time(time.monotonic() - score_t0)
                 if final_states:
                     state_mgr.set_state(final_states)
                 loss_before_sum += loss_before
@@ -154,24 +169,30 @@ def run(cfg: RunConfig, jsonl_paths: list[str], sp_model_path: str) -> None:
                 doc_ce_nats += loss_before
                 doc_tokens += chunk.size(1) - 1
                 chunk_count += 1
+                chunks_scored += 1
 
                 # Adapt — single Muon optimizer; `optimizers` is at most len==1.
-                if optimizers and cfg.steps_per_chunk > 0:
+                if optimizers and cfg.steps_per_chunk > 0 and budget.can_adapt():
+                    adapt_t0 = time.monotonic()
                     loss_after = controller.adapt_on_chunk(
                         chunk,
                         optimizer=optimizers[0],
                         steps=cfg.steps_per_chunk,
                         initial_states=prev_state if prev_state else None,
                     )
+                    budget.add_adapt_time(time.monotonic() - adapt_t0)
                     # Using `or 0.0` would drop legitimate 0.0 losses;
                     # be explicit about the None case.
                     loss_after_sum += 0.0 if loss_after is None else loss_after
                     step_count += cfg.steps_per_chunk
+                    adapt_steps += cfg.steps_per_chunk
 
             wall_ms = (time.monotonic() - t0) * 1000.0
             bpb = compute_bpb(doc_ce_nats, doc.raw_bytes) if doc.raw_bytes > 0 else 0.0
             grad_norm = 0.0  # populated by controller in later task; placeholder
             state_norm = sum(float(s.norm()) for s in state_mgr.get_state()) / max(len(state_mgr.get_state()), 1)
+            tokens_scored += doc_tokens
+            docs_scored += 1
             collector.record_doc(
                 doc_id=doc.doc_id, bpb=bpb, tokens=doc_tokens,
                 loss_before=loss_before_sum / max(chunk_count, 1),
@@ -180,6 +201,20 @@ def run(cfg: RunConfig, jsonl_paths: list[str], sp_model_path: str) -> None:
                 grad_norm=grad_norm, state_norm=state_norm,
             )
     collector.close()
+    if cfg.summary_path:
+        summary_path = Path(cfg.summary_path)
+        summary_path.parent.mkdir(parents=True, exist_ok=True)
+        summary = budget.summary(
+            docs_scored=docs_scored,
+            chunks_scored=chunks_scored,
+            tokens_scored=tokens_scored,
+            adapt_steps=adapt_steps,
+            timed_out=timed_out,
+            collapsed=collector.collapsed,
+            score_only_mode=score_only_mode,
+            elapsed_seconds=time.monotonic() - run_start,
+        )
+        summary_path.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
 
 
 def main():

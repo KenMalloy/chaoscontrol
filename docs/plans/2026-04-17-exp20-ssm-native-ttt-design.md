@@ -48,6 +48,14 @@ A per-doc SSM-native TTT stack can close materially more eval-time bpb than a tr
 
 **Budget portability.** Rather than matching a single 600 s wall-clock at our compute, the harness is parameterized on `(budget_seconds, grad_steps_per_chunk, tokens_per_step)`. Output is a **bpb-vs-compute Pareto curve**; winning configs are the ones whose gain extrapolates linearly under budget scaling. Non-linear extrapolators are rejected — a gain that saturates at low compute won't cash in under the real submission budget.
 
+**Exp 20b slack-budget framing (added 2026-04-18).** The real TTT budget is not 600 s; it is the 600 s submission window minus the score-only eval floor and a safety margin. Phase 20b starts with `adapt_set="none", steps_per_chunk=0` on the final checkpoint and eval stream, writes a summary JSON, and treats that run's elapsed wall-clock as `score_floor_seconds`. Subsequent TTT runs use:
+
+```
+usable_ttt_budget = budget_seconds - score_floor_seconds - safety_margin_seconds
+```
+
+Gradient TTT stops when it consumes this slack. Zero/near-zero mechanisms (`carry_state`, `delta_scale`, residual-cache reads) are judged by their total forward cost; gradient mechanisms are judged by bpb gain per slack second.
+
 **Success tiers:**
 - **Floor:** any (adapt, persist, Δ-mod) triple beats the full-reset + no-TTT baseline by > 0.025 bpb at n = 5 seeds.
 - **Competitive:** best configuration beats the no-TTT baseline by 0.1-0.2 bpb — enough to plausibly close the remaining gap to leaderboard SOTA when stacked with Exp 19 training gains.
@@ -180,6 +188,7 @@ Main-effects-first, interactions-second. The full cross-product (8 × 6 × 3 × 
 | Phase | What | Configs | Hypothesis |
 |---|---|---|---|
 | **A** | Harness smoke | `none × reset × none` vs existing forward-only eval | Scoring path bit-exact. Non-negotiable. |
+| **20b** | Score-floor timing | `none × reset/carry_state × none`, `steps_per_chunk=0`, final checkpoint/eval stream | Measures irreducible eval wall-clock; defines usable TTT slack. |
 | **B** | Axis 2 alone (no weight TTT) | `none × {reset, carry_state} × none`, 3 seeds | H1: SSM-native thesis — does state carry buy bpb for free? |
 | **C** | Axis 1 screen at Axis 2 winner | top 5 adapt-sets × winner_B × none, 3 seeds | H2-H4: which param group responds best per $? |
 | **D** | Axis 3 alone | `none × winner_B × {delta_scale sweep, log_a_shift sweep}`, 3 seeds | H3: Δ-mod as zero-cost knob |

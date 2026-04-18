@@ -43,10 +43,47 @@ Days 1-2 of the post-Exp-19 calendar. Build must complete before any ablation ru
 | 6 | Param-group selector (`TTTRunner`) | exact-match embed, `trainable_h0` pattern, `all` coverage |
 | 7 | Persistence modes (`StateManager`, `trainable_h0`) | depends on Task 3.5; device+dtype placement; gradient-preserving init |
 | 8 | Driver `scripts/run_exp20_eval.py` | single-Muon optimizer; strict load; CUDA seed + LOCAL_RANK |
+| 8.5 | **Exp 20b slack-budget accounting** | summary JSON; score-only floor; gradient TTT slack guard |
 | 9 | Phase A smoke (CPU, bit-exact) | adds state-plumbing canary test |
 | 10 | Pod smoke vs Exp 18 Test 4b | requires `configs/exp20/smoke_test4b.json`; re-run baseline eval path for apples-to-apples gate; pre-push cleanliness check |
 
 Task 3.5 is inserted between Task 3 and Task 4; Tasks 4 through 10 retain their original numbers.
+
+### Task 8.5: Exp 20b slack-budget accounting
+
+**Files:**
+- Create: `src/chaoscontrol/eval_stream/budget.py`
+- Modify: `src/chaoscontrol/eval_stream/types.py`
+- Modify: `src/chaoscontrol/eval_stream/__init__.py`
+- Modify: `scripts/run_exp20_eval.py`
+- Test: `tests/test_eval_stream_budget.py`
+- Test: `tests/test_run_exp20_eval.py`
+
+**Behavior:**
+- Score-only runs (`adapt_set="none"` or `steps_per_chunk=0`) write a summary where `score_floor_seconds` is the whole elapsed eval time.
+- TTT runs accept `score_floor_seconds` and `safety_margin_seconds` in config.
+- Usable adaptation time is `budget_seconds - score_floor_seconds - safety_margin_seconds`, clamped at zero.
+- Gradient adaptation is skipped after the slack budget is exhausted; scoring continues until the normal total budget/doc/collapse gates stop the run.
+
+**Smoke commands:**
+
+```bash
+.venv/bin/python -m pytest tests/test_eval_stream_budget.py tests/test_run_exp20_eval.py -q
+```
+
+**Primary output fields:**
+
+```json
+{
+  "score_floor_seconds": 410.0,
+  "usable_ttt_budget_seconds": 160.0,
+  "ttt_budget_used_seconds": 155.0,
+  "slack_remaining_seconds": 5.0,
+  "score_wall_seconds": 390.0,
+  "adapt_wall_seconds": 155.0,
+  "other_wall_seconds": 20.0
+}
+```
 
 
 ### Task 1: Scaffold `eval_stream/` package
