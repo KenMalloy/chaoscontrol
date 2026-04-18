@@ -46,8 +46,9 @@ def build_ext_modules() -> list:
     # — only `sources` is policed.
     repo_root = this_dir.parents[3]
     cpp_rel = this_dir.relative_to(repo_root) / "src" / "cublaslt_fp8_matmul.cpp"
+    desc_cache_rel = this_dir.relative_to(repo_root) / "src" / "descriptor_cache.cpp"
     cu_rel = this_dir.relative_to(repo_root) / "src" / "fused_amax_cast.cu"
-    sources = [str(cpp_rel), str(cu_rel)]
+    sources = [str(cpp_rel), str(desc_cache_rel), str(cu_rel)]
 
     src_dir = this_dir / "src"
     include_dirs = [str(src_dir)]
