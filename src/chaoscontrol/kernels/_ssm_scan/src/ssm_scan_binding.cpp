@@ -2,18 +2,28 @@
 //
 // Python binding for the diag SSM scan kernel.
 //
-// Public surface (one call):
+// Public surface:
 //   ssm_scan_forward(decay, update) -> state
+//   ssm_scan_backward(grad_state, decay, state) -> (grad_decay, grad_update)
 //
-// decay: (B, T, D) bf16 | fp16 | fp32, contiguous row-major
-// update: (B, T, D) same dtype as decay (or fp16 update with bf16 decay;
-//         see dispatch table in ssm_scan_fwd.cu)
-// Returns: (B, T, D) same dtype as update, fp32 accumulator internal.
+// Forward:
+//   decay: (B, T, D) bf16 | fp16 | fp32, contiguous row-major
+//   update: (B, T, D) same dtype as decay (or fp16 update with bf16 decay;
+//           see dispatch table in ssm_scan_fwd.cu)
+//   Returns: (B, T, D) same dtype as update, fp32 accumulator internal.
+//
+// Backward:
+//   grad_state: (B, T, D) upstream grad; dtype == update_dtype
+//   decay:      (B, T, D) saved from forward; dtype == decay_dtype
+//   state:      (B, T, D) forward output (saved); dtype == update_dtype
+//   Returns:    (grad_decay: decay_dtype, grad_update: update_dtype), both (B, T, D).
 //
 // Semantics: state[0] = decay[0] * 0 + update[0]; state[t] = decay[t] *
 // state[t-1] + update[t]. Bit-identical (fp32 accumulator) to the
 // Python reference at ``chaoscontrol.core._diag_recurrence_inner`` when
-// that reference is also run in fp32.
+// that reference is also run in fp32. Backward derivatives follow the
+// analytical reverse recurrence; matches autograd of the fp32 Python
+// reference to fp32 bit-level.
 
 #include "ssm_scan.h"
 
@@ -22,6 +32,7 @@
 #include <torch/extension.h>
 
 #include <stdexcept>
+#include <tuple>
 
 namespace cc_ssm_scan {
 
@@ -90,6 +101,77 @@ at::Tensor ssm_scan_forward(const at::Tensor& decay,
     return out;
 }
 
+std::tuple<at::Tensor, at::Tensor> ssm_scan_backward(
+    const at::Tensor& grad_state,
+    const at::Tensor& decay,
+    const at::Tensor& state) {
+    TORCH_CHECK(grad_state.is_cuda() && decay.is_cuda() && state.is_cuda(),
+                "grad_state, decay, state must all live on CUDA");
+    TORCH_CHECK(grad_state.dim() == 3 && decay.dim() == 3 && state.dim() == 3,
+                "grad_state, decay, state must all be 3-D (B, T, D)");
+    TORCH_CHECK(grad_state.sizes() == decay.sizes() &&
+                grad_state.sizes() == state.sizes(),
+                "grad_state, decay, state must share shape (B, T, D)");
+    TORCH_CHECK(grad_state.is_contiguous() && decay.is_contiguous() &&
+                state.is_contiguous(),
+                "grad_state, decay, state must be contiguous row-major");
+    TORCH_CHECK(grad_state.device() == decay.device() &&
+                grad_state.device() == state.device(),
+                "grad_state, decay, state must live on the same CUDA device");
+
+    const auto decay_dtype = decay.scalar_type();
+    const auto update_dtype = state.scalar_type();
+    TORCH_CHECK(grad_state.scalar_type() == update_dtype,
+                "grad_state dtype (", toString(grad_state.scalar_type()),
+                ") must match update/state dtype (", toString(update_dtype), ")");
+
+    // Dispatch table mirrors the forward. Any additional combos must be
+    // added to BOTH dispatchers in lockstep.
+    const bool bf16_bf16 = (decay_dtype == at::kBFloat16 && update_dtype == at::kBFloat16);
+    const bool bf16_fp16 = (decay_dtype == at::kBFloat16 && update_dtype == at::kHalf);
+    const bool fp16_fp16 = (decay_dtype == at::kHalf && update_dtype == at::kHalf);
+    const bool fp32_fp32 = (decay_dtype == at::kFloat && update_dtype == at::kFloat);
+    TORCH_CHECK(bf16_bf16 || bf16_fp16 || fp16_fp16 || fp32_fp32,
+                "unsupported (decay, update) dtype combo for backward: (",
+                toString(decay_dtype), ", ", toString(update_dtype),
+                "); want bf16/bf16, bf16/fp16, fp16/fp16, or fp32/fp32");
+
+    const int64_t B = decay.size(0);
+    const int64_t T = decay.size(1);
+    const int64_t D = decay.size(2);
+    TORCH_CHECK(B > 0 && T > 0 && D > 0,
+                "decay shape (", B, ", ", T, ", ", D, ") must be positive");
+    TORCH_CHECK(B <= std::numeric_limits<int>::max() &&
+                T <= std::numeric_limits<int>::max() &&
+                D <= std::numeric_limits<int>::max(),
+                "B/T/D exceeds int32");
+
+    // grad_decay matches decay's dtype; grad_update matches update's dtype.
+    auto grad_decay = at::empty_like(decay);
+    auto grad_update = at::empty_like(state);
+
+    cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
+    launch_ssm_scan_bwd(
+        grad_state.data_ptr(),
+        decay.data_ptr(),
+        state.data_ptr(),
+        grad_decay.data_ptr(),
+        grad_update.data_ptr(),
+        static_cast<int>(B),
+        static_cast<int>(T),
+        static_cast<int>(D),
+        decay_dtype,
+        update_dtype,
+        stream);
+    const cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        throw std::runtime_error(
+            std::string("cc_ssm_scan backward: launch failed: ") +
+            cudaGetErrorString(err));
+    }
+    return std::make_tuple(grad_decay, grad_update);
+}
+
 }  // namespace cc_ssm_scan
 
 
@@ -111,5 +193,28 @@ Args:
 Returns:
   (B, T, D) state tensor; dtype matches ``update``. Accumulator is fp32
   inside the kernel regardless of input dtype.
+)doc");
+
+    m.def("ssm_scan_backward", &cc_ssm_scan::ssm_scan_backward,
+          py::arg("grad_state"),
+          py::arg("decay"),
+          py::arg("state"),
+          R"doc(
+Backward diag SSM scan.
+
+Given grad_state (upstream dL/ds), the saved decay, and the forward
+output state, compute grad_decay and grad_update per the analytical
+reverse recurrence. Each (batch, channel) lane is independent and
+computed in-kernel by a per-thread reverse-time serial scan with fp32
+accumulator.
+
+Args:
+  grad_state: (B, T, D) upstream grad; dtype must match state dtype.
+  decay:      (B, T, D) saved from forward; decay dtype.
+  state:      (B, T, D) forward output (saved); same dtype as grad_state.
+
+Returns:
+  Tuple (grad_decay, grad_update). grad_decay dtype matches decay;
+  grad_update dtype matches state. Both (B, T, D), row-major contiguous.
 )doc");
 }
