@@ -18,12 +18,18 @@
 // Each thread owns one (b, d) lane and serial-loops over T in reverse,
 // carrying the fp32 accumulator in a register.
 //
-// State[t-1] is read from the `state` input tensor with a t>0 guard —
-// the t=0 write of grad_decay is a literal 0. Never issue an out-of-bounds
-// load at (t-1)=-1.
+// State[t-1] is read from the `state_fp32` input tensor (always fp32,
+// written by the forward kernel alongside the lossy `out`) with a t>0
+// guard — the t=0 write of grad_decay is a literal 0. Never issue an
+// out-of-bounds load at (t-1)=-1.
 //
 // Fp32 accumulator regardless of input dtype; outputs cast back to their
 // storage dtype at the store. Same dtype dispatch as forward.
+//
+// Reading fp32 state (not the lossy bf16/fp16 output) means backward
+// differentiates through the TRUE fp32 recurrence, not a quantized
+// surrogate. At bf16 this closes a ~3e-3 pessimistic drift that the
+// old backward inherited from the output-dtype roundtrip.
 //
 // Traffic per (b, d, t): 3 loads (grad_state, decay, state[t-1]) + 2
 // stores (grad_decay, grad_update). Forward does 2 loads + 1 store. So
@@ -90,11 +96,15 @@ struct ElemOps<TagFP32> {
 // Naive per-thread reverse serial scan. grid = (ceil(D / BlockX), B);
 // thread owns the (blockIdx.y, blockIdx.x * BlockX + threadIdx.x) lane
 // for the full reverse-T sweep.
+//
+// `state_fp32` is always fp32 (the forward kernel writes it verbatim
+// from the register accumulator). Reading it directly preserves the
+// fp32 state exactly — no template on UpdateTag for this load.
 template <typename DecayTag, typename UpdateTag, int BlockX>
 __global__ void ssm_scan_bwd_kernel(
     const typename ElemOps<UpdateTag>::Elem* __restrict__ grad_state,
     const typename ElemOps<DecayTag>::Elem* __restrict__ decay,
-    const typename ElemOps<UpdateTag>::Elem* __restrict__ state,
+    const float* __restrict__ state_fp32,
     typename ElemOps<DecayTag>::Elem* __restrict__ grad_decay,
     typename ElemOps<UpdateTag>::Elem* __restrict__ grad_update,
     int B, int T, int D) {
@@ -120,7 +130,7 @@ __global__ void ssm_scan_bwd_kernel(
         float s_prev = 0.0f;
         if (t > 0) {
             const int64_t idx_prev = idx - int64_t(D);
-            s_prev = ElemOps<UpdateTag>::load(state + idx_prev);
+            s_prev = state_fp32[idx_prev];
         }
         ElemOps<DecayTag>::store(grad_decay + idx, G * s_prev);
 
@@ -133,12 +143,13 @@ __global__ void ssm_scan_bwd_kernel(
 
 // Launch dispatch. Dtype combos mirror the forward kernel:
 //   (decay, update) in { (bf16, bf16), (bf16, fp16), (fp16, fp16), (fp32, fp32) }.
-// grad_state + state share update_dtype; grad_update matches update_dtype;
-// grad_decay matches decay_dtype.
+// grad_state shares update_dtype; grad_update matches update_dtype;
+// grad_decay matches decay_dtype. `state_fp32` is always fp32 regardless
+// of the (decay, update) tuple.
 void launch_ssm_scan_bwd(
     const void* grad_state,
     const void* decay,
-    const void* state,
+    const float* state_fp32,
     void* grad_decay,
     void* grad_update,
     int B, int T, int D,
@@ -161,7 +172,7 @@ void launch_ssm_scan_bwd(
         ssm_scan_bwd_kernel<TagBF16, TagBF16, BlockX><<<grid, block, 0, stream>>>(
             reinterpret_cast<const __nv_bfloat16*>(grad_state),
             reinterpret_cast<const __nv_bfloat16*>(decay),
-            reinterpret_cast<const __nv_bfloat16*>(state),
+            state_fp32,
             reinterpret_cast<__nv_bfloat16*>(grad_decay),
             reinterpret_cast<__nv_bfloat16*>(grad_update),
             B, T, D);
@@ -169,7 +180,7 @@ void launch_ssm_scan_bwd(
         ssm_scan_bwd_kernel<TagBF16, TagFP16, BlockX><<<grid, block, 0, stream>>>(
             reinterpret_cast<const __half*>(grad_state),
             reinterpret_cast<const __nv_bfloat16*>(decay),
-            reinterpret_cast<const __half*>(state),
+            state_fp32,
             reinterpret_cast<__nv_bfloat16*>(grad_decay),
             reinterpret_cast<__half*>(grad_update),
             B, T, D);
@@ -177,7 +188,7 @@ void launch_ssm_scan_bwd(
         ssm_scan_bwd_kernel<TagFP16, TagFP16, BlockX><<<grid, block, 0, stream>>>(
             reinterpret_cast<const __half*>(grad_state),
             reinterpret_cast<const __half*>(decay),
-            reinterpret_cast<const __half*>(state),
+            state_fp32,
             reinterpret_cast<__half*>(grad_decay),
             reinterpret_cast<__half*>(grad_update),
             B, T, D);
@@ -185,13 +196,19 @@ void launch_ssm_scan_bwd(
         ssm_scan_bwd_kernel<TagFP32, TagFP32, BlockX><<<grid, block, 0, stream>>>(
             reinterpret_cast<const float*>(grad_state),
             reinterpret_cast<const float*>(decay),
-            reinterpret_cast<const float*>(state),
+            state_fp32,
             reinterpret_cast<float*>(grad_decay),
             reinterpret_cast<float*>(grad_update),
             B, T, D);
     } else {
-        // Unsupported combo — host binding enforces this upstream.
-        // Intentional no-op to mirror forward's dispatch fallthrough.
+        // Defensive: trap on an unreachable dtype combo. See ssm_scan_fwd.cu
+        // for rationale — the binding rejects these upstream, but if a
+        // future dtype tuple is added without updating this dispatcher
+        // we want a loud failure. Launch a deliberately invalid config;
+        // the caller's cudaGetLastError will surface it.
+        cudaGetLastError();  // clear previous
+        ssm_scan_bwd_kernel<TagFP32, TagFP32, BlockX><<<dim3(0), dim3(0), 0, stream>>>(
+            nullptr, nullptr, nullptr, nullptr, nullptr, 0, 0, 0);
     }
 }
 

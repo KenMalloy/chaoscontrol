@@ -52,14 +52,35 @@ def build_ext_modules() -> list:
         "-gencode=arch=compute_90,code=sm_90",
         "--expt-relaxed-constexpr",
         "-Xcompiler=-fPIC",
-        # Use fast-math so nvcc emits the `decay * state + update`
-        # recurrence as a single fp32 FMA instead of a multiply-then-
-        # add. FMA is what we want on H100's tensor pipeline — the
-        # whole scan is accumulator-dominated and per-step FMA is the
-        # shortest-latency form of the recurrence. No ordering hazard:
-        # FMA collapses two consecutive ops into one, it does not
-        # reorder across the t→t+1 boundary (the loop is serial inside
-        # each thread).
+        # Use fast-math. `-use_fast_math` bundles several nvcc flags:
+        #   * `-fmad=true`          — fuse `a*b + c` into a single
+        #                             fp32 FMA. This is the main win
+        #                             for us. No ordering hazard: FMA
+        #                             collapses two consecutive ops
+        #                             into one, it does not reorder
+        #                             across the t→t+1 boundary (the
+        #                             loop is serial inside each
+        #                             thread).
+        #   * `-ftz=true`           — flush denormals to zero. Our
+        #                             decay values are bounded below
+        #                             by ~exp(-delta*a) which stays
+        #                             well above 1e-30; update values
+        #                             are clamped by tanh(·)*sigmoid(·)
+        #                             inside _diag_terms. We never
+        #                             produce denormal intermediates,
+        #                             so FTZ is a latency win with no
+        #                             numerical cost.
+        #   * `-prec-div=false`     — use approximate fp32 div. We
+        #                             don't use fp32 div in the scan
+        #                             kernels at all (only multiply
+        #                             and add). No-op for us.
+        #   * `-prec-sqrt=false`    — use approximate fp32 sqrt. We
+        #                             don't use fp32 sqrt in the scan
+        #                             kernels. No-op.
+        #
+        # Net effect for this kernel: FMA fusion, other flags are
+        # dead code. Kept as `-use_fast_math` for consistency with
+        # the sibling `_cublaslt` extension.
         "-use_fast_math",
         # Silence the CCCL compatibility check: our cu13 pod has nvcc
         # 13.2 + cudart 13.0, which mismatch the minor version but are

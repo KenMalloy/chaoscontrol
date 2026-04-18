@@ -17,8 +17,18 @@
 //
 // Accumulator is fp32 regardless of input dtype. Output dtype matches
 // `update` dtype. bf16 inputs cost two bf16→fp32 loads per step plus
-// one fp32→bf16 store; the cast is saturating and latency-free on H100
-// tensor pipelines.
+// one fp32→bf16 store; the cast is round-to-nearest-even (not
+// saturating) and latency-free on H100 tensor pipelines.
+//
+// We also write a second state tensor in fp32, `state_fp32`, with the
+// same (B, T, D) layout. The backward kernel reads this one (not the
+// lossy `out`) to recover `state[t-1]` exactly. Writing both is one
+// extra fp32 store per step — the kernel was HBM-bandwidth bound at
+// ~0.35 ms fwd, this adds ~0.7 ms worth of writes in the worst case
+// but remains well below the compile path's ~4-8 ms step. Memory
+// overhead: ~500MB at submission regime (B=1024, T=512, D=256). Cheaper
+// than recomputing the fp32 forward in backward for ~2× memory vs
+// 2× compute. See `ssm_scan.h` for the full contract.
 //
 // Coalescing: `threadIdx.x` ranges over D, so consecutive threads hit
 // consecutive D-lanes at the same (b, t) — stride-1 accesses in global
@@ -85,11 +95,16 @@ struct ElemOps<TagFP32> {
 // Naive per-thread serial scan. grid = (ceil(D / BlockX), B); thread
 // owns the (blockIdx.y, blockIdx.x * BlockX + threadIdx.x) lane for
 // the full T sweep.
+//
+// Writes two outputs per step:
+//   * out          — storage dtype = update dtype, for downstream ops
+//   * state_fp32   — always fp32, consumed by backward kernel
 template <typename DecayTag, typename UpdateTag, typename OutTag, int BlockX>
 __global__ void ssm_scan_fwd_kernel(
     const typename ElemOps<DecayTag>::Elem* __restrict__ decay,
     const typename ElemOps<UpdateTag>::Elem* __restrict__ update,
     typename ElemOps<OutTag>::Elem* __restrict__ out,
+    float* __restrict__ state_fp32,
     int B, int T, int D) {
     const int d = blockIdx.x * BlockX + threadIdx.x;
     const int b = blockIdx.y;
@@ -105,6 +120,7 @@ __global__ void ssm_scan_fwd_kernel(
         const float upd = ElemOps<UpdateTag>::load(update + idx);
         state = dec * state + upd;
         ElemOps<OutTag>::store(out + idx, state);
+        state_fp32[idx] = state;
     }
 }
 
@@ -127,6 +143,7 @@ void launch_ssm_scan_fwd(
     const void* decay,
     const void* update,
     void* out,
+    float* state_fp32,
     int B, int T, int D,
     at::ScalarType decay_dtype,
     at::ScalarType update_dtype,
@@ -150,33 +167,44 @@ void launch_ssm_scan_fwd(
             reinterpret_cast<const __nv_bfloat16*>(decay),
             reinterpret_cast<const __nv_bfloat16*>(update),
             reinterpret_cast<__nv_bfloat16*>(out),
+            state_fp32,
             B, T, D);
     } else if (decay_bf16 && update_fp16) {
         ssm_scan_fwd_kernel<TagBF16, TagFP16, TagFP16, BlockX><<<grid, block, 0, stream>>>(
             reinterpret_cast<const __nv_bfloat16*>(decay),
             reinterpret_cast<const __half*>(update),
             reinterpret_cast<__half*>(out),
+            state_fp32,
             B, T, D);
     } else if (decay_fp16 && update_fp16) {
         ssm_scan_fwd_kernel<TagFP16, TagFP16, TagFP16, BlockX><<<grid, block, 0, stream>>>(
             reinterpret_cast<const __half*>(decay),
             reinterpret_cast<const __half*>(update),
             reinterpret_cast<__half*>(out),
+            state_fp32,
             B, T, D);
     } else if (decay_fp32 && update_fp32) {
         ssm_scan_fwd_kernel<TagFP32, TagFP32, TagFP32, BlockX><<<grid, block, 0, stream>>>(
             reinterpret_cast<const float*>(decay),
             reinterpret_cast<const float*>(update),
             reinterpret_cast<float*>(out),
+            state_fp32,
             B, T, D);
     } else {
-        // Fall back: bf16 decay with fp32 update (unusual; promote both).
-        // Not exposed on the public API today, but kept for symmetry
-        // if a future caller asks for it.
-        // We simply abort — host should have checked dtype compat.
-        // Using a device-side assert would require cooperative-kernel
-        // machinery; instead raise at the host boundary.
-        // (Intentional no-op: the binding enforces this upstream.)
+        // Defensive: trap on an unreachable dtype combo. The pybind11
+        // binding rejects these upstream, so this branch is dead today;
+        // but if a future dtype tuple is added to the binding without
+        // the dispatcher, we want a loud failure, not silent garbage.
+        // Cannot raise here (this runs on the host side of the launch
+        // pre-kernel), so emit an un-ignorable device-side trap via
+        // `cudaLaunchKernel`-style no-op that CUDA error-checks.
+        // Simplest: set the async error slot directly.
+        cudaGetLastError();  // clear previous
+        // Force an error: launch with zero grid on the stream to
+        // trigger `cudaErrorInvalidConfiguration`, which the caller's
+        // `cudaGetLastError` check will catch.
+        ssm_scan_fwd_kernel<TagFP32, TagFP32, TagFP32, BlockX><<<dim3(0), dim3(0), 0, stream>>>(
+            nullptr, nullptr, nullptr, nullptr, 0, 0, 0);
     }
 }
 

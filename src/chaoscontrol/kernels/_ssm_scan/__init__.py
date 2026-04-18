@@ -4,13 +4,22 @@
 Replaces the torch.compile path that produced a -63% regression at
 submission regime. Forward is ``src/ssm_scan_fwd.cu`` and backward is
 ``src/ssm_scan_bwd.cu`` — both per-thread serial scans on (b, d) lanes
-with fp32 accumulator. Save-for-backward stores (decay, state) where
-state is the forward output; the backward kernel needs state[t-1] for
-grad_decay.
+with fp32 accumulator.
 
-On dev macs (``_C is None``), the autograd.Function falls back to
-re-running the fp32 Python reference with grad enabled and routing
-through ``torch.autograd.grad``.
+The forward kernel writes TWO tensors: a dtype-matching ``out`` for
+downstream ops and a separate fp32 ``state_fp32`` tensor that the
+backward kernel consumes. Backward differentiates through the exact
+fp32 recurrence this way, not a bf16/fp16-quantized surrogate.
+
+Save-for-backward stores ``(decay, state_fp32)`` — the fp32 state is
+all backward needs for ``grad_decay = G * state[t-1]``. Memory cost vs
+the previous (correctness-broken) design: one extra (B, T, D) fp32
+tensor, ~500MB at submission regime.
+
+On dev macs (``_C is None``) AND on CPU tensors (pod pre-warm probes),
+the autograd.Function falls back to the fp32 Python reference — no
+kernel dispatch, no CUDA requirement. ``ssm_scan(decay, update)`` is
+safe to call on any device without ``_require_ext()``.
 
 Both kernels are registered with ``torch.library.custom_op`` so dynamo
 can trace them as opaque primitives when the caller is compiled.
@@ -57,16 +66,21 @@ if _C is not None:  # pragma: no cover — only on pods with the extension
     def _ssm_scan_forward_op(  # type: ignore[no-redef]
         decay: torch.Tensor,
         update: torch.Tensor,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         return _C.ssm_scan_forward(decay, update)
 
     @_ssm_scan_forward_op.register_fake
     def _ssm_scan_forward_fake(
         decay: torch.Tensor,
         update: torch.Tensor,
-    ) -> torch.Tensor:
-        # Shape + dtype contract: output matches `update`.
-        return torch.empty_like(update)
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        # Shape + dtype contract: out matches `update`, state_fp32 is
+        # (B, T, D) fp32 regardless of input dtype.
+        out = torch.empty_like(update)
+        state_fp32 = torch.empty(
+            decay.shape, dtype=torch.float32, device=decay.device
+        )
+        return out, state_fp32
 
     @torch.library.custom_op(
         "chaoscontrol_ssm_scan::backward",
@@ -75,65 +89,107 @@ if _C is not None:  # pragma: no cover — only on pods with the extension
     def _ssm_scan_backward_op(  # type: ignore[no-redef]
         grad_state: torch.Tensor,
         decay: torch.Tensor,
-        state: torch.Tensor,
+        state_fp32: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        return _C.ssm_scan_backward(grad_state, decay, state)
+        return _C.ssm_scan_backward(grad_state, decay, state_fp32)
 
     @_ssm_scan_backward_op.register_fake
     def _ssm_scan_backward_fake(
         grad_state: torch.Tensor,
         decay: torch.Tensor,
-        state: torch.Tensor,
+        state_fp32: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        # grad_decay has decay dtype; grad_update has state (=update) dtype.
-        return torch.empty_like(decay), torch.empty_like(state)
+        # grad_decay has decay dtype; grad_update has grad_state dtype.
+        return torch.empty_like(decay), torch.empty_like(grad_state)
+
+
+def _is_kernel_eligible(decay: torch.Tensor, update: torch.Tensor) -> bool:
+    """Return True when the CUDA kernel can actually run for these tensors.
+
+    False on dev macs (no ``_C`` built) and on CPU tensors (pre-warm
+    probes, DDP test fixtures). The autograd.Function must route those
+    through the Python fallback instead of calling the kernel and
+    raising a TORCH_CHECK — we don't want the pod-probe path to tear
+    down the global backend cache with a bogus "ssm_scan broke" error.
+    """
+    if _C is None:
+        return False
+    if not decay.is_cuda or not update.is_cuda:
+        return False
+    return True
+
+
+def _fp32_python_reference(
+    decay: torch.Tensor, update: torch.Tensor
+) -> torch.Tensor:
+    """Sequential diag scan in fp32, cast back to ``update`` dtype.
+
+    Mirrors ``chaoscontrol.core._diag_recurrence_inner`` but promotes
+    to fp32 internally for stability. Used by the non-CUDA fallback
+    branch of ``ssm_scan`` — dev macs and CPU pre-warm probes.
+    """
+    out_dtype = update.dtype
+    d32 = decay.to(torch.float32)
+    u32 = update.to(torch.float32)
+    batch, seq, dim = d32.shape
+    state = torch.zeros(batch, dim, dtype=torch.float32, device=d32.device)
+    outputs = []
+    for t in range(seq):
+        state = d32[:, t] * state + u32[:, t]
+        outputs.append(state)
+    return torch.stack(outputs, dim=1).to(out_dtype)
 
 
 class _SSMScanForwardFn(torch.autograd.Function):
     """Autograd wrapper around the forward+backward CUDA kernels.
 
-    Save-for-backward stores ``(decay, state)`` where ``state`` is the
-    forward output. The backward kernel consumes ``state[t-1]`` for
-    ``grad_decay``, so saving the output is sufficient — no need to
-    keep ``update`` around.
+    Kernel path: save-for-backward stores ``(decay, state_fp32)``. The
+    backward kernel consumes ``state_fp32[t-1]`` for ``grad_decay``;
+    fp32-exact state means backward differentiates through the true
+    recurrence rather than a bf16/fp16-quantized surrogate.
 
-    When the C extension isn't built (``_C is None`` — dev macs), the
-    backward path falls back to re-running the fp32 Python reference
-    with autograd enabled. That path still saves ``(decay, update)``
-    because it has to retrace the forward to produce gradients.
+    Python-reference fallback: stores ``(decay, update)`` and retraces
+    the fp32 reference under ``torch.enable_grad`` to produce gradients.
+    Used on dev macs (``_C is None``) and on CPU tensors (pre-warm
+    probes). Gated by ``_is_kernel_eligible`` so the kernel is only
+    invoked when it can actually run.
     """
 
     @staticmethod
-    def forward(ctx, decay: torch.Tensor, update: torch.Tensor) -> torch.Tensor:
-        state = _ssm_scan_forward_op(decay, update)
-        if _C is not None:
-            # Kernel backward only needs decay + state.
-            ctx.save_for_backward(decay, state)
+    def forward(
+        ctx, decay: torch.Tensor, update: torch.Tensor
+    ) -> torch.Tensor:
+        if _is_kernel_eligible(decay, update):
+            out, state_fp32 = _ssm_scan_forward_op(decay, update)
+            ctx.save_for_backward(decay, state_fp32)
             ctx._fallback = False
-        else:  # pragma: no cover — dev-mac branch
-            # Python-loop fallback retraces forward, needs (decay, update).
+        else:
+            # Python fallback: retrace forward in backward.
+            out = _fp32_python_reference(decay, update)
             ctx.save_for_backward(decay, update)
             ctx._fallback = True
         ctx.decay_dtype = decay.dtype
         ctx.update_dtype = update.dtype
         ctx.decay_requires_grad = decay.requires_grad
         ctx.update_requires_grad = update.requires_grad
-        return state
+        return out
 
     @staticmethod
     def backward(ctx, grad_out: torch.Tensor):  # type: ignore[override]
-        if ctx._fallback:  # pragma: no cover — dev-mac branch
+        if ctx._fallback:
             return _SSMScanForwardFn._backward_python(ctx, grad_out)
 
-        decay, state = ctx.saved_tensors
-        # Kernel dispatch requires grad_state.dtype == state.dtype
-        # (== update_dtype). Upstream autograd occasionally hands back
-        # an fp32 grad_out even when the forward produced bf16 — the
-        # .to() is a no-op when dtypes match and a safe cast otherwise.
+        decay, state_fp32 = ctx.saved_tensors
+        # Kernel dispatch requires grad_state.dtype == update_dtype.
+        # Upstream autograd occasionally hands back an fp32 grad_out
+        # even when the forward produced bf16 — the .to() is a no-op
+        # when dtypes match and a safe cast otherwise.
         grad_out_cast = grad_out.to(ctx.update_dtype)
         grad_out_cast = grad_out_cast.contiguous()
 
-        grad_decay, grad_update = _ssm_scan_backward_op(grad_out_cast, decay, state)
+        grad_decay, grad_update = _ssm_scan_backward_op(
+            grad_out_cast, decay, state_fp32
+        )
 
         out: list[torch.Tensor | None] = []
         out.append(grad_decay if ctx.decay_requires_grad else None)
@@ -141,22 +197,28 @@ class _SSMScanForwardFn(torch.autograd.Function):
         return tuple(out)
 
     @staticmethod
-    def _backward_python(ctx, grad_out: torch.Tensor):  # pragma: no cover — dev-mac branch
-        """Dev-mac fallback: autograd through the fp32 Python reference."""
-        from chaoscontrol.core import _diag_recurrence_inner
-
+    def _backward_python(ctx, grad_out: torch.Tensor):
+        """Python-reference fallback: autograd through the fp32 recurrence."""
         decay, update = ctx.saved_tensors
 
-        d_ref = decay.detach().to(torch.float32).requires_grad_(ctx.decay_requires_grad)
-        u_ref = update.detach().to(torch.float32).requires_grad_(ctx.update_requires_grad)
+        d_ref = decay.detach().to(torch.float32).requires_grad_(
+            ctx.decay_requires_grad
+        )
+        u_ref = update.detach().to(torch.float32).requires_grad_(
+            ctx.update_requires_grad
+        )
         with torch.enable_grad():
-            y_ref = _diag_recurrence_inner(d_ref, u_ref)
+            y_ref = _fp32_python_reference(d_ref, u_ref).to(torch.float32)
         grad_out_f32 = grad_out.to(torch.float32)
 
         grads = torch.autograd.grad(
             outputs=y_ref,
-            inputs=[t for t, req in [(d_ref, ctx.decay_requires_grad),
-                                      (u_ref, ctx.update_requires_grad)] if req],
+            inputs=[
+                t for t, req in [
+                    (d_ref, ctx.decay_requires_grad),
+                    (u_ref, ctx.update_requires_grad),
+                ] if req
+            ],
             grad_outputs=grad_out_f32,
             retain_graph=False,
             create_graph=False,
@@ -180,11 +242,32 @@ def ssm_scan_forward(
     decay: torch.Tensor,
     update: torch.Tensor,
 ) -> torch.Tensor:
-    """Forward-only diag SSM scan.
+    """Forward-only diag SSM scan (no autograd).
 
-    See module docstring. Runs the custom kernel; does NOT go through
-    autograd. For the autograd-traceable version call
-    ``ssm_scan(decay, update)``.
+    Returns only the storage-dtype ``out`` tensor. The internal fp32
+    state snapshot is discarded since it's only useful for backward.
+    For the autograd-traceable version call ``ssm_scan(decay, update)``.
+
+    On non-CUDA inputs this falls back to the fp32 Python reference —
+    matches ``ssm_scan``'s dispatch rule.
+    """
+    if _is_kernel_eligible(decay, update):
+        out, _state_fp32 = _ssm_scan_forward_op(decay, update)
+        return out
+    return _fp32_python_reference(decay, update)
+
+
+def ssm_scan_forward_with_state(
+    decay: torch.Tensor,
+    update: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Forward diag SSM scan returning ``(out, state_fp32)``.
+
+    Exposes the fp32 state snapshot — mainly for unit tests that want
+    to call ``ssm_scan_backward`` directly with the saved state. Raises
+    via ``_require_ext`` if the extension isn't built; this helper has
+    no fallback (callers that want the fallback should use
+    ``ssm_scan_forward`` or the autograd wrapper instead).
     """
     _require_ext()
     return _ssm_scan_forward_op(decay, update)
@@ -193,17 +276,17 @@ def ssm_scan_forward(
 def ssm_scan_backward(
     grad_state: torch.Tensor,
     decay: torch.Tensor,
-    state: torch.Tensor,
+    state_fp32: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Raw backward-kernel call.
 
     Given ``grad_state`` (upstream dL/ds), the saved ``decay``, and the
-    forward output ``state``, compute ``(grad_decay, grad_update)``.
-    Does NOT go through autograd; use ``ssm_scan`` for the standard
-    autograd-traceable path.
+    saved fp32 state snapshot ``state_fp32`` from forward, compute
+    ``(grad_decay, grad_update)``. Does NOT go through autograd; use
+    ``ssm_scan`` for the standard autograd-traceable path.
     """
     _require_ext()
-    return _ssm_scan_backward_op(grad_state, decay, state)
+    return _ssm_scan_backward_op(grad_state, decay, state_fp32)
 
 
 def ssm_scan(
@@ -212,12 +295,13 @@ def ssm_scan(
 ) -> torch.Tensor:
     """Autograd-enabled diag SSM scan.
 
-    Forward: custom CUDA kernel.
-    Backward: custom CUDA kernel (per-lane reverse recurrence).
+    Forward: custom CUDA kernel on CUDA inputs when the extension is
+    built; fp32 Python reference otherwise (dev mac or CPU tensor).
+    Backward: custom CUDA kernel on CUDA inputs; autograd-through-fp32
+    reference otherwise.
 
-    On dev macs where the C extension isn't built, both paths fall back
-    to pure-Python references (forward: the sequential loop; backward:
-    autograd through the fp32 reference).
+    No ``_require_ext()`` guard — this function is safe to call on any
+    device. Non-CUDA inputs route through the Python reference.
 
     Args:
         decay: (B, T, D) bf16/fp16/fp32, contiguous, row-major.
@@ -226,12 +310,12 @@ def ssm_scan(
     Returns:
         (B, T, D) state tensor; dtype matches ``update``.
     """
-    _require_ext()
     return _SSMScanForwardFn.apply(decay, update)
 
 
 __all__ = [
     "ssm_scan_forward",
+    "ssm_scan_forward_with_state",
     "ssm_scan_backward",
     "ssm_scan",
 ]
