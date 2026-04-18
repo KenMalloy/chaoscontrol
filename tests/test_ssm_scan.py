@@ -184,11 +184,25 @@ class TestForwardEdgeCases:
         with pytest.raises((RuntimeError, ValueError)):
             ssm_scan_forward(decay, update)
 
-    def test_rejects_cpu(self):
+    def test_cpu_falls_back_cleanly(self):
+        """After Fix #3, ssm_scan_forward on CPU routes through the fp32
+        Python fallback — does NOT raise. The raw kernel-only helper
+        ``ssm_scan_forward_with_state`` still raises because it requires
+        the extension."""
         decay = torch.rand(2, 8, 4)
         update = torch.randn(2, 8, 4)
+
+        # Public entrypoint: falls back, returns a tensor.
+        y = ssm_scan_forward(decay, update)
+        assert y.shape == decay.shape
+        assert y.device.type == "cpu"
+
+        # Raw extension API: still requires CUDA + the extension. It
+        # won't raise for _require_ext here (we gate this module on
+        # _C != None at import), but it'll raise from the TORCH_CHECK
+        # inside the C++ binding for a non-CUDA tensor.
         with pytest.raises((RuntimeError, ValueError)):
-            ssm_scan_forward(decay, update)
+            ssm_scan_forward_with_state(decay, update)
 
 
 # ---------------------------------------------------------------------------
