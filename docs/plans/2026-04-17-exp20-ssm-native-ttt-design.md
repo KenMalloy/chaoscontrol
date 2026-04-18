@@ -112,6 +112,8 @@ First-class submission-day infrastructure, not bench scaffolding.
 
 Sibling to `src/chaoscontrol/runner.py`, not a subclass. `runner.py` trains on packed batches — wrong shape for doc-stream semantics with per-doc state threading. Separation prevents accidental training-path contamination during eval.
 
+**Shared-code prerequisite (added 2026-04-17 after dry-run review):** `ChaosSSMCore.forward` and `ChaosStudentLM.forward` currently hardcode the recurrence's initial state to zeros (see `src/chaoscontrol/core.py:416`). For any Axis 2 persistence mode that claims to carry state across chunks or docs to actually carry state, both forwards must accept an optional `initial_state[s]` kwarg and return the final state. This is a small but genuine mainline-code change owned by Exp 20 and landed as "Task 3.5" in the impl plan before any persistence work. Until it lands, `carry_state`, `trainable_h0`, and their compositions are silent no-ops equivalent to `reset`.
+
 ## The three axes
 
 ### Axis 1 — What adapts at eval time

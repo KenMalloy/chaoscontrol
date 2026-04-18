@@ -26,9 +26,28 @@ Use `superpowers:using-git-worktrees` to create an isolated worktree for this wo
 
 ---
 
-## Phase I — Harness (Tasks 1-10)
+## Phase I — Harness (Tasks 1-10, plus new Task 3.5)
 
 Days 1-2 of the post-Exp-19 calendar. Build must complete before any ablation run.
+
+**Task map (updated after 2026-04-17 dry-run review):**
+
+| # | Task | Notes |
+|---|---|---|
+| 1 | Scaffold `eval_stream/` types | baseline |
+| 2 | `DocStreamer` (JSONL + on-the-fly SP tokenization) | **retrofitted** — see Task 2 Retrofit note |
+| 3 | `MetricsCollector` | baseline |
+| 3.5 | **Thread `initial_states` through core + model forward** | **NEW — shared-code change; prerequisite for real Axis 2 persistence** |
+| 4 | `DeltaModulator` | + Axis 1/3 compatibility assertion |
+| 5 | `LegalityController` | stable chunk hash, empty-CE guard, cross-doc re-adapt test |
+| 6 | Param-group selector (`TTTRunner`) | exact-match embed, `trainable_h0` pattern, `all` coverage |
+| 7 | Persistence modes (`StateManager`, `trainable_h0`) | depends on Task 3.5; device+dtype placement; gradient-preserving init |
+| 8 | Driver `scripts/run_exp20_eval.py` | single-Muon optimizer; strict load; CUDA seed + LOCAL_RANK |
+| 9 | Phase A smoke (CPU, bit-exact) | adds state-plumbing canary test |
+| 10 | Pod smoke vs Exp 18 Test 4b | requires `configs/exp20/smoke_test4b.json`; re-run baseline eval path for apples-to-apples gate; pre-push cleanliness check |
+
+Task 3.5 is inserted between Task 3 and Task 4; Tasks 4 through 10 retain their original numbers.
+
 
 ### Task 1: Scaffold `eval_stream/` package
 
@@ -136,54 +155,100 @@ git commit -m "exp20(harness): scaffold eval_stream package with RunConfig types
 
 ### Task 2: `DocStreamer` — iterate FineWeb eval docs
 
+**Retrofit note (2026-04-17):** the original spec had `DocStreamer` source from `.bin` shards and split on an EOS sentinel. The canonical SP shards built by `scripts/build_sp_shards.py` set `append_eos=False` (see `scripts/build_sp_shards.py:348` and its module docstring, line 17) — there is **no** EOS between docs inside our shards. EOS-splitting would fail silently (one giant "doc" per shard).
+
+Source instead from `docs_selected.jsonl` (the raw-JSONL path used at tokenization time) + an SP tokenizer handle, tokenizing on the fly. This matches how the shards themselves are built, keeps the eval split disjoint by choosing a held-out slice of the JSONL, and removes the need for an in-band sentinel. Throughput is a non-issue at 50k docs.
+
+**Task 2 already executed on this worktree; the DocStreamer and its tests must be rewritten per this retrofit before any downstream task uses it.** The signature changes: `DocStreamer(jsonl_paths: list[Path], sp_model_path: Path, max_docs: int = 50_000)`.
+
 **Files:**
 - Create: `src/chaoscontrol/eval_stream/doc_stream.py`
 - Create: `tests/test_eval_stream_doc_stream.py`
 
-**Context:** FineWeb shards are tokenized in `src/chaoscontrol/data.py`. For eval we need doc-level iteration, not packed batches. Eval split must be disjoint from Exp 19 train. We use the existing eval shard path and split on doc boundary markers (0 or EOS token depending on tokenizer).
+**Context:** FineWeb docs live in JSONL (`docs_selected.jsonl`) one doc per line with a `"text"` field. SP tokenization happens on the fly with a persistent `SentencePieceProcessor` handle. `doc_id` is zero-based across the provided JSONL paths in given order. Eval-split disjointness vs Exp 19 train is enforced by the caller choosing non-overlapping JSONL paths. For raw-bytes (the bpb denominator) we use `len(text.encode("utf-8"))` — exact, not an estimate.
 
 **Step 1: Write failing test**
 
+Tests use a tiny SP model trained in `tmp_path` (keeps the test hermetic). If the repo already ships a fixture SP model under `tests/fixtures/` or an existing SP model path visible from tests — check `grep -r "SentencePiece" tests/` and the build_sp_shards tests — prefer the shipped model. Otherwise train a 64-piece SP model on a handful of synthetic lines in `tmp_path` via the `sentencepiece` training API.
+
 ```python
 # tests/test_eval_stream_doc_stream.py
-import numpy as np
+import json
+from pathlib import Path
+
 import pytest
+import sentencepiece as spm
+
 from chaoscontrol.eval_stream.doc_stream import DocStreamer
 
 
-def test_iterates_docs_in_order(tmp_path):
-    # Build a synthetic shard with 3 docs separated by EOS token (0)
-    toks = np.array([10, 11, 12, 0,  20, 21, 0,  30, 31, 32, 33, 0], dtype=np.uint16)
-    shard = tmp_path / "eval.bin"
-    toks.tofile(shard)
+@pytest.fixture
+def sp_model(tmp_path: Path) -> Path:
+    """Train a tiny SP model for hermetic testing."""
+    corpus = tmp_path / "corpus.txt"
+    corpus.write_text("\n".join([
+        "the quick brown fox jumps over the lazy dog",
+        "sphinx of black quartz judge my vow",
+        "pack my box with five dozen liquor jugs",
+    ] * 50))
+    model_prefix = tmp_path / "sp"
+    spm.SentencePieceTrainer.Train(
+        input=str(corpus),
+        model_prefix=str(model_prefix),
+        vocab_size=64,
+        character_coverage=1.0,
+        model_type="bpe",
+    )
+    return Path(f"{model_prefix}.model")
 
-    streamer = DocStreamer(shard_paths=[shard], eos_token=0, max_docs=10)
-    docs = list(streamer)
+
+def _write_jsonl(path: Path, texts: list[str]) -> None:
+    with path.open("w") as fh:
+        for t in texts:
+            fh.write(json.dumps({"text": t}) + "\n")
+
+
+def test_iterates_docs_in_order(tmp_path, sp_model):
+    jsonl = tmp_path / "docs.jsonl"
+    _write_jsonl(jsonl, ["alpha beta gamma", "delta epsilon", "zeta"])
+
+    docs = list(DocStreamer(jsonl_paths=[jsonl], sp_model_path=sp_model, max_docs=10))
 
     assert len(docs) == 3
-    assert docs[0].tokens == [10, 11, 12]
-    assert docs[1].tokens == [20, 21]
-    assert docs[2].tokens == [30, 31, 32, 33]
-    assert all(d.doc_id == i for i, d in enumerate(docs))
+    assert [d.doc_id for d in docs] == [0, 1, 2]
+    assert all(len(d.tokens) > 0 for d in docs)
 
 
-def test_respects_max_docs(tmp_path):
-    toks = np.array([1, 0, 2, 0, 3, 0, 4, 0], dtype=np.uint16)
-    shard = tmp_path / "eval.bin"
-    toks.tofile(shard)
-    docs = list(DocStreamer(shard_paths=[shard], eos_token=0, max_docs=2))
+def test_respects_max_docs(tmp_path, sp_model):
+    jsonl = tmp_path / "docs.jsonl"
+    _write_jsonl(jsonl, [f"doc number {i}" for i in range(8)])
+    docs = list(DocStreamer(jsonl_paths=[jsonl], sp_model_path=sp_model, max_docs=2))
     assert len(docs) == 2
 
 
-def test_raw_bytes_recorded(tmp_path):
-    toks = np.array([100, 101, 0], dtype=np.uint16)
-    shard = tmp_path / "eval.bin"
-    toks.tofile(shard)
-    # Raw bytes computed from detokenizer; in this test we stub it via constant
-    docs = list(DocStreamer(shard_paths=[shard], eos_token=0, max_docs=1,
-                            bytes_per_token_estimate=4.0))
-    # 2 tokens × 4 bytes/token = 8
-    assert docs[0].raw_bytes == 8
+def test_raw_bytes_equal_utf8_length(tmp_path, sp_model):
+    jsonl = tmp_path / "docs.jsonl"
+    text = "hello"
+    _write_jsonl(jsonl, [text])
+    docs = list(DocStreamer(jsonl_paths=[jsonl], sp_model_path=sp_model, max_docs=1))
+    assert docs[0].raw_bytes == len(text.encode("utf-8"))
+
+
+def test_doc_id_continues_across_jsonl_files(tmp_path, sp_model):
+    a, b = tmp_path / "a.jsonl", tmp_path / "b.jsonl"
+    _write_jsonl(a, ["one", "two"])
+    _write_jsonl(b, ["three"])
+    docs = list(DocStreamer(jsonl_paths=[a, b], sp_model_path=sp_model, max_docs=10))
+    assert [d.doc_id for d in docs] == [0, 1, 2]
+
+
+def test_empty_text_is_skipped(tmp_path, sp_model):
+    jsonl = tmp_path / "docs.jsonl"
+    _write_jsonl(jsonl, ["", "real doc"])
+    docs = list(DocStreamer(jsonl_paths=[jsonl], sp_model_path=sp_model, max_docs=10))
+    # empty text tokenizes to [] which DocStreamer skips; doc_id for the real doc is 0
+    assert len(docs) == 1
+    assert docs[0].doc_id == 0
 ```
 
 **Step 2: Run test to verify it fails**
@@ -196,74 +261,69 @@ Expected: FAIL `ModuleNotFoundError`.
 ```python
 # src/chaoscontrol/eval_stream/doc_stream.py
 from __future__ import annotations
+import json
 from pathlib import Path
 from typing import Iterator
-import numpy as np
+
+import sentencepiece as spm
 
 from chaoscontrol.eval_stream.types import DocRecord
 
 
 class DocStreamer:
-    """Iterates docs from tokenized eval shards. Splits on EOS token.
+    """Iterates docs from FineWeb JSONL files. Tokenizes each line on the fly
+    with a persistent SP handle.
 
-    Doc order is deterministic (shard order, then position). Eval-split disjointness
-    vs Exp 19 train stream is enforced by caller via shard_paths choice.
+    Canonical SP shards are built with `append_eos=False` (see
+    scripts/build_sp_shards.py) — there is no EOS sentinel inside them, so we
+    must source from the raw JSONL that feeds the shard builder rather than
+    the .bin shards themselves. doc_id is zero-based, counted across the
+    provided JSONL files in given order.
+
+    Eval-split disjointness vs Exp 19 train is enforced by the caller choosing
+    non-overlapping JSONL paths.
     """
 
     def __init__(
         self,
         *,
-        shard_paths: list[Path],
-        eos_token: int,
+        jsonl_paths: list[Path],
+        sp_model_path: Path,
         max_docs: int = 50_000,
-        bytes_per_token_estimate: float = 4.0,  # FineWeb avg, ~4 bytes/subword for SP8192
     ) -> None:
-        self.shard_paths = [Path(p) for p in shard_paths]
-        self.eos_token = eos_token
+        self.jsonl_paths = [Path(p) for p in jsonl_paths]
+        self.sp = spm.SentencePieceProcessor(model_file=str(sp_model_path))
         self.max_docs = max_docs
-        self.bytes_per_token_estimate = bytes_per_token_estimate
 
     def __iter__(self) -> Iterator[DocRecord]:
         doc_id = 0
-        for shard in self.shard_paths:
-            arr = np.fromfile(str(shard), dtype=np.uint16)
-            buf: list[int] = []
-            for t in arr:
-                t_int = int(t)
-                if t_int == self.eos_token:
-                    if buf:
-                        yield DocRecord(
-                            doc_id=doc_id,
-                            tokens=buf,
-                            raw_bytes=int(len(buf) * self.bytes_per_token_estimate),
-                        )
-                        doc_id += 1
-                        buf = []
-                        if doc_id >= self.max_docs:
-                            return
-                else:
-                    buf.append(t_int)
-            if buf:
-                yield DocRecord(
-                    doc_id=doc_id,
-                    tokens=buf,
-                    raw_bytes=int(len(buf) * self.bytes_per_token_estimate),
-                )
-                doc_id += 1
-                if doc_id >= self.max_docs:
-                    return
+        for p in self.jsonl_paths:
+            with open(p) as fh:
+                for line in fh:
+                    text = json.loads(line)["text"]
+                    tokens = self.sp.encode(text, out_type=int)
+                    if not tokens:
+                        continue
+                    yield DocRecord(
+                        doc_id=doc_id,
+                        tokens=tokens,
+                        raw_bytes=len(text.encode("utf-8")),
+                    )
+                    doc_id += 1
+                    if doc_id >= self.max_docs:
+                        return
 ```
 
 **Step 4: Run test to verify it passes**
 
 Run: `pytest tests/test_eval_stream_doc_stream.py -v`
-Expected: 3 PASS.
+Expected: 5 PASS.
 
 **Step 5: Commit**
 
 ```bash
 git add src/chaoscontrol/eval_stream/doc_stream.py tests/test_eval_stream_doc_stream.py
-git commit -m "exp20(harness): DocStreamer iterates eval docs on EOS boundary"
+git commit -m "exp20(harness): DocStreamer iterates FineWeb JSONL with on-the-fly SP tokenization"
 ```
 
 ---
@@ -468,6 +528,133 @@ git commit -m "exp20(harness): MetricsCollector with in-run stability gate"
 
 ---
 
+### Task 3.5: Thread `initial_states` through `ChaosSSMCore.forward` and `ChaosStudentLM.forward`
+
+**Files:**
+- Modify: `src/chaoscontrol/core.py` (`ChaosSSMCore.forward`, `ChaosSSMBlock.forward` if it wraps)
+- Modify: `src/chaoscontrol/model.py` (`ChaosStudentLM.forward`)
+- Create: `tests/test_initial_states_regression.py`
+
+**Context (why this exists):** `src/chaoscontrol/core.py:416` hardcodes `state = x.new_zeros((batch, dim))` and `ChaosStudentLM.forward` has no state-threading argument at all. Without this plumbing, every Axis 2 persistence mode that claims to carry state across chunks / docs is silently identical to `reset`. The persistence logic in Task 7 is a no-op until this lands.
+
+This is the **only** shared-code change required by Exp 20. Exp 20 owns the merge-last cost — if mainline changes `forward()` in the meantime, we rebase here.
+
+**Contract:**
+- `ChaosSSMCore.forward(x, initial_state=None, ...)`: if `initial_state` is provided, use it to seed the recurrence; otherwise behave exactly as today (`x.new_zeros(...)`). Return the final state alongside the output so callers can thread it to the next chunk. If `return_jacobian_stats=True` was the prior contract, the stats tuple now includes `final_state`, or the core returns a dedicated `(y, final_state[, stats])` tuple — whichever keeps the existing call-sites compiling with a minimal change. Decide this by inspecting `core.py` at the top of the task.
+- `ChaosSSMBlock.forward(x, initial_state=None)` threads through to the core's kwarg.
+- `ChaosStudentLM.forward(input_ids, initial_states: list[Tensor] | None = None)`: one tensor per block; `None` preserves the current zero-init behavior. The return dict gains `"final_states": list[Tensor]`.
+
+**Step 1: Write regression tests (MUST fail before implementation)**
+
+```python
+# tests/test_initial_states_regression.py
+import torch
+from chaoscontrol.model import ChaosStudentLM
+
+
+def _tiny_lm():
+    torch.manual_seed(0)
+    return ChaosStudentLM(vocab_size=32, dim=16, num_layers=2, block_type="ssm", a_mode="diag")
+
+
+def test_backward_compat_no_state_kwarg():
+    """model(input_ids) with no state kwarg must match prior behavior."""
+    m = _tiny_lm()
+    m.eval()
+    ids = torch.randint(0, 32, (1, 32))
+    with torch.no_grad():
+        out = m(ids)
+    logits = out["logits"] if isinstance(out, dict) else out
+    assert logits.shape == (1, 32, 32)
+    # final_states is newly added; must be a list with one tensor per layer
+    assert "final_states" in out
+    assert len(out["final_states"]) == 2
+    for s in out["final_states"]:
+        assert s.shape == (1, 16)
+
+
+def test_zeros_initial_states_match_default():
+    """Passing zeros for initial_states must be bit-identical to passing nothing."""
+    m = _tiny_lm()
+    m.eval()
+    ids = torch.randint(0, 32, (1, 32))
+    with torch.no_grad():
+        out_default = m(ids)
+        zeros = [torch.zeros(1, 16) for _ in range(2)]
+        out_zeros = m(ids, initial_states=zeros)
+    torch.testing.assert_close(
+        out_default["logits"], out_zeros["logits"], rtol=0, atol=0,
+    )
+
+
+def test_nonzero_initial_state_changes_output():
+    m = _tiny_lm()
+    m.eval()
+    ids = torch.randint(0, 32, (1, 32))
+    with torch.no_grad():
+        out_zero = m(ids)
+        nz = [torch.randn(1, 16) for _ in range(2)]
+        out_nz = m(ids, initial_states=nz)
+    assert not torch.allclose(out_zero["logits"], out_nz["logits"], atol=1e-5)
+
+
+def test_final_state_equals_chunked_sequential():
+    """Whole-doc forward must equal concat of two chunked forwards threaded through final_state.
+
+    This is the canary for the state-plumbing invariant. It must FAIL before
+    Task 3.5 lands and PASS after.
+    """
+    m = _tiny_lm()
+    m.eval()
+    ids = torch.randint(0, 32, (1, 64))
+    with torch.no_grad():
+        whole = m(ids)
+        first = m(ids[:, :32])
+        second = m(ids[:, 32:], initial_states=first["final_states"])
+    # Compare the second-half logits
+    torch.testing.assert_close(
+        whole["logits"][:, 32:], second["logits"], rtol=1e-5, atol=1e-5,
+    )
+```
+
+**Step 2: Run** — expected FAIL (`initial_states` kwarg unknown, no `final_states` key).
+
+**Step 3: Implement**
+
+1. In `ChaosSSMCore.forward`: accept `initial_state: torch.Tensor | None = None`. Replace the hardcoded `state = x.new_zeros((batch, dim))` with:
+   ```python
+   if initial_state is None:
+       state = x.new_zeros((batch, dim))
+   else:
+       # caller owns device/dtype match; do not implicitly cast
+       assert initial_state.shape == (batch, dim), (
+           f"initial_state shape {tuple(initial_state.shape)} != ({batch}, {dim})"
+       )
+       state = initial_state
+   ```
+   At end of forward, return the final state. Keep the existing return shape for callers that don't want it: if the function currently returns `y` or `(y, stats)`, the minimal extension is `(y, stats, final_state)` or swap to a namedtuple. Choose whichever keeps `ChaosSSMBlock.forward`'s call-site a one-line diff.
+
+2. In `ChaosSSMBlock.forward`: accept `initial_state=None`, pass through, capture the returned `final_state`, and make it available to `ChaosStudentLM.forward` (return it alongside the block output).
+
+3. In `ChaosStudentLM.forward`: accept `initial_states: list[Tensor] | None = None`. Iterate blocks with `initial_states[i] if initial_states is not None else None`, collect each block's `final_state`, and include `"final_states": [...]` in the returned dict.
+
+**Step 4: Run** — 4 PASS.
+
+**Step 5: Commit**
+
+```bash
+git add src/chaoscontrol/core.py src/chaoscontrol/model.py tests/test_initial_states_regression.py
+git commit -m "exp20(harness): thread initial_states through core/model forward
+
+Shared-code change: ChaosSSMCore.forward and ChaosStudentLM.forward now
+accept optional initial_state / initial_states kwargs and return
+final_state(s). Default behavior (no kwarg) is bit-identical to prior.
+Prerequisite for Exp 20 Axis 2 persistence modes — without this plumbing,
+carry_state and trainable_h0 were silently no-ops."
+```
+
+---
+
 ### Task 4: `DeltaModulator` — no-grad Δ rescaling via forward hooks
 
 **Files:**
@@ -527,10 +714,13 @@ class DeltaModulator:
     to rescale delta_proj output and shift log_a at eval. No gradients involved.
     """
 
-    def __init__(self, module: nn.Module, *, delta_scale: float = 1.0, log_a_shift: float = 0.0):
+    def __init__(self, module: nn.Module, *, delta_scale: float = 1.0,
+                 log_a_shift: float = 0.0, adapt_set_hint: str | None = None):
         self.module = module
         self.delta_scale = float(delta_scale)
         self.log_a_shift = float(log_a_shift)
+        # Optional hint so we can fail loud on Axis 1 × Axis 3 log_a overlap.
+        self._adapt_set_hint = adapt_set_hint
         self._handles: list[torch.utils.hooks.RemovableHandle] = []
         self._log_a_originals: list[tuple[nn.Parameter, torch.Tensor]] = []
 
@@ -539,6 +729,18 @@ class DeltaModulator:
         return [m for m in self.module.modules() if isinstance(m, ChaosSSMCore)]
 
     def __enter__(self):
+        # Axis 3 (log_a_shift) is designed ⊥ Axis 1 (log_a adaptation). If the
+        # caller is adapting log_a AND shifting it, DeltaModulator will
+        # restore the pre-shift value on exit, wiping the adaptation. Caller
+        # must avoid this combination — enforced by the driver entry check in
+        # Task 8 as well. We assert here as a backstop.
+        if self.log_a_shift != 0.0 and getattr(self, "_adapt_set_hint", None) in (
+            "log_a", "log_a+delta_proj", "all",
+        ):
+            raise ValueError(
+                "DeltaModulator.log_a_shift is incompatible with adapting log_a "
+                "(log_a_shift reverts log_a on exit; Axis 3 is ⊥ Axis 1)."
+            )
         scale = self.delta_scale
         for core in self._find_cores():
             if scale != 1.0:
@@ -685,15 +887,29 @@ class LegalityController:
         self._adapted_chunks: set[int] = set()
 
     @staticmethod
-    def _chunk_hash(chunk: torch.Tensor) -> int:
-        # Hash based on token ids + chunk content to detect re-use
-        return int(chunk.detach().cpu().numpy().tobytes().__hash__())
+    def _chunk_hash(chunk: torch.Tensor) -> bytes:
+        # Stable hash across processes and PYTHONHASHSEED values. Python's
+        # builtin `hash(bytes)` is randomized per-process — fine for the
+        # in-run set, but we want reproducible diagnostics across launches.
+        import hashlib
+        return hashlib.blake2b(
+            chunk.detach().cpu().numpy().tobytes(), digest_size=8
+        ).digest()
 
     def score_chunk(self, chunk: torch.Tensor) -> float:
+        # Empty-CE guard: CE needs at least one target token, i.e. chunk length
+        # >= 2 after shifting. Callers must have already filtered these, but a
+        # silent NaN here would poison the stability gate.
+        if chunk.size(1) < 2:
+            raise ValueError(
+                f"score_chunk needs chunk length >= 2 for teacher-forcing CE; "
+                f"got shape {tuple(chunk.shape)}."
+            )
         h = self._chunk_hash(chunk)
         if self.leak_detection and h in self._adapted_chunks:
             raise LeakDetectedError(
-                f"Chunk hash {h} was adapt_on_chunk'd before score_chunk: Issue #1017 violation."
+                f"Chunk hash {h.hex()} was adapt_on_chunk'd before score_chunk: "
+                "Issue #1017 violation."
             )
         self.model.eval()
         with torch.no_grad():
@@ -727,7 +943,35 @@ class LegalityController:
         self._adapted_chunks.clear()
 ```
 
-**Step 4: Run** — 2 PASS.
+**Additional tests to add to `tests/test_eval_stream_legality.py`:**
+
+```python
+def test_empty_chunk_raises_valueerror():
+    m = _TinyLM()
+    controller = LegalityController(m, loss_fn=_loss)
+    with pytest.raises(ValueError):
+        controller.score_chunk(torch.randint(0, 32, (1, 1)))  # length < 2
+
+
+def test_cross_doc_re_adapt_same_bytes_is_ok_after_mark_new_epoch():
+    """Same chunk content appearing in two different docs is not a leak.
+    mark_new_epoch() clears tracking; re-adapting then re-scoring the same
+    bytes in the next doc must succeed without raising.
+    """
+    torch.manual_seed(0)
+    m = _TinyLM()
+    opt = torch.optim.SGD(m.parameters(), lr=0.01)
+    controller = LegalityController(m, loss_fn=_loss, leak_detection=True)
+
+    chunk = torch.randint(0, 32, (1, 16))
+    controller.adapt_on_chunk(chunk, optimizer=opt, steps=1)
+    controller.mark_new_epoch()
+    # Next doc: same bytes reappear, legitimate score-then-adapt order.
+    _ = controller.score_chunk(chunk)
+    controller.adapt_on_chunk(chunk, optimizer=opt, steps=1)  # must not raise
+```
+
+**Step 4: Run** — 4 PASS.
 
 **Step 5: Commit**
 
@@ -794,6 +1038,33 @@ def test_none_selection_is_empty():
     m = _tiny_ssm_lm()
     params = select_adapt_params(m, adapt_set="none")
     assert params == []
+
+
+def test_all_selection_covers_every_param():
+    m = _tiny_ssm_lm()
+    params = select_adapt_params(m, adapt_set="all")
+    expected = sum(p.numel() for p in m.parameters())
+    assert sum(p.numel() for p in params) == expected
+
+
+def test_embed_rows_seen_is_exact_match():
+    """Must match 'embed.weight' exactly — no collision with any hypothetical
+    embed_norm / embedding_* future sibling params.
+    """
+    m = _tiny_ssm_lm()
+    params = select_adapt_params(m, adapt_set="embed_rows_seen")
+    names = {n for n, p in m.named_parameters() if any(p is q for q in params)}
+    assert names == {"embed.weight"}
+
+
+def test_trainable_h0_pattern(tmp_path):
+    from chaoscontrol.eval_stream.persistence import attach_trainable_h0
+    m = _tiny_ssm_lm()
+    attach_trainable_h0(m)
+    params = select_adapt_params(m, adapt_set="trainable_h0")
+    names = {n for n, p in m.named_parameters() if any(p is q for q in params)}
+    assert len(names) == 2  # 2 layers
+    assert all("_trainable_h0" in n for n in names)
 ```
 
 **Step 2: Run** — FAIL.
@@ -808,26 +1079,43 @@ import torch.nn as nn
 from typing import Iterable
 
 
+# Pattern forms:
+#   "substr:X"    — match if X appears anywhere in the param's FQN
+#   "exact:X"     — match only if the FQN equals X exactly
+# (Plain strings in the list are treated as substr: for backward compatibility.)
 ADAPT_SET_PATTERNS: dict[str, list[str]] = {
     "none": [],
-    "log_a": ["log_a"],
-    "delta_proj": ["delta_proj"],
-    "log_a+delta_proj": ["log_a", "delta_proj"],
-    "B_side": ["in_proj", "select_proj"],
-    "C_side": ["out_proj", "gate_proj"],
-    "embed_rows_seen": ["embed"],  # sparse grad handled at opt step; param set is the whole table
-    "lm_head": ["lm_head"],
-    "lora_r8": ["lora_"],  # lora adapters named lora_A_<name> / lora_B_<name>; see Task 16
-    "all": ["*"],  # sentinel handled below
+    "log_a": ["substr:log_a"],
+    "delta_proj": ["substr:delta_proj"],
+    "log_a+delta_proj": ["substr:log_a", "substr:delta_proj"],
+    "B_side": ["substr:in_proj", "substr:select_proj"],
+    "C_side": ["substr:out_proj", "substr:gate_proj"],
+    # embed_rows_seen: exact match to avoid collisions with any future
+    # "embed_dim" / "embedding_norm" / etc. parameter names.
+    "embed_rows_seen": ["exact:embed.weight"],
+    "lm_head": ["substr:lm_head"],
+    "lora_r8": ["substr:lora_"],  # lora adapters named lora_A_<name> / lora_B_<name>
+    "trainable_h0": ["substr:_trainable_h0"],  # Axis 2 trainable h0, see Task 7
+    "all": ["*"],
 }
 
 
-def select_adapt_params(module: nn.Module, *, adapt_set: str) -> list[nn.Parameter]:
-    """Return the list of parameters that match the adapt_set filter.
+def _matches(name: str, patterns: list[str]) -> bool:
+    for pat in patterns:
+        if pat.startswith("exact:"):
+            if name == pat[len("exact:"):]:
+                return True
+        elif pat.startswith("substr:"):
+            if pat[len("substr:"):] in name:
+                return True
+        else:  # legacy plain string == substr
+            if pat in name:
+                return True
+    return False
 
-    Filter is by substring in the parameter's fully-qualified name. The `all`
-    sentinel returns every parameter.
-    """
+
+def select_adapt_params(module: nn.Module, *, adapt_set: str) -> list[nn.Parameter]:
+    """Return the list of parameters that match the adapt_set filter."""
     if adapt_set not in ADAPT_SET_PATTERNS:
         raise ValueError(f"unknown adapt_set: {adapt_set}")
     patterns = ADAPT_SET_PATTERNS[adapt_set]
@@ -838,14 +1126,14 @@ def select_adapt_params(module: nn.Module, *, adapt_set: str) -> list[nn.Paramet
     out: list[nn.Parameter] = []
     seen: set[int] = set()
     for name, p in module.named_parameters():
-        if any(pat in name for pat in patterns):
+        if _matches(name, patterns):
             if id(p) not in seen:
                 out.append(p)
                 seen.add(id(p))
     return out
 ```
 
-**Step 4: Run** — 4 PASS.
+**Step 4: Run** — 7 PASS.
 
 **Step 5: Commit**
 
@@ -858,12 +1146,14 @@ git commit -m "exp20(harness): param-group selector for Axis 1 adapt sets"
 
 ### Task 7: Persistence modes — state carry + trainable_h0
 
+**Depends on Task 3.5.** `StateManager.get_state()` values are only actually used by the model once `ChaosStudentLM.forward` accepts `initial_states`. Run Task 3.5's regression tests and confirm they pass before starting this task.
+
 **Files:**
 - Create: `src/chaoscontrol/eval_stream/persistence.py`
 - Create: `tests/test_eval_stream_persistence.py`
 - Modify: `src/chaoscontrol/eval_stream/ttt_runner.py` (add weight-snapshot helpers)
 
-**Context:** Axis 2 — at doc boundary, choose: reset state, carry state, carry weight deltas, trainable `h₀`, or compositions. State is a list of per-block tensors returned by the SSM's `.step()` method; `trainable_h0` is a learnable parameter we add to the model at harness setup.
+**Context:** Axis 2 — at doc boundary, choose: reset state, carry state, carry weight deltas, trainable `h₀`, or compositions. State is a list of per-block tensors threaded into `ChaosStudentLM.forward(..., initial_states=...)` (Task 3.5); `trainable_h0` is a learnable parameter we add to the model at harness setup.
 
 **Step 1: Write failing test**
 
@@ -909,6 +1199,36 @@ def test_trainable_h0_is_learnable():
     detach_trainable_h0(m)
     names = [n for n, _ in m.named_parameters()]
     assert not any("trainable_h0" in n for n in names)
+
+
+def test_detach_trainable_h0_clears_state_dict():
+    """After detach, state_dict must not contain any _trainable_h0 keys —
+    otherwise saving/loading checkpoints leaks eval-only state.
+    """
+    m = _tiny_ssm_lm()
+    attach_trainable_h0(m)
+    assert any("_trainable_h0" in k for k in m.state_dict().keys())
+    detach_trainable_h0(m)
+    assert not any("_trainable_h0" in k for k in m.state_dict().keys())
+
+
+def test_trainable_h0_receives_gradient():
+    """Pre-req for Task 3.5 integration: with h0 threaded through
+    initial_states, loss.backward() must accumulate grad on _trainable_h0.
+    """
+    m = _tiny_ssm_lm()
+    attach_trainable_h0(m)
+    ids = torch.randint(0, 32, (1, 16))
+    sm = StateManager(m, persistence_mode="trainable_h0")
+    sm.start_doc(doc_id=0, batch_size=1)
+    out = m(ids, initial_states=sm.get_state())
+    loss = out["logits"].sum()
+    loss.backward()
+    for core in m.modules():
+        from chaoscontrol.core import ChaosSSMCore
+        if isinstance(core, ChaosSSMCore):
+            assert core._trainable_h0.grad is not None
+            assert core._trainable_h0.grad.abs().sum() > 0
 ```
 
 **Step 2: Run** — FAIL.
@@ -953,10 +1273,15 @@ class StateManager:
                 self._state = [torch.zeros(batch_size, c.dim, device=device, dtype=dtype) for c in self._cores]
             # else keep prior state
         elif self.mode == "trainable_h0":
-            self._state = [c._trainable_h0.expand(batch_size, -1).clone() for c in self._cores]
+            # `.clone()` on a view of a Parameter breaks autograd flow back to
+            # the Parameter — we want gradients on _trainable_h0 to accumulate,
+            # so keep the graph edge intact. `.expand()` is a view and can be
+            # fed to the model directly (task 3.5 initial_states kwarg takes
+            # ownership of batching).
+            self._state = [c._trainable_h0.expand(batch_size, -1) for c in self._cores]
         elif self.mode == "trainable_h0+carry":
             if self._doc_idx == 0:
-                self._state = [c._trainable_h0.expand(batch_size, -1).clone() for c in self._cores]
+                self._state = [c._trainable_h0.expand(batch_size, -1) for c in self._cores]
             # else keep prior state
         else:
             raise ValueError(f"unknown persistence_mode: {self.mode}")
@@ -969,21 +1294,34 @@ class StateManager:
 
 
 def attach_trainable_h0(model: nn.Module) -> None:
-    """Add a trainable h0 vector to each ChaosSSMCore. Eval-time only."""
+    """Add a trainable h0 vector to each ChaosSSMCore. Eval-time only.
+
+    Placed on the core's own device+dtype so subsequent `initial_states`
+    threading doesn't trigger implicit copies. `nn.Parameter(...)` is registered
+    via attribute assignment because ChaosSSMCore inherits from nn.Module.
+    """
     for core in model.modules():
         if isinstance(core, ChaosSSMCore):
             if not hasattr(core, "_trainable_h0"):
-                core._trainable_h0 = nn.Parameter(torch.zeros(1, core.dim))
+                # Use an existing core parameter to pin device+dtype.
+                ref = next(core.parameters())
+                core._trainable_h0 = nn.Parameter(
+                    torch.zeros(1, core.dim, device=ref.device, dtype=ref.dtype)
+                )
 
 
 def detach_trainable_h0(model: nn.Module) -> None:
+    """Remove the _trainable_h0 parameter from every core. After this call,
+    `model.state_dict()` must contain no `_trainable_h0` keys.
+    """
     for core in model.modules():
         if isinstance(core, ChaosSSMCore):
             if hasattr(core, "_trainable_h0"):
-                delattr(core, "_trainable_h0")
+                # Attribute delete also removes from _parameters.
+                del core._trainable_h0
 ```
 
-**Step 4: Run** — 3 PASS.
+**Step 4: Run** — 5 PASS.
 
 **Step 5: Commit**
 
@@ -1015,18 +1353,29 @@ import torch
 
 
 def test_driver_runs_tiny_stream(tmp_path):
-    # Tiny synthetic eval shard
-    toks = np.concatenate([np.random.randint(1, 32, size=50).astype(np.int32),
-                           np.array([0], dtype=np.int32)] * 5)
-    shard = tmp_path / "eval.bin"
-    toks.tofile(shard)
+    # Tiny SP model + JSONL doc file — matches the DocStreamer retrofit
+    # (JSONL + on-the-fly SP tokenization).
+    import sentencepiece as spm
+    corpus = tmp_path / "corpus.txt"
+    corpus.write_text("\n".join(["alpha beta gamma", "delta epsilon"] * 50))
+    sp_prefix = tmp_path / "sp"
+    spm.SentencePieceTrainer.Train(
+        input=str(corpus), model_prefix=str(sp_prefix),
+        vocab_size=64, character_coverage=1.0, model_type="bpe",
+    )
+    sp_model_path = f"{sp_prefix}.model"
 
-    # Tiny checkpoint
+    jsonl = tmp_path / "docs.jsonl"
+    with jsonl.open("w") as fh:
+        for t in ["hello world this is a doc", "another small doc", "and a third"]:
+            fh.write(json.dumps({"text": t}) + "\n")
+
+    # Tiny checkpoint — vocab_size must match the SP model's piece count.
     from chaoscontrol.model import ChaosStudentLM
-    m = ChaosStudentLM(vocab_size=32, dim=16, num_layers=2, block_type="ssm", a_mode="diag")
+    m = ChaosStudentLM(vocab_size=64, dim=16, num_layers=2, block_type="ssm", a_mode="diag")
     ckpt_path = tmp_path / "ckpt.pt"
     torch.save({"model": m.state_dict(),
-                "config": {"vocab_size": 32, "dim": 16, "num_layers": 2,
+                "config": {"vocab_size": 64, "dim": 16, "num_layers": 2,
                            "block_type": "ssm", "a_mode": "diag"}}, ckpt_path)
 
     out_path = tmp_path / "metrics.jsonl"
@@ -1034,8 +1383,9 @@ def test_driver_runs_tiny_stream(tmp_path):
     cfg_path.write_text(json.dumps({
         "adapt_set": "none", "persistence_mode": "reset",
         "chunk_size": 32, "steps_per_chunk": 0,
-        "max_docs": 3, "eos_token": 0, "seed": 0,
-        "shard_paths": [str(shard)],
+        "max_docs": 3, "seed": 0,
+        "jsonl_paths": [str(jsonl)],
+        "sp_model_path": sp_model_path,
         "checkpoint_path": str(ckpt_path),
         "output_path": str(out_path),
     }))
@@ -1060,6 +1410,7 @@ def test_driver_runs_tiny_stream(tmp_path):
 from __future__ import annotations
 import argparse
 import json
+import os
 import time
 from pathlib import Path
 
@@ -1070,7 +1421,7 @@ from chaoscontrol.eval_stream.types import RunConfig
 from chaoscontrol.eval_stream.doc_stream import DocStreamer
 from chaoscontrol.eval_stream.legality import LegalityController
 from chaoscontrol.eval_stream.persistence import StateManager, attach_trainable_h0
-from chaoscontrol.eval_stream.ttt_runner import select_adapt_params
+from chaoscontrol.eval_stream.ttt_runner import select_adapt_params, ADAPT_SET_PATTERNS
 from chaoscontrol.eval_stream.delta_mod import DeltaModulator
 from chaoscontrol.eval_stream.metrics import MetricsCollector
 from chaoscontrol.evaluation import compute_bpb
@@ -1083,24 +1434,30 @@ def _ce(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
 
 def _build_model(ckpt_path: Path) -> tuple[torch.nn.Module, dict]:
     from chaoscontrol.model import ChaosStudentLM
+    # weights_only=False because the checkpoint payload is a dict with
+    # {model, config, ...}, not a pure tensor. We trust our own checkpoints.
     blob = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     cfg = blob["config"]
     model = ChaosStudentLM(**cfg)
-    model.load_state_dict(blob["model"], strict=False)
+    # strict=True: any unexpected / missing key is a checkpoint mismatch we
+    # want to surface, not paper over. attach_trainable_h0 runs AFTER this
+    # (see run() below) so eval-only params never need a loose load.
+    model.load_state_dict(blob["model"], strict=True)
     return model, cfg
 
 
-def _build_optimizer(params, lr: float, persistent_moments: bool):
-    # Use Muon for non-scalar params; fall back to AdamW for scalars (log_a)
+def _build_optimizer(params, lr: float):
+    """Single Muon optimizer. Muon handles 1D/0D params internally via its
+    decoupled AdamW path (see src/chaoscontrol/optim/muon.py:145), so a
+    prior "Muon for 2D + AdamW for scalars" split produced: (1) double-
+    backward per chunk, (2) stale-grad bleed between optimizer steps, (3)
+    catastrophic AdamW LR when Muon's LR (e.g. 0.064) was passed through
+    unchanged. Collapsed to a single optimizer.
+    """
     from chaoscontrol.optim.muon import Muon
-    non_scalar = [p for p in params if p.ndim >= 2]
-    scalar = [p for p in params if p.ndim < 2]
-    opt_groups = []
-    if non_scalar:
-        opt_groups.append(Muon(non_scalar, lr=lr))
-    if scalar:
-        opt_groups.append(torch.optim.AdamW(scalar, lr=lr))
-    return opt_groups
+    if not params:
+        return []
+    return [Muon(params, lr=lr)]
 
 
 def _iter_chunks(tokens: list[int], chunk_size: int):
@@ -1111,26 +1468,53 @@ def _iter_chunks(tokens: list[int], chunk_size: int):
         yield tokens[i:i + chunk_size]
 
 
-def run(cfg: RunConfig, shard_paths: list[str], eos_token: int) -> None:
+def run(cfg: RunConfig, jsonl_paths: list[str], sp_model_path: str) -> None:
+    # Entry assertion: Axis 1 adapting log_a is incompatible with Axis 3
+    # log_a_shift (DeltaModulator reverts log_a on exit, wiping the
+    # adaptation). Enforced in DeltaModulator.__enter__ as well; caught here
+    # for an earlier, clearer error.
+    patterns = ADAPT_SET_PATTERNS.get(cfg.adapt_set, [])
+    adapts_log_a = any("log_a" in p for p in patterns) or patterns == ["*"]
+    if adapts_log_a and cfg.log_a_shift != 0.0:
+        raise ValueError(
+            f"adapt_set={cfg.adapt_set!r} adapts log_a but log_a_shift="
+            f"{cfg.log_a_shift} is nonzero; Axis 1 × Axis 3 overlap on log_a."
+        )
+
+    # Seed-parallel launches may share a node; pin this process to its local
+    # GPU before any CUDA work so rank 0 doesn't collide with rank N.
+    if torch.cuda.is_available():
+        torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", 0)))
+
     torch.manual_seed(cfg.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(cfg.seed)
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model, _ = _build_model(Path(cfg.checkpoint_path))
     model.to(device)
 
+    # attach_trainable_h0 AFTER load_state_dict so strict=True works on the
+    # checkpoint (which has no h0 keys) and the newly-created h0 params live
+    # on the model's device+dtype from birth (see persistence.attach_trainable_h0).
     if "trainable_h0" in cfg.persistence_mode:
         attach_trainable_h0(model)
 
     adapt_params = select_adapt_params(model, adapt_set=cfg.adapt_set)
-    optimizers = _build_optimizer(adapt_params, cfg.eval_lr, cfg.persistent_muon_moments) \
-        if adapt_params else []
+    optimizers = _build_optimizer(adapt_params, cfg.eval_lr) if adapt_params else []
 
-    streamer = DocStreamer(shard_paths=[Path(p) for p in shard_paths],
-                           eos_token=eos_token, max_docs=cfg.max_docs)
+    streamer = DocStreamer(
+        jsonl_paths=[Path(p) for p in jsonl_paths],
+        sp_model_path=Path(sp_model_path),
+        max_docs=cfg.max_docs,
+    )
     state_mgr = StateManager(model, persistence_mode=cfg.persistence_mode)
     controller = LegalityController(model, loss_fn=_ce)
     collector = MetricsCollector(output_path=Path(cfg.output_path))
 
-    with DeltaModulator(model, delta_scale=cfg.delta_scale, log_a_shift=cfg.log_a_shift):
+    with DeltaModulator(model, delta_scale=cfg.delta_scale,
+                        log_a_shift=cfg.log_a_shift,
+                        adapt_set_hint=cfg.adapt_set):
         run_start = time.monotonic()
         for doc in streamer:
             if time.monotonic() - run_start > cfg.budget_seconds:
@@ -1161,13 +1545,14 @@ def run(cfg: RunConfig, shard_paths: list[str], eos_token: int) -> None:
                 doc_tokens += chunk.size(1) - 1
                 chunk_count += 1
 
-                # Adapt
-                if adapt_params and cfg.steps_per_chunk > 0:
-                    for opt in optimizers:
-                        loss_after = controller.adapt_on_chunk(
-                            chunk, optimizer=opt, steps=cfg.steps_per_chunk,
-                        )
-                    loss_after_sum += loss_after or 0.0
+                # Adapt — single Muon optimizer; `optimizers` is at most len==1.
+                if optimizers and cfg.steps_per_chunk > 0:
+                    loss_after = controller.adapt_on_chunk(
+                        chunk, optimizer=optimizers[0], steps=cfg.steps_per_chunk,
+                    )
+                    # Using `or 0.0` would drop legitimate 0.0 losses;
+                    # be explicit about the None case.
+                    loss_after_sum += 0.0 if loss_after is None else loss_after
                     step_count += cfg.steps_per_chunk
 
             wall_ms = (time.monotonic() - t0) * 1000.0
@@ -1189,10 +1574,10 @@ def main():
     ap.add_argument("--config", required=True)
     args = ap.parse_args()
     raw = json.loads(Path(args.config).read_text())
-    shard_paths = raw.pop("shard_paths")
-    eos_token = raw.pop("eos_token", 0)
+    jsonl_paths = raw.pop("jsonl_paths")
+    sp_model_path = raw.pop("sp_model_path")
     cfg = RunConfig(**{k: v for k, v in raw.items() if k in RunConfig.__dataclass_fields__})
-    run(cfg, shard_paths=shard_paths, eos_token=eos_token)
+    run(cfg, jsonl_paths=jsonl_paths, sp_model_path=sp_model_path)
 
 
 if __name__ == "__main__":
@@ -1232,25 +1617,99 @@ from chaoscontrol.eval_stream.legality import LegalityController
 
 def test_legality_controller_matches_naive_forward(tmp_path):
     torch.manual_seed(0)
-    m = ChaosStudentLM(vocab_size=32, dim=16, num_layers=2, block_type="ssm", a_mode="diag")
-    m.eval()
-    tokens = torch.randint(1, 32, (1, 64))
+    # CPU-pin the test: bf16/tf32 on GPU exceeds the 1e-4 tolerance; the
+    # bit-exact guarantee is about the harness composition, not the dtype path.
+    device = torch.device("cpu")
+    m = ChaosStudentLM(
+        vocab_size=32, dim=16, num_layers=2, block_type="ssm", a_mode="diag",
+    ).to(device)
+    m.eval()  # must be in eval for deterministic comparison under block_type="attention" too
+    tokens = torch.randint(1, 32, (1, 64), device=device)
 
-    # Naive forward-only
+    # Naive forward-only — call .eval() first so the comparison is invariant
+    # under blocks that include dropout (attention variant).
     with torch.no_grad():
         out = m(tokens)
         logits = out["logits"] if isinstance(out, dict) else out
-        naive = F.cross_entropy(logits[:, :-1].reshape(-1, logits.size(-1)),
-                                tokens[:, 1:].reshape(-1), reduction="sum").item()
+        naive = F.cross_entropy(
+            logits[:, :-1].reshape(-1, logits.size(-1)).float(),
+            tokens[:, 1:].reshape(-1), reduction="sum",
+        ).item()
 
     controller = LegalityController(
         m, loss_fn=lambda lg, tg: F.cross_entropy(
-            lg.reshape(-1, lg.size(-1)), tg.reshape(-1), reduction="sum"
+            lg.reshape(-1, lg.size(-1)).float(), tg.reshape(-1), reduction="sum"
         ),
     )
     harness_score = controller.score_chunk(tokens)
-    # Float-noise tolerance: bf16 path has ~1e-2 relative error, but on fp32 model this should be tight
     assert abs(harness_score - naive) < 1e-4
+
+
+def test_chunked_carry_state_equals_whole_doc(tmp_path):
+    """Canary for the Task 3.5 state-plumbing invariant.
+
+    Running the driver with chunk_size=32 on a 64-token doc at
+    persistence_mode=carry_state must match a single whole-doc forward
+    to within float noise. Before Task 3.5 lands (state kwarg threaded
+    into ChaosStudentLM.forward), carry_state is a silent no-op and
+    this test FAILS. After Task 3.5, it PASSES.
+
+    This is the regression gate that would have caught S2 in-flight.
+    """
+    import json
+    import subprocess
+    import sys
+
+    import sentencepiece as spm
+
+    # Tiny SP model
+    corpus = tmp_path / "corpus.txt"
+    corpus.write_text("\n".join(["alpha beta gamma", "delta epsilon zeta"] * 50))
+    sp_prefix = tmp_path / "sp"
+    spm.SentencePieceTrainer.Train(
+        input=str(corpus), model_prefix=str(sp_prefix),
+        vocab_size=64, character_coverage=1.0, model_type="bpe",
+    )
+
+    # JSONL with one doc long enough to produce >= 64 SP tokens
+    jsonl = tmp_path / "docs.jsonl"
+    with jsonl.open("w") as fh:
+        text = " ".join(["alpha beta gamma delta epsilon zeta"] * 12)
+        fh.write(json.dumps({"text": text}) + "\n")
+
+    # Tiny checkpoint
+    m = ChaosStudentLM(vocab_size=64, dim=16, num_layers=2, block_type="ssm", a_mode="diag")
+    ckpt = tmp_path / "ckpt.pt"
+    torch.save({"model": m.state_dict(),
+                "config": {"vocab_size": 64, "dim": 16, "num_layers": 2,
+                           "block_type": "ssm", "a_mode": "diag"}}, ckpt)
+
+    def _run(chunk_size: int, persistence: str, out_name: str) -> float:
+        cfg_path = tmp_path / f"cfg_{out_name}.json"
+        out_path = tmp_path / f"{out_name}.jsonl"
+        cfg_path.write_text(json.dumps({
+            "adapt_set": "none", "persistence_mode": persistence,
+            "chunk_size": chunk_size, "steps_per_chunk": 0,
+            "max_docs": 1, "seed": 0,
+            "jsonl_paths": [str(jsonl)],
+            "sp_model_path": f"{sp_prefix}.model",
+            "checkpoint_path": str(ckpt),
+            "output_path": str(out_path),
+        }))
+        result = subprocess.run(
+            [sys.executable, "scripts/run_exp20_eval.py", "--config", str(cfg_path)],
+            capture_output=True, text=True,
+        )
+        assert result.returncode == 0, result.stderr
+        rec = json.loads(out_path.read_text().strip().splitlines()[0])
+        # loss_before is mean-per-chunk sum-CE; doc-level summed CE = loss_before * chunk_count
+        return rec["bpb"]
+
+    bpb_whole = _run(chunk_size=-1, persistence="reset", out_name="whole")
+    bpb_carry = _run(chunk_size=32, persistence="carry_state", out_name="carry")
+    # They should be close; the looser tolerance here reflects float noise
+    # across chunked summation order vs whole-doc summation.
+    assert abs(bpb_whole - bpb_carry) < 1e-3, (bpb_whole, bpb_carry)
 ```
 
 **Step 2: Run** — expected FAIL if anything is off.
@@ -1270,32 +1729,62 @@ git commit -m "exp20(harness): Phase A smoke — harness bpb matches forward-onl
 
 ### Task 10: Harness wrap-up — pod smoke against Exp 18 Test 4b checkpoint
 
-**Files:** none (operational verification)
+**Files:** `configs/exp20/smoke_test4b.json` + `docs/runs/2026-04-XX-exp20-harness-smoke.md`.
 
-**Step 1:** Upload the harness-only branch to the pod. Memory rule: only committed code runs on pods.
+**Step 0: Pre-push cleanliness check** — `git status` must show no untracked or modified files before push. Memory rule: "only committed code on pods."
 
 ```bash
+git status
+# Expected: "working tree clean"
 git push origin exp20-ssm-native-ttt
 ```
 
-**Step 2:** On the pod, check out the branch and run the Exp 18 Test 4b checkpoint through the harness with `adapt_set=none, persistence=reset` on 1000 eval docs.
+**Step 1: Write the smoke config.** Create `configs/exp20/smoke_test4b.json` with the explicit contents below. `adapt_set=none, persistence_mode=reset` means this is a pure forward-only run — it exercises the full harness pipeline (DocStreamer → LegalityController → MetricsCollector) against the Exp 18 Test 4b checkpoint on a held-out eval slice.
+
+```json
+{
+  "adapt_set": "none",
+  "persistence_mode": "reset",
+  "chunk_size": -1,
+  "steps_per_chunk": 0,
+  "delta_scale": 1.0,
+  "log_a_shift": 0.0,
+  "max_docs": 1000,
+  "seed": 0,
+  "jsonl_paths": ["/volume/fineweb/eval_docs_selected.jsonl"],
+  "sp_model_path": "/volume/tokenizers/sp16384.model",
+  "checkpoint_path": "/volume/ckpts/exp18_test4b_final.pt",
+  "output_path": "/volume/exp20/smoke_test4b_metrics.jsonl"
+}
+```
+
+Paths above are placeholders — update to the actual pod paths before running. Commit the config with real paths.
+
+**Step 2: Rerun the Test 4b baseline eval path on the same 1000 docs.** The published Test 4b bpb number used a different chunking / state-reset contract from our harness, so an absolute-bpb comparison is not apples-to-apples. The apples-to-apples comparison is:
+
+1. Rerun Test 4b's own eval code on the same 1000 docs (same JSONL slice).
+2. Run the Exp 20 harness smoke config above on the same 1000 docs.
+3. Compare bpb from (1) and (2).
 
 ```bash
+# On pod:
+python scripts/eval_test4b_baseline.py --docs /volume/fineweb/eval_docs_selected.jsonl --max-docs 1000 \
+    --ckpt /volume/ckpts/exp18_test4b_final.pt --out /volume/exp20/test4b_rerun.jsonl
 python scripts/run_exp20_eval.py --config configs/exp20/smoke_test4b.json
 ```
 
-**Step 3:** Verify the bpb matches the Test 4b reported bpb to ~0.01.
+**Step 3: Acceptance gate.** The two bpb numbers must agree to within 0.01. If they don't, the harness has a bug — the reference rerun is ground truth.
 
-**Step 4:** Record findings in `docs/runs/2026-04-18-exp20-harness-smoke.md` (or whatever the day is — actual date when running).
+**Step 4: Record findings** in `docs/runs/2026-04-XX-exp20-harness-smoke.md` (actual date). Include: both bpb numbers, delta, wall-time, any stability gate activity.
 
-**Step 5:** Commit the run log.
+**Step 5: Commit the run log.**
 
 ```bash
 git add docs/runs/*.md configs/exp20/smoke_test4b.json
-git commit -m "exp20(harness): Phase A pod smoke vs Test 4b baseline; bpb matches within 0.01"
+git commit -m "exp20(harness): Phase A pod smoke vs Test 4b re-run baseline; bpb matches within 0.01"
 ```
 
-**GATE:** if bpb drift exceeds 0.05, stop and debug before any Phase B-G run. A broken harness invalidates all downstream.
+**GATE:** if bpb drift between Test 4b rerun and Exp 20 smoke exceeds 0.05, stop and debug before any Phase B-G run. A broken harness invalidates all downstream.
 
 ---
 
@@ -1472,9 +1961,10 @@ Deliver to the submission-repo maintainer via the agreed channel. Mark Exp 20 co
 ## Phase I → II Gate
 
 **Do not start Phase II (Task 11) until:**
-1. All Task 9 smoke tests pass.
-2. Task 10 pod-smoke bpb matches Exp 18 Test 4b within 0.01 bpb.
+1. All Task 9 smoke tests pass — including the chunked-carry-state canary (`test_chunked_carry_state_equals_whole_doc`).
+2. Task 10 pod-smoke bpb matches the Test 4b rerun within 0.01 bpb (apples-to-apples — not the published Test 4b headline).
 3. Leak-detection contract test (Task 5) passes on the pod with the real model, not just the tiny test model.
+4. Task 3.5 `tests/test_initial_states_regression.py` passes (state plumbing works end-to-end).
 
 **If any gate fails, the harness is the problem, not the ablation.** Do not proceed.
 
