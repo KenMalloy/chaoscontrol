@@ -103,18 +103,37 @@ if _C is not None:  # pragma: no cover — only on pods with the extension
         return torch.empty_like(decay), torch.empty_like(grad_state)
 
 
+_KERNEL_DTYPE_COMBOS: frozenset[tuple[torch.dtype, torch.dtype]] = frozenset({
+    (torch.bfloat16, torch.bfloat16),
+    (torch.bfloat16, torch.float16),
+    (torch.float16, torch.float16),
+    (torch.float32, torch.float32),
+    # Autocast bf16/fp16 production path: torch.exp(-delta * a_base)
+    # upcasts decay to fp32 while update stays in the autocast dtype.
+    (torch.float32, torch.bfloat16),
+    (torch.float32, torch.float16),
+})
+
+
 def _is_kernel_eligible(decay: torch.Tensor, update: torch.Tensor) -> bool:
     """Return True when the CUDA kernel can actually run for these tensors.
 
-    False on dev macs (no ``_C`` built) and on CPU tensors (pre-warm
-    probes, DDP test fixtures). The autograd.Function must route those
-    through the Python fallback instead of calling the kernel and
-    raising a TORCH_CHECK — we don't want the pod-probe path to tear
-    down the global backend cache with a bogus "ssm_scan broke" error.
+    False on dev macs (no ``_C`` built), on CPU tensors (pre-warm
+    probes, DDP test fixtures), and on any (decay, update) dtype tuple
+    outside the kernel's dispatch table. The autograd.Function routes
+    ineligible inputs through the fp32 Python fallback instead of
+    calling the kernel and raising a TORCH_CHECK — we don't want a
+    pod-probe path or an unusual dtype combo to tear down the global
+    backend cache with a bogus "ssm_scan broke" error.
+
+    The dtype whitelist mirrors ``_KERNEL_DTYPE_COMBOS`` / the dispatcher
+    in ``ssm_scan_fwd.cu`` / the binding whitelist — keep in lockstep.
     """
     if _C is None:
         return False
     if not decay.is_cuda or not update.is_cuda:
+        return False
+    if (decay.dtype, update.dtype) not in _KERNEL_DTYPE_COMBOS:
         return False
     return True
 
