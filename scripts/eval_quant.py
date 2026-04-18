@@ -69,7 +69,7 @@ def _load_checkpoint(
     """
     from chaoscontrol.model import ChaosStudentLM
 
-    blob = torch.load(ckpt_path, map_location=device, weights_only=False)
+    blob = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     cfg: dict[str, Any] = blob["config"]
     model = ChaosStudentLM(**cfg)
     model.load_state_dict(blob["model"], strict=True)
@@ -95,6 +95,7 @@ def _iter_chunks(tokens: list[int], chunk_size: int):
 def _eval_bpb(
     model: torch.nn.Module,
     *,
+    label: str,
     jsonl_paths: list[Path],
     sp_model_path: Path,
     budget_seconds: float,
@@ -108,6 +109,11 @@ def _eval_bpb(
     and threads through chunks within the same doc via ``final_states``. This
     matches the score-only (no-TTT) path — LegalityController-free because
     this script only measures artifact quality, not eval-time adaptation.
+
+    ``label`` identifies the pass (``"bf16"`` or ``"int6"``) in the error
+    message if the stream yields zero scorable docs/bytes — otherwise a
+    mis-pointed ``--eval-jsonl`` or too-small ``--budget-seconds`` silently
+    returns ``bpb=0.0`` and the pipeline happily reports a green delta.
 
     Returns::
 
@@ -152,8 +158,10 @@ def _eval_bpb(
                 logits = out["logits"]
                 # reduction="sum" so we accumulate total nats across the
                 # corpus; compute_bpb divides by raw byte count at the end.
+                # No .float() upcast — matches run_exp20_eval.py:33-35 exactly
+                # so bpb_bf16 here tracks what the downstream eval harness sees.
                 ce_sum = F.cross_entropy(
-                    logits.float().reshape(-1, logits.size(-1)),
+                    logits.reshape(-1, logits.size(-1)),
                     targets.reshape(-1),
                     reduction="sum",
                 )
@@ -165,7 +173,18 @@ def _eval_bpb(
             docs_scored += 1
 
     wall_seconds = time.monotonic() - t_start
-    bpb = compute_bpb(total_ce_nats, total_raw_bytes) if total_raw_bytes > 0 else 0.0
+    # Fail loud if the stream yielded nothing scorable — a mis-typed
+    # ``--eval-jsonl`` or a too-small ``--budget-seconds`` otherwise sneaks
+    # through as ``bpb=0.0`` and the calibration + roundtrip still runs,
+    # producing a green-looking result JSON with no error signal.
+    if docs_scored == 0 or total_raw_bytes == 0:
+        raise RuntimeError(
+            f"_eval_bpb pass '{label}' scored zero docs/bytes "
+            f"(docs_scored={docs_scored}, raw_bytes={total_raw_bytes}) "
+            f"over jsonl_paths={[str(p) for p in jsonl_paths]}; "
+            "check --eval-jsonl and --budget-seconds."
+        )
+    bpb = compute_bpb(total_ce_nats, total_raw_bytes)
     return {
         "bpb": float(bpb),
         "docs_scored": int(docs_scored),
@@ -370,6 +389,7 @@ def main(argv: list[str] | None = None) -> int:
     # --- Step 2: Eval pass 1 — bf16 ---
     bf16_metrics = _eval_bpb(
         bf16_model,
+        label="bf16",
         jsonl_paths=list(args.eval_jsonl),
         sp_model_path=args.sp_model_path,
         budget_seconds=args.budget_seconds,
@@ -417,15 +437,26 @@ def main(argv: list[str] | None = None) -> int:
     # easy to miss that a new DocStreamer instance is safer than trying
     # to "reset" a mid-iteration one (which the class doesn't support;
     # see doc_stream.py docstring).
+    # Cap pass 2 at pass 1's doc count so delta_bpb compares the SAME slice of
+    # the eval stream. ``budget_seconds`` stays as a safety cap — if int6
+    # inference is somehow slower, the assertion below catches the truncation.
     int6_metrics = _eval_bpb(
         int6_model,
+        label="int6",
         jsonl_paths=list(args.eval_jsonl),
         sp_model_path=args.sp_model_path,
         budget_seconds=args.budget_seconds,
         chunk_size=args.chunk_size,
         device=device,
-        max_docs=args.max_docs,
+        max_docs=min(args.max_docs, bf16_metrics["docs_scored"]),
     )
+    if int6_metrics["docs_scored"] != bf16_metrics["docs_scored"]:
+        raise RuntimeError(
+            "eval pass docs_scored mismatch: "
+            f"bf16={bf16_metrics['docs_scored']} int6={int6_metrics['docs_scored']}. "
+            "Pass 2 truncated before matching pass 1 — likely budget_seconds "
+            "was binding on int6; raise --budget-seconds and retry."
+        )
 
     # --- Step 8: Write result JSON ---
     # Parameter Golf's 16 MB budget is decimal (10^6 bytes), not binary
