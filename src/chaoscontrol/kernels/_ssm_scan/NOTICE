@@ -1,0 +1,39 @@
+Notices for chaoscontrol/kernels/_ssm_scan
+===========================================
+
+Upstream projects (algorithmic reference only — no code copied)
+---------------------------------------------------------------
+
+1. Flash Linear Attention (FLA), https://github.com/sustcsonglin/flash-linear-attention,
+   licensed under the MIT License. The recurrence we compute —
+   ``state[t] = decay[t] * state[t-1] + update[t]`` — is mathematically
+   identical to HGRN's ``h[t] = exp(g[t]) * h[t-1] + x[t]`` with
+   ``g = log(decay)``. We read ``fla/ops/hgrn/fused_recurrent.py`` for the
+   overall structure (per-channel tiling, T-chunk loop) but wrote a fresh
+   CUDA C++ kernel — FLA's reference is Triton, and we own the stack here.
+
+2. Mamba (state-spaces), https://github.com/state-spaces/mamba, licensed
+   under the Apache License, Version 2.0. A copy of that license text is
+   preserved in ``LICENSE_UPSTREAM`` as required by §4(a) for any derivative
+   work. We read ``csrc/selective_scan/selective_scan_fwd_kernel.cuh`` for
+   the block-tile / CUB BlockScan idiom, but:
+     * Mamba's math is selective (per-timestep delta + B/C projections);
+       ours is plain per-channel diagonal scan.
+     * Our current shipping kernel uses the naive per-thread serial loop
+       layout, NOT the BlockScan chunk carry. The Mamba-style approach was
+       evaluated as an optimization path and parked when the naive kernel
+       already beat the torch.compile baseline at our submission shape
+       (B=1024, T=512, D=256).
+
+Scope of derivation
+-------------------
+No upstream source files were copied or translated line-for-line. The
+design of this extension's public API, pybind11 bindings, build hook,
+CUDA kernel, and Python wrapper is first-party. Both upstream projects
+are acknowledged for informing the approach.
+
+If we later port the Mamba-style chunked BlockScan kernel and it crosses
+"informed by" into "derived from" (copied kernel structure, shared lookup
+tables, ported device functions), we will add the upstream copyright
+header to the affected file alongside an explicit "Modifications:" note
+per Apache 2.0 §4(b).

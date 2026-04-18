@@ -1,5 +1,5 @@
 """Setuptools entry point — exists purely so ``pip install -e .`` can build
-the cuBLASLt fp8 C++ extension alongside the pure-Python package defined
+our in-tree C++/CUDA extensions alongside the pure-Python package defined
 in ``pyproject.toml``.
 
 Metadata (name, version, dependencies) lives in ``pyproject.toml`` and is
@@ -7,27 +7,66 @@ intentionally NOT duplicated here. Setuptools merges the two: fields from
 ``pyproject.toml``'s ``[project]`` table win, and this file only adds
 ``ext_modules`` + ``cmdclass``.
 
-If the cuBLASLt extension cannot be built (dev mac without CUDA, missing
-nvidia-cu13 headers, etc.) ``build_ext_modules()`` returns an empty list
-and the install proceeds as pure-Python. The kernel module's
-``__init__.py`` handles the missing-extension case at call time with a
-clear ImportError.
+Extensions built here (concatenated in the order listed):
+  * ``chaoscontrol.kernels._cublaslt._C`` — bespoke cuBLASLt fp8 matmul
+    (build hook at ``src/chaoscontrol/kernels/_cublaslt/setup_ext.py``).
+  * ``chaoscontrol.kernels._ssm_scan._C`` — diag SSM scan kernel
+    (build hook at ``src/chaoscontrol/kernels/_ssm_scan/setup_ext.py``).
+
+If an extension's toolchain prerequisites aren't met (dev mac without
+CUDA, missing nvidia-cu13 headers, missing nvcc, etc.) its
+``build_ext_modules()`` returns an empty list and the install proceeds
+without that extension. Each kernel module's ``__init__.py`` handles
+the missing-extension case at call time with a clear ImportError.
 """
 from __future__ import annotations
 
+import importlib
+import importlib.util
 import sys
 from pathlib import Path
 
 from setuptools import setup
 
-# Make the in-tree kernel's setup_ext importable without installing
-# anything first (classic chicken-and-egg for editable installs).
-_KERNEL_DIR = Path(__file__).resolve().parent / "src" / "chaoscontrol" / "kernels" / "_cublaslt"
-sys.path.insert(0, str(_KERNEL_DIR))
+_KERNELS_DIR = Path(__file__).resolve().parent / "src" / "chaoscontrol" / "kernels"
 
-from setup_ext import build_ext_modules, cmdclass_with_build_ext  # noqa: E402
+
+def _load_build_hook(name: str):
+    """Load ``kernels/<name>/setup_ext.py`` as an anonymous module.
+
+    The two ``setup_ext.py`` modules share identical names. A plain
+    ``sys.path.insert`` trick only loads whichever we add first, so we
+    import each under a private alias with ``importlib``.
+    """
+    path = _KERNELS_DIR / name / "setup_ext.py"
+    spec = importlib.util.spec_from_file_location(
+        f"_chaoscontrol_build_hook_{name}", path
+    )
+    assert spec is not None and spec.loader is not None, (
+        f"failed to locate build hook at {path}"
+    )
+    module = importlib.util.module_from_spec(spec)
+    # Register so relative imports inside the hook (none today, but
+    # defensive) resolve cleanly.
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+_cublaslt_hook = _load_build_hook("_cublaslt")
+_ssm_scan_hook = _load_build_hook("_ssm_scan")
+
+_ext_modules = (
+    _cublaslt_hook.build_ext_modules()
+    + _ssm_scan_hook.build_ext_modules()
+)
+# Both hooks return the same cmdclass (torch's BuildExtension); pick one.
+_cmdclass = (
+    _cublaslt_hook.cmdclass_with_build_ext()
+    or _ssm_scan_hook.cmdclass_with_build_ext()
+)
 
 setup(
-    ext_modules=build_ext_modules(),
-    cmdclass=cmdclass_with_build_ext(),
+    ext_modules=_ext_modules,
+    cmdclass=_cmdclass,
 )
