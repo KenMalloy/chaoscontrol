@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 import time
 from pathlib import Path
@@ -106,14 +107,23 @@ def _eval_bpb(
     """Score the FineWeb stream, return bpb + bookkeeping.
 
     Per-doc: SSM state resets at the start of each doc (``initial_states=None``)
-    and threads through chunks within the same doc via ``final_states``. This
-    matches the score-only (no-TTT) path — LegalityController-free because
-    this script only measures artifact quality, not eval-time adaptation.
+    and threads through chunks within the same doc via ``final_states``.
+    The inner loop mirrors the canonical scoring pattern in
+    ``src/chaoscontrol/eval_stream/legality.py::score_chunk`` (lines 77-79)
+    — full chunk into forward, CE on ``logits[:, :-1]`` against
+    ``chunk[:, 1:]``, carry ``final_states`` from the full chunk. This
+    keeps ``bpb_bf16`` comparable to what a ``run_exp20_eval.py`` run
+    would report on the same checkpoint + stream. LegalityController-free
+    because this script only measures artifact quality (the TTT +
+    leak-detection machinery is overkill for a score-only pipeline).
 
     ``label`` identifies the pass (``"bf16"`` or ``"int6"``) in the error
     message if the stream yields zero scorable docs/bytes — otherwise a
     mis-pointed ``--eval-jsonl`` or too-small ``--budget-seconds`` silently
     returns ``bpb=0.0`` and the pipeline happily reports a green delta.
+    Also raises if the accumulated bpb is non-finite — a dequantized int6
+    weight NaN'ing during pass 2 would otherwise land silently in the
+    output JSON.
 
     Returns::
 
@@ -146,19 +156,23 @@ def _eval_bpb(
             prev_final_states: list[torch.Tensor] | None = None
             for chunk_list in _iter_chunks(doc.tokens, chunk_size):
                 # Need at least 2 tokens to form one (input, target) pair —
-                # matches the guard in run_exp20_eval.py (line 139).
+                # matches the guard in legality.py::score_chunk (line 59-63).
                 if len(chunk_list) < 2:
                     continue
                 chunk = torch.tensor(
                     chunk_list, dtype=torch.long, device=device
                 ).unsqueeze(0)
-                inputs = chunk[:, :-1]
+                # Mirror canonical scoring in
+                # src/chaoscontrol/eval_stream/legality.py::score_chunk
+                # (lines 77-79): full chunk into forward so SSM state
+                # advances T tokens, then slice logits to drop the
+                # final-position logit that has no next-token target.
+                out = model(chunk, initial_states=prev_final_states)
+                logits = out["logits"][:, :-1]
                 targets = chunk[:, 1:]
-                out = model(inputs, initial_states=prev_final_states)
-                logits = out["logits"]
                 # reduction="sum" so we accumulate total nats across the
                 # corpus; compute_bpb divides by raw byte count at the end.
-                # No .float() upcast — matches run_exp20_eval.py:33-35 exactly
+                # No .float() upcast — matches legality.py:79 exactly
                 # so bpb_bf16 here tracks what the downstream eval harness sees.
                 ce_sum = F.cross_entropy(
                     logits.reshape(-1, logits.size(-1)),
@@ -167,7 +181,8 @@ def _eval_bpb(
                 )
                 total_ce_nats += float(ce_sum.item())
                 total_tokens += int(targets.numel())
-                # Thread SSM state across chunks within the doc.
+                # Thread SSM state across chunks within the doc — full-chunk
+                # final_states, matching legality.py:80-84.
                 prev_final_states = out.get("final_states")
             total_raw_bytes += int(doc.raw_bytes)
             docs_scored += 1
@@ -184,9 +199,24 @@ def _eval_bpb(
             f"over jsonl_paths={[str(p) for p in jsonl_paths]}; "
             "check --eval-jsonl and --budget-seconds."
         )
-    bpb = compute_bpb(total_ce_nats, total_raw_bytes)
+    bpb = float(compute_bpb(total_ce_nats, total_raw_bytes))
+    # Fail loud on non-finite bpb. Pass 2 can hit this if dequantized int6
+    # weights produce NaN logits (bad Hessian → Cholesky underflow → NaN
+    # inverse → NaN out); pass 1 can hit it if the bf16 checkpoint itself
+    # is corrupted. Either way we want a stack trace, not a silent
+    # bpb=NaN written to JSON that downstream tooling happily reads.
+    # Mirrors the ``runner_exp21.py`` finiteness guard on training-side
+    # bpb (runner_exp21.py:444-452).
+    if not math.isfinite(bpb):
+        raise RuntimeError(
+            f"_eval_bpb pass '{label}' produced non-finite bpb={bpb} "
+            f"(ce_nats={total_ce_nats}, raw_bytes={total_raw_bytes}). "
+            "For pass 'int6' this usually means a dequantized weight "
+            "NaN'd during inference; for pass 'bf16' it usually means "
+            "the loaded checkpoint is corrupt."
+        )
     return {
-        "bpb": float(bpb),
+        "bpb": bpb,
         "docs_scored": int(docs_scored),
         "tokens_scored": int(total_tokens),
         "wall_seconds": float(wall_seconds),
@@ -438,14 +468,17 @@ def main(argv: list[str] | None = None) -> int:
     # to "reset" a mid-iteration one (which the class doesn't support;
     # see doc_stream.py docstring).
     # Cap pass 2 at pass 1's doc count so delta_bpb compares the SAME slice of
-    # the eval stream. ``budget_seconds`` stays as a safety cap — if int6
-    # inference is somehow slower, the assertion below catches the truncation.
+    # the eval stream. Pass 2 budget auto-scales to ``max(budget, 2*pass1_wall)``
+    # so a slower int6 inference path doesn't trigger the docs-mismatch
+    # RuntimeError below and waste a pod run. The user's --budget-seconds
+    # is still honored as a floor — auto-scale only raises it, never lowers.
+    pass2_budget = max(args.budget_seconds, 2.0 * bf16_metrics["wall_seconds"])
     int6_metrics = _eval_bpb(
         int6_model,
         label="int6",
         jsonl_paths=list(args.eval_jsonl),
         sp_model_path=args.sp_model_path,
-        budget_seconds=args.budget_seconds,
+        budget_seconds=pass2_budget,
         chunk_size=args.chunk_size,
         device=device,
         max_docs=min(args.max_docs, bf16_metrics["docs_scored"]),
@@ -454,8 +487,19 @@ def main(argv: list[str] | None = None) -> int:
         raise RuntimeError(
             "eval pass docs_scored mismatch: "
             f"bf16={bf16_metrics['docs_scored']} int6={int6_metrics['docs_scored']}. "
-            "Pass 2 truncated before matching pass 1 — likely budget_seconds "
-            "was binding on int6; raise --budget-seconds and retry."
+            "Pass 2 truncated before matching pass 1 despite auto-scaled "
+            f"budget of {pass2_budget:.1f}s — int6 inference is >2x slower "
+            "than bf16. Raise --budget-seconds and retry."
+        )
+    delta_bpb = int6_metrics["bpb"] - bf16_metrics["bpb"]
+    # bpb1 and bpb2 are each finite per _eval_bpb's guard, but float
+    # subtraction of two finite numbers is always finite — assert anyway
+    # to make any future regression (e.g. a sign-bug introducing inf)
+    # a loud stack trace rather than a silent JSON write.
+    if not math.isfinite(delta_bpb):
+        raise RuntimeError(
+            f"delta_bpb is non-finite: {delta_bpb} "
+            f"(bpb_bf16={bf16_metrics['bpb']}, bpb_int6={int6_metrics['bpb']})"
         )
 
     # --- Step 8: Write result JSON ---
@@ -471,7 +515,7 @@ def main(argv: list[str] | None = None) -> int:
         "sp_model_path": str(args.sp_model_path),
         "bpb_bf16": bf16_metrics["bpb"],
         "bpb_int6": int6_metrics["bpb"],
-        "delta_bpb": int6_metrics["bpb"] - bf16_metrics["bpb"],
+        "delta_bpb": delta_bpb,
         "artifact_bytes": artifact_bytes,
         "artifact_margin_mb": artifact_margin_mb,
         "bf16_docs_scored": bf16_metrics["docs_scored"],

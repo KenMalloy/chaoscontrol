@@ -466,3 +466,98 @@ def test_eval_bpb_does_not_upcast_logits():
         "diverges the bpb measurement from run_exp20_eval. Remove the "
         "upcast and use bf16 CE so artifact bpb tracks downstream."
     )
+
+
+# =====================================================================
+# Test 5 — non-finite bpb in pass 'bf16' fails loud (Fix 1)
+# =====================================================================
+def test_non_finite_bpb_pass_bf16_raises(
+    tiny_pipeline_paths, eval_quant_module, monkeypatch
+):
+    """Pass-1 NaN bpb must raise RuntimeError naming ``pass 'bf16'``.
+
+    Real-world trigger: a corrupted bf16 checkpoint with NaN weights
+    produces NaN logits → NaN CE → NaN bpb. Pre-fix, the script
+    silently wrote ``bpb_bf16=NaN`` to the JSON and continued through
+    calibration + pack + eval — wasting pod time and giving a
+    downstream reader a NaN delta to parse.
+
+    We simulate the failure mode by monkeypatching ``compute_bpb`` to
+    return NaN; the script-side import is resolved at call time (see
+    ``_eval_bpb`` — ``from chaoscontrol.evaluation import compute_bpb``
+    inside the function body) so the patch takes effect on the next
+    call. The guard must fire on pass 1 (before int6 work begins)
+    and the message must name the pass so downstream triage knows
+    which side of the pipeline produced the NaN.
+    """
+    _patched_quantize_state_dict(monkeypatch)
+    from chaoscontrol import evaluation
+
+    monkeypatch.setattr(evaluation, "compute_bpb", lambda *a, **kw: float("nan"))
+
+    argv = _make_argv(tiny_pipeline_paths)
+    with pytest.raises(RuntimeError) as exc_info:
+        eval_quant_module.main(argv)
+
+    msg = str(exc_info.value)
+    assert "non-finite bpb" in msg, (
+        f"RuntimeError did not identify the non-finite path — message: {msg!r}"
+    )
+    assert "pass 'bf16'" in msg, (
+        f"RuntimeError did not name the bf16 pass — message: {msg!r}"
+    )
+
+
+# =====================================================================
+# Test 6 — non-finite bpb in pass 'int6' fails loud (Fix 1)
+# =====================================================================
+def test_non_finite_bpb_pass_int6_raises(
+    tiny_pipeline_paths, eval_quant_module, monkeypatch
+):
+    """Pass-2 NaN bpb must raise RuntimeError naming ``pass 'int6'``.
+
+    Real-world trigger: GPTQ's Hessian inversion produces a pathological
+    scale that underflows under dequantization, poisoning int6 inference
+    with NaN logits. Pre-fix, the script happily wrote ``bpb_int6=NaN``
+    and a silently-NaN ``delta_bpb``; the V=8192 vs V=16384 comparison
+    then read NaN as "no penalty" or crashed downstream.
+
+    We simulate by monkeypatching ``compute_bpb`` to return NaN ONLY on
+    its second invocation, letting pass 1 produce a valid bpb so the
+    pipeline reaches pass 2 normally. The guard must fire and the
+    message must name ``pass 'int6'`` so the operator knows the
+    quantization lane is what went bad.
+    """
+    _patched_quantize_state_dict(monkeypatch)
+    from chaoscontrol import evaluation
+
+    orig_compute_bpb = evaluation.compute_bpb
+    call_count = [0]
+
+    def nan_on_second_call(*args, **kwargs):
+        call_count[0] += 1
+        if call_count[0] == 2:
+            return float("nan")
+        return orig_compute_bpb(*args, **kwargs)
+
+    monkeypatch.setattr(evaluation, "compute_bpb", nan_on_second_call)
+
+    argv = _make_argv(tiny_pipeline_paths)
+    with pytest.raises(RuntimeError) as exc_info:
+        eval_quant_module.main(argv)
+
+    msg = str(exc_info.value)
+    assert "non-finite bpb" in msg, (
+        f"RuntimeError did not identify the non-finite path — message: {msg!r}"
+    )
+    assert "pass 'int6'" in msg, (
+        f"RuntimeError did not name the int6 pass — message: {msg!r}"
+    )
+    # Pass 1's finite bpb was consumed — the guard should have fired
+    # AFTER pass 1 completed (call_count == 2 means the NaN came from
+    # the int6 side, not a pass-1 regression that happened to use NaN).
+    assert call_count[0] == 2, (
+        f"compute_bpb was called {call_count[0]} times — expected exactly 2 "
+        "(pass 1 bf16 + pass 2 int6). Extra calls suggest the script "
+        "restructured the eval flow; update the monkeypatch trigger."
+    )
