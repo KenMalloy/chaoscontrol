@@ -44,23 +44,32 @@ def _default_transformer_config(vocab_size: int = 256, model_dim: int = 64) -> d
 
 
 def test_build_model_default_returns_bare_ssm():
-    """Default (no model_type) builds ChaosStudentLM bare-SSM."""
-    from chaoscontrol.model import ChaosStudentLM
+    """Default (no model_type) builds ChaosStudentLM bare-SSM.
 
+    Check by ``type(model).__name__`` rather than ``isinstance``: when the
+    full test suite runs, sys.path edits from multiple conftest/runner
+    modules can cause ``chaoscontrol.model`` to be loaded under different
+    module-cache entries, giving distinct class objects with the same
+    qualified name. ``isinstance`` would then spuriously fail even though
+    the model is in fact a ChaosStudentLM. Name-based identity is
+    import-order-independent.
+    """
     model = build_model(
         _default_ssm_config(), torch.device("cpu"), torch.float32
     )
-    assert isinstance(model, ChaosStudentLM)
+    cls = type(model)
+    assert cls.__name__ == "ChaosStudentLM"
+    assert cls.__module__ == "chaoscontrol.model"
 
 
 def test_build_model_transformer_nanogpt_lean_dispatches():
     """model_type='transformer_nanogpt_lean' dispatches to NanoGPTLeanLM."""
-    from chaoscontrol.baselines_nanogpt_lean import NanoGPTLeanLM
-
     model = build_model(
         _default_transformer_config(), torch.device("cpu"), torch.float32
     )
-    assert isinstance(model, NanoGPTLeanLM)
+    cls = type(model)
+    assert cls.__name__ == "NanoGPTLeanLM"
+    assert cls.__module__ == "chaoscontrol.baselines_nanogpt_lean"
     assert model.embed.num_embeddings == 256
     assert model.embed.embedding_dim == 64
 
