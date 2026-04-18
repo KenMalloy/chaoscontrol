@@ -108,13 +108,15 @@ def _parse_args() -> argparse.Namespace:
         "--force-bf16-decay",
         action="store_true",
         help=(
-            "Cast decay to update.dtype before the kernel. Workaround for "
-            "the ssm_scan kernel rejecting (fp32_decay, bf16_update) — the "
-            "exact dtype combo _diag_terms() produces under autocast bf16 "
-            "(torch.exp upcasts to fp32). Without this flag the kernel "
-            "raises on step 1 in the production path. Gives a best-case "
-            "ssm_scan measurement equivalent to a hypothetical kernel "
-            "extension that accepts mixed dtypes."
+            "LEGACY / comparison-only. Casts decay to update.dtype "
+            "before the kernel. Originally a workaround for the "
+            "(fp32_decay, bf16_update) rejection in the pre-phase3-3 "
+            "kernel. That bug is fixed — the kernel now accepts (fp32, "
+            "bf16) natively via a template specialization (see "
+            "ssm_scan_fwd.cu dispatcher). Production runs do NOT need "
+            "this flag anymore; keep it for post-hoc comparison against "
+            "the bridged profile (which bf16-quantizes decay and is "
+            "slightly slower + less precise than the native path)."
         ),
     )
     return p.parse_args()
