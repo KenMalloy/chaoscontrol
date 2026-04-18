@@ -29,7 +29,7 @@ class DocStreamer:
     def __iter__(self) -> Iterator[DocRecord]:
         doc_id = 0
         for shard in self.shard_paths:
-            arr = np.fromfile(str(shard), dtype=np.int32)
+            arr = np.fromfile(str(shard), dtype=np.uint16)
             buf: list[int] = []
             for t in arr:
                 t_int = int(t)
