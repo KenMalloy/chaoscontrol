@@ -39,11 +39,12 @@ cudaDataType_t out_cuda_dtype(at::ScalarType s) {
 // the heuristic call and destroyed immediately after — it's not needed
 // at matmul time.
 //
-// Alignment is pinned at 256 bytes: torch's CUDA caching allocator
-// returns pointers aligned to at least 256B, so the heuristic-time
-// alignment hint is a true upper bound on every runtime operand for
-// this key. Probing alignment per-call (as the pre-cache impl did)
-// offers no benefit when the allocator is uniform.
+// Alignment is part of the cache key. Fresh allocator-backed tensors
+// are typically 256B aligned, but sliced-yet-layout-valid CUDA views can
+// lower the effective alignment while keeping the same (M, N, K, dtype)
+// tuple. Reusing a 256B-planned heuristic for a 2B-aligned view is
+// avoidable risk, so we rebuild the preference attrs for the actual
+// runtime operand alignment.
 std::unique_ptr<CachedGemmPlan> build_plan(
     const DescriptorKey& k,
     cublasLtHandle_t handle,
@@ -116,22 +117,21 @@ std::unique_ptr<CachedGemmPlan> build_plan(
                          pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
                          &workspace_bytes, sizeof(workspace_bytes)),
                      "pref workspace");
-        const uint32_t align256 = 256;
         check_cublas(cublasLtMatmulPreferenceSetAttribute(
                          pref, CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_A_BYTES,
-                         &align256, sizeof(align256)),
+                         &k.align_a_bytes, sizeof(k.align_a_bytes)),
                      "pref align A");
         check_cublas(cublasLtMatmulPreferenceSetAttribute(
                          pref, CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_B_BYTES,
-                         &align256, sizeof(align256)),
+                         &k.align_b_bytes, sizeof(k.align_b_bytes)),
                      "pref align B");
         check_cublas(cublasLtMatmulPreferenceSetAttribute(
                          pref, CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_C_BYTES,
-                         &align256, sizeof(align256)),
+                         &k.align_c_bytes, sizeof(k.align_c_bytes)),
                      "pref align C");
         check_cublas(cublasLtMatmulPreferenceSetAttribute(
                          pref, CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_D_BYTES,
-                         &align256, sizeof(align256)),
+                         &k.align_d_bytes, sizeof(k.align_d_bytes)),
                      "pref align D");
 
         int returned = 0;

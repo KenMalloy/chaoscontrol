@@ -225,18 +225,6 @@ def build_report(results_dir: Path) -> dict[str, Any]:
     p_primary = _p_paired_or_none(C_c, D_c)
     p_secondary = _p_paired_or_none(delta_ssm, delta_trans)
 
-    thesis_validating = (
-        p_primary is not None
-        and p_secondary is not None
-        and p_primary < 0.01
-        and p_secondary < 0.01
-    )
-    thesis_weak = (
-        p_primary is not None
-        and p_primary < 0.01
-        and (p_secondary is None or p_secondary >= 0.01)
-    )
-
     # Controls (optional; may be absent in partial state).
     fullcov_raw = load_cell_bpbs(fullcov_dir, "ssm_fullcov")
     shuffled_raw = load_cell_bpbs(shuffled_dir, "ssm_shuffled")
@@ -252,6 +240,40 @@ def build_report(results_dir: Path) -> dict[str, Any]:
         paired_t_one_sided(F_fc, D_fc, alternative="greater")
         if len(fullcov_common) >= 2
         else None
+    )
+
+    shuffled_common = sorted(set(D_raw) & set(shuffled_raw))
+    D_sh = [D_raw[s] for s in shuffled_common]
+    S_sh = [shuffled_raw[s] for s in shuffled_common]
+    p_shuffled_vs_meanstd = (
+        paired_t_one_sided(S_sh, D_sh, alternative="greater")
+        if len(shuffled_common) >= 2
+        else None
+    )
+
+    controls_complete = (
+        len(fullcov_common) >= 2
+        and len(shuffled_common) >= 2
+    )
+    controls_support_semantics = (
+        p_fullcov_vs_meanstd is not None
+        and p_fullcov_vs_meanstd < 0.01
+        and p_shuffled_vs_meanstd is not None
+        and p_shuffled_vs_meanstd < 0.01
+    )
+
+    thesis_validating = (
+        p_primary is not None
+        and p_secondary is not None
+        and p_primary < 0.01
+        and p_secondary < 0.01
+        and controls_complete
+        and controls_support_semantics
+    )
+    thesis_weak = (
+        p_primary is not None
+        and p_primary < 0.01
+        and not thesis_validating
     )
 
     report: dict[str, Any] = {
@@ -275,6 +297,10 @@ def build_report(results_dir: Path) -> dict[str, Any]:
         "shuffled": _stats(list(shuffled_raw.values())),
         "p_fullcov_vs_meanstd": p_fullcov_vs_meanstd,
         "n_fullcov_pairs": len(fullcov_common),
+        "p_shuffled_vs_meanstd": p_shuffled_vs_meanstd,
+        "n_shuffled_pairs": len(shuffled_common),
+        "controls_complete": controls_complete,
+        "controls_support_semantics": controls_support_semantics,
     }
     return report
 
@@ -338,6 +364,12 @@ def print_report(report: dict[str, Any]) -> None:
             print(
                 f"  (thesis predicts shuffled bpb ≈ C_ssm_random mean = {c_mean:.4f})"
             )
+            print(
+                f"  shuffled vs meanstd (paired on {report['n_shuffled_pairs']} seeds, "
+                f"H1: shuffled bpb > meanstd bpb): p = {_fmt_p(report['p_shuffled_vs_meanstd'])}"
+            )
+        print(f"  controls-complete:         {report['controls_complete']}")
+        print(f"  controls-support-semantics:{report['controls_support_semantics']}")
 
 
 # ---------------------------------------------------------------------------

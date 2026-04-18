@@ -28,3 +28,10 @@ def test_negative_sampler_shape_and_range():
     assert samples.shape == (4, 5)
     assert samples.min() >= 0
     assert samples.max() < 3
+
+
+def test_negative_sampler_returns_samples_on_probs_device():
+    probs = torch.tensor([0.5, 0.3, 0.2])
+    sampler = NegativeSampler(probs)
+    samples = sampler.sample(batch_size=2, k=3)
+    assert samples.device == probs.device

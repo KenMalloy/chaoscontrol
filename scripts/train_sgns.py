@@ -71,7 +71,7 @@ def main() -> None:
 
     probs = unigram_probs_from_counts(counts, power=0.75)
 
-    sampler = NegativeSampler(probs)
+    sampler = NegativeSampler(probs.to(args.device))
     model = SGNSModel(vocab_size=args.vocab_size, dim=args.dim).to(args.device)
     stream = stream.to(args.device)
     opt = torch.optim.Adam(model.parameters(), lr=args.lr)

@@ -13,7 +13,10 @@ class NegativeSampler:
     """Samples K negatives per positive pair from a unigram distribution."""
 
     def __init__(self, probs: torch.Tensor):
-        assert torch.isclose(probs.sum(), torch.tensor(1.0), atol=1e-4)
+        probs = probs.float()
+        assert torch.isclose(
+            probs.sum(), probs.new_tensor(1.0), atol=1e-4,
+        )
         self.probs = probs
 
     def sample(self, batch_size: int, k: int) -> torch.Tensor:

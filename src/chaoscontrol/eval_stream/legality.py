@@ -85,9 +85,20 @@ class LegalityController:
         return float(loss.item()), final_states
 
     def adapt_on_chunk(
-        self, chunk: torch.Tensor, *, optimizer, steps: int = 1,
+        self,
+        chunk: torch.Tensor,
+        *,
+        optimizer,
+        steps: int = 1,
+        initial_states: list[torch.Tensor] | None = None,
     ) -> float | None:
-        """Runs `steps` gradient updates on the chunk. Returns final loss, or None if steps==0."""
+        """Runs ``steps`` gradient updates on ``chunk``.
+
+        ``initial_states`` must match the state context the chunk was just
+        scored under. For ``carry_state`` modes that keeps the adaptation pass
+        legally aligned with the preceding score-before-update forward instead
+        of silently resetting to zeros.
+        """
         if steps <= 0:
             return None
         h = self._chunk_hash(chunk)
@@ -96,7 +107,10 @@ class LegalityController:
         final_loss = None
         for _ in range(steps):
             optimizer.zero_grad()
-            out = self.model(chunk)
+            kwargs: dict = {}
+            if initial_states:
+                kwargs["initial_states"] = initial_states
+            out = self.model(chunk, **kwargs)
             logits = out["logits"] if isinstance(out, dict) else out
             loss = self.loss_fn(logits[:, :-1], chunk[:, 1:])
             loss.backward()

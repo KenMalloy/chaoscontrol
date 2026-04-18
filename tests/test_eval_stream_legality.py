@@ -16,6 +16,25 @@ class _TinyLM(nn.Module):
         return {"logits": self.lm_head(x)}
 
 
+class _StateAwareTinyLM(_TinyLM):
+    def __init__(self, vocab=32, dim=16):
+        super().__init__(vocab=vocab, dim=dim)
+        self.initial_state_history: list[list[torch.Tensor] | None] = []
+
+    def forward(self, input_ids, initial_states=None):
+        recorded = None
+        if initial_states is not None:
+            recorded = [s.detach().clone() for s in initial_states]
+        self.initial_state_history.append(recorded)
+        x = self.embed(input_ids)
+        final_states = (
+            [initial_states[0] + 1.0]
+            if initial_states is not None
+            else [x.mean(dim=1)]
+        )
+        return {"logits": self.lm_head(x), "final_states": final_states}
+
+
 def _loss(logits, targets):
     import torch.nn.functional as F
     return F.cross_entropy(logits.reshape(-1, logits.size(-1)), targets.reshape(-1))
@@ -132,3 +151,32 @@ def test_score_chunk_returns_tuple_with_loss_as_first_element():
     # the summed value is ≈ 107 (SGD not run here, just checking sanity).
     # Just pin it's a positive finite number.
     assert loss > 0 and loss < 1e6
+
+
+def test_adapt_on_chunk_threads_same_initial_states_as_score():
+    """Carry-state TTT must adapt in the same recurrent context it scored.
+
+    Regression target: adapt_on_chunk() used to ignore ``initial_states`` and
+    silently re-run the chunk from zero state, which makes carry-state
+    score-before-update results incomparable to the subsequent gradient step.
+    """
+    torch.manual_seed(0)
+    model = _StateAwareTinyLM()
+    controller = LegalityController(model, loss_fn=_loss)
+    opt = torch.optim.SGD(model.parameters(), lr=0.1)
+    chunk = torch.randint(0, 32, (1, 32))
+    init_state = [torch.randn(1, 16)]
+
+    controller.score_chunk(chunk, initial_states=init_state)
+    controller.adapt_on_chunk(
+        chunk,
+        optimizer=opt,
+        steps=1,
+        initial_states=init_state,
+    )
+
+    assert len(model.initial_state_history) == 2
+    scored_state, adapted_state = model.initial_state_history
+    assert scored_state is not None and adapted_state is not None
+    torch.testing.assert_close(scored_state[0], init_state[0])
+    torch.testing.assert_close(adapted_state[0], init_state[0])

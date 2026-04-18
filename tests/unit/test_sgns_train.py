@@ -1,7 +1,34 @@
 import torch
-from chaoscontrol.sgns.train import train_one_epoch
+from chaoscontrol.sgns.train import _iter_center_context_batches, train_one_epoch
 from chaoscontrol.sgns.model import SGNSModel
 from chaoscontrol.sgns.sampler import NegativeSampler
+
+
+def test_iter_center_context_batches_covers_expected_pairs():
+    stream = torch.arange(6, dtype=torch.long)
+    observed: list[tuple[int, int]] = []
+    for centers, contexts in _iter_center_context_batches(
+        stream, window=2, batch_size=2,
+    ):
+        assert len(centers) == len(contexts)
+        assert len(centers) <= 2
+        observed.extend(
+            (int(c.item()), int(ctx.item()))
+            for c, ctx in zip(centers, contexts)
+        )
+
+    expected = []
+    for offset in (1, 2):
+        expected.extend(
+            (int(stream[i + offset]), int(stream[i]))
+            for i in range(len(stream) - offset)
+        )
+        expected.extend(
+            (int(stream[i]), int(stream[i + offset]))
+            for i in range(len(stream) - offset)
+        )
+
+    assert sorted(observed) == sorted(expected)
 
 
 def test_train_one_epoch_loss_decreases():

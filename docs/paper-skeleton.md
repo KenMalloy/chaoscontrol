@@ -1,3 +1,7 @@
+> Status 2026-04-17: this skeleton reflects an older pre-pivot architecture
+> direction. For the current paper/status plan, see
+> [plans/2026-04-17-paper-status.md](plans/2026-04-17-paper-status.md).
+
 # SemanticEngine SSM: A Biologically-Inspired State-Space Model with Typed Routing and Structured Memory Consolidation
 
 ## Paper Skeleton

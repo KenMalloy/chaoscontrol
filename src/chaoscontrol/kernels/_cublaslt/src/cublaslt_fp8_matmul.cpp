@@ -78,11 +78,17 @@ inline cudaDataType_t out_cuda_dtype(at::ScalarType s) {
     throw std::runtime_error("cublaslt_fp8_matmul: out_dtype must be bfloat16 or float16");
 }
 
-// (Per-call alignment probe removed alongside the shift to DescriptorCache
-// in 2026-04-18: alignment is now pinned at 256 bytes in the cached plan
-// on the assumption that torch's CUDA caching allocator always hands back
-// at-least-256-byte-aligned pointers. If that ever breaks we'd surface it
-// here as a validation and key the cache on alignment too.)
+inline uint32_t alignment_bytes(const void* ptr) {
+    const auto addr = reinterpret_cast<std::uintptr_t>(ptr);
+    if (addr == 0) return 1;
+    uint32_t align = 1;
+    while (align < 256) {
+        const uint32_t next = align << 1;
+        if ((addr % next) != 0) break;
+        align = next;
+    }
+    return align;
+}
 
 // --------------------------------------------------------------------------
 // Shared fp8 GEMM driver.
@@ -187,6 +193,10 @@ GemmResult fp8_matmul_impl(
     // on shared state.
     const DescriptorKey key{
         M, N, K,
+        alignment_bytes(b.data_ptr()),  // cuBLAS A == torch b
+        alignment_bytes(a.data_ptr()),  // cuBLAS B == torch a
+        alignment_bytes(d.data_ptr()),  // C reuses D's layout here
+        alignment_bytes(d.data_ptr()),
         bias_mode, fast_accum,
         a.scalar_type(), b.scalar_type(), out_dtype,
     };

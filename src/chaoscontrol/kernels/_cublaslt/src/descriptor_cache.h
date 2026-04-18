@@ -43,6 +43,10 @@ struct DescriptorKey {
     int64_t M;
     int64_t N;
     int64_t K;
+    uint32_t align_a_bytes;
+    uint32_t align_b_bytes;
+    uint32_t align_c_bytes;
+    uint32_t align_d_bytes;
     BiasMode bias_mode;
     bool fast_accum;
     at::ScalarType a_dtype;
@@ -51,6 +55,10 @@ struct DescriptorKey {
 
     bool operator==(const DescriptorKey& o) const noexcept {
         return M == o.M && N == o.N && K == o.K
+               && align_a_bytes == o.align_a_bytes
+               && align_b_bytes == o.align_b_bytes
+               && align_c_bytes == o.align_c_bytes
+               && align_d_bytes == o.align_d_bytes
                && bias_mode == o.bias_mode && fast_accum == o.fast_accum
                && a_dtype == o.a_dtype && b_dtype == o.b_dtype
                && out_dtype == o.out_dtype;
@@ -67,6 +75,10 @@ struct DescriptorKeyHash {
         size_t h = std::hash<int64_t>{}(k.M);
         h = mix(h, std::hash<int64_t>{}(k.N));
         h = mix(h, std::hash<int64_t>{}(k.K));
+        h = mix(h, std::hash<uint32_t>{}(k.align_a_bytes));
+        h = mix(h, std::hash<uint32_t>{}(k.align_b_bytes));
+        h = mix(h, std::hash<uint32_t>{}(k.align_c_bytes));
+        h = mix(h, std::hash<uint32_t>{}(k.align_d_bytes));
         h = mix(h, static_cast<size_t>(k.bias_mode));
         h = mix(h, static_cast<size_t>(k.fast_accum));
         h = mix(h, static_cast<size_t>(k.a_dtype));

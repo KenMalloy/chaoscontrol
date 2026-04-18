@@ -205,6 +205,27 @@ def test_idempotent_skip(tmp_path: Path, synthetic_jsonl: Path, capsys) -> None:
     )
 
 
+@pytest.mark.parametrize(
+    ("changed_kwarg", "changed_value"),
+    [
+        ("sp_train_docs", 400),
+        ("shard_size", 8_000),
+        ("num_workers", 2),
+    ],
+)
+def test_idempotent_skip_rejects_effective_config_drift(
+    tmp_path: Path,
+    synthetic_jsonl: Path,
+    changed_kwarg: str,
+    changed_value: int,
+) -> None:
+    """Changing tokenizer/shard-affecting knobs must not reuse stale artifacts."""
+    _run_build(tmp_path, synthetic_jsonl)
+    kwargs = {changed_kwarg: changed_value}
+    with pytest.raises(RuntimeError, match="does not match the requested config"):
+        _run_build(tmp_path, synthetic_jsonl, **kwargs)
+
+
 def test_shard_boundary_on_doc(
     tmp_path: Path, synthetic_jsonl: Path,
 ) -> None:

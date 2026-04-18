@@ -325,6 +325,9 @@ def _build_manifest_dict(
     num_docs: int,
     num_val_docs: int,
     num_train_docs: int,
+    sp_train_docs: int,
+    shard_size: int,
+    num_workers: int,
     files_val: list[Path],
     files_train: list[Path],
     tokens_val: int,
@@ -339,6 +342,9 @@ def _build_manifest_dict(
         "num_docs": num_docs,
         "num_val_docs": num_val_docs,
         "num_train_docs": num_train_docs,
+        "sp_train_docs": sp_train_docs,
+        "shard_size": shard_size,
+        "num_workers": num_workers,
         "files_val": [p.name for p in files_val],
         "files_train": [p.name for p in files_train],
         "tokens_val": tokens_val,
@@ -358,6 +364,9 @@ def _manifest_matches(existing: dict, requested: dict) -> bool:
         "num_docs",
         "num_val_docs",
         "num_train_docs",
+        "sp_train_docs",
+        "shard_size",
+        "num_workers",
     )
     return all(existing.get(k) == requested.get(k) for k in keys)
 
@@ -451,6 +460,9 @@ def build(
         "num_docs": num_docs,
         "num_val_docs": min(val_docs, num_docs),
         "num_train_docs": max(num_docs - val_docs, 0),
+        "sp_train_docs": min(sp_train_docs, max(num_docs - val_docs, 0)),
+        "shard_size": shard_size,
+        "num_workers": num_workers,
     }
 
     if build_manifest_path.is_file():
@@ -638,6 +650,9 @@ def build(
         num_docs=num_docs,
         num_val_docs=min(val_docs, num_docs),
         num_train_docs=max(num_docs - val_docs, 0),
+        sp_train_docs=min(sp_train_docs, max(num_docs - val_docs, 0)),
+        shard_size=shard_size,
+        num_workers=num_workers,
         files_val=val_writer.files,
         files_train=train_writer.files,
         tokens_val=val_writer.total_tokens,

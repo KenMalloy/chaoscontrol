@@ -158,7 +158,10 @@ def run(cfg: RunConfig, jsonl_paths: list[str], sp_model_path: str) -> None:
                 # Adapt — single Muon optimizer; `optimizers` is at most len==1.
                 if optimizers and cfg.steps_per_chunk > 0:
                     loss_after = controller.adapt_on_chunk(
-                        chunk, optimizer=optimizers[0], steps=cfg.steps_per_chunk,
+                        chunk,
+                        optimizer=optimizers[0],
+                        steps=cfg.steps_per_chunk,
+                        initial_states=prev_state if prev_state else None,
                     )
                     # Using `or 0.0` would drop legitimate 0.0 losses;
                     # be explicit about the None case.

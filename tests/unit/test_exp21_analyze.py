@@ -182,7 +182,7 @@ def _seed_synthetic_four_cell(
 
 
 def test_build_report_thesis_validating(tmp_path):
-    """Large Δ_SSM, much smaller Δ_Trans → thesis-validating on both gates."""
+    """Large Δ_SSM + passing controls → thesis-validating."""
     # SSM benefits a lot from SGNS (C high, D much lower).
     # Transformer benefits barely (A ≈ B).
     seeds = [1337, 42, 123, 7, 8]
@@ -193,10 +193,19 @@ def test_build_report_thesis_validating(tmp_path):
         C=[(s, 1.60 + i * 0.001) for i, s in enumerate(seeds)],
         D=[(s, 1.40 + i * 0.001) for i, s in enumerate(seeds)],
     )
+    for s in seeds:
+        _write_run_json(
+            tmp_path / "fullcov" / f"ssm_fullcov_s{s}.json", 1.45
+        )
+        _write_run_json(
+            tmp_path / "shuffled" / f"ssm_shuffled_s{s}.json", 1.58
+        )
 
     report = build_report(tmp_path)
     assert report["p_primary"] < 0.01
     assert report["p_secondary"] < 0.01
+    assert report["p_fullcov_vs_meanstd"] < 0.01
+    assert report["p_shuffled_vs_meanstd"] < 0.01
     assert report["thesis_validating"] is True
 
 
@@ -221,6 +230,24 @@ def test_build_report_null_effect(tmp_path):
     report = build_report(tmp_path)
     assert report["p_primary"] > 0.01
     assert report["thesis_validating"] is False
+
+
+def test_build_report_requires_controls_for_thesis_validating(tmp_path):
+    seeds = [1337, 42, 123, 7, 8]
+    _seed_synthetic_four_cell(
+        tmp_path,
+        A=[(s, 1.50 + i * 0.001) for i, s in enumerate(seeds)],
+        B=[(s, 1.498 + i * 0.001) for i, s in enumerate(seeds)],
+        C=[(s, 1.60 + i * 0.001) for i, s in enumerate(seeds)],
+        D=[(s, 1.40 + i * 0.001) for i, s in enumerate(seeds)],
+    )
+
+    report = build_report(tmp_path)
+    assert report["p_primary"] < 0.01
+    assert report["p_secondary"] < 0.01
+    assert report["controls_complete"] is False
+    assert report["thesis_validating"] is False
+    assert report["thesis_weak"] is True
 
 
 def test_build_report_missing_cells_reports_gracefully(tmp_path):
@@ -266,6 +293,9 @@ def test_build_report_includes_control_results(tmp_path):
     assert report["n_fullcov_pairs"] == 5
     assert report["p_fullcov_vs_meanstd"] is not None
     assert report["p_fullcov_vs_meanstd"] < 0.01  # 1.45 >> 1.40 at every seed
+    assert report["n_shuffled_pairs"] == 1
+    assert report["p_shuffled_vs_meanstd"] is None
+    assert report["controls_complete"] is False
 
 
 def test_build_report_consistency_of_delta_and_p(tmp_path):
