@@ -6,6 +6,59 @@ import torch.nn as nn
 class DeltaModulator:
     """Context manager that attaches forward hooks to every ChaosSSMCore in a model
     to rescale delta_proj output and shift log_a at eval. No gradients involved.
+
+    --------------------------------------------------------------------------
+    OPEN QUESTION — delta_scale semantics (pre-softplus vs post-softplus)
+    --------------------------------------------------------------------------
+
+    In ChaosSSMCore.forward the recurrence step-size is
+
+        Δ = softplus(delta_proj(x)).clamp_min(1e-4)
+
+    so Δ is a softplus-shaped function of the pre-activation Wx. Two reasonable
+    ways to "rescale the memory horizon" at eval time:
+
+      1. PRE-softplus scaling (current implementation):
+           hook multiplies delta_proj(x) output → Δ_new = softplus(s · Wx)
+         This is the cheapest to implement — a single forward hook on the
+         existing nn.Linear submodule, no shared-code change.
+
+      2. POST-softplus scaling (design-doc intent per 2026-04-17 design doc,
+         "lengthens/shortens memory uniformly"):
+           Δ_new = s · softplus(Wx).clamp_min(1e-4)
+         Semantically cleaner for the "memory-horizon knob" framing, but
+         requires either a new submodule wrapper inside ChaosSSMCore or a
+         post-softplus hook that doesn't exist as a named submodule today.
+
+    The two agree near Wx = 0 (softplus is ~linear there). They diverge at the
+    extremes:
+      - Large positive Wx (near-identity softplus): pre-softplus SATURATES
+        because softplus(2·large) ≈ 2·large while softplus(large) ≈ large —
+        so pre-softplus roughly doubles Δ. Similar to post-softplus; agreement.
+      - Large negative Wx (softplus in exponential regime): pre-softplus
+        gives softplus(2·(-large)) ≈ 0, while post-softplus gives
+        2·softplus(-large) ≈ 2·exp(-large) — still tiny but a factor of 2
+        off. Different.
+      - Near Wx ≈ 0: post-softplus cleanly scales Δ; pre-softplus barely moves
+        it because softplus'(0) = 0.5.
+
+    For Exp 20's Phase D sweep at delta_scale ∈ {0.25, 0.5, 1.0, 2.0, 4.0}
+    the pre-softplus version will produce ASYMMETRIC response around s=1.0:
+    less sensitive on the downward side (0.25, 0.5) than on the upward side
+    (2.0, 4.0). That's a diagnostic, not a bug — but worth knowing when
+    reading the heatmap.
+
+    Decision (2026-04-17, Ken + Claude): ship pre-softplus for tonight since
+    the design-doc's semantic intent is approximate ("memory horizon") and
+    a pre-softplus sweep still answers the question "does scaling Δ help bpb
+    at eval time?" If Phase D shows a clear monotone response within
+    delta_scale ∈ [0.5, 2.0] we treat the result as valid. If the sweep is
+    noisy or obviously nonmonotone, we revisit with a post-softplus hook.
+
+    Post-softplus implementation sketch if we ever need it: add a no-grad
+    buffer `_delta_post_scale` to ChaosSSMCore (init 1.0) and multiply Δ by
+    it after the softplus/clamp step inside ChaosSSMCore.forward. Then this
+    DeltaModulator sets/restores that buffer instead of hooking delta_proj.
     """
 
     def __init__(self, module: nn.Module, *, delta_scale: float = 1.0,
