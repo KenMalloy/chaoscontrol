@@ -94,6 +94,7 @@ def build_model(
             n_head=n_head,
             n_layer=int(config["num_layers"]),
             ffn_mult=int(config.get("ff_mult", 4)),
+            activation_checkpoint=bool(config.get("activation_checkpoint", False)),
         )
     else:
         model = ChaosStudentLM(

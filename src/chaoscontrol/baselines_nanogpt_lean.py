@@ -18,6 +18,7 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint as _checkpoint
 
 from chaoscontrol.core import RMSNorm
 
@@ -145,10 +146,12 @@ class NanoGPTLeanLM(nn.Module):
         n_layer: int = 8,
         ffn_mult: int = 4,
         max_seq_len: int = 2048,
+        activation_checkpoint: bool = False,
     ):
         super().__init__()
         assert d_model % n_head == 0
         self.vocab_size = vocab_size
+        self.activation_checkpoint = activation_checkpoint
         self.embed = nn.Embedding(vocab_size, d_model)
         self.blocks = nn.ModuleList(
             [NanoGPTLeanBlock(d_model, n_head, ffn_mult) for _ in range(n_layer)]
@@ -182,6 +185,13 @@ class NanoGPTLeanLM(nn.Module):
         forward/backward through ``final_norm + lm_head``. Must produce
         the identical tensor to ``forward()["hidden"]`` or the chunked
         path and the frozen forward path diverge.
+
+        When ``activation_checkpoint=True``, each block is wrapped with
+        ``torch.utils.checkpoint`` (``use_reentrant=False``) so activations
+        are recomputed in backward. Peak memory drops by ~n_layer× at the
+        cost of one extra forward per block in backward. Follows the
+        ``ChaosStudentLM`` pattern at ``model.py:1080`` — same flag, same
+        checkpoint call shape, same ``use_reentrant=False`` policy.
         """
         T = input_ids.shape[1]
         if T > self.rope_cache.shape[1]:
@@ -190,8 +200,12 @@ class NanoGPTLeanLM(nn.Module):
             self.rope_cache = new_cache
         rope = self.rope_cache[:, :T]
         h = self.embed(input_ids)
+        use_ckpt = self.activation_checkpoint and self.training
         for block in self.blocks:
-            h = block(h, rope)
+            if use_ckpt:
+                h = _checkpoint(block, h, rope, use_reentrant=False)
+            else:
+                h = block(h, rope)
         return h
 
     def forward(self, input_ids: torch.Tensor, *, return_jacobian_stats: bool = False):
@@ -216,6 +230,7 @@ def build_nanogpt_lean(
     n_layer: int = 8,
     ffn_mult: int = 4,
     max_seq_len: int = 2048,
+    activation_checkpoint: bool = False,
 ) -> NanoGPTLeanLM:
     """Factory with design-spec defaults (~10.49M params at V=8192)."""
     return NanoGPTLeanLM(
@@ -225,4 +240,5 @@ def build_nanogpt_lean(
         n_layer=n_layer,
         ffn_mult=ffn_mult,
         max_seq_len=max_seq_len,
+        activation_checkpoint=activation_checkpoint,
     )
