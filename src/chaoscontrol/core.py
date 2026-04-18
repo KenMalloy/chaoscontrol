@@ -121,9 +121,9 @@ def _resolve_diag_recurrence_impl():
         "python"   — sequential Python loop (_diag_recurrence_inner)
         "compile"  — torch.compile'd Python loop (default, fast on CUDA)
         "chunked"  — chunked vectorized scan (cumprod+cumsum, Exp 18 Test 1)
-        "ssm_scan" — hand-written CUDA kernel (forward-only; backward
-                     via autograd.Function fallback to the Python loop).
-                     Phase 1B-4 follow-up to the torch.compile regression.
+        "ssm_scan" — hand-written CUDA kernels for forward AND backward
+                     (per-lane serial scan, fp32 accumulator). Phase 1B-4
+                     / Phase 2 follow-up to the torch.compile regression.
 
     We avoid compiling at import time so a mismatched Inductor/CUDA/toolchain
     stack does not make the whole package fail before argument parsing.
@@ -182,10 +182,10 @@ def _resolve_diag_recurrence_impl():
             _diag_recurrence_impl = _ssm_scan_fn
             _diag_recurrence_backend = "ssm_scan"
             _diag_recurrence_note = (
-                "hand-written CUDA kernel (forward, ~1.5 G tok/s bf16 at "
-                "submission shape) + Python-loop autograd fallback (backward, "
-                "slower than the 'compile' backend); prefer 'compile' for full "
-                "training until the Phase 2 backward kernel lands"
+                "hand-written CUDA kernels for forward and backward "
+                "(per-lane serial scan with fp32 accumulator, bf16 at "
+                "submission shape); see benchmarks/bench_ssm_scan.py for "
+                "timings vs compile/chunked/python"
             )
         else:
             _diag_recurrence_impl = _diag_recurrence_chunked
