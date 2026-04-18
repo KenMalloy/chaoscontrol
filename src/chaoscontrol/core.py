@@ -183,9 +183,10 @@ def _resolve_diag_recurrence_impl():
             _diag_recurrence_backend = "ssm_scan"
             _diag_recurrence_note = (
                 "hand-written CUDA kernels for forward and backward "
-                "(per-lane serial scan with fp32 accumulator, bf16 at "
-                "submission shape); see benchmarks/bench_ssm_scan.py for "
-                "timings vs compile/chunked/python"
+                "(per-lane serial scan with fp32 accumulator). At submission "
+                "shape B=1024/T=512/D=256 bf16 on 1xH100: 1.88 ms fwd+bwd "
+                "(~40x vs chunked, ~220x vs compile); 0.35 ms fwd, 1.26 ms "
+                "bwd. See benchmarks/bench_ssm_scan.py"
             )
         else:
             _diag_recurrence_impl = _diag_recurrence_chunked

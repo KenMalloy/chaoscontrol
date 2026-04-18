@@ -19,6 +19,14 @@ Training is dominated by ``fwd+bwd``; that row is the honest headline.
 ``fwd`` and ``bwd`` are there for diagnostic when a regression shows up
 in the headline.
 
+Note: ``fwd+bwd`` is typically slightly more than ``fwd + bwd`` at the
+ssm_scan submission shape because the fwd+bwd loop builds a fresh
+autograd graph each iter (fresh ``requires_grad_(True)`` leaves,
+custom_op tracing). At bf16 B=1024/T=512/D=256 the overhead is ~0.27 ms.
+The bwd row, which runs on a retained graph, is therefore a
+lower bound on "pure reverse sweep" and the fwd+bwd row is what a
+training step actually pays.
+
 Usage on a CUDA-capable pod:
 
     source /workspace/venv/bin/activate
