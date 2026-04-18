@@ -104,6 +104,19 @@ def _parse_args() -> argparse.Namespace:
         default=str(Path(__file__).parent / "profile_traces"),
         help="Directory for trace_<tag>.json. Created if missing.",
     )
+    p.add_argument(
+        "--force-bf16-decay",
+        action="store_true",
+        help=(
+            "Cast decay to update.dtype before the kernel. Workaround for "
+            "the ssm_scan kernel rejecting (fp32_decay, bf16_update) — the "
+            "exact dtype combo _diag_terms() produces under autocast bf16 "
+            "(torch.exp upcasts to fp32). Without this flag the kernel "
+            "raises on step 1 in the production path. Gives a best-case "
+            "ssm_scan measurement equivalent to a hypothetical kernel "
+            "extension that accepts mixed dtypes."
+        ),
+    )
     return p.parse_args()
 
 
@@ -133,6 +146,32 @@ def main() -> int:
         f"note={backend_info['note']}",
         flush=True,
     )
+
+    # --force-bf16-decay: monkey-patch ``_diag_recurrence`` to cast decay
+    # to update.dtype. The ssm_scan kernel rejects (fp32, bf16) combos
+    # that autocast bf16 produces naturally inside ``_diag_terms``
+    # (``torch.exp(-delta * a_base)`` is on the "autocast to fp32" list,
+    # but ``select * candidate`` stays bf16). This cast is cheap
+    # (B*T*D bf16 allocation — ~256 MB for submission shape, 1 kernel
+    # launch) and reflects what the kernel would do internally if it
+    # accepted mixed dtypes. Without this the profile can't measure
+    # ssm_scan at all in the real path.
+    if args.force_bf16_decay:
+        import chaoscontrol.core as _core
+
+        _orig_diag = _core._diag_recurrence
+
+        def _diag_with_dtype_bridge(decay, update):
+            if decay.dtype != update.dtype:
+                decay = decay.to(update.dtype)
+            return _orig_diag(decay, update)
+
+        _core._diag_recurrence = _diag_with_dtype_bridge
+        print(
+            "[profile] --force-bf16-decay active: casting decay->update.dtype "
+            "before every _diag_recurrence call (see docstring).",
+            flush=True,
+        )
 
     model = build_model(
         SUBMISSION_CONFIG, device=device, param_dtype=torch.bfloat16
