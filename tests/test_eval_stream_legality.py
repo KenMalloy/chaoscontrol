@@ -30,7 +30,7 @@ def test_score_is_under_pre_update_weights():
     controller = LegalityController(model, loss_fn=_loss)
     # Score chunk of 32 tokens under frozen weights, then adapt on them
     chunk = tokens[:, :32]
-    loss_before = controller.score_chunk(chunk)
+    loss_before, _ = controller.score_chunk(chunk)
     # Capture FULL state snapshot — SGD on model.parameters() updates every
     # param (embed + lm_head), so rolling back only lm_head would leave embed
     # perturbed and the re-forward loss would not match the pre-update score.
@@ -84,5 +84,51 @@ def test_cross_doc_re_adapt_same_bytes_is_ok_after_mark_new_epoch():
     controller.adapt_on_chunk(chunk, optimizer=opt, steps=1)
     controller.mark_new_epoch()
     # Next doc: same bytes reappear, legitimate score-then-adapt order.
-    _ = controller.score_chunk(chunk)
+    _, _ = controller.score_chunk(chunk)
     controller.adapt_on_chunk(chunk, optimizer=opt, steps=1)  # must not raise
+
+
+def test_adapt_on_chunk_with_zero_steps_returns_none():
+    """adapt_on_chunk(steps=0) is a no-op; returns None and does not touch
+    the optimizer, the model, or _adapted_chunks tracking.
+
+    Driver uses this path when `adapt_set="none"` or `steps_per_chunk=0`,
+    so a silent side-effect here would corrupt Phase B (which relies on
+    adapt_set=none producing zero weight change).
+    """
+    torch.manual_seed(0)
+    m = _TinyLM()
+    pre_weights = {k: v.detach().clone() for k, v in m.state_dict().items()}
+    opt = torch.optim.SGD(m.parameters(), lr=0.1)
+    controller = LegalityController(m, loss_fn=_loss, leak_detection=True)
+
+    chunk = torch.randint(0, 32, (1, 32))
+    result = controller.adapt_on_chunk(chunk, optimizer=opt, steps=0)
+    assert result is None
+    # Model must be bit-identical — no optimizer step happened.
+    for k, v in m.state_dict().items():
+        assert torch.equal(pre_weights[k], v), f"{k} mutated on steps=0"
+    # And the chunk must not have been marked adapted — leak detection stays
+    # armed for a real future adapt.
+    controller.score_chunk(chunk)  # must not raise
+
+
+def test_score_chunk_returns_tuple_with_loss_as_first_element():
+    """Contract pin: score_chunk returns (loss, ...). The driver unpacks
+    the first element as the scalar loss. A refactor that swaps the
+    tuple order would silently produce garbage bpb values.
+    """
+    m = _TinyLM()
+    controller = LegalityController(m, loss_fn=_loss)
+    chunk = torch.randint(0, 32, (1, 32))
+    result = controller.score_chunk(chunk)
+    # Returned tuple must have at least one element; first is a Python float
+    # (cross-entropy summed over the chunk).
+    assert isinstance(result, tuple)
+    loss = result[0]
+    assert isinstance(loss, float)
+    # Cross-entropy of a random uniform lm_head over random tokens should be
+    # close to log(vocab_size) = log(32) ≈ 3.47 per token; with 31 targets,
+    # the summed value is ≈ 107 (SGD not run here, just checking sanity).
+    # Just pin it's a positive finite number.
+    assert loss > 0 and loss < 1e6
