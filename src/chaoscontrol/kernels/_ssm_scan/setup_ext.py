@@ -29,8 +29,9 @@ def build_ext_modules() -> list:
     this_dir = Path(__file__).resolve().parent
     repo_root = this_dir.parents[3]
     cpp_rel = this_dir.relative_to(repo_root) / "src" / "ssm_scan_binding.cpp"
-    cu_rel = this_dir.relative_to(repo_root) / "src" / "ssm_scan_fwd.cu"
-    sources = [str(cpp_rel), str(cu_rel)]
+    cu_fwd_rel = this_dir.relative_to(repo_root) / "src" / "ssm_scan_fwd.cu"
+    cu_bwd_rel = this_dir.relative_to(repo_root) / "src" / "ssm_scan_bwd.cu"
+    sources = [str(cpp_rel), str(cu_fwd_rel), str(cu_bwd_rel)]
 
     src_dir = this_dir / "src"
     include_dirs = [str(src_dir)]
