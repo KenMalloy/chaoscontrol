@@ -1,0 +1,43 @@
+# Exp 21 quant-penalty measurement — V=8192 arm.
+#
+# Purpose: answer "does V=8192 vs V=16384 matter for the int6+LZMA roundtrip
+# penalty at the 10.7M-param submission regime?". This YAML feeds
+# runner_exp21.py directly (single-condition config — no cells/seeds list).
+#
+# Random init only (embed_init_path=null). The counterpart V=16384 config
+# has no SGNS artifact at that vocab size, so this arm matches it apples
+# to apples — both measure the quant penalty on a vanilla-trained SSM.
+#
+# base_lr=0.064 is the Exp 18 Test 5b SSM-arm winner at ws=2 × bs=1024/rank;
+# we're running here at ws=4 × bs=1024/rank. Constant LR across the two
+# arms is the right control — this experiment measures the QUANT penalty,
+# not training optimality. If bpb_bf16 diverges between V=8192 and V=16384,
+# that's an LR-vocab interaction finding, separate from the quant question.
+#
+# See also: project_exp18_test5b_results_2026-04-16,
+# project_sp_retokenization_day_of_training.
+model_type: ssm
+vocab_size: 8192
+model_dim: 256
+num_layers: 4
+ff_mult: 2
+a_mode: diag
+a_full_rank: 8
+a_full_gamma: 0.05
+seq_len: 512
+stride: 256
+batch_size: 1024
+eval_batches: 16
+optimizer: muon
+base_lr: 0.064
+weight_decay: 0.01
+grad_clip_norm: 1.0
+chunk_size: 64
+dtype: bf16
+precision: bf16
+activation_checkpoint: true
+embed_init_path: null
+local_attn_window: 0
+local_attn_heads: 1
+local_attn_dim: 64
+seed: 1337

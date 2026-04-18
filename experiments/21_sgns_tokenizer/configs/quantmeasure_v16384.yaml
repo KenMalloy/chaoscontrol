@@ -1,0 +1,32 @@
+# Exp 21 quant-penalty measurement — V=16384 arm.
+#
+# Counterpart to quantmeasure_v8192.yaml. Identical except vocab_size: 16384.
+# Constant base_lr across the two arms is an intentional control — this
+# experiment measures the int6+LZMA quant penalty, not training optimality.
+#
+# See quantmeasure_v8192.yaml for the full rationale.
+model_type: ssm
+vocab_size: 16384
+model_dim: 256
+num_layers: 4
+ff_mult: 2
+a_mode: diag
+a_full_rank: 8
+a_full_gamma: 0.05
+seq_len: 512
+stride: 256
+batch_size: 1024
+eval_batches: 16
+optimizer: muon
+base_lr: 0.064
+weight_decay: 0.01
+grad_clip_norm: 1.0
+chunk_size: 64
+dtype: bf16
+precision: bf16
+activation_checkpoint: true
+embed_init_path: null
+local_attn_window: 0
+local_attn_heads: 1
+local_attn_dim: 64
+seed: 1337
