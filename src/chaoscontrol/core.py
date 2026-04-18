@@ -188,6 +188,17 @@ def verify_diag_recurrence(device: torch.device | None = None) -> dict[str, str]
 
 
 def _diag_recurrence(decay: torch.Tensor, update: torch.Tensor) -> torch.Tensor:
+    # When an outer ``torch.compile`` is tracing this call (e.g. via
+    # ``train_ssm._compiled_step_fn``), route through the uncompiled
+    # Python loop so the outer gets a single unified graph. Skipping the
+    # inner ``torch.compile`` wrapper here is what un-parks
+    # ``compile_full_path=True``: the nested-compile pattern produced a
+    # −62.77% regression in the 1A-4 microbench. Dynamo evaluates
+    # ``is_compiling()`` at trace time, so this branch resolves to a
+    # single-path graph — no runtime overhead for the eager caller either
+    # (constant-folded to False by the CPython interpreter).
+    if torch.compiler.is_compiling():
+        return _diag_recurrence_inner(decay, update)
     global _diag_recurrence_impl, _diag_recurrence_backend, _diag_recurrence_note
     impl = _resolve_diag_recurrence_impl()
     try:

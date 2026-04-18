@@ -211,6 +211,19 @@ def post_scan_fused(
     ff_proj_weight: torch.Tensor,
 ) -> torch.Tensor:
     """Dispatcher with runtime fallback to eager on compile failure."""
+    # Same rationale as ``core._diag_recurrence``: when an outer
+    # ``torch.compile`` is tracing this call, route through the eager
+    # implementation so the outer gets a single unified graph rather
+    # than nesting into our cached ``torch.compile`` wrapper.
+    if torch.compiler.is_compiling():
+        return _post_scan_fused_eager(
+            x_pre_residual,
+            scan_out,
+            ff_norm_weight,
+            ff_norm_eps,
+            ff_fc_weight,
+            ff_proj_weight,
+        )
     global _post_scan_impl, _post_scan_backend, _post_scan_note
     impl = _resolve_post_scan_impl()
     try:

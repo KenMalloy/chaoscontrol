@@ -168,21 +168,17 @@ def _encode_only(
     whatever precision policy the outer ``autocast_context`` selected;
     dynamo traces the matmuls inside it correctly.
 
-    Known park (as of Phase 1A microbench, 2026-04-18): enabling this
-    wrapper via ``compile_full_path=True`` is a **−62.77% tok/s
-    regression** (paired p=3.5e-15, 1×H100, submission regime). The
-    encoder path already contains two nested ``torch.compile`` calls —
-    ``core._diag_recurrence_impl`` at ``core.py:152`` and
-    ``core_fused._post_scan_impl`` at ``core_fused.py:180`` — both
-    compiled lazily at the first call. Wrapping the whole ``model.encode``
-    in a THIRD ``torch.compile(fullgraph=True)`` then produces a
-    double-compile situation in which the outer dynamo re-traces the
-    already-compiled inner wrappers, losing their specialization and
-    producing slower inductor output than either eager or
-    single-level-compile would yield. Before reusing this flag, replace
-    the inner compiles with ``@torch.compiler.disable`` markers (so the
-    outer treats them as opaque) or remove them in favor of letting the
-    outer compile subsume them. Parked per Phase 1A RESULTS.
+    Nested-compile fix: the encoder path has two cached lazy
+    ``torch.compile`` wrappers (``core._diag_recurrence_impl`` at
+    ``core.py:152``, ``core_fused._post_scan_impl`` at
+    ``core_fused.py:180``). Without mitigation, the outer
+    ``torch.compile(fullgraph=True)`` here would trace INTO those
+    wrappers and produce a double-compile — the 1A-4 microbench saw
+    a −62.77% tok/s regression from exactly that pattern. Both
+    dispatchers now early-return the uncompiled inner when
+    ``torch.compiler.is_compiling()`` reports outer tracing, so the
+    outer gets a single unified graph and eager callers still benefit
+    from the inner compile.
     """
     return model.encode(inputs)
 
