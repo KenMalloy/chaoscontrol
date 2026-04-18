@@ -186,9 +186,10 @@ def _resolve_diag_recurrence_impl():
                 "(per-lane serial scan with fp32 accumulator; fp32 state "
                 "snapshot saved for backward to avoid bf16-quantized grads). "
                 "At submission shape B=1024/T=512/D=256 bf16 on 1xH100: "
-                "~40x vs chunked (the honest baseline; `compile` baseline "
-                "is pessimistic because compile's own backward is broken). "
-                "See benchmarks/bench_ssm_scan.py for the full table."
+                "2.20 ms fwd+bwd, ~35x vs chunked (the honest baseline; "
+                "`compile` baseline is pessimistic because compile's own "
+                "backward is broken). See benchmarks/bench_ssm_scan.py "
+                "for the full table."
             )
         else:
             _diag_recurrence_impl = _diag_recurrence_chunked
