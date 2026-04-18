@@ -64,6 +64,24 @@ def main() -> None:
     stream = train_tokens_mmap[:n].to(torch.long)
     print(f"using first {n:,} tokens")
 
+    # Clamp header-contamination negatives + any OOR tokens. Same policy
+    # as ``runner_exp17.load_sp_data`` (see its docstring for rationale) —
+    # the shard reader ``load_fineweb_tokens`` leaves a few hundred negative
+    # header bytes in the int16 view; ``torch.bincount`` would raise on
+    # the first negative and the embedding lookup would CUDA-assert.
+    oor_mask = (stream < 0) | (stream >= args.vocab_size)
+    n_oor = int(oor_mask.sum().item())
+    if n_oor > 0:
+        oor_frac = n_oor / max(stream.numel(), 1)
+        if oor_frac > 0.001:
+            raise ValueError(
+                f"train_sgns: tokenizer/data mismatch at {args.data_dir}. "
+                f"More than 0.1% of tokens outside [0, {args.vocab_size}). "
+                f"oor={n_oor}/{stream.numel()} ({oor_frac:.4%})."
+            )
+        print(f"clamping {n_oor} out-of-range tokens ({oor_frac:.4%}) to 0")
+        stream = stream.clamp(0, args.vocab_size - 1)
+
     # Unigram counts + subsampling
     counts = torch.bincount(stream, minlength=args.vocab_size).float()
     stream = _subsample(stream, counts, args.subsample_threshold)
