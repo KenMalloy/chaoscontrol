@@ -147,10 +147,18 @@ def query(
 
 
 def verify(registry_path: Path | str | None = None) -> dict:
-    """Sanity-check the registry. Raises ``ValueError`` on duplicate
-    ``(experiment, condition, seed, status)`` keys. Returns a summary
-    dict otherwise — callers can inspect dirty_records before treating
-    the registry as paper-final."""
+    """Sanity-check the registry. Raises ``ValueError`` on
+
+    (a) duplicate ``(experiment, condition, seed, status)`` keys, or
+    (b) any confirmatory record committed from a dirty working tree.
+
+    Exploratory runs MAY be dirty — research scratchpads shouldn't
+    require a clean commit. But confirmatory records are paper-binding,
+    so a dirty tree there means the ``git_sha`` on file doesn't fully
+    pin the code that produced the measurement. Downgrade to
+    exploratory, or re-register after committing.
+
+    Returns a summary dict otherwise."""
     records = load(registry_path)
     seen: dict[tuple[str, str, int, str], int] = {}
     duplicates: list[tuple[tuple[str, str, int, str], int, int]] = []
@@ -165,6 +173,19 @@ def verify(registry_path: Path | str | None = None) -> dict:
             f"{k} (lines {a + 1} and {b + 1})" for k, a, b in duplicates
         )
         raise ValueError(f"duplicate registry keys: {pretty}")
+    dirty_confirmatory = [
+        (i, r) for i, r in enumerate(records)
+        if r.git_dirty and r.status == "confirmatory"
+    ]
+    if dirty_confirmatory:
+        pretty = ", ".join(
+            f"{r.experiment}/{r.condition} seed={r.seed} (line {i + 1})"
+            for i, r in dirty_confirmatory
+        )
+        raise ValueError(
+            f"confirmatory records committed from dirty tree: {pretty}. "
+            "Commit and re-register, or downgrade status to exploratory."
+        )
     return {
         "n_records": len(records),
         "experiments": sorted({r.experiment for r in records}),

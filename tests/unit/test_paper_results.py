@@ -110,6 +110,28 @@ def test_verify_allows_same_key_with_different_status(tmp_path: Path) -> None:
     assert summary["n_records"] == 2
 
 
+def test_verify_raises_on_dirty_confirmatory(tmp_path: Path) -> None:
+    """Confirmatory records are paper-binding — a dirty tree means the
+    ``git_sha`` on file doesn't fully pin the code that produced the
+    measurement. ``verify()`` must fail loud so a downstream paper-stats
+    pipeline can't silently inherit un-reproducible rows."""
+    reg = tmp_path / "registry.jsonl"
+    _reg(reg, status="confirmatory", git_dirty=True)
+    with pytest.raises(ValueError, match="dirty tree"):
+        verify(registry_path=reg)
+
+
+def test_verify_allows_dirty_exploratory(tmp_path: Path) -> None:
+    """Exploratory runs MAY be dirty — researcher scratchpads shouldn't
+    require a clean commit before every data point. ``verify()`` returns
+    the summary with ``dirty_records`` > 0 and no raise."""
+    reg = tmp_path / "registry.jsonl"
+    _reg(reg, status="exploratory", git_dirty=True)
+    summary = verify(registry_path=reg)
+    assert summary["dirty_records"] == 1
+    assert summary["exploratory"] == 1
+
+
 def test_invalid_status_rejected() -> None:
     with pytest.raises(ValueError, match="invalid status"):
         RunRecord(

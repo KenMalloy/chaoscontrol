@@ -146,6 +146,22 @@ def load_cell_bpbs(results_dir: Path, cell_name: str) -> dict[int, float]:
         except (OSError, json.JSONDecodeError) as exc:
             print(f"  warn: could not read {path.name}: {exc}")
             continue
+        # Explicit nonfinite-flag filter. A run written by runner_exp21
+        # with ``allow_nonfinite=true`` (zero-init controls, deliberately
+        # divergent runs) carries ``nonfinite.flag=True`` even when
+        # eval.bpb happens to be finite — e.g. divergence early in
+        # training that recovered by eval, or a bpb=0 from a degenerate
+        # softmax collapse. Filter on the explicit flag so zero-control
+        # comparisons don't silently pull in runs the trainer already
+        # marked as scientifically unsound.
+        nonfinite = data.get("nonfinite") or {}
+        if nonfinite.get("flag"):
+            reason = nonfinite.get("reason", "unspecified")
+            print(
+                f"  warn: {path.name} has nonfinite.flag=True "
+                f"(reason={reason}); skipping"
+            )
+            continue
         eval_block = data.get("eval") or {}
         bpb_raw = eval_block.get("bpb")
         if bpb_raw is None:

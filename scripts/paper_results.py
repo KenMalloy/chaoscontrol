@@ -17,8 +17,17 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from dataclasses import asdict
 from pathlib import Path
+
+# Mirror the sys.path bootstrap used by scripts/eval_quant.py and
+# tests/conftest.py so this CLI works without ``PYTHONPATH=src`` on the
+# dev tree and on the training pod. Done before the chaoscontrol import.
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+_SRC = _REPO_ROOT / "src"
+if _SRC.is_dir() and str(_SRC) not in sys.path:
+    sys.path.insert(0, str(_SRC))
 
 from chaoscontrol.paper_results import load, query, register, verify
 
