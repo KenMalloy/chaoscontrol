@@ -86,17 +86,50 @@ class ChaosSSMBlock(nn.Module):
         x: torch.Tensor,
         *,
         return_jacobian_stats: bool = False,
-    ) -> torch.Tensor | tuple[torch.Tensor, dict]:
+        initial_state: torch.Tensor | None = None,
+        return_final_state: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, ...]:
+        """Sequence forward. See ChaosSSMCore.forward for state-threading semantics.
+
+        The block's residual + FF chain is unchanged regardless of the state
+        kwargs — only the recurrence is seeded, and ``final_state`` is plumbed
+        out so ChaosStudentLM can assemble a per-block list.
+
+        Returns:
+            x                                     (both False)
+            (x, stats)                            (stats=True)
+            (x, final_state)                      (final_state=True)
+            (x, stats, final_state)               (both True)
+        """
         normed = self.input_norm(x)
-        result = self.core(normed, rich_b=self.rich_b, return_jacobian_stats=return_jacobian_stats)
-        if return_jacobian_stats:
+        result = self.core(
+            normed,
+            rich_b=self.rich_b,
+            return_jacobian_stats=return_jacobian_stats,
+            initial_state=initial_state,
+            return_final_state=return_final_state,
+        )
+        # Unpack per the core's documented return tuple shape.
+        if return_jacobian_stats and return_final_state:
+            y, stats, final_state = result
+        elif return_jacobian_stats:
             y, stats = result
+            final_state = None
+        elif return_final_state:
+            y, final_state = result
+            stats = None
         else:
             y = result
+            stats = None
+            final_state = None
         x = x + y
         x = x + self.ff(self.ff_norm(x))
+        if return_jacobian_stats and return_final_state:
+            return x, stats, final_state
         if return_jacobian_stats:
             return x, stats
+        if return_final_state:
+            return x, final_state
         return x
 
 
@@ -178,7 +211,9 @@ class ChaosSSMHybridBlock(nn.Module):
         x: torch.Tensor,
         *,
         return_jacobian_stats: bool = False,
-    ) -> torch.Tensor | tuple[torch.Tensor, dict]:
+        initial_state: torch.Tensor | None = None,
+        return_final_state: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, ...]:
         """Parallel sequence-level forward.
 
         SSM runs the compiled diag scan over the full sequence, then local
@@ -188,10 +223,24 @@ class ChaosSSMHybridBlock(nn.Module):
 
         The step() method with RollingKVCache is still available for
         autoregressive inference.
+
+        ``initial_state`` and ``return_final_state`` thread through to
+        ``ChaosSSMCore.forward`` identically to ``ChaosSSMBlock``. The
+        local-attention sidecar is stateless across forward calls here
+        (KV cache lives only in the step() path via RollingKVCache), so
+        the final_state is the SSM core's final state only.
         """
         # 1. SSM: parallel over full sequence (compiled diag scan)
         normed = self.input_norm(x)
-        ssm_out = self.core.forward(normed)
+        if return_final_state:
+            ssm_out, final_state = self.core.forward(
+                normed,
+                initial_state=initial_state,
+                return_final_state=True,
+            )
+        else:
+            ssm_out = self.core.forward(normed, initial_state=initial_state)
+            final_state = None
         x_ssm = x + ssm_out  # residual
 
         # 2. Attention sidecar: local window, top-k selective, or top-k random
@@ -208,8 +257,16 @@ class ChaosSSMHybridBlock(nn.Module):
         # 3. FF: parallel
         y = x_ssm + self.ff(self.ff_norm(x_ssm))
 
+        stats = (
+            {"lambda_max": torch.tensor(0.0), "sv_log_var": torch.tensor(0.0)}
+            if return_jacobian_stats else None
+        )
+        if return_jacobian_stats and return_final_state:
+            return y, stats, final_state
         if return_jacobian_stats:
-            return y, {"lambda_max": torch.tensor(0.0), "sv_log_var": torch.tensor(0.0)}
+            return y, stats
+        if return_final_state:
+            return y, final_state
         return y
 
 
@@ -463,24 +520,45 @@ class ChaosAttentionBlock(nn.Module):
         x: torch.Tensor,
         *,
         return_jacobian_stats: bool = False,
-    ) -> torch.Tensor | tuple[torch.Tensor, dict]:
+        initial_state: torch.Tensor | None = None,
+        return_final_state: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, ...]:
         """Sequence forward pass. Shape: (batch, seq, dim) -> (batch, seq, dim).
 
         return_jacobian_stats is accepted for interface parity with
         ChaosSSMBlock. Attention has no per-step Jacobian in the SSM sense, so
         we return dummy zero stats matching the SSM diag-mode contract (see
         ChaosSSMCore.forward around the ``return_jacobian_stats`` branch).
+
+        ``initial_state`` / ``return_final_state`` are accepted for block
+        interface parity with ChaosSSMBlock. Attention has no cross-token
+        recurrent state in this block (no KV cache threaded across forward
+        calls — that lives in step()), so initial_state is ignored and
+        final_state is returned as zeros of shape (batch, dim) to match the
+        SSM contract. This mirrors the choice made in ``step()`` at line
+        458; it preserves uniform iteration in ChaosStudentLM without
+        pretending attention has an SSM-shaped recurrent state.
         """
         normed = self.input_norm(x)
         y = self._attn(normed)
         x = x + y
         x = x + self.ff(self.ff_norm(x))
+        stats = None
         if return_jacobian_stats:
             stats = {
                 "lambda_max": torch.tensor(0.0, device=x.device),
                 "sv_log_var": torch.tensor(0.0, device=x.device),
             }
+        final_state = None
+        if return_final_state:
+            batch = x.shape[0]
+            final_state = torch.zeros(batch, self.dim, device=x.device, dtype=x.dtype)
+        if return_jacobian_stats and return_final_state:
+            return x, stats, final_state
+        if return_jacobian_stats:
             return x, stats
+        if return_final_state:
+            return x, final_state
         return x
 
 
@@ -1029,6 +1107,7 @@ class ChaosStudentLM(nn.Module):
         *,
         return_jacobian_stats: bool = False,
         memory_write_mode: str = "none",
+        initial_states: list[torch.Tensor] | None = None,
     ) -> dict[str, Any]:
         """Forward pass.
 
@@ -1038,7 +1117,20 @@ class ChaosStudentLM(nn.Module):
             memory_write_mode: "none" (default, side-effect free),
                 "append_only" (append per-token KV pairs to buffer after forward).
                 The caller (training loop or eval) decides when writes happen.
+            initial_states: optional list of per-block initial recurrent states.
+                When provided, length must equal ``num_layers``; each tensor is
+                ``(batch, dim)``. ``None`` preserves the historical zero-init
+                behavior and produces bit-identical logits to the pre-Task-3.5
+                forward. The returned dict always includes ``final_states``:
+                one ``(batch, dim)`` tensor per physical block, captured after
+                the last virtual-layer step touches that block.
         """
+        if initial_states is not None:
+            if len(initial_states) != len(self.layers):
+                raise ValueError(
+                    f"initial_states length {len(initial_states)} does not match "
+                    f"num_layers {len(self.layers)}"
+                )
         x = self.embed(input_ids)
 
         # Wernicke layer: compose bytes into typed units before SSM recurrence
@@ -1121,22 +1213,37 @@ class ChaosStudentLM(nn.Module):
         # best and a warning-emitting behavior drift at worst.
         use_ckpt = self.activation_checkpoint and torch.is_grad_enabled() and x.requires_grad
         all_stats: list[dict] = []
+        # Per-physical-block final state, indexed by physical layer index.
+        # Under depth recurrence (_virtual_layer_indices repeats indices),
+        # the last virtual hit to a given physical block overwrites the slot,
+        # matching the "state at end of sequence for this physical block"
+        # semantics the Task 3.5 contract exposes.
+        final_states: list[torch.Tensor | None] = [None] * len(self.layers)
         for layer_idx in self._virtual_layer_indices:
             layer = self.layers[layer_idx]
+            init_state = initial_states[layer_idx] if initial_states is not None else None
             if use_ckpt:
                 result = _checkpoint(
                     layer,
                     x,
                     return_jacobian_stats=return_jacobian_stats,
+                    initial_state=init_state,
+                    return_final_state=True,
                     use_reentrant=False,
                 )
             else:
-                result = layer(x, return_jacobian_stats=return_jacobian_stats)
+                result = layer(
+                    x,
+                    return_jacobian_stats=return_jacobian_stats,
+                    initial_state=init_state,
+                    return_final_state=True,
+                )
             if return_jacobian_stats:
-                x, stats = result
+                x, stats, fstate = result
                 all_stats.append(stats)
             else:
-                x = result
+                x, fstate = result
+            final_states[layer_idx] = fstate
 
         # Error-driven posterior read — add correction bias after SSM recurrence,
         # before LM head. The posterior update happens AFTER loss computation
@@ -1196,6 +1303,16 @@ class ChaosStudentLM(nn.Module):
                     self.bucket_prototypes_module.update_batch(bids_flat, encoded_flat)
 
         out: dict[str, Any] = {"logits": logits, "hidden": hidden}
+        # Every physical block gets visited by at least one virtual-layer
+        # iteration in standard configs; None slots would indicate a bug in
+        # _virtual_layer_indices rather than a supported state. Assert here
+        # so Task 3.5's contract (list[Tensor] of length num_layers) is
+        # guaranteed to downstream callers.
+        assert all(s is not None for s in final_states), (
+            "final_states has unvisited slots — virtual layer indices did not "
+            "cover every physical layer"
+        )
+        out["final_states"] = final_states
         if balance_loss is not None:
             out["balance_loss"] = balance_loss
         if bucket_ids is not None:

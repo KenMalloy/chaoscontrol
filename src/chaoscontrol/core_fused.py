@@ -322,21 +322,40 @@ class FusedChaosSSMBlock(nn.Module):
         x: torch.Tensor,
         *,
         return_jacobian_stats: bool = False,
-    ) -> torch.Tensor | tuple[torch.Tensor, dict]:
+        initial_state: torch.Tensor | None = None,
+        return_final_state: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, ...]:
         # Unsupported configurations fall back to the unfused path. This
         # keeps FusedChaosSSMBlock behaviorally identical to ChaosSSMBlock
         # for all inputs; fusion is strictly a fast path.
-        if return_jacobian_stats or self._a_mode != "diag":
-            return self._forward_unfused(x, return_jacobian_stats=return_jacobian_stats)
+        # Non-zero initial_state forces the unfused path because the fused
+        # kernel reuses the core fast scan which cannot seed a carry. Zero
+        # initial state (or None) with return_final_state=True stays on the
+        # fused path — we extract final_state from an extra core call that
+        # returns the states tensor; still cheaper than the unfused loop.
+        if return_jacobian_stats or self._a_mode != "diag" or initial_state is not None:
+            return self._forward_unfused(
+                x,
+                return_jacobian_stats=return_jacobian_stats,
+                initial_state=initial_state,
+                return_final_state=return_final_state,
+            )
 
         # 1) Input norm — identical to ChaosSSMBlock.
         normed = self.input_norm(x)
 
         # 2) ChaosSSMCore diag scan — untouched, delegates to core.forward.
-        scan_out = self.core(normed, rich_b=None, return_jacobian_stats=False)
+        if return_final_state:
+            scan_out, final_state = self.core(
+                normed, rich_b=None, return_jacobian_stats=False,
+                return_final_state=True,
+            )
+        else:
+            scan_out = self.core(normed, rich_b=None, return_jacobian_stats=False)
+            final_state = None
 
         # 3) Fused post-scan chain: residual + RMSNorm + FF + residual.
-        return post_scan_fused(
+        y = post_scan_fused(
             x,
             scan_out,
             self.ff_norm.weight,
@@ -344,24 +363,44 @@ class FusedChaosSSMBlock(nn.Module):
             self.ff.fc.weight,
             self.ff.proj.weight,
         )
+        if return_final_state:
+            return y, final_state
+        return y
 
     def _forward_unfused(
         self,
         x: torch.Tensor,
         *,
         return_jacobian_stats: bool = False,
-    ) -> torch.Tensor | tuple[torch.Tensor, dict]:
+        initial_state: torch.Tensor | None = None,
+        return_final_state: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, ...]:
         """Fallback path matching ChaosSSMBlock.forward byte-for-byte."""
         normed = self.input_norm(x)
         result = self.core(
-            normed, rich_b=self.rich_b, return_jacobian_stats=return_jacobian_stats
+            normed, rich_b=self.rich_b,
+            return_jacobian_stats=return_jacobian_stats,
+            initial_state=initial_state,
+            return_final_state=return_final_state,
         )
-        if return_jacobian_stats:
+        if return_jacobian_stats and return_final_state:
+            y, stats, final_state = result
+        elif return_jacobian_stats:
             y, stats = result
+            final_state = None
+        elif return_final_state:
+            y, final_state = result
+            stats = None
         else:
             y = result
+            stats = None
+            final_state = None
         x = x + y
         x = x + self.ff(self.ff_norm(x))
+        if return_jacobian_stats and return_final_state:
+            return x, stats, final_state
         if return_jacobian_stats:
             return x, stats
+        if return_final_state:
+            return x, final_state
         return x

@@ -411,17 +411,78 @@ class ChaosSSMCore(nn.Module):
         *,
         rich_b: Any = None,
         return_jacobian_stats: bool = False,
-    ) -> torch.Tensor | tuple[torch.Tensor, dict]:
+        initial_state: torch.Tensor | None = None,
+        return_final_state: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, ...]:
+        """Run the SSM recurrence over a sequence.
+
+        Args:
+            x: (batch, seq, dim) input.
+            rich_b: optional RichB module that computes per-step update.
+            return_jacobian_stats: if True, append a per-seq Jacobian stats dict
+                to the return (only meaningful in ``full`` mode).
+            initial_state: (batch, dim) — optional non-zero seed for the
+                recurrence. When ``None`` (default), state is zero-initialized
+                exactly like before, so the default call is bit-identical to
+                prior behavior.
+            return_final_state: if True, append ``final_state`` (shape
+                ``(batch, dim)``) to the return. Caller must destructure.
+
+        Returns:
+            Depending on the return_* kwargs:
+                y                                     (both False)
+                (y, stats)                            (stats=True)
+                (y, final_state)                      (final_state=True)
+                (y, stats, final_state)               (both True)
+        """
         batch, seq, dim = x.shape
-        state = x.new_zeros((batch, dim))
+        if initial_state is not None:
+            # Cast to match x's dtype/device so the recurrence stays well-typed.
+            state = initial_state.to(dtype=x.dtype, device=x.device)
+            # LOAD-BEARING: this zero-detection is what keeps the rtol=0, atol=0
+            # bit-identity invariant in test_zeros_initial_states_match_default.
+            # Without it, explicit zeros would take the sequential Python-loop
+            # branch below while None takes the parallel _diag_recurrence scan,
+            # and the two paths accumulate in different orders — the outputs
+            # match to ~1e-7 but NOT bit-exact. Downstream Axis 2 persistence
+            # modes rely on "pass zeros == pass nothing" as a clean identity.
+            # Do not remove without also collapsing the fast/slow paths to one.
+            # Cost: O(B*D), negligible vs. (B, T, D) forward; real persisted
+            # non-zero states skip this branch via the short-circuit.
+            if not torch.any(initial_state):
+                initial_state = None
+        else:
+            state = x.new_zeros((batch, dim))
         outputs = []
 
+        def _bundle(y: torch.Tensor, stats: dict | None, final_state: torch.Tensor):
+            """Assemble the return tuple per the return_* kwargs."""
+            if return_jacobian_stats and return_final_state:
+                return y, stats, final_state
+            if return_jacobian_stats:
+                return y, stats
+            if return_final_state:
+                return y, final_state
+            return y
+
         if self.a_mode == "diag":
-            if rich_b is None:
-                y = self._forward_diag_scan(x)
-                if return_jacobian_stats:
-                    return y, {"lambda_max": torch.tensor(0.0), "sv_log_var": torch.tensor(0.0)}
-                return y
+            # Fast path: parallel scan. Requires zero-initial-state AND no rich_b.
+            # When an initial state is supplied we fall back to the sequential
+            # loop so the seed threads through correctly — the chunked scan's
+            # carry is hardcoded to zeros and plumbing a non-zero carry would
+            # touch the scan kernels unnecessarily. This fallback is tested by
+            # test_final_state_equals_chunked_sequential.
+            if rich_b is None and initial_state is None:
+                decay, update, gate = self._diag_terms(x)
+                states = _diag_recurrence(decay, update)
+                out = gate * states
+                y = self.out_proj(out)
+                stats = (
+                    {"lambda_max": torch.tensor(0.0), "sv_log_var": torch.tensor(0.0)}
+                    if return_jacobian_stats else None
+                )
+                final_state = states[:, -1] if return_final_state else None
+                return _bundle(y, stats, final_state)
             a_base = torch.sigmoid(self.log_a).to(dtype=x.dtype)[None, :]
             for idx in range(seq):
                 inp = x[:, idx, :]
@@ -437,9 +498,11 @@ class ChaosSSMCore(nn.Module):
                 out = torch.sigmoid(self.gate_proj(inp)) * state
                 outputs.append(self.out_proj(out))
             y = torch.stack(outputs, dim=1)
-            if return_jacobian_stats:
-                return y, {"lambda_max": torch.tensor(0.0), "sv_log_var": torch.tensor(0.0)}
-            return y
+            stats = (
+                {"lambda_max": torch.tensor(0.0), "sv_log_var": torch.tensor(0.0)}
+                if return_jacobian_stats else None
+            )
+            return _bundle(y, stats, state)
 
         elif self.a_mode == "paired":
             n_pairs = dim // 2
@@ -470,9 +533,11 @@ class ChaosSSMCore(nn.Module):
                 out = torch.sigmoid(self.gate_proj(inp)) * state
                 outputs.append(self.out_proj(out))
             y = torch.stack(outputs, dim=1)
-            if return_jacobian_stats:
-                return y, {"lambda_max": torch.tensor(0.0), "sv_log_var": torch.tensor(0.0)}
-            return y
+            stats = (
+                {"lambda_max": torch.tensor(0.0), "sv_log_var": torch.tensor(0.0)}
+                if return_jacobian_stats else None
+            )
+            return _bundle(y, stats, state)
 
         elif self.a_mode == "full":
             A_c = self._get_A_full().to(dtype=x.dtype)
@@ -499,13 +564,13 @@ class ChaosSSMCore(nn.Module):
                     sv_log_maxes.append(log_svs[0])
                     sv_log_vars.append(log_svs.var())
             y = torch.stack(outputs, dim=1)
+            stats = None
             if return_jacobian_stats:
                 stats = {
                     "lambda_max": torch.stack(sv_log_maxes).mean(),
                     "sv_log_var": torch.stack(sv_log_vars).mean(),
                 }
-                return y, stats
-            return y
+            return _bundle(y, stats, state)
 
         else:
             raise ValueError(f"unsupported a_mode: {self.a_mode}")
