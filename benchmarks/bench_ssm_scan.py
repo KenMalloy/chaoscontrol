@@ -275,18 +275,37 @@ def main() -> None:
         print(row)
 
     # Honest headline: fwd+bwd is the training-loop shape.
+    #
+    # Report speedup against BOTH baselines. `compile` is the backend
+    # whose -63% regression motivated this kernel — but `compile`'s
+    # own backward is broken (OOMs / NaNs at our submission shape),
+    # so the compile baseline is pessimistic for any honest compare.
+    # `chunked` is the real baseline: it's what the codebase was
+    # using before `compile` was tried, and it actually runs correctly
+    # end-to-end. Headlines below show both so the reader can pick the
+    # framing they trust.
     print("\nHeadline (fwd+bwd, training shape):")
-    base = results.get("compile", {}).get("fwd+bwd", {}).get("mean_ms")
+    base_compile = results.get("compile", {}).get("fwd+bwd", {}).get("mean_ms")
+    base_chunked = results.get("chunked", {}).get("fwd+bwd", {}).get("mean_ms")
     for name, by_mode in results.items():
         r = by_mode.get("fwd+bwd", {})
         if "error" in r or "mean_ms" not in r:
             continue
-        speedup = (base / r["mean_ms"]) if (base and name != "compile") else None
-        suffix = f"  {speedup:.2f}× vs compile" if speedup else ""
+        parts: list[str] = []
+        if base_compile and name not in ("compile",):
+            parts.append(f"{base_compile / r['mean_ms']:.2f}× vs compile")
+        if base_chunked and name not in ("chunked",):
+            parts.append(f"{base_chunked / r['mean_ms']:.2f}× vs chunked")
+        suffix = ("  " + " / ".join(parts)) if parts else ""
         print(
             f"  {name:10s}  {r['mean_ms']:8.3f} ms  "
             f"{r['tok_per_s']:>14,.0f} tok/s{suffix}"
         )
+    print(
+        "\n  Note: `compile` has a broken backward at submission shape "
+        "(the reason this kernel exists); `chunked` is the honest baseline.\n"
+        "  Prefer the `vs chunked` speedup for reporting."
+    )
 
     # Dump JSON.
     if args.json_out:
