@@ -1,20 +1,36 @@
 """Precision autocast policy for train_ssm training loop.
 
 Supported dtypes:
-    "fp32" — no autocast (vanilla float32)
-    "bf16" — torch.amp.autocast(dtype=torch.bfloat16)
-    "fp8"  — transformer_engine.pytorch.fp8_autocast(enabled=True)
+    "fp32"      — no autocast (vanilla float32)
+    "bf16"      — torch.amp.autocast(dtype=torch.bfloat16)
+    "fp8"       — transformer_engine.pytorch.fp8_autocast(enabled=True)
+    "fp8_fused" — our bespoke cuBLASLt fp8 path (FusedFP8Linear);
+                  autocast is bf16 because the fp8 cast happens inside
+                  the C++ kernel and its inputs must be bf16.
 
 Callers pass cfg["precision"] and get the right context back; no
 branching elsewhere in the loop. TE availability is lazily probed
 the first time fp8 is requested, so the module imports cleanly on
-machines without TE installed.
+machines without TE installed. The bespoke _cublaslt extension is
+probed the first time fp8_fused is requested, same pattern.
 
-Also exposes maybe_promote_linears_to_te(model, enabled) which does
-in-place nn.Linear -> te.Linear swaps when fp8 is requested. te.Linear
-implements fp8 matmul inside a te.fp8_autocast context; without the
-swap, nn.Linear runs at its declared dtype regardless of the autocast
-context. Promotion preserves weights, bias, and device/dtype.
+Also exposes:
+    maybe_promote_linears_to_te(model, enabled)       — nn.Linear -> te.Linear
+    maybe_promote_linears_to_fused_fp8(model, enabled) — nn.Linear -> FusedFP8Linear
+
+te.Linear implements fp8 matmul inside a te.fp8_autocast context;
+FusedFP8Linear implements fp8 matmul at every forward call (no
+autocast coupling). Without the swap, nn.Linear runs at its declared
+dtype regardless of the context. Promotion preserves weights, bias,
+and device/dtype.
+
+Training-loop contract for fp8_fused:
+    After every optimizer.step(), call fused_fp8_flush_all(model) to
+    roll the per-layer amax pending buffers into their history rings
+    and recompute scales. Skipping the flush leaves scales stale — not
+    a correctness bug, just a missed opportunity to tighten the fp8
+    representable range. See fp8_linear.flush_amax_history for why
+    this is a separate call rather than fused into the forward pass.
 """
 from __future__ import annotations
 
@@ -30,6 +46,12 @@ import torch.nn as nn
 # result means repeat calls don't re-pay the import attempt cost, and we
 # only print the "TE unavailable" warning once per process.
 _TE_AVAILABLE: bool | None = None
+
+# Same pattern for our bespoke cuBLASLt fp8 extension. The compiled _C.so
+# is built during ``pip install -e .`` on CUDA-capable pods and skipped on
+# dev machines without a CUDA toolchain; probing separately from TE lets
+# a machine support one path without the other.
+_FUSED_FP8_AVAILABLE: bool | None = None
 
 
 def _check_te_available() -> bool:
@@ -53,6 +75,26 @@ def _check_te_available() -> bool:
         # where the package is half-installed.
         _TE_AVAILABLE = False
     return _TE_AVAILABLE
+
+
+def _check_fused_fp8_available() -> bool:
+    """Lazy probe for the bespoke cuBLASLt fp8 extension.
+
+    The compiled ``_C.so`` is built by ``setup_ext.py`` during
+    ``pip install -e .`` on CUDA-capable pods. On dev machines without
+    CUDA the Python wrapper still imports but the underlying extension
+    raises ``ImportError`` at call time — we detect that here by
+    attempting to load the compiled module directly.
+    """
+    global _FUSED_FP8_AVAILABLE
+    if _FUSED_FP8_AVAILABLE is not None:
+        return _FUSED_FP8_AVAILABLE
+    try:
+        from chaoscontrol.kernels._cublaslt import _C  # noqa: F401
+        _FUSED_FP8_AVAILABLE = True
+    except Exception:
+        _FUSED_FP8_AVAILABLE = False
+    return _FUSED_FP8_AVAILABLE
 
 
 @contextlib.contextmanager
@@ -98,9 +140,22 @@ def autocast_context(dtype: str, device_type: str = "cuda") -> ContextManager:
         with te.fp8_autocast(enabled=True):
             yield
         return
+    if dtype == "fp8_fused":
+        # Our bespoke cuBLASLt path takes bf16 inputs and does the fp8
+        # cast inside the C++ kernel; the surrounding autocast is bf16
+        # so ambient activations match FusedFP8Linear's input contract.
+        # No TE fp8_autocast wrapper — our Linear does not hook into
+        # TE's recipe tracker and runs fp8 unconditionally once promoted.
+        if device_type != "cuda":
+            with contextlib.nullcontext():
+                yield
+            return
+        with torch.amp.autocast(device_type=device_type, dtype=torch.bfloat16):
+            yield
+        return
     raise ValueError(
         f"Unsupported precision dtype: {dtype!r}. "
-        f"Expected one of {{'fp32', 'bf16', 'fp8'}}."
+        f"Expected one of {{'fp32', 'bf16', 'fp8', 'fp8_fused'}}."
     )
 
 
@@ -195,6 +250,52 @@ def maybe_promote_linears_to_te(model: nn.Module, enabled: bool) -> int:
             if has_bias:
                 new.bias.data.copy_(old.bias.data)
 
+        setattr(parent, child_name, new)
+        promoted += 1
+    return promoted
+
+
+def maybe_promote_linears_to_fused_fp8(model: nn.Module, enabled: bool) -> int:
+    """In-place swap ``nn.Linear`` children with ``FusedFP8Linear`` so
+    our bespoke cuBLASLt fp8 path handles the matmul.
+
+    Returns the number of layers promoted; 0 means no promotion happened
+    (``enabled=False`` or extension unavailable). ``FusedFP8Linear`` is
+    a ``nn.Module`` subclass (not ``nn.Linear``), so re-running the walk
+    after promotion is idempotent — promoted children aren't picked up
+    by ``_iter_linear_children``.
+
+    Design note: unlike ``te.Linear``, ``FusedFP8Linear`` always emits
+    fp8 matmuls when called — there is no autocast context that toggles
+    it off. Callers that mix promoted and unpromoted Linears will see
+    fp8 on the former and bf16 on the latter, regardless of outer
+    ``autocast_context``.
+
+    Training-loop contract: after every ``optimizer.step()`` the caller
+    must invoke ``fused_fp8_flush_all(model)`` from
+    ``chaoscontrol.kernels.fp8_linear`` to roll per-layer amax pending
+    buffers into their history rings and recompute scales. Skipping the
+    flush is correctness-preserving (scales stay stale); it only misses
+    the recent-amax trajectory.
+    """
+    if not enabled:
+        return 0
+    if not _check_fused_fp8_available():
+        print(
+            "[precision] WARNING: maybe_promote_linears_to_fused_fp8(enabled=True) "
+            "was called but chaoscontrol.kernels._cublaslt._C is not built; "
+            "skipping promotion (returning 0). Rebuild the extension via "
+            "`pip install -e .` on a CUDA pod.",
+            flush=True,
+        )
+        return 0
+
+    from chaoscontrol.kernels.fp8_linear import FusedFP8Linear
+
+    pairs = _iter_linear_children(model)
+    promoted = 0
+    for parent, child_name, old in pairs:
+        new = FusedFP8Linear.from_nn_linear(old)
         setattr(parent, child_name, new)
         promoted += 1
     return promoted

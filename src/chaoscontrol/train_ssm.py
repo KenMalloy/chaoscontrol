@@ -395,6 +395,19 @@ def train_ssm_for_budget(
                 torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
         optimizer.step()
 
+        # Post-step amax bookkeeping for the bespoke fp8 path. Each
+        # FusedFP8Linear holds (x/w/gy) amax-history rings + pending
+        # buffers; the per-forward/backward kernels atomicMax-fold into
+        # the pending slots, and this call rolls them into the history
+        # ring + recomputes the live scale. Skipping it leaves scales
+        # stale (correctness-preserving; just loses the recent-amax
+        # trajectory). The helper is a no-op when the model contains no
+        # FusedFP8Linear submodules, so the unconditional call is safe
+        # under any precision setting.
+        if precision == "fp8_fused":
+            from chaoscontrol.kernels.fp8_linear import fused_fp8_flush_all
+            fused_fp8_flush_all(model)
+
         loss_tensors.append(loss.detach())
         steps += 1
 
