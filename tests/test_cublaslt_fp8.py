@@ -582,7 +582,18 @@ def test_bwd_x_fused_matches_primitive() -> None:
 
 
 def test_bwd_w_fused_matches_primitive() -> None:
-    """Fused backward grad_w + bias_grad match the primitive path."""
+    """Fused backward grad_w matches the primitive path; bias_grad matches
+    an eager ``grad_y.sum(0).to(bf16)`` reference.
+
+    Post task 25: the primitive path (``cublaslt_fp8_matmul_grad_w``)
+    never returns a bias gradient — it has no access to the bf16
+    ``grad_y`` needed to compute one, and cuBLASLt's BGRADB epilogue
+    is rejected for fp8 E5M2×E4M3. The fused path
+    (``cublaslt_fp8_linear_bwd_w``) folds the column-sum into its
+    grad_y cast kernel and always produces a bf16 bias_grad when
+    ``compute_bias_grad=True``. This test holds both paths to the same
+    grad_w bar and checks the fused bias_grad against the eager sum.
+    """
     torch.manual_seed(0)
     M, K, N = 1024, 256, 256
     grad_y = torch.randn(M, N, device="cuda", dtype=torch.bfloat16) * 0.1
@@ -601,12 +612,18 @@ def test_bwd_w_fused_matches_primitive() -> None:
         out_dtype=torch.bfloat16, compute_bias_grad=True,
     )
 
-    # Primitive path.
+    # Primitive path grad_w reference (no bias_grad from this entry
+    # point — it doesn't have bf16 grad_y to sum over).
     gy_t_fp8 = (grad_y.t().contiguous() / gy_scale).to(torch.float8_e5m2)
     x_col_fp8 = (x.t().contiguous().t() / x_scale).to(torch.float8_e4m3fn)
     grad_w_ref, grad_b_ref = cublaslt_fp8_matmul_grad_w(
         gy_t_fp8, x_col_fp8, scale_gy=gy_scale, scale_x=x_scale,
         out_dtype=torch.bfloat16, compute_bias_grad=True,
+    )
+    assert grad_b_ref is None, (
+        "primitive grad_w path returned a bias gradient; post task 25 it "
+        "must always return None since BGRADB is unsupported and the "
+        "entry has no bf16 grad_y to sum."
     )
 
     assert grad_w_fused.shape == grad_w_ref.shape == (N, K)
@@ -614,18 +631,38 @@ def test_bwd_w_fused_matches_primitive() -> None:
     assert torch.allclose(grad_w_fused, grad_w_ref, rtol=3e-2, atol=3e-2), (
         f"fused grad_w vs primitive drift: max={diff.max().item():.4e}"
     )
-    if grad_b_fused is not None and grad_b_ref is not None:
-        bdiff = (grad_b_fused.float() - grad_b_ref.float()).abs()
-        assert torch.allclose(grad_b_fused, grad_b_ref, rtol=3e-2, atol=3e-2), (
-            f"fused grad_b drift: max={bdiff.max().item():.4e}"
-        )
-    else:
-        # Both primitive and fused paths should fall back together, OR
-        # both should succeed; a split indicates a branching bug.
-        assert (grad_b_fused is None) == (grad_b_ref is None), (
-            "fused and primitive bias-grad paths diverged on BGRADB fallback"
-        )
-    # gy_pending updated.
+
+    # Fused path must produce a real bias_grad via the in-cast reduction.
+    assert grad_b_fused is not None, (
+        "fused path must return bias_grad when compute_bias_grad=True"
+    )
+    assert grad_b_fused.shape == (N,)
+    assert grad_b_fused.dtype == torch.bfloat16
+    # Reference: eager column-sum of the original bf16 grad_y cast to
+    # bf16. Our fused reduction accumulates in fp32 and casts at the end,
+    # so rounding matches the eager path to within bf16's own tolerance.
+    grad_b_ref_eager = grad_y.float().sum(dim=0).to(torch.bfloat16)
+    bdiff = (grad_b_fused.float() - grad_b_ref_eager.float()).abs()
+    assert torch.allclose(grad_b_fused, grad_b_ref_eager, rtol=3e-2, atol=3e-2), (
+        f"fused grad_b vs eager reference drift: "
+        f"max={bdiff.max().item():.4e} mean={bdiff.mean().item():.4e}"
+    )
+
+    # compute_bias_grad=False path: no bias_grad produced.
+    gy_pending_nb = _make_pending()
+    x_pending_nb = _make_pending()
+    _, grad_b_none = cublaslt_fp8_linear_bwd_w(
+        grad_y, x, gy_scale=gy_scale, x_scale=x_scale,
+        gy_pending=gy_pending_nb, x_pending=x_pending_nb,
+        out_dtype=torch.bfloat16, compute_bias_grad=False,
+    )
+    assert grad_b_none is None, (
+        "compute_bias_grad=False must yield a None bias gradient so "
+        "callers that don't need one pay zero extra kernel work."
+    )
+
+    # gy_pending still captured amax (reduction is an additional side-
+    # output on the same kernel; amax accumulation remains intact).
     assert torch.isclose(
         gy_pending, gy_amax.float().unsqueeze(0), rtol=1e-5, atol=1e-5,
     ).item()

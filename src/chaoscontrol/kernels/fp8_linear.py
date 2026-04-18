@@ -237,13 +237,14 @@ class _FusedFP8LinearFn(torch.autograd.Function):
             out_dtype=torch.bfloat16,
             compute_bias_grad=ctx.has_bias,
         )
-        if ctx.has_bias and grad_b is None:
-            # Fused BGRADB is unsupported in every cuBLAS we've probed
-            # for fp8 E5M2×E4M3 (12.8.4 and 13.4.0.1, checked
-            # 2026-04-17 and 2026-04-18) — the C++ kernel catches the
-            # heuristic rejection and returns None so we reduce eagerly.
-            # TE uses the same fallback at this dim range.
-            grad_b = grad_y_c.sum(dim=0).to(torch.bfloat16)
+        # Bias gradient is produced inside the bwd_w cast kernel via a
+        # fused column-sum reduction (task 25, 2026-04-18) — piggybacks
+        # on the bf16 read bandwidth we're already paying for the fp8
+        # cast of grad_y. Replaces the former Python grad_y.sum(0) path,
+        # which existed because cuBLASLt's BGRADB epilogue is rejected
+        # for fp8 E5M2×E4M3 on every cuBLAS version we've probed
+        # (12.8.4, 13.4.0.1). Our path is independent of NVIDIA shipping
+        # that epilogue.
 
         # Phase 3: the gx_pending update was Python-orchestrated (two
         # kernel launches: .abs().amax() + .maximum()) and was eating

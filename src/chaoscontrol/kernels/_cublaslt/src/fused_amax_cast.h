@@ -79,10 +79,18 @@ void launch_fused_flush_amax_diagnostic(
 // 1, col_stride_in=N (i.e. reading the M×N tensor column-by-column in
 // the transposed access pattern). The kernel writes out_fp8 in row-major
 // [N, M] layout — i.e. contiguous rows of length M.
+// Optional ``bias_grad_fp32`` side-output (nullable): when non-null, each
+// thread does ``atomicAdd(&bias_grad_fp32[r], v)`` alongside its fp8 cast,
+// producing a column-sum of the INPUT in fp32 at [rows_out] shape. Used by
+// the fp8 E5M2×E4M3 backward to compute the bias gradient as a free rider
+// on the cast's bf16 read bandwidth — NVIDIA's CUBLASLT_EPILOGUE_BGRADB
+// does not support this dtype pair on cublasLt 13.4.0.1 (task 25). Caller
+// must pre-zero the buffer; the kernel only accumulates.
 void launch_fused_amax_cast_transpose_bf16(
     const void* x_bf16,
     const void* scale_ptr,
     void* pending,
+    void* bias_grad_fp32,     // optional fp32 [rows_out] column-sum out, or nullptr
     void* out_fp8,
     c10::ScalarType out_dtype,
     int64_t rows_out,         // output rows (logical [rows_out, cols_out])

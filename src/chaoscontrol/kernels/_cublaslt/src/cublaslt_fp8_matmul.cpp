@@ -377,29 +377,18 @@ std::tuple<at::Tensor, std::optional<at::Tensor>> cublaslt_fp8_matmul_grad_w(
     const at::Tensor& scale_x,
     at::ScalarType out_dtype,
     bool compute_bias_grad) {
-    if (compute_bias_grad) {
-        // Try BGRADB first. Empirically (cuBLAS 12.8.4 and 13.4.0.1,
-        // probed 2026-04-17 and 2026-04-18) BGRADB is rejected with
-        // CUBLAS_STATUS_NOT_SUPPORTED (code 15) for fp8 E5M2×E4M3 at
-        // every shape we tested. The fallback path below returns nullopt
-        // so the caller can reduce ``grad_y`` eagerly — this is what TE
-        // itself does at the same dim range, so we're not leaving
-        // throughput on the table by a measurable amount. Keep the path
-        // in place until a future cuBLAS release lights up the epilogue.
-        try {
-            auto result = fp8_matmul_impl(grad_y_fp8_t, x_fp8, scale_gy, scale_x,
-                                          /*bias_in=*/c10::nullopt, out_dtype,
-                                          BiasMode::BGradB, /*fast_accum=*/false);
-            return std::make_tuple(std::move(result.d),
-                                   std::move(result.bias_grad));
-        } catch (const std::runtime_error& e) {
-            const std::string what = e.what();
-            if (what.find("heuristic") == std::string::npos) {
-                throw;   // Not a heuristic/support issue — re-raise.
-            }
-            // Fall through to DEFAULT path.
-        }
-    }
+    // Primitive-path entry takes pre-cast fp8 operands, so it does not
+    // have the bf16 ``grad_y`` needed to fold a column-sum into a cast
+    // pass (the strategy used by ``cublaslt_fp8_linear_bwd_w``).
+    // cuBLASLt's BGRADB epilogue is rejected with
+    // CUBLAS_STATUS_NOT_SUPPORTED for fp8 E5M2×E4M3 on every cuBLAS
+    // we've probed (12.8.4 / 13.4.0.1), so we take the DEFAULT epilogue
+    // unconditionally and return nullopt for bias_grad. Callers that
+    // want a bias gradient at this entry point must compute
+    // ``grad_y.sum(0).to(bf16)`` eagerly themselves. Callers wanting
+    // the efficient fused path should use
+    // ``cublaslt_fp8_linear_bwd_w``.
+    (void)compute_bias_grad;
     auto result = fp8_matmul_impl(grad_y_fp8_t, x_fp8, scale_gy, scale_x,
                                   /*bias_in=*/c10::nullopt, out_dtype,
                                   BiasMode::None, /*fast_accum=*/false);
@@ -502,43 +491,10 @@ static at::Tensor fused_amax_cast_transpose(
     return staging.t();
 }
 
-// Fused amax + cast for the grad_w path's two operands.
-//
-// (a) grad_y.t() [N, M] row-major E5M2 from grad_y [M, N] row-major bf16.
-//     The kernel writes [N, M] row-major fp8 directly; transpose is
-//     implemented by an index permutation in the kernel, not by a
-//     .contiguous() copy.
-static at::Tensor fused_amax_cast_grad_y_transposed(
-    const at::Tensor& grad_y_bf16,  // [M, N] row-major bf16
-    const at::Tensor& scale,
-    at::Tensor pending,
-    at::ScalarType fp8_dtype) {
-    TORCH_CHECK(grad_y_bf16.is_cuda()
-                    && grad_y_bf16.scalar_type() == at::kBFloat16
-                    && grad_y_bf16.dim() == 2
-                    && grad_y_bf16.is_contiguous(),
-                "grad_y must be contiguous 2-D bf16 CUDA tensor");
-    const int64_t M = grad_y_bf16.size(0);
-    const int64_t N = grad_y_bf16.size(1);
-
-    auto out = at::empty({N, M}, grad_y_bf16.options().dtype(fp8_dtype));
-    cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
-    // Output [N, M] row-major — for output cell (r=n, c=m), read input
-    // [m, n] = (n * 1 + m * N) in row-major [M, N] flattening. With
-    // in_row_stride = 1, in_col_stride = N.
-    launch_fused_amax_cast_transpose_bf16(
-        grad_y_bf16.data_ptr(),
-        scale.data_ptr(),
-        pending.data_ptr(),
-        out.data_ptr(),
-        fp8_dtype,
-        /*rows_out=*/N,
-        /*cols_out=*/M,
-        /*in_row_stride=*/1,
-        /*in_col_stride=*/N,
-        stream);
-    return out;
-}
+// (Former ``fused_amax_cast_grad_y_transposed`` helper removed 2026-04-18
+// when ``cublaslt_fp8_linear_bwd_w`` inlined the call to pass its new
+// ``bias_grad_fp32`` output pointer. The launch contract is identical;
+// just the wrapping layer is gone.)
 
 // (b) x [M, K] column-major fp8 from x [M, K] row-major bf16.
 //     Physical layout needed: strides (1, M) — the transpose of an [M, K]
@@ -569,6 +525,7 @@ static at::Tensor fused_amax_cast_x_transposed_then_transpose_back(
         x_bf16.data_ptr(),
         scale.data_ptr(),
         pending.data_ptr(),
+        /*bias_grad_fp32=*/nullptr,
         staging.data_ptr(),
         fp8_dtype,
         /*rows_out=*/K,
@@ -642,6 +599,7 @@ at::Tensor cublaslt_fp8_linear_bwd_x(
         weight_bf16.data_ptr(),
         w_scale.data_ptr(),
         /*pending=*/nullptr,
+        /*bias_grad_fp32=*/nullptr,
         staging_w.data_ptr(),
         at::kFloat8_e4m3fn,
         /*rows_out=*/K,
@@ -717,58 +675,93 @@ std::tuple<at::Tensor, std::optional<at::Tensor>> cublaslt_fp8_linear_bwd_w(
     at::Tensor x_pending,            // scratch — reuse is safe (see forward)
     at::ScalarType out_dtype,
     bool compute_bias_grad) {
-    // grad_y.t() → [N, M] E5M2 row-major
-    at::Tensor gy_t_fp8 = fused_amax_cast_grad_y_transposed(
-        grad_y_bf16, gy_scale, gy_pending, at::kFloat8_e5m2);
-    // x → [M, K] E4M3 column-major (transpose-and-back trick). The
-    // forward already accumulated the x amax into x_pending at the
-    // current step; re-running the atomicMax here would be idempotent
-    // but wasted work. The helper below honors pending=nullptr to skip
-    // the atomic write. Allocate staging and call through the kernel
-    // directly so we can pass nullptr.
-    (void)x_pending;
+    (void)x_pending;  // reuse-is-safe, see forward
+    TORCH_CHECK(grad_y_bf16.is_cuda()
+                    && grad_y_bf16.scalar_type() == at::kBFloat16
+                    && grad_y_bf16.dim() == 2
+                    && grad_y_bf16.is_contiguous(),
+                "grad_y must be contiguous 2-D bf16 CUDA tensor");
     TORCH_CHECK(x_bf16.is_contiguous(), "x must be contiguous");
+    const int64_t yM = grad_y_bf16.size(0);
+    const int64_t yN = grad_y_bf16.size(1);
     const int64_t xM = x_bf16.size(0);
     const int64_t xK = x_bf16.size(1);
+    TORCH_CHECK(yM == xM, "grad_y [M,N] and x [M,K] must share batch M");
+    cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
+
+    // When compute_bias_grad is requested, allocate an fp32 scratch
+    // [N] to receive the column-sum that the grad_y cast kernel folds
+    // in on our behalf. cuBLASLt's CUBLASLT_EPILOGUE_BGRADB does not
+    // support fp8 E5M2×E4M3 on any cuBLAS we've probed (12.8.4 /
+    // 13.4.0.1) — NVIDIA feature gap, not a build issue. Folding the
+    // reduction into our existing cast kernel piggybacks on bf16 read
+    // bandwidth we're already paying for; zero additional kernel
+    // launches vs the BGRADB-works hypothetical.
+    //
+    // at::zeros uses cudaMemsetAsync so the pre-zero is a fast device
+    // memset rather than a per-cell kernel.
+    std::optional<at::Tensor> bias_grad_fp32;
+    void* bias_grad_fp32_ptr = nullptr;
+    if (compute_bias_grad) {
+        bias_grad_fp32 = at::zeros(
+            {yN}, grad_y_bf16.options().dtype(at::kFloat));
+        bias_grad_fp32_ptr = bias_grad_fp32->data_ptr();
+    }
+
+    // grad_y [M, N] bf16 → gy_t [N, M] E5M2 row-major, with optional
+    // column-sum side-output into bias_grad_fp32.
+    at::Tensor gy_t_fp8 = at::empty(
+        {yN, yM}, grad_y_bf16.options().dtype(at::kFloat8_e5m2));
+    launch_fused_amax_cast_transpose_bf16(
+        grad_y_bf16.data_ptr(),
+        gy_scale.data_ptr(),
+        gy_pending.data_ptr(),
+        bias_grad_fp32_ptr,
+        gy_t_fp8.data_ptr(),
+        at::kFloat8_e5m2,
+        /*rows_out=*/yN,
+        /*cols_out=*/yM,
+        /*in_row_stride=*/1,
+        /*in_col_stride=*/yN,
+        stream);
+
+    // x → [M, K] E4M3 column-major. Pending=nullptr because the forward
+    // already accumulated x's amax this step; bias_grad_fp32=nullptr
+    // because the bias gradient lives on the grad_y axis, not x.
     auto staging_x = at::empty({xK, xM},
                                x_bf16.options().dtype(at::kFloat8_e4m3fn));
-    cudaStream_t stream_bwdw = c10::cuda::getCurrentCUDAStream();
     launch_fused_amax_cast_transpose_bf16(
         x_bf16.data_ptr(),
         x_scale.data_ptr(),
         /*pending=*/nullptr,
+        /*bias_grad_fp32=*/nullptr,
         staging_x.data_ptr(),
         at::kFloat8_e4m3fn,
         /*rows_out=*/xK,
         /*cols_out=*/xM,
         /*in_row_stride=*/1,
         /*in_col_stride=*/xK,
-        stream_bwdw);
+        stream);
     at::Tensor x_col_fp8 = staging_x.t();
 
-    if (compute_bias_grad) {
-        try {
-            auto result = fp8_matmul_impl(gy_t_fp8, x_col_fp8,
-                                          gy_scale, x_scale,
-                                          /*bias_in=*/c10::nullopt,
-                                          out_dtype, BiasMode::BGradB,
-                                          /*fast_accum=*/false);
-            return std::make_tuple(std::move(result.d),
-                                   std::move(result.bias_grad));
-        } catch (const std::runtime_error& e) {
-            const std::string what = e.what();
-            if (what.find("heuristic") == std::string::npos) throw;
-            // Fall through to DEFAULT. See cublaslt_fp8_matmul_grad_w
-            // above — BGRADB is unsupported for fp8 E5M2×E4M3 in every
-            // cuBLAS we've probed (12.8.4, 13.4.0.1).
-        }
-    }
+    // GEMM — no BGRADB epilogue; we provided the bias grad in the cast
+    // kernel above. DEFAULT epilogue, always.
     auto result = fp8_matmul_impl(gy_t_fp8, x_col_fp8,
                                   gy_scale, x_scale,
                                   /*bias_in=*/c10::nullopt,
                                   out_dtype, BiasMode::None,
                                   /*fast_accum=*/false);
-    return std::make_tuple(std::move(result.d), std::optional<at::Tensor>{});
+
+    // Finalize bias_grad: cast fp32 accumulator → out_dtype (bf16) for
+    // the caller. Launches on the same stream as the cast, so ordering
+    // is implicit; the cast's atomics are visible by the time .to()
+    // reads them.
+    std::optional<at::Tensor> bias_grad_out;
+    if (compute_bias_grad) {
+        bias_grad_out = bias_grad_fp32->to(out_dtype);
+    }
+
+    return std::make_tuple(std::move(result.d), std::move(bias_grad_out));
 }
 
 }  // namespace cc_cublaslt

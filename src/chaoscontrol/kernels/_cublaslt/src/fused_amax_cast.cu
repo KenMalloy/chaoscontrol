@@ -120,11 +120,28 @@ __global__ void fused_amax_cast_1d_kernel(
 // Transpose variant: reads a 2-D input with arbitrary strides (to support
 // a transposed view) and writes out_fp8 as row-major [rows_out, cols_out].
 // Used for grad_y.t() (bwd-w) and for x [M,K] col-major (bwd-w b operand).
+//
+// Optional column-sum side-output (``bias_grad_fp32``, nullable): when
+// non-null, each thread does ``atomicAdd(&bias_grad_fp32[r], v)`` in
+// addition to the fp8 cast, producing the bf16-reduced-sum-over-cols
+// needed for the fp8 E5M2×E4M3 bias-grad path (cf. task 25 —
+// CUBLASLT_EPILOGUE_BGRADB unsupported by NVIDIA for this dtype pair).
+// Caller must pre-zero the buffer; we only accumulate.
+//
+// Atomic contention: in the submission regime (rows_out=N, cols_out=M,
+// M >> blockDim), each block's threads mostly hit the same ``r``, so
+// up to blockDim threads contend on one address. H100's L2 atomics
+// absorb that at a few-µs-per-block cost — small vs the ~50-100 µs
+// savings we get from eliminating the Python grad_y.sum(0) reduction.
+// A block-local smem reduction to drop contention to one atomicAdd
+// per block per ``r`` is a straightforward optimization if the bench
+// shows it as a hot lane.
 template <typename Tag, int kBlockThreads>
 __global__ void fused_amax_cast_transpose_kernel(
     const __nv_bfloat16* __restrict__ x_bf16,
     const float* __restrict__ scale_ptr,
     float* __restrict__ pending,
+    float* __restrict__ bias_grad_fp32,
     __nv_fp8_storage_t* __restrict__ out_fp8,
     int64_t rows_out,
     int64_t cols_out,
@@ -144,6 +161,9 @@ __global__ void fused_amax_cast_transpose_kernel(
         const float a = fabsf(v);
         if (a > thread_max) thread_max = a;
         out_fp8[k] = quantize_to_fp8(v * inv_scale, Tag{});
+        if (bias_grad_fp32 != nullptr) {
+            atomicAdd(&bias_grad_fp32[r], v);
+        }
     }
     float block_max = block_reduce_max<kBlockThreads>(thread_max);
     if (threadIdx.x == 0 && block_max > 0.0f && pending != nullptr) {
@@ -295,6 +315,7 @@ void launch_fused_amax_cast_transpose_bf16(
     const void* x_bf16,
     const void* scale_ptr,
     void* pending,
+    void* bias_grad_fp32,
     void* out_fp8,
     c10::ScalarType out_dtype,
     int64_t rows_out,
@@ -308,16 +329,17 @@ void launch_fused_amax_cast_transpose_bf16(
     const auto* x_ptr = static_cast<const __nv_bfloat16*>(x_bf16);
     const auto* s_ptr = static_cast<const float*>(scale_ptr);
     auto* p_ptr = static_cast<float*>(pending);
+    auto* bg_ptr = static_cast<float*>(bias_grad_fp32);
     auto* o_ptr = static_cast<__nv_fp8_storage_t*>(out_fp8);
     if (out_dtype == at::kFloat8_e4m3fn) {
         fused_amax_cast_transpose_kernel<TagE4M3, kThreadsPerBlock>
             <<<grid, kThreadsPerBlock, 0, stream>>>(
-                x_ptr, s_ptr, p_ptr, o_ptr,
+                x_ptr, s_ptr, p_ptr, bg_ptr, o_ptr,
                 rows_out, cols_out, in_row_stride, in_col_stride);
     } else if (out_dtype == at::kFloat8_e5m2) {
         fused_amax_cast_transpose_kernel<TagE5M2, kThreadsPerBlock>
             <<<grid, kThreadsPerBlock, 0, stream>>>(
-                x_ptr, s_ptr, p_ptr, o_ptr,
+                x_ptr, s_ptr, p_ptr, bg_ptr, o_ptr,
                 rows_out, cols_out, in_row_stride, in_col_stride);
     } else {
         return;
