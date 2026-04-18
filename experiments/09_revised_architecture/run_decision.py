@@ -1,5 +1,14 @@
 #!/usr/bin/env python3
-"""Decision experiment: go/no-go on H100 scale-up.
+"""EXPLORATORY-ONLY — not paper-grade.
+
+Uses unpaired Welch-style summaries via ``stats.welch_ttest`` and an older
+exploratory decision workflow rather than the paired confirmatory framing
+the paper requires. Per ``docs/plans/2026-04-17-paper-status.md``
+§"Claims that are not safe yet" (item 4), numbers from this script MUST
+NOT appear in any confirmatory paper table without being re-run under the
+paired repeated-measures framing called out in §"Immediate next steps".
+
+Decision experiment: go/no-go on H100 scale-up.
 
 Tests whether the full ChaosControl stack (SSM + memory + Wernicke MoE)
 outperforms bare SSM and transformer at increasing training budgets.
@@ -402,6 +411,12 @@ def print_decision(data_path: str):
 
 
 def main():
+    print(
+        "\n  EXPLORATORY-ONLY — not paper-grade.\n"
+        "  Numbers from this script MUST NOT appear in confirmatory paper tables.\n"
+        "  See docs/plans/2026-04-17-paper-status.md \"Claims that are not safe yet\" (item 4).\n",
+        file=sys.stderr,
+    )
     parser = argparse.ArgumentParser(description="Decision experiment: go/no-go on H100 scale-up")
     parser.add_argument("--data-path", required=True)
     parser.add_argument("--num-gpus", type=int, default=1)

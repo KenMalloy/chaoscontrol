@@ -1,5 +1,15 @@
 #!/usr/bin/env python3
-"""Phase 2 eval-time ablation: test gate, CFR, memory state, and warmup on Phase 1 checkpoints.
+"""EXPLORATORY-ONLY — not paper-grade.
+
+Uses a bucket-0 CFR prior at eval time and unpaired Welch-style summaries
+via ``stats.welch_ttest``. Per
+``docs/plans/2026-04-17-paper-status.md`` §"Claims that are not safe yet"
+(item 4), numbers from this script MUST NOT appear in any confirmatory
+paper table without first being re-run under the paired repeated-measures
+framing called out in §"Immediate next steps".
+
+Phase 2 eval-time ablation: test gate, CFR, memory state, and warmup on
+Phase 1 checkpoints.
 
 Loads trained checkpoints from Phase 1 and evaluates under all meaningful
 combinations of inference-time settings. Forward passes only -- no training.
@@ -348,6 +358,12 @@ def run_single_eval(
 
 
 def main():
+    print(
+        "\n  EXPLORATORY-ONLY — not paper-grade.\n"
+        "  Numbers from this script MUST NOT appear in confirmatory paper tables.\n"
+        "  See docs/plans/2026-04-17-paper-status.md \"Claims that are not safe yet\" (item 4).\n",
+        file=sys.stderr,
+    )
     parser = argparse.ArgumentParser(description="Phase 2: Eval-time ablation matrix")
     parser.add_argument("--checkpoint-dir", required=True, help="Dir with Phase 1 .pt checkpoints")
     parser.add_argument("--data-path", required=True, help="FineWeb data dir")
