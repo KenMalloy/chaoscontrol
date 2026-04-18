@@ -449,7 +449,14 @@ class ChaosSSMCore(nn.Module):
             # Do not remove without also collapsing the fast/slow paths to one.
             # Cost: O(B*D), negligible vs. (B, T, D) forward; real persisted
             # non-zero states skip this branch via the short-circuit.
-            if not torch.any(initial_state):
+            #
+            # `requires_grad` gate: a trainable `h0` (Task 7 / Axis 2) may
+            # legitimately start at zero but needs the autograd edge through
+            # the slow path so gradient accumulates on the source Parameter.
+            # Training's zero-init buffer is `x.new_zeros` with grad disabled,
+            # so the fast path still fires there. See
+            # test_trainable_h0_receives_gradient for the regression pin.
+            if not torch.any(initial_state) and not initial_state.requires_grad:
                 initial_state = None
         else:
             state = x.new_zeros((batch, dim))

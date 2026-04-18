@@ -59,6 +59,29 @@ def test_nonzero_initial_state_changes_output():
     assert not torch.allclose(out_zero["logits"], out_nz["logits"], atol=1e-5)
 
 
+def test_zero_initial_state_with_grad_flows_gradient():
+    """Zero-valued initial_state WITH requires_grad=True must route through
+    the slow path so autograd accumulates grad on the source Parameter.
+
+    The fast-path zero short-circuit (core.py) is gated on
+    `not initial_state.requires_grad` precisely so Axis 2 `trainable_h0`
+    starts at zero yet still receives gradient. See
+    test_trainable_h0_receives_gradient for the Axis-2 integration pin;
+    this test is the minimal core-level contract.
+    """
+    import torch.nn as nn
+    m = _tiny_lm()
+    m.train()
+    ids = torch.randint(0, 32, (1, 16))
+    # Mint a zero Parameter per layer and feed it as initial_states.
+    h0 = [nn.Parameter(torch.zeros(1, 16)) for _ in range(2)]
+    out = m(ids, initial_states=h0)
+    out["logits"].sum().backward()
+    for p in h0:
+        assert p.grad is not None
+        assert p.grad.abs().sum() > 0
+
+
 def test_final_state_equals_chunked_sequential():
     """Whole-doc forward must equal concat of two chunked forwards threaded through final_state."""
     m = _tiny_lm()
