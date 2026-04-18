@@ -174,11 +174,17 @@ class NanoGPTLeanLM(nn.Module):
     def artifact_bytes(self) -> int:
         return int(sum(p.numel() for p in self.parameters()) * 2)
 
-    def forward(self, input_ids: torch.Tensor, *, return_jacobian_stats: bool = False):
+    def encode(self, input_ids: torch.Tensor) -> torch.Tensor:
+        """Return the pre-final_norm hidden state (B, T, D).
+
+        Contract for ``train_ssm_for_budget``: the chunked LM-head backward
+        runs ``model.encode()`` once, detaches, then loops chunked
+        forward/backward through ``final_norm + lm_head``. Must produce
+        the identical tensor to ``forward()["hidden"]`` or the chunked
+        path and the frozen forward path diverge.
+        """
         T = input_ids.shape[1]
         if T > self.rope_cache.shape[1]:
-            # Extend cache on-demand to cover longer sequences. Rare path;
-            # training typically stays under max_seq_len.
             head_dim = self.rope_cache.shape[-1]
             new_cache = _build_rope_cache(head_dim, T).to(self.rope_cache.device)
             self.rope_cache = new_cache
@@ -186,8 +192,11 @@ class NanoGPTLeanLM(nn.Module):
         h = self.embed(input_ids)
         for block in self.blocks:
             h = block(h, rope)
-        hidden = h
-        h = self.final_norm(h)
+        return h
+
+    def forward(self, input_ids: torch.Tensor, *, return_jacobian_stats: bool = False):
+        hidden = self.encode(input_ids)
+        h = self.final_norm(hidden)
         logits = self.lm_head(h)
         out = {"logits": logits, "hidden": hidden}
         if return_jacobian_stats:
