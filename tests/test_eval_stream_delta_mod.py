@@ -69,3 +69,68 @@ def test_log_a_shift_zero_does_not_raise_even_with_log_a_hint():
     core = ChaosSSMCore(dim=16, a_mode="diag")
     with DeltaModulator(core, delta_scale=1.0, log_a_shift=0.0, adapt_set_hint="log_a"):
         pass  # no raise
+
+
+def test_multi_core_model_all_cores_get_hooks():
+    """DeltaModulator walks `module.modules()` to find ChaosSSMCores.
+    For a full model with N layers, all N cores must be modulated, not
+    just the first. Otherwise the Phase D sweep partially modulates and
+    the result is a lie about Δ-rescaling.
+    """
+    from chaoscontrol.model import ChaosStudentLM
+    torch.manual_seed(0)
+    m = ChaosStudentLM(
+        vocab_size=32, dim=16, num_layers=3, block_type="ssm", a_mode="diag",
+    )
+    # Collect the 3 cores.
+    cores = [c for c in m.modules() if isinstance(c, ChaosSSMCore)]
+    assert len(cores) == 3
+
+    # Without modulator, no hooks.
+    for c in cores:
+        assert len(c.delta_proj._forward_hooks) == 0
+
+    with DeltaModulator(m, delta_scale=2.0):
+        for c in cores:
+            assert len(c.delta_proj._forward_hooks) == 1, \
+                f"core {id(c)} missing hook"
+
+    # After exit, all cleaned up.
+    for c in cores:
+        assert len(c.delta_proj._forward_hooks) == 0
+
+
+def test_multi_core_log_a_shift_applied_to_all():
+    """Every ChaosSSMCore's log_a gets shifted on enter and restored on exit."""
+    from chaoscontrol.model import ChaosStudentLM
+    torch.manual_seed(0)
+    m = ChaosStudentLM(
+        vocab_size=32, dim=16, num_layers=3, block_type="ssm", a_mode="diag",
+    )
+    cores = [c for c in m.modules() if isinstance(c, ChaosSSMCore)]
+    originals = [c.log_a.detach().clone() for c in cores]
+
+    with DeltaModulator(m, delta_scale=1.0, log_a_shift=0.5):
+        # All cores must be shifted.
+        for c, orig in zip(cores, originals):
+            assert torch.allclose(c.log_a, orig + 0.5, atol=1e-6), \
+                "log_a not shifted"
+
+    # After exit, all cores restored.
+    for c, orig in zip(cores, originals):
+        assert torch.equal(c.log_a, orig), "log_a not restored"
+
+
+def test_module_without_cores_is_no_op():
+    """Graceful no-op on a module that contains no ChaosSSMCore.
+
+    Regression pin: `_find_cores` uses isinstance filtering, so a module
+    hierarchy with no SSM cores must not crash or produce spurious hooks —
+    it should just enter/exit as a no-op. Matters for any test harness
+    that wraps a pure-attention baseline.
+    """
+    import torch.nn as nn
+    m = nn.Sequential(nn.Linear(4, 4), nn.ReLU(), nn.Linear(4, 4))
+    # No ChaosSSMCore anywhere.
+    with DeltaModulator(m, delta_scale=2.0, log_a_shift=0.5):
+        pass  # must not raise
