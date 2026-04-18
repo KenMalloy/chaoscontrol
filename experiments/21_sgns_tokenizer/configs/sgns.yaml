@@ -1,0 +1,12 @@
+# SGNS offline embedding pre-training — Exp 21
+# Used by scripts/train_sgns.py; duplicates the CLI defaults there
+# so the canonical hyperparameters live alongside the other configs.
+vocab_size: 8192
+dim: 256
+window: 5
+k: 10
+epochs: 3
+subsample_threshold: 1.0e-5
+batch_size: 4096
+lr: 0.025
+seed: 0

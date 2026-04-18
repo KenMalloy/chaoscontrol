@@ -1,0 +1,24 @@
+# Phase 0 transformer LR sweep — Exp 21
+# 1 seed × 3 LRs on the transformer_nanogpt_lean arm, random init only.
+# The winning LR is carried forward into Phase 6 (four_cell.yaml) for the
+# transformer arm; the SSM arm's LR stays at 0.064 (Exp 18 Test 5b winner).
+#
+# This YAML is documentation of the config shape; the orchestrator at
+# runner_phase0.py builds the actual condition dicts programmatically.
+model_type: transformer_nanogpt_lean
+model_dim: 256
+num_layers: 8
+n_head: 4
+ff_mult: 4
+vocab_size: 8192
+seq_len: 512
+stride: 256
+batch_size: 1024
+eval_batches: 16
+optimizer: muon
+dtype: bf16
+precision: bf16
+chunk_size: 64
+activation_checkpoint: true
+lrs: [0.016, 0.032, 0.064]
+seed: 1337

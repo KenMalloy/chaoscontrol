@@ -1,0 +1,56 @@
+# Exp 21 4-cell main ablation — SSM × modded-NanoGPT × {random, SGNS init}
+# 4 cells × 5 seeds = 20 runs. Thesis: semantic anchor geometry helps SSMs
+# more than transformers (primary: Δ_SSM > 0 at p<0.01, secondary:
+# Δ_SSM > Δ_Trans at p<0.01).
+#
+# The SSM arm's base_lr is the Exp 18 Test 5b winner for ws=2 × bs_per_rank=1024.
+# The transformer arm's base_lr is filled in by runner_4cell.py from the
+# Phase 0 winner JSON.
+#
+# This YAML documents the ablation shape; runner_4cell.py is the source of
+# truth for the exact condition dicts handed to _harness.
+cells:
+  - name: A_transformer_random
+    model_type: transformer_nanogpt_lean
+    model_dim: 256
+    num_layers: 8
+    n_head: 4
+    ff_mult: 4
+    embed_init_path: null
+    # base_lr: <from phase0 winner>
+  - name: B_transformer_sgns
+    model_type: transformer_nanogpt_lean
+    model_dim: 256
+    num_layers: 8
+    n_head: 4
+    ff_mult: 4
+    embed_init_path: artifacts/sgns_init_meanstd.pt
+    # base_lr: <from phase0 winner>
+  - name: C_ssm_random
+    model_type: ssm
+    model_dim: 256
+    num_layers: 4
+    ff_mult: 2
+    a_mode: diag
+    embed_init_path: null
+    base_lr: 0.064
+  - name: D_ssm_sgns
+    model_type: ssm
+    model_dim: 256
+    num_layers: 4
+    ff_mult: 2
+    a_mode: diag
+    embed_init_path: artifacts/sgns_init_meanstd.pt
+    base_lr: 0.064
+seeds: [1337, 42, 123, 7, 8]
+# Shared axes across all cells
+vocab_size: 8192
+seq_len: 512
+stride: 256
+batch_size: 1024
+eval_batches: 16
+optimizer: muon
+dtype: bf16
+precision: bf16
+chunk_size: 64
+activation_checkpoint: true
