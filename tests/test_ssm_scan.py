@@ -240,6 +240,33 @@ class TestAutograd:
 # ---------------------------------------------------------------------------
 
 
+class TestDynamoTraceable:
+    """``ssm_scan_forward`` must trace through ``torch.compile`` as an
+    opaque primitive. The ``torch.library.custom_op`` + ``register_fake``
+    wiring in ``__init__.py`` is the mechanism; this test is the contract
+    pin in case that wiring regresses silently. Matches the cuBLASLt
+    precedent which has the same dynamo-traceability requirement for
+    ``cublaslt_fp8_linear_fwd``.
+    """
+
+    def test_torch_compile_traces_forward(self):
+        @torch.compile(dynamic=False)
+        def traced(decay, update):
+            return ssm_scan_forward(decay, update)
+
+        torch.manual_seed(11)
+        B, T, D = 2, 16, 8
+        decay = (torch.rand(B, T, D, device="cuda") * 0.3 + 0.65).to(torch.bfloat16)
+        update = (torch.randn(B, T, D, device="cuda") * 0.1).to(torch.bfloat16)
+        y_traced = traced(decay, update)
+        y_eager = ssm_scan_forward(decay, update)
+        # Same kernel, same inputs — output should be bit-identical.
+        assert torch.equal(y_traced, y_eager), (
+            f"compile-traced kernel diverges from eager call at shape "
+            f"{tuple(y_traced.shape)}"
+        )
+
+
 class TestBackendWiring:
     def test_ssm_scan_backend_selectable_via_env(self):
         """CHAOSCONTROL_DIAG_SCAN_BACKEND=ssm_scan routes through the kernel."""

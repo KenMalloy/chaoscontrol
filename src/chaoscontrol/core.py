@@ -182,7 +182,10 @@ def _resolve_diag_recurrence_impl():
             _diag_recurrence_impl = _ssm_scan_fn
             _diag_recurrence_backend = "ssm_scan"
             _diag_recurrence_note = (
-                "hand-written CUDA kernel (forward) + autograd fallback (backward)"
+                "hand-written CUDA kernel (forward, ~1.5 G tok/s bf16 at "
+                "submission shape) + Python-loop autograd fallback (backward, "
+                "slower than the 'compile' backend); prefer 'compile' for full "
+                "training until the Phase 2 backward kernel lands"
             )
         else:
             _diag_recurrence_impl = _diag_recurrence_chunked

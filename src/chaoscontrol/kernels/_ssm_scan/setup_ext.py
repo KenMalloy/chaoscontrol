@@ -51,12 +51,14 @@ def build_ext_modules() -> list:
         "-gencode=arch=compute_90,code=sm_90",
         "--expt-relaxed-constexpr",
         "-Xcompiler=-fPIC",
-        # Use fast-math for fp32 FMAs inside the scan — scan is
-        # accumulator-dominated and we want the bf16-cast path to hit
-        # the H100 tensor pipeline's fp32 FMA throughput. Disable
-        # auto-contract that could reorder operations across the
-        # recurrence (we do not want `decay * state + update` reduced
-        # to an imprecise pattern).
+        # Use fast-math so nvcc emits the `decay * state + update`
+        # recurrence as a single fp32 FMA instead of a multiply-then-
+        # add. FMA is what we want on H100's tensor pipeline — the
+        # whole scan is accumulator-dominated and per-step FMA is the
+        # shortest-latency form of the recurrence. No ordering hazard:
+        # FMA collapses two consecutive ops into one, it does not
+        # reorder across the t→t+1 boundary (the loop is serial inside
+        # each thread).
         "-use_fast_math",
         # Silence the CCCL compatibility check: our cu13 pod has nvcc
         # 13.2 + cudart 13.0, which mismatch the minor version but are
