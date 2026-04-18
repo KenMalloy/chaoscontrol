@@ -612,3 +612,357 @@ class TestCPUFallback:
         assert decay.grad is not None and update.grad is not None
         assert torch.isfinite(decay.grad).all()
         assert torch.isfinite(update.grad).all()
+
+
+# ---------------------------------------------------------------------------
+# Autocast (fp32 decay, bf16/fp16 update) dtype-combo tests.
+#
+# Phase-3 fix pin: the shipped kernel (HEAD e80e00a) rejected the
+# (fp32_decay, bf16_update) tuple that autocast bf16 produces from
+# ``_diag_terms``. `torch.exp(-delta * a_base)` upcasts decay to fp32
+# under autocast bf16 while ``update = select * candidate`` stays bf16.
+# Without the template specialization these tests would raise a
+# RuntimeError from the binding's TORCH_CHECK on the unsupported tuple.
+# ---------------------------------------------------------------------------
+
+
+class TestAutocastDtypeCombos:
+    """Dtype-combo tests for the autocast production path.
+
+    The four core assertions:
+      * Direct forward parity — mixed fp32/bf16 and fp32/fp16 inputs
+      * Direct backward parity via ``autograd.grad`` on the Python loop
+      * Output dtype contract (matches ``update``)
+      * ``grad_decay`` dtype matches decay (fp32), so autocast's fp32
+        decay stays fp32 through backward (not bf16-quantized).
+
+    The parity tolerances mirror the existing bf16/fp16 tests — the
+    fp32 decay input actually makes these TIGHTER than the all-bf16
+    baseline because decay accumulates at fp32 precision through the
+    recurrence.
+    """
+
+    def test_fwd_fp32_decay_bf16_update_matches_python(self):
+        torch.manual_seed(400)
+        B, T, D = 4, 64, 32
+        # Construct inputs the way autocast bf16 produces them:
+        # fp32 decay (from torch.exp upcast), bf16 update (from
+        # bf16 * bf16 elementwise).
+        decay = (torch.rand(B, T, D, device="cuda") * 0.3 + 0.65)
+        update = (torch.randn(B, T, D, device="cuda") * 0.1).to(torch.bfloat16)
+        assert decay.dtype == torch.float32
+        assert update.dtype == torch.bfloat16
+
+        y_ker = ssm_scan_forward(decay, update)
+        # Output dtype must match update (bf16), not decay (fp32).
+        assert y_ker.dtype == torch.bfloat16
+
+        y_ref = _fp32_reference(decay, update)
+        # Tight bound — tighter than all-bf16 since decay stays fp32
+        # through the recurrence; only the final state cast quantizes.
+        max_diff = (y_ref.float() - y_ker.float()).abs().max().item()
+        assert max_diff < 5e-3, (
+            f"fp32/bf16 fwd diff: {max_diff:.2e}"
+        )
+
+    def test_fwd_fp32_decay_fp16_update_matches_python(self):
+        torch.manual_seed(401)
+        B, T, D = 4, 64, 32
+        decay = (torch.rand(B, T, D, device="cuda") * 0.3 + 0.65)
+        update = (torch.randn(B, T, D, device="cuda") * 0.1).to(torch.float16)
+        assert decay.dtype == torch.float32
+        assert update.dtype == torch.float16
+
+        y_ker = ssm_scan_forward(decay, update)
+        assert y_ker.dtype == torch.float16
+
+        y_ref = _fp32_reference(decay, update)
+        max_diff = (y_ref.float() - y_ker.float()).abs().max().item()
+        assert max_diff < 1e-3, (
+            f"fp32/fp16 fwd diff: {max_diff:.2e}"
+        )
+
+    def test_bwd_fp32_decay_bf16_update_matches_python(self):
+        """Backward kernel parity: grad_decay is fp32 (matches decay),
+        grad_update is bf16 (matches update)."""
+        torch.manual_seed(402)
+        B, T, D = 4, 64, 32
+        decay = (torch.rand(B, T, D, device="cuda") * 0.3 + 0.65)
+        update = (torch.randn(B, T, D, device="cuda") * 0.1).to(torch.bfloat16)
+        state, state_fp32 = ssm_scan_forward_with_state(decay, update)
+        # grad_state must match update dtype (bf16) per the contract.
+        grad_state = (torch.randn_like(state.float()) * 0.2).to(torch.bfloat16)
+
+        grad_d_ker, grad_u_ker = ssm_scan_backward(grad_state, decay, state_fp32)
+        # grad_decay dtype matches decay (fp32) — this is the whole
+        # point of the mixed-dtype specialization: keep decay grads at
+        # fp32 rather than bf16-quantizing them.
+        assert grad_d_ker.dtype == torch.float32, (
+            f"grad_decay must be fp32 when decay is fp32, got {grad_d_ker.dtype}"
+        )
+        assert grad_u_ker.dtype == torch.bfloat16
+
+        grad_d_ref, grad_u_ref = _python_loop_grads(decay, update, grad_state)
+        diff_d = (grad_d_ker - grad_d_ref).abs().max().item()
+        diff_u = (grad_u_ker.float() - grad_u_ref.float()).abs().max().item()
+        # fp32 decay grad should match the Python loop's fp32 grad tightly.
+        assert diff_d < 1e-4, f"fp32 grad_decay diff: {diff_d:.2e}"
+        assert diff_u < 1e-2, f"bf16 grad_update diff: {diff_u:.2e}"
+
+    def test_bwd_fp32_decay_fp16_update_matches_python(self):
+        torch.manual_seed(403)
+        B, T, D = 4, 64, 32
+        decay = (torch.rand(B, T, D, device="cuda") * 0.3 + 0.65)
+        update = (torch.randn(B, T, D, device="cuda") * 0.1).to(torch.float16)
+        state, state_fp32 = ssm_scan_forward_with_state(decay, update)
+        grad_state = (torch.randn_like(state.float()) * 0.2).to(torch.float16)
+
+        grad_d_ker, grad_u_ker = ssm_scan_backward(grad_state, decay, state_fp32)
+        assert grad_d_ker.dtype == torch.float32
+        assert grad_u_ker.dtype == torch.float16
+
+        grad_d_ref, grad_u_ref = _python_loop_grads(decay, update, grad_state)
+        diff_d = (grad_d_ker - grad_d_ref).abs().max().item()
+        diff_u = (grad_u_ker.float() - grad_u_ref.float()).abs().max().item()
+        assert diff_d < 1e-4, f"fp32 grad_decay diff: {diff_d:.2e}"
+        assert diff_u < 5e-3, f"fp16 grad_update diff: {diff_u:.2e}"
+
+    def test_autograd_fp32_decay_bf16_update_end_to_end(self):
+        """Full autograd roundtrip on mixed fp32/bf16 — exercises the
+        _SSMScanForwardFn wrapper, not just the raw kernel."""
+        torch.manual_seed(404)
+        B, T, D = 2, 64, 16
+        decay_base = torch.rand(B, T, D, device="cuda") * 0.3 + 0.65
+        update_base = (torch.randn(B, T, D, device="cuda") * 0.1).to(torch.bfloat16)
+
+        d_loop = decay_base.clone().detach().requires_grad_(True)
+        u_loop = update_base.clone().detach().requires_grad_(True)
+        d_ker = decay_base.clone().detach().requires_grad_(True)
+        u_ker = update_base.clone().detach().requires_grad_(True)
+
+        # Reference via Python loop. Cast to fp32 internally for
+        # stability (matches _diag_recurrence_inner's dtype promotion
+        # rules given a mixed-dtype input).
+        y_loop = _diag_recurrence_inner(
+            d_loop.to(torch.float32), u_loop.to(torch.float32),
+        ).to(torch.bfloat16)
+        y_loop.pow(2).sum().backward()
+
+        y_ker = ssm_scan(d_ker, u_ker)
+        assert y_ker.dtype == torch.bfloat16
+        y_ker.pow(2).sum().backward()
+
+        # decay grad should be fp32 (preserves autocast semantics)
+        assert d_ker.grad.dtype == torch.float32
+        assert u_ker.grad.dtype == torch.bfloat16
+        max_decay = (d_loop.grad - d_ker.grad).abs().max().item()
+        max_update = (u_loop.grad.float() - u_ker.grad.float()).abs().max().item()
+        assert max_decay < 1e-2, f"fp32 decay grad diff: {max_decay:.2e}"
+        assert max_update < 1e-2, f"bf16 update grad diff: {max_update:.2e}"
+
+
+class TestAutocastBf16Integration:
+    """Integration test for the autocast bf16 production path.
+
+    This is the load-bearing test that would have caught the shipped
+    HEAD e80e00a bug: run a real ChaosSSMCore forward+backward under
+    ``torch.autocast(device_type='cuda', dtype=torch.bfloat16)`` with
+    ``CHAOSCONTROL_DIAG_SCAN_BACKEND=ssm_scan`` and confirm (1) the
+    ssm_scan backend is actually active (not silently falling back),
+    and (2) the kernel accepts ``_diag_terms()``'s natural output —
+    fp32 decay from ``torch.exp(-delta * a_base)``, bf16 update from
+    ``select * candidate``.
+
+    BEFORE the Phase-3 fix: the kernel's dtype whitelist rejected the
+    (fp32, bf16) combo, so this test would raise a RuntimeError on the
+    first diag recurrence call with "unsupported (decay, update) dtype
+    combo: (Float, BFloat16)". Run this test once against HEAD e80e00a
+    (or any pre-fix commit) to see it fail — that's the gap.
+
+    AFTER the fix: the template specialization accepts (fp32, bf16)
+    natively with zero runtime pre-cast; the test passes.
+    """
+
+    def test_autocast_bf16_diag_terms_runs_through_kernel(self):
+        """Construct inputs exactly the way ``_diag_terms`` does under
+        autocast bf16 and push them through ``_diag_recurrence``. The
+        kernel MUST accept the (fp32, bf16) tuple."""
+        old_env = os.environ.get("CHAOSCONTROL_DIAG_SCAN_BACKEND")
+        os.environ["CHAOSCONTROL_DIAG_SCAN_BACKEND"] = "ssm_scan"
+        try:
+            if "chaoscontrol.core" in sys.modules:
+                importlib.reload(sys.modules["chaoscontrol.core"])
+            import chaoscontrol.core as core
+
+            info = core.get_diag_recurrence_backend()
+            assert info["backend"] == "ssm_scan", (
+                f"expected ssm_scan backend, got {info}"
+            )
+
+            torch.manual_seed(500)
+            dim = 32
+            core_mod = core.ChaosSSMCore(dim=dim, a_mode="diag").cuda()
+
+            # Submission-ish shape scaled down for test speed.
+            B, T = 2, 64
+            x = torch.randn(B, T, dim, device="cuda", dtype=torch.bfloat16)
+
+            # Inside this autocast context, ``_diag_terms`` produces:
+            #   a_base = sigmoid(log_a).to(x.dtype)  → bf16
+            #   delta  = F.softplus(delta_proj(x))   → bf16
+            #   decay  = torch.exp(-delta * a_base)  → fp32 (torch.exp
+            #            is on the autocast bf16 upcast list)
+            #   update = select * candidate          → bf16
+            # This is the exact dtype tuple that crashed HEAD e80e00a.
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                decay, update, gate = core_mod._diag_terms(x)
+
+            # Sanity: verify our understanding of autocast matches
+            # reality. If torch ever changes this behavior, the test
+            # shape needs to update.
+            assert decay.dtype == torch.float32, (
+                f"autocast bf16 should produce fp32 decay (via torch.exp "
+                f"upcast); got {decay.dtype}. If this assertion fires, "
+                f"autocast rules may have changed and the kernel's dtype "
+                f"dispatch may need revisiting."
+            )
+            assert update.dtype == torch.bfloat16, (
+                f"autocast bf16 should produce bf16 update (from bf16 * "
+                f"bf16); got {update.dtype}"
+            )
+
+            # The critical assertion: this call must NOT raise. On the
+            # pre-fix kernel, this raises RuntimeError from the binding's
+            # TORCH_CHECK on the unsupported (Float, BFloat16) combo.
+            y_ker = core._diag_recurrence(decay, update)
+            assert y_ker.dtype == torch.bfloat16
+
+            # Backend must still be ssm_scan — no silent demote.
+            info_after = core.get_diag_recurrence_backend()
+            assert info_after["backend"] == "ssm_scan", (
+                f"backend demoted after autocast call: {info_after}"
+            )
+
+            # Parity: kernel result matches the fp32 Python reference
+            # cast back to bf16.
+            y_ref = _fp32_reference(decay, update)
+            max_diff = (y_ref.float() - y_ker.float()).abs().max().item()
+            assert max_diff < 5e-3, (
+                f"autocast-path fwd diff: {max_diff:.2e}"
+            )
+        finally:
+            if old_env is None:
+                os.environ.pop("CHAOSCONTROL_DIAG_SCAN_BACKEND", None)
+            else:
+                os.environ["CHAOSCONTROL_DIAG_SCAN_BACKEND"] = old_env
+            if "chaoscontrol.core" in sys.modules:
+                importlib.reload(sys.modules["chaoscontrol.core"])
+
+    def test_autocast_bf16_full_forward_backward(self):
+        """End-to-end: run a ChaosSSMCore forward+backward inside
+        autocast bf16 with ssm_scan backend active. Confirms the full
+        training-step path — the one that crashed on step 1 in the
+        real runner — works after the fix.
+
+        Checks:
+          * Backend stays ssm_scan through the call
+          * Forward returns a tensor (no exception)
+          * Backward populates grads
+          * Grads are finite
+          * log_a grad is fp32 (param is fp32; autocast doesn't demote
+            leaf param dtype)
+        """
+        old_env = os.environ.get("CHAOSCONTROL_DIAG_SCAN_BACKEND")
+        os.environ["CHAOSCONTROL_DIAG_SCAN_BACKEND"] = "ssm_scan"
+        try:
+            if "chaoscontrol.core" in sys.modules:
+                importlib.reload(sys.modules["chaoscontrol.core"])
+            import chaoscontrol.core as core
+
+            info = core.get_diag_recurrence_backend()
+            assert info["backend"] == "ssm_scan"
+
+            torch.manual_seed(501)
+            dim = 32
+            core_mod = core.ChaosSSMCore(dim=dim, a_mode="diag").cuda()
+
+            B, T = 2, 64
+            x = torch.randn(
+                B, T, dim, device="cuda", dtype=torch.bfloat16,
+                requires_grad=True,
+            )
+
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                # _forward_diag_scan is the prod call path:
+                # decay, update, gate = self._diag_terms(x)
+                # states = _diag_recurrence(decay, update)
+                # out = gate * states
+                # return self.out_proj(out)
+                y = core_mod._forward_diag_scan(x)
+
+            loss = y.float().pow(2).sum()
+            loss.backward()
+
+            # Every param with requires_grad=True must have a finite grad.
+            for name, p in core_mod.named_parameters():
+                assert p.grad is not None, f"no grad on {name}"
+                assert torch.isfinite(p.grad).all(), (
+                    f"non-finite grad on {name}"
+                )
+            # log_a is fp32 leaf; autocast doesn't demote it.
+            assert core_mod.log_a.grad.dtype == torch.float32
+
+            # Backend must still be ssm_scan.
+            info_after = core.get_diag_recurrence_backend()
+            assert info_after["backend"] == "ssm_scan"
+        finally:
+            if old_env is None:
+                os.environ.pop("CHAOSCONTROL_DIAG_SCAN_BACKEND", None)
+            else:
+                os.environ["CHAOSCONTROL_DIAG_SCAN_BACKEND"] = old_env
+            if "chaoscontrol.core" in sys.modules:
+                importlib.reload(sys.modules["chaoscontrol.core"])
+
+
+class TestDtypeWhitelistNegative:
+    """Pin the behavior for combos OUTSIDE the dispatcher whitelist.
+
+    After the Phase-3 fix the whitelist is:
+      {(bf16, bf16), (bf16, fp16), (fp16, fp16), (fp32, fp32),
+       (fp32, bf16), (fp32, fp16)}.
+
+    Combos outside this set (e.g. bf16 decay + fp32 update — unusual,
+    since autocast upcasts decay to fp32 not the other way around)
+    must fall back to the fp32 Python reference via
+    ``_is_kernel_eligible``, not raise a TORCH_CHECK from the kernel.
+    This keeps the cache state machine intact (``TestBackendCache
+    StateMachine`` covers the general contract; this test pins the
+    dtype-combo-specific path)."""
+
+    def test_bf16_decay_fp32_update_falls_back_to_python(self):
+        """(bf16, fp32) isn't in the kernel's whitelist. autograd.Function
+        should route this through the fp32 Python reference rather than
+        raising from the C++ binding."""
+        from chaoscontrol.kernels._ssm_scan import _is_kernel_eligible
+
+        torch.manual_seed(600)
+        B, T, D = 2, 16, 8
+        decay = (torch.rand(B, T, D, device="cuda") * 0.3 + 0.65).to(torch.bfloat16)
+        update = torch.randn(B, T, D, device="cuda") * 0.1
+        assert decay.dtype == torch.bfloat16
+        assert update.dtype == torch.float32
+
+        # Whitelist gate must report ineligible.
+        assert not _is_kernel_eligible(decay, update), (
+            "(bf16, fp32) should NOT be kernel-eligible; it's not in the "
+            "dispatcher's whitelist and autograd should fall back."
+        )
+
+        # ssm_scan() must not raise — fallback path handles it.
+        y = ssm_scan(decay, update)
+        # Output dtype matches update.
+        assert y.dtype == torch.float32
+
+        # Reference via fp32 python.
+        y_ref = _diag_recurrence_inner(decay.float(), update).to(torch.float32)
+        assert torch.allclose(y, y_ref, atol=1e-4)
