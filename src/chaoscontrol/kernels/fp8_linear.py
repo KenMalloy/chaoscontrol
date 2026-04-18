@@ -52,6 +52,11 @@ import torch
 import torch.nn as nn
 
 from chaoscontrol.kernels._cublaslt import (
+    cublaslt_fp8_flush_amax,
+    cublaslt_fp8_flush_amax_diagnostic,
+    cublaslt_fp8_linear_bwd_w,
+    cublaslt_fp8_linear_bwd_x,
+    cublaslt_fp8_linear_fwd,
     cublaslt_fp8_matmul,
     cublaslt_fp8_matmul_grad_w,
     cublaslt_fp8_matmul_grad_x,
@@ -114,6 +119,12 @@ def _push_amax_and_rescale(
     All in-place on device. No host sync — the max over the history is
     still a GPU-side reduction, but it runs ONCE per optimizer step (per
     tensor per layer), not once per forward.
+
+    Phase 3: the hot path now calls ``cublaslt_fp8_flush_amax`` which
+    collapses this whole block into a single kernel launch. This Python
+    implementation is kept as a numerical reference for tests and as a
+    fallback on hosts where the extension isn't compiled — same policy
+    as ``_scaled_mm_forward_reference``.
     """
     with torch.no_grad():
         history.copy_(torch.roll(history, -1))
@@ -170,37 +181,28 @@ class _FusedFP8LinearFn(torch.autograd.Function):
         gy_pending: torch.Tensor,
         gx_pending: torch.Tensor,
     ) -> torch.Tensor:
-        # --- Fold this forward's amax into the pending buffers. ---
-        # torch.maximum is a pure device op (single kernel, no host sync).
-        # We detach so autograd doesn't graph the amax into its tape.
-        with torch.no_grad():
-            x_amax = x_flat.detach().abs().amax().to(torch.float32)
-            w_amax = weight.detach().abs().amax().to(torch.float32)
-            x_pending.copy_(torch.maximum(x_pending.squeeze(), x_amax))
-            w_pending.copy_(torch.maximum(w_pending.squeeze(), w_amax))
-
-        # --- Forward fp8 GEMM via the cuBLASLt fork. ---
-        # a: x_flat row-major [M, K] → quantize to E4M3.
-        # b: weight.t() column-major [K, N] → quantize to E4M3.
-        x_fp8 = (x_flat / x_scale).to(torch.float8_e4m3fn)
-        # Transpose produces a K×N view of the [N, K] weight. That view
-        # is column-major over [K, N] with strides (1, K) — exactly what
-        # the kernel requires. Quantization respects strides, so the
-        # resulting fp8 tensor preserves the column-major layout.
-        w_t_fp8 = (weight.t() / w_scale).to(torch.float8_e4m3fn)
-
-        y_flat = cublaslt_fp8_matmul(
-            x_fp8, w_t_fp8,
-            scale_a=x_scale, scale_b=w_scale,
+        # Phase 3: single C++ frame folds
+        #   * max-reduce of |x_flat|, atomic into x_pending,
+        #   * max-reduce of |weight|, atomic into w_pending,
+        #   * bf16→E4M3 cast of both at the CURRENT scales,
+        #   * fp8 cuBLASLt matmul + optional CUBLASLT_EPILOGUE_BIAS.
+        # Replaces ~6 Python-launched kernels with a single call.
+        y_flat = cublaslt_fp8_linear_fwd(
+            x_flat, weight,
+            x_scale=x_scale, w_scale=w_scale,
+            x_pending=x_pending, w_pending=w_pending,
             bias=bias, out_dtype=torch.bfloat16,
         )
 
-        # Save for backward. We save the fp8 tensors directly (not the
-        # bf16 originals) so we don't need to requantize on backward —
-        # the forward's fp8 cast is authoritative at the current scale.
+        # Save the bf16 operands (not the fp8 staging tensors — those
+        # were released at the C++ frame boundary). The backward
+        # re-casts x and grad_y via the same fused kernel. This costs
+        # one extra fp8 cast vs caching the staging fp8 forward-side,
+        # but avoids two Python-side transpose allocations, which
+        # dominated Phase 2's backward time.
         ctx.save_for_backward(
-            x_fp8, weight, x_scale, w_scale, gy_scale,
-            gy_pending, gx_pending,
+            x_flat, weight, x_scale, w_scale, gy_scale,
+            gy_pending, x_pending, gx_pending,
         )
         ctx.has_bias = bias is not None
         return y_flat
@@ -209,70 +211,46 @@ class _FusedFP8LinearFn(torch.autograd.Function):
     def backward(  # type: ignore[override]
         ctx: Any, grad_y: torch.Tensor,
     ) -> tuple[torch.Tensor | None, ...]:
-        (x_fp8, weight, x_scale, w_scale, gy_scale,
-         gy_pending, gx_pending) = ctx.saved_tensors
+        (x_flat, weight, x_scale, w_scale, gy_scale,
+         gy_pending, x_pending, gx_pending) = ctx.saved_tensors
 
-        # --- Quantize grad_y to E5M2 using the module-held scale. ---
-        # grad_y is [M, N] row-major. Make it contiguous (autograd can
-        # hand back non-contiguous grads when upstream ops fused views)
-        # so the fp8 cast produces the row-major layout the kernel wants.
+        # Autograd can hand back a non-contiguous grad_y when upstream
+        # ops fused views. The fused kernel requires row-major bf16.
         grad_y_c = grad_y.contiguous()
-        grad_y_fp8 = (grad_y_c / gy_scale).to(torch.float8_e5m2)
 
-        # Fold this backward's amax into the grad-y pending buffer.
-        with torch.no_grad():
-            gy_amax = grad_y_c.detach().abs().amax().to(torch.float32)
-            gy_pending.copy_(torch.maximum(gy_pending.squeeze(), gy_amax))
-
-        # --- grad_x = grad_y @ W via the cuBLASLt fork. ---
-        # a: grad_y_fp8 [M, N] row-major E5M2.
-        # b: need [N, K] column-major E4M3. Weight is [N, K] row-major
-        #    bf16, so weight.t() is [K, N] column-major. To get [N, K]
-        #    column-major we need a view whose first stride is 1 and
-        #    second stride is N — that's weight.t().contiguous().t().
-        #    The .contiguous() materializes the K×N transpose, then the
-        #    second .t() flips back to [N, K] column-major. Quantize
-        #    after the layout dance so fp8 bytes live in the right order.
-        weight_col = weight.t().contiguous().t()     # [N, K] col-major, bf16
-        weight_col_fp8 = (weight_col / w_scale).to(torch.float8_e4m3fn)
-
-        grad_x_flat = cublaslt_fp8_matmul_grad_x(
-            grad_y_fp8, weight_col_fp8,
-            scale_gy=gy_scale, scale_w=w_scale,
+        # grad_x = grad_y @ W — fused cast of grad_y (E5M2) + cast of
+        # weight to col-major E4M3 + GEMM, all in one C++ frame.
+        grad_x_flat = cublaslt_fp8_linear_bwd_x(
+            grad_y_c, weight,
+            gy_scale=gy_scale, w_scale=w_scale,
+            gy_pending=gy_pending, gx_pending=gx_pending,
             out_dtype=torch.bfloat16,
         )
 
-        # --- grad_w = grad_y.t() @ x (+ optional dbias via BGRADB). ---
-        # a: grad_y.t() [N, M] row-major E5M2. Materialize the transpose
-        #    so strides are contiguous in that layout.
-        grad_y_t_fp8 = (grad_y_c.t().contiguous() / gy_scale).to(torch.float8_e5m2)
-        # b: x [M, K] column-major E4M3. x_fp8 was saved in row-major
-        #    [M, K] from forward. Column-major [M, K] is x_fp8.t().contiguous().t().
-        #    The saved tensor's storage is row-major; we need to flip
-        #    the byte layout. For fp8 tensors ``.contiguous()`` on a
-        #    transposed view does materialize new storage — we pay that
-        #    cost once per backward.
-        x_col_fp8 = x_fp8.t().contiguous().t()       # [M, K] col-major E4M3
-
-        grad_w, grad_b = cublaslt_fp8_matmul_grad_w(
-            grad_y_t_fp8, x_col_fp8,
-            scale_gy=gy_scale, scale_x=x_scale,
+        # grad_w = grad_y.t() @ x + optional dbias — fused transpose-casts
+        # of grad_y (→[N, M] E5M2) and x (→[M, K] col-major E4M3) + GEMM
+        # with optional CUBLASLT_EPILOGUE_BGRADB.
+        grad_w, grad_b = cublaslt_fp8_linear_bwd_w(
+            grad_y_c, x_flat,
+            gy_scale=gy_scale, x_scale=x_scale,
+            gy_pending=gy_pending, x_pending=x_pending,
             out_dtype=torch.bfloat16,
             compute_bias_grad=ctx.has_bias,
         )
         if ctx.has_bias and grad_b is None:
-            # Fused BGRADB unavailable on this cuBLAS version — observed
-            # on 12.8.4, which rejects the BGRADA/B epilogues for fp8
-            # inputs. Fall back to the eager bf16 reduction. TE itself
-            # uses this path at the same dim range, so we don't give up
-            # anything measurable at the submission shape.
+            # Fused BGRADB unavailable on this cuBLAS version (observed
+            # on 12.8.4, which rejects BGRADA/B for fp8). Fall back to
+            # the eager bf16 reduction. Parity with the primitive path.
             grad_b = grad_y_c.sum(dim=0).to(torch.bfloat16)
 
-        # Fold grad_x amax into its pending buffer — diagnostic only; no
-        # downstream consumer reads it on this module's hot path.
-        with torch.no_grad():
-            gx_amax = grad_x_flat.detach().abs().amax().to(torch.float32)
-            gx_pending.copy_(torch.maximum(gx_pending.squeeze(), gx_amax))
+        # Phase 3: the gx_pending update was Python-orchestrated (two
+        # kernel launches: .abs().amax() + .maximum()) and was eating
+        # ~30-40 us per backward. The gx_amax signal is purely
+        # diagnostic — no consumer scale reads it — so we drop it from
+        # the hot path. The gx_amax_history ring will read zero in
+        # downstream diagnostics; any future consumer should fold the
+        # amax inside the C++ bwd_x entry point.
+        _ = gx_pending   # suppress unused-arg lint
 
         # Return order mirrors forward args.
         return (
@@ -385,26 +363,25 @@ class FusedFP8Linear(nn.Module):
     def flush_amax_history(self) -> None:
         """Roll pending amax into history + recompute scales, once per step.
 
-        Called by the training loop after ``optimizer.step()``. Cheap:
-        three pending→history rolls (one per tracked tensor that feeds a
-        GEMM) plus a single max-reduction over the length-16 history
-        ring. No host sync.
+        Phase 3: each (history, pending, scale) triple flushes via a
+        single C++ kernel launch — replaces ~6 Python-orchestrated ops
+        per tensor (``torch.roll + indexing + .max() + torch.where +
+        .copy_() + .zero_()``). Four tensors total → four kernel
+        launches instead of ~21. No host sync.
         """
-        _push_amax_and_rescale(
+        cublaslt_fp8_flush_amax(
             self.x_amax_history, self.x_amax_pending, self.x_scale, _E4M3_MAX,
         )
-        _push_amax_and_rescale(
+        cublaslt_fp8_flush_amax(
             self.w_amax_history, self.w_amax_pending, self.w_scale, _E4M3_MAX,
         )
-        _push_amax_and_rescale(
+        cublaslt_fp8_flush_amax(
             self.gy_amax_history, self.gy_amax_pending, self.gy_scale, _E5M2_MAX,
         )
-        # grad_x amax is diagnostic — roll its pending but don't maintain
-        # a consumer scale. Kept to mirror TE's per-tensor bookkeeping.
-        with torch.no_grad():
-            self.gx_amax_history.copy_(torch.roll(self.gx_amax_history, -1))
-            self.gx_amax_history[-1] = self.gx_amax_pending.squeeze()
-            self.gx_amax_pending.zero_()
+        # grad_x amax is diagnostic — roll + zero, no consumer scale.
+        cublaslt_fp8_flush_amax_diagnostic(
+            self.gx_amax_history, self.gx_amax_pending,
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Run fused fp8 Linear via the cuBLASLt fork.

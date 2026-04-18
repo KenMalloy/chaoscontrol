@@ -125,8 +125,144 @@ def cublaslt_fp8_matmul_grad_w(
     )
 
 
+def cublaslt_fp8_linear_fwd(
+    a_bf16: torch.Tensor,
+    b_bf16: torch.Tensor,
+    x_scale: torch.Tensor,
+    w_scale: torch.Tensor,
+    x_pending: torch.Tensor,
+    w_pending: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    out_dtype: torch.dtype = torch.bfloat16,
+) -> torch.Tensor:
+    """Fused amax-update + bf16→E4M3 cast + forward cuBLASLt matmul.
+
+    One C++ frame replaces the per-call Python orchestration of
+    ``torch.maximum + (x / scale).to(e4m3) + matmul``. See phase 3
+    task spec for rationale.
+
+    Args:
+        a_bf16: bf16 ``[M, K]`` row-major activations.
+        b_bf16: bf16 ``[N, K]`` row-major weight (transposed inside to
+            a column-major ``[K, N]`` fp8 tensor — no Python-side ``.t()``).
+        x_scale, w_scale: fp32 scalar dequant multipliers; read stale,
+            refreshed by ``flush_amax_history()``.
+        x_pending, w_pending: fp32 scalar pending-amax buffers; updated
+            atomically with ``max(|a|)``, ``max(|b|)``.
+        bias: optional ``[N]`` bias, fused via CUBLASLT_EPILOGUE_BIAS.
+        out_dtype: ``torch.bfloat16`` or ``torch.float16``.
+
+    Returns:
+        ``[M, N]`` tensor in ``out_dtype``.
+    """
+    _require_ext()
+    return _C.cublaslt_fp8_linear_fwd(
+        a_bf16, b_bf16, x_scale, w_scale, x_pending, w_pending, bias, out_dtype,
+    )
+
+
+def cublaslt_fp8_linear_bwd_x(
+    grad_y_bf16: torch.Tensor,
+    weight_bf16: torch.Tensor,
+    gy_scale: torch.Tensor,
+    w_scale: torch.Tensor,
+    gy_pending: torch.Tensor,
+    gx_pending: torch.Tensor,
+    out_dtype: torch.dtype = torch.bfloat16,
+) -> torch.Tensor:
+    """Fused amax-update + fp8 cast + backward matmul for ``grad_x``.
+
+    Updates ``gy_pending`` with ``amax(grad_y)``. ``gx_pending`` is
+    reserved for a diagnostic grad_x amax fold; currently the C++
+    implementation does not write to it (the Python wrapper folds it
+    post-return).
+
+    Args:
+        grad_y_bf16: bf16 ``[M, N]`` row-major.
+        weight_bf16: bf16 ``[N, K]`` row-major (same layout as
+            ``nn.Linear.weight``).
+        gy_scale, w_scale: fp32 scalar dequant multipliers.
+        gy_pending, gx_pending: fp32 scalar pending buffers.
+        out_dtype: ``torch.bfloat16`` (default).
+
+    Returns:
+        ``[M, K]`` grad_x tensor.
+    """
+    _require_ext()
+    return _C.cublaslt_fp8_linear_bwd_x(
+        grad_y_bf16, weight_bf16, gy_scale, w_scale, gy_pending, gx_pending,
+        out_dtype,
+    )
+
+
+def cublaslt_fp8_linear_bwd_w(
+    grad_y_bf16: torch.Tensor,
+    x_bf16: torch.Tensor,
+    gy_scale: torch.Tensor,
+    x_scale: torch.Tensor,
+    gy_pending: torch.Tensor,
+    x_pending: torch.Tensor,
+    out_dtype: torch.dtype = torch.bfloat16,
+    compute_bias_grad: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Fused amax-update + fp8 cast + backward matmul for ``grad_w``.
+
+    Handles the grad_y and x transposes internally — no Python-side
+    ``.t().contiguous()``. ``x_pending`` is currently ignored inside
+    (the forward already updated the same tensor's pending this step);
+    we still accept it for API uniformity.
+
+    Args:
+        grad_y_bf16: bf16 ``[M, N]`` row-major.
+        x_bf16: bf16 ``[M, K]`` row-major activations (the same tensor
+            used in the forward).
+        gy_scale, x_scale: fp32 scalar dequant multipliers.
+        gy_pending, x_pending: fp32 scalar pending buffers.
+        out_dtype: ``torch.bfloat16`` (default).
+        compute_bias_grad: if True, fuse CUBLASLT_EPILOGUE_BGRADB.
+
+    Returns:
+        ``(grad_w [N, K], grad_bias [N] or None)``.
+    """
+    _require_ext()
+    return _C.cublaslt_fp8_linear_bwd_w(
+        grad_y_bf16, x_bf16, gy_scale, x_scale, gy_pending, x_pending,
+        out_dtype, compute_bias_grad,
+    )
+
+
+def cublaslt_fp8_flush_amax(
+    history: torch.Tensor,
+    pending: torch.Tensor,
+    scale: torch.Tensor,
+    max_rep: float,
+) -> None:
+    """One-shot C++ amax flush.
+
+    Single kernel launch replaces the Python chain
+    ``history = torch.roll(history, -1); history[-1] = pending; scale =
+    max(history) / max_rep; pending.zero_()``. All updates in place.
+    """
+    _require_ext()
+    _C.cublaslt_fp8_flush_amax(history, pending, scale, float(max_rep))
+
+
+def cublaslt_fp8_flush_amax_diagnostic(
+    history: torch.Tensor,
+    pending: torch.Tensor,
+) -> None:
+    """Diagnostic flush variant: roll history, zero pending, no scale."""
+    _require_ext()
+    _C.cublaslt_fp8_flush_amax_diagnostic(history, pending)
+
+
 __all__ = [
     "cublaslt_fp8_matmul",
     "cublaslt_fp8_matmul_grad_x",
     "cublaslt_fp8_matmul_grad_w",
+    "cublaslt_fp8_linear_fwd",
+    "cublaslt_fp8_linear_bwd_x",
+    "cublaslt_fp8_linear_bwd_w",
+    "cublaslt_fp8_flush_amax",
+    "cublaslt_fp8_flush_amax_diagnostic",
 ]

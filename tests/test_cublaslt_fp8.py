@@ -47,6 +47,9 @@ import transformer_engine.pytorch as te  # type: ignore[import-not-found]  # noq
 try:
     from chaoscontrol.kernels._cublaslt import _C as _cublaslt_C  # noqa: F401
     from chaoscontrol.kernels._cublaslt import (
+        cublaslt_fp8_linear_bwd_w,
+        cublaslt_fp8_linear_bwd_x,
+        cublaslt_fp8_linear_fwd,
         cublaslt_fp8_matmul,
         cublaslt_fp8_matmul_grad_w,
         cublaslt_fp8_matmul_grad_x,
@@ -461,4 +464,226 @@ def test_grad_x_faster_than_scaled_mm() -> None:
         f"grad_x not fast enough: ours={ours_s * 1e6:.2f}us "
         f"_scaled_mm={scaled_mm_s * 1e6:.2f}us "
         f"ratio={ours_s / scaled_mm_s:.3f}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Phase 3: fused amax + cast + GEMM entry points.
+#
+# The fused path takes bf16 operands + scale/pending buffers; the primitive
+# path takes pre-cast fp8 operands + scales. These tests verify that the
+# fused path produces bit-comparable matmul output to the primitive path
+# AND that the pending buffers are atomically updated with the input amax.
+# ---------------------------------------------------------------------------
+
+
+def _make_pending() -> torch.Tensor:
+    """Zero fp32 scalar on CUDA — same shape as FusedFP8Linear's pending."""
+    return torch.zeros(1, dtype=torch.float32, device="cuda")
+
+
+def _make_scale(value: float) -> torch.Tensor:
+    return torch.tensor([value], dtype=torch.float32, device="cuda")
+
+
+def test_fwd_fused_amax_matches_primitive() -> None:
+    """Fused forward entry point: output matches the composition
+    ``cublaslt_fp8_matmul(x.to(e4m3), w.t().to(e4m3), ...)`` at fp8
+    tolerance, AND the pending buffers capture the input amax."""
+    torch.manual_seed(0)
+    M, K, N = 1024, 256, 256
+    x = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
+    w = torch.randn(N, K, device="cuda", dtype=torch.bfloat16) * 0.05
+    bias = torch.randn(N, device="cuda", dtype=torch.bfloat16) * 0.01
+
+    # Compute the dequant scales the way FusedFP8Linear would (after
+    # flush_amax_history) so both the fused and the primitive path are
+    # using the SAME scale — otherwise fp8 rounding diverges.
+    x_amax = x.float().abs().amax()
+    w_amax = w.float().abs().amax()
+    x_scale_val = (x_amax / _E4M3_MAX).item()
+    w_scale_val = (w_amax / _E4M3_MAX).item()
+    x_scale = _make_scale(x_scale_val)
+    w_scale = _make_scale(w_scale_val)
+    x_pending = _make_pending()
+    w_pending = _make_pending()
+
+    # Fused path.
+    y_fused = cublaslt_fp8_linear_fwd(
+        x, w, x_scale=x_scale, w_scale=w_scale,
+        x_pending=x_pending, w_pending=w_pending,
+        bias=bias, out_dtype=torch.bfloat16,
+    )
+
+    # Primitive reference: cast the same way, call the primitive directly.
+    x_fp8 = (x / x_scale).to(torch.float8_e4m3fn)
+    w_t_fp8 = (w.t() / w_scale).to(torch.float8_e4m3fn)
+    y_ref = cublaslt_fp8_matmul(
+        x_fp8, w_t_fp8, scale_a=x_scale, scale_b=w_scale,
+        bias=bias, out_dtype=torch.bfloat16,
+    )
+
+    assert y_fused.shape == y_ref.shape == (M, N)
+    assert y_fused.dtype == torch.bfloat16
+    diff = (y_fused.float() - y_ref.float()).abs()
+    assert torch.allclose(y_fused, y_ref, rtol=3e-2, atol=3e-2), (
+        f"fused vs primitive drift: max={diff.max().item():.4e} "
+        f"mean={diff.mean().item():.4e}"
+    )
+    # Pending buffers updated with the observed amax. Bit-pattern
+    # atomicMax should equal the tensor amax down to fp32 precision.
+    assert torch.isclose(
+        x_pending, x_amax.float().unsqueeze(0), rtol=1e-5, atol=1e-5,
+    ).item(), f"x_pending={x_pending.item()} != x_amax={x_amax.item()}"
+    assert torch.isclose(
+        w_pending, w_amax.float().unsqueeze(0), rtol=1e-5, atol=1e-5,
+    ).item(), f"w_pending={w_pending.item()} != w_amax={w_amax.item()}"
+
+
+def test_bwd_x_fused_matches_primitive() -> None:
+    """Fused backward grad_x matches the primitive path."""
+    torch.manual_seed(0)
+    M, K, N = 1024, 256, 256
+    grad_y = torch.randn(M, N, device="cuda", dtype=torch.bfloat16) * 0.1
+    w = torch.randn(N, K, device="cuda", dtype=torch.bfloat16) * 0.05
+
+    gy_amax = grad_y.float().abs().amax()
+    w_amax = w.float().abs().amax()
+    gy_scale = _make_scale((gy_amax / _E5M2_MAX).item())
+    w_scale = _make_scale((w_amax / _E4M3_MAX).item())
+    gy_pending = _make_pending()
+    gx_pending = _make_pending()
+
+    grad_x_fused = cublaslt_fp8_linear_bwd_x(
+        grad_y, w, gy_scale=gy_scale, w_scale=w_scale,
+        gy_pending=gy_pending, gx_pending=gx_pending,
+        out_dtype=torch.bfloat16,
+    )
+
+    # Primitive path via explicit cast + grad_x kernel.
+    gy_fp8 = (grad_y / gy_scale).to(torch.float8_e5m2)
+    w_col = w.t().contiguous().t()   # [N, K] col-major bf16
+    w_col_fp8 = (w_col / w_scale).to(torch.float8_e4m3fn)
+    grad_x_ref = cublaslt_fp8_matmul_grad_x(
+        gy_fp8, w_col_fp8, scale_gy=gy_scale, scale_w=w_scale,
+        out_dtype=torch.bfloat16,
+    )
+
+    assert grad_x_fused.shape == grad_x_ref.shape == (M, K)
+    diff = (grad_x_fused.float() - grad_x_ref.float()).abs()
+    assert torch.allclose(grad_x_fused, grad_x_ref, rtol=3e-2, atol=3e-2), (
+        f"fused grad_x vs primitive drift: max={diff.max().item():.4e}"
+    )
+    # gy_pending captured grad_y amax.
+    assert torch.isclose(
+        gy_pending, gy_amax.float().unsqueeze(0), rtol=1e-5, atol=1e-5,
+    ).item()
+
+
+def test_bwd_w_fused_matches_primitive() -> None:
+    """Fused backward grad_w + bias_grad match the primitive path."""
+    torch.manual_seed(0)
+    M, K, N = 1024, 256, 256
+    grad_y = torch.randn(M, N, device="cuda", dtype=torch.bfloat16) * 0.1
+    x = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
+
+    gy_amax = grad_y.float().abs().amax()
+    x_amax = x.float().abs().amax()
+    gy_scale = _make_scale((gy_amax / _E5M2_MAX).item())
+    x_scale = _make_scale((x_amax / _E4M3_MAX).item())
+    gy_pending = _make_pending()
+    x_pending = _make_pending()
+
+    grad_w_fused, grad_b_fused = cublaslt_fp8_linear_bwd_w(
+        grad_y, x, gy_scale=gy_scale, x_scale=x_scale,
+        gy_pending=gy_pending, x_pending=x_pending,
+        out_dtype=torch.bfloat16, compute_bias_grad=True,
+    )
+
+    # Primitive path.
+    gy_t_fp8 = (grad_y.t().contiguous() / gy_scale).to(torch.float8_e5m2)
+    x_col_fp8 = (x.t().contiguous().t() / x_scale).to(torch.float8_e4m3fn)
+    grad_w_ref, grad_b_ref = cublaslt_fp8_matmul_grad_w(
+        gy_t_fp8, x_col_fp8, scale_gy=gy_scale, scale_x=x_scale,
+        out_dtype=torch.bfloat16, compute_bias_grad=True,
+    )
+
+    assert grad_w_fused.shape == grad_w_ref.shape == (N, K)
+    diff = (grad_w_fused.float() - grad_w_ref.float()).abs()
+    assert torch.allclose(grad_w_fused, grad_w_ref, rtol=3e-2, atol=3e-2), (
+        f"fused grad_w vs primitive drift: max={diff.max().item():.4e}"
+    )
+    if grad_b_fused is not None and grad_b_ref is not None:
+        bdiff = (grad_b_fused.float() - grad_b_ref.float()).abs()
+        assert torch.allclose(grad_b_fused, grad_b_ref, rtol=3e-2, atol=3e-2), (
+            f"fused grad_b drift: max={bdiff.max().item():.4e}"
+        )
+    else:
+        # Both primitive and fused paths should fall back together, OR
+        # both should succeed; a split indicates a branching bug.
+        assert (grad_b_fused is None) == (grad_b_ref is None), (
+            "fused and primitive bias-grad paths diverged on BGRADB fallback"
+        )
+    # gy_pending updated.
+    assert torch.isclose(
+        gy_pending, gy_amax.float().unsqueeze(0), rtol=1e-5, atol=1e-5,
+    ).item()
+
+
+def test_pending_buffers_accumulate_max_atomically() -> None:
+    """Call the fused fwd twice with different inputs. The pending
+    buffer must hold the MAX across both calls — not be overwritten
+    by the second call.
+    """
+    torch.manual_seed(0)
+    M, K, N = 128, 64, 64
+    # First input: small amax.
+    x1 = torch.randn(M, K, device="cuda", dtype=torch.bfloat16) * 0.1
+    # Second input: large amax.
+    x2 = torch.randn(M, K, device="cuda", dtype=torch.bfloat16) * 10.0
+    w = torch.randn(N, K, device="cuda", dtype=torch.bfloat16) * 0.05
+
+    amax_1 = x1.float().abs().amax().item()
+    amax_2 = x2.float().abs().amax().item()
+    assert amax_2 > amax_1, "test setup: x2 must have larger amax"
+
+    x_scale = _make_scale(amax_2 / _E4M3_MAX)  # use stable scale
+    w_scale = _make_scale(w.float().abs().amax().item() / _E4M3_MAX)
+    x_pending = _make_pending()
+    w_pending = _make_pending()
+
+    cublaslt_fp8_linear_fwd(
+        x1, w, x_scale=x_scale, w_scale=w_scale,
+        x_pending=x_pending, w_pending=w_pending,
+        bias=None, out_dtype=torch.bfloat16,
+    )
+    after_first = float(x_pending.item())
+    assert after_first > 0.0
+    assert abs(after_first - amax_1) < 1e-4 * max(amax_1, 1.0), (
+        f"after first call x_pending={after_first} != amax_1={amax_1}"
+    )
+
+    cublaslt_fp8_linear_fwd(
+        x2, w, x_scale=x_scale, w_scale=w_scale,
+        x_pending=x_pending, w_pending=w_pending,
+        bias=None, out_dtype=torch.bfloat16,
+    )
+    after_second = float(x_pending.item())
+    # Must be max(amax_1, amax_2) = amax_2 — not amax_2 alone if amax_1
+    # were somehow larger, and NOT amax_1 (overwrite bug).
+    assert abs(after_second - amax_2) < 1e-3 * amax_2, (
+        f"after second call x_pending={after_second} != amax_2={amax_2}"
+    )
+
+    # Call #3 with a SMALLER input: pending must NOT regress.
+    x3 = torch.randn(M, K, device="cuda", dtype=torch.bfloat16) * 0.01
+    cublaslt_fp8_linear_fwd(
+        x3, w, x_scale=x_scale, w_scale=w_scale,
+        x_pending=x_pending, w_pending=w_pending,
+        bias=None, out_dtype=torch.bfloat16,
+    )
+    after_third = float(x_pending.item())
+    assert abs(after_third - amax_2) < 1e-3 * amax_2, (
+        f"pending regressed: after third call x_pending={after_third} "
+        f"but should still hold max amax_2={amax_2}"
     )

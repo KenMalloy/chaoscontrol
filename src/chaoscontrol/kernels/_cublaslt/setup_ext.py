@@ -32,7 +32,7 @@ def build_ext_modules() -> list:
           no CUDA kernels, only host-side cuBLASLt calls.
     """
     try:
-        from torch.utils.cpp_extension import CppExtension
+        from torch.utils.cpp_extension import CppExtension, CUDAExtension
     except ImportError:
         # torch not installed — no editable build here. The pyproject
         # declares torch>=2.0 so this should only hit truly broken envs.
@@ -46,7 +46,8 @@ def build_ext_modules() -> list:
     # — only `sources` is policed.
     repo_root = this_dir.parents[3]
     cpp_rel = this_dir.relative_to(repo_root) / "src" / "cublaslt_fp8_matmul.cpp"
-    sources = [str(cpp_rel)]
+    cu_rel = this_dir.relative_to(repo_root) / "src" / "fused_amax_cast.cu"
+    sources = [str(cpp_rel), str(cu_rel)]
 
     src_dir = this_dir / "src"
     include_dirs = [str(src_dir)]
@@ -147,7 +148,21 @@ def build_ext_modules() -> list:
     # LD_LIBRARY_PATH preset at import time.
     runtime_library_dirs = list(library_dirs)
 
-    extra_compile_args = ["-O3", "-std=c++17"]
+    # The extension now includes a .cu kernel (``fused_amax_cast.cu``) so
+    # we need nvcc in the loop. Split extra_compile_args by compiler.
+    cxx_args = ["-O3", "-std=c++17"]
+    # nvcc must match the host C++ standard and target the H100's sm_90
+    # (our only production GPU). Keep the list short; adding -O3 tells
+    # nvcc to pass -O3 to the device compiler too.
+    nvcc_args = [
+        "-O3",
+        "-std=c++17",
+        "-gencode=arch=compute_90,code=sm_90",
+        "--expt-relaxed-constexpr",
+        "-Xcompiler=-fPIC",
+    ]
+    extra_compile_args = {"cxx": cxx_args, "nvcc": nvcc_args}
+
     # Link against versioned libs by filename — the nvidia-*-cuNN wheels
     # only ship versioned .so.NN files (no unversioned symlinks). The
     # ``-l:filename`` form is a GCC/GNU-ld extension that asks for a
@@ -160,8 +175,10 @@ def build_ext_modules() -> list:
     ]
 
     # Tell PyTorch's BUILD_ABI stays consistent with how torch was built.
-    # CppExtension already appends torch's include dirs + ABI flag.
-    ext = CppExtension(
+    # CUDAExtension injects nvcc into the build and wires up CUDA include
+    # dirs; we still need cublasLt headers in include_dirs (nvidia wheel
+    # layout).
+    ext = CUDAExtension(
         name="chaoscontrol.kernels._cublaslt._C",
         sources=sources,
         include_dirs=include_dirs,

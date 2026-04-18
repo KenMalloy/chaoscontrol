@@ -58,6 +58,7 @@
 #include <string>
 #include <tuple>
 
+#include "fused_amax_cast.h"
 #include "workspace_cache.h"
 
 namespace cc_cublaslt {
@@ -458,6 +459,369 @@ std::tuple<at::Tensor, std::optional<at::Tensor>> cublaslt_fp8_matmul_grad_w(
     return std::make_tuple(std::move(result.d), std::optional<at::Tensor>{});
 }
 
+// --------------------------------------------------------------------------
+// Phase 3 fused entry points: fold amax-update + bf16→fp8 cast + GEMM into
+// a single C++ call. Python still reads amax scales from separate device
+// buffers refreshed by flush_amax_history() — we only collapse the per-call
+// orchestration, not the deferred-amax lifecycle.
+//
+// Each entry point takes bf16 operands + a scale buffer + a pending buffer,
+// allocates the fp8 staging tensors, launches the fused kernel, and then
+// delegates to the existing fp8_matmul_impl for the cuBLASLt matmul. The
+// fp8 staging tensors go out of scope at the end of each call — PyTorch's
+// caching allocator keeps the slab warm so there is no per-iteration
+// cudaMalloc.
+// --------------------------------------------------------------------------
+
+namespace {
+
+// Fused amax + bf16→fp8 cast producing a ROW-MAJOR [M, K] fp8 output
+// from a row-major [M, K] bf16 input. Used for:
+//   * forward x (E4M3)
+//   * backward grad_y @ grad_x path (E5M2)
+static at::Tensor fused_amax_cast_rowmajor(
+    const at::Tensor& x_bf16,    // [M, K] row-major bf16 (or a contiguous view)
+    const at::Tensor& scale,     // fp32 scalar, device
+    at::Tensor pending,          // fp32 scalar, device — updated atomically
+    at::ScalarType fp8_dtype) {  // kFloat8_e4m3fn or kFloat8_e5m2
+    TORCH_CHECK(x_bf16.is_cuda(), "input must be CUDA");
+    TORCH_CHECK(x_bf16.scalar_type() == at::kBFloat16,
+                "input must be bfloat16");
+    TORCH_CHECK(scale.is_cuda() && scale.scalar_type() == at::kFloat
+                    && scale.numel() == 1,
+                "scale must be fp32 scalar device tensor");
+    TORCH_CHECK(pending.is_cuda() && pending.scalar_type() == at::kFloat
+                    && pending.numel() == 1,
+                "pending must be fp32 scalar device tensor");
+    TORCH_CHECK(fp8_dtype == at::kFloat8_e4m3fn || fp8_dtype == at::kFloat8_e5m2,
+                "fp8_dtype must be e4m3fn or e5m2");
+    TORCH_CHECK(x_bf16.is_contiguous(), "input must be contiguous row-major");
+    auto out = at::empty(x_bf16.sizes(), x_bf16.options().dtype(fp8_dtype));
+    cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
+    launch_fused_amax_cast_bf16(
+        x_bf16.data_ptr(),
+        scale.data_ptr(),
+        pending.data_ptr(),
+        out.data_ptr(),
+        fp8_dtype,
+        x_bf16.numel(),
+        stream);
+    return out;
+}
+
+// Fused amax + cast producing a COLUMN-MAJOR [K, N] fp8 output from a
+// row-major [N, K] bf16 input (i.e. casts weight.t()). weight_bf16 is
+// [N, K] contiguous row-major with strides (K, 1). The output is the
+// transpose: [K, N] with strides (1, K) — exactly what the cuBLASLt
+// forward kernel expects as its ``b`` operand.
+//
+// Implementation: we write the output in a logical [K, N] row-major
+// layout which, since N fits the physical col-stride, produces the
+// col-major [K, N] layout we need. The kernel treats the bf16 input
+// via a transposed indexing pattern.
+static at::Tensor fused_amax_cast_transpose(
+    const at::Tensor& weight_bf16,  // [N, K] row-major bf16
+    const at::Tensor& scale,
+    at::Tensor pending,
+    at::ScalarType fp8_dtype) {
+    TORCH_CHECK(weight_bf16.is_cuda(), "weight must be CUDA");
+    TORCH_CHECK(weight_bf16.scalar_type() == at::kBFloat16,
+                "weight must be bfloat16");
+    TORCH_CHECK(weight_bf16.dim() == 2, "weight must be 2-D");
+    TORCH_CHECK(weight_bf16.is_contiguous(),
+                "weight must be contiguous [N, K] row-major");
+    const int64_t N = weight_bf16.size(0);
+    const int64_t K = weight_bf16.size(1);
+
+    // Allocate as [K, N] with stride (1, K) — column-major over [K, N].
+    // We do this by allocating a contiguous [N, K] tensor and taking
+    // .t(); the .t() flips strides to (1, K). The cast kernel writes
+    // out in row-major [N, K] which, after .t(), presents as col-major
+    // [K, N] — exactly the b-operand layout cuBLASLt wants.
+    auto staging = at::empty({N, K}, weight_bf16.options().dtype(fp8_dtype));
+    // We will write staging as row-major [N, K] with the SAME indexing
+    // as weight_bf16 — i.e. no transpose kernel needed here because the
+    // byte layout of staging.t() is already column-major [K, N].
+    cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
+    launch_fused_amax_cast_bf16(
+        weight_bf16.data_ptr(),
+        scale.data_ptr(),
+        pending.data_ptr(),
+        staging.data_ptr(),
+        fp8_dtype,
+        weight_bf16.numel(),
+        stream);
+    // .t() returns a view with flipped strides; no data movement.
+    return staging.t();
+}
+
+// Fused amax + cast for the grad_w path's two operands.
+//
+// (a) grad_y.t() [N, M] row-major E5M2 from grad_y [M, N] row-major bf16.
+//     The kernel writes [N, M] row-major fp8 directly; transpose is
+//     implemented by an index permutation in the kernel, not by a
+//     .contiguous() copy.
+static at::Tensor fused_amax_cast_grad_y_transposed(
+    const at::Tensor& grad_y_bf16,  // [M, N] row-major bf16
+    const at::Tensor& scale,
+    at::Tensor pending,
+    at::ScalarType fp8_dtype) {
+    TORCH_CHECK(grad_y_bf16.is_cuda()
+                    && grad_y_bf16.scalar_type() == at::kBFloat16
+                    && grad_y_bf16.dim() == 2
+                    && grad_y_bf16.is_contiguous(),
+                "grad_y must be contiguous 2-D bf16 CUDA tensor");
+    const int64_t M = grad_y_bf16.size(0);
+    const int64_t N = grad_y_bf16.size(1);
+
+    auto out = at::empty({N, M}, grad_y_bf16.options().dtype(fp8_dtype));
+    cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
+    // Output [N, M] row-major — for output cell (r=n, c=m), read input
+    // [m, n] = (n * 1 + m * N) in row-major [M, N] flattening. With
+    // in_row_stride = 1, in_col_stride = N.
+    launch_fused_amax_cast_transpose_bf16(
+        grad_y_bf16.data_ptr(),
+        scale.data_ptr(),
+        pending.data_ptr(),
+        out.data_ptr(),
+        fp8_dtype,
+        /*rows_out=*/N,
+        /*cols_out=*/M,
+        /*in_row_stride=*/1,
+        /*in_col_stride=*/N,
+        stream);
+    return out;
+}
+
+// (b) x [M, K] column-major fp8 from x [M, K] row-major bf16.
+//     Physical layout needed: strides (1, M) — the transpose of an [M, K]
+//     contiguous tensor. Implementation: allocate a contiguous [K, M] fp8
+//     tensor, write rows=K × cols=M where each cell (r=k, c=m) reads
+//     input[m, k] = m*K + k (in_row_stride=K for row=k, in_col_stride=1
+//     for col=m  — OR just swap axes: we want to write dst[k, m] from
+//     src[m, k]). Then return staging.t() as the [M, K] col-major view.
+static at::Tensor fused_amax_cast_x_transposed_then_transpose_back(
+    const at::Tensor& x_bf16,   // [M, K] row-major bf16
+    const at::Tensor& scale,
+    at::Tensor pending,
+    at::ScalarType fp8_dtype) {
+    TORCH_CHECK(x_bf16.is_cuda()
+                    && x_bf16.scalar_type() == at::kBFloat16
+                    && x_bf16.dim() == 2
+                    && x_bf16.is_contiguous(),
+                "x must be contiguous 2-D bf16 CUDA tensor");
+    const int64_t M = x_bf16.size(0);
+    const int64_t K = x_bf16.size(1);
+
+    auto staging = at::empty({K, M}, x_bf16.options().dtype(fp8_dtype));
+    cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
+    // Output [K, M] row-major; for (r=k, c=m) read src[m, k] → index
+    // m*K + k. So in_row_stride = 1 (row index k contributes +1),
+    // in_col_stride = K (col index m contributes +K).
+    launch_fused_amax_cast_transpose_bf16(
+        x_bf16.data_ptr(),
+        scale.data_ptr(),
+        pending.data_ptr(),
+        staging.data_ptr(),
+        fp8_dtype,
+        /*rows_out=*/K,
+        /*cols_out=*/M,
+        /*in_row_stride=*/1,
+        /*in_col_stride=*/K,
+        stream);
+    // staging.t() is [M, K] with strides (1, K) — col-major, what
+    // cublaslt_fp8_matmul_grad_w wants as its b operand.
+    return staging.t();
+}
+
+}  // namespace
+
+// Forward: amax + E4M3 cast of x and w, then GEMM. Bias optional.
+at::Tensor cublaslt_fp8_linear_fwd(
+    const at::Tensor& a_bf16,        // [M, K] row-major bf16
+    const at::Tensor& b_bf16,        // [N, K] row-major bf16 (i.e. weight);
+                                     // we transpose to [K, N] col-major inside.
+    const at::Tensor& x_scale,
+    const at::Tensor& w_scale,
+    at::Tensor x_pending,
+    at::Tensor w_pending,
+    const c10::optional<at::Tensor>& bias,
+    at::ScalarType out_dtype) {
+    at::Tensor a_fp8 = fused_amax_cast_rowmajor(
+        a_bf16, x_scale, x_pending, at::kFloat8_e4m3fn);
+    at::Tensor b_fp8 = fused_amax_cast_transpose(
+        b_bf16, w_scale, w_pending, at::kFloat8_e4m3fn);
+
+    const BiasMode mode = (bias.has_value() && bias->defined())
+                              ? BiasMode::ForwardBias
+                              : BiasMode::None;
+    auto result = fp8_matmul_impl(a_fp8, b_fp8, x_scale, w_scale, bias,
+                                  out_dtype, mode, /*fast_accum=*/true);
+    return std::move(result.d);
+}
+
+// Backward grad_x: fused cast of grad_y (E5M2) and weight.t() (E4M3 col-major),
+// then GEMM.
+at::Tensor cublaslt_fp8_linear_bwd_x(
+    const at::Tensor& grad_y_bf16,  // [M, N] row-major bf16
+    const at::Tensor& weight_bf16,  // [N, K] row-major bf16
+    const at::Tensor& gy_scale,
+    const at::Tensor& w_scale,
+    at::Tensor gy_pending,
+    at::Tensor gx_pending,            // diagnostic only; we don't touch it here
+    at::ScalarType out_dtype) {
+    (void)gx_pending;   // diagnostic grad_x amax folded by Python after return
+
+    at::Tensor gy_fp8 = fused_amax_cast_rowmajor(
+        grad_y_bf16, gy_scale, gy_pending, at::kFloat8_e5m2);
+    // Weight: we want [N, K] col-major E4M3 — strides (1, N). That means
+    // a contiguous [K, N] cast with a transposed read pattern, then .t().
+    //
+    // Input layout: weight_bf16 is [N, K] contiguous row-major (strides
+    //   (K, 1)). Output (staging) layout: [K, N] contiguous row-major.
+    //   Cell (r=k, c=n) in staging reads input[n, k] = n*K + k.
+    //   So in_row_stride = 1, in_col_stride = K.
+    TORCH_CHECK(weight_bf16.is_contiguous(), "weight must be contiguous");
+    const int64_t N = weight_bf16.size(0);
+    const int64_t K = weight_bf16.size(1);
+    auto staging_w = at::empty({K, N}, weight_bf16.options().dtype(at::kFloat8_e4m3fn));
+    cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
+    // Pass nullptr for the pending buffer — the weight's amax was
+    // already accumulated in w_pending during forward, and re-
+    // accumulating the same tensor here would not change the max
+    // (idempotent) but would cost an atomic round-trip. Skipping the
+    // atomic write entirely is cleaner.
+    launch_fused_amax_cast_transpose_bf16(
+        weight_bf16.data_ptr(),
+        w_scale.data_ptr(),
+        /*pending=*/nullptr,
+        staging_w.data_ptr(),
+        at::kFloat8_e4m3fn,
+        /*rows_out=*/K,
+        /*cols_out=*/N,
+        /*in_row_stride=*/1,
+        /*in_col_stride=*/K,
+        stream);
+    at::Tensor w_fp8 = staging_w.t();   // [N, K] col-major
+
+    auto result = fp8_matmul_impl(gy_fp8, w_fp8, gy_scale, w_scale,
+                                  /*bias_in=*/c10::nullopt,
+                                  out_dtype, BiasMode::None,
+                                  /*fast_accum=*/false);
+    return std::move(result.d);
+}
+
+// One-shot flush of a (history, pending) pair → (new_scale), all in
+// a single kernel launch. Replaces ``_push_amax_and_rescale`` in
+// fp8_linear.py. Works in-place on the passed tensors — no return
+// value since both history and scale are updated on device.
+void cublaslt_fp8_flush_amax(
+    at::Tensor history,   // fp32 [H], device
+    at::Tensor pending,   // fp32 [1], device
+    at::Tensor scale,     // fp32 [1], device
+    double max_rep) {
+    TORCH_CHECK(history.is_cuda() && history.scalar_type() == at::kFloat,
+                "history must be fp32 CUDA");
+    TORCH_CHECK(pending.is_cuda() && pending.scalar_type() == at::kFloat
+                    && pending.numel() == 1,
+                "pending must be fp32 scalar CUDA");
+    TORCH_CHECK(scale.is_cuda() && scale.scalar_type() == at::kFloat
+                    && scale.numel() == 1,
+                "scale must be fp32 scalar CUDA");
+    TORCH_CHECK(history.is_contiguous(), "history must be contiguous");
+    TORCH_CHECK(history.numel() <= 1024, "history too long (max 1024)");
+    cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
+    launch_fused_flush_amax(
+        static_cast<float*>(history.data_ptr()),
+        static_cast<float*>(pending.data_ptr()),
+        static_cast<float*>(scale.data_ptr()),
+        static_cast<int>(history.numel()),
+        static_cast<float>(max_rep),
+        stream);
+}
+
+// Diagnostic flush (no scale): roll + zero. Used for gx_amax_history.
+void cublaslt_fp8_flush_amax_diagnostic(
+    at::Tensor history,
+    at::Tensor pending) {
+    TORCH_CHECK(history.is_cuda() && history.scalar_type() == at::kFloat,
+                "history must be fp32 CUDA");
+    TORCH_CHECK(pending.is_cuda() && pending.scalar_type() == at::kFloat
+                    && pending.numel() == 1,
+                "pending must be fp32 scalar CUDA");
+    TORCH_CHECK(history.is_contiguous(), "history must be contiguous");
+    TORCH_CHECK(history.numel() <= 1024, "history too long (max 1024)");
+    cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
+    launch_fused_flush_amax_diagnostic(
+        static_cast<float*>(history.data_ptr()),
+        static_cast<float*>(pending.data_ptr()),
+        static_cast<int>(history.numel()),
+        stream);
+}
+
+// Backward grad_w + optional bias_grad: fused transposed-cast of grad_y
+// and x, then GEMM with optional BGRADB epilogue.
+std::tuple<at::Tensor, std::optional<at::Tensor>> cublaslt_fp8_linear_bwd_w(
+    const at::Tensor& grad_y_bf16,   // [M, N] row-major bf16
+    const at::Tensor& x_bf16,        // [M, K] row-major bf16
+    const at::Tensor& gy_scale,
+    const at::Tensor& x_scale,
+    at::Tensor gy_pending,
+    at::Tensor x_pending,            // scratch — reuse is safe (see forward)
+    at::ScalarType out_dtype,
+    bool compute_bias_grad) {
+    // grad_y.t() → [N, M] E5M2 row-major
+    at::Tensor gy_t_fp8 = fused_amax_cast_grad_y_transposed(
+        grad_y_bf16, gy_scale, gy_pending, at::kFloat8_e5m2);
+    // x → [M, K] E4M3 column-major (transpose-and-back trick). The
+    // forward already accumulated the x amax into x_pending at the
+    // current step; re-running the atomicMax here would be idempotent
+    // but wasted work. The helper below honors pending=nullptr to skip
+    // the atomic write. Allocate staging and call through the kernel
+    // directly so we can pass nullptr.
+    (void)x_pending;
+    TORCH_CHECK(x_bf16.is_contiguous(), "x must be contiguous");
+    const int64_t xM = x_bf16.size(0);
+    const int64_t xK = x_bf16.size(1);
+    auto staging_x = at::empty({xK, xM},
+                               x_bf16.options().dtype(at::kFloat8_e4m3fn));
+    cudaStream_t stream_bwdw = c10::cuda::getCurrentCUDAStream();
+    launch_fused_amax_cast_transpose_bf16(
+        x_bf16.data_ptr(),
+        x_scale.data_ptr(),
+        /*pending=*/nullptr,
+        staging_x.data_ptr(),
+        at::kFloat8_e4m3fn,
+        /*rows_out=*/xK,
+        /*cols_out=*/xM,
+        /*in_row_stride=*/1,
+        /*in_col_stride=*/xK,
+        stream_bwdw);
+    at::Tensor x_col_fp8 = staging_x.t();
+
+    if (compute_bias_grad) {
+        try {
+            auto result = fp8_matmul_impl(gy_t_fp8, x_col_fp8,
+                                          gy_scale, x_scale,
+                                          /*bias_in=*/c10::nullopt,
+                                          out_dtype, BiasMode::BGradB,
+                                          /*fast_accum=*/false);
+            return std::make_tuple(std::move(result.d),
+                                   std::move(result.bias_grad));
+        } catch (const std::runtime_error& e) {
+            const std::string what = e.what();
+            if (what.find("heuristic") == std::string::npos) throw;
+            // Fall through to DEFAULT.
+        }
+    }
+    auto result = fp8_matmul_impl(gy_t_fp8, x_col_fp8,
+                                  gy_scale, x_scale,
+                                  /*bias_in=*/c10::nullopt,
+                                  out_dtype, BiasMode::None,
+                                  /*fast_accum=*/false);
+    return std::make_tuple(std::move(result.d), std::optional<at::Tensor>{});
+}
+
 }  // namespace cc_cublaslt
 
 
@@ -531,5 +895,104 @@ Args:
 
 Returns:
   Tuple (grad_w [N, K], grad_bias [N] or None). Fast-accum OFF.
+)doc");
+
+    // -- Phase 3 fused entry points --------------------------------------
+    m.def("cublaslt_fp8_linear_fwd", &cc_cublaslt::cublaslt_fp8_linear_fwd,
+          py::arg("a_bf16"),
+          py::arg("b_bf16"),
+          py::arg("x_scale"),
+          py::arg("w_scale"),
+          py::arg("x_pending"),
+          py::arg("w_pending"),
+          py::arg("bias") = py::none(),
+          py::arg("out_dtype") = at::kBFloat16,
+          R"doc(
+Fused amax-update + fp8 cast + forward cuBLASLt matmul.
+
+Args:
+  a_bf16: bf16 [M, K] row-major activations.
+  b_bf16: bf16 [N, K] row-major weight (same layout as nn.Linear.weight).
+  x_scale, w_scale: fp32 scalar dequant multipliers (READ; refreshed by
+    flush_amax_history between optimizer steps).
+  x_pending, w_pending: fp32 scalar pending-amax buffers (atomically
+    UPDATED with max(|a_bf16|), max(|b_bf16|)).
+  bias: optional bf16 [N] bias fused via CUBLASLT_EPILOGUE_BIAS.
+  out_dtype: bfloat16 default.
+
+Returns:
+  bf16 [M, N] output. Fast-accum ON.
+)doc");
+
+    m.def("cublaslt_fp8_linear_bwd_x", &cc_cublaslt::cublaslt_fp8_linear_bwd_x,
+          py::arg("grad_y_bf16"),
+          py::arg("weight_bf16"),
+          py::arg("gy_scale"),
+          py::arg("w_scale"),
+          py::arg("gy_pending"),
+          py::arg("gx_pending"),
+          py::arg("out_dtype") = at::kBFloat16,
+          R"doc(
+Fused amax-update + fp8 cast + backward cuBLASLt matmul for grad_x.
+
+Args:
+  grad_y_bf16: bf16 [M, N] row-major.
+  weight_bf16: bf16 [N, K] row-major.
+  gy_scale, w_scale: fp32 scalar dequant multipliers.
+  gy_pending: fp32 scalar pending — atomically updated with amax(grad_y).
+  gx_pending: reserved diagnostic buffer; not touched inside.
+  out_dtype: bfloat16.
+
+Returns:
+  bf16 [M, K] grad_x. Fast-accum OFF.
+)doc");
+
+    m.def("cublaslt_fp8_linear_bwd_w", &cc_cublaslt::cublaslt_fp8_linear_bwd_w,
+          py::arg("grad_y_bf16"),
+          py::arg("x_bf16"),
+          py::arg("gy_scale"),
+          py::arg("x_scale"),
+          py::arg("gy_pending"),
+          py::arg("x_pending"),
+          py::arg("out_dtype") = at::kBFloat16,
+          py::arg("compute_bias_grad") = false,
+          R"doc(
+Fused amax-update + fp8 cast + backward cuBLASLt matmul for grad_w (+ dbias).
+
+Args:
+  grad_y_bf16: bf16 [M, N] row-major.
+  x_bf16: bf16 [M, K] row-major (typically re-materialized from the fp8
+    saved_for_backward; callers can pass the bf16 input if the hot path
+    keeps it live).
+  gy_scale, x_scale: fp32 scalar dequant multipliers.
+  gy_pending, x_pending: fp32 scalar pending — gy_pending is updated;
+    x_pending is currently ignored (forward already updated it for the
+    same tensor/step; passing it again would double-count).
+  out_dtype: bfloat16.
+  compute_bias_grad: if true, fuse BGRADB epilogue.
+
+Returns:
+  Tuple (grad_w [N, K], grad_bias [N] or None). Fast-accum OFF.
+)doc");
+
+    m.def("cublaslt_fp8_flush_amax", &cc_cublaslt::cublaslt_fp8_flush_amax,
+          py::arg("history"),
+          py::arg("pending"),
+          py::arg("scale"),
+          py::arg("max_rep"),
+          R"doc(
+One-shot amax flush: roll history left, append pending at history[-1],
+compute max(history), write scale = max_history / max_rep (or 1.0 if
+zero), zero pending. Single kernel launch. max_rep is 448.0 for E4M3,
+57344.0 for E5M2.
+)doc");
+
+    m.def("cublaslt_fp8_flush_amax_diagnostic",
+          &cc_cublaslt::cublaslt_fp8_flush_amax_diagnostic,
+          py::arg("history"),
+          py::arg("pending"),
+          R"doc(
+Diagnostic flush variant: roll history left + append pending + zero
+pending. No scale output.
 )doc");
 }

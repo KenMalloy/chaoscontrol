@@ -479,3 +479,13 @@ def test_forward_backward_report_bench(cuda_required, capsys) -> None:
             f"({bespoke_time * 1e6 / iters:.2f} us/iter)\n"
             f"  ratio     = {bespoke_time / te_time:.3f}\n"
         )
+
+    # Phase 3 gate: whole-stack fwd+bwd must beat stock TE by at least
+    # 10% (bespoke < 0.9 * stock_te). The gate is the whole point of
+    # phase 3 — primitives already win at the GEMM level; the work in
+    # phase 3 is closing the Python-orchestration gap.
+    assert bespoke_time < 0.9 * te_time, (
+        f"phase 3 gate missed: bespoke={bespoke_time:.4f}s "
+        f"te={te_time:.4f}s ratio={bespoke_time / te_time:.3f} "
+        "(need < 0.9×)"
+    )
