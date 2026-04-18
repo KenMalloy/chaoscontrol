@@ -139,8 +139,15 @@ def run(cfg: RunConfig, jsonl_paths: list[str], sp_model_path: str) -> None:
                 if len(chunk_list) < 2:
                     continue
                 chunk = torch.tensor(chunk_list, dtype=torch.long, device=device).unsqueeze(0)
-                # Score (legality-guarded)
-                loss_before = controller.score_chunk(chunk)
+                # Score (legality-guarded); thread the StateManager's per-doc
+                # carry state in, capture final_state out. An empty state list
+                # (pre-start_doc or no SSM cores) passes through as None.
+                prev_state = state_mgr.get_state()
+                loss_before, final_states = controller.score_chunk(
+                    chunk, initial_states=prev_state if prev_state else None,
+                )
+                if final_states:
+                    state_mgr.set_state(final_states)
                 loss_before_sum += loss_before
                 # nats per chunk (sum): loss_before is mean-CE from controller; convert
                 # But our _ce uses reduction="sum" — so loss_before IS summed nats.

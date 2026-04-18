@@ -38,10 +38,24 @@ class LegalityController:
             chunk.detach().cpu().numpy().tobytes(), digest_size=8
         ).digest()
 
-    def score_chunk(self, chunk: torch.Tensor) -> float:
-        # Empty-CE guard: CE needs at least one target token, i.e. chunk length
-        # >= 2 after shifting. Callers must have already filtered these, but a
-        # silent NaN here would poison the stability gate.
+    def score_chunk(
+        self,
+        chunk: torch.Tensor,
+        *,
+        initial_states: list[torch.Tensor] | None = None,
+    ) -> tuple[float, list[torch.Tensor]]:
+        """Forward-only score under current weights.
+
+        Returns ``(loss, final_states)``. ``final_states`` is the list of
+        per-physical-block recurrent states at the end of the chunk, suitable
+        for threading into the next chunk via ``persistence_mode=carry_state``.
+        Returns ``[]`` when the model's forward doesn't expose ``final_states``
+        (non-SSM blocks).
+
+        Empty-CE guard: CE needs at least one target token, i.e. chunk length
+        >= 2 after shifting. Callers must have already filtered these, but a
+        silent NaN here would poison the stability gate.
+        """
         if chunk.size(1) < 2:
             raise ValueError(
                 f"score_chunk needs chunk length >= 2 for teacher-forcing CE; "
@@ -54,11 +68,21 @@ class LegalityController:
                 "Issue #1017 violation."
             )
         self.model.eval()
+        # StateManager returns [] before start_doc; pass None rather than an
+        # empty list so the model's length-mismatch guard doesn't misfire.
+        kwargs: dict = {}
+        if initial_states:
+            kwargs["initial_states"] = initial_states
         with torch.no_grad():
-            out = self.model(chunk)
+            out = self.model(chunk, **kwargs)
             logits = out["logits"] if isinstance(out, dict) else out
             loss = self.loss_fn(logits[:, :-1], chunk[:, 1:])
-        return float(loss.item())
+            final_states = (
+                list(out["final_states"])
+                if isinstance(out, dict) and "final_states" in out
+                else []
+            )
+        return float(loss.item()), final_states
 
     def adapt_on_chunk(
         self, chunk: torch.Tensor, *, optimizer, steps: int = 1,
