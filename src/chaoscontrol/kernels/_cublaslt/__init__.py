@@ -43,6 +43,56 @@ def _require_ext() -> None:
         )
 
 
+# Register the forward as a torch custom op so ``torch.compile``'s dynamo
+# tracer treats it as an opaque primitive instead of trying to descend
+# into the pybind11 extension (which it cannot trace). The wrapper
+# underneath the public function keeps its identity + docstring; only
+# the dispatch target changes when the extension is present.
+#
+# Why only the forward: the compile region is ``model.encode(inputs)``
+# per the Phase 1A plan; backward + chunked-CE run eager. Forward hot
+# path is the only one that must be dynamo-traceable.
+_cublaslt_fp8_linear_fwd_op: Any = None
+
+if _C is not None:  # pragma: no cover — only on pods with the extension
+    @torch.library.custom_op(
+        "chaoscontrol_fp8::cublaslt_fp8_linear_fwd",
+        mutates_args=("x_pending", "w_pending"),
+    )
+    def _cublaslt_fp8_linear_fwd_op(  # type: ignore[no-redef]
+        a_bf16: torch.Tensor,
+        b_bf16: torch.Tensor,
+        x_scale: torch.Tensor,
+        w_scale: torch.Tensor,
+        x_pending: torch.Tensor,
+        w_pending: torch.Tensor,
+        bias: torch.Tensor | None = None,
+        out_dtype: torch.dtype = torch.bfloat16,
+    ) -> torch.Tensor:
+        return _C.cublaslt_fp8_linear_fwd(
+            a_bf16, b_bf16, x_scale, w_scale,
+            x_pending, w_pending, bias, out_dtype,
+        )
+
+    @_cublaslt_fp8_linear_fwd_op.register_fake
+    def _cublaslt_fp8_linear_fwd_fake(
+        a_bf16: torch.Tensor,
+        b_bf16: torch.Tensor,
+        x_scale: torch.Tensor,
+        w_scale: torch.Tensor,
+        x_pending: torch.Tensor,
+        w_pending: torch.Tensor,
+        bias: torch.Tensor | None = None,
+        out_dtype: torch.dtype = torch.bfloat16,
+    ) -> torch.Tensor:
+        # Shape contract: a_bf16 [M, K] × b_bf16 [N, K]  →  out [M, N]
+        # in ``out_dtype`` on a_bf16's device. Matches the real kernel.
+        return torch.empty(
+            a_bf16.shape[0], b_bf16.shape[0],
+            dtype=out_dtype, device=a_bf16.device,
+        )
+
+
 def cublaslt_fp8_matmul(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -156,7 +206,9 @@ def cublaslt_fp8_linear_fwd(
         ``[M, N]`` tensor in ``out_dtype``.
     """
     _require_ext()
-    return _C.cublaslt_fp8_linear_fwd(
+    # Route through the registered custom op so the call is traceable
+    # under ``torch.compile``. Semantics are unchanged in eager mode.
+    return _cublaslt_fp8_linear_fwd_op(
         a_bf16, b_bf16, x_scale, w_scale, x_pending, w_pending, bias, out_dtype,
     )
 
