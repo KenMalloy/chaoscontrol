@@ -183,10 +183,12 @@ def _resolve_diag_recurrence_impl():
             _diag_recurrence_backend = "ssm_scan"
             _diag_recurrence_note = (
                 "hand-written CUDA kernels for forward and backward "
-                "(per-lane serial scan with fp32 accumulator). At submission "
-                "shape B=1024/T=512/D=256 bf16 on 1xH100: 1.88 ms fwd+bwd "
-                "(~40x vs chunked, ~220x vs compile); 0.35 ms fwd, 1.26 ms "
-                "bwd. See benchmarks/bench_ssm_scan.py"
+                "(per-lane serial scan with fp32 accumulator; fp32 state "
+                "snapshot saved for backward to avoid bf16-quantized grads). "
+                "At submission shape B=1024/T=512/D=256 bf16 on 1xH100: "
+                "~40x vs chunked (the honest baseline; `compile` baseline "
+                "is pessimistic because compile's own backward is broken). "
+                "See benchmarks/bench_ssm_scan.py for the full table."
             )
         else:
             _diag_recurrence_impl = _diag_recurrence_chunked
@@ -263,6 +265,17 @@ def _diag_recurrence(decay: torch.Tensor, update: torch.Tensor) -> torch.Tensor:
         return impl(decay, update)
     except Exception as exc:  # pragma: no cover - only triggers on mismatched stacks
         if impl is _diag_recurrence_inner:
+            raise
+        # Only the `compile` backend should be demoted on a runtime
+        # failure — that's the one known to fail mid-run on mismatched
+        # Inductor/CUDA stacks. Other backends (ssm_scan, chunked)
+        # raise meaningful exceptions that callers need to see; do NOT
+        # silently rewrite the global backend cache to "python" and
+        # discard the error. Fix #2: `ssm_scan` on a CPU tensor already
+        # falls back gracefully inside the wrapper, so this path is
+        # never entered for that case — but guarding the cache demote
+        # on backend == "compile" is belt-and-suspenders.
+        if _diag_recurrence_backend != "compile":
             raise
         _diag_recurrence_impl = _diag_recurrence_inner
         _diag_recurrence_backend = "python"
