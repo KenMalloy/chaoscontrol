@@ -11,6 +11,15 @@ class DocRecord:
 
 @dataclass
 class ChunkRecord:
+    """Per-chunk measurement record.
+
+    NOTE (2026-04-17): Currently unused by the driver — `MetricsCollector`
+    logs per-doc only. Kept in `__all__` because the plan calls for per-chunk
+    logging as a future extension, and the type's field set encodes the
+    Score-then-Adapt contract (loss_before_adapt pre-update, loss_after_adapt
+    nullable when the `none` adapt set skips the inner loop). If per-chunk
+    logging lands, wire this through instead of re-defining it ad hoc.
+    """
     doc_id: int
     chunk_idx: int
     tokens: list[int]
