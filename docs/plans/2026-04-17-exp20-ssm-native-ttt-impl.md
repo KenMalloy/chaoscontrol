@@ -311,6 +311,61 @@ def test_stability_gate_flags_collapse(tmp_path):
                              loss_after=None, step_count=0, wall_ms=1.0,
                              grad_norm=0.0, state_norm=1.0)
     assert collector.collapsed is True
+
+
+def test_baseline_frozen_across_long_run(tmp_path):
+    """Baseline is frozen to the first `stability_window` docs; it must not drift.
+
+    Regression test for the bug where `deque(maxlen=N)[:window]` silently
+    shifted the baseline past doc N — the gate's detection window and Exp 20's
+    collapse-detection window overlap exactly at doc 10K-30K.
+    """
+    out = tmp_path / "metrics.jsonl"
+    # Small window, small threshold, many docs.
+    collector = MetricsCollector(
+        output_path=out, stability_window=10, stability_sd_threshold=3.0,
+    )
+    # First 10 docs: low steady loss → baseline mean ~1.0, sd ~0.01
+    for i in range(10):
+        collector.record_doc(doc_id=i, bpb=1.0, tokens=1, loss_before=1.0 + 0.01 * (i % 2),
+                             loss_after=None, step_count=0, wall_ms=1.0,
+                             grad_norm=0.0, state_norm=1.0)
+    # Docs 10..9999: slowly drift upward to a new steady state around 1.5 —
+    # a transformer-gradient-style slow drift that a rolling baseline would
+    # absorb and stop flagging. Frozen baseline keeps flagging.
+    for i in range(10, 10_000):
+        collector.record_doc(doc_id=i, bpb=1.5, tokens=1, loss_before=1.5,
+                             loss_after=None, step_count=0, wall_ms=1.0,
+                             grad_norm=0.0, state_norm=1.0)
+    # With a frozen baseline and enough consecutive drift, collapsed must be True.
+    assert collector.collapsed is True
+
+
+def test_gate_does_not_fire_on_steady_model(tmp_path):
+    """No collapse when losses stay inside the baseline band."""
+    out = tmp_path / "metrics.jsonl"
+    collector = MetricsCollector(
+        output_path=out, stability_window=10, stability_sd_threshold=3.0,
+    )
+    import random
+    rng = random.Random(0)
+    for i in range(500):
+        # All losses in [0.98, 1.02] — way inside 3σ of any reasonable baseline.
+        collector.record_doc(doc_id=i, bpb=1.0, tokens=1,
+                             loss_before=1.0 + 0.02 * (rng.random() - 0.5),
+                             loss_after=None, step_count=0, wall_ms=1.0,
+                             grad_norm=0.0, state_norm=1.0)
+    assert collector.collapsed is False
+
+
+def test_context_manager_closes_file(tmp_path):
+    out = tmp_path / "metrics.jsonl"
+    with MetricsCollector(output_path=out) as collector:
+        collector.record_doc(doc_id=0, bpb=1.0, tokens=1, loss_before=1.0,
+                             loss_after=None, step_count=0, wall_ms=1.0,
+                             grad_norm=0.0, state_norm=1.0)
+    # File should be closed after the with-block exits.
+    assert collector._fh.closed
 ```
 
 **Step 2: Run**
@@ -325,14 +380,15 @@ Expected: FAIL.
 from __future__ import annotations
 import json
 from pathlib import Path
-from collections import deque
 
 
 class MetricsCollector:
     """Per-doc JSONL logger with in-run stability gate.
 
-    Stability gate: tracks a rolling window of per-doc loss; flags `collapsed`
-    if loss remains > N SDs above the pre-window mean for K consecutive docs.
+    Stability gate: tracks the first `stability_window` per-doc losses as
+    a frozen baseline (mean, SD), then flags `collapsed` when loss stays
+    > `stability_sd_threshold` SDs above the baseline mean for
+    `stability_window // 2` consecutive subsequent docs.
     """
 
     def __init__(
@@ -347,7 +403,8 @@ class MetricsCollector:
         self._fh = self.output_path.open("w")
         self.stability_window = stability_window
         self.stability_sd_threshold = stability_sd_threshold
-        self._loss_history: deque[float] = deque(maxlen=10_000)
+        self._pre_window_losses: list[float] = []
+        self._baseline_stats: tuple[float, float] | None = None  # (mean, sd) once frozen
         self._consecutive_drift = 0
         self.collapsed = False
 
@@ -364,16 +421,22 @@ class MetricsCollector:
         )
         self._fh.write(json.dumps(rec) + "\n")
         self._fh.flush()
+        # Gate uses loss_before (pre-adapt score) — loss_after can be None,
+        # and pre-adapt drift is what signals the model's held-out quality dropping.
         self._update_stability(loss_before)
 
     def _update_stability(self, loss: float) -> None:
-        self._loss_history.append(loss)
-        if len(self._loss_history) < self.stability_window + self.stability_window // 2:
+        # Collect pre-window losses until we have enough to freeze a baseline.
+        if self._baseline_stats is None:
+            self._pre_window_losses.append(loss)
+            if len(self._pre_window_losses) >= self.stability_window:
+                baseline = self._pre_window_losses[:self.stability_window]
+                mean = sum(baseline) / len(baseline)
+                var = sum((x - mean) ** 2 for x in baseline) / len(baseline)
+                sd = var ** 0.5 if var > 0 else 1e-6
+                self._baseline_stats = (mean, sd)
             return
-        baseline = list(self._loss_history)[:self.stability_window]
-        mean = sum(baseline) / len(baseline)
-        var = sum((x - mean) ** 2 for x in baseline) / len(baseline)
-        sd = var ** 0.5 if var > 0 else 1e-6
+        mean, sd = self._baseline_stats
         if loss - mean > self.stability_sd_threshold * sd:
             self._consecutive_drift += 1
         else:
@@ -383,11 +446,18 @@ class MetricsCollector:
 
     def close(self) -> None:
         self._fh.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.close()
+        return False
 ```
 
 **Step 4: Run**
 
-Expected: 2 PASS.
+Expected: 5 PASS (`test_writes_per_doc_record`, `test_stability_gate_flags_collapse`, `test_baseline_frozen_across_long_run`, `test_gate_does_not_fire_on_steady_model`, `test_context_manager_closes_file`).
 
 **Step 5: Commit**
 

@@ -1,14 +1,15 @@
 from __future__ import annotations
 import json
 from pathlib import Path
-from collections import deque
 
 
 class MetricsCollector:
     """Per-doc JSONL logger with in-run stability gate.
 
-    Stability gate: tracks a rolling window of per-doc loss; flags `collapsed`
-    if loss remains > N SDs above the pre-window mean for K consecutive docs.
+    Stability gate: tracks the first `stability_window` per-doc losses as
+    a frozen baseline (mean, SD), then flags `collapsed` when loss stays
+    > `stability_sd_threshold` SDs above the baseline mean for
+    `stability_window // 2` consecutive subsequent docs.
     """
 
     def __init__(
@@ -23,7 +24,8 @@ class MetricsCollector:
         self._fh = self.output_path.open("w")
         self.stability_window = stability_window
         self.stability_sd_threshold = stability_sd_threshold
-        self._loss_history: deque[float] = deque(maxlen=10_000)
+        self._pre_window_losses: list[float] = []
+        self._baseline_stats: tuple[float, float] | None = None  # (mean, sd) once frozen
         self._consecutive_drift = 0
         self.collapsed = False
 
@@ -40,16 +42,22 @@ class MetricsCollector:
         )
         self._fh.write(json.dumps(rec) + "\n")
         self._fh.flush()
+        # Gate uses loss_before (pre-adapt score) — loss_after can be None,
+        # and pre-adapt drift is what signals the model's held-out quality dropping.
         self._update_stability(loss_before)
 
     def _update_stability(self, loss: float) -> None:
-        self._loss_history.append(loss)
-        if len(self._loss_history) < self.stability_window + self.stability_window // 2:
+        # Collect pre-window losses until we have enough to freeze a baseline.
+        if self._baseline_stats is None:
+            self._pre_window_losses.append(loss)
+            if len(self._pre_window_losses) >= self.stability_window:
+                baseline = self._pre_window_losses[:self.stability_window]
+                mean = sum(baseline) / len(baseline)
+                var = sum((x - mean) ** 2 for x in baseline) / len(baseline)
+                sd = var ** 0.5 if var > 0 else 1e-6
+                self._baseline_stats = (mean, sd)
             return
-        baseline = list(self._loss_history)[:self.stability_window]
-        mean = sum(baseline) / len(baseline)
-        var = sum((x - mean) ** 2 for x in baseline) / len(baseline)
-        sd = var ** 0.5 if var > 0 else 1e-6
+        mean, sd = self._baseline_stats
         if loss - mean > self.stability_sd_threshold * sd:
             self._consecutive_drift += 1
         else:
@@ -59,3 +67,10 @@ class MetricsCollector:
 
     def close(self) -> None:
         self._fh.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.close()
+        return False
