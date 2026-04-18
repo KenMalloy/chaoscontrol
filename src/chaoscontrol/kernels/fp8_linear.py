@@ -238,9 +238,11 @@ class _FusedFP8LinearFn(torch.autograd.Function):
             compute_bias_grad=ctx.has_bias,
         )
         if ctx.has_bias and grad_b is None:
-            # Fused BGRADB unavailable on this cuBLAS version (observed
-            # on 12.8.4, which rejects BGRADA/B for fp8). Fall back to
-            # the eager bf16 reduction. Parity with the primitive path.
+            # Fused BGRADB is unsupported in every cuBLAS we've probed
+            # for fp8 E5M2×E4M3 (12.8.4 and 13.4.0.1, checked
+            # 2026-04-17 and 2026-04-18) — the C++ kernel catches the
+            # heuristic rejection and returns None so we reduce eagerly.
+            # TE uses the same fallback at this dim range.
             grad_b = grad_y_c.sum(dim=0).to(torch.bfloat16)
 
         # Phase 3: the gx_pending update was Python-orchestrated (two

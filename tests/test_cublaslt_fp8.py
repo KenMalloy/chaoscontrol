@@ -375,7 +375,8 @@ def test_grad_w_with_bias_grad_matches_te() -> None:
         # BGRADB unsupported on this cuBLAS — the C++ kernel returns
         # None so the caller can fall back. Compute eagerly on the
         # input tensor for the parity check; this is what
-        # FusedFP8Linear.backward does in the wild.
+        # FusedFP8Linear.backward does in the wild. cuBLAS 12.8.4 and
+        # 13.4.0.1 both reject the epilogue for fp8 E5M2×E4M3.
         gb = grad_y.sum(dim=0).to(torch.bfloat16)
     assert gb.shape == (N,)
 
