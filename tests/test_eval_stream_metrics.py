@@ -86,3 +86,47 @@ def test_context_manager_closes_file(tmp_path):
                              grad_norm=0.0, state_norm=1.0)
     # File should be closed after the with-block exits.
     assert collector._fh.closed
+
+
+def test_all_fields_roundtrip_through_json(tmp_path):
+    """Every field written by record_doc must round-trip through JSON. Pins
+    the on-disk schema so a refactor that renames `state_norm` → `state_norm_avg`
+    or drops a field gets caught here, not silently in Phase F analysis.
+
+    Also confirms loss_after=None serializes as JSON null (Python None → null
+    → None on read).
+    """
+    out = tmp_path / "metrics.jsonl"
+    with MetricsCollector(output_path=out) as collector:
+        # Record with loss_after populated
+        collector.record_doc(
+            doc_id=11, bpb=1.234, tokens=500,
+            loss_before=0.987, loss_after=0.654,
+            step_count=3, wall_ms=456.7, grad_norm=1.23, state_norm=4.56,
+        )
+        # Record with loss_after=None (no-weight-TTT case)
+        collector.record_doc(
+            doc_id=12, bpb=2.345, tokens=750,
+            loss_before=1.111, loss_after=None,
+            step_count=0, wall_ms=78.9, grad_norm=0.0, state_norm=5.67,
+        )
+    lines = out.read_text().splitlines()
+    assert len(lines) == 2
+    r0 = json.loads(lines[0])
+    r1 = json.loads(lines[1])
+
+    # Every field from the record_doc signature, first record.
+    assert r0["doc_id"] == 11
+    assert r0["bpb"] == 1.234
+    assert r0["tokens"] == 500
+    assert r0["loss_before"] == 0.987
+    assert r0["loss_after"] == 0.654
+    assert r0["step_count"] == 3
+    assert r0["wall_ms"] == 456.7
+    assert r0["grad_norm"] == 1.23
+    assert r0["state_norm"] == 4.56
+
+    # Second record: loss_after=None must round-trip as JSON null → Python None.
+    assert r1["doc_id"] == 12
+    assert r1["loss_after"] is None
+    assert r1["step_count"] == 0
