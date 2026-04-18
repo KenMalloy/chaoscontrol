@@ -38,7 +38,11 @@ if not torch.cuda.is_available():  # pragma: no cover — dev-mac branch
 
 try:
     from chaoscontrol.kernels._ssm_scan import _C as _ssm_scan_C  # noqa: F401
-    from chaoscontrol.kernels._ssm_scan import ssm_scan, ssm_scan_forward
+    from chaoscontrol.kernels._ssm_scan import (
+        ssm_scan,
+        ssm_scan_backward,
+        ssm_scan_forward,
+    )
 except ImportError as e:  # pragma: no cover
     pytest.skip(
         f"ssm_scan extension not built: {e!r}. "
@@ -183,20 +187,120 @@ class TestForwardEdgeCases:
 
 
 # ---------------------------------------------------------------------------
+# Backward kernel parity — raw kernel call vs Python-loop autograd.
+# ---------------------------------------------------------------------------
+
+
+def _python_loop_grads(
+    decay: torch.Tensor,
+    update: torch.Tensor,
+    grad_out: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Reference backward via autograd on the fp32 Python recurrence.
+
+    Promotes to fp32 internally for stability; casts grads back to the
+    input dtypes on the way out. Same semantics as the old
+    ``_SSMScanForwardFn`` fallback path, but callable standalone.
+    """
+    d_ref = decay.detach().to(torch.float32).requires_grad_(True)
+    u_ref = update.detach().to(torch.float32).requires_grad_(True)
+    with torch.enable_grad():
+        y = _diag_recurrence_inner(d_ref, u_ref)
+    g_ref = grad_out.to(torch.float32)
+    grad_d, grad_u = torch.autograd.grad(
+        outputs=y,
+        inputs=[d_ref, u_ref],
+        grad_outputs=g_ref,
+    )
+    return grad_d.to(decay.dtype), grad_u.to(update.dtype)
+
+
+class TestBackwardKernelParity:
+    def test_backward_kernel_fp32_matches_autograd(self):
+        """Raw kernel backward should match autograd-through-loop in fp32."""
+        torch.manual_seed(100)
+        B, T, D = 3, 17, 8
+        decay = (torch.rand(B, T, D, device="cuda") * 0.3 + 0.65)
+        update = torch.randn(B, T, D, device="cuda") * 0.1
+        state = ssm_scan_forward(decay, update)
+        grad_state = torch.randn_like(state) * 0.2
+
+        grad_d_ker, grad_u_ker = ssm_scan_backward(grad_state, decay, state)
+        grad_d_ref, grad_u_ref = _python_loop_grads(decay, update, grad_state)
+
+        diff_d = (grad_d_ker - grad_d_ref).abs().max().item()
+        diff_u = (grad_u_ker - grad_u_ref).abs().max().item()
+        assert diff_d < 1e-5, f"grad_decay diff: {diff_d:.2e}"
+        assert diff_u < 1e-5, f"grad_update diff: {diff_u:.2e}"
+
+    def test_backward_kernel_fp32_submission_shape(self):
+        """Cross-check at submission shape (downscaled B for test speed)."""
+        torch.manual_seed(101)
+        B, T, D = 16, 512, 256
+        decay = (torch.rand(B, T, D, device="cuda") * 0.3 + 0.65)
+        update = torch.randn(B, T, D, device="cuda") * 0.1
+        state = ssm_scan_forward(decay, update)
+        grad_state = torch.randn_like(state) * 0.2
+
+        grad_d_ker, grad_u_ker = ssm_scan_backward(grad_state, decay, state)
+        grad_d_ref, grad_u_ref = _python_loop_grads(decay, update, grad_state)
+
+        diff_d = (grad_d_ker - grad_d_ref).abs().max().item()
+        diff_u = (grad_u_ker - grad_u_ref).abs().max().item()
+        assert diff_d < 1e-4, f"grad_decay diff at T=512: {diff_d:.2e}"
+        assert diff_u < 1e-4, f"grad_update diff at T=512: {diff_u:.2e}"
+
+    def test_backward_kernel_bf16_matches_fp32_autograd(self):
+        """bf16 kernel grads should match fp32 autograd cast back to bf16."""
+        torch.manual_seed(102)
+        B, T, D = 4, 64, 32
+        decay = (torch.rand(B, T, D, device="cuda") * 0.3 + 0.65).to(torch.bfloat16)
+        update = (torch.randn(B, T, D, device="cuda") * 0.1).to(torch.bfloat16)
+        state = ssm_scan_forward(decay, update)
+        grad_state = (torch.randn_like(state.float()) * 0.2).to(torch.bfloat16)
+
+        grad_d_ker, grad_u_ker = ssm_scan_backward(grad_state, decay, state)
+        assert grad_d_ker.dtype == torch.bfloat16
+        assert grad_u_ker.dtype == torch.bfloat16
+
+        grad_d_ref, grad_u_ref = _python_loop_grads(decay, update, grad_state)
+        diff_d = (grad_d_ker.float() - grad_d_ref.float()).abs().max().item()
+        diff_u = (grad_u_ker.float() - grad_u_ref.float()).abs().max().item()
+        # bf16 rounding: same ~3% budget as the forward bf16 test.
+        assert diff_d < 5e-2, f"bf16 grad_decay diff: {diff_d:.2e}"
+        assert diff_u < 5e-2, f"bf16 grad_update diff: {diff_u:.2e}"
+
+    def test_grad_decay_zero_at_t0(self):
+        """grad_decay[:, 0, :] must be exactly 0 (state[-1] := 0).
+
+        Guards against the most likely backward-kernel bug: an uninit
+        or out-of-bounds load for state[t-1] at t=0. The kernel should
+        short-circuit that branch and write a literal 0.
+        """
+        torch.manual_seed(103)
+        for dtype in [torch.float32, torch.bfloat16, torch.float16]:
+            B, T, D = 2, 16, 8
+            decay = (torch.rand(B, T, D, device="cuda") * 0.3 + 0.65).to(dtype)
+            update = (torch.randn(B, T, D, device="cuda") * 0.1).to(dtype)
+            state = ssm_scan_forward(decay, update)
+            grad_state = (torch.randn_like(state.float()) * 0.5).to(dtype)
+
+            grad_d, _ = ssm_scan_backward(grad_state, decay, state)
+            at_t0 = grad_d[:, 0, :].float().abs().max().item()
+            assert at_t0 == 0.0, (
+                f"grad_decay[:, 0, :] must be exactly 0 for dtype={dtype}; "
+                f"got max |.| = {at_t0:.3e}"
+            )
+
+
+# ---------------------------------------------------------------------------
 # Autograd wrapper.
 # ---------------------------------------------------------------------------
 
 
 class TestAutograd:
     def test_backward_matches_python_loop_fp32(self):
-        """``ssm_scan`` backward should match the Python loop's gradients.
-
-        The backward path in ``_SSMScanForwardFn`` re-runs the Python
-        reference with grad enabled, so by construction the gradients
-        agree. This is a regression pin in case we later swap in a
-        kernel-level backward: the test must still pass against the
-        fallback path.
-        """
+        """``ssm_scan`` backward via the kernel should match autograd loop."""
         torch.manual_seed(7)
         B, T, D = 2, 64, 16
         decay_base = (torch.rand(B, T, D, device="cuda") * 0.3 + 0.65)
@@ -233,6 +337,22 @@ class TestAutograd:
         u_ref = u_ker.detach().clone().requires_grad_(True)
         _diag_recurrence_inner(d_ref, u_ref).pow(2).sum().backward()
         assert torch.allclose(u_ker.grad, u_ref.grad, atol=1e-4)
+
+    def test_backward_bf16_roundtrip(self):
+        """Full forward+backward in bf16 should survive autograd roundtrip."""
+        torch.manual_seed(9)
+        B, T, D = 2, 128, 16
+        d_ker = (torch.rand(B, T, D, device="cuda") * 0.3 + 0.65).to(torch.bfloat16).detach().requires_grad_(True)
+        u_ker = (torch.randn(B, T, D, device="cuda") * 0.1).to(torch.bfloat16).detach().requires_grad_(True)
+        y = ssm_scan(d_ker, u_ker)
+        loss = y.pow(2).sum()
+        loss.backward()
+        assert d_ker.grad is not None and u_ker.grad is not None
+        assert d_ker.grad.dtype == torch.bfloat16
+        assert u_ker.grad.dtype == torch.bfloat16
+        # Sanity: gradients must be finite.
+        assert torch.isfinite(d_ker.grad).all()
+        assert torch.isfinite(u_ker.grad).all()
 
 
 # ---------------------------------------------------------------------------
