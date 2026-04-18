@@ -8,8 +8,11 @@
 //
 // Forward:
 //   decay: (B, T, D) bf16 | fp16 | fp32, contiguous row-major
-//   update: (B, T, D) same dtype as decay (or fp16 update with bf16 decay;
-//           see dispatch table in ssm_scan_fwd.cu)
+//   update: (B, T, D) bf16 | fp16 | fp32; dtype need not match decay,
+//           but the pair must be one of the combos listed in the
+//           dispatch table in ssm_scan_fwd.cu (bf16/bf16, bf16/fp16,
+//           fp16/fp16, fp32/fp32, fp32/bf16, fp32/fp16). The mixed
+//           (fp32, bf16/fp16) combos are the autocast production path.
 //   Returns:
 //     out        — (B, T, D) same dtype as update
 //     state_fp32 — (B, T, D) ALWAYS fp32, the true register-level state
@@ -58,15 +61,22 @@ std::tuple<at::Tensor, at::Tensor> ssm_scan_forward(
     const auto update_dtype = update.scalar_type();
 
     // Allowed dtype combos. Extend the dispatcher in ssm_scan_fwd.cu
-    // if a caller needs more.
+    // in lockstep if a caller needs more. (fp32, bf16) and (fp32, fp16)
+    // cover the autocast-bf16 / autocast-fp16 production path where
+    // `torch.exp(-delta * a_base)` upcasts decay to fp32 while update
+    // stays in the autocast dtype.
     const bool bf16_bf16 = (decay_dtype == at::kBFloat16 && update_dtype == at::kBFloat16);
     const bool bf16_fp16 = (decay_dtype == at::kBFloat16 && update_dtype == at::kHalf);
     const bool fp16_fp16 = (decay_dtype == at::kHalf && update_dtype == at::kHalf);
     const bool fp32_fp32 = (decay_dtype == at::kFloat && update_dtype == at::kFloat);
-    TORCH_CHECK(bf16_bf16 || bf16_fp16 || fp16_fp16 || fp32_fp32,
+    const bool fp32_bf16 = (decay_dtype == at::kFloat && update_dtype == at::kBFloat16);
+    const bool fp32_fp16 = (decay_dtype == at::kFloat && update_dtype == at::kHalf);
+    TORCH_CHECK(bf16_bf16 || bf16_fp16 || fp16_fp16 || fp32_fp32
+                || fp32_bf16 || fp32_fp16,
                 "unsupported (decay, update) dtype combo: (",
                 toString(decay_dtype), ", ", toString(update_dtype),
-                "); want bf16/bf16, bf16/fp16, fp16/fp16, or fp32/fp32");
+                "); want bf16/bf16, bf16/fp16, fp16/fp16, fp32/fp32, "
+                "fp32/bf16, or fp32/fp16");
 
     const int64_t B = decay.size(0);
     const int64_t T = decay.size(1);
@@ -140,15 +150,20 @@ std::tuple<at::Tensor, at::Tensor> ssm_scan_backward(
     const auto update_dtype = grad_state.scalar_type();
 
     // Dispatch table mirrors the forward. Any additional combos must be
-    // added to BOTH dispatchers in lockstep.
+    // added to BOTH dispatchers in lockstep. (fp32, bf16) and (fp32, fp16)
+    // are the autocast production paths — see the forward comment.
     const bool bf16_bf16 = (decay_dtype == at::kBFloat16 && update_dtype == at::kBFloat16);
     const bool bf16_fp16 = (decay_dtype == at::kBFloat16 && update_dtype == at::kHalf);
     const bool fp16_fp16 = (decay_dtype == at::kHalf && update_dtype == at::kHalf);
     const bool fp32_fp32 = (decay_dtype == at::kFloat && update_dtype == at::kFloat);
-    TORCH_CHECK(bf16_bf16 || bf16_fp16 || fp16_fp16 || fp32_fp32,
+    const bool fp32_bf16 = (decay_dtype == at::kFloat && update_dtype == at::kBFloat16);
+    const bool fp32_fp16 = (decay_dtype == at::kFloat && update_dtype == at::kHalf);
+    TORCH_CHECK(bf16_bf16 || bf16_fp16 || fp16_fp16 || fp32_fp32
+                || fp32_bf16 || fp32_fp16,
                 "unsupported (decay, update) dtype combo for backward: (",
                 toString(decay_dtype), ", ", toString(update_dtype),
-                "); want bf16/bf16, bf16/fp16, fp16/fp16, or fp32/fp32");
+                "); want bf16/bf16, bf16/fp16, fp16/fp16, fp32/fp32, "
+                "fp32/bf16, or fp32/fp16");
 
     const int64_t B = decay.size(0);
     const int64_t T = decay.size(1);
@@ -201,8 +216,10 @@ over every (batch, channel) lane independently.
 
 Args:
   decay: (B, T, D) bf16/fp16/fp32, contiguous, row-major.
-  update: (B, T, D) matching dtype (see dispatcher in ssm_scan_fwd.cu
-    for allowed combos).
+  update: (B, T, D) bf16/fp16/fp32. Allowed (decay, update) combos:
+    bf16/bf16, bf16/fp16, fp16/fp16, fp32/fp32, fp32/bf16, fp32/fp16.
+    The mixed fp32-decay combos are the autocast-bf16/fp16 production
+    path (torch.exp upcasts decay to fp32; update stays bf16/fp16).
 
 Returns:
   Tuple (out, state_fp32):
