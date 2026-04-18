@@ -67,6 +67,60 @@ from runner_exp17 import (  # noqa: E402
 )
 
 
+def _ssm_constructor_kwargs(config: dict[str, Any]) -> dict[str, Any]:
+    """Extract the exact ChaosStudentLM(**kwargs) needed to reconstruct the
+    SSM-arm model from a runner training config.
+
+    Single source of truth for the SSM arm: ``build_model`` consumes this
+    dict to instantiate the live training model, and ``--output-ckpt``
+    serializes the same dict so ``scripts/run_exp20_eval.py::_build_model``
+    can do ``ChaosStudentLM(**cfg)`` and reconstruct the matching shape.
+
+    Keys must match ``ChaosStudentLM.__init__`` parameter names — not YAML
+    config keys (e.g. ``dim`` not ``model_dim``). Carries every kwarg that
+    affects parameter shape; defaults from ``ChaosStudentLM`` for absent
+    fields stay implicit and the class supplies them on reload.
+    """
+    return dict(
+        vocab_size=int(config["vocab_size"]),
+        dim=int(config["model_dim"]),
+        num_layers=int(config["num_layers"]),
+        ff_mult=int(config.get("ff_mult", 2)),
+        a_mode=config.get("a_mode", "diag"),
+        a_full_rank=int(config.get("a_full_rank", 8)),
+        a_full_gamma=float(config.get("a_full_gamma", 0.05)),
+        outer_model_dim=0,
+        wernicke_enabled=False,
+        local_attn_window=int(config.get("local_attn_window", 0)),
+        local_attn_heads=int(config.get("local_attn_heads", 1)),
+        local_attn_dim=int(config.get("local_attn_dim", 64)),
+        local_attn_topk=int(config.get("local_attn_topk", 0)),
+        local_attn_topk_random=bool(config.get("local_attn_topk_random", False)),
+        activation_checkpoint=bool(config.get("activation_checkpoint", False)),
+    )
+
+
+def _transformer_constructor_kwargs(config: dict[str, Any]) -> dict[str, Any]:
+    """Extract the exact NanoGPTLeanLM(**kwargs) needed to reconstruct the
+    transformer-arm model from a runner training config.
+
+    Same single-source-of-truth contract as ``_ssm_constructor_kwargs``.
+    Note: ``max_seq_len`` is intentionally omitted — ``build_model`` does
+    not pass it, so reload uses ``NanoGPTLeanLM``'s 2048 default which is
+    what training also used.
+    """
+    model_dim = int(config["model_dim"])
+    n_head = int(config.get("n_head", max(1, model_dim // 64)))
+    return dict(
+        vocab_size=int(config["vocab_size"]),
+        d_model=model_dim,
+        n_head=n_head,
+        n_layer=int(config["num_layers"]),
+        ffn_mult=int(config.get("ff_mult", 4)),
+        activation_checkpoint=bool(config.get("activation_checkpoint", False)),
+    )
+
+
 def build_model(
     config: dict[str, Any],
     device: torch.device,
@@ -86,34 +140,11 @@ def build_model(
     if model_type == "transformer_nanogpt_lean":
         from chaoscontrol.baselines_nanogpt_lean import NanoGPTLeanLM
 
-        model_dim = int(config["model_dim"])
-        n_head = int(config.get("n_head", max(1, model_dim // 64)))
         model: torch.nn.Module = NanoGPTLeanLM(
-            vocab_size=int(config["vocab_size"]),
-            d_model=model_dim,
-            n_head=n_head,
-            n_layer=int(config["num_layers"]),
-            ffn_mult=int(config.get("ff_mult", 4)),
-            activation_checkpoint=bool(config.get("activation_checkpoint", False)),
+            **_transformer_constructor_kwargs(config)
         )
     else:
-        model = ChaosStudentLM(
-            vocab_size=int(config["vocab_size"]),
-            dim=int(config["model_dim"]),
-            num_layers=int(config["num_layers"]),
-            ff_mult=int(config.get("ff_mult", 2)),
-            a_mode=config.get("a_mode", "diag"),
-            a_full_rank=int(config.get("a_full_rank", 8)),
-            a_full_gamma=float(config.get("a_full_gamma", 0.05)),
-            outer_model_dim=0,
-            wernicke_enabled=False,
-            local_attn_window=int(config.get("local_attn_window", 0)),
-            local_attn_heads=int(config.get("local_attn_heads", 1)),
-            local_attn_dim=int(config.get("local_attn_dim", 64)),
-            local_attn_topk=int(config.get("local_attn_topk", 0)),
-            local_attn_topk_random=bool(config.get("local_attn_topk_random", False)),
-            activation_checkpoint=bool(config.get("activation_checkpoint", False)),
-        )
+        model = ChaosStudentLM(**_ssm_constructor_kwargs(config))
     model = model.to(device)
     if device.type == "cuda":
         model = model.to(dtype=param_dtype)
@@ -223,6 +254,39 @@ def _shard_train_starts(
     return sharded
 
 
+def _save_output_ckpt(
+    output_ckpt: str,
+    model: torch.nn.Module,
+    config: dict[str, Any],
+) -> None:
+    """Write a downstream-loadable checkpoint to ``output_ckpt``.
+
+    Format is ``{"model": state_dict, "config": <constructor_kwargs>}`` —
+    the exact contract consumed by ``scripts/run_exp20_eval.py::_build_model``
+    via ``ChaosStudentLM(**cfg).load_state_dict(blob['model'], strict=True)``.
+
+    Both arms are saved with the right kwargs dict, but the consumer
+    currently hardcodes ``ChaosStudentLM(**cfg)`` and will only successfully
+    reconstruct the SSM arm. Transformer-arm checkpoints save correctly but
+    require a future ``_build_model`` extension to load — left intentional
+    since the submission target is SSM.
+
+    Saves model weights on CPU so the artifact is portable across
+    GPU/CPU and bf16/fp32 reload contexts.
+    """
+    model_type = str(config.get("model_type", "")).strip()
+    if model_type == "transformer_nanogpt_lean":
+        ctor_kwargs = _transformer_constructor_kwargs(config)
+    else:
+        ctor_kwargs = _ssm_constructor_kwargs(config)
+    cpu_state = {k: v.detach().to("cpu") for k, v in model.state_dict().items()}
+    out_path = Path(output_ckpt)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = out_path.with_suffix(out_path.suffix + ".tmp")
+    torch.save({"model": cpu_state, "config": ctor_kwargs}, tmp_path)
+    tmp_path.rename(out_path)
+
+
 def run_ddp(
     config: dict[str, Any],
     *,
@@ -231,6 +295,7 @@ def run_ddp(
     budget_seconds: float,
     output_json: str | None,
     world_size_override: int | None,
+    output_ckpt: str | None = None,
 ) -> dict[str, Any]:
     """Run one Exp 21 training condition via the lean train_ssm path.
 
@@ -414,6 +479,11 @@ def run_ddp(
         tmp_path.write_text(json.dumps(result, indent=2, default=str))
         tmp_path.rename(out_path)
 
+    # Optional checkpoint save AFTER the JSON write — a save failure here
+    # does not lose the result of an already-completed training run.
+    if is_rank0 and output_ckpt:
+        _save_output_ckpt(output_ckpt, model, config)
+
     if is_rank0:
         bpb_display = eval_result.get("bpb", float("nan"))
         print(
@@ -439,6 +509,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--sp-model-path", required=True)
     parser.add_argument("--budget", type=float, default=600.0)
     parser.add_argument("--output-json", default=None)
+    parser.add_argument(
+        "--output-ckpt",
+        default=None,
+        help=(
+            "Optional path to save a checkpoint loadable by "
+            "scripts/run_exp20_eval.py::_build_model. Format: "
+            '{"model": state_dict, "config": constructor_kwargs}.'
+        ),
+    )
     parser.add_argument("--world-size", type=int, default=None)
     args = parser.parse_args(argv)
 
@@ -450,6 +529,7 @@ def main(argv: list[str] | None = None) -> int:
         budget_seconds=args.budget,
         output_json=args.output_json,
         world_size_override=args.world_size,
+        output_ckpt=args.output_ckpt,
     )
     return 0
 
