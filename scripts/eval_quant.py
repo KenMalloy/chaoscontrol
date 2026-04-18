@@ -428,11 +428,11 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     # --- Step 8: Write result JSON ---
-    # ``artifact_margin_mb`` uses the MiB divisor (1024**2) that the task
-    # spec prescribes. Parameter Golf's published budget is 16.0 MB (10^6
-    # decimal); if the submission tooling ever flips to decimal MB, flip
-    # the divisor here in lockstep so this script stays aligned.
-    artifact_margin_mb = 16.0 - (artifact_bytes / (1024 ** 2))
+    # Parameter Golf's 16 MB budget is decimal (10^6 bytes), not binary
+    # (MiB, 2^20). An artifact at 16,000,000 bytes is AT the budget —
+    # margin should be 0.0. Using a MiB divisor would falsely report
+    # +0.74 positive margin at that boundary.
+    artifact_margin_mb = 16.0 - (artifact_bytes / 1e6)
 
     result = {
         "ckpt_path": str(args.ckpt),
@@ -465,8 +465,8 @@ def main(argv: list[str] | None = None) -> int:
         f"[eval_quant] bpb_bf16={result['bpb_bf16']:.4f} "
         f"bpb_int6={result['bpb_int6']:.4f} "
         f"delta={result['delta_bpb']:+.4f} "
-        f"artifact={artifact_bytes/1024/1024:.3f} MiB "
-        f"margin={artifact_margin_mb:+.3f} MiB"
+        f"artifact={artifact_bytes/1e6:.3f} MB "
+        f"margin={artifact_margin_mb:+.3f} MB"
     )
     return 0
 
