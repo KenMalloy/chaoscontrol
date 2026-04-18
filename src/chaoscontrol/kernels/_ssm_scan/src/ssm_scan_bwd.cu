@@ -39,6 +39,7 @@
 
 #include "ssm_scan.h"
 
+#include <c10/util/Exception.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -142,10 +143,12 @@ __global__ void ssm_scan_bwd_kernel(
 }  // namespace
 
 // Launch dispatch. Dtype combos mirror the forward kernel:
-//   (decay, update) in { (bf16, bf16), (bf16, fp16), (fp16, fp16), (fp32, fp32) }.
+//   (decay, update) in { (bf16, bf16), (bf16, fp16), (fp16, fp16),
+//                         (fp32, fp32), (fp32, bf16), (fp32, fp16) }.
 // grad_state shares update_dtype; grad_update matches update_dtype;
 // grad_decay matches decay_dtype. `state_fp32` is always fp32 regardless
-// of the (decay, update) tuple.
+// of the (decay, update) tuple. The (fp32, bf16) combo is the autocast
+// bf16 production path — see ssm_scan_fwd.cu for the full rationale.
 void launch_ssm_scan_bwd(
     const void* grad_state,
     const void* decay,
@@ -200,15 +203,38 @@ void launch_ssm_scan_bwd(
             reinterpret_cast<float*>(grad_decay),
             reinterpret_cast<float*>(grad_update),
             B, T, D);
+    } else if (decay_fp32 && update_bf16) {
+        // Autocast bf16 production path. grad_state/grad_update are
+        // bf16; grad_decay is fp32 (matches decay). See ssm_scan_fwd.cu
+        // for the full dtype-flow rationale.
+        ssm_scan_bwd_kernel<TagFP32, TagBF16, BlockX><<<grid, block, 0, stream>>>(
+            reinterpret_cast<const __nv_bfloat16*>(grad_state),
+            reinterpret_cast<const float*>(decay),
+            state_fp32,
+            reinterpret_cast<float*>(grad_decay),
+            reinterpret_cast<__nv_bfloat16*>(grad_update),
+            B, T, D);
+    } else if (decay_fp32 && update_fp16) {
+        // fp16 analogue — grad_state/grad_update are fp16; grad_decay
+        // is fp32.
+        ssm_scan_bwd_kernel<TagFP32, TagFP16, BlockX><<<grid, block, 0, stream>>>(
+            reinterpret_cast<const __half*>(grad_state),
+            reinterpret_cast<const float*>(decay),
+            state_fp32,
+            reinterpret_cast<float*>(grad_decay),
+            reinterpret_cast<__half*>(grad_update),
+            B, T, D);
     } else {
-        // Defensive: trap on an unreachable dtype combo. See ssm_scan_fwd.cu
-        // for rationale — the binding rejects these upstream, but if a
-        // future dtype tuple is added without updating this dispatcher
-        // we want a loud failure. Launch a deliberately invalid config;
-        // the caller's cudaGetLastError will surface it.
-        cudaGetLastError();  // clear previous
-        ssm_scan_bwd_kernel<TagFP32, TagFP32, BlockX><<<dim3(0), dim3(0), 0, stream>>>(
-            nullptr, nullptr, nullptr, nullptr, nullptr, 0, 0, 0);
+        // Unreachable under the binding-side whitelist; host-side
+        // TORCH_CHECK mirrors ssm_scan_fwd.cu's contract. See that file
+        // for the ScalarType stringify workaround.
+        TORCH_CHECK(false,
+                    "cc_ssm_scan bwd: unsupported (decay, update) dtype combo "
+                    "reached the CUDA dispatcher; binding should have "
+                    "rejected it upstream. Got decay=",
+                    static_cast<int>(decay_dtype),
+                    " update=", static_cast<int>(update_dtype),
+                    " (see c10/core/ScalarType.h for enum mapping)");
     }
 }
 

@@ -40,6 +40,7 @@
 
 #include "ssm_scan.h"
 
+#include <c10/util/Exception.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -129,10 +130,16 @@ __global__ void ssm_scan_fwd_kernel(
 // Launch dispatch. The input dtype pair determines the template
 // instantiation. Valid combos:
 //   (decay, update, out) in { (bf16, bf16, bf16), (bf16, fp16, fp16),
-//                             (fp32, fp32, fp32), (fp16, fp16, fp16) }.
+//                             (fp32, fp32, fp32), (fp16, fp16, fp16),
+//                             (fp32, bf16, bf16), (fp32, fp16, fp16) }.
 // The public API takes decay+update dtypes and the wrapper here picks
 // the instantiation. bf16 is the prod case; fp32 is the numerical
-// reference path.
+// reference path. The (fp32, bf16) combo is what autocast bf16 produces
+// in production: `torch.exp(-delta * a_base)` upcasts to fp32 while
+// `update = select * candidate` stays bf16. Matching natively preserves
+// fp32 decay precision with zero pre-cast overhead. The (fp32, fp16)
+// combo is the fp16 analogue for older hardware or mixed-precision
+// configs.
 //
 // BlockX default 128 — a compromise between coalescing (want BlockX
 // divides D cleanly; D=256 gives 2 blocks per batch at BlockX=128,
@@ -190,21 +197,42 @@ void launch_ssm_scan_fwd(
             reinterpret_cast<float*>(out),
             state_fp32,
             B, T, D);
+    } else if (decay_fp32 && update_bf16) {
+        // Autocast bf16 production path: `torch.exp(-delta * a_base)`
+        // upcasts decay to fp32 while `update = select * candidate`
+        // stays bf16. Matching natively (fp32 load for decay, bf16
+        // load/store for update) preserves the fp32 decay precision
+        // without any host-side pre-cast.
+        ssm_scan_fwd_kernel<TagFP32, TagBF16, TagBF16, BlockX><<<grid, block, 0, stream>>>(
+            reinterpret_cast<const float*>(decay),
+            reinterpret_cast<const __nv_bfloat16*>(update),
+            reinterpret_cast<__nv_bfloat16*>(out),
+            state_fp32,
+            B, T, D);
+    } else if (decay_fp32 && update_fp16) {
+        // fp16 analogue of the autocast path — symmetric for older
+        // hardware or mixed-precision configs that land in fp16 update
+        // with fp32 decay from the same `torch.exp` autocast rule.
+        ssm_scan_fwd_kernel<TagFP32, TagFP16, TagFP16, BlockX><<<grid, block, 0, stream>>>(
+            reinterpret_cast<const float*>(decay),
+            reinterpret_cast<const __half*>(update),
+            reinterpret_cast<__half*>(out),
+            state_fp32,
+            B, T, D);
     } else {
-        // Defensive: trap on an unreachable dtype combo. The pybind11
-        // binding rejects these upstream, so this branch is dead today;
-        // but if a future dtype tuple is added to the binding without
-        // the dispatcher, we want a loud failure, not silent garbage.
-        // Cannot raise here (this runs on the host side of the launch
-        // pre-kernel), so emit an un-ignorable device-side trap via
-        // `cudaLaunchKernel`-style no-op that CUDA error-checks.
-        // Simplest: set the async error slot directly.
-        cudaGetLastError();  // clear previous
-        // Force an error: launch with zero grid on the stream to
-        // trigger `cudaErrorInvalidConfiguration`, which the caller's
-        // `cudaGetLastError` check will catch.
-        ssm_scan_fwd_kernel<TagFP32, TagFP32, TagFP32, BlockX><<<dim3(0), dim3(0), 0, stream>>>(
-            nullptr, nullptr, nullptr, nullptr, 0, 0, 0);
+        // Unreachable under the binding-side whitelist; keep as a host-
+        // side TORCH_CHECK so a future binding mistake surfaces as a
+        // readable error rather than silent garbage. Runs before the
+        // stream, no device-side trap needed. decay_dtype/update_dtype
+        // are printed as raw enum ints so we don't take a ScalarType
+        // stringify dependency in the .cu TU.
+        TORCH_CHECK(false,
+                    "cc_ssm_scan fwd: unsupported (decay, update) dtype combo "
+                    "reached the CUDA dispatcher; binding should have "
+                    "rejected it upstream. Got decay=",
+                    static_cast<int>(decay_dtype),
+                    " update=", static_cast<int>(update_dtype),
+                    " (see c10/core/ScalarType.h for enum mapping)");
     }
 }
 
