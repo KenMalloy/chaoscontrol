@@ -72,8 +72,17 @@ class DeltaModulator:
         self._log_a_originals: list[tuple[nn.Parameter, torch.Tensor]] = []
 
     def _find_cores(self) -> list[nn.Module]:
-        from chaoscontrol.core import ChaosSSMCore
-        return [m for m in self.module.modules() if isinstance(m, ChaosSSMCore)]
+        # NOTE: matches by class name rather than `isinstance(m, ChaosSSMCore)`.
+        # `tests/test_core.py::test_chunked_backend_selectable_via_env` reloads
+        # `chaoscontrol.core` via `importlib.reload` (lines 180, 200) to flip
+        # the env-var-gated diag-recurrence backend. After that reload the
+        # module-level ChaosSSMCore symbol points at a new class object, so
+        # any core instantiated earlier fails `isinstance` against the new
+        # class and DeltaModulator silently returns no cores — turning it
+        # into a no-op at the exact moment we rely on it for Axis 3. Name
+        # matching survives the reload. The cost is brittleness to renames,
+        # which is explicit and caught by our test suite.
+        return [m for m in self.module.modules() if type(m).__name__ == "ChaosSSMCore"]
 
     def __enter__(self):
         # Axis 3 (log_a_shift) is designed ⊥ Axis 1 (log_a adaptation). If the
