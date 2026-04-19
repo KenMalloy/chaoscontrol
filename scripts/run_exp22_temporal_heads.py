@@ -53,8 +53,14 @@ class Exp22RunConfig:
     analysis_path: str = ""
     evidence_label: str = "exploratory"
     depth_recurrence_count: int = 3
-    mixer: Literal["uniform_logprob", "base_prior_logprob"] = "uniform_logprob"
+    mixer: Literal[
+        "uniform_logprob",
+        "base_prior_logprob",
+        "online_exp_weights_logprob",
+    ] = "uniform_logprob"
     mixer_weights: tuple[float, ...] | None = None
+    online_eta: float = 1.0
+    online_initial_weights: tuple[float, ...] | None = None
 
 
 def _iter_chunks(tokens: list[int], chunk_size: int):
@@ -215,6 +221,7 @@ def run(cfg: Exp22RunConfig, *, jsonl_paths: list[str], sp_model_path: str) -> N
     horizon_shifts = tuple(float(x) for x in cfg.horizon_shifts)
     head_ids = _normalize_str_tuple(cfg.head_ids)
     mixer_weights = _normalize_float_tuple(cfg.mixer_weights)
+    online_initial_weights = _normalize_float_tuple(cfg.online_initial_weights)
     if cfg.condition == "identical_heads_uniform":
         if any(shift != 0.0 for shift in horizon_shifts):
             raise ValueError("identical_heads_uniform requires every horizon shift to be 0.0")
@@ -229,6 +236,8 @@ def run(cfg: Exp22RunConfig, *, jsonl_paths: list[str], sp_model_path: str) -> N
         head_ids=head_ids,
         mixer=cfg.mixer,
         mixer_weights=mixer_weights,
+        online_eta=float(cfg.online_eta),
+        online_initial_weights=online_initial_weights,
     )
     temporal_condition = cfg.condition in (
         "single_horizon",
@@ -356,6 +365,12 @@ def run(cfg: Exp22RunConfig, *, jsonl_paths: list[str], sp_model_path: str) -> N
                             if temporal_cfg.mixer_weights is not None
                             else None
                         ),
+                        "online_eta": temporal_cfg.online_eta,
+                        "online_initial_weights": (
+                            list(temporal_cfg.online_initial_weights)
+                            if temporal_cfg.online_initial_weights is not None
+                            else None
+                        ),
                         "horizon_shifts": list(temporal_cfg.horizon_shifts),
                         "head_ids": (
                             list(temporal_cfg.head_ids)
@@ -417,6 +432,12 @@ def run(cfg: Exp22RunConfig, *, jsonl_paths: list[str], sp_model_path: str) -> N
                 "mixer_weights": (
                     list(temporal_cfg.mixer_weights)
                     if temporal_cfg.mixer_weights is not None
+                    else None
+                ),
+                "online_eta": temporal_cfg.online_eta,
+                "online_initial_weights": (
+                    list(temporal_cfg.online_initial_weights)
+                    if temporal_cfg.online_initial_weights is not None
                     else None
                 ),
                 "analysis_path": cfg.analysis_path or None,

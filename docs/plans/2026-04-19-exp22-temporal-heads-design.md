@@ -169,6 +169,7 @@ Phase B is run if Phase A shows a non-trivial signal, or if Phase A is null whil
 
 | Tag | Description | Purpose |
 |---|---|---|
+| `temporal_heads_3_online_exp_weights` | causal exponential-weights mixer over the slow/base/fast traces, updating only after each token's realized loss | tests the highest-ceiling parameter-free causal expert-aggregation variant |
 | `temporal_scale_dropout_train` | train with random per-batch or per-block horizon shifts, eval with temporal heads | reduces eval-only OOD risk |
 | `tiny_mixer` | small frozen-checkpoint mixer trained on held-out calibration stream | measures learned composition without touching base weights |
 | `tiny_ssm_sidecar` | small recurrent sidecar predicts logit deltas for high-priority chunks | deferred expert-SSM bridge |
@@ -254,6 +255,18 @@ else:
 
 That secondary policy is exploratory until it is frozen on a calibration stream and re-run on the primary stream. The threshold should be chosen on a calibration stream or smoke split, then frozen for the primary eval stream. If the threshold is tuned on the primary eval stream, the run must be labeled exploratory.
 
+The online exponential-weights mixer follows the same legality rule at token
+granularity. Token `t` is scored with weights computed from tokens `< t`; only
+after token `t` has been scored may its per-head losses update weights for
+token `t+1`:
+
+```text
+log_w_{t+1,k} = log_softmax(log_w_{t,k} - eta * nll_{t,k})
+```
+
+Any per-token oracle chooser or future-token weight update is an invalid score
+and may only be reported as an explicitly leaky diagnostic.
+
 ## Metrics
 
 Primary:
@@ -324,7 +337,9 @@ class TemporalHeadConfig:
     horizon_shifts: tuple[float, ...] = (-0.5, 0.0, 0.5)
     head_ids: tuple[str, ...] | None = None  # required when shifts repeat
     horizon_knob: Literal["log_a_shift", "delta_post_scale", "delta_pre_scale"] = "log_a_shift"
-    mixer: Literal["uniform_logprob", "logit_mean"] = "uniform_logprob"
+    mixer: Literal["uniform_logprob", "base_prior_logprob", "online_exp_weights_logprob", "logit_mean"] = "uniform_logprob"
+    online_eta: float = 1.0
+    online_initial_weights: tuple[float, ...] | None = None
     policy: Literal["always", "previous_chunk_priority"] = "always"
     threshold: float | None = None
 ```
@@ -346,12 +361,13 @@ Load-bearing tests:
 2. Uniform log-prob mixture with one head matches that head exactly.
 3. Each head carries independent recurrent state.
 4. Repeated `horizon_shifts=(0.0, 0.0, 0.0)` with explicit `head_ids` matches `score_only` within float noise while preserving independent state objects.
-5. Gating for chunk `k` cannot read target-dependent stats from chunk `k`.
-6. Wall-clock accounting charges every temporal-head forward pass.
-7. Artifact bytes are unchanged for parameter-free conditions.
-8. `log_a_shift=0.0` temporal path is bit-compatible with the existing Exp 20 `DeltaModulator` path.
-9. `same_horizon_virtual_depth` uses one state bundle and a deterministic virtual-layer replay; it does not instantiate multiple identical temporal-head states.
-10. Gating after a base-only chunk ignores head disagreement or uses only the pre-registered decayed cache.
+5. Online exponential weighting uses pre-update weights for token `t`, then updates only from token `t` losses for token `t+1`.
+6. Gating for chunk `k` cannot read target-dependent stats from chunk `k`.
+7. Wall-clock accounting charges every temporal-head forward pass.
+8. Artifact bytes are unchanged for parameter-free conditions.
+9. `log_a_shift=0.0` temporal path is bit-compatible with the existing Exp 20 `DeltaModulator` path.
+10. `same_horizon_virtual_depth` uses one state bundle and a deterministic virtual-layer replay; it does not instantiate multiple identical temporal-head states.
+11. Gating after a base-only chunk ignores head disagreement or uses only the pre-registered decayed cache.
 
 ## Risks
 

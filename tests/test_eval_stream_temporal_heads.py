@@ -6,6 +6,7 @@ from chaoscontrol.eval_stream.temporal_heads import (
     TemporalHeadConfig,
     make_same_horizon_virtual_depth_config,
     score_temporal_heads_chunk,
+    online_exp_weighted_logprob_mixture,
     uniform_logprob_mixture,
     weighted_logprob_mixture,
 )
@@ -53,6 +54,81 @@ def test_weighted_logprob_mixture_rejects_bad_weights():
         assert "weights length" in str(exc)
     else:
         raise AssertionError("expected bad weight length to fail")
+
+
+def test_online_exp_weighted_mixture_updates_after_each_token_loss():
+    head_a = torch.log(
+        torch.tensor(
+            [
+                [
+                    [0.90, 0.10],
+                    [0.90, 0.10],
+                    [0.50, 0.50],
+                ]
+            ]
+        )
+    )
+    head_b = torch.log(
+        torch.tensor(
+            [
+                [
+                    [0.10, 0.90],
+                    [0.10, 0.90],
+                    [0.50, 0.50],
+                ]
+            ]
+        )
+    )
+    targets = torch.tensor([[0, 0]])
+
+    mixed = online_exp_weighted_logprob_mixture(
+        [head_a, head_b],
+        targets,
+        eta=4.0,
+    )
+    uniform = uniform_logprob_mixture([head_a, head_b])
+
+    assert torch.allclose(mixed[:, 0], uniform[:, 0])
+    assert mixed.exp()[0, 1, 0] > uniform.exp()[0, 1, 0]
+
+
+def test_online_exp_weighted_mixture_does_not_let_future_targets_change_current_mix():
+    head_a = torch.log(
+        torch.tensor(
+            [
+                [
+                    [0.80, 0.20],
+                    [0.70, 0.30],
+                    [0.50, 0.50],
+                ]
+            ]
+        )
+    )
+    head_b = torch.log(
+        torch.tensor(
+            [
+                [
+                    [0.20, 0.80],
+                    [0.30, 0.70],
+                    [0.50, 0.50],
+                ]
+            ]
+        )
+    )
+
+    future_zero = online_exp_weighted_logprob_mixture(
+        [head_a, head_b],
+        torch.tensor([[0, 0]]),
+        eta=2.0,
+    )
+    future_one = online_exp_weighted_logprob_mixture(
+        [head_a, head_b],
+        torch.tensor([[0, 1]]),
+        eta=2.0,
+    )
+
+    assert torch.equal(future_zero[:, 0], future_one[:, 0])
+    assert torch.equal(future_zero[:, 1], future_one[:, 1])
 
 
 def test_single_zero_shift_matches_direct_model():

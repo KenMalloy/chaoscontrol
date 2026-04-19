@@ -58,6 +58,9 @@ if it does not, the temporal-head runner is not a clean self-ensemble scaffold.
 `phaseA_temporal_heads_3_base_prior` is the engineering guardrail: it keeps
 80% prior weight on the base horizon and 10% on each shifted horizon, so a
 badly OOD shifted head cannot divide a correct base forecast by three.
+`phaseB_temporal_heads_3_online_exp_weights` is exploratory: it updates mixture
+weights after each realized token loss, so token `t` is always scored with
+weights computed before seeing token `t`.
 
 ```bash
 python scripts/run_exp22_temporal_heads.py \
@@ -74,6 +77,9 @@ python scripts/run_exp22_temporal_heads.py \
 
 python scripts/run_exp22_temporal_heads.py \
   --config experiments/22_temporal_heads/configs/phaseA_same_horizon_virtual_depth.json
+
+python scripts/run_exp22_temporal_heads.py \
+  --config experiments/22_temporal_heads/configs/phaseB_temporal_heads_3_online_exp_weights.json
 ```
 
 Before running, replace every `TODO/...` path in the config files with the
@@ -95,6 +101,20 @@ The half-life diagnostic uses `ln(2) / (delta * sigmoid(log_a + shift))`, with
 `delta` measured from the same chunk forward pass. If shifted half-life
 histograms overlap heavily with the base horizon, treat temporal heads as
 redundant even before interpreting bpb.
+
+## Online Mixing
+
+`online_exp_weights_logprob` is the causal exponential-weights mixer. It starts
+from fixed initial weights, scores each token using the current weights, then
+updates weights from that token's already-revealed per-head log loss:
+
+```text
+log_w_{t+1,k} = log_softmax(log_w_{t,k} - eta * nll_{t,k})
+```
+
+It is not the same as an oracle per-token head chooser. Any oracle or
+future-token weighting result must be labeled as a leaky diagnostic, never as a
+language-model score.
 
 ## Statistics
 

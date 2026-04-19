@@ -252,6 +252,27 @@ def test_exp22_runner_identical_heads_uniform_matches_score_only(tmp_path):
     assert summary["temporal_head_count"] == 3
 
 
+def test_exp22_runner_accepts_online_exp_weights_mixer(tmp_path):
+    cfg_path, _, summary_path = _write_tiny_fixture(
+        tmp_path,
+        condition="temporal_heads",
+        horizon_shifts=[-0.5, 0.0, 0.5],
+        extra_config={
+            "mixer": "online_exp_weights_logprob",
+            "online_eta": 0.75,
+            "online_initial_weights": [0.2, 0.6, 0.2],
+        },
+    )
+
+    result = _run_exp22_config(cfg_path)
+
+    assert result.returncode == 0, result.stderr
+    summary = json.loads(summary_path.read_text())
+    assert summary["mixer"] == "online_exp_weights_logprob"
+    assert summary["online_eta"] == 0.75
+    assert summary["online_initial_weights"] == [0.2, 0.6, 0.2]
+
+
 def test_exp22_parameter_free_run_does_not_mutate_checkpoint(tmp_path):
     cfg_path, _, _ = _write_tiny_fixture(
         tmp_path,
