@@ -398,6 +398,8 @@ class FusedFP8Linear(nn.Module):
         """
         leading_shape = x.shape[:-1]
         x_flat = x.reshape(-1, self.in_features)
+        if x_flat.dtype != self.weight.dtype:
+            x_flat = x_flat.to(dtype=self.weight.dtype)
 
         y_flat = _FusedFP8LinearFn.apply(
             x_flat, self.weight, self.bias,
