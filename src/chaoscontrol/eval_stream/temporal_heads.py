@@ -67,12 +67,64 @@ def online_exp_weighted_logprob_mixture(
     The pre-update weights score token t. Only after token t is scored are the
     per-head losses for token t used to update weights for token t+1.
     """
+    mixed, _log_weights = _online_exp_weighted_logprob_mixture_with_final_weights(
+        log_probs,
+        targets,
+        eta=eta,
+        initial_weights=initial_weights,
+    )
+    return mixed
+
+
+def update_online_exp_weighted_log_weights(
+    log_weights: torch.Tensor,
+    head_log_probs: list[torch.Tensor],
+    target: torch.Tensor,
+    *,
+    eta: float,
+) -> torch.Tensor:
+    """Update online expert weights after a scored target token."""
+    if eta < 0.0:
+        raise ValueError("eta must be non-negative")
+    if not head_log_probs:
+        raise ValueError("head_log_probs requires at least one tensor")
+    batch, head_count = log_weights.shape
+    if head_count != len(head_log_probs):
+        raise ValueError(
+            f"log_weights head count {head_count} does not match "
+            f"head_log_probs length {len(head_log_probs)}"
+        )
+    if target.shape != (batch,):
+        raise ValueError(
+            f"target shape {tuple(target.shape)} does not match expected {(batch,)}"
+        )
+    token_log_probs = torch.stack(
+        [
+            logp.gather(-1, target.unsqueeze(-1)).squeeze(-1)
+            for logp in head_log_probs
+        ],
+        dim=1,
+    )
+    return torch.log_softmax(
+        log_weights + float(eta) * token_log_probs,
+        dim=1,
+    )
+
+
+def _online_exp_weighted_logprob_mixture_with_final_weights(
+    log_probs: list[torch.Tensor],
+    targets: torch.Tensor,
+    *,
+    eta: float,
+    initial_weights: tuple[float, ...] | None = None,
+    initial_log_weights: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
     if not log_probs:
         raise ValueError(
             "online_exp_weighted_logprob_mixture requires at least one tensor"
         )
     if len(log_probs) == 1:
-        return log_probs[0]
+        return log_probs[0], None
     if eta < 0.0:
         raise ValueError("eta must be non-negative")
     shape = log_probs[0].shape
@@ -87,22 +139,33 @@ def online_exp_weighted_logprob_mixture(
             f"expected {(batch, seq_len - 1)}"
         )
 
-    if initial_weights is None:
-        initial_weights = tuple(1.0 for _ in log_probs)
-    weight_tensor = torch.tensor(
-        initial_weights,
-        device=log_probs[0].device,
-        dtype=log_probs[0].dtype,
-    )
-    if len(weight_tensor) != len(log_probs):
-        raise ValueError(
-            f"initial_weights length {len(weight_tensor)} does not match "
-            f"log_probs length {len(log_probs)}"
+    if initial_log_weights is not None:
+        if initial_log_weights.shape != (batch, len(log_probs)):
+            raise ValueError(
+                f"initial_log_weights shape {tuple(initial_log_weights.shape)} "
+                f"does not match expected {(batch, len(log_probs))}"
+            )
+        log_weights = initial_log_weights.to(
+            device=log_probs[0].device,
+            dtype=log_probs[0].dtype,
         )
-    if torch.any(weight_tensor <= 0):
-        raise ValueError("all initial online weights must be positive")
-    log_weights = (weight_tensor / weight_tensor.sum()).log()
-    log_weights = log_weights.unsqueeze(0).expand(batch, -1).clone()
+    else:
+        if initial_weights is None:
+            initial_weights = tuple(1.0 for _ in log_probs)
+        weight_tensor = torch.tensor(
+            initial_weights,
+            device=log_probs[0].device,
+            dtype=log_probs[0].dtype,
+        )
+        if len(weight_tensor) != len(log_probs):
+            raise ValueError(
+                f"initial_weights length {len(weight_tensor)} does not match "
+                f"log_probs length {len(log_probs)}"
+            )
+        if torch.any(weight_tensor <= 0):
+            raise ValueError("all initial online weights must be positive")
+        log_weights = (weight_tensor / weight_tensor.sum()).log()
+        log_weights = log_weights.unsqueeze(0).expand(batch, -1).clone()
     stacked = torch.stack(log_probs, dim=1)
     head_count = len(log_probs)
 
@@ -115,18 +178,14 @@ def online_exp_weighted_logprob_mixture(
             )
         )
         if pos < targets.size(1):
-            target_idx = targets[:, pos].view(batch, 1, 1).expand(-1, head_count, 1)
-            token_log_probs = (
-                stacked[:, :, pos, :]
-                .gather(-1, target_idx)
-                .squeeze(-1)
-            )
-            log_weights = torch.log_softmax(
-                log_weights + float(eta) * token_log_probs,
-                dim=1,
+            log_weights = update_online_exp_weighted_log_weights(
+                log_weights,
+                [stacked[:, head_idx, pos, :] for head_idx in range(head_count)],
+                targets[:, pos],
+                eta=eta,
             )
 
-    return torch.stack(mixed_positions, dim=1)
+    return torch.stack(mixed_positions, dim=1), log_weights
 
 
 @dataclass(frozen=True)
@@ -156,6 +215,9 @@ class TemporalHeadChunkResult:
     winner_counts_by_shift: dict[HeadKey, int]
     half_life_stats_by_shift: dict[HeadKey, list[dict[str, float | int | None]]]
     state_divergence_by_shift: dict[HeadKey, list[dict[str, float | int]]]
+    last_mixed_log_probs: torch.Tensor | None = None
+    last_log_probs_by_shift: dict[HeadKey, torch.Tensor] | None = None
+    online_final_log_weights: torch.Tensor | None = None
 
 
 @dataclass
@@ -408,11 +470,12 @@ def score_temporal_heads_chunk(
     *,
     states_by_shift: dict[HeadKey, list[torch.Tensor] | None],
     cfg: TemporalHeadConfig,
+    online_initial_log_weights: torch.Tensor | None = None,
 ) -> TemporalHeadChunkResult:
     """Score one chunk under parallel horizon shifts without updating weights."""
-    if chunk.size(1) < 2:
+    if chunk.size(1) < 1:
         raise ValueError(
-            f"score_temporal_heads_chunk needs chunk length >= 2; got {tuple(chunk.shape)}"
+            f"score_temporal_heads_chunk needs chunk length >= 1; got {tuple(chunk.shape)}"
         )
     if cfg.horizon_knob != "log_a_shift":
         raise ValueError(f"unsupported horizon_knob: {cfg.horizon_knob!r}")
@@ -428,6 +491,7 @@ def score_temporal_heads_chunk(
     head_keys = _head_keys(cfg)
     base_key = _base_head_key(head_keys, cfg.horizon_shifts)
     log_probs: list[torch.Tensor] = []
+    log_probs_by_shift: dict[HeadKey, torch.Tensor] = {}
     final_states_by_shift: dict[HeadKey, list[torch.Tensor]] = {}
     per_head_loss_nats: dict[HeadKey, float] = {}
     raw_half_lives_by_shift: dict[HeadKey, list[torch.Tensor | None]] = {}
@@ -453,6 +517,7 @@ def score_temporal_heads_chunk(
             logits = out["logits"] if isinstance(out, dict) else out
             head_log_probs = F.log_softmax(logits, dim=-1)
             log_probs.append(head_log_probs)
+            log_probs_by_shift[head_key] = head_log_probs
             per_head_loss_nats[head_key] = float(
                 _nll_from_log_probs(head_log_probs, targets).item()
             )
@@ -462,18 +527,24 @@ def score_temporal_heads_chunk(
                 else []
             )
 
+        online_final_log_weights = None
         if cfg.mixer == "uniform_logprob":
             mixed_log_probs = uniform_logprob_mixture(log_probs)
         elif cfg.mixer == "base_prior_logprob":
             weights = cfg.mixer_weights or _default_base_prior_weights(cfg.horizon_shifts)
             mixed_log_probs = weighted_logprob_mixture(log_probs, weights=weights)
         else:
-            mixed_log_probs = online_exp_weighted_logprob_mixture(
-                log_probs,
-                targets,
-                eta=cfg.online_eta,
-                initial_weights=cfg.online_initial_weights,
+            mixed_log_probs, online_final_log_weights = (
+                _online_exp_weighted_logprob_mixture_with_final_weights(
+                    log_probs,
+                    targets,
+                    eta=cfg.online_eta,
+                    initial_weights=cfg.online_initial_weights,
+                    initial_log_weights=online_initial_log_weights,
+                )
             )
+        if cfg.mixer != "online_exp_weights_logprob":
+            online_final_log_weights = None
         loss_nats = float(_nll_from_log_probs(mixed_log_probs, targets).item())
         per_token_nll = torch.stack(
             [_token_nll_from_log_probs(logp, targets) for logp in log_probs],
@@ -499,6 +570,16 @@ def score_temporal_heads_chunk(
         state_divergence_by_shift=_state_divergence_by_shift(
             final_states_by_shift,
             base_key=base_key,
+        ),
+        last_mixed_log_probs=mixed_log_probs[:, -1].detach().clone(),
+        last_log_probs_by_shift={
+            shift: logp[:, -1].detach().clone()
+            for shift, logp in log_probs_by_shift.items()
+        },
+        online_final_log_weights=(
+            online_final_log_weights.detach().clone()
+            if online_final_log_weights is not None
+            else None
         ),
     )
 

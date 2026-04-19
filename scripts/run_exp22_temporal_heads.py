@@ -23,6 +23,7 @@ from chaoscontrol.eval_stream.budget import BudgetTracker, EvalDeadline
 from chaoscontrol.eval_stream.doc_stream import DocStreamer
 from chaoscontrol.eval_stream.temporal_heads import (
     TemporalHeadConfig,
+    update_online_exp_weighted_log_weights,
     make_same_horizon_virtual_depth_config,
     score_temporal_heads_chunk,
 )
@@ -61,6 +62,14 @@ class Exp22RunConfig:
     mixer_weights: tuple[float, ...] | None = None
     online_eta: float = 1.0
     online_initial_weights: tuple[float, ...] | None = None
+
+
+@dataclass
+class DirectChunkResult:
+    loss_nats: float
+    tokens_scored: int
+    final_states: list[torch.Tensor]
+    last_log_probs: torch.Tensor
 
 
 def _iter_chunks(tokens: list[int], chunk_size: int):
@@ -157,24 +166,66 @@ def _score_direct_chunk(
     model: torch.nn.Module,
     chunk: torch.Tensor,
     states: list[torch.Tensor] | None,
-) -> tuple[float, list[torch.Tensor]]:
+) -> DirectChunkResult:
     kwargs = {}
     if states:
         kwargs["initial_states"] = states
     with torch.no_grad():
         out = model(chunk, **kwargs)
         logits = out["logits"] if isinstance(out, dict) else out
-        loss = F.cross_entropy(
-            logits[:, :-1].reshape(-1, logits.size(-1)),
-            chunk[:, 1:].reshape(-1),
-            reduction="sum",
-        )
+        targets = chunk[:, 1:]
+        if targets.numel() > 0:
+            loss = F.cross_entropy(
+                logits[:, :-1].reshape(-1, logits.size(-1)),
+                targets.reshape(-1),
+                reduction="sum",
+            )
+        else:
+            loss = logits.new_zeros(())
         final_states = (
             [state.detach().clone() for state in out["final_states"]]
             if isinstance(out, dict) and "final_states" in out
             else []
         )
-    return float(loss.item()), final_states
+        last_log_probs = F.log_softmax(logits[:, -1], dim=-1).detach().clone()
+    return DirectChunkResult(
+        loss_nats=float(loss.item()),
+        tokens_scored=int(targets.numel()),
+        final_states=final_states,
+        last_log_probs=last_log_probs,
+    )
+
+
+def _boundary_nll_from_log_probs(
+    log_probs: torch.Tensor,
+    target: torch.Tensor,
+) -> float:
+    return float(
+        -log_probs.gather(-1, target.unsqueeze(-1)).squeeze(-1).sum().item()
+    )
+
+
+def _add_boundary_winner_counts(
+    winner_counts: dict[float | str, int],
+    *,
+    head_keys: tuple[float | str, ...],
+    log_probs_by_shift: dict[float | str, torch.Tensor],
+    target: torch.Tensor,
+) -> None:
+    token_nlls = torch.stack(
+        [
+            -log_probs_by_shift[head_key]
+            .gather(-1, target.unsqueeze(-1))
+            .squeeze(-1)
+            for head_key in head_keys
+        ],
+        dim=0,
+    )
+    winners = token_nlls.argmin(dim=0)
+    for idx, head_key in enumerate(head_keys):
+        winner_counts[head_key] = winner_counts.get(head_key, 0) + int(
+            (winners == idx).sum().item()
+        )
 
 
 def run(cfg: Exp22RunConfig, *, jsonl_paths: list[str], sp_model_path: str) -> None:
@@ -280,11 +331,18 @@ def run(cfg: Exp22RunConfig, *, jsonl_paths: list[str], sp_model_path: str) -> N
                     states_by_shift: dict[float | str, list[torch.Tensor] | None] = {
                         head_key: None for head_key in head_keys
                     }
+                    previous_mixed_log_probs: torch.Tensor | None = None
+                    previous_head_log_probs_by_shift: dict[
+                        float | str,
+                        torch.Tensor,
+                    ] | None = None
+                    online_log_weights: torch.Tensor | None = None
                 else:
                     states: list[torch.Tensor] | None = None
+                    previous_direct_log_probs: torch.Tensor | None = None
 
                 for chunk_list in _iter_chunks(doc.tokens, cfg.chunk_size):
-                    if len(chunk_list) < 2:
+                    if len(chunk_list) < 1:
                         continue
                     chunk = torch.tensor(
                         chunk_list,
@@ -292,14 +350,55 @@ def run(cfg: Exp22RunConfig, *, jsonl_paths: list[str], sp_model_path: str) -> N
                         device=device,
                     ).unsqueeze(0)
                     score_t0 = time.monotonic()
+                    first_token = chunk[:, 0]
                     if temporal_condition:
+                        if previous_mixed_log_probs is not None:
+                            doc_loss_nats += _boundary_nll_from_log_probs(
+                                previous_mixed_log_probs,
+                                first_token,
+                            )
+                            doc_tokens += int(first_token.numel())
+                            if previous_head_log_probs_by_shift is not None:
+                                for shift, log_probs in (
+                                    previous_head_log_probs_by_shift.items()
+                                ):
+                                    per_head_loss_nats[shift] += (
+                                        _boundary_nll_from_log_probs(
+                                            log_probs,
+                                            first_token,
+                                        )
+                                    )
+                                _add_boundary_winner_counts(
+                                    doc_winner_counts,
+                                    head_keys=head_keys,
+                                    log_probs_by_shift=previous_head_log_probs_by_shift,
+                                    target=first_token,
+                                )
+                            if (
+                                temporal_cfg.mixer == "online_exp_weights_logprob"
+                                and online_log_weights is not None
+                                and previous_head_log_probs_by_shift is not None
+                            ):
+                                online_log_weights = update_online_exp_weighted_log_weights(
+                                    online_log_weights,
+                                    [
+                                        previous_head_log_probs_by_shift[head_key]
+                                        for head_key in head_keys
+                                    ],
+                                    first_token,
+                                    eta=temporal_cfg.online_eta,
+                                )
                         result = score_temporal_heads_chunk(
                             model,
                             chunk,
                             states_by_shift=states_by_shift,
                             cfg=temporal_cfg,
+                            online_initial_log_weights=online_log_weights,
                         )
                         states_by_shift = result.final_states_by_shift
+                        previous_mixed_log_probs = result.last_mixed_log_probs
+                        previous_head_log_probs_by_shift = result.last_log_probs_by_shift
+                        online_log_weights = result.online_final_log_weights
                         doc_loss_nats += result.loss_nats
                         doc_tokens += result.tokens_scored
                         for shift, loss_nats in result.per_head_loss_nats.items():
@@ -313,9 +412,17 @@ def run(cfg: Exp22RunConfig, *, jsonl_paths: list[str], sp_model_path: str) -> N
                         for shift, summaries in result.state_divergence_by_shift.items():
                             doc_state_divergence_samples.setdefault(shift, []).append(summaries)
                     else:
-                        loss_nats, states = _score_direct_chunk(model, chunk, states)
-                        doc_loss_nats += loss_nats
-                        doc_tokens += chunk.size(1) - 1
+                        if previous_direct_log_probs is not None:
+                            doc_loss_nats += _boundary_nll_from_log_probs(
+                                previous_direct_log_probs,
+                                first_token,
+                            )
+                            doc_tokens += int(first_token.numel())
+                        result = _score_direct_chunk(model, chunk, states)
+                        states = result.final_states
+                        previous_direct_log_probs = result.last_log_probs
+                        doc_loss_nats += result.loss_nats
+                        doc_tokens += result.tokens_scored
                     budget.add_score_time(time.monotonic() - score_t0)
                     chunks_scored += 1
                     doc_chunks_scored += 1

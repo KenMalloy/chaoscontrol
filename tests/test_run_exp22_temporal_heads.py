@@ -273,6 +273,193 @@ def test_exp22_runner_accepts_online_exp_weights_mixer(tmp_path):
     assert summary["online_initial_weights"] == [0.2, 0.6, 0.2]
 
 
+def test_score_only_scores_every_post_initial_token_across_chunk_boundaries(
+    monkeypatch,
+    tmp_path,
+):
+    runner = _load_runner_module()
+    tokens = [0, 1, 2, 3, 4, 5, 6]
+    vocab_size = 16
+
+    class FakeModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.zeros(()))
+
+        def forward(self, chunk, **_kwargs):
+            logits = -torch.arange(
+                vocab_size,
+                dtype=torch.float32,
+                device=chunk.device,
+            ).expand(chunk.size(0), chunk.size(1), vocab_size)
+            return {"logits": logits, "final_states": []}
+
+    class FakeStreamer:
+        def __init__(self, **_kwargs):
+            pass
+
+        def __iter__(self):
+            yield SimpleNamespace(doc_id=0, tokens=tokens, raw_bytes=len(tokens))
+
+    def fake_build_model(_ckpt_path, _cfg):
+        return FakeModel(), {"vocab_size": vocab_size, "num_layers": 0}
+
+    monkeypatch.setattr(runner, "_build_model", fake_build_model)
+    monkeypatch.setattr(runner, "DocStreamer", FakeStreamer)
+
+    metrics_path = tmp_path / "metrics.jsonl"
+    summary_path = tmp_path / "summary.json"
+    ckpt_path = tmp_path / "unused.pt"
+    ckpt_path.write_bytes(b"checkpoint")
+    cfg = runner.Exp22RunConfig(
+        condition="score_only",
+        checkpoint_path=str(ckpt_path),
+        output_path=str(metrics_path),
+        summary_path=str(summary_path),
+        chunk_size=3,
+    )
+
+    runner.run(cfg, jsonl_paths=["unused.jsonl"], sp_model_path="unused.model")
+
+    record = json.loads(metrics_path.read_text())
+    log_z = torch.logsumexp(-torch.arange(vocab_size, dtype=torch.float32), dim=0)
+    expected_loss = sum(float(token + log_z) for token in tokens[1:])
+    assert record["tokens"] == len(tokens) - 1
+    assert record["loss_nats"] == pytest.approx(expected_loss)
+
+
+def test_temporal_heads_scores_every_post_initial_token_across_chunk_boundaries(
+    monkeypatch,
+    tmp_path,
+):
+    runner = _load_runner_module()
+    tokens = [0, 1, 2, 3, 4, 5, 6]
+    vocab_size = 16
+
+    class FakeModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.zeros(()))
+
+        def forward(self, chunk, **_kwargs):
+            logits = -torch.arange(
+                vocab_size,
+                dtype=torch.float32,
+                device=chunk.device,
+            ).expand(chunk.size(0), chunk.size(1), vocab_size)
+            return {"logits": logits, "final_states": []}
+
+    class FakeStreamer:
+        def __init__(self, **_kwargs):
+            pass
+
+        def __iter__(self):
+            yield SimpleNamespace(doc_id=0, tokens=tokens, raw_bytes=len(tokens))
+
+    def fake_build_model(_ckpt_path, _cfg):
+        return FakeModel(), {"vocab_size": vocab_size, "num_layers": 0}
+
+    monkeypatch.setattr(runner, "_build_model", fake_build_model)
+    monkeypatch.setattr(runner, "DocStreamer", FakeStreamer)
+
+    metrics_path = tmp_path / "metrics.jsonl"
+    summary_path = tmp_path / "summary.json"
+    ckpt_path = tmp_path / "unused.pt"
+    ckpt_path.write_bytes(b"checkpoint")
+    cfg = runner.Exp22RunConfig(
+        condition="temporal_heads",
+        checkpoint_path=str(ckpt_path),
+        output_path=str(metrics_path),
+        summary_path=str(summary_path),
+        chunk_size=3,
+        horizon_shifts=(0.0,),
+    )
+
+    runner.run(cfg, jsonl_paths=["unused.jsonl"], sp_model_path="unused.model")
+
+    record = json.loads(metrics_path.read_text())
+    log_z = torch.logsumexp(-torch.arange(vocab_size, dtype=torch.float32), dim=0)
+    expected_loss = sum(float(token + log_z) for token in tokens[1:])
+    assert record["tokens"] == len(tokens) - 1
+    assert record["loss_nats"] == pytest.approx(expected_loss)
+    assert record["per_head_bpb"]["0.0"] == pytest.approx(record["bpb"])
+
+
+def test_online_mixer_updates_weights_after_boundary_token_before_next_chunk(
+    monkeypatch,
+    tmp_path,
+):
+    runner = _load_runner_module()
+    head_keys = (0.0, 0.5)
+    boundary_weights = []
+
+    class FakeModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.zeros(()))
+
+    class FakeStreamer:
+        def __init__(self, **_kwargs):
+            pass
+
+        def __iter__(self):
+            yield SimpleNamespace(doc_id=0, tokens=[0, 1, 2, 3], raw_bytes=4)
+
+    def fake_build_model(_ckpt_path, _cfg):
+        return FakeModel(), {"vocab_size": 8, "num_layers": 0}
+
+    def fake_score_temporal_heads_chunk(
+        _model,
+        chunk,
+        *,
+        states_by_shift,
+        cfg,
+        online_initial_log_weights=None,
+    ):
+        if chunk[0, 0].item() == 3:
+            boundary_weights.append(
+                torch.softmax(online_initial_log_weights, dim=1).detach().clone()
+            )
+        last_mixed = torch.log(torch.full((1, 8), 1.0 / 8.0))
+        head_a = torch.log(torch.tensor([[0.01, 0.01, 0.01, 0.90, 0.02, 0.02, 0.02, 0.01]]))
+        head_b = torch.log(torch.tensor([[0.01, 0.01, 0.01, 0.10, 0.30, 0.20, 0.20, 0.17]]))
+        return TemporalHeadChunkResult(
+            loss_nats=0.0,
+            tokens_scored=max(chunk.size(1) - 1, 0),
+            mixed_log_probs=torch.empty(0),
+            final_states_by_shift={shift: [] for shift in cfg.horizon_shifts},
+            per_head_loss_nats={shift: 0.0 for shift in cfg.horizon_shifts},
+            winner_counts_by_shift={shift: 0 for shift in cfg.horizon_shifts},
+            half_life_stats_by_shift={shift: [] for shift in cfg.horizon_shifts},
+            state_divergence_by_shift={},
+            last_mixed_log_probs=last_mixed,
+            last_log_probs_by_shift={head_keys[0]: head_a, head_keys[1]: head_b},
+            online_final_log_weights=torch.log(torch.tensor([[0.5, 0.5]])),
+        )
+
+    monkeypatch.setattr(runner, "_build_model", fake_build_model)
+    monkeypatch.setattr(runner, "DocStreamer", FakeStreamer)
+    monkeypatch.setattr(runner, "score_temporal_heads_chunk", fake_score_temporal_heads_chunk)
+
+    ckpt_path = tmp_path / "unused.pt"
+    ckpt_path.write_bytes(b"checkpoint")
+    cfg = runner.Exp22RunConfig(
+        condition="temporal_heads",
+        checkpoint_path=str(ckpt_path),
+        output_path=str(tmp_path / "metrics.jsonl"),
+        summary_path="",
+        chunk_size=3,
+        horizon_shifts=head_keys,
+        mixer="online_exp_weights_logprob",
+        online_eta=4.0,
+    )
+
+    runner.run(cfg, jsonl_paths=["unused.jsonl"], sp_model_path="unused.model")
+
+    assert len(boundary_weights) == 1
+    assert boundary_weights[0][0, 0] > 0.99
+
+
 def test_exp22_parameter_free_run_does_not_mutate_checkpoint(tmp_path):
     cfg_path, _, _ = _write_tiny_fixture(
         tmp_path,
@@ -313,7 +500,12 @@ def test_same_horizon_virtual_depth_threads_one_direct_state_bundle(monkeypatch,
     def fake_score_direct_chunk(_model, _chunk, states):
         seen_states.append(None if states is None else [state.clone() for state in states])
         next_state = torch.full((1, 1), float(len(seen_states)))
-        return 1.0, [next_state]
+        return runner.DirectChunkResult(
+            loss_nats=1.0,
+            tokens_scored=max(_chunk.size(1) - 1, 0),
+            final_states=[next_state],
+            last_log_probs=torch.zeros(1, 8),
+        )
 
     monkeypatch.setattr(runner, "_build_model", fake_build_model)
     monkeypatch.setattr(runner, "DocStreamer", FakeStreamer)
@@ -330,6 +522,7 @@ def test_same_horizon_virtual_depth_threads_one_direct_state_bundle(monkeypatch,
 
     assert seen_states[0] is None
     assert torch.equal(seen_states[1][0], torch.ones(1, 1))
+    assert torch.equal(seen_states[2][0], torch.full((1, 1), 2.0))
 
 
 def test_temporal_head_budget_time_includes_all_head_work(monkeypatch, tmp_path):
@@ -356,19 +549,31 @@ def test_temporal_head_budget_time_includes_all_head_work(monkeypatch, tmp_path)
     def fake_build_model(_ckpt_path, _cfg):
         return FakeModel(), {"vocab_size": 8, "num_layers": 1}
 
-    def fake_score_temporal_heads_chunk(_model, chunk, *, states_by_shift, cfg):
+    def fake_score_temporal_heads_chunk(
+        _model,
+        chunk,
+        *,
+        states_by_shift,
+        cfg,
+        online_initial_log_weights=None,
+    ):
         for _shift in cfg.horizon_shifts:
             forwards["count"] += 1
             clock["now"] += 0.25
+        last_log_probs = torch.zeros(1, 8)
         return TemporalHeadChunkResult(
             loss_nats=1.0,
-            tokens_scored=chunk.size(1) - 1,
+            tokens_scored=max(chunk.size(1) - 1, 0),
             mixed_log_probs=torch.empty(0),
             final_states_by_shift={shift: [] for shift in cfg.horizon_shifts},
             per_head_loss_nats={shift: 1.0 for shift in cfg.horizon_shifts},
             winner_counts_by_shift={shift: 0 for shift in cfg.horizon_shifts},
             half_life_stats_by_shift={shift: [] for shift in cfg.horizon_shifts},
             state_divergence_by_shift={},
+            last_mixed_log_probs=last_log_probs,
+            last_log_probs_by_shift={
+                shift: last_log_probs for shift in cfg.horizon_shifts
+            },
         )
 
     monkeypatch.setattr(runner.time, "monotonic", fake_monotonic)
@@ -391,5 +596,5 @@ def test_temporal_head_budget_time_includes_all_head_work(monkeypatch, tmp_path)
     runner.run(cfg, jsonl_paths=["unused.jsonl"], sp_model_path="unused.model")
 
     summary = json.loads(summary_path.read_text())
-    assert forwards["count"] == 6
-    assert summary["score_wall_seconds"] == pytest.approx(1.5)
+    assert forwards["count"] == 9
+    assert summary["score_wall_seconds"] == pytest.approx(2.25)
