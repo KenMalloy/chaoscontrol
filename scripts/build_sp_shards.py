@@ -186,7 +186,10 @@ def _train_sentencepiece(
         model_prefix=str(partial_prefix),
         vocab_size=vocab_size,
         model_type="bpe",
-        character_coverage=1.0,
+        # FineWeb has ~11,428 distinct required chars; coverage=1.0 fails
+        # with vocab_size < required_chars. 0.9995 drops the rarest <0.05%
+        # of code points to the byte_fallback path, which is lossless.
+        character_coverage=0.9995,
         # Byte fallback guarantees round-tripping even on rare unicode —
         # required for FineWeb's raw web text.
         byte_fallback=True,
