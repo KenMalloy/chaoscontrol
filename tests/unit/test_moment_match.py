@@ -1,8 +1,13 @@
 import torch
 from chaoscontrol.sgns.moment_match import (
+    frequency_bucket_ids,
     match_row_norm_moments,
     match_full_covariance,
+    sample_full_covariance,
+    sample_with_row_norms,
     shuffle_rows,
+    shuffle_rows_within_buckets,
+    token_class_bucket_ids,
 )
 
 
@@ -48,3 +53,88 @@ def test_shuffle_rows_is_permutation():
     sorted_out = out[torch.argsort(out[:, 0])]
     assert torch.allclose(sorted_src, sorted_out)
     assert not torch.allclose(src, out)
+
+
+def test_sample_with_row_norms_preserves_reference_norms_without_directions():
+    torch.manual_seed(0)
+    reference = torch.randn(128, 16) * 2.0
+    out_a = sample_with_row_norms(reference, seed=11)
+    out_b = sample_with_row_norms(reference, seed=11)
+    out_c = sample_with_row_norms(reference, seed=12)
+
+    torch.testing.assert_close(out_a.norm(dim=-1), reference.norm(dim=-1))
+    torch.testing.assert_close(out_a, out_b)
+    assert not torch.allclose(out_a, out_c)
+
+    # The control carries per-token norm information, not SGNS directions.
+    cos = torch.nn.functional.cosine_similarity(reference, out_a, dim=-1)
+    assert cos.abs().mean() < 0.5
+
+
+def test_sample_with_row_norms_can_shuffle_norm_assignment():
+    reference = torch.arange(1, 17, dtype=torch.float32).unsqueeze(1).repeat(1, 4)
+    aligned = sample_with_row_norms(reference, seed=3)
+    shuffled = sample_with_row_norms(reference, seed=3, shuffle_norms_seed=99)
+
+    torch.testing.assert_close(
+        shuffled.norm(dim=-1).sort().values,
+        reference.norm(dim=-1).sort().values,
+    )
+    assert not torch.allclose(shuffled.norm(dim=-1), aligned.norm(dim=-1))
+
+
+def test_shuffle_rows_within_buckets_preserves_each_bucket_multiset():
+    src = torch.arange(10, dtype=torch.float32).unsqueeze(1)
+    buckets = torch.tensor([0, 0, 0, 1, 1, 2, 2, 2, 2, 2])
+    out = shuffle_rows_within_buckets(src, buckets, seed=7)
+
+    for bucket in buckets.unique():
+        mask = buckets == bucket
+        torch.testing.assert_close(
+            out[mask, 0].sort().values,
+            src[mask, 0].sort().values,
+        )
+    assert not torch.allclose(out, src)
+
+
+def test_frequency_bucket_ids_assigns_equal_size_frequency_ranks():
+    counts = torch.tensor([100.0, 90.0, 80.0, 5.0, 4.0, 3.0, 0.0, 0.0])
+    buckets = frequency_bucket_ids(counts, num_buckets=4)
+    torch.testing.assert_close(
+        buckets,
+        torch.tensor([0, 0, 1, 1, 2, 2, 3, 3]),
+    )
+
+
+def test_token_class_bucket_ids_groups_sentencepiece_style_pieces():
+    pieces = [
+        "<unk>",
+        "\u2581hello",
+        "world",
+        "\u2581",
+        "123",
+        "9th",
+        ".",
+        "\u2581!?",
+        "hello-world",
+    ]
+    buckets = token_class_bucket_ids(pieces)
+
+    assert buckets[1] == buckets[3] == buckets[7]  # leading-space/whitespace
+    assert buckets[2] != buckets[4]  # alpha vs numeric
+    assert buckets[4] != buckets[5]  # numeric vs mixed
+    assert buckets[6] != buckets[8]  # punctuation vs mixed
+    assert len(set(buckets.tolist())) >= 5
+
+
+def test_sample_full_covariance_is_deterministic_and_matches_moments():
+    torch.manual_seed(0)
+    scale = torch.tensor([2.0, 0.5, 1.5, 0.25])
+    reference = torch.randn(4096, 4) * scale + torch.tensor([1.0, -2.0, 0.5, 3.0])
+
+    out_a = sample_full_covariance(reference, seed=101)
+    out_b = sample_full_covariance(reference, seed=101)
+    torch.testing.assert_close(out_a, out_b)
+
+    torch.testing.assert_close(out_a.mean(dim=0), reference.mean(dim=0), atol=0.08, rtol=0.08)
+    torch.testing.assert_close(torch.cov(out_a.T), torch.cov(reference.T), atol=0.15, rtol=0.15)
