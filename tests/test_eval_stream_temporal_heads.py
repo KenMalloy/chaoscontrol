@@ -13,6 +13,17 @@ from chaoscontrol.eval_stream.temporal_heads import (
 from chaoscontrol.model import ChaosStudentLM
 
 
+def _mutate_suffix(tokens: torch.Tensor, *, cut: int, vocab_size: int) -> torch.Tensor:
+    mutant = tokens.clone()
+    offsets = torch.arange(
+        1,
+        tokens.size(1) - cut + 1,
+        device=tokens.device,
+    ).unsqueeze(0)
+    mutant[:, cut:] = (mutant[:, cut:] + offsets) % vocab_size
+    return mutant
+
+
 def test_uniform_logprob_mixture_one_head_is_identity():
     logp = torch.log_softmax(torch.randn(2, 3, 5), dim=-1)
 
@@ -43,6 +54,35 @@ def test_weighted_logprob_mixture_matches_probability_average():
     expected = torch.log(logp_a.exp() * 0.8 + logp_b.exp() * 0.2)
 
     assert torch.allclose(mixed, expected)
+
+
+def test_model_prefix_logprobs_are_suffix_invariant():
+    torch.manual_seed(17)
+    vocab_size = 64
+    model = ChaosStudentLM(
+        vocab_size=vocab_size,
+        dim=16,
+        num_layers=2,
+        block_type="ssm",
+        a_mode="diag",
+    )
+    model.eval()
+
+    for _trial in range(4):
+        tokens = torch.randint(0, vocab_size, (1, 18))
+        for cut in (3, 7, 12, 16):
+            mutant = _mutate_suffix(tokens, cut=cut, vocab_size=vocab_size)
+
+            with torch.no_grad():
+                original_log_probs = F.log_softmax(model(tokens)["logits"], dim=-1)
+                mutant_log_probs = F.log_softmax(model(mutant)["logits"], dim=-1)
+
+            torch.testing.assert_close(
+                original_log_probs[:, :cut],
+                mutant_log_probs[:, :cut],
+                rtol=0.0,
+                atol=0.0,
+            )
 
 
 def test_weighted_logprob_mixture_rejects_bad_weights():

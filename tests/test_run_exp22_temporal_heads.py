@@ -9,7 +9,13 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from chaoscontrol.eval_stream.temporal_heads import TemporalHeadChunkResult
+from chaoscontrol.eval_stream.temporal_heads import (
+    TemporalHeadChunkResult,
+    TemporalHeadConfig,
+    score_temporal_heads_chunk,
+    update_online_exp_weighted_log_weights,
+)
+from chaoscontrol.model import ChaosStudentLM
 
 
 RAW_DOC_TEXTS = ("hello world this is a doc", "another small doc")
@@ -94,6 +100,82 @@ def _run_exp22_config(cfg_path):
         capture_output=True,
         text=True,
     )
+
+
+def _mutate_suffix(tokens: torch.Tensor, *, cut: int, vocab_size: int) -> torch.Tensor:
+    mutant = tokens.clone()
+    offsets = torch.arange(
+        1,
+        tokens.size(1) - cut + 1,
+        device=tokens.device,
+    ).unsqueeze(0)
+    mutant[:, cut:] = (mutant[:, cut:] + offsets) % vocab_size
+    return mutant
+
+
+def _token_nlls_from_log_probs(
+    log_probs: torch.Tensor,
+    targets: torch.Tensor,
+) -> torch.Tensor:
+    return -log_probs[:, :-1].gather(-1, targets.unsqueeze(-1)).squeeze(-1).reshape(-1)
+
+
+def _score_chunked_temporal_token_nlls(
+    model: torch.nn.Module,
+    tokens: torch.Tensor,
+    *,
+    cfg: TemporalHeadConfig,
+    chunk_size: int,
+) -> torch.Tensor:
+    runner = _load_runner_module()
+    head_keys = cfg.head_ids or cfg.horizon_shifts
+    states_by_shift = {head_key: None for head_key in head_keys}
+    previous_mixed_log_probs = None
+    previous_head_log_probs_by_shift = None
+    online_log_weights = None
+    nlls: list[torch.Tensor] = []
+
+    for chunk_list in runner._iter_chunks(tokens.squeeze(0).tolist(), chunk_size):
+        if not chunk_list:
+            continue
+        chunk = torch.tensor(chunk_list, dtype=torch.long).unsqueeze(0)
+        first_token = chunk[:, 0]
+        if previous_mixed_log_probs is not None:
+            nlls.append(
+                -previous_mixed_log_probs
+                .gather(-1, first_token.unsqueeze(-1))
+                .squeeze(-1)
+            )
+            if (
+                cfg.mixer == "online_exp_weights_logprob"
+                and online_log_weights is not None
+                and previous_head_log_probs_by_shift is not None
+            ):
+                online_log_weights = update_online_exp_weighted_log_weights(
+                    online_log_weights,
+                    [
+                        previous_head_log_probs_by_shift[head_key]
+                        for head_key in head_keys
+                    ],
+                    first_token,
+                    eta=cfg.online_eta,
+                )
+
+        result = score_temporal_heads_chunk(
+            model,
+            chunk,
+            states_by_shift=states_by_shift,
+            cfg=cfg,
+            online_initial_log_weights=online_log_weights,
+        )
+        if result.tokens_scored:
+            nlls.append(_token_nlls_from_log_probs(result.mixed_log_probs, chunk[:, 1:]))
+        states_by_shift = result.final_states_by_shift
+        previous_mixed_log_probs = result.last_mixed_log_probs
+        previous_head_log_probs_by_shift = result.last_log_probs_by_shift
+        online_log_weights = result.online_final_log_weights
+
+    return torch.cat(nlls)
 
 
 def test_exp22_runner_writes_metrics_and_summary(tmp_path):
@@ -271,6 +353,50 @@ def test_exp22_runner_accepts_online_exp_weights_mixer(tmp_path):
     assert summary["mixer"] == "online_exp_weights_logprob"
     assert summary["online_eta"] == 0.75
     assert summary["online_initial_weights"] == [0.2, 0.6, 0.2]
+
+
+def test_exp22_runner_prefix_scores_are_suffix_invariant():
+    torch.manual_seed(23)
+    vocab_size = 64
+    model = ChaosStudentLM(
+        vocab_size=vocab_size,
+        dim=16,
+        num_layers=2,
+        block_type="ssm",
+        a_mode="diag",
+    )
+    model.eval()
+    cfg = TemporalHeadConfig(
+        horizon_shifts=(-0.5, 0.0, 0.5),
+        mixer="online_exp_weights_logprob",
+        online_eta=0.75,
+    )
+
+    for _trial in range(2):
+        tokens = torch.randint(0, vocab_size, (1, 15))
+        original_nlls = _score_chunked_temporal_token_nlls(
+            model,
+            tokens,
+            cfg=cfg,
+            chunk_size=5,
+        )
+
+        for cut in (3, 6, 11, 14):
+            mutant = _mutate_suffix(tokens, cut=cut, vocab_size=vocab_size)
+            mutant_nlls = _score_chunked_temporal_token_nlls(
+                model,
+                mutant,
+                cfg=cfg,
+                chunk_size=5,
+            )
+            prefix_targets = cut - 1
+
+            torch.testing.assert_close(
+                original_nlls[:prefix_targets],
+                mutant_nlls[:prefix_targets],
+                rtol=0.0,
+                atol=1e-6,
+            )
 
 
 def test_score_only_scores_every_post_initial_token_across_chunk_boundaries(
