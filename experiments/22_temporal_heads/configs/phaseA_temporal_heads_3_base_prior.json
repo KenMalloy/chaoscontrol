@@ -1,5 +1,5 @@
 {
-  "analysis_path": "experiments/22_temporal_heads/results/phaseA_temporal_heads_3_uniform_analysis.jsonl",
+  "analysis_path": "experiments/22_temporal_heads/results/phaseA_temporal_heads_3_base_prior_analysis.jsonl",
   "budget_seconds": 600.0,
   "checkpoint_path": "TODO/checkpoints/final_exp21_ssm.pt",
   "chunk_size": 256,
@@ -14,11 +14,16 @@
     "TODO/data/primary_eval.jsonl"
   ],
   "max_docs": 50000,
-  "mixer": "uniform_logprob",
-  "output_path": "experiments/22_temporal_heads/results/phaseA_temporal_heads_3_uniform.jsonl",
+  "mixer": "base_prior_logprob",
+  "mixer_weights": [
+    0.1,
+    0.8,
+    0.1
+  ],
+  "output_path": "experiments/22_temporal_heads/results/phaseA_temporal_heads_3_base_prior.jsonl",
   "safety_margin_seconds": 0.0,
   "score_floor_seconds": 0.0,
   "seed": 0,
   "sp_model_path": "TODO/tokenizers/final_sp.model",
-  "summary_path": "experiments/22_temporal_heads/results/phaseA_temporal_heads_3_uniform_summary.json"
+  "summary_path": "experiments/22_temporal_heads/results/phaseA_temporal_heads_3_base_prior_summary.json"
 }

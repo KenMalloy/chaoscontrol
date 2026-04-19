@@ -48,8 +48,11 @@ class Exp22RunConfig:
     checkpoint_path: str = ""
     output_path: str = ""
     summary_path: str = ""
+    analysis_path: str = ""
     evidence_label: str = "exploratory"
     depth_recurrence_count: int = 3
+    mixer: Literal["uniform_logprob", "base_prior_logprob"] = "uniform_logprob"
+    mixer_weights: tuple[float, ...] | None = None
 
 
 def _iter_chunks(tokens: list[int], chunk_size: int):
@@ -70,6 +73,54 @@ def _sha256_file(path: Path, chunk_size: int = 1 << 20) -> str:
 
 def _hash_cfg(cfg: dict) -> str:
     return hashlib.sha256(json.dumps(cfg, sort_keys=True).encode()).hexdigest()
+
+
+def _normalize_float_tuple(values) -> tuple[float, ...] | None:
+    if values is None:
+        return None
+    return tuple(float(value) for value in values)
+
+
+def _json_shift_map(values: dict[float, object]) -> dict[str, object]:
+    return {str(shift): value for shift, value in values.items()}
+
+
+def _average_layer_summaries(
+    samples_by_shift: dict[float, list[list[dict[str, float | int | None]]]],
+) -> dict[float, list[dict[str, float | int | None]]]:
+    averaged: dict[float, list[dict[str, float | int | None]]] = {}
+    for shift, samples in samples_by_shift.items():
+        if not samples:
+            averaged[shift] = []
+            continue
+        layer_count = max((len(sample) for sample in samples), default=0)
+        layers: list[dict[str, float | int | None]] = []
+        for layer_idx in range(layer_count):
+            metric_names = sorted(
+                {
+                    key
+                    for sample in samples
+                    if layer_idx < len(sample)
+                    for key in sample[layer_idx]
+                    if key != "layer"
+                }
+            )
+            layer_summary: dict[str, float | int | None] = {"layer": layer_idx}
+            for name in metric_names:
+                numeric_values = [
+                    float(sample[layer_idx][name])
+                    for sample in samples
+                    if layer_idx < len(sample)
+                    and sample[layer_idx].get(name) is not None
+                ]
+                layer_summary[name] = (
+                    sum(numeric_values) / len(numeric_values)
+                    if numeric_values
+                    else None
+                )
+            layers.append(layer_summary)
+        averaged[shift] = layers
+    return averaged
 
 
 def _build_model(ckpt_path: Path, cfg: Exp22RunConfig) -> tuple[torch.nn.Module, dict]:
@@ -153,82 +204,145 @@ def run(cfg: Exp22RunConfig, *, jsonl_paths: list[str], sp_model_path: str) -> N
     total_loss_nats = 0.0
     total_raw_bytes = 0
     timed_out = False
-    temporal_cfg = TemporalHeadConfig(horizon_shifts=tuple(float(x) for x in cfg.horizon_shifts))
+    mixer_weights = _normalize_float_tuple(cfg.mixer_weights)
+    temporal_cfg = TemporalHeadConfig(
+        horizon_shifts=tuple(float(x) for x in cfg.horizon_shifts),
+        mixer=cfg.mixer,
+        mixer_weights=mixer_weights,
+    )
     temporal_condition = cfg.condition in ("single_horizon", "temporal_heads")
     if cfg.condition == "single_horizon" and len(temporal_cfg.horizon_shifts) != 1:
         raise ValueError("single_horizon requires exactly one horizon shift")
 
-    with out_path.open("w") as out_fh:
-        for doc in streamer:
-            if deadline.is_expired():
-                timed_out = True
-                break
+    analysis_fh = None
+    if cfg.analysis_path:
+        analysis_path = Path(cfg.analysis_path)
+        analysis_path.parent.mkdir(parents=True, exist_ok=True)
+        analysis_fh = analysis_path.open("w")
 
-            doc_t0 = time.monotonic()
-            doc_loss_nats = 0.0
-            doc_tokens = 0
-            per_head_loss_nats = {shift: 0.0 for shift in temporal_cfg.horizon_shifts}
-
-            if temporal_condition:
-                states_by_shift: dict[float, list[torch.Tensor] | None] = {
-                    shift: None for shift in temporal_cfg.horizon_shifts
-                }
-            else:
-                states: list[torch.Tensor] | None = None
-
-            for chunk_list in _iter_chunks(doc.tokens, cfg.chunk_size):
-                if len(chunk_list) < 2:
-                    continue
-                chunk = torch.tensor(chunk_list, dtype=torch.long, device=device).unsqueeze(0)
-                score_t0 = time.monotonic()
-                if temporal_condition:
-                    result = score_temporal_heads_chunk(
-                        model,
-                        chunk,
-                        states_by_shift=states_by_shift,
-                        cfg=temporal_cfg,
-                    )
-                    states_by_shift = result.final_states_by_shift
-                    doc_loss_nats += result.loss_nats
-                    doc_tokens += result.tokens_scored
-                    for shift, loss_nats in result.per_head_loss_nats.items():
-                        per_head_loss_nats[shift] += loss_nats
-                else:
-                    loss_nats, states = _score_direct_chunk(model, chunk, states)
-                    doc_loss_nats += loss_nats
-                    doc_tokens += chunk.size(1) - 1
-                budget.add_score_time(time.monotonic() - score_t0)
-                chunks_scored += 1
-
+    try:
+        with out_path.open("w") as out_fh:
+            for doc in streamer:
                 if deadline.is_expired():
                     timed_out = True
                     break
 
-            if timed_out:
-                break
-            if doc_tokens <= 0:
-                continue
+                doc_t0 = time.monotonic()
+                doc_loss_nats = 0.0
+                doc_tokens = 0
+                per_head_loss_nats = {shift: 0.0 for shift in temporal_cfg.horizon_shifts}
+                doc_chunks_scored = 0
+                doc_winner_counts = {shift: 0 for shift in temporal_cfg.horizon_shifts}
+                doc_half_life_samples: dict[
+                    float,
+                    list[list[dict[str, float | int | None]]],
+                ] = {shift: [] for shift in temporal_cfg.horizon_shifts}
+                doc_state_divergence_samples: dict[
+                    float,
+                    list[list[dict[str, float | int | None]]],
+                ] = {}
 
-            docs_scored += 1
-            tokens_scored += doc_tokens
-            total_loss_nats += doc_loss_nats
-            total_raw_bytes += doc.raw_bytes
-            bpb = compute_bpb(doc_loss_nats, doc.raw_bytes)
-            record = {
-                "doc_id": doc.doc_id,
-                "condition": cfg.condition,
-                "horizon_shifts": list(temporal_cfg.horizon_shifts),
-                "bpb": bpb,
-                "tokens": doc_tokens,
-                "loss_nats": doc_loss_nats,
-                "wall_ms": (time.monotonic() - doc_t0) * 1000.0,
-            }
-            if temporal_condition:
-                record["per_head_bpb"] = {
-                    str(shift): compute_bpb(loss, doc.raw_bytes)
-                    for shift, loss in per_head_loss_nats.items()
+                if temporal_condition:
+                    states_by_shift: dict[float, list[torch.Tensor] | None] = {
+                        shift: None for shift in temporal_cfg.horizon_shifts
+                    }
+                else:
+                    states: list[torch.Tensor] | None = None
+
+                for chunk_list in _iter_chunks(doc.tokens, cfg.chunk_size):
+                    if len(chunk_list) < 2:
+                        continue
+                    chunk = torch.tensor(
+                        chunk_list,
+                        dtype=torch.long,
+                        device=device,
+                    ).unsqueeze(0)
+                    score_t0 = time.monotonic()
+                    if temporal_condition:
+                        result = score_temporal_heads_chunk(
+                            model,
+                            chunk,
+                            states_by_shift=states_by_shift,
+                            cfg=temporal_cfg,
+                        )
+                        states_by_shift = result.final_states_by_shift
+                        doc_loss_nats += result.loss_nats
+                        doc_tokens += result.tokens_scored
+                        for shift, loss_nats in result.per_head_loss_nats.items():
+                            per_head_loss_nats[shift] += loss_nats
+                        for shift, count in result.winner_counts_by_shift.items():
+                            doc_winner_counts[shift] = (
+                                doc_winner_counts.get(shift, 0) + count
+                            )
+                        for shift, summaries in result.half_life_stats_by_shift.items():
+                            doc_half_life_samples.setdefault(shift, []).append(summaries)
+                        for shift, summaries in result.state_divergence_by_shift.items():
+                            doc_state_divergence_samples.setdefault(shift, []).append(summaries)
+                    else:
+                        loss_nats, states = _score_direct_chunk(model, chunk, states)
+                        doc_loss_nats += loss_nats
+                        doc_tokens += chunk.size(1) - 1
+                    budget.add_score_time(time.monotonic() - score_t0)
+                    chunks_scored += 1
+                    doc_chunks_scored += 1
+
+                    if deadline.is_expired():
+                        timed_out = True
+                        break
+
+                if timed_out:
+                    break
+                if doc_tokens <= 0:
+                    continue
+
+                docs_scored += 1
+                tokens_scored += doc_tokens
+                total_loss_nats += doc_loss_nats
+                total_raw_bytes += doc.raw_bytes
+                bpb = compute_bpb(doc_loss_nats, doc.raw_bytes)
+                record = {
+                    "doc_id": doc.doc_id,
+                    "condition": cfg.condition,
+                    "horizon_shifts": list(temporal_cfg.horizon_shifts),
+                    "bpb": bpb,
+                    "tokens": doc_tokens,
+                    "loss_nats": doc_loss_nats,
+                    "wall_ms": (time.monotonic() - doc_t0) * 1000.0,
                 }
-            out_fh.write(json.dumps(record, sort_keys=True) + "\n")
+                if temporal_condition:
+                    record["per_head_bpb"] = {
+                        str(shift): compute_bpb(loss, doc.raw_bytes)
+                        for shift, loss in per_head_loss_nats.items()
+                    }
+                out_fh.write(json.dumps(record, sort_keys=True) + "\n")
+                if temporal_condition and analysis_fh is not None:
+                    analysis_record = {
+                        "analysis_only": True,
+                        "doc_id": doc.doc_id,
+                        "condition": cfg.condition,
+                        "mixer": temporal_cfg.mixer,
+                        "mixer_weights": (
+                            list(temporal_cfg.mixer_weights)
+                            if temporal_cfg.mixer_weights is not None
+                            else None
+                        ),
+                        "horizon_shifts": list(temporal_cfg.horizon_shifts),
+                        "chunks": doc_chunks_scored,
+                        "tokens": doc_tokens,
+                        "winner_counts_by_shift": _json_shift_map(doc_winner_counts),
+                        "half_life_stats_by_shift": _json_shift_map(
+                            _average_layer_summaries(doc_half_life_samples)
+                        ),
+                        "state_divergence_by_shift": _json_shift_map(
+                            _average_layer_summaries(doc_state_divergence_samples)
+                        ),
+                    }
+                    analysis_fh.write(
+                        json.dumps(analysis_record, sort_keys=True) + "\n"
+                    )
+    finally:
+        if analysis_fh is not None:
+            analysis_fh.close()
 
     if cfg.summary_path:
         summary_path = Path(cfg.summary_path)
@@ -259,6 +373,13 @@ def run(cfg: Exp22RunConfig, *, jsonl_paths: list[str], sp_model_path: str) -> N
                 "aggregate_loss_nats": total_loss_nats,
                 "aggregate_raw_bytes": total_raw_bytes,
                 "horizon_shifts": list(temporal_cfg.horizon_shifts),
+                "mixer": temporal_cfg.mixer,
+                "mixer_weights": (
+                    list(temporal_cfg.mixer_weights)
+                    if temporal_cfg.mixer_weights is not None
+                    else None
+                ),
+                "analysis_path": cfg.analysis_path or None,
                 "temporal_head_count": (
                     len(temporal_cfg.horizon_shifts)
                     if temporal_condition

@@ -15,7 +15,7 @@ then mixing their probability forecasts. The primary mechanism is
 |---|---|---|
 | `score_only` | Normal frozen checkpoint eval at `log_a_shift=0.0` | baseline |
 | `single_horizon` | One shifted horizon, used for Phase 0 / best-single control | exploratory unless pre-registered |
-| `temporal_heads` | Uniform probability mixture over shifted horizons | exploratory until matched seeds/full stream |
+| `temporal_heads` | Probability mixture over shifted horizons | exploratory until matched seeds/full stream |
 | `same_horizon_virtual_depth` | Equal-compute deterministic replay through shared SSM layers | control |
 
 `gated_temporal_heads` intentionally fails fast in the runner until a
@@ -48,9 +48,12 @@ Copy that config for the other pilot shifts, changing `horizon_shifts`,
 
 ## Phase A
 
-Run the score-only floor, the 3-head temporal mixture, and the same-horizon
+Run the score-only floor, the 3-head temporal mixtures, and the same-horizon
 virtual-depth control on the same checkpoint, tokenizer, stream, seed, and
-budget accounting:
+budget accounting. `phaseA_temporal_heads_3_uniform` is the clean scientific
+baseline. `phaseA_temporal_heads_3_base_prior` is the engineering guardrail:
+it keeps 80% prior weight on the base horizon and 10% on each shifted horizon,
+so a badly OOD shifted head cannot divide a correct base forecast by three.
 
 ```bash
 python scripts/run_exp22_temporal_heads.py \
@@ -60,11 +63,31 @@ python scripts/run_exp22_temporal_heads.py \
   --config experiments/22_temporal_heads/configs/phaseA_temporal_heads_3_uniform.json
 
 python scripts/run_exp22_temporal_heads.py \
+  --config experiments/22_temporal_heads/configs/phaseA_temporal_heads_3_base_prior.json
+
+python scripts/run_exp22_temporal_heads.py \
   --config experiments/22_temporal_heads/configs/phaseA_same_horizon_virtual_depth.json
 ```
 
 Before running, replace every `TODO/...` path in the config files with the
 actual final checkpoint, tokenizer, eval JSONL path, and result directory.
+
+## Analysis Sidecar
+
+Temporal-head configs may set `analysis_path` to write one analysis-only JSONL
+record per scored document. These fields must not affect scoring or gating:
+
+- `winner_counts_by_shift`: per-token argmin-NLL counts for each horizon.
+- `half_life_stats_by_shift`: per-layer p10/median/p90 implied half-life and
+  the fraction of channels separated from the base horizon by at least 0.5
+  octaves.
+- `state_divergence_by_shift`: per-layer L2 and cosine distance from the base
+  horizon state.
+
+The half-life diagnostic uses `ln(2) / (delta * sigmoid(log_a + shift))`, with
+`delta` measured from the same chunk forward pass. If shifted half-life
+histograms overlap heavily with the base horizon, treat temporal heads as
+redundant even before interpreting bpb.
 
 ## Statistics
 

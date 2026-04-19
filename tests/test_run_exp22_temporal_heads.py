@@ -25,7 +25,7 @@ def _load_runner_module():
     return module
 
 
-def _write_tiny_fixture(tmp_path, *, condition, horizon_shifts):
+def _write_tiny_fixture(tmp_path, *, condition, horizon_shifts, extra_config=None):
     import sentencepiece as spm
     from chaoscontrol.model import ChaosStudentLM
 
@@ -70,22 +70,21 @@ def _write_tiny_fixture(tmp_path, *, condition, horizon_shifts):
     out_path = tmp_path / "metrics.jsonl"
     summary_path = tmp_path / "summary.json"
     cfg_path = tmp_path / "run.json"
-    cfg_path.write_text(
-        json.dumps(
-            {
-                "condition": condition,
-                "horizon_shifts": horizon_shifts,
-                "chunk_size": 32,
-                "max_docs": 2,
-                "seed": 0,
-                "jsonl_paths": [str(jsonl)],
-                "sp_model_path": f"{sp_prefix}.model",
-                "checkpoint_path": str(ckpt_path),
-                "output_path": str(out_path),
-                "summary_path": str(summary_path),
-            }
-        )
-    )
+    raw_config = {
+        "condition": condition,
+        "horizon_shifts": horizon_shifts,
+        "chunk_size": 32,
+        "max_docs": 2,
+        "seed": 0,
+        "jsonl_paths": [str(jsonl)],
+        "sp_model_path": f"{sp_prefix}.model",
+        "checkpoint_path": str(ckpt_path),
+        "output_path": str(out_path),
+        "summary_path": str(summary_path),
+    }
+    if extra_config:
+        raw_config.update(extra_config)
+    cfg_path.write_text(json.dumps(raw_config))
     return cfg_path, out_path, summary_path
 
 
@@ -175,6 +174,39 @@ def test_exp22_runner_rejects_unknown_config_keys(tmp_path):
 
     assert result.returncode != 0
     assert "unknown Exp 22 config key(s): horizon_knob" in result.stderr
+
+
+def test_exp22_runner_writes_analysis_sidecar_and_mixer_metadata(tmp_path):
+    analysis_path = tmp_path / "analysis.jsonl"
+    cfg_path, out_path, summary_path = _write_tiny_fixture(
+        tmp_path,
+        condition="temporal_heads",
+        horizon_shifts=[-0.5, 0.0, 0.5],
+        extra_config={
+            "analysis_path": str(analysis_path),
+            "mixer": "base_prior_logprob",
+            "mixer_weights": [0.1, 0.8, 0.1],
+        },
+    )
+
+    result = _run_exp22_config(cfg_path)
+
+    assert result.returncode == 0, result.stderr
+    metric_records = [json.loads(line) for line in out_path.read_text().splitlines()]
+    analysis_records = [json.loads(line) for line in analysis_path.read_text().splitlines()]
+    summary = json.loads(summary_path.read_text())
+    assert summary["mixer"] == "base_prior_logprob"
+    assert summary["mixer_weights"] == [0.1, 0.8, 0.1]
+    assert len(analysis_records) == len(metric_records)
+    first = analysis_records[0]
+    assert first["analysis_only"] is True
+    assert first["mixer"] == "base_prior_logprob"
+    assert set(first["winner_counts_by_shift"]) == {"-0.5", "0.0", "0.5"}
+    assert sum(first["winner_counts_by_shift"].values()) == first["tokens"]
+    assert set(first["half_life_stats_by_shift"]) == {"-0.5", "0.0", "0.5"}
+    assert "separated_fraction_vs_base" in first["half_life_stats_by_shift"]["-0.5"][0]
+    assert set(first["state_divergence_by_shift"]) == {"-0.5", "0.5"}
+    assert "cosine_vs_base" in first["state_divergence_by_shift"]["-0.5"][0]
 
 
 def test_exp22_parameter_free_run_does_not_mutate_checkpoint(tmp_path):
@@ -270,6 +302,9 @@ def test_temporal_head_budget_time_includes_all_head_work(monkeypatch, tmp_path)
             mixed_log_probs=torch.empty(0),
             final_states_by_shift={shift: [] for shift in cfg.horizon_shifts},
             per_head_loss_nats={shift: 1.0 for shift in cfg.horizon_shifts},
+            winner_counts_by_shift={shift: 0 for shift in cfg.horizon_shifts},
+            half_life_stats_by_shift={shift: [] for shift in cfg.horizon_shifts},
+            state_divergence_by_shift={},
         )
 
     monkeypatch.setattr(runner.time, "monotonic", fake_monotonic)
