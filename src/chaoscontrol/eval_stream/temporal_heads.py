@@ -45,6 +45,56 @@ class TemporalHeadChunkResult:
     per_head_loss_nats: dict[float, float]
 
 
+@dataclass
+class PreviousChunkPriorityGate:
+    """Pre-registered primary gate for running temporal heads on the next chunk."""
+
+    threshold: float
+    entropy_weight: float = 1.0
+    loss_spike_weight: float = 1.0
+    state_delta_weight: float = 1.0
+    use_disagreement_ema: bool = False
+    disagreement_weight: float = 0.0
+    disagreement_decay: float = 0.9
+
+    def __post_init__(self) -> None:
+        self._priority = 0.0
+        self._disagreement_ema = 0.0
+
+    def update_after_chunk(
+        self,
+        *,
+        entropy: float,
+        loss_spike: float,
+        state_delta_norm: float,
+        head_disagreement: float | None = None,
+        temporal_heads_ran: bool = False,
+    ) -> None:
+        if self.use_disagreement_ema:
+            if temporal_heads_ran and head_disagreement is not None:
+                self._disagreement_ema = (
+                    self.disagreement_decay * self._disagreement_ema
+                    + (1.0 - self.disagreement_decay) * float(head_disagreement)
+                )
+            else:
+                self._disagreement_ema *= self.disagreement_decay
+        else:
+            self._disagreement_ema = 0.0
+
+        self._priority = (
+            self.entropy_weight * float(entropy)
+            + self.loss_spike_weight * float(loss_spike)
+            + self.state_delta_weight * float(state_delta_norm)
+            + self.disagreement_weight * self._disagreement_ema
+        )
+
+    def should_run(self, *, extra_cost_seconds: float, slack_remaining_seconds: float) -> bool:
+        return (
+            self._priority > self.threshold
+            and float(slack_remaining_seconds) >= float(extra_cost_seconds)
+        )
+
+
 def _nll_from_log_probs(log_probs: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
     token_log_probs = log_probs[:, :-1].gather(-1, targets.unsqueeze(-1)).squeeze(-1)
     return -token_log_probs.sum()
@@ -101,3 +151,21 @@ def score_temporal_heads_chunk(
         final_states_by_shift=final_states_by_shift,
         per_head_loss_nats=per_head_loss_nats,
     )
+
+
+def make_same_horizon_virtual_depth_config(
+    cfg: dict,
+    *,
+    depth_recurrence_count: int,
+) -> dict:
+    """Return a checkpoint config for the deterministic same-horizon control."""
+    if depth_recurrence_count < 1:
+        raise ValueError("depth_recurrence_count must be >= 1")
+    out = dict(cfg)
+    shared = list(out.get("depth_recurrence_shared_layers") or [])
+    if not shared:
+        num_layers = int(out["num_layers"])
+        shared = list(range(num_layers))
+    out["depth_recurrence_shared_layers"] = shared
+    out["depth_recurrence_count"] = int(depth_recurrence_count)
+    return out

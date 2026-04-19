@@ -2,7 +2,9 @@ import torch
 import torch.nn.functional as F
 
 from chaoscontrol.eval_stream.temporal_heads import (
+    PreviousChunkPriorityGate,
     TemporalHeadConfig,
+    make_same_horizon_virtual_depth_config,
     score_temporal_heads_chunk,
     uniform_logprob_mixture,
 )
@@ -85,3 +87,53 @@ def test_temporal_heads_keep_independent_states():
     for layer_idx in range(2):
         assert states[-0.5][layer_idx].data_ptr() != states[0.0][layer_idx].data_ptr()
         assert states[0.0][layer_idx].data_ptr() != states[0.5][layer_idx].data_ptr()
+
+
+def test_primary_gate_ignores_stale_head_disagreement_after_base_only_chunk():
+    gate = PreviousChunkPriorityGate(
+        threshold=1.0,
+        entropy_weight=1.0,
+        loss_spike_weight=0.0,
+        state_delta_weight=0.0,
+    )
+
+    gate.update_after_chunk(
+        entropy=0.5,
+        loss_spike=0.0,
+        state_delta_norm=0.0,
+        head_disagreement=999.0,
+        temporal_heads_ran=False,
+    )
+
+    assert not gate.should_run(extra_cost_seconds=0.1, slack_remaining_seconds=1.0)
+
+
+def test_same_horizon_virtual_depth_config_uses_all_layers_when_no_group():
+    cfg = {
+        "vocab_size": 64,
+        "dim": 16,
+        "num_layers": 3,
+        "block_type": "ssm",
+        "a_mode": "diag",
+    }
+
+    out = make_same_horizon_virtual_depth_config(cfg, depth_recurrence_count=3)
+
+    assert out["depth_recurrence_shared_layers"] == [0, 1, 2]
+    assert out["depth_recurrence_count"] == 3
+
+
+def test_same_horizon_virtual_depth_config_preserves_existing_group():
+    cfg = {
+        "vocab_size": 64,
+        "dim": 16,
+        "num_layers": 4,
+        "block_type": "ssm",
+        "a_mode": "diag",
+        "depth_recurrence_shared_layers": [1, 2],
+    }
+
+    out = make_same_horizon_virtual_depth_config(cfg, depth_recurrence_count=2)
+
+    assert out["depth_recurrence_shared_layers"] == [1, 2]
+    assert out["depth_recurrence_count"] == 2
