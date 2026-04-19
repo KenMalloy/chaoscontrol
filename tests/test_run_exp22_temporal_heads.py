@@ -5,7 +5,7 @@ import sys
 import torch
 
 
-def test_exp22_runner_writes_metrics_and_summary(tmp_path):
+def _write_tiny_fixture(tmp_path, *, condition, horizon_shifts):
     import sentencepiece as spm
     from chaoscontrol.model import ChaosStudentLM
 
@@ -53,8 +53,8 @@ def test_exp22_runner_writes_metrics_and_summary(tmp_path):
     cfg_path.write_text(
         json.dumps(
             {
-                "condition": "temporal_heads",
-                "horizon_shifts": [-0.5, 0.0, 0.5],
+                "condition": condition,
+                "horizon_shifts": horizon_shifts,
                 "chunk_size": 32,
                 "max_docs": 2,
                 "seed": 0,
@@ -66,12 +66,25 @@ def test_exp22_runner_writes_metrics_and_summary(tmp_path):
             }
         )
     )
+    return cfg_path, out_path, summary_path
 
-    result = subprocess.run(
+
+def _run_exp22_config(cfg_path):
+    return subprocess.run(
         [sys.executable, "scripts/run_exp22_temporal_heads.py", "--config", str(cfg_path)],
         capture_output=True,
         text=True,
     )
+
+
+def test_exp22_runner_writes_metrics_and_summary(tmp_path):
+    cfg_path, out_path, summary_path = _write_tiny_fixture(
+        tmp_path,
+        condition="temporal_heads",
+        horizon_shifts=[-0.5, 0.0, 0.5],
+    )
+
+    result = _run_exp22_config(cfg_path)
 
     assert result.returncode == 0, result.stderr
     records = [json.loads(line) for line in out_path.read_text().splitlines()]
@@ -85,3 +98,38 @@ def test_exp22_runner_writes_metrics_and_summary(tmp_path):
     assert summary["temporal_head_count"] == 3
     assert summary["horizon_shifts"] == [-0.5, 0.0, 0.5]
     assert summary["docs_scored"] == 2
+
+
+def test_exp22_runner_supports_single_horizon_pilot(tmp_path):
+    cfg_path, out_path, summary_path = _write_tiny_fixture(
+        tmp_path,
+        condition="single_horizon",
+        horizon_shifts=[-0.5],
+    )
+
+    result = _run_exp22_config(cfg_path)
+
+    assert result.returncode == 0, result.stderr
+    records = [json.loads(line) for line in out_path.read_text().splitlines()]
+    assert len(records) == 2
+    assert all(record["condition"] == "single_horizon" for record in records)
+    assert all(record["horizon_shifts"] == [-0.5] for record in records)
+    assert all(list(record["per_head_bpb"]) == ["-0.5"] for record in records)
+
+    summary = json.loads(summary_path.read_text())
+    assert summary["condition"] == "single_horizon"
+    assert summary["temporal_head_count"] == 1
+    assert summary["horizon_shifts"] == [-0.5]
+
+
+def test_exp22_runner_rejects_unwired_gated_condition(tmp_path):
+    cfg_path, _, _ = _write_tiny_fixture(
+        tmp_path,
+        condition="gated_temporal_heads",
+        horizon_shifts=[-0.5, 0.0, 0.5],
+    )
+
+    result = _run_exp22_config(cfg_path)
+
+    assert result.returncode != 0
+    assert "gated_temporal_heads is not wired" in result.stderr

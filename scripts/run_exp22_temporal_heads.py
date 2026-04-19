@@ -33,6 +33,7 @@ from chaoscontrol.evaluation import compute_bpb
 class Exp22RunConfig:
     condition: Literal[
         "score_only",
+        "single_horizon",
         "temporal_heads",
         "gated_temporal_heads",
         "same_horizon_virtual_depth",
@@ -118,6 +119,13 @@ def _score_direct_chunk(
 
 
 def run(cfg: Exp22RunConfig, *, jsonl_paths: list[str], sp_model_path: str) -> None:
+    if cfg.condition == "gated_temporal_heads":
+        raise NotImplementedError(
+            "gated_temporal_heads is not wired into this runner yet; run "
+            "temporal_heads for always-on heads or add a pre-registered "
+            "previous-chunk gate before using the gated condition."
+        )
+
     if torch.cuda.is_available():
         torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", 0)))
 
@@ -150,6 +158,9 @@ def run(cfg: Exp22RunConfig, *, jsonl_paths: list[str], sp_model_path: str) -> N
     tokens_scored = 0
     timed_out = False
     temporal_cfg = TemporalHeadConfig(horizon_shifts=tuple(float(x) for x in cfg.horizon_shifts))
+    temporal_condition = cfg.condition in ("single_horizon", "temporal_heads")
+    if cfg.condition == "single_horizon" and len(temporal_cfg.horizon_shifts) != 1:
+        raise ValueError("single_horizon requires exactly one horizon shift")
 
     with out_path.open("w") as out_fh:
         for doc in streamer:
@@ -162,7 +173,7 @@ def run(cfg: Exp22RunConfig, *, jsonl_paths: list[str], sp_model_path: str) -> N
             doc_tokens = 0
             per_head_loss_nats = {shift: 0.0 for shift in temporal_cfg.horizon_shifts}
 
-            if cfg.condition in ("temporal_heads", "gated_temporal_heads"):
+            if temporal_condition:
                 states_by_shift: dict[float, list[torch.Tensor] | None] = {
                     shift: None for shift in temporal_cfg.horizon_shifts
                 }
@@ -174,7 +185,7 @@ def run(cfg: Exp22RunConfig, *, jsonl_paths: list[str], sp_model_path: str) -> N
                     continue
                 chunk = torch.tensor(chunk_list, dtype=torch.long, device=device).unsqueeze(0)
                 score_t0 = time.monotonic()
-                if cfg.condition in ("temporal_heads", "gated_temporal_heads"):
+                if temporal_condition:
                     result = score_temporal_heads_chunk(
                         model,
                         chunk,
@@ -214,7 +225,7 @@ def run(cfg: Exp22RunConfig, *, jsonl_paths: list[str], sp_model_path: str) -> N
                 "loss_nats": doc_loss_nats,
                 "wall_ms": (time.monotonic() - doc_t0) * 1000.0,
             }
-            if cfg.condition in ("temporal_heads", "gated_temporal_heads"):
+            if temporal_condition:
                 record["per_head_bpb"] = {
                     str(shift): compute_bpb(loss, doc.raw_bytes)
                     for shift, loss in per_head_loss_nats.items()
@@ -249,7 +260,7 @@ def run(cfg: Exp22RunConfig, *, jsonl_paths: list[str], sp_model_path: str) -> N
                 "horizon_shifts": list(temporal_cfg.horizon_shifts),
                 "temporal_head_count": (
                     len(temporal_cfg.horizon_shifts)
-                    if cfg.condition in ("temporal_heads", "gated_temporal_heads")
+                    if temporal_condition
                     else 1
                 ),
                 "depth_recurrence_count": (
