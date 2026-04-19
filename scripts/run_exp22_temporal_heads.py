@@ -35,10 +35,12 @@ class Exp22RunConfig:
         "score_only",
         "single_horizon",
         "temporal_heads",
+        "identical_heads_uniform",
         "gated_temporal_heads",
         "same_horizon_virtual_depth",
     ] = "temporal_heads"
     horizon_shifts: tuple[float, ...] = (-0.5, 0.0, 0.5)
+    head_ids: tuple[str, ...] | None = None
     chunk_size: int = 256
     max_docs: int = 50_000
     seed: int = 0
@@ -81,7 +83,13 @@ def _normalize_float_tuple(values) -> tuple[float, ...] | None:
     return tuple(float(value) for value in values)
 
 
-def _json_shift_map(values: dict[float, object]) -> dict[str, object]:
+def _normalize_str_tuple(values) -> tuple[str, ...] | None:
+    if values is None:
+        return None
+    return tuple(str(value) for value in values)
+
+
+def _json_shift_map(values: dict[object, object]) -> dict[str, object]:
     return {str(shift): value for shift, value in values.items()}
 
 
@@ -204,15 +212,32 @@ def run(cfg: Exp22RunConfig, *, jsonl_paths: list[str], sp_model_path: str) -> N
     total_loss_nats = 0.0
     total_raw_bytes = 0
     timed_out = False
+    horizon_shifts = tuple(float(x) for x in cfg.horizon_shifts)
+    head_ids = _normalize_str_tuple(cfg.head_ids)
     mixer_weights = _normalize_float_tuple(cfg.mixer_weights)
+    if cfg.condition == "identical_heads_uniform":
+        if any(shift != 0.0 for shift in horizon_shifts):
+            raise ValueError("identical_heads_uniform requires every horizon shift to be 0.0")
+        if len(horizon_shifts) < 2:
+            raise ValueError("identical_heads_uniform requires at least two heads")
+        if cfg.mixer != "uniform_logprob":
+            raise ValueError("identical_heads_uniform requires mixer='uniform_logprob'")
+        if head_ids is None:
+            head_ids = tuple(f"same_{idx}" for idx in range(len(horizon_shifts)))
     temporal_cfg = TemporalHeadConfig(
-        horizon_shifts=tuple(float(x) for x in cfg.horizon_shifts),
+        horizon_shifts=horizon_shifts,
+        head_ids=head_ids,
         mixer=cfg.mixer,
         mixer_weights=mixer_weights,
     )
-    temporal_condition = cfg.condition in ("single_horizon", "temporal_heads")
+    temporal_condition = cfg.condition in (
+        "single_horizon",
+        "temporal_heads",
+        "identical_heads_uniform",
+    )
     if cfg.condition == "single_horizon" and len(temporal_cfg.horizon_shifts) != 1:
         raise ValueError("single_horizon requires exactly one horizon shift")
+    head_keys = temporal_cfg.head_ids or temporal_cfg.horizon_shifts
 
     analysis_fh = None
     if cfg.analysis_path:
@@ -230,21 +255,21 @@ def run(cfg: Exp22RunConfig, *, jsonl_paths: list[str], sp_model_path: str) -> N
                 doc_t0 = time.monotonic()
                 doc_loss_nats = 0.0
                 doc_tokens = 0
-                per_head_loss_nats = {shift: 0.0 for shift in temporal_cfg.horizon_shifts}
+                per_head_loss_nats = {head_key: 0.0 for head_key in head_keys}
                 doc_chunks_scored = 0
-                doc_winner_counts = {shift: 0 for shift in temporal_cfg.horizon_shifts}
+                doc_winner_counts = {head_key: 0 for head_key in head_keys}
                 doc_half_life_samples: dict[
-                    float,
+                    float | str,
                     list[list[dict[str, float | int | None]]],
-                ] = {shift: [] for shift in temporal_cfg.horizon_shifts}
+                ] = {head_key: [] for head_key in head_keys}
                 doc_state_divergence_samples: dict[
-                    float,
+                    float | str,
                     list[list[dict[str, float | int | None]]],
                 ] = {}
 
                 if temporal_condition:
-                    states_by_shift: dict[float, list[torch.Tensor] | None] = {
-                        shift: None for shift in temporal_cfg.horizon_shifts
+                    states_by_shift: dict[float | str, list[torch.Tensor] | None] = {
+                        head_key: None for head_key in head_keys
                     }
                 else:
                     states: list[torch.Tensor] | None = None
@@ -304,6 +329,11 @@ def run(cfg: Exp22RunConfig, *, jsonl_paths: list[str], sp_model_path: str) -> N
                     "doc_id": doc.doc_id,
                     "condition": cfg.condition,
                     "horizon_shifts": list(temporal_cfg.horizon_shifts),
+                    "head_ids": (
+                        list(temporal_cfg.head_ids)
+                        if temporal_cfg.head_ids is not None
+                        else None
+                    ),
                     "bpb": bpb,
                     "tokens": doc_tokens,
                     "loss_nats": doc_loss_nats,
@@ -327,6 +357,11 @@ def run(cfg: Exp22RunConfig, *, jsonl_paths: list[str], sp_model_path: str) -> N
                             else None
                         ),
                         "horizon_shifts": list(temporal_cfg.horizon_shifts),
+                        "head_ids": (
+                            list(temporal_cfg.head_ids)
+                            if temporal_cfg.head_ids is not None
+                            else None
+                        ),
                         "chunks": doc_chunks_scored,
                         "tokens": doc_tokens,
                         "winner_counts_by_shift": _json_shift_map(doc_winner_counts),
@@ -373,6 +408,11 @@ def run(cfg: Exp22RunConfig, *, jsonl_paths: list[str], sp_model_path: str) -> N
                 "aggregate_loss_nats": total_loss_nats,
                 "aggregate_raw_bytes": total_raw_bytes,
                 "horizon_shifts": list(temporal_cfg.horizon_shifts),
+                "head_ids": (
+                    list(temporal_cfg.head_ids)
+                    if temporal_cfg.head_ids is not None
+                    else None
+                ),
                 "mixer": temporal_cfg.mixer,
                 "mixer_weights": (
                     list(temporal_cfg.mixer_weights)
@@ -381,7 +421,7 @@ def run(cfg: Exp22RunConfig, *, jsonl_paths: list[str], sp_model_path: str) -> N
                 ),
                 "analysis_path": cfg.analysis_path or None,
                 "temporal_head_count": (
-                    len(temporal_cfg.horizon_shifts)
+                    len(head_keys)
                     if temporal_condition
                     else 1
                 ),

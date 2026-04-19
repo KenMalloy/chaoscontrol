@@ -209,6 +209,49 @@ def test_exp22_runner_writes_analysis_sidecar_and_mixer_metadata(tmp_path):
     assert "cosine_vs_base" in first["state_divergence_by_shift"]["-0.5"][0]
 
 
+def test_exp22_runner_identical_heads_uniform_matches_score_only(tmp_path):
+    head_ids = ["same_a", "same_b", "same_c"]
+    cfg_path, out_path, summary_path = _write_tiny_fixture(
+        tmp_path,
+        condition="identical_heads_uniform",
+        horizon_shifts=[0.0, 0.0, 0.0],
+        extra_config={"head_ids": head_ids},
+    )
+    raw = json.loads(cfg_path.read_text())
+    score_out_path = tmp_path / "score_metrics.jsonl"
+    score_summary_path = tmp_path / "score_summary.json"
+    score_cfg_path = tmp_path / "score_run.json"
+    score_raw = {
+        **raw,
+        "condition": "score_only",
+        "horizon_shifts": [0.0],
+        "output_path": str(score_out_path),
+        "summary_path": str(score_summary_path),
+    }
+    score_raw.pop("head_ids")
+    score_cfg_path.write_text(json.dumps(score_raw))
+
+    identical_result = _run_exp22_config(cfg_path)
+    score_result = _run_exp22_config(score_cfg_path)
+
+    assert identical_result.returncode == 0, identical_result.stderr
+    assert score_result.returncode == 0, score_result.stderr
+    identical_records = [json.loads(line) for line in out_path.read_text().splitlines()]
+    score_records = [json.loads(line) for line in score_out_path.read_text().splitlines()]
+    assert len(identical_records) == len(score_records) == 2
+    for identical, score in zip(identical_records, score_records, strict=True):
+        assert identical["head_ids"] == head_ids
+        assert identical["horizon_shifts"] == [0.0, 0.0, 0.0]
+        assert set(identical["per_head_bpb"]) == set(head_ids)
+        assert identical["bpb"] == pytest.approx(score["bpb"])
+        assert identical["loss_nats"] == pytest.approx(score["loss_nats"])
+
+    summary = json.loads(summary_path.read_text())
+    assert summary["condition"] == "identical_heads_uniform"
+    assert summary["head_ids"] == head_ids
+    assert summary["temporal_head_count"] == 3
+
+
 def test_exp22_parameter_free_run_does_not_mutate_checkpoint(tmp_path):
     cfg_path, _, _ = _write_tiny_fixture(
         tmp_path,

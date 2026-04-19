@@ -88,6 +88,56 @@ def test_single_zero_shift_matches_direct_model():
     assert set(result.final_states_by_shift) == {0.0}
 
 
+def test_identical_uniform_heads_match_direct_model_with_independent_states():
+    torch.manual_seed(0)
+    model = ChaosStudentLM(
+        vocab_size=64,
+        dim=16,
+        num_layers=2,
+        block_type="ssm",
+        a_mode="diag",
+    )
+    chunk = torch.randint(0, 64, (1, 12))
+    cfg = TemporalHeadConfig(
+        horizon_shifts=(0.0, 0.0, 0.0),
+        head_ids=("same_a", "same_b", "same_c"),
+    )
+
+    result = score_temporal_heads_chunk(
+        model,
+        chunk,
+        states_by_shift={head_id: None for head_id in cfg.head_ids},
+        cfg=cfg,
+    )
+
+    with torch.no_grad():
+        out = model(chunk)
+        direct_log_probs = F.log_softmax(out["logits"], dim=-1)
+        direct_loss = F.cross_entropy(
+            out["logits"][:, :-1].reshape(-1, 64),
+            chunk[:, 1:].reshape(-1),
+            reduction="sum",
+        )
+
+    assert torch.allclose(result.mixed_log_probs, direct_log_probs)
+    assert torch.isclose(torch.tensor(result.loss_nats), direct_loss)
+    assert set(result.final_states_by_shift) == {"same_a", "same_b", "same_c"}
+    assert result.winner_counts_by_shift == {
+        "same_a": result.tokens_scored,
+        "same_b": 0,
+        "same_c": 0,
+    }
+    for layer_idx in range(2):
+        assert (
+            result.final_states_by_shift["same_a"][layer_idx].data_ptr()
+            != result.final_states_by_shift["same_b"][layer_idx].data_ptr()
+        )
+        assert (
+            result.final_states_by_shift["same_b"][layer_idx].data_ptr()
+            != result.final_states_by_shift["same_c"][layer_idx].data_ptr()
+        )
+
+
 def test_base_prior_mixer_protects_base_probability():
     slow = torch.log(torch.tensor([[[0.01, 0.99]]]))
     base = torch.log(torch.tensor([[[0.90, 0.10]]]))

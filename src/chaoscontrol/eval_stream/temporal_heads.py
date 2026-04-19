@@ -9,6 +9,9 @@ import torch.nn.functional as F
 from chaoscontrol.eval_stream.delta_mod import DeltaModulator
 
 
+HeadKey = float | str
+
+
 def uniform_logprob_mixture(log_probs: list[torch.Tensor]) -> torch.Tensor:
     """Uniform probability-space mixture of per-head log-probabilities."""
     if not log_probs:
@@ -55,6 +58,7 @@ def weighted_logprob_mixture(
 @dataclass(frozen=True)
 class TemporalHeadConfig:
     horizon_shifts: tuple[float, ...] = (-0.5, 0.0, 0.5)
+    head_ids: tuple[str, ...] | None = None
     horizon_knob: Literal["log_a_shift"] = "log_a_shift"
     mixer: Literal["uniform_logprob", "base_prior_logprob"] = "uniform_logprob"
     mixer_weights: tuple[float, ...] | None = None
@@ -67,11 +71,11 @@ class TemporalHeadChunkResult:
     loss_nats: float
     tokens_scored: int
     mixed_log_probs: torch.Tensor
-    final_states_by_shift: dict[float, list[torch.Tensor]]
-    per_head_loss_nats: dict[float, float]
-    winner_counts_by_shift: dict[float, int]
-    half_life_stats_by_shift: dict[float, list[dict[str, float | int | None]]]
-    state_divergence_by_shift: dict[float, list[dict[str, float | int]]]
+    final_states_by_shift: dict[HeadKey, list[torch.Tensor]]
+    per_head_loss_nats: dict[HeadKey, float]
+    winner_counts_by_shift: dict[HeadKey, int]
+    half_life_stats_by_shift: dict[HeadKey, list[dict[str, float | int | None]]]
+    state_divergence_by_shift: dict[HeadKey, list[dict[str, float | int]]]
 
 
 @dataclass
@@ -137,6 +141,31 @@ def _find_ssm_cores(model) -> list:
     return [m for m in model.modules() if type(m).__name__ == "ChaosSSMCore"]
 
 
+def _head_keys(cfg: TemporalHeadConfig) -> tuple[HeadKey, ...]:
+    if cfg.head_ids is None:
+        if len(set(cfg.horizon_shifts)) != len(cfg.horizon_shifts):
+            raise ValueError("duplicate horizon_shifts require explicit head_ids")
+        return cfg.horizon_shifts
+    if len(cfg.head_ids) != len(cfg.horizon_shifts):
+        raise ValueError(
+            f"head_ids length {len(cfg.head_ids)} does not match "
+            f"horizon_shifts length {len(cfg.horizon_shifts)}"
+        )
+    if len(set(cfg.head_ids)) != len(cfg.head_ids):
+        raise ValueError("head_ids must be unique")
+    return cfg.head_ids
+
+
+def _base_head_key(
+    head_keys: tuple[HeadKey, ...],
+    horizon_shifts: tuple[float, ...],
+) -> HeadKey | None:
+    for head_key, shift in zip(head_keys, horizon_shifts, strict=True):
+        if shift == 0.0:
+            return head_key
+    return None
+
+
 def _capture_delta_means(model) -> tuple[list, list[list[torch.Tensor]]]:
     cores = _find_ssm_cores(model)
     captures: list[list[torch.Tensor]] = [[] for _ in cores]
@@ -197,10 +226,16 @@ def _half_lives_for_shift(
 
 
 def _summarize_half_life_stats(
-    raw_half_lives_by_shift: dict[float, list[torch.Tensor | None]],
-) -> dict[float, list[dict[str, float | int | None]]]:
-    base_layers = raw_half_lives_by_shift.get(0.0)
-    summary: dict[float, list[dict[str, float | int | None]]] = {}
+    raw_half_lives_by_shift: dict[HeadKey, list[torch.Tensor | None]],
+    *,
+    base_key: HeadKey | None,
+) -> dict[HeadKey, list[dict[str, float | int | None]]]:
+    base_layers = (
+        raw_half_lives_by_shift.get(base_key)
+        if base_key is not None
+        else None
+    )
+    summary: dict[HeadKey, list[dict[str, float | int | None]]] = {}
     for shift, half_lives_by_layer in raw_half_lives_by_shift.items():
         layer_stats: list[dict[str, float | int | None]] = []
         for layer_idx, half_lives in enumerate(half_lives_by_layer):
@@ -241,14 +276,18 @@ def _summarize_half_life_stats(
 
 
 def _state_divergence_by_shift(
-    final_states_by_shift: dict[float, list[torch.Tensor]],
-) -> dict[float, list[dict[str, float | int]]]:
-    base_states = final_states_by_shift.get(0.0)
+    final_states_by_shift: dict[HeadKey, list[torch.Tensor]],
+    *,
+    base_key: HeadKey | None,
+) -> dict[HeadKey, list[dict[str, float | int]]]:
+    if base_key is None:
+        return {}
+    base_states = final_states_by_shift.get(base_key)
     if not base_states:
         return {}
-    out: dict[float, list[dict[str, float | int]]] = {}
+    out: dict[HeadKey, list[dict[str, float | int]]] = {}
     for shift, states in final_states_by_shift.items():
-        if shift == 0.0:
+        if shift == base_key:
             continue
         if len(states) != len(base_states):
             continue
@@ -287,7 +326,7 @@ def score_temporal_heads_chunk(
     model,
     chunk: torch.Tensor,
     *,
-    states_by_shift: dict[float, list[torch.Tensor] | None],
+    states_by_shift: dict[HeadKey, list[torch.Tensor] | None],
     cfg: TemporalHeadConfig,
 ) -> TemporalHeadChunkResult:
     """Score one chunk under parallel horizon shifts without updating weights."""
@@ -302,16 +341,18 @@ def score_temporal_heads_chunk(
 
     model.eval()
     targets = chunk[:, 1:]
+    head_keys = _head_keys(cfg)
+    base_key = _base_head_key(head_keys, cfg.horizon_shifts)
     log_probs: list[torch.Tensor] = []
-    final_states_by_shift: dict[float, list[torch.Tensor]] = {}
-    per_head_loss_nats: dict[float, float] = {}
-    raw_half_lives_by_shift: dict[float, list[torch.Tensor | None]] = {}
+    final_states_by_shift: dict[HeadKey, list[torch.Tensor]] = {}
+    per_head_loss_nats: dict[HeadKey, float] = {}
+    raw_half_lives_by_shift: dict[HeadKey, list[torch.Tensor | None]] = {}
     cores = _find_ssm_cores(model)
 
     with torch.no_grad():
-        for shift in cfg.horizon_shifts:
+        for head_key, shift in zip(head_keys, cfg.horizon_shifts, strict=True):
             kwargs = {}
-            initial_states = states_by_shift.get(shift)
+            initial_states = states_by_shift.get(head_key)
             if initial_states:
                 kwargs["initial_states"] = initial_states
             handles, delta_captures = _capture_delta_means(model)
@@ -320,7 +361,7 @@ def score_temporal_heads_chunk(
                     out = model(chunk, **kwargs)
                 finally:
                     _remove_hooks(handles)
-            raw_half_lives_by_shift[shift] = _half_lives_for_shift(
+            raw_half_lives_by_shift[head_key] = _half_lives_for_shift(
                 cores,
                 _mean_delta_by_layer(delta_captures),
                 shift=shift,
@@ -328,10 +369,10 @@ def score_temporal_heads_chunk(
             logits = out["logits"] if isinstance(out, dict) else out
             head_log_probs = F.log_softmax(logits, dim=-1)
             log_probs.append(head_log_probs)
-            per_head_loss_nats[shift] = float(
+            per_head_loss_nats[head_key] = float(
                 _nll_from_log_probs(head_log_probs, targets).item()
             )
-            final_states_by_shift[shift] = (
+            final_states_by_shift[head_key] = (
                 [state.detach().clone() for state in out["final_states"]]
                 if isinstance(out, dict) and "final_states" in out
                 else []
@@ -349,8 +390,8 @@ def score_temporal_heads_chunk(
         )
         winners = per_token_nll.argmin(dim=0)
         winner_counts_by_shift = {
-            shift: int((winners == idx).sum().item())
-            for idx, shift in enumerate(cfg.horizon_shifts)
+            head_key: int((winners == idx).sum().item())
+            for idx, head_key in enumerate(head_keys)
         }
 
     return TemporalHeadChunkResult(
@@ -360,8 +401,14 @@ def score_temporal_heads_chunk(
         final_states_by_shift=final_states_by_shift,
         per_head_loss_nats=per_head_loss_nats,
         winner_counts_by_shift=winner_counts_by_shift,
-        half_life_stats_by_shift=_summarize_half_life_stats(raw_half_lives_by_shift),
-        state_divergence_by_shift=_state_divergence_by_shift(final_states_by_shift),
+        half_life_stats_by_shift=_summarize_half_life_stats(
+            raw_half_lives_by_shift,
+            base_key=base_key,
+        ),
+        state_divergence_by_shift=_state_divergence_by_shift(
+            final_states_by_shift,
+            base_key=base_key,
+        ),
     )
 
 
