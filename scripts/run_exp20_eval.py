@@ -28,7 +28,7 @@ from chaoscontrol.eval_stream.persistence import StateManager, attach_trainable_
 from chaoscontrol.eval_stream.ttt_runner import select_adapt_params, ADAPT_SET_PATTERNS
 from chaoscontrol.eval_stream.delta_mod import DeltaModulator
 from chaoscontrol.eval_stream.metrics import MetricsCollector
-from chaoscontrol.eval_stream.budget import BudgetTracker
+from chaoscontrol.eval_stream.budget import BudgetTracker, EvalDeadline
 from chaoscontrol.evaluation import compute_bpb
 
 
@@ -148,9 +148,9 @@ def run(cfg: RunConfig, jsonl_paths: list[str], sp_model_path: str) -> None:
     with DeltaModulator(model, delta_scale=cfg.delta_scale,
                         log_a_shift=cfg.log_a_shift,
                         adapt_set_hint=cfg.adapt_set):
-        run_start = time.monotonic()
+        deadline = EvalDeadline(cfg.budget_seconds)
         for doc in streamer:
-            if time.monotonic() - run_start > cfg.budget_seconds:
+            if deadline.is_expired():
                 timed_out = True
                 break
             if collector.collapsed:
@@ -204,6 +204,18 @@ def run(cfg: RunConfig, jsonl_paths: list[str], sp_model_path: str) -> None:
                     loss_after_sum += 0.0 if loss_after is None else loss_after
                     step_count += cfg.steps_per_chunk
                     adapt_steps += cfg.steps_per_chunk
+                # In-loop wall cap: a single adapt can take much longer than
+                # ``budget.can_adapt()``'s pre-check implied (slack was 1s,
+                # adapt took 50s). Check the deadline post-adapt and break
+                # the chunk loop so overrun is bounded to ONE adapt's worth
+                # of overshoot, not unbounded. The outer doc loop's
+                # ``deadline.is_expired()`` check completes the break.
+                if deadline.is_expired():
+                    timed_out = True
+                    break
+
+            if timed_out:
+                break
 
             wall_ms = (time.monotonic() - t0) * 1000.0
             bpb = compute_bpb(doc_ce_nats, doc.raw_bytes) if doc.raw_bytes > 0 else 0.0
@@ -239,7 +251,7 @@ def run(cfg: RunConfig, jsonl_paths: list[str], sp_model_path: str) -> None:
             timed_out=timed_out,
             collapsed=collector.collapsed,
             score_only_mode=score_only_mode,
-            elapsed_seconds=time.monotonic() - run_start,
+            elapsed_seconds=deadline.elapsed(),
             ckpt_sha256=ckpt_sha256,
             ckpt_cfg_hash=ckpt_cfg_hash,
             stream_seed=cfg.seed,

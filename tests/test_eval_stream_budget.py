@@ -1,6 +1,12 @@
+import time
+
 import pytest
 
-from chaoscontrol.eval_stream.budget import BudgetTracker, compute_usable_ttt_budget
+from chaoscontrol.eval_stream.budget import (
+    BudgetTracker,
+    EvalDeadline,
+    compute_usable_ttt_budget,
+)
 
 
 def test_compute_usable_ttt_budget_subtracts_floor_and_margin():
@@ -82,6 +88,34 @@ def test_summary_provenance_defaults_to_none():
     ):
         assert key in prov, f"missing provenance field: {key}"
         assert prov[key] is None, f"expected None default for {key}, got {prov[key]!r}"
+
+
+def test_eval_deadline_fresh_not_expired():
+    """A just-constructed deadline with a non-trivial budget is live —
+    elapsed is tiny, remaining is close to the full budget, is_expired
+    is False."""
+    d = EvalDeadline(budget_seconds=5.0)
+    assert d.elapsed() < 0.1
+    assert d.remaining() > 4.5
+    assert not d.is_expired()
+
+
+def test_eval_deadline_expires_after_sleep():
+    """Deadline expires once elapsed passes the budget. Uses a short budget
+    + a short sleep so the test is deterministic without being slow."""
+    d = EvalDeadline(budget_seconds=0.05)
+    time.sleep(0.1)
+    assert d.is_expired()
+    assert d.remaining() == pytest.approx(0.0)
+
+
+def test_eval_deadline_zero_budget_is_expired():
+    """A zero-budget deadline is expired immediately. Useful as a
+    sentinel — pass ``EvalDeadline(0.0)`` to force-break a loop."""
+    d = EvalDeadline(budget_seconds=0.0)
+    # elapsed will be a microsecond or two, but strictly > 0
+    assert d.is_expired()
+    assert d.remaining() == pytest.approx(0.0)
 
 
 def test_summary_provenance_fields_passed_through():

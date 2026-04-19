@@ -1,5 +1,35 @@
 from __future__ import annotations
 
+import time
+
+
+class EvalDeadline:
+    """Wall-clock deadline for bounded-time eval loops.
+
+    Single source of truth for elapsed / expiry checks — replaces
+    ad-hoc ``time.monotonic() - run_start > budget`` patterns scattered
+    across eval drivers. Designed as the extension point for cooperative
+    cancellation inside ``controller.adapt_on_chunk``: pass the deadline
+    in, check between optimizer steps, raise early if expired. That
+    refactor is deferred; today, loops call ``is_expired()`` at natural
+    break points (doc boundaries, post-adapt) and break out.
+
+    Not thread-safe; one deadline per eval loop.
+    """
+
+    def __init__(self, budget_seconds: float) -> None:
+        self.budget_seconds = float(budget_seconds)
+        self._start = time.monotonic()
+
+    def elapsed(self) -> float:
+        return time.monotonic() - self._start
+
+    def remaining(self) -> float:
+        return max(0.0, self.budget_seconds - self.elapsed())
+
+    def is_expired(self) -> bool:
+        return self.elapsed() > self.budget_seconds
+
 
 def compute_usable_ttt_budget(
     *,
