@@ -1,0 +1,5 @@
+{
+  "_comment": "Canonical configs registry. Keys are sha256-prefixed config hashes (as produced by scripts/exp21_register_all.py::_config_hash). Values declare which (experiment, condition) a config is canonical for, plus rationale (why this config was chosen for the paper) and lineage (prior exploratory config_hashes that informed this choice). Add entries BEFORE running paper_results register with status=confirmatory — the register-side gate refuses un-declared hashes.",
+  "schema_version": 1,
+  "canonical": {}
+}

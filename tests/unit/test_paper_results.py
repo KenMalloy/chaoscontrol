@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
 
 from chaoscontrol.paper_results import (
     RunRecord,
+    is_canonical,
     load,
+    load_canonical_configs,
     query,
     register,
     verify,
@@ -130,6 +133,83 @@ def test_verify_allows_dirty_exploratory(tmp_path: Path) -> None:
     summary = verify(registry_path=reg)
     assert summary["dirty_records"] == 1
     assert summary["exploratory"] == 1
+
+
+# =====================================================================
+# Canonical configs
+# =====================================================================
+def test_load_canonical_configs_missing_file_returns_empty(tmp_path: Path) -> None:
+    """Pre-curation default: no canonical file yet means the canonical
+    map is empty. The register-side gate treats every hash as
+    non-canonical, forcing the operator to add entries before stamping
+    confirmatory — the deliberate-curation goal."""
+    assert load_canonical_configs(path=tmp_path / "missing.json") == {}
+
+
+def test_load_canonical_configs_reads_canonical_subdict(tmp_path: Path) -> None:
+    """The canonical file uses a schema wrapper — ``{"schema_version": 1,
+    "canonical": {hash: entry}}`` — so future schema fields don't
+    collide with hash keys. ``load_canonical_configs`` returns just the
+    inner ``canonical`` map."""
+    path = tmp_path / "canonical.json"
+    path.write_text(json.dumps({
+        "schema_version": 1,
+        "canonical": {
+            "sha256:abc": {
+                "experiment": "exp21",
+                "condition": "D_ssm_sgns",
+                "rationale": "4-cell SGNS-init winner, Δ=+0.0113 p=0.0074",
+                "lineage": ["sha256:prior1"],
+            }
+        },
+    }))
+    canonical = load_canonical_configs(path=path)
+    assert "sha256:abc" in canonical
+    assert canonical["sha256:abc"]["condition"] == "D_ssm_sgns"
+
+
+def test_is_canonical_matches_experiment_and_condition(tmp_path: Path) -> None:
+    """``is_canonical`` requires all three fields to match. A hash that's
+    declared canonical for ``exp21/D_ssm_sgns`` is NOT canonical for
+    ``exp21/A_transformer_random`` — prevents hash reuse across arms."""
+    path = tmp_path / "canonical.json"
+    path.write_text(json.dumps({
+        "canonical": {
+            "sha256:abc": {
+                "experiment": "exp21",
+                "condition": "D_ssm_sgns",
+                "rationale": "x",
+                "lineage": [],
+            }
+        },
+    }))
+    assert is_canonical(
+        config_hash="sha256:abc",
+        experiment="exp21",
+        condition="D_ssm_sgns",
+        path=path,
+    )
+    # Different condition → not canonical
+    assert not is_canonical(
+        config_hash="sha256:abc",
+        experiment="exp21",
+        condition="A_transformer_random",
+        path=path,
+    )
+    # Different experiment → not canonical
+    assert not is_canonical(
+        config_hash="sha256:abc",
+        experiment="exp22",
+        condition="D_ssm_sgns",
+        path=path,
+    )
+    # Unknown hash → not canonical
+    assert not is_canonical(
+        config_hash="sha256:unknown",
+        experiment="exp21",
+        condition="D_ssm_sgns",
+        path=path,
+    )
 
 
 def test_invalid_status_rejected() -> None:

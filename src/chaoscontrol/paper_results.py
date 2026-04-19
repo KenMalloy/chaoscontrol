@@ -19,6 +19,7 @@ _VALID_STATUSES: frozenset[str] = frozenset({"exploratory", "confirmatory"})
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_REGISTRY_PATH = _REPO_ROOT / "paper_results" / "registry.jsonl"
+DEFAULT_CANONICAL_CONFIGS_PATH = _REPO_ROOT / "paper_results" / "canonical_configs.json"
 
 
 @dataclass
@@ -195,13 +196,63 @@ def verify(registry_path: Path | str | None = None) -> dict:
     }
 
 
+def load_canonical_configs(
+    path: Path | str | None = None,
+) -> dict[str, dict]:
+    """Load the canonical-configs registry, return ``{config_hash: entry}``.
+
+    Missing file returns ``{}`` — treat as "no canonical set declared yet".
+    Each entry has ``experiment``, ``condition``, ``rationale``,
+    ``lineage``. Rationale captures the "why this config was chosen"
+    trail that a mechanical hash match would otherwise lose; lineage
+    lists prior exploratory config_hashes that informed the choice so
+    the research path stays legible from a single file.
+    """
+    p = Path(path) if path is not None else DEFAULT_CANONICAL_CONFIGS_PATH
+    if not p.exists():
+        return {}
+    data = json.loads(p.read_text())
+    if isinstance(data, dict) and "canonical" in data:
+        return data["canonical"]
+    # Backwards-compat: bare dict of {hash: entry} without schema wrapper.
+    return data
+
+
+def is_canonical(
+    *,
+    config_hash: str,
+    experiment: str,
+    condition: str,
+    path: Path | str | None = None,
+) -> bool:
+    """True iff ``config_hash`` maps to a canonical entry whose
+    ``(experiment, condition)`` matches.
+
+    A config hash that's canonical for a DIFFERENT ``(experiment,
+    condition)`` pair is NOT canonical for the one you claimed —
+    prevents accidentally reusing a hash declared for one arm as
+    authority for another.
+    """
+    canonical = load_canonical_configs(path)
+    entry = canonical.get(config_hash)
+    if entry is None:
+        return False
+    return (
+        entry.get("experiment") == experiment
+        and entry.get("condition") == condition
+    )
+
+
 __all__ = [
     "RunRecord",
     "Status",
     "SCHEMA_VERSION",
     "DEFAULT_REGISTRY_PATH",
+    "DEFAULT_CANONICAL_CONFIGS_PATH",
     "register",
     "load",
     "query",
     "verify",
+    "load_canonical_configs",
+    "is_canonical",
 ]
