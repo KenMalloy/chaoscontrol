@@ -13,11 +13,20 @@ An attention head specializes *what to retrieve* from context. A temporal head s
 In implementation terms, a temporal head is a parallel recurrent trace that:
 
 1. reuses the same SSM weights,
-2. applies a different `delta_scale` / memory-horizon multiplier,
+2. applies a different memory-horizon knob,
 3. maintains its own recurrent state, and
 4. contributes a separate log-probability view of the next token.
 
 Parameter-free temporal heads add eval-time compute and recurrent state memory, but do not increase artifact size.
+
+The primary horizon knob is `log_a_shift`, not the current pre-softplus `delta_scale` hook. `log_a_shift` directly changes the SSM pole term:
+
+```python
+a_base = sigmoid(log_a + shift)
+decay = exp(-delta * a_base)
+```
+
+Negative shifts reduce `a_base` and lengthen memory; positive shifts increase `a_base` and shorten memory. Pre-softplus `delta_scale` remains a diagnostic or fallback knob because the current implementation scales `delta_proj(x)` before `softplus`, which can be asymmetric and weak near zero.
 
 ## Motivation
 
@@ -31,12 +40,12 @@ The single-timescale bottleneck is the suspected failure mode. A standard SSM co
 
 ## Core hypothesis
 
-**Primary hypothesis:** A parameter-free multi-timeframe SSM improves bpb per extra eval second over both the best single timeframe and an equal-compute same-horizon recurrence control.
+**Primary hypothesis:** A parameter-free multi-timeframe SSM improves bpb per extra eval second over both the best single horizon and an equal-compute same-horizon recurrence control.
 
 **Secondary hypotheses:**
 
-1. **Temporal diversity matters.** Multi-timeframe heads beat the best single `delta_scale`, not merely the baseline `delta_scale=1.0`.
-2. **Different horizons beat repeated horizon.** Multi-timeframe heads beat uniform depth recurrence or same-horizon extra compute at matched wall time.
+1. **Temporal diversity matters.** Multi-timeframe heads beat the best single horizon knob, not merely the baseline `log_a_shift=0.0`.
+2. **Different horizons beat repeated horizon.** Multi-timeframe heads beat the pinned same-horizon virtual-depth control at matched wall time.
 3. **Conditional use matters.** Gated temporal heads improve bpb per second over always-on temporal heads when the slack budget is tight.
 4. **Training can make it real.** If eval-only temporal heads help, train-time temporal-scale dropout should make the effect stronger and less out-of-distribution.
 
@@ -51,30 +60,30 @@ Small expert SSMs are deliberately deferred. Temporal heads are the safer first 
 
 ## Mechanism
 
-For a scale set such as:
+For a shift set such as:
 
 ```python
-time_scales = [0.5, 1.0, 2.0]  # slow, base, fast if applied as reciprocal horizon multipliers
+horizon_shifts = [-0.5, 0.0, 0.5]  # slow, base, fast via log_a_shift
 ```
 
-the eval loop carries one state bundle per scale:
+the eval loop carries one state bundle per shift:
 
 ```python
-states_by_scale = {
+states_by_shift = {
+    -0.5: init_states(),
+    0.0: init_states(),
     0.5: init_states(),
-    1.0: init_states(),
-    2.0: init_states(),
 }
 ```
 
-Each chunk is scored separately under each scale:
+Each chunk is scored separately under each shift:
 
 ```python
-for scale, states in states_by_scale.items():
-    with DeltaModulator(model, delta_scale=scale):
+for shift, states in states_by_shift.items():
+    with DeltaModulator(model, log_a_shift=shift):
         out = model(chunk, initial_states=states)
-    logp_by_scale[scale] = log_softmax(out["logits"], dim=-1)
-    states_by_scale[scale] = out["final_states"]
+    logp_by_shift[shift] = log_softmax(out["logits"], dim=-1)
+    states_by_shift[shift] = out["final_states"]
 ```
 
 The first parameter-free mixer should be a uniform probability mixture, not a raw logits average:
@@ -116,24 +125,44 @@ Current-chunk target loss may be logged and may schedule compute for future chun
 
 ## Conditions
 
+Phase 0 is a cheap calibration gate. It does not produce confirmatory claims.
+
+| Tag | Description | Purpose |
+|---|---|---|
+| `horizon_response_pilot` | 10% calibration stream sweep of `log_a_shift in {-1.0, -0.5, 0.0, 0.5, 1.0}` plus current pre-softplus `delta_scale in {0.5, 1.0, 2.0}` | verify the horizon knob moves bpb/state norms monotonically enough to lock Phase A |
+
+If every non-base `log_a_shift` costs more than `0.03` bpb on the pilot, Phase A still may run, but it is labeled exploratory unless Phase B train-time temporal-scale dropout is run. If pre-softplus `delta_scale` is noisy or nonmonotone in the pilot, it is not used as the primary temporal-head knob.
+
 Phase A is the core experiment. It should run before any learned mixer or training change.
 
 | Tag | Description | Purpose |
 |---|---|---|
-| `score_only` | Final checkpoint, normal eval, `delta_scale=1.0` | bpb and wall-clock floor |
-| `single_delta_sweep` | Fixed single scales, e.g. `0.5`, `1.0`, `2.0`, `4.0` | find best single horizon |
-| `uniform_depth_recur` | same-horizon extra compute via depth recurrence / repeated shared layers | equal-compute "more thinking" control |
+| `score_only` | Final checkpoint, normal eval, `log_a_shift=0.0` | bpb and wall-clock floor |
+| `single_horizon_sweep` | Fixed single shifts, pre-registered from pilot | find best single horizon |
+| `same_horizon_virtual_depth` | deterministic replay of the same SSM layer group at `log_a_shift=0.0`; see control definition below | equal-compute "more thinking" control |
 | `temporal_heads_3_uniform` | slow/base/fast heads with uniform probability mixture | primary parameter-free temporal head test |
-| `temporal_heads_5_uniform` | wider scale set if 3-head diversity is too low | checks whether scale coverage is the bottleneck |
+| `temporal_heads_5_uniform` | wider shift set if 3-head diversity is too low | checks whether horizon coverage is the bottleneck |
 | `gated_temporal_heads_3` | base path always, extra heads only when previous-chunk priority is high | tests bpb per slack second |
 | `exp20_ttt_best` | best completed Exp 20 TTT policy under same slack accounting | strongest existing eval-time compute baseline |
 | `temporal_heads_plus_ttt` | temporal heads first, TTT only if priority remains high | tests composition |
 
-Phase B is only run if Phase A shows a non-trivial signal.
+### Equal-compute same-horizon control
+
+`same_horizon_virtual_depth` is pinned before implementation:
+
+1. Load the same checkpoint weights.
+2. Keep the horizon knob at `log_a_shift=0.0`.
+3. Use one recurrent state bundle, not one state bundle per replay.
+4. Replay the same contiguous SSM layer group through `ChaosStudentLM.depth_recurrence_shared_layers`.
+5. Choose `depth_recurrence_count` by wall-clock matching against `temporal_heads_3_uniform`, not by nominal pass count.
+
+If the final Exp 19 checkpoint was trained with an explicit depth-recurrence group, use that group. If it was not, the primary control uses all SSM blocks as the shared group. This control is deterministic. It is not a random-seed rescore, not an ensemble of identical base passes, and not a learned expert.
+
+Phase B is run if Phase A shows a non-trivial signal, or if Phase A is null while the Phase 0 pilot suggests non-base horizons are suffering a large eval-only OOD penalty.
 
 | Tag | Description | Purpose |
 |---|---|---|
-| `temporal_scale_dropout_train` | train with random per-batch or per-block `delta_scale` jitter, eval with temporal heads | reduces eval-only OOD risk |
+| `temporal_scale_dropout_train` | train with random per-batch or per-block horizon shifts, eval with temporal heads | reduces eval-only OOD risk |
 | `tiny_mixer` | small frozen-checkpoint mixer trained on held-out calibration stream | measures learned composition without touching base weights |
 | `tiny_ssm_sidecar` | small recurrent sidecar predicts logit deltas for high-priority chunks | deferred expert-SSM bridge |
 
@@ -148,13 +177,13 @@ delta_seed_i = bpb_condition_seed_i - bpb_score_only_seed_i
 Primary comparisons use paired deltas across seeds:
 
 1. `temporal_heads_3_uniform` vs `score_only`,
-2. `temporal_heads_3_uniform` vs best pre-registered single scale,
-3. `temporal_heads_3_uniform` vs `uniform_depth_recur`,
+2. `temporal_heads_3_uniform` vs best pre-registered single horizon,
+3. `temporal_heads_3_uniform` vs `same_horizon_virtual_depth`,
 4. `gated_temporal_heads_3` vs `temporal_heads_3_uniform` on bpb per extra second.
 
 If only one final checkpoint exists, Exp 22 can still answer the engineering question, but it must not report seed-level p-values. Doc bootstrap confidence intervals may be included as diagnostics only; they do not replace independent checkpoint seeds.
 
-Scale selection is also pre-registered. The primary scale set is `(0.5, 1.0, 2.0)`. Wider single-scale sweeps are exploratory unless they are chosen on a calibration stream and re-run, locked, on the primary eval stream.
+Horizon selection is also pre-registered. The primary shift set is `(-0.5, 0.0, 0.5)` unless the Phase 0 calibration stream rejects it. Wider horizon sweeps are exploratory unless they are chosen on a calibration stream and re-run, locked, on the primary eval stream.
 
 ## Evidence labels
 
@@ -163,19 +192,21 @@ Every Exp 22 result must be labeled before it is discussed in writeups or status
 **Confirmatory-candidate** requires all of the following:
 
 1. at least 5 matched checkpoint seeds,
-2. fixed primary scale set `(0.5, 1.0, 2.0)`,
+2. fixed primary horizon set,
 3. fixed gating threshold chosen off the primary eval stream,
 4. full intended eval stream and budget regime,
 5. passing legality tests,
 6. paired seed-level analysis,
 7. no learned mixer, tiny sidecar, or post-hoc oracle selection.
 
+**Provisional** is allowed when only 3 matched checkpoint seeds are feasible after the final submission checkpoint is chosen. Provisional results require the same fixed horizon set, full eval stream, legal accounting, paired seed deltas, and a pre-registered block bootstrap over documents as a diagnostic. Provisional results may guide engineering decisions, but they are not thesis-level and must not be presented as confirmatory evidence.
+
 **Exploratory** is mandatory if any of the following are true:
 
-- only one checkpoint seed is available,
+- fewer than 3 matched checkpoint seeds are available,
 - doc bootstrap is the only uncertainty estimate,
-- scales or thresholds are chosen on the primary eval stream,
-- the run uses a wider scale sweep not locked before primary eval,
+- horizons or thresholds are chosen on the primary eval stream,
+- the run uses a wider horizon sweep not locked before primary eval,
 - the run uses `tiny_mixer`, `tiny_ssm_sidecar`, or train-time temporal-scale dropout for the first time,
 - the run uses a partial stream, degraded world size, or non-submission budget,
 - any causal legality check is missing or not yet tested.
@@ -186,14 +217,13 @@ Seed-level p-values are secondary because `n=5` is small. The main report must s
 
 ## Compute policy
 
-The first gated policy should be deliberately simple and pre-registered. It uses only information available before the chunk it affects.
+The first gated policy should be deliberately simple and pre-registered. It uses only information available before the chunk it affects. The primary gate does **not** use `prev_head_disagreement`, because disagreement is only observed after temporal heads have run and would become stale after base-only chunks.
 
 ```python
 priority_next = (
     alpha * z(prev_entropy)
     + beta * z(prev_loss_spike)
     + gamma * z(prev_state_delta_norm)
-    + delta * z(prev_head_disagreement)
 )
 
 if priority_next > threshold and slack_remaining > estimated_temporal_cost:
@@ -202,7 +232,16 @@ else:
     action = "base_only"
 ```
 
-The threshold should be chosen on a calibration stream or smoke split, then frozen for the primary eval stream. If the threshold is tuned on the primary eval stream, the run must be labeled exploratory.
+A secondary gated policy may add head disagreement through an exponentially decayed cache:
+
+```python
+if temporal_heads_ran:
+    disagreement_ema = update_ema(disagreement_ema, current_head_disagreement)
+else:
+    disagreement_ema = decay_toward_prior(disagreement_ema)
+```
+
+That secondary policy is exploratory until it is frozen on a calibration stream and re-run on the primary stream. The threshold should be chosen on a calibration stream or smoke split, then frozen for the primary eval stream. If the threshold is tuned on the primary eval stream, the run must be labeled exploratory.
 
 ## Metrics
 
@@ -236,7 +275,7 @@ Useful diagnostic plots:
 
 ## Success criteria
 
-**Promising:** `temporal_heads_3_uniform` beats `score_only` by at least `0.005` bpb and beats the best single scale or equal-compute recurrence on bpb per second.
+**Promising:** `temporal_heads_3_uniform` beats `score_only` by at least `0.005` bpb and beats the best single horizon or equal-compute recurrence on bpb per second.
 
 **Strong:** `gated_temporal_heads_3` beats always-on temporal heads on bpb per second while using no more than 30% of chunks for extra heads.
 
@@ -244,14 +283,17 @@ Useful diagnostic plots:
 
 **Architecture-worthy:** train-time temporal-scale dropout improves the temporal-head gain or removes instability without increasing artifact size beyond the allowed budget.
 
+**Phase B promotion rule:** A Phase A null does not falsify temporal heads as an architecture idea if the pilot shows large single-horizon OOD penalties. In that case, promote `temporal_scale_dropout_train` to mandatory before killing the line. Eval-only temporal heads and train-aware temporal heads are separate claims.
+
 ## Kill criteria
 
-- If the best single `delta_scale` matches or beats temporal heads at lower wall time, do not claim temporal heads. Report "single horizon retuning wins."
-- If `uniform_depth_recur` matches or beats temporal heads at equal wall time, do not claim multiple timeframes. Report "extra same-horizon compute wins."
-- If head disagreement is near zero across the eval stream, the chosen scales are redundant. Expand the scale set once, then park if still redundant.
-- If temporal heads produce worse bpb than `score_only` by more than `0.005`, park eval-only temporal heads and only revisit under train-time scale dropout.
+- If the best single horizon matches or beats temporal heads at lower wall time, do not claim temporal heads. Report "single horizon retuning wins."
+- If `same_horizon_virtual_depth` matches or beats temporal heads at equal wall time, do not claim multiple timeframes. Report "extra same-horizon compute wins."
+- If head disagreement is near zero across the eval stream, the chosen horizons are redundant. Expand the horizon set once on the calibration stream, then park if still redundant.
+- If eval-only temporal heads produce worse bpb than `score_only` by more than `0.005`, park eval-only temporal heads and run Phase B only if the horizon-response pilot suggests OOD is the likely cause.
 - If any gating policy uses current-chunk target-dependent information to affect current-chunk scoring, invalidate that run.
 - If overhead consumes the slack needed for Exp 20 TTT and gives less bpb/sec than TTT, keep TTT as the eval-time compute path.
+- If temporal-scale dropout training also fails to beat the same-horizon and best-single-horizon controls, kill the temporal-head architecture claim.
 
 ## Implementation sketch
 
@@ -268,7 +310,8 @@ Minimal API:
 ```python
 @dataclass(frozen=True)
 class TemporalHeadConfig:
-    scales: tuple[float, ...] = (0.5, 1.0, 2.0)
+    horizon_shifts: tuple[float, ...] = (-0.5, 0.0, 0.5)
+    horizon_knob: Literal["log_a_shift", "delta_post_scale", "delta_pre_scale"] = "log_a_shift"
     mixer: Literal["uniform_logprob", "logit_mean"] = "uniform_logprob"
     policy: Literal["always", "previous_chunk_priority"] = "always"
     threshold: float | None = None
@@ -287,34 +330,36 @@ result = score_with_temporal_heads(
 
 Load-bearing tests:
 
-1. `scales=(1.0,)` matches `score_only` within float noise.
+1. `horizon_shifts=(0.0,)` matches `score_only` within float noise.
 2. Uniform log-prob mixture with one head matches that head exactly.
 3. Each head carries independent recurrent state.
 4. Gating for chunk `k` cannot read target-dependent stats from chunk `k`.
 5. Wall-clock accounting charges every temporal-head forward pass.
 6. Artifact bytes are unchanged for parameter-free conditions.
-7. `delta_scale=1.0` temporal path is bit-compatible with the existing Exp 20 `DeltaModulator` path.
+7. `log_a_shift=0.0` temporal path is bit-compatible with the existing Exp 20 `DeltaModulator` path.
+8. `same_horizon_virtual_depth` uses one state bundle and a deterministic virtual-layer replay; it does not instantiate multiple identical temporal-head states.
+9. Gating after a base-only chunk ignores head disagreement or uses only the pre-registered decayed cache.
 
 ## Risks
 
-1. **Eval-only OOD.** The model was trained at one horizon, so alternative scales may be poorly calibrated. Mitigation: start parameter-free, then only run temporal-scale dropout training if Phase A shows signal.
+1. **Eval-only OOD.** The model was trained at one horizon, so alternative horizon shifts may be poorly calibrated. Mitigation: run the Phase 0 horizon-response pilot first; if OOD dominates, promote temporal-scale dropout before killing the architecture idea.
 2. **Causal leakage through routing.** Whole-chunk stats can accidentally leak future tokens into early-position scoring. Mitigation: always-on Phase A first; gated Phase A uses previous-chunk stats only.
 3. **Miscalibrated mixtures.** Averaging logits can create false gains or losses. Mitigation: primary mixer is probability-space `logsumexp`.
 4. **Compute tax.** Three heads roughly triple forward cost. Mitigation: compare by bpb per extra second and include gated variants.
 5. **State memory.** Separate states per head increase VRAM. Mitigation: log peak VRAM; limit Phase A to 3 heads unless diversity is too low.
-6. **Multiple comparisons.** Scale sweeps can overfit. Mitigation: lock primary scales before primary eval; treat wide sweeps as exploratory unless re-run.
+6. **Multiple comparisons.** Horizon sweeps can overfit. Mitigation: lock primary horizons before primary eval; treat wide sweeps as exploratory unless re-run.
 
 ## Decision rule
 
 Exp 22 ships the term **Temporal Heads** only if the primary comparison is positive:
 
 ```text
-multi-timeframe temporal heads > best single timeframe
+multi-timeframe temporal heads > best single horizon
 and
 multi-timeframe temporal heads > equal-compute same-horizon recurrence
 ```
 
-If only the first inequality holds, the result is "multi-scale retuning helps." If only the second holds, the result is "ensembling horizons helps but scale choice is unresolved." If neither holds, temporal heads are a good name for a falsified idea, which is still useful.
+If only the first inequality holds, the result is "multi-horizon retuning helps." If only the second holds, the result is "ensembling horizons helps but horizon choice is unresolved." If neither holds, temporal heads are a good name for a falsified idea, which is still useful.
 
 ## Condensed thesis
 
