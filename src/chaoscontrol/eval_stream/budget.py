@@ -72,7 +72,25 @@ class BudgetTracker:
         collapsed: bool,
         score_only_mode: bool,
         elapsed_seconds: float,
+        ckpt_sha256: str | None = None,
+        ckpt_cfg_hash: str | None = None,
+        stream_seed: int | None = None,
+        gpu_name: str | None = None,
+        torch_version: str | None = None,
+        cuda_version: str | None = None,
+        chunk_size: int | None = None,
+        max_docs: int | None = None,
     ) -> dict:
+        """Return a summary dict.
+
+        The budget/accounting fields (``total_budget_seconds``, ``elapsed_seconds``,
+        ``score_wall_seconds``, ...) are required for the slack-budget arithmetic.
+        The ``provenance`` sub-dict is optional but strongly recommended for any
+        run whose summary will be cited — it pins the measurement to the exact
+        ckpt bytes, ckpt config hash, stream seed, GPU model, and library
+        versions that produced it. Without provenance, a summary is not
+        independently reproducible.
+        """
         score_floor_seconds = self._score_floor_for_summary(
             score_only_mode=score_only_mode,
             elapsed_seconds=elapsed_seconds,
@@ -105,4 +123,14 @@ class BudgetTracker:
             "timed_out": bool(timed_out),
             "collapsed": bool(collapsed),
             "score_only_mode": bool(score_only_mode),
+            "provenance": {
+                "ckpt_sha256": ckpt_sha256,
+                "ckpt_cfg_hash": ckpt_cfg_hash,
+                "stream_seed": stream_seed,
+                "gpu_name": gpu_name,
+                "torch_version": torch_version,
+                "cuda_version": cuda_version,
+                "chunk_size": chunk_size,
+                "max_docs": max_docs,
+            },
         }

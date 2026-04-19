@@ -3,6 +3,7 @@
 """
 from __future__ import annotations
 import argparse
+import hashlib
 import json
 import os
 import sys
@@ -50,6 +51,23 @@ def _build_model(ckpt_path: Path) -> tuple[torch.nn.Module, dict]:
     return model, cfg
 
 
+def _sha256_file(path: Path, chunk_size: int = 1 << 20) -> str:
+    """Streaming sha256 of a file's raw bytes. Used for ckpt provenance so
+    a summary can pin the exact bytes that produced it. Chunked so memory
+    stays bounded on multi-GB checkpoints."""
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for buf in iter(lambda: f.read(chunk_size), b""):
+            h.update(buf)
+    return h.hexdigest()
+
+
+def _hash_cfg(cfg: dict) -> str:
+    """Deterministic sha256 of a ckpt config dict. Sorted-json so key-order
+    doesn't perturb the hash."""
+    return hashlib.sha256(json.dumps(cfg, sort_keys=True).encode()).hexdigest()
+
+
 def _build_optimizer(params, lr: float):
     """Single Muon optimizer. Muon handles 1D/0D params internally via its
     decoupled AdamW path (see src/chaoscontrol/optim/muon.py:145), so a
@@ -95,7 +113,7 @@ def run(cfg: RunConfig, jsonl_paths: list[str], sp_model_path: str) -> None:
         torch.cuda.manual_seed_all(cfg.seed)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model, _ = _build_model(Path(cfg.checkpoint_path))
+    model, ckpt_cfg = _build_model(Path(cfg.checkpoint_path))
     model.to(device)
 
     # attach_trainable_h0 AFTER load_state_dict so strict=True works on the
@@ -204,6 +222,15 @@ def run(cfg: RunConfig, jsonl_paths: list[str], sp_model_path: str) -> None:
     if cfg.summary_path:
         summary_path = Path(cfg.summary_path)
         summary_path.parent.mkdir(parents=True, exist_ok=True)
+        # Provenance pins the summary to the exact measurement artifact.
+        # Computed here (not in the hot loop) because it's cheap at eval-end
+        # and avoids adding a load-time side-effect to _build_model.
+        ckpt_path = Path(cfg.checkpoint_path)
+        ckpt_sha256 = _sha256_file(ckpt_path)
+        ckpt_cfg_hash = _hash_cfg(ckpt_cfg)
+        gpu_name = (
+            torch.cuda.get_device_name(0) if torch.cuda.is_available() else None
+        )
         summary = budget.summary(
             docs_scored=docs_scored,
             chunks_scored=chunks_scored,
@@ -213,6 +240,14 @@ def run(cfg: RunConfig, jsonl_paths: list[str], sp_model_path: str) -> None:
             collapsed=collector.collapsed,
             score_only_mode=score_only_mode,
             elapsed_seconds=time.monotonic() - run_start,
+            ckpt_sha256=ckpt_sha256,
+            ckpt_cfg_hash=ckpt_cfg_hash,
+            stream_seed=cfg.seed,
+            gpu_name=gpu_name,
+            torch_version=torch.__version__,
+            cuda_version=torch.version.cuda,
+            chunk_size=cfg.chunk_size,
+            max_docs=cfg.max_docs,
         )
         summary_path.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
 
