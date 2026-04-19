@@ -88,12 +88,6 @@ def _build_model(ckpt_path: Path, cfg: Exp22RunConfig) -> tuple[torch.nn.Module,
     return model, ckpt_cfg
 
 
-def _init_states(model: torch.nn.Module, *, batch_size: int) -> list[torch.Tensor]:
-    if hasattr(model, "init_state"):
-        return model.init_state(batch_size)
-    return []
-
-
 def _score_direct_chunk(
     model: torch.nn.Module,
     chunk: torch.Tensor,
@@ -156,6 +150,8 @@ def run(cfg: Exp22RunConfig, *, jsonl_paths: list[str], sp_model_path: str) -> N
     docs_scored = 0
     chunks_scored = 0
     tokens_scored = 0
+    total_loss_nats = 0.0
+    total_raw_bytes = 0
     timed_out = False
     temporal_cfg = TemporalHeadConfig(horizon_shifts=tuple(float(x) for x in cfg.horizon_shifts))
     temporal_condition = cfg.condition in ("single_horizon", "temporal_heads")
@@ -178,7 +174,7 @@ def run(cfg: Exp22RunConfig, *, jsonl_paths: list[str], sp_model_path: str) -> N
                     shift: None for shift in temporal_cfg.horizon_shifts
                 }
             else:
-                states = _init_states(model, batch_size=1)
+                states: list[torch.Tensor] | None = None
 
             for chunk_list in _iter_chunks(doc.tokens, cfg.chunk_size):
                 if len(chunk_list) < 2:
@@ -215,6 +211,8 @@ def run(cfg: Exp22RunConfig, *, jsonl_paths: list[str], sp_model_path: str) -> N
 
             docs_scored += 1
             tokens_scored += doc_tokens
+            total_loss_nats += doc_loss_nats
+            total_raw_bytes += doc.raw_bytes
             bpb = compute_bpb(doc_loss_nats, doc.raw_bytes)
             record = {
                 "doc_id": doc.doc_id,
@@ -257,6 +255,9 @@ def run(cfg: Exp22RunConfig, *, jsonl_paths: list[str], sp_model_path: str) -> N
             {
                 "condition": cfg.condition,
                 "evidence_label": cfg.evidence_label,
+                "aggregate_bpb": compute_bpb(total_loss_nats, total_raw_bytes),
+                "aggregate_loss_nats": total_loss_nats,
+                "aggregate_raw_bytes": total_raw_bytes,
                 "horizon_shifts": list(temporal_cfg.horizon_shifts),
                 "temporal_head_count": (
                     len(temporal_cfg.horizon_shifts)
@@ -281,6 +282,9 @@ def main() -> None:
     jsonl_paths = raw.pop("jsonl_paths")
     sp_model_path = raw.pop("sp_model_path")
     cfg_fields = {field.name for field in fields(Exp22RunConfig)}
+    unknown_keys = sorted(set(raw) - cfg_fields)
+    if unknown_keys:
+        raise ValueError(f"unknown Exp 22 config key(s): {', '.join(unknown_keys)}")
     cfg = Exp22RunConfig(**{key: value for key, value in raw.items() if key in cfg_fields})
     run(cfg, jsonl_paths=jsonl_paths, sp_model_path=sp_model_path)
 

@@ -52,11 +52,13 @@ def test_single_zero_shift_matches_direct_model():
 
     with torch.no_grad():
         out = model(chunk)
+        direct_log_probs = F.log_softmax(out["logits"], dim=-1)
         direct_loss = F.cross_entropy(
             out["logits"][:, :-1].reshape(-1, 64),
             chunk[:, 1:].reshape(-1),
             reduction="sum",
         )
+    assert torch.equal(result.mixed_log_probs, direct_log_probs)
     assert torch.isclose(torch.tensor(result.loss_nats), direct_loss)
     assert result.tokens_scored == chunk.size(1) - 1
     assert set(result.final_states_by_shift) == {0.0}
@@ -89,16 +91,61 @@ def test_temporal_heads_keep_independent_states():
         assert states[0.0][layer_idx].data_ptr() != states[0.5][layer_idx].data_ptr()
 
 
-def test_primary_gate_ignores_stale_head_disagreement_after_base_only_chunk():
+def test_temporal_heads_state_values_diverge_across_chunks():
+    torch.manual_seed(0)
+    model = ChaosStudentLM(
+        vocab_size=64,
+        dim=16,
+        num_layers=2,
+        block_type="ssm",
+        a_mode="diag",
+    )
+    chunk_a = torch.randint(0, 64, (1, 12))
+    chunk_b = torch.randint(0, 64, (1, 12))
+    cfg = TemporalHeadConfig(horizon_shifts=(-0.5, 0.0, 0.5))
+
+    first = score_temporal_heads_chunk(
+        model,
+        chunk_a,
+        states_by_shift={shift: None for shift in cfg.horizon_shifts},
+        cfg=cfg,
+    )
+    second = score_temporal_heads_chunk(
+        model,
+        chunk_b,
+        states_by_shift=first.final_states_by_shift,
+        cfg=cfg,
+    )
+
+    for layer_idx in range(2):
+        assert not torch.allclose(
+            second.final_states_by_shift[-0.5][layer_idx],
+            second.final_states_by_shift[0.5][layer_idx],
+        )
+
+
+def test_primary_gate_decays_stale_head_disagreement_after_base_only_chunk():
     gate = PreviousChunkPriorityGate(
-        threshold=1.0,
-        entropy_weight=1.0,
+        threshold=10.0,
+        entropy_weight=0.0,
         loss_spike_weight=0.0,
         state_delta_weight=0.0,
+        use_disagreement_ema=True,
+        disagreement_weight=1.0,
+        disagreement_decay=0.5,
     )
 
     gate.update_after_chunk(
-        entropy=0.5,
+        entropy=0.0,
+        loss_spike=0.0,
+        state_delta_norm=0.0,
+        head_disagreement=40.0,
+        temporal_heads_ran=True,
+    )
+    assert gate.should_run(extra_cost_seconds=0.1, slack_remaining_seconds=1.0)
+
+    gate.update_after_chunk(
+        entropy=0.0,
         loss_spike=0.0,
         state_delta_norm=0.0,
         head_disagreement=999.0,
