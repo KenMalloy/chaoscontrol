@@ -26,6 +26,12 @@ experiments/*/profile_traces/
 # Paper results registry — local-only run records, not versioned
 paper_results/registry.jsonl
 
+# External baseline data (tokenizers + challenge shards) — local-only, not versioned
+baselines/parameter_golf/tokenizers/
+baselines/parameter_golf/datasets/
+baselines/parameter_golf/docs_selected*
+baselines/parameter_golf/manifest.json
+
 # OS / editor
 .DS_Store
 package-lock.json
