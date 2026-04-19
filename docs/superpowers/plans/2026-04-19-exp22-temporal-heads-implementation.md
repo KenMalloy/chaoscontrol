@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Build the minimum runnable Exp22 temporal-head eval path: parameter-free horizon heads, legality-safe gating, same-horizon control helpers, and a script that emits metrics/summary JSON.
+**Goal:** Build the minimum runnable Exp22 temporal-head eval path: parameter-free horizon heads, legality-safe gating helpers, same-horizon control helpers, and a script that emits metrics/summary JSON.
 
 **Architecture:** Add a focused `temporal_heads.py` module under `src/chaoscontrol/eval_stream/`. It owns temporal-head scoring, uniform log-prob mixing, previous-chunk gating, and same-horizon virtual-depth config helpers. Add `scripts/run_exp22_temporal_heads.py` as a thin runner that reuses the Exp20 checkpoint/stream/budget contracts.
 
@@ -14,7 +14,7 @@
 
 - Create `src/chaoscontrol/eval_stream/temporal_heads.py`: dataclasses, log-prob mixture, temporal chunk scoring, previous-chunk gate, same-horizon control config helper.
 - Create `tests/test_eval_stream_temporal_heads.py`: unit tests for mixture math, single-head equivalence, independent states, gating semantics, same-horizon control helper.
-- Create `scripts/run_exp22_temporal_heads.py`: CLI runner for score-only, temporal heads, gated temporal heads, and same-horizon virtual-depth conditions.
+- Create `scripts/run_exp22_temporal_heads.py`: CLI runner for score-only, single-horizon pilot, temporal heads, and same-horizon virtual-depth conditions. `gated_temporal_heads` must fail fast until the pre-registered gate is wired into the runner.
 - Create `tests/test_run_exp22_temporal_heads.py`: subprocess smoke test on a tiny SentencePiece stream and tiny checkpoint.
 - Modify `src/chaoscontrol/eval_stream/__init__.py` only if imports are already exported there; otherwise leave it untouched.
 
@@ -24,7 +24,7 @@
 - Create: `src/chaoscontrol/eval_stream/temporal_heads.py`
 - Test: `tests/test_eval_stream_temporal_heads.py`
 
-- [ ] **Step 1: Write failing tests for uniform log-prob mixing and single-head identity**
+- [x] **Step 1: Write failing tests for uniform log-prob mixing and single-head identity**
 
 Add tests:
 
@@ -55,7 +55,7 @@ pytest tests/test_eval_stream_temporal_heads.py::test_uniform_logprob_mixture_on
 
 Expected: import failure because `temporal_heads.py` does not exist.
 
-- [ ] **Step 2: Implement `uniform_logprob_mixture`**
+- [x] **Step 2: Implement `uniform_logprob_mixture`**
 
 Create:
 
@@ -80,7 +80,7 @@ def uniform_logprob_mixture(log_probs: list[torch.Tensor]) -> torch.Tensor:
 
 Run the same tests. Expected: both pass.
 
-- [ ] **Step 3: Write failing tests for temporal-head scoring identity and independent states**
+- [x] **Step 3: Write failing tests for temporal-head scoring identity and independent states**
 
 Add tests that instantiate a tiny `ChaosStudentLM`, score a chunk through `score_temporal_heads_chunk` with `horizon_shifts=(0.0,)`, and compare summed CE to direct model scoring. Add a second test that uses `horizon_shifts=(-0.5, 0.0, 0.5)` and asserts every head has its own returned state list object and tensors do not share storage.
 
@@ -92,7 +92,7 @@ pytest tests/test_eval_stream_temporal_heads.py::test_single_zero_shift_matches_
 
 Expected: import failure for `TemporalHeadConfig` / `score_temporal_heads_chunk`.
 
-- [ ] **Step 4: Implement temporal-head scoring**
+- [x] **Step 4: Implement temporal-head scoring**
 
 Add:
 
@@ -131,7 +131,7 @@ Expected: current tests pass.
 - Modify: `src/chaoscontrol/eval_stream/temporal_heads.py`
 - Modify: `tests/test_eval_stream_temporal_heads.py`
 
-- [ ] **Step 1: Write failing tests for primary gate not using head disagreement**
+- [x] **Step 1: Write failing tests for primary gate not using head disagreement**
 
 Add tests for `PreviousChunkPriorityGate`:
 
@@ -150,13 +150,13 @@ pytest tests/test_eval_stream_temporal_heads.py::test_primary_gate_ignores_stale
 
 Expected: import failure.
 
-- [ ] **Step 2: Implement `PreviousChunkPriorityGate`**
+- [x] **Step 2: Implement `PreviousChunkPriorityGate`**
 
 Implement a dataclass with weights for entropy, loss spike, and state delta. Store only previous scalar features. Ignore `head_disagreement` unless `use_disagreement_ema=True`, which defaults to `False`.
 
 Run gate tests. Expected: pass.
 
-- [ ] **Step 3: Write failing tests for same-horizon config helper**
+- [x] **Step 3: Write failing tests for same-horizon config helper**
 
 Add test:
 
@@ -170,7 +170,7 @@ def test_same_horizon_virtual_depth_config_uses_all_layers_when_no_group():
 
 Run expected import failure.
 
-- [ ] **Step 4: Implement `make_same_horizon_virtual_depth_config`**
+- [x] **Step 4: Implement `make_same_horizon_virtual_depth_config`**
 
 Copy the config dict, preserve an existing non-empty `depth_recurrence_shared_layers`, otherwise set all physical layer indices. Set `depth_recurrence_count`.
 
@@ -188,7 +188,7 @@ Expected: pass.
 - Create: `scripts/run_exp22_temporal_heads.py`
 - Test: `tests/test_run_exp22_temporal_heads.py`
 
-- [ ] **Step 1: Write failing subprocess smoke test**
+- [x] **Step 1: Write failing subprocess smoke test**
 
 Create a tiny SentencePiece model, JSONL stream, tiny checkpoint, and config:
 
@@ -209,13 +209,14 @@ pytest tests/test_run_exp22_temporal_heads.py::test_exp22_runner_writes_metrics_
 
 Expected: script missing.
 
-- [ ] **Step 2: Implement script bootstrap, config dataclass, model load, and stream loop**
+- [x] **Step 2: Implement script bootstrap, config dataclass, model load, and stream loop**
 
 Mirror `scripts/run_exp20_eval.py` bootstrap. Support conditions:
 
 - `score_only`
+- `single_horizon`
 - `temporal_heads`
-- `gated_temporal_heads`
+- `gated_temporal_heads` as a fail-fast guard until routing is implemented
 - `same_horizon_virtual_depth`
 
 For `temporal_heads`, initialize one state bundle per horizon shift at each doc boundary, score chunks via `score_temporal_heads_chunk`, and charge each chunk's elapsed time to `BudgetTracker.add_score_time`.
@@ -226,7 +227,7 @@ Write per-doc JSONL records with `doc_id`, `bpb`, `tokens`, `wall_ms`, and condi
 
 Run smoke test. Expected: pass.
 
-- [ ] **Step 3: Run focused verification**
+- [x] **Step 3: Run focused verification**
 
 Run:
 
@@ -240,19 +241,21 @@ Expected: all pass.
 
 **Files:**
 - Create: `experiments/22_temporal_heads/README.md`
-- Create: `experiments/22_temporal_heads/configs/phase0_horizon_response_pilot.json`
+- Create: `experiments/22_temporal_heads/configs/phase0_single_horizon_log_a_m050.json`
+- Create: `experiments/22_temporal_heads/configs/phaseA_score_only.json`
 - Create: `experiments/22_temporal_heads/configs/phaseA_temporal_heads_3_uniform.json`
+- Create: `experiments/22_temporal_heads/configs/phaseA_same_horizon_virtual_depth.json`
 
-- [ ] **Step 1: Add README and config templates**
+- [x] **Step 1: Add README and config templates**
 
 README must state that templates require real checkpoint/data paths. Configs should include intentionally invalid sentinel strings, such as `"/path/to/final_ckpt.pt"`, and the README must say they are templates.
 
-- [ ] **Step 2: Verify docs/config files are valid JSON**
+- [x] **Step 2: Verify docs/config files are valid JSON**
 
 Run:
 
 ```bash
-python3 -m json.tool experiments/22_temporal_heads/configs/phase0_horizon_response_pilot.json >/tmp/phase0.json
+python3 -m json.tool experiments/22_temporal_heads/configs/phase0_single_horizon_log_a_m050.json >/tmp/phase0.json
 python3 -m json.tool experiments/22_temporal_heads/configs/phaseA_temporal_heads_3_uniform.json >/tmp/phaseA.json
 ```
 
@@ -264,7 +267,7 @@ Run:
 
 ```bash
 pytest tests/test_eval_stream_temporal_heads.py tests/test_run_exp22_temporal_heads.py tests/test_eval_stream_delta_mod.py tests/test_run_exp20_eval.py -q
-python3 -m json.tool experiments/22_temporal_heads/configs/phase0_horizon_response_pilot.json >/tmp/phase0.json
+python3 -m json.tool experiments/22_temporal_heads/configs/phase0_single_horizon_log_a_m050.json >/tmp/phase0.json
 python3 -m json.tool experiments/22_temporal_heads/configs/phaseA_temporal_heads_3_uniform.json >/tmp/phaseA.json
 git diff --check
 ```
