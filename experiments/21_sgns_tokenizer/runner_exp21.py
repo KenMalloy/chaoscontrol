@@ -357,6 +357,14 @@ def run_ddp(
                 f"[rank 0] promoted {n_promoted} nn.Linear -> te.Linear for fp8",
                 flush=True,
             )
+    elif precision == "fp8_fused":
+        from chaoscontrol.precision import maybe_promote_linears_to_fused_fp8
+        n_promoted = maybe_promote_linears_to_fused_fp8(model, enabled=True)
+        if is_rank0:
+            print(
+                f"[rank 0] promoted {n_promoted} nn.Linear -> FusedFP8Linear for fp8_fused",
+                flush=True,
+            )
     model_params = sum(p.numel() for p in model.parameters())
 
     if is_rank0:
