@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 import sentencepiece as spm
 import torch
+import torch.nn.functional as F
 
 from chaoscontrol.eval_stream.val_cache import CachedDoc, load_val_cache, write_val_cache
 
@@ -252,6 +253,7 @@ def test_chunk_boundary_targets_match_whole_doc_score(
     assert summary["record_order_safe_reason"] == "reset_score_only_commutative_ce_reduction"
     assert summary["score_reduction_order_invariant"] is True
     assert summary["device_tokens_staged"] is True
+    assert summary["device_token_dtype"] == "torch.int32"
     assert summary["torch_compile_mode"] == "none"
     assert summary["score_warmup_steps"] == 0
     assert summary["score_graph_mode"] == "none"
@@ -291,6 +293,171 @@ def test_chunk_boundary_targets_match_whole_doc_score(
         assert source_rec["tokens"] == whole_rec["tokens"]
         assert source_rec["bpb"] == pytest.approx(whole_rec["bpb"], rel=0.0, abs=1e-6)
     assert json.loads(source_summary.read_text())["doc_ordering"] == "source_order"
+
+
+def test_batched_boundary_targets_match_direct_chunked_model_score(
+    tiny_fixture: dict[str, Path],
+) -> None:
+    cache = load_val_cache(tiny_fixture["cache_dir"])
+    model, _cfg = fast_score._build_model(tiny_fixture["ckpt"])
+    model.eval()
+    device = torch.device("cpu")
+    chunk_size = 8
+    docs = list(cache.iter_docs())
+    work = prepare_doc_work(docs, doc_packing="source_order", chunk_size=chunk_size)
+    device_tokens = torch.tensor(cache.tokens, dtype=torch.int32, device=device)
+
+    def direct_doc_score(doc: CachedDoc) -> tuple[float, int]:
+        prev_states = None
+        ce_nats = 0.0
+        tokens_scored = 0
+        doc_tokens = cache.tokens_for_doc(doc)
+        with torch.inference_mode():
+            for start, end in fast_score._token_chunk_ranges(int(doc.token_len), chunk_size):
+                if end - start < 2:
+                    continue
+                chunk = torch.tensor(doc_tokens[start:end], dtype=torch.long, device=device).unsqueeze(0)
+                kwargs = {"initial_states": prev_states} if prev_states is not None else {}
+                out = model(chunk, **kwargs)
+                logits = fast_score._model_logits(out)
+                loss = F.cross_entropy(
+                    logits[:, :-1].reshape(-1, logits.size(-1)),
+                    chunk[:, 1:].reshape(-1),
+                    reduction="sum",
+                )
+                tokens_scored += int(chunk.size(1) - 1)
+                if end < int(doc.token_len):
+                    target = torch.tensor([int(doc_tokens[end])], dtype=torch.long, device=device)
+                    loss = loss + F.cross_entropy(logits[:, -1, :], target, reduction="sum")
+                    tokens_scored += 1
+                ce_nats += float(loss.item())
+                prev_states = fast_score._model_final_states(out)
+        return ce_nats, tokens_scored
+
+    with torch.inference_mode():
+        scores = fast_score._score_docs_reset_batch(
+            model=model,
+            work_items=work,
+            device_tokens=device_tokens,
+            chunk_size=chunk_size,
+            device=device,
+            score_boundary_targets=True,
+        )
+
+    scores_by_output = sorted(scores, key=lambda score: score.output_index)
+    for score, doc in zip(scores_by_output, docs):
+        direct_ce, direct_tokens = direct_doc_score(doc)
+        assert score.doc.doc_id == doc.doc_id
+        assert score.tokens_scored == direct_tokens == max(int(doc.token_len) - 1, 0)
+        assert score.ce_nats == pytest.approx(direct_ce, rel=0.0, abs=1e-4)
+
+
+def test_fake_graph_path_matches_eager_and_replays_zero_initial_chunks(
+    tiny_fixture: dict[str, Path],
+) -> None:
+    cache = load_val_cache(tiny_fixture["cache_dir"])
+    model, _cfg = fast_score._build_model(tiny_fixture["ckpt"])
+    model.eval()
+    device = torch.device("cpu")
+    chunk_size = 8
+    docs = list(cache.iter_docs())
+    work = prepare_doc_work(docs, doc_packing="source_order", chunk_size=chunk_size)
+    device_tokens = torch.tensor(cache.tokens, dtype=torch.int32, device=device)
+
+    class FakeGraphRunner:
+        batch_size = len(work)
+        seq_len = chunk_size
+
+        def __init__(self) -> None:
+            self.zero_replay_count = 0
+            self.carried_replay_count = 0
+
+        def _score(
+            self,
+            *,
+            chunk: torch.Tensor,
+            initial_states: list[torch.Tensor] | None,
+            boundary_targets: torch.Tensor,
+            boundary_mask: torch.Tensor,
+        ) -> tuple[torch.Tensor, list[torch.Tensor]]:
+            kwargs = {"initial_states": initial_states} if initial_states is not None else {}
+            out = model(chunk, **kwargs)
+            logits = fast_score._model_logits(out)
+            losses = F.cross_entropy(
+                logits[:, :-1].reshape(-1, logits.size(-1)),
+                chunk[:, 1:].reshape(-1).to(torch.long),
+                reduction="none",
+            ).reshape(chunk.size(0), chunk.size(1) - 1).sum(dim=1)
+            boundary_losses = F.cross_entropy(
+                logits[:, -1, :],
+                boundary_targets.to(torch.long),
+                reduction="none",
+            )
+            losses = losses + boundary_losses * boundary_mask.to(boundary_losses.dtype)
+            return losses, fast_score._model_final_states(out)
+
+        def replay_zero_initial(
+            self,
+            *,
+            chunk: torch.Tensor,
+            boundary_targets: torch.Tensor,
+            boundary_mask: torch.Tensor,
+        ) -> tuple[torch.Tensor, list[torch.Tensor]]:
+            self.zero_replay_count += 1
+            return self._score(
+                chunk=chunk,
+                initial_states=None,
+                boundary_targets=boundary_targets,
+                boundary_mask=boundary_mask,
+            )
+
+        def replay(
+            self,
+            *,
+            chunk: torch.Tensor,
+            initial_states: list[torch.Tensor],
+            boundary_targets: torch.Tensor,
+            boundary_mask: torch.Tensor,
+        ) -> tuple[torch.Tensor, list[torch.Tensor]]:
+            self.carried_replay_count += 1
+            return self._score(
+                chunk=chunk,
+                initial_states=initial_states,
+                boundary_targets=boundary_targets,
+                boundary_mask=boundary_mask,
+            )
+
+    with torch.inference_mode():
+        eager_scores = fast_score._score_docs_reset_batch(
+            model=model,
+            work_items=work,
+            device_tokens=device_tokens,
+            chunk_size=chunk_size,
+            device=device,
+            score_boundary_targets=True,
+        )
+        fake_graph = FakeGraphRunner()
+        graph_stats = fast_score._ScoreGraphStats()
+        graph_scores = fast_score._score_docs_reset_batch(
+            model=model,
+            work_items=work,
+            device_tokens=device_tokens,
+            chunk_size=chunk_size,
+            device=device,
+            score_boundary_targets=True,
+            score_graph_runner=fake_graph,
+            graph_stats=graph_stats,
+        )
+
+    eager_by_output = sorted(eager_scores, key=lambda score: score.output_index)
+    graph_by_output = sorted(graph_scores, key=lambda score: score.output_index)
+    assert fake_graph.zero_replay_count >= 1
+    assert fake_graph.carried_replay_count >= 1
+    assert graph_stats.replay_count == fake_graph.zero_replay_count + fake_graph.carried_replay_count
+    for eager_score, graph_score in zip(eager_by_output, graph_by_output):
+        assert graph_score.doc.doc_id == eager_score.doc.doc_id
+        assert graph_score.tokens_scored == eager_score.tokens_scored
+        assert graph_score.ce_nats == pytest.approx(eager_score.ce_nats, rel=0.0, abs=0.0)
 
 
 def test_record_order_safe_reason_documents_packing_contract() -> None:

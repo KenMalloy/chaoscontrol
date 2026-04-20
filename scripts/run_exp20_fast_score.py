@@ -426,8 +426,11 @@ class _CudaGraphScoreRunner:
         self.static_boundary_mask.fill_(1.0)
         self.static_prev_states = self._make_static_prev_states()
         self.graph = torch.cuda.CUDAGraph()
+        self.zero_graph = torch.cuda.CUDAGraph()
         self.static_losses: torch.Tensor | None = None
         self.static_final_states: list[torch.Tensor] | None = None
+        self.static_zero_losses: torch.Tensor | None = None
+        self.static_zero_final_states: list[torch.Tensor] | None = None
         self._capture()
 
     def _make_static_prev_states(self) -> list[torch.Tensor]:
@@ -438,12 +441,19 @@ class _CudaGraphScoreRunner:
                 raise RuntimeError("CUDA graph scoring requires model final_states")
             prev_states = [torch.empty_like(state) for state in final_states]
             for state in prev_states:
-                state.fill_(1e-3)
+                # Capture only needs stable input addresses; replay overwrites
+                # these tensors before use. Zero-fill avoids undefined warmup data.
+                state.zero_()
             del out, final_states
         return prev_states
 
-    def _forward_static(self) -> tuple[torch.Tensor, list[torch.Tensor]]:
-        out = self.model(self.static_chunk, initial_states=self.static_prev_states)
+    def _forward_static(
+        self,
+        *,
+        initial_states: list[torch.Tensor] | None,
+    ) -> tuple[torch.Tensor, list[torch.Tensor]]:
+        kwargs = {"initial_states": initial_states} if initial_states is not None else {}
+        out = self.model(self.static_chunk, **kwargs)
         logits = _model_logits(out)
         losses = F.cross_entropy(
             logits[:, :-1].reshape(-1, logits.size(-1)),
@@ -467,11 +477,37 @@ class _CudaGraphScoreRunner:
         warmup_stream.wait_stream(torch.cuda.current_stream(self.device))
         with torch.cuda.stream(warmup_stream), torch.inference_mode():
             for _ in range(3):
-                losses, final_states = self._forward_static()
+                losses, final_states = self._forward_static(initial_states=None)
+                del losses, final_states
+                losses, final_states = self._forward_static(initial_states=self.static_prev_states)
                 del losses, final_states
         torch.cuda.current_stream(self.device).wait_stream(warmup_stream)
+        with torch.cuda.graph(self.zero_graph), torch.inference_mode():
+            self.static_zero_losses, self.static_zero_final_states = self._forward_static(
+                initial_states=None,
+            )
         with torch.cuda.graph(self.graph), torch.inference_mode():
-            self.static_losses, self.static_final_states = self._forward_static()
+            self.static_losses, self.static_final_states = self._forward_static(
+                initial_states=self.static_prev_states,
+            )
+
+    def replay_zero_initial(
+        self,
+        *,
+        chunk: torch.Tensor,
+        boundary_targets: torch.Tensor,
+        boundary_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, list[torch.Tensor]]:
+        if tuple(chunk.shape) != tuple(self.static_chunk.shape):
+            raise ValueError(f"graph chunk shape {tuple(chunk.shape)} != {tuple(self.static_chunk.shape)}")
+        self.static_chunk.copy_(chunk, non_blocking=True)
+        if self.score_boundary_targets:
+            self.static_boundary_targets.copy_(boundary_targets, non_blocking=True)
+            self.static_boundary_mask.copy_(boundary_mask, non_blocking=True)
+        self.zero_graph.replay()
+        if self.static_zero_losses is None or self.static_zero_final_states is None:
+            raise RuntimeError("CUDA zero-state graph replay used before capture")
+        return self.static_zero_losses, self.static_zero_final_states
 
     def replay(
         self,
@@ -534,7 +570,7 @@ def _score_doc(
         logits = _model_logits(out)
         loss = F.cross_entropy(
             logits[:, :-1].reshape(-1, logits.size(-1)),
-            chunk[:, 1:].reshape(-1),
+            chunk[:, 1:].reshape(-1).to(torch.long),
             reduction="sum",
         )
         if score_boundary_targets and end < int(doc.token_len):
@@ -549,7 +585,7 @@ def _score_doc(
                 )
             loss = loss + F.cross_entropy(
                 logits[:, -1, :],
-                next_token,
+                next_token.to(torch.long),
                 reduction="sum",
             )
             tokens_scored += 1
@@ -609,12 +645,12 @@ def _score_docs_reset_batch(
     row_index_cache: dict[tuple[int, ...], torch.Tensor] = {}
     max_token_len = max(token_lens)
 
-    def offsets_for(seq_len: int) -> torch.Tensor:
-        offsets = arange_cache.get(seq_len)
-        if offsets is None:
-            offsets = torch.arange(seq_len, dtype=torch.long, device=device)
-            arange_cache[seq_len] = offsets
-        return offsets
+    def arange_for(length: int) -> torch.Tensor:
+        values = arange_cache.get(length)
+        if values is None:
+            values = torch.arange(length, dtype=torch.long, device=device)
+            arange_cache[length] = values
+        return values
 
     def row_index_for(doc_indices: list[int]) -> torch.Tensor:
         key = tuple(doc_indices)
@@ -628,6 +664,8 @@ def _score_docs_reset_batch(
         nonlocal states
         if not doc_indices:
             return
+        # LOAD-BEARING: work_items is sorted by (-token_len, output_index), so
+        # full-width active docs are always the leading rows for a chunk step.
         contiguous_prefix = doc_indices == list(range(len(doc_indices)))
         row_index: torch.Tensor | None = None
         if contiguous_prefix:
@@ -658,7 +696,7 @@ def _score_docs_reset_batch(
                     boundary_token_count[row_idx] = 1
             if score_graph_runner is not None and len(doc_indices) == score_graph_runner.batch_size:
                 if row_index is None:
-                    doc_index_tensor = torch.arange(len(doc_indices), dtype=torch.long, device=device)
+                    doc_index_tensor = arange_for(len(doc_indices))
                 else:
                     doc_index_tensor = row_index
                 has_boundary = token_lens_tensor.index_select(0, doc_index_tensor) > next_token_pos
@@ -670,25 +708,31 @@ def _score_docs_reset_batch(
                 graph_boundary_targets = device_tokens[safe_positions]
                 graph_boundary_mask = has_boundary.to(torch.float32)
 
-        chunk = device_tokens[starts.unsqueeze(1) + offsets_for(seq_len).unsqueeze(0)]
+        chunk = device_tokens[starts.unsqueeze(1) + arange_for(seq_len).unsqueeze(0)]
         can_replay_graph = (
             score_graph_runner is not None
             and contiguous_prefix
             and len(doc_indices) == score_graph_runner.batch_size
             and seq_len == score_graph_runner.seq_len
-            and initial_states is not None
         )
         if can_replay_graph:
             if graph_boundary_targets is None:
                 graph_boundary_targets = torch.zeros(len(doc_indices), dtype=torch.long, device=device)
                 graph_boundary_mask = torch.zeros(len(doc_indices), dtype=torch.float32, device=device)
             assert graph_boundary_mask is not None
-            losses, final_states = score_graph_runner.replay(
-                chunk=chunk,
-                initial_states=initial_states,
-                boundary_targets=graph_boundary_targets,
-                boundary_mask=graph_boundary_mask,
-            )
+            if initial_states is None:
+                losses, final_states = score_graph_runner.replay_zero_initial(
+                    chunk=chunk,
+                    boundary_targets=graph_boundary_targets,
+                    boundary_mask=graph_boundary_mask,
+                )
+            else:
+                losses, final_states = score_graph_runner.replay(
+                    chunk=chunk,
+                    initial_states=initial_states,
+                    boundary_targets=graph_boundary_targets,
+                    boundary_mask=graph_boundary_mask,
+                )
             if graph_stats is not None:
                 graph_stats.replay_count += 1
         else:
@@ -699,13 +743,13 @@ def _score_docs_reset_batch(
             logits = _model_logits(out)
             losses = F.cross_entropy(
                 logits[:, :-1].reshape(-1, logits.size(-1)),
-                chunk[:, 1:].reshape(-1),
+                chunk[:, 1:].reshape(-1).to(torch.long),
                 reduction="none",
             ).reshape(len(doc_indices), seq_len - 1).sum(dim=1)
             if score_boundary_targets and boundary_doc_indices:
                 boundary_row_index = torch.tensor(boundary_rows, dtype=torch.long, device=device)
                 boundary_docs = row_index_for(boundary_doc_indices)
-                targets = device_tokens[token_starts.index_select(0, boundary_docs) + next_token_pos]
+                targets = device_tokens[token_starts.index_select(0, boundary_docs) + next_token_pos].to(torch.long)
                 boundary_losses = F.cross_entropy(
                     logits.index_select(0, boundary_row_index)[:, -1, :],
                     targets,
@@ -856,7 +900,7 @@ def run(args: argparse.Namespace) -> dict:
         raise RuntimeError(
             f"doc_packing={doc_packing!r} is not order-safe for persistence_mode={args.persistence_mode!r}"
         )
-    device_tokens = torch.tensor(cache.tokens, dtype=torch.long, device=device)
+    device_tokens = torch.tensor(cache.tokens, dtype=torch.int32, device=device)
     doc_records: dict[int, str] = {}
     requested_doc_batch_size = max(1, int(args.doc_batch_size))
     max_forward_tokens = resolve_max_forward_tokens(
