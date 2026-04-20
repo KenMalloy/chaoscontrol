@@ -119,6 +119,16 @@ runs are not prefix samples and are labeled with their `doc_packing` value. Use
 `--doc-packing source_order` or the legacy `--no-sort-docs-by-length` only when a
 prefix-shaped exploratory run matters more than throughput.
 
+Ordering contract: packed scheduling is record-safe only for this runner's
+current semantics: frozen score-only eval, `persistence_mode=reset`, and final
+BPB computed from the commutative sum of per-doc CE and raw bytes. In that mode,
+document schedule cannot optimize over the validation sequence because no state,
+weights, or adaptation crosses doc boundaries. The summary records
+`record_order_safe: true` and
+`record_order_safe_reason: reset_score_only_commutative_ce_reduction`. If carry
+state, cross-doc memory, or eval-time adaptation is enabled later, use
+`source_order` unless the organizers explicitly bless schedule-only reordering.
+
 Under `torchrun`, non-source packing forms nearby-key batches, sorts those
 batches by padded token work, and assigns them to ranks with longest-processing-
 time first. This avoids giving one rank all the expensive batches. Rank files

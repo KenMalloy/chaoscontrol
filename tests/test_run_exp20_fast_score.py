@@ -31,6 +31,7 @@ expected_scored_tokens = fast_score.expected_scored_tokens
 prepare_doc_work = fast_score.prepare_doc_work
 prepare_rank_doc_work = fast_score.prepare_rank_doc_work
 padded_token_work = fast_score.padded_token_work
+record_order_safe_reason = fast_score.record_order_safe_reason
 resolve_doc_batch_size = fast_score.resolve_doc_batch_size
 resolve_max_forward_tokens = fast_score.resolve_max_forward_tokens
 resolve_distributed_context = fast_score.resolve_distributed_context
@@ -247,6 +248,9 @@ def test_chunk_boundary_targets_match_whole_doc_score(
     assert summary["score_boundary_targets"] is True
     assert summary["doc_ordering"] == "chunk_count_tail"
     assert summary["doc_packing"] == "chunk_count_tail"
+    assert summary["record_order_safe"] is True
+    assert summary["record_order_safe_reason"] == "reset_score_only_commutative_ce_reduction"
+    assert summary["score_reduction_order_invariant"] is True
     assert summary["device_tokens_staged"] is True
     assert summary["torch_compile_mode"] == "none"
     assert summary["score_warmup_steps"] == 0
@@ -287,6 +291,24 @@ def test_chunk_boundary_targets_match_whole_doc_score(
         assert source_rec["tokens"] == whole_rec["tokens"]
         assert source_rec["bpb"] == pytest.approx(whole_rec["bpb"], rel=0.0, abs=1e-6)
     assert json.loads(source_summary.read_text())["doc_ordering"] == "source_order"
+
+
+def test_record_order_safe_reason_documents_packing_contract() -> None:
+    assert record_order_safe_reason(
+        persistence_mode="reset",
+        score_only_mode=True,
+        doc_packing="chunk_count_tail",
+    ) == "reset_score_only_commutative_ce_reduction"
+    assert record_order_safe_reason(
+        persistence_mode="carry_state",
+        score_only_mode=True,
+        doc_packing="chunk_count_tail",
+    ) == "not_order_safe_for_stateful_or_adaptive_eval"
+    assert record_order_safe_reason(
+        persistence_mode="reset",
+        score_only_mode=False,
+        doc_packing="chunk_count_tail",
+    ) == "not_order_safe_for_stateful_or_adaptive_eval"
 
 
 def test_expected_scored_tokens_matches_boundary_modes() -> None:

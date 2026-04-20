@@ -239,6 +239,14 @@ def validate_doc_score_coverage(
         )
 
 
+def record_order_safe_reason(*, persistence_mode: str, score_only_mode: bool, doc_packing: str) -> str:
+    if doc_packing == "source_order":
+        return "source_order_preserved"
+    if persistence_mode == "reset" and score_only_mode:
+        return "reset_score_only_commutative_ce_reduction"
+    return "not_order_safe_for_stateful_or_adaptive_eval"
+
+
 def doc_range_for_rank(*, num_docs: int, rank: int, world_size: int) -> tuple[int, int]:
     if world_size <= 0:
         raise ValueError(f"world_size must be positive, got {world_size}")
@@ -839,6 +847,15 @@ def run(args: argparse.Namespace) -> dict:
         doc_packing=args.doc_packing,
         sort_docs_by_length=args.sort_docs_by_length,
     )
+    order_safe_reason = record_order_safe_reason(
+        persistence_mode=args.persistence_mode,
+        score_only_mode=True,
+        doc_packing=doc_packing,
+    )
+    if order_safe_reason == "not_order_safe_for_stateful_or_adaptive_eval":
+        raise RuntimeError(
+            f"doc_packing={doc_packing!r} is not order-safe for persistence_mode={args.persistence_mode!r}"
+        )
     device_tokens = torch.tensor(cache.tokens, dtype=torch.long, device=device)
     doc_records: dict[int, str] = {}
     requested_doc_batch_size = max(1, int(args.doc_batch_size))
@@ -1030,6 +1047,9 @@ def run(args: argparse.Namespace) -> dict:
         "score_boundary_targets": bool(args.score_boundary_targets),
         "doc_ordering": doc_packing,
         "doc_packing": doc_packing,
+        "record_order_safe": order_safe_reason != "not_order_safe_for_stateful_or_adaptive_eval",
+        "record_order_safe_reason": order_safe_reason,
+        "score_reduction_order_invariant": args.persistence_mode == "reset",
         "rank_assignment": (
             "contiguous_source_range"
             if doc_packing == "source_order"

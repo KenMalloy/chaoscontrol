@@ -100,6 +100,9 @@ Hot-loop shape policy:
 - Stage cache tokens onto the target device once before the scoring loop.
 - Pack docs by chunk count, tail bucket, and token length for dense full-width
   chunk groups, but preserve original doc order in the JSONL output.
+- Mark packed scoring as order-safe only under reset score-only semantics:
+  per-doc CE/raw-byte totals are reduced commutatively and no state, weights, or
+  adaptation crosses doc boundaries.
 - Under distributed scoring, form packed batches globally and assign them to
   ranks with longest-processing-time first by padded token work.
 - Treat `doc_batch_size` as an upper bound and cap effective microbatches with
