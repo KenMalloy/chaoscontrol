@@ -27,9 +27,12 @@ def _load_module():
 
 fast_score = _load_module()
 doc_range_for_rank = fast_score.doc_range_for_rank
+expected_scored_tokens = fast_score.expected_scored_tokens
 prepare_doc_work = fast_score.prepare_doc_work
 resolve_doc_batch_size = fast_score.resolve_doc_batch_size
+resolve_max_forward_tokens = fast_score.resolve_max_forward_tokens
 resolve_distributed_context = fast_score.resolve_distributed_context
+validate_doc_score_coverage = fast_score.validate_doc_score_coverage
 
 
 @pytest.fixture
@@ -243,6 +246,7 @@ def test_chunk_boundary_targets_match_whole_doc_score(
     assert summary["doc_ordering"] == "token_len_desc"
     assert summary["device_tokens_staged"] is True
     assert summary["torch_compile_mode"] == "none"
+    assert summary["score_warmup_steps"] == 0
 
     source_out = tmp_path / "source.jsonl"
     source_summary = tmp_path / "source_summary.json"
@@ -279,6 +283,34 @@ def test_chunk_boundary_targets_match_whole_doc_score(
     assert json.loads(source_summary.read_text())["doc_ordering"] == "source_order"
 
 
+def test_expected_scored_tokens_matches_boundary_modes() -> None:
+    assert expected_scored_tokens(token_len=17, chunk_size=-1, score_boundary_targets=True) == 16
+    assert expected_scored_tokens(token_len=17, chunk_size=8, score_boundary_targets=True) == 16
+    assert expected_scored_tokens(token_len=17, chunk_size=8, score_boundary_targets=False) == 14
+    assert expected_scored_tokens(token_len=1, chunk_size=8, score_boundary_targets=True) == 0
+
+
+def test_validate_doc_score_coverage_detects_skipped_chunks() -> None:
+    doc = CachedDoc(doc_id=7, token_start=100, token_len=17, raw_bytes=17)
+    score = fast_score._DocScore(
+        doc=doc,
+        output_index=0,
+        ce_nats=1.0,
+        tokens_scored=15,
+        chunk_count=2,
+        loss_before=0.5,
+        wall_ms=1.0,
+        state_norm=0.0,
+    )
+
+    with pytest.raises(RuntimeError, match="token coverage mismatch"):
+        validate_doc_score_coverage(
+            score,
+            chunk_size=8,
+            score_boundary_targets=True,
+        )
+
+
 def test_prepare_doc_work_sorts_by_length_and_remembers_output_order() -> None:
     docs = [
         CachedDoc(doc_id=0, token_start=0, token_len=4, raw_bytes=4),
@@ -299,18 +331,54 @@ def test_resolve_doc_batch_size_caps_by_token_budget() -> None:
     assert resolve_doc_batch_size(
         requested_doc_batch_size=4096,
         chunk_size=256,
-        max_batch_tokens=524_288,
+        max_forward_tokens=524_288,
     ) == 2048
     assert resolve_doc_batch_size(
         requested_doc_batch_size=512,
         chunk_size=256,
-        max_batch_tokens=524_288,
+        max_forward_tokens=524_288,
     ) == 512
     assert resolve_doc_batch_size(
         requested_doc_batch_size=4096,
         chunk_size=-1,
-        max_batch_tokens=524_288,
+        max_forward_tokens=524_288,
     ) == 4096
+
+
+def test_resolve_max_forward_tokens_auto_uses_probe_for_cuda() -> None:
+    calls = []
+
+    def fake_probe(limit: int) -> int:
+        calls.append(limit)
+        return 786_432
+
+    assert resolve_max_forward_tokens(
+        max_forward_tokens="auto",
+        requested_doc_batch_size=4096,
+        chunk_size=256,
+        device=torch.device("cuda"),
+        probe_fn=fake_probe,
+    ) == 786_432
+    assert calls == [1_048_576]
+
+
+def test_resolve_max_forward_tokens_auto_uses_requested_shape_on_cpu() -> None:
+    assert resolve_max_forward_tokens(
+        max_forward_tokens="auto",
+        requested_doc_batch_size=8,
+        chunk_size=32,
+        device=torch.device("cpu"),
+    ) == 256
+
+
+def test_resolve_max_forward_tokens_accepts_explicit_integer() -> None:
+    assert resolve_max_forward_tokens(
+        max_forward_tokens="131072",
+        requested_doc_batch_size=4096,
+        chunk_size=256,
+        device=torch.device("cuda"),
+        probe_fn=lambda _limit: 1,
+    ) == 131_072
 
 
 def test_doc_range_for_rank_partitions_docs_exactly_once() -> None:

@@ -106,7 +106,7 @@ python scripts/run_exp20_fast_score.py \
   --summary-path experiments/20_ssm_native_ttt/results_floor/score_only_summary.json \
   --chunk-size 256 \
   --doc-batch-size 4096 \
-  --max-batch-tokens 524288 \
+  --max-forward-tokens auto \
   --budget-seconds 600 \
   --device cuda
 ```
@@ -121,21 +121,30 @@ It also stages the validation token cache as one device-resident int64 tensor
 before the timer loop. This costs a few hundred MB for the current 50k cache
 and avoids per-chunk host-to-device copies plus uint16-to-target dtype churn.
 
-`doc_batch_size` is an upper bound. The runner also applies
-`max_batch_tokens / chunk_size` so length-sorted batches do not put all longest
-documents into one OOM-prone full-width group. On H100, start with
-`--max-batch-tokens 524288` (`2048 x 256`) and tune from there.
+`doc_batch_size` is an upper bound. The runner resolves `--max-forward-tokens`
+before the measured scoring loop and caps effective microbatches with
+`max_forward_tokens / chunk_size` so length-sorted batches do not put all
+longest documents into one OOM-prone full-width group. `auto` probes the
+requested CUDA shape and backs off to a safe fixed shape if it OOMs; on non-CUDA
+devices it uses the requested shape. The deprecated `--max-batch-tokens`
+spelling is still accepted as an alias for old launch commands.
 
-Optional graphing probe:
+Optional warmup / graphing probe:
 
 ```bash
-python scripts/run_exp20_fast_score.py ... --torch-compile-mode reduce-overhead
+python scripts/run_exp20_fast_score.py ... \
+  --torch-compile-mode reduce-overhead \
+  --score-warmup-steps 20
 ```
 
-Keep `torch_compile_mode` from the summary with the result. A full-shape
-`reduce-overhead` probe on 1xH100 did not finish its first scoring batch after
-several minutes of compilation, so do not use compile mode for floor claims
-until a smaller fixed-shape wrapper or CUDA graph path is separately validated.
+Keep `torch_compile_mode`, `score_warmup_steps`, `score_warmup_seconds`,
+`pre_eval_setup_seconds`, and `elapsed_seconds` from the summary with the
+result. The scorer warmup uses synthetic token IDs and restores no validation
+state; it exists to prime fixed forward/loss shapes before measured scoring. A
+full-shape `reduce-overhead` probe without this explicit warmup did not finish
+its first scoring batch after several minutes of compilation, so do not use
+compile mode for floor claims until the warmed compile path or a CUDA graph path
+is separately validated.
 
 For legacy parity checks only:
 
@@ -143,11 +152,14 @@ For legacy parity checks only:
 python scripts/run_exp20_fast_score.py ... --no-score-boundary-targets
 ```
 
-On the 1xH100 pod sampled on 2026-04-20, `ssm_scan`, `chunk_size=256`, and
-`doc_batch_size=4096` scored 4,096 full-token-accounting docs in 115.35s
-(~35.5 docs/s). That projects to roughly 352s on 4xH100 and 176s on 8xH100
-before distributed overhead. Confirm this with an actual multi-GPU run before
-treating it as a record floor.
+On the 1xH100 pod sampled on 2026-04-20, uncapped `4096 x 256` OOMed. With
+`max_forward_tokens=524288`, the effective shape was `2048 x 256`. A sorted
+long-document sample scored 10.68M tokens in 158.3s (~67.5k tok/s); a fixed
+source-order sample scored 1.66M tokens in 79.8s (~20.8k tok/s). The difference
+is throughput, not score semantics: reset score-only BPB is order-invariant, and
+the tests compare chunked sorted/source-order runs against whole-doc scoring.
+Confirm with an actual multi-GPU full-validation run before treating any
+projection as a record floor.
 
 ## Exploratory Floor Pass
 

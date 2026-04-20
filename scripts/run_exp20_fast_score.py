@@ -14,6 +14,7 @@ import json
 import os
 import sys
 import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import NamedTuple
 
@@ -29,6 +30,9 @@ import torch.nn.functional as F
 from chaoscontrol.eval_stream.budget import BudgetTracker
 from chaoscontrol.eval_stream.val_cache import CachedDoc, ValCache, load_val_cache
 from chaoscontrol.evaluation import compute_bpb
+
+
+DEFAULT_MAX_FORWARD_TOKENS = 524_288
 
 
 class _DocWork(NamedTuple):
@@ -58,13 +62,72 @@ def resolve_doc_batch_size(
     *,
     requested_doc_batch_size: int,
     chunk_size: int,
-    max_batch_tokens: int,
+    max_forward_tokens: int,
 ) -> int:
     requested = max(1, int(requested_doc_batch_size))
-    if chunk_size < 0 or max_batch_tokens <= 0:
+    if chunk_size < 0 or max_forward_tokens <= 0:
         return requested
-    token_limited = max(1, int(max_batch_tokens) // max(1, int(chunk_size)))
+    token_limited = max(1, int(max_forward_tokens) // max(1, int(chunk_size)))
     return min(requested, token_limited)
+
+
+def resolve_max_forward_tokens(
+    *,
+    max_forward_tokens: str | int,
+    requested_doc_batch_size: int,
+    chunk_size: int,
+    device: torch.device,
+    probe_fn: Callable[[int], int] | None = None,
+) -> int:
+    if isinstance(max_forward_tokens, int) or str(max_forward_tokens).lower() != "auto":
+        value = int(max_forward_tokens)
+        if value <= 0:
+            raise ValueError(f"max_forward_tokens must be positive or 'auto', got {max_forward_tokens!r}")
+        return value
+
+    if chunk_size < 0:
+        return 0
+    requested_forward_tokens = max(1, int(requested_doc_batch_size)) * max(1, int(chunk_size))
+    if device.type != "cuda":
+        return requested_forward_tokens
+    if probe_fn is None:
+        return min(requested_forward_tokens, DEFAULT_MAX_FORWARD_TOKENS)
+    probed = int(probe_fn(requested_forward_tokens))
+    return max(1, min(requested_forward_tokens, probed))
+
+
+def expected_scored_tokens(
+    *,
+    token_len: int,
+    chunk_size: int,
+    score_boundary_targets: bool,
+) -> int:
+    token_len = int(token_len)
+    if token_len < 2:
+        return 0
+    if chunk_size < 0 or score_boundary_targets:
+        return token_len - 1
+    return sum(end - start - 1 for start, end in _token_chunk_ranges(token_len, chunk_size))
+
+
+def validate_doc_score_coverage(
+    score: _DocScore,
+    *,
+    chunk_size: int,
+    score_boundary_targets: bool,
+) -> None:
+    expected = expected_scored_tokens(
+        token_len=score.doc.token_len,
+        chunk_size=chunk_size,
+        score_boundary_targets=score_boundary_targets,
+    )
+    if int(score.tokens_scored) != expected:
+        raise RuntimeError(
+            "token coverage mismatch "
+            f"doc_id={score.doc.doc_id} expected={expected} actual={score.tokens_scored} "
+            f"token_len={score.doc.token_len} chunk_size={chunk_size} "
+            f"score_boundary_targets={score_boundary_targets}"
+        )
 
 
 def doc_range_for_rank(*, num_docs: int, rank: int, world_size: int) -> tuple[int, int]:
@@ -119,6 +182,93 @@ def _resolve_device(device_arg: str) -> torch.device:
     return device
 
 
+def _model_logits(out: object) -> torch.Tensor:
+    return out["logits"] if isinstance(out, dict) else out  # type: ignore[index,return-value]
+
+
+def _model_final_states(out: object) -> list[torch.Tensor] | None:
+    if isinstance(out, dict) and out.get("final_states"):
+        return list(out["final_states"])
+    return None
+
+
+def _probe_max_forward_tokens(
+    model: torch.nn.Module,
+    *,
+    requested_forward_tokens: int,
+    chunk_size: int,
+    device: torch.device,
+) -> int:
+    if device.type != "cuda" or chunk_size < 0:
+        return requested_forward_tokens
+    candidate_docs = max(1, int(requested_forward_tokens) // max(1, int(chunk_size)))
+    model_was_training = model.training
+    model.eval()
+    with torch.inference_mode():
+        while candidate_docs >= 1:
+            try:
+                torch.cuda.empty_cache()
+                chunk = torch.zeros(
+                    (candidate_docs, chunk_size),
+                    dtype=torch.long,
+                    device=device,
+                )
+                out = model(chunk)
+                logits = _model_logits(out)
+                loss = F.cross_entropy(
+                    logits[:, :-1].reshape(-1, logits.size(-1)),
+                    chunk[:, 1:].reshape(-1),
+                    reduction="sum",
+                )
+                del loss, logits, out, chunk
+                torch.cuda.synchronize(device)
+                torch.cuda.empty_cache()
+                if model_was_training:
+                    model.train()
+                return candidate_docs * chunk_size
+            except torch.cuda.OutOfMemoryError:
+                candidate_docs //= 2
+                torch.cuda.empty_cache()
+    if model_was_training:
+        model.train()
+    return max(1, min(DEFAULT_MAX_FORWARD_TOKENS, requested_forward_tokens))
+
+
+def _run_score_warmup(
+    model: torch.nn.Module,
+    *,
+    doc_batch_size: int,
+    chunk_size: int,
+    device: torch.device,
+    steps: int,
+) -> float:
+    if steps <= 0 or doc_batch_size <= 0 or chunk_size < 2:
+        return 0.0
+    warmup_t0 = time.monotonic()
+    model_was_training = model.training
+    model.eval()
+    prev_states: list[torch.Tensor] | None = None
+    with torch.inference_mode():
+        chunk = torch.zeros((doc_batch_size, chunk_size), dtype=torch.long, device=device)
+        for _ in range(int(steps)):
+            kwargs = {"initial_states": prev_states} if prev_states is not None else {}
+            out = model(chunk, **kwargs)
+            logits = _model_logits(out)
+            loss = F.cross_entropy(
+                logits[:, :-1].reshape(-1, logits.size(-1)),
+                chunk[:, 1:].reshape(-1),
+                reduction="sum",
+            )
+            prev_states = _model_final_states(out)
+            del loss, logits, out
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        del chunk, prev_states
+    if model_was_training:
+        model.train()
+    return time.monotonic() - warmup_t0
+
+
 def _rank_output_path(output_path: Path, rank: int, world_size: int) -> Path:
     if world_size <= 1:
         return output_path
@@ -153,7 +303,7 @@ def _score_doc(
             chunk = torch.tensor(chunk_np, dtype=torch.long, device=device).unsqueeze(0)
         kwargs = {"initial_states": prev_states} if prev_states else {}
         out = model(chunk, **kwargs)
-        logits = out["logits"] if isinstance(out, dict) else out
+        logits = _model_logits(out)
         loss = F.cross_entropy(
             logits[:, :-1].reshape(-1, logits.size(-1)),
             chunk[:, 1:].reshape(-1),
@@ -178,8 +328,9 @@ def _score_doc(
         doc_ce += loss.to(torch.float64)
         tokens_scored += int(chunk.size(1) - 1)
         chunk_count += 1
-        if isinstance(out, dict) and out.get("final_states"):
-            prev_states = list(out["final_states"])
+        final_states = _model_final_states(out)
+        if final_states:
+            prev_states = final_states
 
     wall_ms = (time.monotonic() - t0) * 1000.0
     state_norm = 0.0
@@ -265,7 +416,7 @@ def _score_docs_reset_batch(
         chunk = device_tokens[starts.unsqueeze(1) + offsets_for(seq_len).unsqueeze(0)]
         kwargs = {"initial_states": initial_states} if initial_states is not None else {}
         out = model(chunk, **kwargs)
-        logits = out["logits"] if isinstance(out, dict) else out
+        logits = _model_logits(out)
         losses = F.cross_entropy(
             logits[:, :-1].reshape(-1, logits.size(-1)),
             chunk[:, 1:].reshape(-1),
@@ -293,11 +444,7 @@ def _score_docs_reset_batch(
                 )
                 losses.index_add_(0, boundary_row_index, boundary_losses)
 
-        final_states = (
-            list(out["final_states"])
-            if isinstance(out, dict) and out.get("final_states")
-            else None
-        )
+        final_states = _model_final_states(out)
         if states is None and final_states is not None:
             states = [
                 torch.empty(
@@ -397,6 +544,7 @@ def run(args: argparse.Namespace) -> dict:
         torch.cuda.set_device(local_rank)
         device = torch.device("cuda", local_rank)
 
+    setup_t0 = time.monotonic()
     cache = load_val_cache(args.cache_dir)
     model, _ckpt_cfg = _build_model(args.checkpoint_path)
     model.to(device)
@@ -417,7 +565,6 @@ def run(args: argparse.Namespace) -> dict:
         score_floor_seconds=0.0,
         safety_margin_seconds=args.safety_margin_seconds,
     )
-    run_t0 = time.monotonic()
     total_ce = 0.0
     total_raw_bytes = 0
     docs_scored = 0
@@ -437,11 +584,34 @@ def run(args: argparse.Namespace) -> dict:
     device_tokens = torch.tensor(cache.tokens, dtype=torch.long, device=device)
     doc_records: list[str | None] = [None for _ in rank_docs]
     requested_doc_batch_size = max(1, int(args.doc_batch_size))
+    max_forward_tokens = resolve_max_forward_tokens(
+        max_forward_tokens=args.max_forward_tokens,
+        requested_doc_batch_size=requested_doc_batch_size,
+        chunk_size=args.chunk_size,
+        device=device,
+        probe_fn=(
+            lambda limit: _probe_max_forward_tokens(
+                model,
+                requested_forward_tokens=limit,
+                chunk_size=args.chunk_size,
+                device=device,
+            )
+        ),
+    )
     doc_batch_size = resolve_doc_batch_size(
         requested_doc_batch_size=requested_doc_batch_size,
         chunk_size=args.chunk_size,
-        max_batch_tokens=args.max_batch_tokens,
+        max_forward_tokens=max_forward_tokens,
     )
+    score_warmup_seconds = _run_score_warmup(
+        model,
+        doc_batch_size=doc_batch_size,
+        chunk_size=args.chunk_size,
+        device=device,
+        steps=args.score_warmup_steps,
+    )
+    pre_eval_setup_seconds = time.monotonic() - setup_t0
+    run_t0 = time.monotonic()
     with torch.inference_mode():
         for batch_start in range(0, len(doc_work), doc_batch_size):
             if time.monotonic() - run_t0 > args.budget_seconds:
@@ -483,6 +653,11 @@ def run(args: argparse.Namespace) -> dict:
                 )
             budget.add_score_time(time.monotonic() - score_t0)
             for score in scores:
+                validate_doc_score_coverage(
+                    score,
+                    chunk_size=args.chunk_size,
+                    score_boundary_targets=args.score_boundary_targets,
+                )
                 if score.tokens_scored <= 0:
                     continue
                 doc_bpb = compute_bpb(score.ce_nats, score.doc.raw_bytes)
@@ -565,12 +740,17 @@ def run(args: argparse.Namespace) -> dict:
         "rank_output_path": str(rank_output_path),
         "doc_batch_size": doc_batch_size,
         "requested_doc_batch_size": requested_doc_batch_size,
-        "max_batch_tokens": int(args.max_batch_tokens),
+        "max_forward_tokens": int(max_forward_tokens),
+        "max_forward_tokens_request": str(args.max_forward_tokens),
+        "max_batch_tokens": int(max_forward_tokens),
         "score_boundary_targets": bool(args.score_boundary_targets),
         "doc_ordering": "token_len_desc" if args.sort_docs_by_length else "source_order",
         "device_tokens_staged": True,
         "device_token_dtype": str(device_tokens.dtype),
         "torch_compile_mode": args.torch_compile_mode,
+        "score_warmup_steps": int(args.score_warmup_steps),
+        "score_warmup_seconds": score_warmup_seconds,
+        "pre_eval_setup_seconds": pre_eval_setup_seconds,
     })
     if world_size == 4:
         summary["projected_8x_wall_seconds"] = elapsed * 4.0 / 8.0
@@ -599,7 +779,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--safety-margin-seconds", type=float, default=0.0)
     parser.add_argument("--persistence-mode", choices=["reset"], default="reset")
     parser.add_argument("--doc-batch-size", type=int, default=1)
-    parser.add_argument("--max-batch-tokens", type=int, default=524_288)
+    parser.add_argument(
+        "--max-forward-tokens",
+        default="auto",
+        help=(
+            "Maximum fixed-shape token positions per forward, or 'auto' to probe "
+            "the requested CUDA shape and back off on OOM. The deprecated --max-batch-tokens "
+            "spelling is accepted as an alias."
+        ),
+    )
+    parser.add_argument("--max-batch-tokens", dest="max_forward_tokens", help=argparse.SUPPRESS)
     parser.add_argument("--score-boundary-targets", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--sort-docs-by-length", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument(
@@ -607,6 +796,7 @@ def parse_args() -> argparse.Namespace:
         choices=["none", "default", "reduce-overhead", "max-autotune"],
         default="none",
     )
+    parser.add_argument("--score-warmup-steps", type=int, default=0)
     parser.add_argument("--device", default="auto")
     return parser.parse_args()
 

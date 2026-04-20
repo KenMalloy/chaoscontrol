@@ -101,14 +101,21 @@ Hot-loop shape policy:
 - Length-sort each rank's work for dense full-width chunk groups, but preserve
   original doc order in the JSONL output.
 - Treat `doc_batch_size` as an upper bound and cap effective microbatches with
-  `max_batch_tokens / chunk_size` so sorted longest-doc batches do not OOM.
+  `max_forward_tokens / chunk_size` so sorted longest-doc batches do not OOM.
+  `--max-forward-tokens auto` probes the requested fixed shape on CUDA, backs
+  off if it OOMs, and records the resolved value; `--max-batch-tokens` remains
+  a compatibility alias.
 - Keep recurrent states as per-layer batch tensors instead of rebuilding them
   with per-doc slice/cat operations each chunk.
+- Validate every doc's scored target count against independent token-coverage
+  math before writing the result, so skipped chunks fail loudly during normal
+  runs instead of becoming suspiciously fast summaries.
 - Expose `--torch-compile-mode reduce-overhead` as an explicit GPU benchmark
-  knob; do not silently enable it until pod measurements show a net win. The
-  initial full-shape compile probe exceeded several minutes before first batch
-  completion, so CUDA graph capture or a smaller fixed-shape wrapper should be
-  investigated separately.
+  knob and pair it with explicit `--score-warmup-steps` when measuring. The
+  warmup uses synthetic token IDs and is documented separately from measured
+  scoring time. The initial full-shape compile probe exceeded several minutes
+  before first batch completion, so CUDA graph capture or a smaller fixed-shape
+  wrapper should be investigated separately.
 
 - [ ] **Step 3: Remove hot-loop CPU syncs**
 
