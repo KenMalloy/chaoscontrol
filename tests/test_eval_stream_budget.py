@@ -64,6 +64,69 @@ def test_score_only_summary_uses_elapsed_time_as_floor():
     assert summary["score_only_mode"] is True
 
 
+def test_summary_marks_timed_out_validation_as_incomplete_not_record_eligible():
+    tracker = BudgetTracker(total_budget_seconds=600.0)
+
+    summary = tracker.summary(
+        docs_scored=1_275,
+        chunks_scored=4_417,
+        tokens_scored=970_835,
+        adapt_steps=0,
+        timed_out=True,
+        collapsed=False,
+        score_only_mode=True,
+        elapsed_seconds=600.04,
+        max_docs=50_000,
+    )
+
+    assert summary["requested_docs_complete"] is False
+    assert summary["full_validation_complete"] is False
+    assert summary["record_eligible"] is False
+    assert summary["result_status"] == "incomplete_timeout"
+
+
+def test_summary_marks_completed_prefix_as_exploratory_not_record_eligible():
+    tracker = BudgetTracker(total_budget_seconds=600.0)
+
+    summary = tracker.summary(
+        docs_scored=512,
+        chunks_scored=1_663,
+        tokens_scored=360_733,
+        adapt_steps=228,
+        timed_out=False,
+        collapsed=False,
+        score_only_mode=False,
+        elapsed_seconds=522.08,
+        max_docs=512,
+    )
+
+    assert summary["requested_docs_complete"] is True
+    assert summary["full_validation_complete"] is False
+    assert summary["record_eligible"] is False
+    assert summary["result_status"] == "exploratory_prefix_complete"
+
+
+def test_summary_marks_full_validation_under_budget_as_record_eligible():
+    tracker = BudgetTracker(total_budget_seconds=600.0)
+
+    summary = tracker.summary(
+        docs_scored=50_000,
+        chunks_scored=173_000,
+        tokens_scored=38_000_000,
+        adapt_steps=0,
+        timed_out=False,
+        collapsed=False,
+        score_only_mode=True,
+        elapsed_seconds=599.0,
+        max_docs=50_000,
+    )
+
+    assert summary["requested_docs_complete"] is True
+    assert summary["full_validation_complete"] is True
+    assert summary["record_eligible"] is True
+    assert summary["result_status"] == "record_eligible"
+
+
 def test_summary_provenance_defaults_to_none():
     """Backwards-compat: callers that don't pass provenance still get a
     ``provenance`` sub-dict with all fields set to None. Keeps summary JSON

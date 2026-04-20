@@ -3,6 +3,9 @@ from __future__ import annotations
 import time
 
 
+FULL_VALIDATION_DOCS = 50_000
+
+
 class EvalDeadline:
     """Wall-clock deadline for bounded-time eval loops.
 
@@ -91,6 +94,27 @@ class BudgetTracker:
             return max(0.0, float(elapsed_seconds))
         return 0.0
 
+    def _result_status(
+        self,
+        *,
+        requested_docs_complete: bool,
+        full_validation_complete: bool,
+        record_eligible: bool,
+        timed_out: bool,
+        collapsed: bool,
+    ) -> str:
+        if record_eligible:
+            return "record_eligible"
+        if timed_out:
+            return "incomplete_timeout"
+        if collapsed:
+            return "incomplete_collapsed"
+        if not requested_docs_complete:
+            return "incomplete_docs"
+        if not full_validation_complete:
+            return "exploratory_prefix_complete"
+        return "full_validation_over_budget"
+
     def summary(
         self,
         *,
@@ -130,6 +154,29 @@ class BudgetTracker:
             score_floor_seconds=score_floor_seconds,
             safety_margin_seconds=self.safety_margin_seconds,
         )
+        requested_docs_complete = (
+            max_docs is not None
+            and int(docs_scored) >= int(max_docs)
+            and not timed_out
+            and not collapsed
+        )
+        full_validation_complete = (
+            requested_docs_complete
+            and int(docs_scored) >= FULL_VALIDATION_DOCS
+            and max_docs is not None
+            and int(max_docs) >= FULL_VALIDATION_DOCS
+        )
+        record_eligible = (
+            full_validation_complete
+            and float(elapsed_seconds) <= self.total_budget_seconds
+        )
+        result_status = self._result_status(
+            requested_docs_complete=requested_docs_complete,
+            full_validation_complete=full_validation_complete,
+            record_eligible=record_eligible,
+            timed_out=timed_out,
+            collapsed=collapsed,
+        )
         return {
             "total_budget_seconds": self.total_budget_seconds,
             "elapsed_seconds": float(elapsed_seconds),
@@ -153,6 +200,11 @@ class BudgetTracker:
             "timed_out": bool(timed_out),
             "collapsed": bool(collapsed),
             "score_only_mode": bool(score_only_mode),
+            "requested_docs_complete": requested_docs_complete,
+            "full_validation_docs": FULL_VALIDATION_DOCS,
+            "full_validation_complete": full_validation_complete,
+            "record_eligible": record_eligible,
+            "result_status": result_status,
             "provenance": {
                 "ckpt_sha256": ckpt_sha256,
                 "ckpt_cfg_hash": ckpt_cfg_hash,

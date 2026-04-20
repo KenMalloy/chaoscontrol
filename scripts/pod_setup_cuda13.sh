@@ -115,15 +115,16 @@ import pytest  # noqa: F401
 import chaoscontrol  # noqa: F401 — editable install present
 # Bespoke cuBLASLt fp8 extension must be built. If missing the C-side
 # compiled module, the editable install needs to re-run so setup.py
-# builds ext_modules. Import the compiled _C directly rather than the
-# wrapper — the wrapper falls back gracefully to an ImportError at
-# call time, but here we want the probe to fire.
+# builds ext_modules. Import the compiled _C modules directly rather than
+# wrappers that may fall back gracefully; readiness should fail if either
+# extension is absent.
 from chaoscontrol.kernels._cublaslt import _C  # noqa: F401
+from chaoscontrol.kernels._ssm_scan import _C as _ssm_scan_C  # noqa: F401
 _ = te.Linear(16, 16, device='cuda' if torch.cuda.is_available() else 'cpu')
 PROBE
 then
     echo "    torch + TE + sentencepiece + numpy + pytest + chaoscontrol all import;"
-    echo "    cuBLASLt fp8 extension importable; TE Linear constructs — skipping reinstall."
+    echo "    cuBLASLt fp8 + SSM scan extensions importable; TE Linear constructs — skipping reinstall."
     echo "    (force-reinstall by removing one of the above imports from the pod.)"
     echo ""
     echo "Pod ready."
@@ -238,6 +239,12 @@ if torch.cuda.is_available():
     scale = torch.tensor(1.0 / 448.0, device="cuda")
     y = cublaslt_fp8_matmul(a, b, scale, scale, None, torch.bfloat16)
     print(f"cublaslt fp8 smoke OK: y.shape={tuple(y.shape)} dtype={y.dtype}")
+
+    from chaoscontrol.kernels._ssm_scan import ssm_scan_forward
+    decay = torch.full((2, 4, 8), 0.9, device="cuda", dtype=torch.float32)
+    update = torch.randn(2, 4, 8, device="cuda", dtype=torch.bfloat16)
+    y = ssm_scan_forward(decay, update)
+    print(f"ssm scan smoke OK: y.shape={tuple(y.shape)} dtype={y.dtype}")
 else:
     print("no CUDA device visible; fp8 smoke skipped")
 PY

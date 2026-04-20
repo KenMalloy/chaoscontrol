@@ -3,6 +3,26 @@
 This directory contains the runnable Exp20 matrix artifacts. The goal is to
 run the actual SSM-native ablation, not the old naive `adapt_set=all` envelope.
 
+## Record Eligibility
+
+Parameter Golf record claims must score the full fixed validation split
+(`fineweb_val_*`, 50,000 documents) and finish evaluation within the 600 second
+8xH100 limit. A run that times out before `docs_scored == 50000` is incomplete,
+even if it produced a mean BPB for the scored prefix.
+
+The Exp20 summaries therefore carry explicit interpretation fields:
+
+- `requested_docs_complete`: the configured `max_docs` finished without timeout
+  or collapse.
+- `full_validation_complete`: the fixed 50k-document validation set completed.
+- `record_eligible`: full validation completed within `budget_seconds`.
+- `result_status`: one of `record_eligible`, `exploratory_prefix_complete`,
+  `incomplete_timeout`, `incomplete_collapsed`, `incomplete_docs`, or
+  `full_validation_over_budget`.
+
+Use `max_docs < 50000` only for pilots and label those results exploratory.
+Do not compare them as final Parameter Golf scores.
+
 ## Pod Lifecycle
 
 The repo has a lease-aware RunPod helper for bringing pods up/down:
@@ -39,7 +59,70 @@ stop in one step:
 python tools/runpod.py harvest-stop <POD_ID>
 ```
 
-## Floor Pass
+## Full-Validation Performance Gate
+
+Before running the TTT matrix for paper- or record-facing claims, lock the
+performance path by proving the score-only floor completes all 50,000 validation
+documents under the 600 second budget on the target 8xH100 shape. If a floor
+run reports `timed_out: true`, `full_validation_complete: false`, or
+`record_eligible: false`, do not use it as a score floor for confirmatory TTT.
+
+The prior 1xH100 floor pass timed out at roughly 1.3k carry-state docs and
+1.6k-1.8k reset docs. That result is useful throughput evidence, not a valid
+score floor for record claims.
+
+## Generated Validation Cache
+
+The fast eval path uses a generated cache so tokenization and JSONL parsing stay
+outside the timed loop. Build it on the pod or shared volume; do not commit the
+cache contents unless there is a specific reproducibility reason.
+
+```bash
+python scripts/build_exp20_val_cache.py \
+  --jsonl-path /workspace/chaoscontrol/baselines/parameter_golf/docs_selected.jsonl \
+  --sp-model-path /workspace/chaoscontrol/baselines/parameter_golf/tokenizers/fineweb_8192_bpe.model \
+  --cache-dir /workspace/cache/exp20_val_8192 \
+  --max-docs 50000
+```
+
+The cache contains `tokens.npy`, `docs.npy`, and `manifest.json`. The manifest
+pins the source JSONL path/size/mtime, tokenizer hash, schema version, and
+requested doc count so stale caches are rejected unless rebuilt with `--force`.
+
+## Fast Score-Only Floor
+
+Use the cache-backed scorer for record-facing score-only floors. It scores
+document-boundary reset semantics by default and includes chunk-boundary
+targets, so `tokens_scored` should equal the sum of `token_len - 1` over all
+scored documents. Disable that only when comparing against the legacy Exp20
+harness:
+
+```bash
+CHAOSCONTROL_DIAG_SCAN_BACKEND=ssm_scan \
+python scripts/run_exp20_fast_score.py \
+  --cache-dir /workspace/cache/exp20_val_8192 \
+  --checkpoint-path /workspace/results/quantmeasure/v8192.pt \
+  --output-path experiments/20_ssm_native_ttt/results_floor/score_only.jsonl \
+  --summary-path experiments/20_ssm_native_ttt/results_floor/score_only_summary.json \
+  --chunk-size 256 \
+  --doc-batch-size 4096 \
+  --budget-seconds 600 \
+  --device cuda
+```
+
+For legacy parity checks only:
+
+```bash
+python scripts/run_exp20_fast_score.py ... --no-score-boundary-targets
+```
+
+On the 1xH100 pod sampled on 2026-04-20, `ssm_scan`, `chunk_size=256`, and
+`doc_batch_size=4096` scored 4,096 full-token-accounting docs in 115.35s
+(~35.5 docs/s). That projects to roughly 352s on 4xH100 and 176s on 8xH100
+before distributed overhead. Confirm this with an actual multi-GPU run before
+treating it as a record floor.
+
+## Exploratory Floor Pass
 
 Generate score-floor configs first:
 
@@ -66,12 +149,13 @@ python experiments/20_ssm_native_ttt/run_queue.py \
   --log-dir experiments/20_ssm_native_ttt/logs_floor
 ```
 
-Choose the score floor from the resulting score-only summaries, then generate
-the screens with that measured value.
+For exploratory matrix design, choose a bounded prefix that completes with
+`result_status: exploratory_prefix_complete`. Do not promote an incomplete
+timeout into a score floor.
 
 ## First-Wave Screens
 
-Generate configs after the floor is known:
+Generate configs after the performance gate or exploratory prefix is known:
 
 ```bash
 python experiments/20_ssm_native_ttt/build_matrix.py \
