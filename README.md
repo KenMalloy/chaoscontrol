@@ -2,233 +2,215 @@
 
 *Codename: ChaosControl*
 
-**A research repo for efficient typed-memory architectures on top of a state-space model.**
+**A research repo for efficient SSM architectures built from biological principles.**
 
-16MB artifact target. FineWeb validation. Bits-per-byte metric. Built for the OpenAI Parameter Golf competition.
+16MB artifact target. FineWeb validation. Bits-per-byte metric. Built for the OpenAI Parameter Golf competition. **Competition deadline: April 30, 2026.**
 
 ## Current Status
 
-As of **April 9, 2026**:
+As of **April 20, 2026**:
 
-- **Bare SSM is the strongest confirmed system at 600s on A40.**
-- **Wernicke routing helped in earlier lower-budget ablations, but recent 600s baseline sweeps show routing and full-stack memory are currently underwater on A40 because they cost too many training steps.**
-- **Sleep/consolidation is no longer the active center of the project.** Experiment 11 showed that only the cheapest `n3_only` compression pass pays for itself at this budget.
-- **The active hypothesis has shifted to Experiment 14:** typed, append-only KV memory with local retrieval may preserve the semantic-engine idea while removing most of the operational overhead.
+- **Throughput is the dominant variable.** torch.compile on the diagonal recurrence gives ~32× speedup (14K+ training steps in 600s vs 447 before Exp 16). Everything else is downstream of this.
+- **Submission regime is locked** from Exp 18: V=16384 SP tokenization, seq=512, bs=1024/rank, Muon LR=0.064, bf16, chunked scan (763K tok/s on 1×H100), ws=8 target.
+- **Chunked LM backward is implemented** in `train_ssm.py`. Logits peak VRAM drops 8× at V=16384, enabling bs=1024 without OOM.
+- **Exp 13 constants are locked:** `crit_target=0.92`, `max_slots=32`.
+- **Score-only floor (Exp 20):** 1.5326 BPB on the full 50k-doc FineWeb validation in 163.7s on 4×H100; ~518s TTT slack at 8×H100.
+- **Active parallel tracks (Exp 19–22):** training-time optimization matrix, SSM-native TTT, SGNS embedding init, and temporal heads.
 
-This repo should be read as an active research program, not a claim of architectural victory. The codebase contains both:
+## Competition Context
 
-- ideas that have survived ablation
-- ideas that are still scientifically interesting but currently unsupported at the tested budget
+| | |
+|---|---|
+| **Task** | OpenAI Parameter Golf — compress a language model into 16MB |
+| **Metric** | BPB (bits per byte) on 50,000 FineWeb validation documents |
+| **Budget** | 600s train + 600s eval, 8×H100 |
+| **Artifact** | ≤16MB serialized checkpoint |
+| **Deadline** | April 30, 2026 |
+| **Known SOTA** | ~1.0208 BPB (open PR, GDN-Hybrid) |
+| **Our floor** | 1.5326 BPB score-only (Exp 20, 4×H100, preliminary) |
+
+TTT is legal. Offline FineWeb pretraining is legal (SP tokenizers are in accepted submissions). The score-first TTT protocol (warmup steps + state restore before the 600s timer) is the production path.
 
 ## Thesis
 
-The durable thesis is:
+**An SSM trunk trained at maximum throughput can serve as a strong competition base. Eval-time adaptation (TTT) and complementary initialization priors (SGNS) may push below 1.1 BPB within the 600s budget.**
 
-**An SSM trunk plus typed routing plus structured memory may beat a plain trunk if memory behaves like cheap state rather than expensive extra compute.**
+The biological framing — criticality coupling, episodic memory, sleep cycles — motivated the early ablations (Exp 09–14) and produced the locked constants. The current competition arc replaces biological mechanisms with the highest-throughput SSM configuration that still fits in 16MB.
 
-That breaks into two layers:
+## Architecture
 
-### Core Invariants
-
-- The SSM trunk should do the fast sequential prediction work.
-- Typed routing should organize information before memory access.
-- Memory should be structured by semantic type, not just raw recency.
-- Efficiency matters as much as raw quality: extra mechanisms must earn their step cost.
-
-### Replaceable Mechanisms
-
-- surprise-gated writes
-- offline sleep consolidation
-- REM/CFR mechanisms
-- retrieval strategy
-- flat vs hierarchical Wernicke routing
-- global semantic basis vs per-bucket prototypes
-
-Those mechanisms are implementation choices, not the thesis itself.
-
-## Architecture Evolution
-
-### Historical emphasis (Experiments 09-13)
+### Submission configuration (locked)
 
 ```text
-raw bytes
-  -> Wernicke typed routing
-  -> SSM trunk
-  -> surprise-gated episodic memory
-  -> sleep-time consolidation (N1/N2/N3/REM)
-  -> semantic / latent memory refinements
-```
-
-This version produced useful negative results:
-
-- the metabolic gate hurts badly at eval time on memoryless checkpoints
-- heavy sleep stages lose too many steps at 600s
-- bare SSM wins the latest 600s A40 baseline sweep
-
-### Current active emphasis (Experiment 14)
-
-```text
-raw bytes
-  -> Wernicke typed routing
-  -> append-only typed KV buffer
-  -> within-bucket retrieval
-  -> optional per-bucket prototypes
-  -> SSM trunk
-```
-
-The active question is no longer "can elaborate consolidation help?" but:
-
-**Can typed locality make memory cheap enough to matter?**
-
-## What The Data Says So Far
-
-### Confirmed Results
-
-| Finding | Evidence |
-|---|---|
-| **Bare SSM is the current 600s A40 winner** | Baseline sweep summary in `experiments/baselines/results/baseline_summary.json` |
-| **`n3_only` is the only sleep payload that helps at 600s** | `experiments/11_sleep_cycle/REPORT_exp11.md` |
-| **Metabolic gating hurts on memoryless checkpoints** | `experiments/09_revised_architecture/REPORT_phase2.md` |
-| **`crit_target_coupling=0.92` and `outer_max_slots=32` look like the strongest constant improvements** | `experiments/13_constants_validation/REPORT_exp13.md` |
-
-### Current Interpretation
-
-- The original semantic-engine stack is **not yet compute-efficient enough** at the tested budget.
-- The problem may be **mechanism placement**, not the entire idea.
-- If ChaosControl wins, it is more likely to be through **typed routing + cheap typed memory** than through expensive offline maintenance.
-
-## Experiments
-
-| Experiment | What it tests | Status on April 9, 2026 |
-|---|---|---|
-| **09: Revised architecture** | Layered ablation: tokenizer, gate, memory, Wernicke, CFR | Complete |
-| **10: Scaling laws** | Size and architecture scaling configs | Designed / partially wired |
-| **10b: Quantization robustness** | Delta-bpb curves under int8/int6, reactivation isolation | Designed, not run |
-| **11: Sleep cycle ablation** | 9 sleep conditions with REM mechanism isolation | Complete |
-| **12: Polyphasic sleep** | K-of-N partition scheduling and topology comparison | Code ready, not yet run |
-| **13: Constants validation** | Criticality, slot count, semantic tier, merge threshold | Complete |
-| **14: VRAM typed buffer** | Append-only typed KV memory, retrieval ablations, hierarchical Wernicke, TTT warming curves | Active next architecture test |
-| **Baselines** | Bare SSM, Wernicke variants, full stack, Mamba-2 wiring | Baseline sweep complete; Mamba-2 package still optional |
-
-## Snapshot Results
-
-### Experiment 11: Sleep Cycle Ablation (600s, 7 seeds)
-
-| Condition | Mean bpb | Steps | Verdict |
-|---|---|---|---|
-| `no_sleep` | 2.4210 | 390 | Baseline |
-| **`n3_only`** | **2.4090** | 385 | **Best sleep condition** |
-| `n2_n3` | 2.4946 | 320 | Too expensive |
-| `full_cycle` | 2.4916 | 316 | Too expensive |
-
-### Baseline Sweep (600s, A40)
-
-| Configuration | Mean bpb | Steps | Verdict |
-|---|---|---|---|
-| **bare_ssm** | **2.478** | 505 | **Current winner** |
-| ssm_wernicke_k16 | 2.488 | 446 | Slightly worse |
-| full_stack_k16 | 2.502 | 433 | Worse |
-
-### Experiment 13: Constants Validation
-
-| Constant | Default | Best candidate | Delta | Action |
-|---|---|---|---|---|
-| `crit_target_coupling` | 0.88 | **0.92** | -0.017 | confirm |
-| `outer_max_slots` | 64 | **32** | -0.033 | confirm |
-| `semantic_tier` | off | `b8/r0.1` | -0.008 | trend only |
-
-## Experiment 14
-
-Experiment 14 is the most important next-step architecture test in the repo.
-
-It asks whether ChaosControl becomes more plausible when memory is treated as a **typed, rebuildable buffer** instead of a consolidation-heavy subsystem.
-
-### Experiment 14 Claims
-
-- **Claim 1:** A typed append-only KV buffer can give an SSM useful context access without transformer-style attention cost.
-- **Claim 2:** If Claim 1 works, developmental fast weights and online defrag may further improve warmup and buffer quality.
-
-### Experiment 14 Design
-
-```text
-Input bytes
+SP8192/16384 tokenization
   -> byte embedding
-  -> Wernicke routing (flat or hierarchical)
-  -> typed KV buffer read within bucket
-  -> optional bucket prototype bias
-  -> SSM backbone
-  -> unconditional append to matching bucket
+  -> 4-layer × 256d SSM trunk (diag A, torch.compile, chunked scan)
+  -> chunked cross-entropy head (8× VRAM reduction at V=16384)
+  -> 16MB artifact
+```
+
+Key implementation details:
+- **Diag A-mode:** diagonal state matrix, no full matrix_exp overhead
+- **torch.compile:** JIT fuses the recurrence loop; 32× speedup vs eager sequential
+- **Muon optimizer:** `LR=0.064`, `ws=2` base, `ws=8` for submission
+- **bf16 throughout:** tensor core path on H100; TE (transformer_engine) IS available on CUDA 13 pod
+- **Chunked scan:** CUDA-extension-backed chunked parallel scan, 763K tok/s on 1×H100
+- **Chunked LM backward:** recompute logits in backward; peak VRAM for logits drops from ~9GB to ~1GB at V=16384, bs=1024
+
+### Historical architecture (Experiments 09–14)
+
+The earlier experiments tested biologically-inspired additions on top of this trunk:
+
+```text
+raw bytes
+  -> Wernicke typed routing (flat or hierarchical)
+  -> surprise-gated episodic memory (multi-slot, typed buffer)
+  -> sleep-time consolidation (N1/N2/N3/REM)
+  -> semantic tier
+  -> SSM trunk
   -> LM head
 ```
 
-### Experiment 14 Retrieval Modes
+Findings from this phase: the full stack is throughput-starved at 600s on A40/H100. Bare SSM wins the baseline sweep. Only `crit_target=0.92` and `max_slots=32` survived as locked constants. The biological mechanisms are **not retired** — they're parked pending a longer budget or efficient approximation.
 
-| Mode | Character |
+## Key Findings
+
+| Finding | Evidence |
 |---|---|
-| `bucket_mean` | routing does most of the work |
-| `bucket_recent` | recency-biased local retrieval |
-| `bucket_topk` | selective retrieval within bucket |
-| `softmax_all` | legacy/global baseline |
+| **Bare SSM wins the 600s baseline sweep** | Exp 09 / `experiments/baselines/` |
+| **`crit_target=0.92`, `max_slots=32` are the best constants** | Exp 13 (`experiments/13_constants_validation/`) |
+| **Typed KV buffer fails at 600s budget** | Exp 14 Phase A (`experiments/14_vram_buffer/REPORT_phase_a.md`) |
+| **SSM state oracle falsified; residual stream is the retrieval signal** | Exp 16 (`experiments/16_entropy_sparse_attention/VERDICT.md`) |
+| **torch.compile diag: 32× throughput, bpb 1.63 at 600s** | Exp 16 |
+| **Chunked scan: 763K tok/s on 1×H100** | Exp 18 Test 1 |
+| **LR=0.064, seq=512, bs=1024/rank, ws=2 optimal at single-node** | Exp 18 Test 5b |
+| **seq=512 wins at matched wall-clock; ws=8 target for submission** | Exp 18 Test 8 / Test 4b |
+| **bf16 beats fp8 at 10.7M params; bf16 is submission regime** | Exp 18 Test 10 |
+| **Score-only floor: 1.5326 BPB (4×H100, 163.7s, ~518s TTT slack)** | Exp 20 (`experiments/20_ssm_native_ttt/`) |
+| **TTT pilot (128-doc, steps=1): no cell beats reset floor** | Exp 20 pilot |
 
-### Experiment 14 Evaluation Story
+## Experiments
 
-The important metric is not just pretrain bpb. It is the **warming curve**:
+| Experiment | What it tests | Status |
+|---|---|---|
+| **09: Revised architecture** | Layered ablation: tokenizer, gate, memory, Wernicke, CFR | Complete |
+| **10: Scaling laws** | Size and architecture scaling configs | Code ready, not run |
+| **10b: Quantization robustness** | Delta-bpb curves under int8/int6 | Designed, not run |
+| **11: Sleep cycle ablation** | 9 sleep conditions with REM isolation | Complete |
+| **12: Polyphasic sleep** | K-of-N partition scheduling | Code ready, not run |
+| **13: Constants validation** | crit_target, max_slots, semantic tier | Complete; constants locked |
+| **14: VRAM typed buffer** | Typed KV buffer, retrieval ablations | Phase A complete; verdict: fails at 600s |
+| **15: ChaosPiece** | SP8192 tokenizer-first SSM vs byte SSM | Code ready; Phase A matrix pending |
+| **16: Entropy sparse attention** | SSM state as sparse retrieval oracle | Complete; oracle falsified; 32× speedup confirmed |
+| **17: Local attention sidecar** | Local attention window on top of fast SP-SSM | Code scaffolded; not run |
+| **18: Throughput advantage** | Chunked scan, LR/batch/seq/precision sweep | Tests 1–10 complete; submission regime locked |
+| **18: Throughput levers** | Fused Muon, fused grad clip, compile flags | Code complete; Phase 1A bench results pending |
+| **19: Phase 1** | Phase 1A lever bench; Phase 1C full training matrix | Persistent DDP runner ready; bench results pending |
+| **19: Prereqs** | Persistent-DDP multi-seed launcher | Infrastructure complete |
+| **20: SSM-native TTT** | Test-time training on validation stream | Score floor measured; first-wave TTT matrix pending |
+| **21: SGNS tokenizer** | SGNS embedding init + 4-cell SSM×transformer ablation | In progress |
+| **22: Temporal heads** | Parallel recurrent states at multiple memory horizons | Code scaffolded; Phase 0/A pending |
 
-- cold artifact performance with an empty buffer
-- performance after 100 / 500 / 1000 / 5000 tokens of rebuild
-
-If that curve is steep, then the typed buffer is doing real work.
+*Experiments 01–08 are in `archive/round1/`. They ran on H100 with the full biological stack (300s budget); the final report is in `archive/round1/FINAL_REPORT.md`.*
 
 ## Quick Start
 
 ```bash
 # Install
-python -m venv .venv && .venv/bin/pip install torch numpy pyyaml
+python -m venv .venv
+.venv/bin/pip install torch numpy pyyaml sentencepiece
 
 # Run tests
 PYTHONPATH=src .venv/bin/python -m pytest tests/ -q
 
-# Reproduce the sleep ablation
-PYTHONPATH=src .venv/bin/python experiments/11_sleep_cycle/run_sleep_ablation.py \
-    --data-path /path/to/fineweb_data --budget 600 --num-gpus 4
+# On the training pod — activate the persistent venv first
+source /workspace/venv/bin/activate
 
-# Run Experiment 14 Phase A
-PYTHONPATH=src .venv/bin/python experiments/14_vram_buffer/run_exp14.py \
-    --data-path /path/to/fineweb_data --budget 600 --num-gpus 8 --phase A
+# Build SP16384 shards (competition submission path)
+cd baselines/parameter_golf
+python build_sp_shards.py --variant sp16384 --train-shards 80
+
+# Run a single throughput bench at the submission regime
+PYTHONPATH=src python experiments/19_prereqs/run_persistent_launcher.py \
+    --data-path baselines/parameter_golf/datasets/fineweb10B_sp16384 \
+    --sp-model-path baselines/parameter_golf/tokenizers/fineweb_16384_bpe.model \
+    --output-dir /tmp/bench_out \
+    --world-size 4 --base-lr 0.064 --budget 600
+
+# Score-only floor pass (Exp 20)
+python scripts/run_exp20_fast_score.py \
+    --cache-dir /workspace/cache/exp20_val_8192 \
+    --checkpoint-path /workspace/results/final.pt \
+    --output-path experiments/20_ssm_native_ttt/results_floor/score_only.jsonl \
+    --chunk-size 256 --doc-batch-size 4096 \
+    --max-forward-tokens auto --budget-seconds 600 --device cuda
 ```
+
+**Pod note:** The persistent Python environment lives at `/workspace/venv` on the RunPod volume. Always activate it before running Python on the pod. Never `pip install` into the system interpreter — it is wiped on every pod restart.
 
 ## Project Structure
 
 ```text
 src/chaoscontrol/
-  core.py              SSM recurrence (diag/paired/full A-modes)
-  model.py             ChaosStudentLM wiring and Exp 14 buffer path
-  wernicke.py          Flat + hierarchical typed routing
-  memory.py            Multi-slot memory, typed buffer, prototypes, affinity
-  sleep.py             Sleep cycle (N1/N2/N3/REM consolidation)
-  wake_cache.py        High-signal moment cache for sleep
-  fatigue.py           Dynamic fatigue tracker
-  partition.py         Polyphasic partitions + scheduler
-  metabolic.py         Fork/MC/MCTS gating experiments
-  regret.py            Counterfactual regret table
-  training.py          Training loop with sleep and typed-buffer integration
+  core.py              SSM recurrence (diag A-mode, RMSNorm)
+  core_fused.py        Fused SSM forward
+  model.py             ChaosStudentLM — attention + Wernicke + typed buffer wiring
+  train_ssm.py         SP-tokenized training loop with chunked LM backward
+  training.py          Original training loop (byte-level)
   evaluation.py        Eval + bpb / warming-curve calculation
   artifact.py          16MB artifact serialization
-  baselines.py         SimpleTransformerLM, Mamba2LM
+  tokenizer.py         SentencePiece byte-LUT and competition-correct bpb
+  data.py              FineWeb loading (raw bytes and SP tokens)
+  distributed.py       DDP all-reduce helpers
+  precision.py         bf16/fp8 precision management
   config.py            ChaosControlConfig dataclass
-  data.py              FineWeb data loading
+  baselines.py         SimpleTransformerLM, Mamba2LM
+  baselines_nanogpt_lean.py  NanoGPTLeanLM (Exp 21, in progress)
+  routing.py           Wernicke routing variants
+  wernicke.py          Flat + hierarchical typed routing
+  memory.py            Multi-slot memory, typed buffer, prototypes
+  sleep.py             Sleep cycle (N1/N2/N3/REM) — historical
+  wake_cache.py        Wake cache
+  fatigue.py           Fatigue tracker
+  partition.py         Polyphasic partitions + scheduler
+  metabolic.py         Metabolic gate experiments
+  regret.py            Counterfactual regret table
+  local_attn.py        Local attention module (Exp 17)
+  vq.py                Vector quantization
+  posterior.py         Posterior estimation utilities
+  alignment.py         Alignment utilities
+  paper_results.py     Paper results extraction
+  optim/               Muon and fused Muon optimizers
+  kernels/             CUDA kernel extensions (_ssm_scan)
+  quantization/        Quantization utilities
+  eval_stream/         Streaming eval pipeline
+  sgns/                SGNS embedding tools (Exp 21)
 
 experiments/
-  09_revised_architecture/   Layered ablation
-  10_scaling_laws/           Scaling-law sweep scaffolding
-  11_sleep_cycle/            Sleep stage ablation
+  09_revised_architecture/   Layered ablation (complete)
+  10_scaling_laws/           Scaling sweep scaffolding
+  11_sleep_cycle/            Sleep stage ablation (complete)
   12_polyphasic_sleep/       Partitioned sleep scheduling
-  13_constants_validation/   Constant sweeps and confirmations
-  14_vram_buffer/            Typed-buffer architecture test
+  13_constants_validation/   Constants sweep (complete; crit=0.92, slots=32 locked)
+  14_vram_buffer/            Typed buffer (phase A complete; verdict: fails at 600s)
+  15_chaospiece/             SP8192 tokenizer-first SSM (code ready)
+  16_entropy_sparse_attention/ SSM state oracle (complete; oracle falsified; 32× speedup)
+  17_local_attn_sidecar/     Local attention hybrid (scaffolded)
+  18_throughput_advantage/   Throughput sweep (complete; submission regime locked)
+  18_throughput_levers/      Fused Muon / compile levers (bench pending)
+  19_phase1/                 Phase 1A bench + Phase 1C matrix (pending)
+  19_prereqs/                Persistent-DDP multi-seed launcher (complete)
+  20_ssm_native_ttt/         SSM-native TTT (floor measured; matrix pending)
+  21_sgns_tokenizer/         SGNS init + transformer baseline (in progress)
+  22_temporal_heads/         Temporal heads eval-time strategy (scaffolded)
+  baselines/                 Bare SSM, Wernicke variants, full stack
 
-docs/plans/                  Design documents and implementation plans
-tools/                       RunPod deployment, polling, watchdog scripts
-tests/                       Unit and integration coverage
+archive/round1/            Exp 01–08 results (300s, full biological stack)
+baselines/parameter_golf/  Competition harness, SP shard builder, data manifests
+docs/plans/                Design documents and implementation plans
+scripts/                   RunPod setup, eval scripts, shard builders
+tools/                     RunPod lease-aware pod management
+tests/                     Unit and integration coverage
 ```
 
 ## References
