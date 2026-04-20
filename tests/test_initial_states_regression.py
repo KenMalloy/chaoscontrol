@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import torch
 
+from chaoscontrol.core import _should_use_zero_initial_state_fast_path
 from chaoscontrol.model import ChaosStudentLM
 
 
@@ -80,6 +81,22 @@ def test_zero_initial_state_with_grad_flows_gradient():
     for p in h0:
         assert p.grad is not None
         assert p.grad.abs().sum() > 0
+
+
+def test_cuda_graph_capture_skips_zero_state_tensor_check(monkeypatch):
+    """The zero-state shortcut uses torch.any, which is illegal inside CUDA graph capture."""
+    class FakeCudaState:
+        is_cuda = True
+        requires_grad = False
+
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+
+    def fail_any(_state):
+        raise AssertionError("torch.any should not run while CUDA graph capture is active")
+
+    monkeypatch.setattr(torch, "any", fail_any)
+
+    assert _should_use_zero_initial_state_fast_path(FakeCudaState()) is False
 
 
 def test_final_state_equals_chunked_sequential():

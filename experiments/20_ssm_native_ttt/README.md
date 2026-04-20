@@ -111,11 +111,19 @@ python scripts/run_exp20_fast_score.py \
   --device cuda
 ```
 
-The scorer length-sorts each rank's document work by default to keep hot-loop
-chunk shapes dense. Completed full-validation runs are unaffected; timed-out
-partial runs are not prefix samples and are labeled with
-`doc_ordering: token_len_desc`. Use `--no-sort-docs-by-length` only when a
+The scorer uses chunk-aware packing by default (`doc_packing:
+chunk_count_tail`). It groups docs by recurrent chunk count first, then by tail
+bucket and token length, so fixed-size chunk work is denser than raw length sort
+alone. Completed full-validation frozen runs are unaffected; timed-out partial
+runs are not prefix samples and are labeled with their `doc_packing` value. Use
+`--doc-packing source_order` or the legacy `--no-sort-docs-by-length` only when a
 prefix-shaped exploratory run matters more than throughput.
+
+Under `torchrun`, non-source packing forms nearby-key batches, sorts those
+batches by padded token work, and assigns them to ranks with longest-processing-
+time first. This avoids giving one rank all the expensive batches. Rank files
+still write records sorted by original document index, and the summary records
+`rank_assignment`.
 
 It also stages the validation token cache as one device-resident int64 tensor
 before the timer loop. This costs a few hundred MB for the current 50k cache
@@ -123,28 +131,37 @@ and avoids per-chunk host-to-device copies plus uint16-to-target dtype churn.
 
 `doc_batch_size` is an upper bound. The runner resolves `--max-forward-tokens`
 before the measured scoring loop and caps effective microbatches with
-`max_forward_tokens / chunk_size` so length-sorted batches do not put all
-longest documents into one OOM-prone full-width group. `auto` probes the
-requested CUDA shape and backs off to a safe fixed shape if it OOMs; on non-CUDA
-devices it uses the requested shape. The deprecated `--max-batch-tokens`
-spelling is still accepted as an alias for old launch commands.
+`max_forward_tokens / chunk_size` so packed batches do not put too much full-
+width work into one OOM-prone forward. `auto` probes the requested CUDA shape
+and backs off to a safe fixed shape if it OOMs; on non-CUDA devices it uses the
+requested shape. The deprecated `--max-batch-tokens` spelling is still accepted
+as an alias for old launch commands.
 
 Optional warmup / graphing probe:
 
 ```bash
 python scripts/run_exp20_fast_score.py ... \
-  --torch-compile-mode reduce-overhead \
-  --score-warmup-steps 20
+  --score-warmup-steps 20 \
+  --score-graph-mode cuda
 ```
 
 Keep `torch_compile_mode`, `score_warmup_steps`, `score_warmup_seconds`,
-`pre_eval_setup_seconds`, and `elapsed_seconds` from the summary with the
-result. The scorer warmup uses synthetic token IDs and restores no validation
-state; it exists to prime fixed forward/loss shapes before measured scoring. A
-full-shape `reduce-overhead` probe without this explicit warmup did not finish
-its first scoring batch after several minutes of compilation, so do not use
-compile mode for floor claims until the warmed compile path or a CUDA graph path
-is separately validated.
+`pre_eval_setup_seconds`, `score_graph_mode`, `graph_replay_count`,
+`graph_fallback_count`, and `elapsed_seconds` from the summary with the result.
+The scorer warmup uses synthetic token IDs and restores no validation state; it
+exists to prime fixed forward/loss shapes before measured scoring.
+
+`--score-graph-mode cuda` captures only the fixed full-batch full-chunk path
+with previous recurrent states. First chunks, reduced prefixes, final partial
+batches, and ragged tails fall back to eager. That keeps graph replay limited to
+the shape CUDA graphs are good at while preserving eager behavior everywhere
+shape or state semantics vary. Compare BPB and token counts against
+`--score-graph-mode none` before using graph mode for a floor claim.
+
+A full-shape `torch.compile(reduce-overhead)` probe without this explicit
+warmup did not finish its first scoring batch after several minutes of
+compilation, so keep compile mode as a separate benchmark axis from CUDA graph
+mode until the warmed compile path is separately validated.
 
 For legacy parity checks only:
 
@@ -153,13 +170,13 @@ python scripts/run_exp20_fast_score.py ... --no-score-boundary-targets
 ```
 
 On the 1xH100 pod sampled on 2026-04-20, uncapped `4096 x 256` OOMed. With
-`max_forward_tokens=524288`, the effective shape was `2048 x 256`. A sorted
-long-document sample scored 10.68M tokens in 158.3s (~67.5k tok/s); a fixed
-source-order sample scored 1.66M tokens in 79.8s (~20.8k tok/s). The difference
-is throughput, not score semantics: reset score-only BPB is order-invariant, and
-the tests compare chunked sorted/source-order runs against whole-doc scoring.
-Confirm with an actual multi-GPU full-validation run before treating any
-projection as a record floor.
+`max_forward_tokens=524288`, the effective shape was `2048 x 256`. Before
+chunk-aware packing landed, a sorted long-document sample scored 10.68M tokens
+in 158.3s (~67.5k tok/s), while a fixed source-order sample scored 1.66M tokens
+in 79.8s (~20.8k tok/s). CUDA graph mode was parity-checked at `128 x 256`:
+2.40M tokens in 57.64s eager vs. 52.03s graph, same BPB/tokens, 43 graph
+replays. Confirm the current packing+graph combination with an actual multi-GPU
+full-validation run before treating any projection as a record floor.
 
 ## Exploratory Floor Pass
 

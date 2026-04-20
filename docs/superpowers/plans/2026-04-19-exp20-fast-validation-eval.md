@@ -98,8 +98,10 @@ which historically skipped those boundary targets.
 Hot-loop shape policy:
 
 - Stage cache tokens onto the target device once before the scoring loop.
-- Length-sort each rank's work for dense full-width chunk groups, but preserve
-  original doc order in the JSONL output.
+- Pack docs by chunk count, tail bucket, and token length for dense full-width
+  chunk groups, but preserve original doc order in the JSONL output.
+- Under distributed scoring, form packed batches globally and assign them to
+  ranks with longest-processing-time first by padded token work.
 - Treat `doc_batch_size` as an upper bound and cap effective microbatches with
   `max_forward_tokens / chunk_size` so sorted longest-doc batches do not OOM.
   `--max-forward-tokens auto` probes the requested fixed shape on CUDA, backs
@@ -116,6 +118,10 @@ Hot-loop shape policy:
   scoring time. The initial full-shape compile probe exceeded several minutes
   before first batch completion, so CUDA graph capture or a smaller fixed-shape
   wrapper should be investigated separately.
+- Add `--score-graph-mode cuda` as an eager-fallback graph replay path for only
+  the fixed full-batch full-chunk scorer group with previous recurrent states.
+  Record `graph_replay_count` and `graph_fallback_count` so performance claims
+  disclose how much of the run actually used graph replay.
 
 - [ ] **Step 3: Remove hot-loop CPU syncs**
 

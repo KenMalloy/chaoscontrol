@@ -33,6 +33,14 @@ def _diag_recurrence_inner(decay: torch.Tensor, update: torch.Tensor) -> torch.T
 _DEFAULT_CHUNK_SIZE = 32
 
 
+def _should_use_zero_initial_state_fast_path(initial_state: torch.Tensor) -> bool:
+    if initial_state.requires_grad:
+        return False
+    if initial_state.is_cuda and torch.cuda.is_current_stream_capturing():
+        return False
+    return not torch.any(initial_state)
+
+
 def _diag_recurrence_chunked(
     decay: torch.Tensor,
     update: torch.Tensor,
@@ -539,7 +547,7 @@ class ChaosSSMCore(nn.Module):
             # Training's zero-init buffer is `x.new_zeros` with grad disabled,
             # so the fast path still fires there. See
             # test_trainable_h0_receives_gradient for the regression pin.
-            if not torch.any(initial_state) and not initial_state.requires_grad:
+            if _should_use_zero_initial_state_fast_path(initial_state):
                 initial_state = None
         else:
             state = x.new_zeros((batch, dim))

@@ -29,6 +29,8 @@ fast_score = _load_module()
 doc_range_for_rank = fast_score.doc_range_for_rank
 expected_scored_tokens = fast_score.expected_scored_tokens
 prepare_doc_work = fast_score.prepare_doc_work
+prepare_rank_doc_work = fast_score.prepare_rank_doc_work
+padded_token_work = fast_score.padded_token_work
 resolve_doc_batch_size = fast_score.resolve_doc_batch_size
 resolve_max_forward_tokens = fast_score.resolve_max_forward_tokens
 resolve_distributed_context = fast_score.resolve_distributed_context
@@ -243,10 +245,14 @@ def test_chunk_boundary_targets_match_whole_doc_score(
     summary = json.loads(chunked_summary.read_text())
     assert summary["tokens_scored"] == expected_targets
     assert summary["score_boundary_targets"] is True
-    assert summary["doc_ordering"] == "token_len_desc"
+    assert summary["doc_ordering"] == "chunk_count_tail"
+    assert summary["doc_packing"] == "chunk_count_tail"
     assert summary["device_tokens_staged"] is True
     assert summary["torch_compile_mode"] == "none"
     assert summary["score_warmup_steps"] == 0
+    assert summary["score_graph_mode"] == "none"
+    assert summary["graph_replay_count"] == 0
+    assert summary["graph_fallback_count"] == 0
 
     source_out = tmp_path / "source.jsonl"
     source_summary = tmp_path / "source_summary.json"
@@ -327,6 +333,56 @@ def test_prepare_doc_work_sorts_by_length_and_remembers_output_order() -> None:
     assert [work.output_index for work in original_work] == [0, 1, 2]
 
 
+def test_prepare_doc_work_sorts_by_chunk_count_tail() -> None:
+    docs = [
+        CachedDoc(doc_id=0, token_start=0, token_len=17, raw_bytes=17),
+        CachedDoc(doc_id=1, token_start=17, token_len=33, raw_bytes=33),
+        CachedDoc(doc_id=2, token_start=50, token_len=31, raw_bytes=31),
+        CachedDoc(doc_id=3, token_start=81, token_len=32, raw_bytes=32),
+    ]
+
+    work = prepare_doc_work(docs, doc_packing="chunk_count_tail", chunk_size=16)
+
+    assert [item.doc.doc_id for item in work] == [1, 3, 2, 0]
+    assert [item.output_index for item in work] == [1, 3, 2, 0]
+
+
+def test_prepare_rank_doc_work_lpt_balances_padded_batches() -> None:
+    docs = [
+        CachedDoc(doc_id=0, token_start=0, token_len=65, raw_bytes=65),
+        CachedDoc(doc_id=1, token_start=65, token_len=64, raw_bytes=64),
+        CachedDoc(doc_id=2, token_start=129, token_len=33, raw_bytes=33),
+        CachedDoc(doc_id=3, token_start=162, token_len=32, raw_bytes=32),
+        CachedDoc(doc_id=4, token_start=194, token_len=17, raw_bytes=17),
+        CachedDoc(doc_id=5, token_start=211, token_len=16, raw_bytes=16),
+    ]
+
+    rank0 = prepare_rank_doc_work(
+        docs,
+        rank=0,
+        world_size=2,
+        doc_packing="chunk_count_tail",
+        chunk_size=16,
+        doc_batch_size=2,
+    )
+    rank1 = prepare_rank_doc_work(
+        docs,
+        rank=1,
+        world_size=2,
+        doc_packing="chunk_count_tail",
+        chunk_size=16,
+        doc_batch_size=2,
+    )
+
+    covered = sorted(item.output_index for item in rank0 + rank1)
+    assert covered == list(range(len(docs)))
+    loads = [
+        sum(padded_token_work(item.doc, chunk_size=16) for item in rank_work)
+        for rank_work in (rank0, rank1)
+    ]
+    assert max(loads) - min(loads) <= 32
+
+
 def test_resolve_doc_batch_size_caps_by_token_budget() -> None:
     assert resolve_doc_batch_size(
         requested_doc_batch_size=4096,
@@ -379,6 +435,36 @@ def test_resolve_max_forward_tokens_accepts_explicit_integer() -> None:
         device=torch.device("cuda"),
         probe_fn=lambda _limit: 1,
     ) == 131_072
+
+
+def test_cuda_graph_mode_requires_cuda(tiny_fixture: dict[str, Path], tmp_path: Path) -> None:
+    run = subprocess.run(
+        [
+            sys.executable,
+            "scripts/run_exp20_fast_score.py",
+            "--cache-dir",
+            str(tiny_fixture["cache_dir"]),
+            "--checkpoint-path",
+            str(tiny_fixture["ckpt"]),
+            "--output-path",
+            str(tmp_path / "out.jsonl"),
+            "--summary-path",
+            str(tmp_path / "summary.json"),
+            "--chunk-size",
+            "8",
+            "--doc-batch-size",
+            "3",
+            "--score-graph-mode",
+            "cuda",
+            "--device",
+            "cpu",
+        ],
+        capture_output=True,
+        text=True,
+    )
+
+    assert run.returncode != 0
+    assert "--score-graph-mode cuda requires CUDA" in run.stderr
 
 
 def test_doc_range_for_rank_partitions_docs_exactly_once() -> None:

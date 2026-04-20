@@ -51,11 +51,120 @@ class _DocScore(NamedTuple):
     state_norm: float
 
 
-def prepare_doc_work(docs: list[CachedDoc], *, sort_by_length: bool) -> list[_DocWork]:
-    work = [_DocWork(doc=doc, output_index=idx) for idx, doc in enumerate(docs)]
-    if sort_by_length:
-        return sorted(work, key=lambda item: (-item.doc.token_len, item.output_index))
+class _ScoreGraphStats:
+    def __init__(self) -> None:
+        self.replay_count = 0
+        self.fallback_count = 0
+
+
+def chunk_count_for_doc(doc: CachedDoc, *, chunk_size: int) -> int:
+    if chunk_size < 0:
+        return 1 if int(doc.token_len) >= 2 else 0
+    return max(1, (int(doc.token_len) + int(chunk_size) - 1) // int(chunk_size))
+
+
+def padded_token_work(doc: CachedDoc, *, chunk_size: int) -> int:
+    if chunk_size < 0:
+        return int(doc.token_len)
+    return chunk_count_for_doc(doc, chunk_size=chunk_size) * int(chunk_size)
+
+
+def resolve_doc_packing(
+    *,
+    doc_packing: str | None,
+    sort_docs_by_length: bool | None,
+) -> str:
+    if doc_packing:
+        return doc_packing
+    if sort_docs_by_length is False:
+        return "source_order"
+    if sort_docs_by_length is True:
+        return "token_len_desc"
+    return "chunk_count_tail"
+
+
+def _doc_packing_key(item: _DocWork, *, doc_packing: str, chunk_size: int) -> tuple[int, ...]:
+    n_tokens = int(item.doc.token_len)
+    n_chunks = chunk_count_for_doc(item.doc, chunk_size=chunk_size)
+    if chunk_size < 0:
+        tail = 0
+        tail_bucket = 0
+    else:
+        tail = n_tokens % int(chunk_size)
+        tail_bucket = tail // min(32, max(1, int(chunk_size)))
+    if doc_packing == "source_order":
+        return (item.output_index,)
+    if doc_packing == "token_len_desc":
+        return (-n_tokens, item.output_index)
+    if doc_packing == "chunk_count_desc":
+        return (-n_chunks, -n_tokens, item.output_index)
+    if doc_packing == "chunk_count_tail":
+        return (-n_chunks, tail_bucket, -n_tokens, item.output_index)
+    raise ValueError(f"unsupported doc_packing: {doc_packing}")
+
+
+def prepare_doc_work(
+    docs: list[CachedDoc],
+    *,
+    sort_by_length: bool | None = None,
+    doc_packing: str | None = None,
+    chunk_size: int = 256,
+    start_index: int = 0,
+) -> list[_DocWork]:
+    packing = resolve_doc_packing(
+        doc_packing=doc_packing,
+        sort_docs_by_length=sort_by_length,
+    )
+    work = [
+        _DocWork(doc=doc, output_index=start_index + idx)
+        for idx, doc in enumerate(docs)
+    ]
+    if packing != "source_order":
+        return sorted(work, key=lambda item: _doc_packing_key(
+            item,
+            doc_packing=packing,
+            chunk_size=chunk_size,
+        ))
     return work
+
+
+def prepare_rank_doc_work(
+    docs: list[CachedDoc],
+    *,
+    rank: int,
+    world_size: int,
+    doc_packing: str,
+    chunk_size: int,
+    doc_batch_size: int,
+) -> list[_DocWork]:
+    if doc_packing == "source_order":
+        start, end = doc_range_for_rank(num_docs=len(docs), rank=rank, world_size=world_size)
+        return prepare_doc_work(
+            docs[start:end],
+            doc_packing="source_order",
+            chunk_size=chunk_size,
+            start_index=start,
+        )
+    work = prepare_doc_work(docs, doc_packing=doc_packing, chunk_size=chunk_size)
+    if world_size <= 1:
+        return work
+
+    batch_size = max(1, int(doc_batch_size))
+    batches = [work[idx:idx + batch_size] for idx in range(0, len(work), batch_size)]
+    batches.sort(
+        key=lambda batch: sum(padded_token_work(item.doc, chunk_size=chunk_size) for item in batch),
+        reverse=True,
+    )
+    rank_loads = [0 for _ in range(world_size)]
+    rank_batches: list[list[_DocWork]] = [[] for _ in range(world_size)]
+    for batch in batches:
+        target_rank = min(range(world_size), key=lambda idx: (rank_loads[idx], idx))
+        rank_batches[target_rank].extend(batch)
+        rank_loads[target_rank] += sum(
+            padded_token_work(item.doc, chunk_size=chunk_size)
+            for item in batch
+        )
+    return rank_batches[rank]
 
 
 def resolve_doc_batch_size(
@@ -269,6 +378,117 @@ def _run_score_warmup(
     return time.monotonic() - warmup_t0
 
 
+class _CudaGraphScoreRunner:
+    def __init__(
+        self,
+        model: torch.nn.Module,
+        *,
+        batch_size: int,
+        seq_len: int,
+        device: torch.device,
+        score_boundary_targets: bool,
+    ) -> None:
+        if device.type != "cuda":
+            raise RuntimeError("--score-graph-mode cuda requires CUDA")
+        if batch_size <= 0 or seq_len < 2:
+            raise ValueError("CUDA graph scoring requires batch_size > 0 and seq_len >= 2")
+
+        self.model = model
+        self.batch_size = int(batch_size)
+        self.seq_len = int(seq_len)
+        self.device = device
+        self.score_boundary_targets = bool(score_boundary_targets)
+        self.static_chunk = torch.empty(
+            (self.batch_size, self.seq_len),
+            dtype=torch.long,
+            device=device,
+        )
+        self.static_boundary_targets = torch.empty(
+            self.batch_size,
+            dtype=torch.long,
+            device=device,
+        )
+        self.static_boundary_mask = torch.empty(
+            self.batch_size,
+            dtype=torch.float32,
+            device=device,
+        )
+        self.static_chunk.zero_()
+        self.static_boundary_targets.zero_()
+        self.static_boundary_mask.fill_(1.0)
+        self.static_prev_states = self._make_static_prev_states()
+        self.graph = torch.cuda.CUDAGraph()
+        self.static_losses: torch.Tensor | None = None
+        self.static_final_states: list[torch.Tensor] | None = None
+        self._capture()
+
+    def _make_static_prev_states(self) -> list[torch.Tensor]:
+        with torch.inference_mode():
+            out = self.model(self.static_chunk)
+            final_states = _model_final_states(out)
+            if not final_states:
+                raise RuntimeError("CUDA graph scoring requires model final_states")
+            prev_states = [torch.empty_like(state) for state in final_states]
+            for state in prev_states:
+                state.fill_(1e-3)
+            del out, final_states
+        return prev_states
+
+    def _forward_static(self) -> tuple[torch.Tensor, list[torch.Tensor]]:
+        out = self.model(self.static_chunk, initial_states=self.static_prev_states)
+        logits = _model_logits(out)
+        losses = F.cross_entropy(
+            logits[:, :-1].reshape(-1, logits.size(-1)),
+            self.static_chunk[:, 1:].reshape(-1),
+            reduction="none",
+        ).reshape(self.batch_size, self.seq_len - 1).sum(dim=1)
+        if self.score_boundary_targets:
+            boundary_losses = F.cross_entropy(
+                logits[:, -1, :],
+                self.static_boundary_targets,
+                reduction="none",
+            )
+            losses = losses + boundary_losses * self.static_boundary_mask.to(boundary_losses.dtype)
+        final_states = _model_final_states(out)
+        if not final_states:
+            raise RuntimeError("CUDA graph scoring requires model final_states")
+        return losses, final_states
+
+    def _capture(self) -> None:
+        warmup_stream = torch.cuda.Stream(device=self.device)
+        warmup_stream.wait_stream(torch.cuda.current_stream(self.device))
+        with torch.cuda.stream(warmup_stream), torch.inference_mode():
+            for _ in range(3):
+                losses, final_states = self._forward_static()
+                del losses, final_states
+        torch.cuda.current_stream(self.device).wait_stream(warmup_stream)
+        with torch.cuda.graph(self.graph), torch.inference_mode():
+            self.static_losses, self.static_final_states = self._forward_static()
+
+    def replay(
+        self,
+        *,
+        chunk: torch.Tensor,
+        initial_states: list[torch.Tensor],
+        boundary_targets: torch.Tensor,
+        boundary_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, list[torch.Tensor]]:
+        if tuple(chunk.shape) != tuple(self.static_chunk.shape):
+            raise ValueError(f"graph chunk shape {tuple(chunk.shape)} != {tuple(self.static_chunk.shape)}")
+        if len(initial_states) != len(self.static_prev_states):
+            raise ValueError("graph initial state count mismatch")
+        self.static_chunk.copy_(chunk, non_blocking=True)
+        for static_state, state in zip(self.static_prev_states, initial_states):
+            static_state.copy_(state, non_blocking=True)
+        if self.score_boundary_targets:
+            self.static_boundary_targets.copy_(boundary_targets, non_blocking=True)
+            self.static_boundary_mask.copy_(boundary_mask, non_blocking=True)
+        self.graph.replay()
+        if self.static_losses is None or self.static_final_states is None:
+            raise RuntimeError("CUDA graph replay used before capture")
+        return self.static_losses, self.static_final_states
+
+
 def _rank_output_path(output_path: Path, rank: int, world_size: int) -> Path:
     if world_size <= 1:
         return output_path
@@ -349,6 +569,8 @@ def _score_docs_reset_batch(
     chunk_size: int,
     device: torch.device,
     score_boundary_targets: bool,
+    score_graph_runner: _CudaGraphScoreRunner | None = None,
+    graph_stats: _ScoreGraphStats | None = None,
 ) -> list[_DocScore]:
     """Score a document batch while preserving reset-mode semantics.
 
@@ -369,6 +591,7 @@ def _score_docs_reset_batch(
         device=device,
     )
     token_lens = [int(item.doc.token_len) for item in work_items]
+    token_lens_tensor = torch.tensor(token_lens, dtype=torch.long, device=device)
     ce_sums = torch.zeros(batch_size, device=device, dtype=torch.float64)
     tokens_scored = [0 for _ in work_items]
     chunk_counts = [0 for _ in work_items]
@@ -413,17 +636,9 @@ def _score_docs_reset_batch(
             else:
                 initial_states = [state.index_select(0, row_index) for state in states]
 
-        chunk = device_tokens[starts.unsqueeze(1) + offsets_for(seq_len).unsqueeze(0)]
-        kwargs = {"initial_states": initial_states} if initial_states is not None else {}
-        out = model(chunk, **kwargs)
-        logits = _model_logits(out)
-        losses = F.cross_entropy(
-            logits[:, :-1].reshape(-1, logits.size(-1)),
-            chunk[:, 1:].reshape(-1),
-            reduction="none",
-        ).reshape(len(doc_indices), seq_len - 1).sum(dim=1)
-
         boundary_token_count = [0 for _ in doc_indices]
+        graph_boundary_targets: torch.Tensor | None = None
+        graph_boundary_mask: torch.Tensor | None = None
         if score_boundary_targets:
             boundary_rows: list[int] = []
             boundary_doc_indices: list[int] = []
@@ -433,7 +648,53 @@ def _score_docs_reset_batch(
                     boundary_rows.append(row_idx)
                     boundary_doc_indices.append(doc_idx)
                     boundary_token_count[row_idx] = 1
-            if boundary_rows:
+            if score_graph_runner is not None and len(doc_indices) == score_graph_runner.batch_size:
+                if row_index is None:
+                    doc_index_tensor = torch.arange(len(doc_indices), dtype=torch.long, device=device)
+                else:
+                    doc_index_tensor = row_index
+                has_boundary = token_lens_tensor.index_select(0, doc_index_tensor) > next_token_pos
+                safe_positions = torch.where(
+                    has_boundary,
+                    token_starts.index_select(0, doc_index_tensor) + next_token_pos,
+                    token_starts.index_select(0, doc_index_tensor),
+                )
+                graph_boundary_targets = device_tokens[safe_positions]
+                graph_boundary_mask = has_boundary.to(torch.float32)
+
+        chunk = device_tokens[starts.unsqueeze(1) + offsets_for(seq_len).unsqueeze(0)]
+        can_replay_graph = (
+            score_graph_runner is not None
+            and contiguous_prefix
+            and len(doc_indices) == score_graph_runner.batch_size
+            and seq_len == score_graph_runner.seq_len
+            and initial_states is not None
+        )
+        if can_replay_graph:
+            if graph_boundary_targets is None:
+                graph_boundary_targets = torch.zeros(len(doc_indices), dtype=torch.long, device=device)
+                graph_boundary_mask = torch.zeros(len(doc_indices), dtype=torch.float32, device=device)
+            assert graph_boundary_mask is not None
+            losses, final_states = score_graph_runner.replay(
+                chunk=chunk,
+                initial_states=initial_states,
+                boundary_targets=graph_boundary_targets,
+                boundary_mask=graph_boundary_mask,
+            )
+            if graph_stats is not None:
+                graph_stats.replay_count += 1
+        else:
+            if graph_stats is not None:
+                graph_stats.fallback_count += 1
+            kwargs = {"initial_states": initial_states} if initial_states is not None else {}
+            out = model(chunk, **kwargs)
+            logits = _model_logits(out)
+            losses = F.cross_entropy(
+                logits[:, :-1].reshape(-1, logits.size(-1)),
+                chunk[:, 1:].reshape(-1),
+                reduction="none",
+            ).reshape(len(doc_indices), seq_len - 1).sum(dim=1)
+            if score_boundary_targets and boundary_doc_indices:
                 boundary_row_index = torch.tensor(boundary_rows, dtype=torch.long, device=device)
                 boundary_docs = row_index_for(boundary_doc_indices)
                 targets = device_tokens[token_starts.index_select(0, boundary_docs) + next_token_pos]
@@ -443,8 +704,7 @@ def _score_docs_reset_batch(
                     reduction="none",
                 )
                 losses.index_add_(0, boundary_row_index, boundary_losses)
-
-        final_states = _model_final_states(out)
+            final_states = _model_final_states(out)
         if states is None and final_states is not None:
             states = [
                 torch.empty(
@@ -543,6 +803,8 @@ def run(args: argparse.Namespace) -> dict:
     if device.type == "cuda":
         torch.cuda.set_device(local_rank)
         device = torch.device("cuda", local_rank)
+    if args.score_graph_mode == "cuda" and device.type != "cuda":
+        raise RuntimeError("--score-graph-mode cuda requires CUDA")
 
     setup_t0 = time.monotonic()
     cache = load_val_cache(args.cache_dir)
@@ -573,16 +835,12 @@ def run(args: argparse.Namespace) -> dict:
     timed_out = False
 
     docs = list(cache.iter_docs())
-    doc_start, doc_end = doc_range_for_rank(
-        num_docs=len(docs),
-        rank=rank,
-        world_size=world_size,
+    doc_packing = resolve_doc_packing(
+        doc_packing=args.doc_packing,
+        sort_docs_by_length=args.sort_docs_by_length,
     )
-
-    rank_docs = docs[doc_start:doc_end]
-    doc_work = prepare_doc_work(rank_docs, sort_by_length=args.sort_docs_by_length)
     device_tokens = torch.tensor(cache.tokens, dtype=torch.long, device=device)
-    doc_records: list[str | None] = [None for _ in rank_docs]
+    doc_records: dict[int, str] = {}
     requested_doc_batch_size = max(1, int(args.doc_batch_size))
     max_forward_tokens = resolve_max_forward_tokens(
         max_forward_tokens=args.max_forward_tokens,
@@ -603,6 +861,20 @@ def run(args: argparse.Namespace) -> dict:
         chunk_size=args.chunk_size,
         max_forward_tokens=max_forward_tokens,
     )
+    doc_work = prepare_rank_doc_work(
+        docs,
+        rank=rank,
+        world_size=world_size,
+        doc_packing=doc_packing,
+        chunk_size=args.chunk_size,
+        doc_batch_size=doc_batch_size,
+    )
+    if doc_work:
+        rank_doc_start = min(item.output_index for item in doc_work)
+        rank_doc_end = max(item.output_index for item in doc_work) + 1
+    else:
+        rank_doc_start = 0
+        rank_doc_end = 0
     score_warmup_seconds = _run_score_warmup(
         model,
         doc_batch_size=doc_batch_size,
@@ -610,6 +882,16 @@ def run(args: argparse.Namespace) -> dict:
         device=device,
         steps=args.score_warmup_steps,
     )
+    graph_stats = _ScoreGraphStats() if args.score_graph_mode == "cuda" else None
+    score_graph_runner = None
+    if args.score_graph_mode == "cuda" and doc_batch_size > 1 and args.chunk_size >= 2:
+        score_graph_runner = _CudaGraphScoreRunner(
+            model,
+            batch_size=doc_batch_size,
+            seq_len=args.chunk_size,
+            device=device,
+            score_boundary_targets=args.score_boundary_targets,
+        )
     pre_eval_setup_seconds = time.monotonic() - setup_t0
     run_t0 = time.monotonic()
     with torch.inference_mode():
@@ -650,6 +932,8 @@ def run(args: argparse.Namespace) -> dict:
                     chunk_size=args.chunk_size,
                     device=device,
                     score_boundary_targets=args.score_boundary_targets,
+                    score_graph_runner=score_graph_runner,
+                    graph_stats=graph_stats,
                 )
             budget.add_score_time(time.monotonic() - score_t0)
             for score in scores:
@@ -682,9 +966,8 @@ def run(args: argparse.Namespace) -> dict:
                 break
 
     with rank_output_path.open("w", encoding="utf-8") as out_fh:
-        for record in doc_records:
-            if record is not None:
-                out_fh.write(record + "\n")
+        for _doc_idx, record in sorted(doc_records.items()):
+            out_fh.write(record + "\n")
 
     elapsed = time.monotonic() - run_t0
     if distributed:
@@ -735,8 +1018,9 @@ def run(args: argparse.Namespace) -> dict:
         "parallel_semantics": args.persistence_mode,
         "world_size": world_size,
         "rank": rank,
-        "rank_doc_start": doc_start,
-        "rank_doc_end": doc_end,
+        "rank_doc_start": rank_doc_start,
+        "rank_doc_end": rank_doc_end,
+        "rank_doc_count": len(doc_work),
         "rank_output_path": str(rank_output_path),
         "doc_batch_size": doc_batch_size,
         "requested_doc_batch_size": requested_doc_batch_size,
@@ -744,13 +1028,23 @@ def run(args: argparse.Namespace) -> dict:
         "max_forward_tokens_request": str(args.max_forward_tokens),
         "max_batch_tokens": int(max_forward_tokens),
         "score_boundary_targets": bool(args.score_boundary_targets),
-        "doc_ordering": "token_len_desc" if args.sort_docs_by_length else "source_order",
+        "doc_ordering": doc_packing,
+        "doc_packing": doc_packing,
+        "rank_assignment": (
+            "contiguous_source_range"
+            if doc_packing == "source_order"
+            else ("single_rank" if world_size == 1 else "lpt_padded_tokens")
+        ),
         "device_tokens_staged": True,
         "device_token_dtype": str(device_tokens.dtype),
         "torch_compile_mode": args.torch_compile_mode,
         "score_warmup_steps": int(args.score_warmup_steps),
         "score_warmup_seconds": score_warmup_seconds,
         "pre_eval_setup_seconds": pre_eval_setup_seconds,
+        "score_graph_mode": args.score_graph_mode,
+        "score_graph_enabled": score_graph_runner is not None,
+        "graph_replay_count": graph_stats.replay_count if graph_stats is not None else 0,
+        "graph_fallback_count": graph_stats.fallback_count if graph_stats is not None else 0,
     })
     if world_size == 4:
         summary["projected_8x_wall_seconds"] = elapsed * 4.0 / 8.0
@@ -780,6 +1074,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--persistence-mode", choices=["reset"], default="reset")
     parser.add_argument("--doc-batch-size", type=int, default=1)
     parser.add_argument(
+        "--doc-packing",
+        choices=["source_order", "token_len_desc", "chunk_count_desc", "chunk_count_tail"],
+        default=None,
+        help=(
+            "Document scheduling policy. Defaults to chunk_count_tail; "
+            "--no-sort-docs-by-length remains an alias for source_order."
+        ),
+    )
+    parser.add_argument(
         "--max-forward-tokens",
         default="auto",
         help=(
@@ -790,13 +1093,14 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--max-batch-tokens", dest="max_forward_tokens", help=argparse.SUPPRESS)
     parser.add_argument("--score-boundary-targets", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--sort-docs-by-length", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--sort-docs-by-length", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument(
         "--torch-compile-mode",
         choices=["none", "default", "reduce-overhead", "max-autotune"],
         default="none",
     )
     parser.add_argument("--score-warmup-steps", type=int, default=0)
+    parser.add_argument("--score-graph-mode", choices=["none", "cuda"], default="none")
     parser.add_argument("--device", default="auto")
     return parser.parse_args()
 
