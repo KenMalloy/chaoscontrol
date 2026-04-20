@@ -17,8 +17,6 @@ import time
 from pathlib import Path
 from typing import NamedTuple
 
-import numpy as np
-
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 _SRC = _REPO_ROOT / "src"
 if _SRC.is_dir() and str(_SRC) not in sys.path:
@@ -33,14 +31,40 @@ from chaoscontrol.eval_stream.val_cache import CachedDoc, ValCache, load_val_cac
 from chaoscontrol.evaluation import compute_bpb
 
 
+class _DocWork(NamedTuple):
+    doc: CachedDoc
+    output_index: int
+
+
 class _DocScore(NamedTuple):
     doc: CachedDoc
+    output_index: int
     ce_nats: float
     tokens_scored: int
     chunk_count: int
     loss_before: float
     wall_ms: float
     state_norm: float
+
+
+def prepare_doc_work(docs: list[CachedDoc], *, sort_by_length: bool) -> list[_DocWork]:
+    work = [_DocWork(doc=doc, output_index=idx) for idx, doc in enumerate(docs)]
+    if sort_by_length:
+        return sorted(work, key=lambda item: (-item.doc.token_len, item.output_index))
+    return work
+
+
+def resolve_doc_batch_size(
+    *,
+    requested_doc_batch_size: int,
+    chunk_size: int,
+    max_batch_tokens: int,
+) -> int:
+    requested = max(1, int(requested_doc_batch_size))
+    if chunk_size < 0 or max_batch_tokens <= 0:
+        return requested
+    token_limited = max(1, int(max_batch_tokens) // max(1, int(chunk_size)))
+    return min(requested, token_limited)
 
 
 def doc_range_for_rank(*, num_docs: int, rank: int, world_size: int) -> tuple[int, int]:
@@ -109,19 +133,24 @@ def _score_doc(
     chunk_size: int,
     device: torch.device,
     score_boundary_targets: bool,
+    device_tokens: torch.Tensor | None = None,
 ) -> tuple[float, int, int, float, float, float]:
     prev_states: list[torch.Tensor] | None = None
     doc_ce = torch.zeros((), device=device, dtype=torch.float64)
     tokens_scored = 0
     chunk_count = 0
     t0 = time.monotonic()
-    doc_tokens_np = cache.tokens_for_doc(doc)
+    doc_tokens_np = None if device_tokens is not None else cache.tokens_for_doc(doc)
 
     for start, end in _token_chunk_ranges(int(doc.token_len), chunk_size):
-        chunk_np = doc_tokens_np[start:end]
-        if len(chunk_np) < 2:
+        if end - start < 2:
             continue
-        chunk = torch.tensor(chunk_np, dtype=torch.long, device=device).unsqueeze(0)
+        if device_tokens is not None:
+            chunk = device_tokens[doc.token_start + start:doc.token_start + end].unsqueeze(0)
+        else:
+            assert doc_tokens_np is not None
+            chunk_np = doc_tokens_np[start:end]
+            chunk = torch.tensor(chunk_np, dtype=torch.long, device=device).unsqueeze(0)
         kwargs = {"initial_states": prev_states} if prev_states else {}
         out = model(chunk, **kwargs)
         logits = out["logits"] if isinstance(out, dict) else out
@@ -131,11 +160,15 @@ def _score_doc(
             reduction="sum",
         )
         if score_boundary_targets and end < int(doc.token_len):
-            next_token = torch.tensor(
-                [int(doc_tokens_np[end])],
-                dtype=torch.long,
-                device=device,
-            )
+            if device_tokens is not None:
+                next_token = device_tokens[doc.token_start + end:doc.token_start + end + 1]
+            else:
+                assert doc_tokens_np is not None
+                next_token = torch.tensor(
+                    [int(doc_tokens_np[end])],
+                    dtype=torch.long,
+                    device=device,
+                )
             loss = loss + F.cross_entropy(
                 logits[:, -1, :],
                 next_token,
@@ -160,8 +193,8 @@ def _score_doc(
 def _score_docs_reset_batch(
     *,
     model: torch.nn.Module,
-    cache: ValCache,
-    docs: list[CachedDoc],
+    work_items: list[_DocWork],
+    device_tokens: torch.Tensor,
     chunk_size: int,
     device: torch.device,
     score_boundary_targets: bool,
@@ -172,122 +205,174 @@ def _score_docs_reset_batch(
     together chunks with the same true length, which avoids padding tokens from
     contaminating final-state diagnostics or future carried chunks.
     """
-    if not docs:
+    if not work_items:
         return []
+    if chunk_size < 0:
+        raise ValueError("batched reset scoring requires chunk_size >= 0")
+    work_items = sorted(work_items, key=lambda item: (-item.doc.token_len, item.output_index))
     batch_t0 = time.monotonic()
-    token_arrays = [cache.tokens_for_doc(doc) for doc in docs]
-    chunk_ranges = [
-        _token_chunk_ranges(int(doc.token_len), chunk_size)
-        for doc in docs
-    ]
-    progress = [0 for _ in docs]
-    states_by_doc: list[list[torch.Tensor] | None] = [None for _ in docs]
-    ce_sums = torch.zeros(len(docs), device=device, dtype=torch.float64)
-    tokens_scored = [0 for _ in docs]
-    chunk_counts = [0 for _ in docs]
-    wall_ms = [0.0 for _ in docs]
+    batch_size = len(work_items)
+    token_starts = torch.tensor(
+        [item.doc.token_start for item in work_items],
+        dtype=torch.long,
+        device=device,
+    )
+    token_lens = [int(item.doc.token_len) for item in work_items]
+    ce_sums = torch.zeros(batch_size, device=device, dtype=torch.float64)
+    tokens_scored = [0 for _ in work_items]
+    chunk_counts = [0 for _ in work_items]
+    states: list[torch.Tensor] | None = None
+    has_state = [False for _ in work_items]
+    arange_cache: dict[int, torch.Tensor] = {}
+    row_index_cache: dict[tuple[int, ...], torch.Tensor] = {}
+    max_token_len = max(token_lens)
 
-    while True:
-        groups: dict[int, list[int]] = {}
-        for doc_idx, ranges in enumerate(chunk_ranges):
-            if progress[doc_idx] >= len(ranges):
-                continue
-            start, end = ranges[progress[doc_idx]]
-            groups.setdefault(end - start, []).append(doc_idx)
-        if not groups:
-            break
+    def offsets_for(seq_len: int) -> torch.Tensor:
+        offsets = arange_cache.get(seq_len)
+        if offsets is None:
+            offsets = torch.arange(seq_len, dtype=torch.long, device=device)
+            arange_cache[seq_len] = offsets
+        return offsets
 
-        for seq_len, doc_indices in groups.items():
-            group_t0 = time.monotonic()
-            rows = []
-            for doc_idx in doc_indices:
-                start, end = chunk_ranges[doc_idx][progress[doc_idx]]
-                rows.append(token_arrays[doc_idx][start:end])
-            chunk_np = np.stack(rows, axis=0)
-            chunk = torch.tensor(chunk_np, dtype=torch.long, device=device)
+    def row_index_for(doc_indices: list[int]) -> torch.Tensor:
+        key = tuple(doc_indices)
+        row_index = row_index_cache.get(key)
+        if row_index is None:
+            row_index = torch.tensor(doc_indices, dtype=torch.long, device=device)
+            row_index_cache[key] = row_index
+        return row_index
 
-            prev_states = states_by_doc[doc_indices[0]]
-            if prev_states is None:
+    def process_group(doc_indices: list[int], *, chunk_start: int, seq_len: int) -> None:
+        nonlocal states
+        if not doc_indices:
+            return
+        contiguous_prefix = doc_indices == list(range(len(doc_indices)))
+        row_index: torch.Tensor | None = None
+        if contiguous_prefix:
+            starts = token_starts[:len(doc_indices)] + chunk_start
+            if states is None or not all(has_state[idx] for idx in doc_indices):
                 initial_states = None
             else:
-                initial_states = [
-                    torch.cat(
-                        [
-                            states_by_doc[doc_idx][layer_idx]  # type: ignore[index]
-                            for doc_idx in doc_indices
-                        ],
-                        dim=0,
-                    )
-                    for layer_idx in range(len(prev_states))
-                ]
-            kwargs = {"initial_states": initial_states} if initial_states is not None else {}
-            out = model(chunk, **kwargs)
-            logits = out["logits"] if isinstance(out, dict) else out
-            losses = F.cross_entropy(
-                logits[:, :-1].reshape(-1, logits.size(-1)),
-                chunk[:, 1:].reshape(-1),
-                reduction="none",
-            ).reshape(len(doc_indices), seq_len - 1).sum(dim=1)
-            boundary_token_count = [0 for _ in doc_indices]
-            if score_boundary_targets:
-                boundary_targets: list[int] = []
-                boundary_rows: list[int] = []
-                for row_idx, doc_idx in enumerate(doc_indices):
-                    _start, end = chunk_ranges[doc_idx][progress[doc_idx]]
-                    if end < int(docs[doc_idx].token_len):
-                        boundary_rows.append(row_idx)
-                        boundary_targets.append(int(token_arrays[doc_idx][end]))
-                        boundary_token_count[row_idx] = 1
-                if boundary_rows:
-                    row_index = torch.tensor(boundary_rows, dtype=torch.long, device=device)
-                    targets = torch.tensor(boundary_targets, dtype=torch.long, device=device)
-                    boundary_losses = F.cross_entropy(
-                        logits.index_select(0, row_index)[:, -1, :],
-                        targets,
-                        reduction="none",
-                    )
-                    losses.index_add_(0, row_index, boundary_losses)
+                initial_states = [state[:len(doc_indices)] for state in states]
+        else:
+            row_index = row_index_for(doc_indices)
+            starts = token_starts.index_select(0, row_index) + chunk_start
+            if states is None or not all(has_state[idx] for idx in doc_indices):
+                initial_states = None
+            else:
+                initial_states = [state.index_select(0, row_index) for state in states]
 
-            final_states = (
-                list(out["final_states"])
-                if isinstance(out, dict) and out.get("final_states")
-                else None
-            )
-            group_wall_ms = (time.monotonic() - group_t0) * 1000.0
-            wall_share_ms = group_wall_ms / max(len(doc_indices), 1)
+        chunk = device_tokens[starts.unsqueeze(1) + offsets_for(seq_len).unsqueeze(0)]
+        kwargs = {"initial_states": initial_states} if initial_states is not None else {}
+        out = model(chunk, **kwargs)
+        logits = out["logits"] if isinstance(out, dict) else out
+        losses = F.cross_entropy(
+            logits[:, :-1].reshape(-1, logits.size(-1)),
+            chunk[:, 1:].reshape(-1),
+            reduction="none",
+        ).reshape(len(doc_indices), seq_len - 1).sum(dim=1)
+
+        boundary_token_count = [0 for _ in doc_indices]
+        if score_boundary_targets:
+            boundary_rows: list[int] = []
+            boundary_doc_indices: list[int] = []
+            next_token_pos = chunk_start + seq_len
             for row_idx, doc_idx in enumerate(doc_indices):
-                ce_sums[doc_idx] += losses[row_idx].to(torch.float64)
-                tokens_scored[doc_idx] += seq_len - 1 + boundary_token_count[row_idx]
-                chunk_counts[doc_idx] += 1
-                progress[doc_idx] += 1
-                wall_ms[doc_idx] += wall_share_ms
-                if final_states is not None:
-                    states_by_doc[doc_idx] = [
-                        state[row_idx:row_idx + 1]
-                        for state in final_states
-                    ]
+                if next_token_pos < token_lens[doc_idx]:
+                    boundary_rows.append(row_idx)
+                    boundary_doc_indices.append(doc_idx)
+                    boundary_token_count[row_idx] = 1
+            if boundary_rows:
+                boundary_row_index = torch.tensor(boundary_rows, dtype=torch.long, device=device)
+                boundary_docs = row_index_for(boundary_doc_indices)
+                targets = device_tokens[token_starts.index_select(0, boundary_docs) + next_token_pos]
+                boundary_losses = F.cross_entropy(
+                    logits.index_select(0, boundary_row_index)[:, -1, :],
+                    targets,
+                    reduction="none",
+                )
+                losses.index_add_(0, boundary_row_index, boundary_losses)
+
+        final_states = (
+            list(out["final_states"])
+            if isinstance(out, dict) and out.get("final_states")
+            else None
+        )
+        if states is None and final_states is not None:
+            states = [
+                torch.empty(
+                    (batch_size, state.size(1)),
+                    dtype=state.dtype,
+                    device=device,
+                )
+                for state in final_states
+            ]
+        if states is not None and final_states is not None:
+            if contiguous_prefix:
+                for state, final_state in zip(states, final_states):
+                    state[:len(doc_indices)].copy_(final_state)
+            else:
+                assert row_index is not None
+                for state, final_state in zip(states, final_states):
+                    state.index_copy_(0, row_index, final_state)
+
+        if contiguous_prefix:
+            ce_sums[:len(doc_indices)] += losses.to(torch.float64)
+        else:
+            assert row_index is not None
+            ce_sums.index_add_(0, row_index, losses.to(torch.float64))
+        for row_idx, doc_idx in enumerate(doc_indices):
+            tokens_scored[doc_idx] += seq_len - 1 + boundary_token_count[row_idx]
+            chunk_counts[doc_idx] += 1
+            if final_states is not None:
+                has_state[doc_idx] = True
+
+    for chunk_start in range(0, max_token_len, chunk_size):
+        active_count = 0
+        full_count = 0
+        full_end = chunk_start + chunk_size
+        for token_len in token_lens:
+            remaining = token_len - chunk_start
+            if remaining < 2:
+                break
+            active_count += 1
+            if token_len >= full_end:
+                full_count += 1
+        process_group(list(range(full_count)), chunk_start=chunk_start, seq_len=chunk_size)
+
+        tail_groups: dict[int, list[int]] = {}
+        for doc_idx in range(full_count, active_count):
+            seq_len = token_lens[doc_idx] - chunk_start
+            tail_groups.setdefault(seq_len, []).append(doc_idx)
+        for seq_len, doc_indices in tail_groups.items():
+            process_group(doc_indices, chunk_start=chunk_start, seq_len=seq_len)
 
     batch_wall_ms = (time.monotonic() - batch_t0) * 1000.0
     total_wall_weight = sum(chunk_counts)
+    ce_values = ce_sums.cpu().tolist()
+    if states is None:
+        state_norm_values = [0.0 for _ in work_items]
+    else:
+        state_norm_tensor = torch.zeros(batch_size, dtype=torch.float64, device=device)
+        for state in states:
+            state_norm_tensor += state.norm(dim=1).to(torch.float64)
+        state_norm_values = (state_norm_tensor / len(states)).cpu().tolist()
     scores = []
-    for doc_idx, doc in enumerate(docs):
-        states = states_by_doc[doc_idx]
-        state_norm = 0.0
-        if states:
-            state_norm = sum(float(s.norm().item()) for s in states) / len(states)
-        ce_nats = float(ce_sums[doc_idx].item())
+    for doc_idx, item in enumerate(work_items):
+        ce_nats = float(ce_values[doc_idx])
         if total_wall_weight and chunk_counts[doc_idx]:
             measured_wall_ms = batch_wall_ms * chunk_counts[doc_idx] / total_wall_weight
         else:
-            measured_wall_ms = wall_ms[doc_idx]
+            measured_wall_ms = 0.0
         scores.append(_DocScore(
-            doc=doc,
+            doc=item.doc,
+            output_index=item.output_index,
             ce_nats=ce_nats,
             tokens_scored=tokens_scored[doc_idx],
             chunk_count=chunk_counts[doc_idx],
             loss_before=ce_nats / max(chunk_counts[doc_idx], 1),
             wall_ms=measured_wall_ms,
-            state_norm=state_norm,
+            state_norm=float(state_norm_values[doc_idx]),
         ))
     return scores
 
@@ -316,6 +401,11 @@ def run(args: argparse.Namespace) -> dict:
     model, _ckpt_cfg = _build_model(args.checkpoint_path)
     model.to(device)
     model.eval()
+    if args.torch_compile_mode != "none":
+        compile_kwargs = {}
+        if args.torch_compile_mode != "default":
+            compile_kwargs["mode"] = args.torch_compile_mode
+        model = torch.compile(model, **compile_kwargs)
 
     rank_output_path = _rank_output_path(args.output_path, rank, world_size)
     rank_output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -343,38 +433,50 @@ def run(args: argparse.Namespace) -> dict:
     )
 
     rank_docs = docs[doc_start:doc_end]
-    doc_batch_size = max(1, int(args.doc_batch_size))
-    with rank_output_path.open("w", encoding="utf-8") as out_fh, torch.inference_mode():
-        for batch_start in range(0, len(rank_docs), doc_batch_size):
+    doc_work = prepare_doc_work(rank_docs, sort_by_length=args.sort_docs_by_length)
+    device_tokens = torch.tensor(cache.tokens, dtype=torch.long, device=device)
+    doc_records: list[str | None] = [None for _ in rank_docs]
+    requested_doc_batch_size = max(1, int(args.doc_batch_size))
+    doc_batch_size = resolve_doc_batch_size(
+        requested_doc_batch_size=requested_doc_batch_size,
+        chunk_size=args.chunk_size,
+        max_batch_tokens=args.max_batch_tokens,
+    )
+    with torch.inference_mode():
+        for batch_start in range(0, len(doc_work), doc_batch_size):
             if time.monotonic() - run_t0 > args.budget_seconds:
                 timed_out = True
                 break
-            batch_docs = rank_docs[batch_start:batch_start + doc_batch_size]
+            batch_work = doc_work[batch_start:batch_start + doc_batch_size]
             score_t0 = time.monotonic()
-            if len(batch_docs) == 1:
-                doc = batch_docs[0]
-                ce_nats, doc_tokens, doc_chunks, loss_before, wall_ms, state_norm = _score_doc(
-                    model=model,
-                    cache=cache,
-                    doc=doc,
-                    chunk_size=args.chunk_size,
-                    device=device,
-                    score_boundary_targets=args.score_boundary_targets,
-                )
-                scores = [_DocScore(
-                    doc=doc,
-                    ce_nats=ce_nats,
-                    tokens_scored=doc_tokens,
-                    chunk_count=doc_chunks,
-                    loss_before=loss_before,
-                    wall_ms=wall_ms,
-                    state_norm=state_norm,
-                )]
+            if len(batch_work) == 1 or args.chunk_size < 0:
+                scores = []
+                for work_item in batch_work:
+                    doc = work_item.doc
+                    ce_nats, doc_tokens, doc_chunks, loss_before, wall_ms, state_norm = _score_doc(
+                        model=model,
+                        cache=cache,
+                        doc=doc,
+                        chunk_size=args.chunk_size,
+                        device=device,
+                        score_boundary_targets=args.score_boundary_targets,
+                        device_tokens=device_tokens,
+                    )
+                    scores.append(_DocScore(
+                        doc=doc,
+                        output_index=work_item.output_index,
+                        ce_nats=ce_nats,
+                        tokens_scored=doc_tokens,
+                        chunk_count=doc_chunks,
+                        loss_before=loss_before,
+                        wall_ms=wall_ms,
+                        state_norm=state_norm,
+                    ))
             else:
                 scores = _score_docs_reset_batch(
                     model=model,
-                    cache=cache,
-                    docs=batch_docs,
+                    work_items=batch_work,
+                    device_tokens=device_tokens,
                     chunk_size=args.chunk_size,
                     device=device,
                     score_boundary_targets=args.score_boundary_targets,
@@ -389,7 +491,7 @@ def run(args: argparse.Namespace) -> dict:
                 tokens_scored += int(score.tokens_scored)
                 chunks_scored += int(score.chunk_count)
                 docs_scored += 1
-                out_fh.write(json.dumps({
+                doc_records[score.output_index] = json.dumps({
                     "doc_id": score.doc.doc_id,
                     "bpb": doc_bpb,
                     "tokens": score.tokens_scored,
@@ -399,11 +501,15 @@ def run(args: argparse.Namespace) -> dict:
                     "wall_ms": score.wall_ms,
                     "grad_norm": 0.0,
                     "state_norm": score.state_norm,
-                }) + "\n")
-            out_fh.flush()
-            if time.monotonic() - run_t0 > args.budget_seconds and batch_start + doc_batch_size < len(rank_docs):
+                })
+            if time.monotonic() - run_t0 > args.budget_seconds and batch_start + doc_batch_size < len(doc_work):
                 timed_out = True
                 break
+
+    with rank_output_path.open("w", encoding="utf-8") as out_fh:
+        for record in doc_records:
+            if record is not None:
+                out_fh.write(record + "\n")
 
     elapsed = time.monotonic() - run_t0
     if distributed:
@@ -458,7 +564,13 @@ def run(args: argparse.Namespace) -> dict:
         "rank_doc_end": doc_end,
         "rank_output_path": str(rank_output_path),
         "doc_batch_size": doc_batch_size,
+        "requested_doc_batch_size": requested_doc_batch_size,
+        "max_batch_tokens": int(args.max_batch_tokens),
         "score_boundary_targets": bool(args.score_boundary_targets),
+        "doc_ordering": "token_len_desc" if args.sort_docs_by_length else "source_order",
+        "device_tokens_staged": True,
+        "device_token_dtype": str(device_tokens.dtype),
+        "torch_compile_mode": args.torch_compile_mode,
     })
     if world_size == 4:
         summary["projected_8x_wall_seconds"] = elapsed * 4.0 / 8.0
@@ -487,7 +599,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--safety-margin-seconds", type=float, default=0.0)
     parser.add_argument("--persistence-mode", choices=["reset"], default="reset")
     parser.add_argument("--doc-batch-size", type=int, default=1)
+    parser.add_argument("--max-batch-tokens", type=int, default=524_288)
     parser.add_argument("--score-boundary-targets", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--sort-docs-by-length", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--torch-compile-mode",
+        choices=["none", "default", "reduce-overhead", "max-autotune"],
+        default="none",
+    )
     parser.add_argument("--device", default="auto")
     return parser.parse_args()
 

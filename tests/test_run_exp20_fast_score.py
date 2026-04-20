@@ -10,7 +10,7 @@ import pytest
 import sentencepiece as spm
 import torch
 
-from chaoscontrol.eval_stream.val_cache import load_val_cache, write_val_cache
+from chaoscontrol.eval_stream.val_cache import CachedDoc, load_val_cache, write_val_cache
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -27,6 +27,8 @@ def _load_module():
 
 fast_score = _load_module()
 doc_range_for_rank = fast_score.doc_range_for_rank
+prepare_doc_work = fast_score.prepare_doc_work
+resolve_doc_batch_size = fast_score.resolve_doc_batch_size
 resolve_distributed_context = fast_score.resolve_distributed_context
 
 
@@ -217,7 +219,7 @@ def test_chunk_boundary_targets_match_whole_doc_score(
             "--device",
             "cpu",
             "--doc-batch-size",
-            "2",
+            "3",
         ],
         capture_output=True,
         text=True,
@@ -238,6 +240,77 @@ def test_chunk_boundary_targets_match_whole_doc_score(
     summary = json.loads(chunked_summary.read_text())
     assert summary["tokens_scored"] == expected_targets
     assert summary["score_boundary_targets"] is True
+    assert summary["doc_ordering"] == "token_len_desc"
+    assert summary["device_tokens_staged"] is True
+    assert summary["torch_compile_mode"] == "none"
+
+    source_out = tmp_path / "source.jsonl"
+    source_summary = tmp_path / "source_summary.json"
+    source_order = subprocess.run(
+        [
+            sys.executable,
+            "scripts/run_exp20_fast_score.py",
+            "--cache-dir",
+            str(tiny_fixture["cache_dir"]),
+            "--checkpoint-path",
+            str(tiny_fixture["ckpt"]),
+            "--output-path",
+            str(source_out),
+            "--summary-path",
+            str(source_summary),
+            "--chunk-size",
+            "8",
+            "--device",
+            "cpu",
+            "--doc-batch-size",
+            "3",
+            "--no-sort-docs-by-length",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert source_order.returncode == 0, source_order.stderr
+    source_records = _read_jsonl(source_out)
+    assert [r["doc_id"] for r in source_records] == [r["doc_id"] for r in whole_records]
+    assert sum(r["tokens"] for r in source_records) == expected_targets
+    for whole_rec, source_rec in zip(whole_records, source_records):
+        assert source_rec["tokens"] == whole_rec["tokens"]
+        assert source_rec["bpb"] == pytest.approx(whole_rec["bpb"], rel=0.0, abs=1e-6)
+    assert json.loads(source_summary.read_text())["doc_ordering"] == "source_order"
+
+
+def test_prepare_doc_work_sorts_by_length_and_remembers_output_order() -> None:
+    docs = [
+        CachedDoc(doc_id=0, token_start=0, token_len=4, raw_bytes=4),
+        CachedDoc(doc_id=1, token_start=4, token_len=12, raw_bytes=12),
+        CachedDoc(doc_id=2, token_start=16, token_len=7, raw_bytes=7),
+    ]
+
+    sorted_work = prepare_doc_work(docs, sort_by_length=True)
+    original_work = prepare_doc_work(docs, sort_by_length=False)
+
+    assert [work.doc.doc_id for work in sorted_work] == [1, 2, 0]
+    assert [work.output_index for work in sorted_work] == [1, 2, 0]
+    assert [work.doc.doc_id for work in original_work] == [0, 1, 2]
+    assert [work.output_index for work in original_work] == [0, 1, 2]
+
+
+def test_resolve_doc_batch_size_caps_by_token_budget() -> None:
+    assert resolve_doc_batch_size(
+        requested_doc_batch_size=4096,
+        chunk_size=256,
+        max_batch_tokens=524_288,
+    ) == 2048
+    assert resolve_doc_batch_size(
+        requested_doc_batch_size=512,
+        chunk_size=256,
+        max_batch_tokens=524_288,
+    ) == 512
+    assert resolve_doc_batch_size(
+        requested_doc_batch_size=4096,
+        chunk_size=-1,
+        max_batch_tokens=524_288,
+    ) == 4096
 
 
 def test_doc_range_for_rank_partitions_docs_exactly_once() -> None:

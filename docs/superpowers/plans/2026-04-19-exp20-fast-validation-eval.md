@@ -95,6 +95,21 @@ the final logit from chunk N scores the first token of chunk N+1. Keep a
 legacy compatibility flag for comparisons against `scripts/run_exp20_eval.py`,
 which historically skipped those boundary targets.
 
+Hot-loop shape policy:
+
+- Stage cache tokens onto the target device once before the scoring loop.
+- Length-sort each rank's work for dense full-width chunk groups, but preserve
+  original doc order in the JSONL output.
+- Treat `doc_batch_size` as an upper bound and cap effective microbatches with
+  `max_batch_tokens / chunk_size` so sorted longest-doc batches do not OOM.
+- Keep recurrent states as per-layer batch tensors instead of rebuilding them
+  with per-doc slice/cat operations each chunk.
+- Expose `--torch-compile-mode reduce-overhead` as an explicit GPU benchmark
+  knob; do not silently enable it until pod measurements show a net win. The
+  initial full-shape compile probe exceeded several minutes before first batch
+  completion, so CUDA graph capture or a smaller fixed-shape wrapper should be
+  investigated separately.
+
 - [ ] **Step 3: Remove hot-loop CPU syncs**
 
   Accumulate CE tensors on device and synchronize once per batch or at end. Avoid per-chunk `.item()`.

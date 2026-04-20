@@ -106,9 +106,36 @@ python scripts/run_exp20_fast_score.py \
   --summary-path experiments/20_ssm_native_ttt/results_floor/score_only_summary.json \
   --chunk-size 256 \
   --doc-batch-size 4096 \
+  --max-batch-tokens 524288 \
   --budget-seconds 600 \
   --device cuda
 ```
+
+The scorer length-sorts each rank's document work by default to keep hot-loop
+chunk shapes dense. Completed full-validation runs are unaffected; timed-out
+partial runs are not prefix samples and are labeled with
+`doc_ordering: token_len_desc`. Use `--no-sort-docs-by-length` only when a
+prefix-shaped exploratory run matters more than throughput.
+
+It also stages the validation token cache as one device-resident int64 tensor
+before the timer loop. This costs a few hundred MB for the current 50k cache
+and avoids per-chunk host-to-device copies plus uint16-to-target dtype churn.
+
+`doc_batch_size` is an upper bound. The runner also applies
+`max_batch_tokens / chunk_size` so length-sorted batches do not put all longest
+documents into one OOM-prone full-width group. On H100, start with
+`--max-batch-tokens 524288` (`2048 x 256`) and tune from there.
+
+Optional graphing probe:
+
+```bash
+python scripts/run_exp20_fast_score.py ... --torch-compile-mode reduce-overhead
+```
+
+Keep `torch_compile_mode` from the summary with the result. A full-shape
+`reduce-overhead` probe on 1xH100 did not finish its first scoring batch after
+several minutes of compilation, so do not use compile mode for floor claims
+until a smaller fixed-shape wrapper or CUDA graph path is separately validated.
 
 For legacy parity checks only:
 
