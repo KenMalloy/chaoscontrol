@@ -15,6 +15,7 @@ that the old loop knows how to run.
 from __future__ import annotations
 
 import copy
+import warnings
 
 import pytest
 import torch
@@ -41,7 +42,14 @@ def _compile_works() -> bool:
     pod (or any host where compile works) and skip honestly otherwise.
     """
     try:
-        fn = torch.compile(lambda x: x * 2, fullgraph=True, dynamic=False)
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                message=r"`torch\.jit\.script_method` is not supported in Python 3\.14\+",
+                category=DeprecationWarning,
+                module=r"torch\.jit\._script",
+            )
+            fn = torch.compile(lambda x: x * 2, fullgraph=True, dynamic=False)
         out = fn(torch.tensor([1.0]))
         return bool(torch.equal(out, torch.tensor([2.0])))
     except Exception:
@@ -49,6 +57,25 @@ def _compile_works() -> bool:
 
 
 _COMPILE_WORKS = _compile_works()
+
+
+@pytest.fixture(autouse=True)
+def _quiet_non_compile_host_diag_backend(monkeypatch):
+    """Use explicit chunked scan on hosts where compile tests skip."""
+    if _COMPILE_WORKS:
+        yield
+        return
+
+    import chaoscontrol.core as core
+
+    monkeypatch.setenv("CHAOSCONTROL_DIAG_SCAN_BACKEND", "chunked")
+    core._diag_recurrence_impl = None
+    core._diag_recurrence_backend = "python"
+    core._diag_recurrence_note = "fallback"
+    yield
+    core._diag_recurrence_impl = None
+    core._diag_recurrence_backend = "python"
+    core._diag_recurrence_note = "fallback"
 
 
 class _DeterministicClock:
