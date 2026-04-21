@@ -1,0 +1,29 @@
+{
+  "tokens_per_sec": 2891373.427578865,
+  "steps": 108,
+  "elapsed_s": 19.58346281386912,
+  "peak_vram_mb": 45105.59326171875,
+  "cuda_graph": {
+    "accepted": true,
+    "reasons": [],
+    "budget_seconds": 20.0,
+    "capture_seconds": 0.15011687390506268,
+    "warmup_seconds": 0.6361116115003824,
+    "warmup_steps": 3,
+    "overhead_seconds": 0.7862284854054451,
+    "eager_step_seconds": 0.2120372038334608,
+    "graph_step_seconds": 0.17387357209291723,
+    "projected_eager_steps": 94.32306990667773,
+    "projected_graph_steps": 110.50426630866481,
+    "projected_total_speedup": 0.17155078198786988,
+    "min_total_speedup": 0.05,
+    "max_capture_seconds": 30.0,
+    "break_even_steps": 20.60151116514905,
+    "break_even_seconds": 4.368286822202028,
+    "mode": "probe",
+    "replay_steps": 108,
+    "replay_seconds": 18.77834578603506,
+    "capture_counted_as_training_step": true,
+    "optimizer_step_captured": false
+  }
+}
