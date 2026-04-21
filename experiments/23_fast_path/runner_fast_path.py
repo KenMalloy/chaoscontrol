@@ -132,7 +132,7 @@ def _run_train_step(
     ddp_active: bool,
     world_size: int,
     compile_full_path: bool = False,
-    lm_head_backward_mode: str = "fused",
+    lm_head_backward_mode: str = "chunked",
 ) -> torch.Tensor:
     _reject_unsupported(model)
     with autocast_context(precision, device_type=inputs.device.type):
@@ -209,7 +209,7 @@ def train_fast_for_budget(
     max_steps: int | None = None,
     compile_full_path: bool = False,
     prefetch_batches: bool = False,
-    lm_head_backward_mode: str = "fused",
+    lm_head_backward_mode: str = "chunked",
 ) -> dict[str, Any]:
     rank_ = int(rank)
     world_size_ = int(world_size)
@@ -376,7 +376,7 @@ def _warmup(
         max_steps=steps,
         compile_full_path=bool(config.get("compile_full_path", False)),
         prefetch_batches=bool(config.get("prefetch_batches", True)),
-        lm_head_backward_mode=str(config.get("lm_head_backward_mode", "fused")),
+        lm_head_backward_mode=str(config.get("lm_head_backward_mode", "chunked")),
     )
 
 
@@ -491,7 +491,7 @@ def run_condition(
         vocab_size=vocab_size,
         compile_full_path=bool(config.get("compile_full_path", False)),
         prefetch_batches=bool(config.get("prefetch_batches", True)),
-        lm_head_backward_mode=str(config.get("lm_head_backward_mode", "fused")),
+        lm_head_backward_mode=str(config.get("lm_head_backward_mode", "chunked")),
     )
 
     if ddp_active:

@@ -177,7 +177,7 @@ def test_stage_a_matrix_names_and_fast_defaults():
         assert entry["fused_grad_clip"] is True
         assert entry["fused_muon"] is True
         assert entry["compile_full_path"] is False
-        assert entry["lm_head_backward_mode"] == "fused"
+        assert entry["lm_head_backward_mode"] == "chunked"
         assert entry["prefetch_batches"] is True
         assert entry["eval_batches"] == 0
         assert entry["warmup_steps"] == 5
