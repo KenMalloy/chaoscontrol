@@ -58,6 +58,7 @@ from fast_path import (  # noqa: E402
     choose_lm_starts_lazy,
     should_stop_training_loop,
     sample_sharded_lm_starts,
+    summarize_cuda_graph_gate,
     summarize_train_timing,
 )
 from runner_exp17 import (  # noqa: E402
@@ -185,6 +186,326 @@ def _restore_state_dict(model: torch.nn.Module, state: dict[str, torch.Tensor]) 
     model.load_state_dict(state, strict=True)
 
 
+def _cuda_graph_rejection_reasons(
+    *,
+    device: torch.device,
+    ddp_active: bool,
+    compile_full_path: bool,
+    lm_head_backward_mode: str,
+) -> list[str]:
+    reasons: list[str] = []
+    if device.type != "cuda" or not torch.cuda.is_available():
+        reasons.append("cuda_required")
+    if ddp_active:
+        reasons.append("ddp_not_supported")
+    if compile_full_path:
+        reasons.append("compile_full_path_not_supported")
+    if lm_head_backward_mode != "fused":
+        reasons.append("fused_lm_head_required")
+    return reasons
+
+
+def _rejected_cuda_graph_summary(
+    *,
+    mode: str,
+    reasons: list[str],
+    budget_seconds: float,
+    min_total_speedup: float,
+    max_capture_seconds: float,
+) -> dict[str, Any]:
+    summary = summarize_cuda_graph_gate(
+        budget_seconds=budget_seconds,
+        capture_seconds=0.0,
+        warmup_seconds=0.0,
+        warmup_steps=0,
+        eager_step_seconds=0.0,
+        graph_step_seconds=0.0,
+        min_total_speedup=min_total_speedup,
+        max_capture_seconds=max_capture_seconds,
+    )
+    merged_reasons = list(dict.fromkeys([*reasons, *summary["reasons"]]))
+    summary.update({
+        "mode": mode,
+        "accepted": False,
+        "reasons": merged_reasons,
+    })
+    return summary
+
+
+def _make_batch_fetcher(
+    *,
+    prefetch_batches: bool,
+    train_tokens: torch.Tensor,
+    train_num_tokens: int,
+    seq_len: int,
+    stride: int,
+    batch_size: int,
+    rank: int,
+    world_size: int,
+    device: torch.device,
+    generator: torch.Generator,
+    vocab_size: int,
+) -> tuple[Any, Any]:
+    prefetcher = None
+    if prefetch_batches:
+        prefetcher = Exp23BatchPrefetcher(
+            tokens=train_tokens,
+            seq_len=seq_len,
+            stride=stride,
+            batch_size=batch_size,
+            rank=rank,
+            world_size=world_size,
+            device=device,
+            generator=generator,
+            vocab_size=vocab_size,
+        ).prime()
+
+        def next_batch() -> tuple[torch.Tensor, torch.Tensor]:
+            return prefetcher.next()
+
+        return next_batch, prefetcher
+
+    def next_batch() -> tuple[torch.Tensor, torch.Tensor]:
+        starts = sample_sharded_lm_starts(
+            num_tokens=train_num_tokens,
+            seq_len=seq_len,
+            stride=stride,
+            batch_size=batch_size,
+            rank=rank,
+            world_size=world_size,
+            generator=generator,
+        )
+        return batch_from_start_tensor(
+            tokens=train_tokens,
+            starts=starts,
+            seq_len=seq_len,
+            device=device,
+            vocab_size=vocab_size,
+        )
+
+    return next_batch, None
+
+
+def _apply_grad_clip(
+    *,
+    model: torch.nn.Module,
+    grad_clip_norm: float,
+    fused_grad_clip: bool,
+) -> None:
+    if grad_clip_norm <= 0.0:
+        return
+    if fused_grad_clip:
+        clip_grad_norm_fused(model.parameters(), grad_clip_norm)
+    else:
+        torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
+
+
+def _train_fast_for_budget_cuda_graph(
+    *,
+    model: torch.nn.Module,
+    train_tokens: torch.Tensor,
+    train_num_tokens: int,
+    stride: int,
+    seq_len: int,
+    batch_size: int,
+    device: torch.device,
+    optimizer: torch.optim.Optimizer,
+    budget_seconds: float,
+    chunk_size: int,
+    grad_clip_norm: float,
+    fused_grad_clip: bool,
+    rank: int,
+    world_size: int,
+    seed: int,
+    precision: str,
+    stop_check_interval: int,
+    stop_margin_seconds: float,
+    vocab_size: int,
+    max_steps: int | None,
+    compile_full_path: bool,
+    prefetch_batches: bool,
+    lm_head_backward_mode: str,
+    cuda_graph_mode: str,
+    cuda_graph_min_total_speedup: float,
+    cuda_graph_max_capture_seconds: float,
+    cuda_graph_warmup_steps: int,
+) -> dict[str, Any]:
+    rank_ = int(rank)
+    world_size_ = int(world_size)
+    ddp_active = world_size_ > 1
+    rng = torch.Generator(device="cpu")
+    rng.manual_seed(int(seed) + rank_)
+    next_batch, prefetcher = _make_batch_fetcher(
+        prefetch_batches=prefetch_batches,
+        train_tokens=train_tokens,
+        train_num_tokens=train_num_tokens,
+        seq_len=seq_len,
+        stride=stride,
+        batch_size=batch_size,
+        rank=rank_,
+        world_size=world_size_,
+        device=device,
+        generator=rng,
+        vocab_size=vocab_size,
+    )
+
+    model.train()
+    losses: list[torch.Tensor] = []
+    steps = 0
+    start_time = time.perf_counter()
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
+
+    static_inputs, static_targets = next_batch()
+    static_inputs = static_inputs.contiguous()
+    static_targets = static_targets.contiguous()
+    graph_loss: torch.Tensor | None = None
+    graph = torch.cuda.CUDAGraph()
+
+    try:
+        warmup_start = time.perf_counter()
+        warmup_steps = max(1, int(cuda_graph_warmup_steps))
+        warmup_stream = torch.cuda.Stream(device=device)
+        warmup_stream.wait_stream(torch.cuda.current_stream(device))
+        with torch.cuda.stream(warmup_stream):
+            for _ in range(warmup_steps):
+                inputs, targets = next_batch()
+                static_inputs.copy_(inputs, non_blocking=True)
+                static_targets.copy_(targets, non_blocking=True)
+                optimizer.zero_grad(set_to_none=False)
+                loss = _run_train_step(
+                    model=model,
+                    inputs=static_inputs,
+                    targets=static_targets,
+                    chunk_size=chunk_size,
+                    precision=precision,
+                    ddp_active=ddp_active,
+                    world_size=world_size_,
+                    compile_full_path=compile_full_path,
+                    lm_head_backward_mode=lm_head_backward_mode,
+                )
+                _apply_grad_clip(
+                    model=model,
+                    grad_clip_norm=grad_clip_norm,
+                    fused_grad_clip=fused_grad_clip,
+                )
+                optimizer.step()
+                losses.append(loss.detach())
+        torch.cuda.current_stream(device).wait_stream(warmup_stream)
+        torch.cuda.synchronize(device)
+        warmup_seconds = time.perf_counter() - warmup_start
+
+        capture_inputs, capture_targets = next_batch()
+        static_inputs.copy_(capture_inputs, non_blocking=True)
+        static_targets.copy_(capture_targets, non_blocking=True)
+        torch.cuda.synchronize(device)
+        capture_start = time.perf_counter()
+        optimizer.zero_grad(set_to_none=False)
+        with torch.cuda.graph(graph):
+            optimizer.zero_grad(set_to_none=False)
+            graph_loss = _run_train_step(
+                model=model,
+                inputs=static_inputs,
+                targets=static_targets,
+                chunk_size=chunk_size,
+                precision=precision,
+                ddp_active=ddp_active,
+                world_size=world_size_,
+                compile_full_path=compile_full_path,
+                lm_head_backward_mode=lm_head_backward_mode,
+            )
+            _apply_grad_clip(
+                model=model,
+                grad_clip_norm=grad_clip_norm,
+                fused_grad_clip=fused_grad_clip,
+            )
+        torch.cuda.synchronize(device)
+        capture_seconds = time.perf_counter() - capture_start
+
+        # The captured pass produced real gradients for the capture batch.
+        # Keep optimizer.step eager so Muon's scalar Adam counters advance
+        # normally rather than freezing inside the graph replay.
+        optimizer.step()
+        losses.append(graph_loss.detach())
+
+        replay_start = time.perf_counter()
+        while True:
+            check_interval = max(1, int(stop_check_interval))
+            max_steps_reached = max_steps is not None and steps >= int(max_steps)
+            if steps == 0 or steps % check_interval == 0 or max_steps_reached:
+                elapsed = time.perf_counter() - start_time
+                local_stop = should_stop_training_loop(
+                    steps=steps,
+                    elapsed_s=elapsed,
+                    budget_seconds=budget_seconds,
+                    stop_margin_seconds=stop_margin_seconds,
+                    max_steps=max_steps,
+                )
+                if should_stop_now(local_stop, device, ddp_active):
+                    break
+
+            inputs, targets = next_batch()
+            static_inputs.copy_(inputs, non_blocking=True)
+            static_targets.copy_(targets, non_blocking=True)
+            graph.replay()
+            optimizer.step()
+            if graph_loss is not None:
+                losses.append(graph_loss.detach().clone())
+            steps += 1
+        torch.cuda.synchronize(device)
+        replay_seconds = time.perf_counter() - replay_start
+    finally:
+        if prefetcher is not None:
+            prefetcher.close()
+
+    if ddp_active:
+        dist.barrier()
+
+    elapsed_s = time.perf_counter() - start_time
+    loss_cpu = torch.stack(losses).cpu() if losses else torch.empty(0)
+    peak_vram_mb = torch.cuda.max_memory_allocated(device) / (1024 * 1024)
+    timing = summarize_train_timing(
+        steps=steps,
+        elapsed_s=elapsed_s,
+        batch_size=batch_size,
+        seq_len=seq_len,
+        world_size=world_size_,
+    )
+    graph_step_seconds = replay_seconds / max(steps, 1)
+    eager_step_seconds = warmup_seconds / max(warmup_steps, 1)
+    graph_summary = summarize_cuda_graph_gate(
+        budget_seconds=budget_seconds,
+        capture_seconds=capture_seconds,
+        warmup_seconds=warmup_seconds,
+        warmup_steps=warmup_steps,
+        eager_step_seconds=eager_step_seconds,
+        graph_step_seconds=graph_step_seconds,
+        min_total_speedup=cuda_graph_min_total_speedup,
+        max_capture_seconds=cuda_graph_max_capture_seconds,
+    )
+    graph_summary.update({
+        "mode": cuda_graph_mode,
+        "replay_steps": steps,
+        "replay_seconds": replay_seconds,
+        "capture_counted_as_training_step": True,
+        "optimizer_step_captured": False,
+    })
+    return {
+        "steps": steps,
+        "elapsed_s": elapsed_s,
+        "rank": rank_,
+        "world_size": world_size_,
+        "initial_loss": float(loss_cpu[0]) if loss_cpu.numel() else float("nan"),
+        "final_loss": float(loss_cpu[-1]) if loss_cpu.numel() else float("nan"),
+        "loss_delta": (
+            float(loss_cpu[-1] - loss_cpu[0]) if loss_cpu.numel() >= 2 else float("nan")
+        ),
+        "peak_vram_mb": peak_vram_mb,
+        **timing,
+        "cuda_graph": graph_summary,
+    }
+
+
 def train_fast_for_budget(
     model: torch.nn.Module,
     *,
@@ -210,12 +531,79 @@ def train_fast_for_budget(
     compile_full_path: bool = False,
     prefetch_batches: bool = False,
     lm_head_backward_mode: str = "fused",
+    cuda_graph_mode: str = "none",
+    cuda_graph_min_total_speedup: float = 0.05,
+    cuda_graph_max_capture_seconds: float = 30.0,
+    cuda_graph_warmup_steps: int = 3,
 ) -> dict[str, Any]:
     rank_ = int(rank)
     world_size_ = int(world_size)
     ddp_active = world_size_ > 1
     if ddp_active:
         broadcast_params(model)
+
+    graph_mode = str(cuda_graph_mode).strip().lower()
+    if graph_mode not in {"none", "probe"}:
+        raise ValueError(
+            "cuda_graph_mode must be 'none' or 'probe', "
+            f"got {cuda_graph_mode!r}"
+        )
+    graph_summary: dict[str, Any] | None = None
+    if graph_mode != "none":
+        graph_rejections = _cuda_graph_rejection_reasons(
+            device=device,
+            ddp_active=ddp_active,
+            compile_full_path=compile_full_path,
+            lm_head_backward_mode=lm_head_backward_mode,
+        )
+        if graph_rejections:
+            graph_summary = _rejected_cuda_graph_summary(
+                mode=graph_mode,
+                reasons=graph_rejections,
+                budget_seconds=budget_seconds,
+                min_total_speedup=cuda_graph_min_total_speedup,
+                max_capture_seconds=cuda_graph_max_capture_seconds,
+            )
+        else:
+            try:
+                return _train_fast_for_budget_cuda_graph(
+                    model=model,
+                    train_tokens=train_tokens,
+                    train_num_tokens=train_num_tokens,
+                    stride=stride,
+                    seq_len=seq_len,
+                    batch_size=batch_size,
+                    device=device,
+                    optimizer=optimizer,
+                    budget_seconds=budget_seconds,
+                    chunk_size=chunk_size,
+                    grad_clip_norm=grad_clip_norm,
+                    fused_grad_clip=fused_grad_clip,
+                    rank=rank_,
+                    world_size=world_size_,
+                    seed=seed,
+                    precision=precision,
+                    stop_check_interval=stop_check_interval,
+                    stop_margin_seconds=stop_margin_seconds,
+                    vocab_size=vocab_size,
+                    max_steps=max_steps,
+                    compile_full_path=compile_full_path,
+                    prefetch_batches=prefetch_batches,
+                    lm_head_backward_mode=lm_head_backward_mode,
+                    cuda_graph_mode=graph_mode,
+                    cuda_graph_min_total_speedup=cuda_graph_min_total_speedup,
+                    cuda_graph_max_capture_seconds=cuda_graph_max_capture_seconds,
+                    cuda_graph_warmup_steps=cuda_graph_warmup_steps,
+                )
+            except RuntimeError as exc:
+                graph_summary = _rejected_cuda_graph_summary(
+                    mode=graph_mode,
+                    reasons=["capture_failed"],
+                    budget_seconds=budget_seconds,
+                    min_total_speedup=cuda_graph_min_total_speedup,
+                    max_capture_seconds=cuda_graph_max_capture_seconds,
+                )
+                graph_summary["error"] = str(exc)[:500]
 
     rng = torch.Generator(device="cpu")
     rng.manual_seed(int(seed) + rank_)
@@ -319,7 +707,7 @@ def train_fast_for_budget(
         seq_len=seq_len,
         world_size=world_size_,
     )
-    return {
+    result = {
         "steps": steps,
         "elapsed_s": elapsed_s,
         "rank": rank_,
@@ -332,6 +720,10 @@ def train_fast_for_budget(
         "peak_vram_mb": peak_vram_mb,
         **timing,
     }
+    if graph_summary is not None:
+        graph_summary["warmup_steps"] = int(cuda_graph_warmup_steps)
+        result["cuda_graph"] = graph_summary
+    return result
 
 
 def _warmup(
@@ -377,6 +769,7 @@ def _warmup(
         compile_full_path=bool(config.get("compile_full_path", False)),
         prefetch_batches=bool(config.get("prefetch_batches", True)),
         lm_head_backward_mode=str(config.get("lm_head_backward_mode", "fused")),
+        cuda_graph_mode="none",
     )
 
 
@@ -492,6 +885,14 @@ def run_condition(
         compile_full_path=bool(config.get("compile_full_path", False)),
         prefetch_batches=bool(config.get("prefetch_batches", True)),
         lm_head_backward_mode=str(config.get("lm_head_backward_mode", "fused")),
+        cuda_graph_mode=str(config.get("cuda_graph_mode", "none")),
+        cuda_graph_min_total_speedup=float(
+            config.get("cuda_graph_min_total_speedup", 0.05)
+        ),
+        cuda_graph_max_capture_seconds=float(
+            config.get("cuda_graph_max_capture_seconds", 30.0)
+        ),
+        cuda_graph_warmup_steps=int(config.get("cuda_graph_warmup_steps", 3)),
     )
 
     if ddp_active:

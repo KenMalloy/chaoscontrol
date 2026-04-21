@@ -303,6 +303,151 @@ def test_cuda_graph_gate_counts_capture_against_budget():
     assert "projected_speedup_below_minimum" in rejected_small_win["reasons"]
 
 
+def test_cuda_graph_probe_rejects_cpu_and_runs_eager() -> None:
+    mod = _load_runner_module()
+    torch.manual_seed(5)
+    model = _TinyTokenTrainModel()
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+    train_tokens = torch.arange(128, dtype=torch.int16)
+
+    result = mod.train_fast_for_budget(
+        model,
+        train_tokens=train_tokens,
+        train_num_tokens=int(train_tokens.numel()),
+        stride=4,
+        seq_len=8,
+        batch_size=4,
+        device=torch.device("cpu"),
+        optimizer=optimizer,
+        budget_seconds=30.0,
+        chunk_size=4,
+        grad_clip_norm=0.0,
+        fused_grad_clip=False,
+        rank=0,
+        world_size=1,
+        seed=123,
+        precision="fp32",
+        stop_check_interval=1,
+        stop_margin_seconds=0.0,
+        vocab_size=6,
+        max_steps=2,
+        prefetch_batches=False,
+        lm_head_backward_mode="fused",
+        cuda_graph_mode="probe",
+    )
+
+    assert result["steps"] == 2
+    assert result["cuda_graph"]["accepted"] is False
+    assert "cuda_required" in result["cuda_graph"]["reasons"]
+
+
+def test_cuda_graph_probe_delegates_when_eligible(monkeypatch) -> None:
+    mod = _load_runner_module()
+    model = _TinyTokenTrainModel()
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+    train_tokens = torch.arange(128, dtype=torch.int16)
+    calls: list[dict] = []
+
+    monkeypatch.setattr(mod, "_cuda_graph_rejection_reasons", lambda **_: [])
+
+    def fake_graph_runner(**kwargs):
+        calls.append(kwargs)
+        return {
+            "steps": 7,
+            "elapsed_s": 1.0,
+            "rank": kwargs["rank"],
+            "world_size": kwargs["world_size"],
+            "initial_loss": 1.0,
+            "final_loss": 0.5,
+            "loss_delta": -0.5,
+            "peak_vram_mb": 0.0,
+            "tokens_per_step": 32,
+            "aggregate_tokens_per_sec": 224.0,
+            "per_gpu_tokens_per_sec": 224.0,
+            "cuda_graph": {"mode": "probe", "accepted": True, "reasons": []},
+        }
+
+    monkeypatch.setattr(mod, "_train_fast_for_budget_cuda_graph", fake_graph_runner)
+
+    result = mod.train_fast_for_budget(
+        model,
+        train_tokens=train_tokens,
+        train_num_tokens=int(train_tokens.numel()),
+        stride=4,
+        seq_len=8,
+        batch_size=4,
+        device=torch.device("cpu"),
+        optimizer=optimizer,
+        budget_seconds=30.0,
+        chunk_size=4,
+        grad_clip_norm=0.0,
+        fused_grad_clip=False,
+        rank=0,
+        world_size=1,
+        seed=123,
+        precision="fp32",
+        stop_check_interval=1,
+        stop_margin_seconds=0.0,
+        vocab_size=6,
+        max_steps=2,
+        prefetch_batches=False,
+        lm_head_backward_mode="fused",
+        cuda_graph_mode="probe",
+        cuda_graph_warmup_steps=4,
+    )
+
+    assert result["steps"] == 7
+    assert calls
+    assert calls[0]["cuda_graph_warmup_steps"] == 4
+    assert calls[0]["cuda_graph_mode"] == "probe"
+
+
+def test_cuda_graph_probe_falls_back_to_eager_on_capture_failure(monkeypatch) -> None:
+    mod = _load_runner_module()
+    torch.manual_seed(6)
+    model = _TinyTokenTrainModel()
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+    train_tokens = torch.arange(128, dtype=torch.int16)
+
+    monkeypatch.setattr(mod, "_cuda_graph_rejection_reasons", lambda **_: [])
+
+    def broken_graph_runner(**_kwargs):
+        raise RuntimeError("capture failed in smoke")
+
+    monkeypatch.setattr(mod, "_train_fast_for_budget_cuda_graph", broken_graph_runner)
+
+    result = mod.train_fast_for_budget(
+        model,
+        train_tokens=train_tokens,
+        train_num_tokens=int(train_tokens.numel()),
+        stride=4,
+        seq_len=8,
+        batch_size=4,
+        device=torch.device("cpu"),
+        optimizer=optimizer,
+        budget_seconds=30.0,
+        chunk_size=4,
+        grad_clip_norm=0.0,
+        fused_grad_clip=False,
+        rank=0,
+        world_size=1,
+        seed=123,
+        precision="fp32",
+        stop_check_interval=1,
+        stop_margin_seconds=0.0,
+        vocab_size=6,
+        max_steps=2,
+        prefetch_batches=False,
+        lm_head_backward_mode="fused",
+        cuda_graph_mode="probe",
+    )
+
+    assert result["steps"] == 2
+    assert result["cuda_graph"]["accepted"] is False
+    assert "capture_failed" in result["cuda_graph"]["reasons"]
+    assert "capture failed in smoke" in result["cuda_graph"]["error"]
+
+
 def test_run_train_step_uses_compiled_encoder_when_enabled(monkeypatch):
     mod = _load_runner_module()
     if hasattr(train_ssm._compiled_step_fn, "cache_clear"):
