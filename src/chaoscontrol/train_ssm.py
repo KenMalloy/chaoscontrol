@@ -119,6 +119,30 @@ def chunked_lm_head_backward(
     return loss_accum
 
 
+def full_lm_head_backward(
+    hidden: torch.Tensor,
+    final_norm: nn.Module,
+    lm_head: nn.Linear,
+    targets: torch.Tensor,
+) -> torch.Tensor:
+    """Run final norm + LM head + CE as one autograd graph.
+
+    This is the fast path for shapes where the full ``(B, T, V)`` logits
+    tensor fits in memory. Unlike ``chunked_lm_head_backward``, it does
+    not detach ``hidden`` or inject gradients through a second backward;
+    a single ``loss.backward()`` propagates through the head and encoder.
+    """
+    vocab = lm_head.out_features
+    logits = lm_head(final_norm(hidden))
+    loss = F.cross_entropy(
+        logits.reshape(-1, vocab).float(),
+        targets.reshape(-1),
+        reduction="mean",
+    )
+    loss.backward()
+    return loss.detach()
+
+
 _UNSUPPORTED_ATTRS: tuple[tuple[str, str], ...] = (
     ("wernicke", "wernicke layer"),
     ("outer_model", "outer_model / typed buffer"),
@@ -230,15 +254,18 @@ def train_ssm_step(
     world_size: int = 1,
     precision: str = "bf16",
     compile_full_path: bool = False,
+    lm_head_backward_mode: str = "chunked",
 ) -> torch.Tensor:
     """One forward + chunked-backward cycle for a bare-SSM model.
 
-    Runs ``model.encode(inputs)`` to produce the hidden state, then
-    loops chunked forward/backward through ``final_norm + lm_head + CE``
-    accumulating gradients into the detached hidden tensor. A single
-    encoder backward propagates the accumulated hidden gradient into
-    encoder parameters. When DDP is active, per-parameter gradients
-    are all-reduced (AVG) before return.
+    Runs ``model.encode(inputs)`` to produce the hidden state. In the
+    default ``lm_head_backward_mode="chunked"`` path it then loops chunked
+    forward/backward through ``final_norm + lm_head + CE`` accumulating
+    gradients into a detached hidden tensor before one encoder backward.
+    In ``"single"`` mode it materializes full logits and calls
+    ``loss.backward()`` once, which removes the detached-hidden bridge at
+    the cost of higher peak memory. When DDP is active, per-parameter
+    gradients are all-reduced (AVG) before return.
 
     The caller owns ``optimizer.step()`` and ``optimizer.zero_grad()``
     — this function only computes gradients and leaves them on the
@@ -282,25 +309,38 @@ def train_ssm_step(
         else:
             hidden = model.encode(inputs)
 
-        # Detach to form a boundary between the chunked LM-head graph and
-        # the encoder graph. The chunked backward accumulates gradient
-        # into hidden_for_ce.grad; that gradient is then injected into the
-        # encoder by ``hidden.backward(gradient=hidden_for_ce.grad)``.
-        # This step is eager by design — ``requires_grad_`` is unsupported
-        # under ``fullgraph=True``, as is the per-chunk ``.backward()``
-        # inside ``chunked_lm_head_backward``.
-        hidden_for_ce = hidden.detach().requires_grad_(True)
-        loss = chunked_lm_head_backward(
-            hidden=hidden_for_ce,
-            final_norm=model.final_norm,
-            lm_head=model.lm_head,
-            targets=targets,
-            chunk_size=chunk_size,
-        )
+        if lm_head_backward_mode == "single":
+            loss = full_lm_head_backward(
+                hidden=hidden,
+                final_norm=model.final_norm,
+                lm_head=model.lm_head,
+                targets=targets,
+            )
+        elif lm_head_backward_mode == "chunked":
+            # Detach to form a boundary between the chunked LM-head graph and
+            # the encoder graph. The chunked backward accumulates gradient
+            # into hidden_for_ce.grad; that gradient is then injected into the
+            # encoder by ``hidden.backward(gradient=hidden_for_ce.grad)``.
+            # This step is eager by design — ``requires_grad_`` is unsupported
+            # under ``fullgraph=True``, as is the per-chunk ``.backward()``
+            # inside ``chunked_lm_head_backward``.
+            hidden_for_ce = hidden.detach().requires_grad_(True)
+            loss = chunked_lm_head_backward(
+                hidden=hidden_for_ce,
+                final_norm=model.final_norm,
+                lm_head=model.lm_head,
+                targets=targets,
+                chunk_size=chunk_size,
+            )
 
-        # Single encoder backward — ``hidden_for_ce.grad`` is the complete
-        # downstream gradient that ``hidden`` should receive.
-        hidden.backward(gradient=hidden_for_ce.grad)
+            # Single encoder backward — ``hidden_for_ce.grad`` is the complete
+            # downstream gradient that ``hidden`` should receive.
+            hidden.backward(gradient=hidden_for_ce.grad)
+        else:
+            raise ValueError(
+                "lm_head_backward_mode must be 'chunked' or 'single', got "
+                f"{lm_head_backward_mode!r}"
+            )
 
     if ddp_active and world_size > 1:
         allreduce_grads(model, world_size)
@@ -328,6 +368,7 @@ def train_ssm_for_budget(
     precision: str = "bf16",
     compile_full_path: bool = False,
     max_steps: int | None = None,
+    lm_head_backward_mode: str = "chunked",
 ) -> dict[str, Any]:
     """Bare-SSM wall-clock training loop.
 
@@ -399,6 +440,7 @@ def train_ssm_for_budget(
             world_size=world_size_,
             precision=precision,
             compile_full_path=compile_full_path,
+            lm_head_backward_mode=lm_head_backward_mode,
         )
         if grad_clip_norm > 0.0:
             if fused_grad_clip:

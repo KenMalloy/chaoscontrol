@@ -49,6 +49,7 @@ from chaoscontrol.train_ssm import (  # noqa: E402
     _compiled_step_fn,
     _reject_unsupported,
     chunked_lm_head_backward,
+    full_lm_head_backward,
 )
 from fast_path import (  # noqa: E402
     Exp23BatchPrefetcher,
@@ -130,6 +131,7 @@ def _run_train_step(
     ddp_active: bool,
     world_size: int,
     compile_full_path: bool = False,
+    lm_head_backward_mode: str = "single",
 ) -> torch.Tensor:
     _reject_unsupported(model)
     with autocast_context(precision, device_type=inputs.device.type):
@@ -137,15 +139,28 @@ def _run_train_step(
             hidden = _compiled_step_fn()(model, inputs)
         else:
             hidden = model.encode(inputs)
-        hidden_for_ce = hidden.detach().requires_grad_(True)
-        loss = chunked_lm_head_backward(
-            hidden=hidden_for_ce,
-            final_norm=model.final_norm,
-            lm_head=model.lm_head,
-            targets=targets,
-            chunk_size=chunk_size,
-        )
-        hidden.backward(gradient=hidden_for_ce.grad)
+        if lm_head_backward_mode == "single":
+            loss = full_lm_head_backward(
+                hidden=hidden,
+                final_norm=model.final_norm,
+                lm_head=model.lm_head,
+                targets=targets,
+            )
+        elif lm_head_backward_mode == "chunked":
+            hidden_for_ce = hidden.detach().requires_grad_(True)
+            loss = chunked_lm_head_backward(
+                hidden=hidden_for_ce,
+                final_norm=model.final_norm,
+                lm_head=model.lm_head,
+                targets=targets,
+                chunk_size=chunk_size,
+            )
+            hidden.backward(gradient=hidden_for_ce.grad)
+        else:
+            raise ValueError(
+                "lm_head_backward_mode must be 'chunked' or 'single', got "
+                f"{lm_head_backward_mode!r}"
+            )
     if ddp_active and world_size > 1:
         allreduce_grads(model, world_size)
     return loss
@@ -186,6 +201,7 @@ def train_fast_for_budget(
     max_steps: int | None = None,
     compile_full_path: bool = False,
     prefetch_batches: bool = False,
+    lm_head_backward_mode: str = "single",
 ) -> dict[str, Any]:
     rank_ = int(rank)
     world_size_ = int(world_size)
@@ -266,6 +282,7 @@ def train_fast_for_budget(
                 ddp_active=ddp_active,
                 world_size=world_size_,
                 compile_full_path=compile_full_path,
+                lm_head_backward_mode=lm_head_backward_mode,
             )
             if grad_clip_norm > 0.0:
                 if fused_grad_clip:
@@ -351,6 +368,7 @@ def _warmup(
         max_steps=steps,
         compile_full_path=bool(config.get("compile_full_path", False)),
         prefetch_batches=bool(config.get("prefetch_batches", True)),
+        lm_head_backward_mode=str(config.get("lm_head_backward_mode", "single")),
     )
 
 
@@ -465,6 +483,7 @@ def run_condition(
         vocab_size=vocab_size,
         compile_full_path=bool(config.get("compile_full_path", False)),
         prefetch_batches=bool(config.get("prefetch_batches", True)),
+        lm_head_backward_mode=str(config.get("lm_head_backward_mode", "single")),
     )
 
     if ddp_active:

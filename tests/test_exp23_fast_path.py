@@ -177,6 +177,7 @@ def test_stage_a_matrix_names_and_fast_defaults():
         assert entry["fused_grad_clip"] is True
         assert entry["fused_muon"] is True
         assert entry["compile_full_path"] is False
+        assert entry["lm_head_backward_mode"] == "single"
         assert entry["prefetch_batches"] is True
         assert entry["eval_batches"] == 0
         assert entry["warmup_steps"] == 5
@@ -323,6 +324,40 @@ def test_run_train_step_leaves_encoder_eager_when_compile_disabled(monkeypatch):
 
     assert loss.ndim == 0
     assert compile_calls == []
+
+
+def test_run_train_step_can_use_single_backward(monkeypatch):
+    mod = _load_runner_module()
+
+    chunked_calls = 0
+
+    def fail_if_chunked(**kwargs):
+        nonlocal chunked_calls
+        chunked_calls += 1
+        raise AssertionError("single-backward mode must not call chunked CE")
+
+    monkeypatch.setattr(mod, "chunked_lm_head_backward", fail_if_chunked)
+
+    model = _TinyTrainStepModel()
+    inputs = torch.randn(2, 3, 4)
+    targets = torch.zeros(2, 3, dtype=torch.long)
+
+    loss = mod._run_train_step(
+        model=model,
+        inputs=inputs,
+        targets=targets,
+        chunk_size=2,
+        precision="bf16",
+        ddp_active=False,
+        world_size=1,
+        compile_full_path=False,
+        lm_head_backward_mode="single",
+    )
+
+    assert loss.ndim == 0
+    assert chunked_calls == 0
+    assert model.encoder.weight.grad is not None
+    assert model.lm_head.weight.grad is not None
 
 
 def test_train_fast_for_budget_can_use_batch_prefetcher(monkeypatch):
