@@ -56,12 +56,12 @@ from typing import Any
 
 # Anchor: Exp 18 Test 4b winner at ws=4 (LR = 2 × Test 5b's ws=2 anchor
 # 0.064). Mirrors ``run_persistent_launcher._base_config``; any drift
-# there must be reflected here. ``world_size`` is elided because the
-# persistent-DDP launcher validates it against its own --world-size CLI
-# arg, and matrix assembly is world-size-agnostic (the caller picks ws
-# and the matching LR).
+# there must be reflected here. ``world_size`` is included because the
+# persistent-DDP launcher fail-closes if matrix metadata disagrees with
+# its torchrun world size; the default matrix is the ws=4 Phase 1C anchor.
 _DEFAULT_BASE_CONFIG: dict[str, Any] = {
     "model_type": "ssm",
+    "world_size": 4,
     "vocab_size": 16384,
     "model_dim": 256,
     "num_layers": 4,

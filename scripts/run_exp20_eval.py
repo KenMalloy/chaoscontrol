@@ -79,7 +79,7 @@ def _build_optimizer(params, lr: float):
     from chaoscontrol.optim.muon import Muon
     if not params:
         return []
-    return [Muon(params, lr=lr)]
+    return [Muon(params, lr=lr, fused=True)]
 
 
 def _iter_chunks(tokens: list[int], chunk_size: int):

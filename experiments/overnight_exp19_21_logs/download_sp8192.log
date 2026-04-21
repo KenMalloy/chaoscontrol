@@ -1,0 +1,6 @@
+Traceback (most recent call last):
+  File "/workspace/chaoscontrol/baselines/parameter_golf/cached_challenge_fineweb.py", line 157, in <module>
+    main()
+  File "/workspace/chaoscontrol/baselines/parameter_golf/cached_challenge_fineweb.py", line 130, in main
+    raise ValueError(f"dataset {dataset_dir} not found in {REMOTE_ROOT_PREFIX}/manifest.json")
+ValueError: dataset fineweb10B_sp8192 not found in datasets/manifest.json

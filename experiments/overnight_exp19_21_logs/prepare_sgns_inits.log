@@ -1,0 +1,12 @@
+Wrote /workspace/chaoscontrol/artifacts/sgns_init_meanstd.pt shape=(8192, 256)
+Wrote /workspace/chaoscontrol/artifacts/sgns_init_fullcov.pt shape=(8192, 256)
+Wrote /workspace/chaoscontrol/artifacts/sgns_init_shuffled.pt shape=(8192, 256)
+Wrote /workspace/chaoscontrol/artifacts/sgns_init_zero.pt shape=(8192, 256)
+Wrote /workspace/chaoscontrol/artifacts/sgns_init_norm_only.pt shape=(8192, 256)
+Wrote /workspace/chaoscontrol/artifacts/sgns_init_norm_only_shuffled.pt shape=(8192, 256)
+Wrote /workspace/chaoscontrol/artifacts/sgns_init_fullcov_shuffled.pt shape=(8192, 256)
+Wrote /workspace/chaoscontrol/artifacts/sgns_init_random_fullcov.pt shape=(8192, 256)
+Wrote /workspace/chaoscontrol/artifacts/sgns_init_freq_bucket_shuffle.pt shape=(8192, 256)
+Wrote /workspace/chaoscontrol/artifacts/sgns_init_class_bucket_shuffle.pt shape=(8192, 256)
+  ref row-norm    mean=15.9853  std=0.7037
+  meanstd norm    mean=15.9853  std=0.7037

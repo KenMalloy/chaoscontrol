@@ -61,12 +61,13 @@ class LegalityController:
                 f"score_chunk needs chunk length >= 2 for teacher-forcing CE; "
                 f"got shape {tuple(chunk.shape)}."
             )
-        h = self._chunk_hash(chunk)
-        if self.leak_detection and h in self._adapted_chunks:
-            raise LeakDetectedError(
-                f"Chunk hash {h.hex()} was adapt_on_chunk'd before score_chunk: "
-                "Issue #1017 violation."
-            )
+        if self.leak_detection:
+            h = self._chunk_hash(chunk)
+            if h in self._adapted_chunks:
+                raise LeakDetectedError(
+                    f"Chunk hash {h.hex()} was adapt_on_chunk'd before score_chunk: "
+                    "Issue #1017 violation."
+                )
         self.model.eval()
         # StateManager returns [] before start_doc; pass None rather than an
         # empty list so the model's length-mismatch guard doesn't misfire.
@@ -101,12 +102,13 @@ class LegalityController:
         """
         if steps <= 0:
             return None
-        h = self._chunk_hash(chunk)
-        self._adapted_chunks.add(h)
+        if self.leak_detection:
+            h = self._chunk_hash(chunk)
+            self._adapted_chunks.add(h)
         self.model.train()
         final_loss = None
         for _ in range(steps):
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)
             kwargs: dict = {}
             if initial_states:
                 kwargs["initial_states"] = initial_states
@@ -115,8 +117,8 @@ class LegalityController:
             loss = self.loss_fn(logits[:, :-1], chunk[:, 1:])
             loss.backward()
             optimizer.step()
-            final_loss = float(loss.item())
-        return final_loss
+            final_loss = loss.detach()
+        return None if final_loss is None else float(final_loss.item())
 
     def mark_new_epoch(self) -> None:
         """Reset chunk-reuse tracking at doc boundary — chunks are per-doc."""

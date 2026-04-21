@@ -1,0 +1,7 @@
+train shards total length: 12,340,465,972
+using first 50,000,000 tokens
+after subsampling: 10,290,623 tokens
+epoch 0: mean_loss = 3.9238
+epoch 1: mean_loss = 3.9085
+epoch 2: mean_loss = 3.9068
+saved W_in to /workspace/chaoscontrol/artifacts/sgns_v8192_d256.pt

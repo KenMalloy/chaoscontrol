@@ -10,10 +10,16 @@ set -euo pipefail
 
 DATA_DIR="${1:?data-dir required}"
 OUT="${2:-artifacts/sgns_v8192_d256.pt}"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+PY_BIN="${PY:-${PYTHON:-python}}"
 
 mkdir -p "$(dirname "$OUT")"
 
-python scripts/train_sgns.py \
+export PYTHONPATH="$REPO_ROOT/src:${PYTHONPATH:-}"
+cd "$REPO_ROOT"
+
+"$PY_BIN" scripts/train_sgns.py \
   --data-dir "$DATA_DIR" \
   --vocab-size 8192 --dim 256 --window 5 --k 10 --epochs 3 \
   --subsample-threshold 1e-5 --batch-size 4096 --lr 0.025 --seed 0 \

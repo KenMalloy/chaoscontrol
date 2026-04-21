@@ -82,6 +82,28 @@ def test_leak_detected_when_scoring_under_updated_weights():
         controller.score_chunk(tokens)
 
 
+def test_leak_detection_disabled_does_not_hash_chunks(monkeypatch):
+    """The production path should not CPU-sync chunks for leak hashing.
+
+    Leak detection is a contract-test mode. When it is disabled, score/adapt
+    order is enforced by the driver, so hashing every CUDA chunk is pure
+    overhead.
+    """
+    torch.manual_seed(0)
+    model = _TinyLM()
+    tokens = torch.randint(0, 32, (1, 32))
+    opt = torch.optim.SGD(model.parameters(), lr=0.1)
+    controller = LegalityController(model, loss_fn=_loss, leak_detection=False)
+
+    def _unexpected_hash(_chunk):
+        raise AssertionError("hashing should be skipped when leak_detection=False")
+
+    monkeypatch.setattr(LegalityController, "_chunk_hash", staticmethod(_unexpected_hash))
+
+    controller.score_chunk(tokens)
+    controller.adapt_on_chunk(tokens, optimizer=opt, steps=1)
+
+
 def test_empty_chunk_raises_valueerror():
     m = _TinyLM()
     controller = LegalityController(m, loss_fn=_loss)
@@ -130,6 +152,43 @@ def test_adapt_on_chunk_with_zero_steps_returns_none():
     # And the chunk must not have been marked adapted — leak detection stays
     # armed for a real future adapt.
     controller.score_chunk(chunk)  # must not raise
+
+
+def test_adapt_on_chunk_zeros_grad_to_none_and_syncs_loss_once(monkeypatch):
+    torch.manual_seed(0)
+    model = _TinyLM()
+    controller = LegalityController(model, loss_fn=_loss)
+    chunk = torch.randint(0, 32, (1, 32))
+    zero_grad_args: list[bool] = []
+
+    class _RecordingOptimizer:
+        def zero_grad(self, *, set_to_none: bool = False):
+            zero_grad_args.append(set_to_none)
+            for p in model.parameters():
+                p.grad = None
+
+        def step(self):
+            pass
+
+    original_item = torch.Tensor.item
+    item_calls = 0
+
+    def _counting_item(self):
+        nonlocal item_calls
+        item_calls += 1
+        return original_item(self)
+
+    monkeypatch.setattr(torch.Tensor, "item", _counting_item)
+
+    result = controller.adapt_on_chunk(
+        chunk,
+        optimizer=_RecordingOptimizer(),
+        steps=3,
+    )
+
+    assert result is not None
+    assert zero_grad_args == [True, True, True]
+    assert item_calls == 1
 
 
 def test_score_chunk_returns_tuple_with_loss_as_first_element():

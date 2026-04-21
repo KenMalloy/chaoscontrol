@@ -1,0 +1,1523 @@
+[launcher] using external matrix: /workspace/chaoscontrol/experiments/19_phase1/matrix_phase1c_fp8_ws4.json (40 entries)
+[launcher] wrote matrix to /workspace/tmp/persistent_matrix_t0czb601.json
+[launcher] launching: /workspace/venv/bin/python -m torch.distributed.run --nproc_per_node=4 --rdzv-endpoint=localhost:29519 --rdzv-backend=c10d --rdzv-id=cc_exp19_persistent_29519 /workspace/chaoscontrol/experiments/19_prereqs/runner_persistent_ddp.py --data-path /workspace/chaoscontrol/baselines/parameter_golf/datasets/fineweb10B_sp16384 --sp-model-path /workspace/chaoscontrol/baselines/parameter_golf/tokenizers/fineweb_16384_bpe.model --config-matrix /workspace/tmp/persistent_matrix_t0czb601.json --output-dir /workspace/chaoscontrol/experiments/19_phase1/results_phase1c_fp8_ws4 --budget 600.0
+
+*****************************************
+Setting OMP_NUM_THREADS environment variable for each process to be 1 in default, to avoid your system being overloaded, please further tune the variable for optimal performance in your application as needed.
+*****************************************
+  SP data: train=11,211,958,257 val=35,737,273 tokens (clamped 0 train + 0 val header-contam tokens)
+[rank 0/4] persistent-DDP ready: device=cuda:0 dtype=torch.bfloat16 entries=40 vocab=16384
+[rank 0/4] entry seed=1337 precision=bf16 dim=256 layers=4 params=10,751,232
+[rank 0] warmup: 20 steps before timer
+/usr/local/lib/python3.12/dist-packages/torch/distributed/distributed_c10d.py:4876: UserWarning: barrier(): using the device under current context. You can specify `device_id` in `init_process_group` to mute this warning.
+  warnings.warn(  # warn only once
+[rank 0] warmup complete, real timer starts now
+[rank 0/4] done entry seed=1337: bpb=1.4922 steps=1084 steps/s=1.81 peak_vram=16117.9 MB
+[rank 0] completed bf16_stock_seed1337_s1337 in 783.2s (entry 1/40)
+[rank 0/4] entry seed=2674 precision=bf16 dim=256 layers=4 params=10,751,232
+[rank 0] warmup: 20 steps before timer
+[rank 0] warmup complete, real timer starts now
+[rank 0/4] done entry seed=2674: bpb=1.4872 steps=1086 steps/s=1.81 peak_vram=16117.9 MB
+[rank 0] completed bf16_stock_seed2674_s2674 in 619.1s (entry 2/40)
+[rank 0/4] entry seed=4011 precision=bf16 dim=256 layers=4 params=10,751,232
+[rank 0] warmup: 20 steps before timer
+[rank 0] warmup complete, real timer starts now
+[rank 0/4] done entry seed=4011: bpb=1.4839 steps=1088 steps/s=1.81 peak_vram=16117.9 MB
+[rank 0] completed bf16_stock_seed4011_s4011 in 618.6s (entry 3/40)
+[rank 0/4] entry seed=5348 precision=bf16 dim=256 layers=4 params=10,751,232
+[rank 0] warmup: 20 steps before timer
+[rank 0] warmup complete, real timer starts now
+[rank 0/4] done entry seed=5348: bpb=1.4876 steps=1088 steps/s=1.81 peak_vram=16117.9 MB
+[rank 0] completed bf16_stock_seed5348_s5348 in 619.1s (entry 4/40)
+[rank 0/4] entry seed=1337 precision=bf16 dim=256 layers=4 params=10,751,232
+[rank 0] warmup: 20 steps before timer
+/usr/local/lib/python3.12/dist-packages/torch/distributed/distributed_c10d.py:4876: UserWarning: barrier(): using the device under current context. You can specify `device_id` in `init_process_group` to mute this warning.
+  warnings.warn(  # warn only once
+[rank 0] warmup complete, real timer starts now
+[rank 0/4] done entry seed=1337: bpb=1.5656 steps=426 steps/s=0.71 peak_vram=16118.5 MB
+[rank 0] completed bf16_all_seed1337_s1337 in 1228.0s (entry 5/40)
+[rank 0/4] entry seed=2674 precision=bf16 dim=256 layers=4 params=10,751,232
+[rank 0] warmup: 20 steps before timer
+[rank 0] warmup complete, real timer starts now
+[rank 0/4] done entry seed=2674: bpb=1.5649 steps=428 steps/s=0.71 peak_vram=16118.6 MB
+[rank 0] completed bf16_all_seed2674_s2674 in 640.6s (entry 6/40)
+[rank 0/4] entry seed=4011 precision=bf16 dim=256 layers=4 params=10,751,232
+[rank 0] warmup: 20 steps before timer
+[rank 0] warmup complete, real timer starts now
+[rank 0/4] done entry seed=4011: bpb=1.5625 steps=429 steps/s=0.71 peak_vram=16118.6 MB
+[rank 0] completed bf16_all_seed4011_s4011 in 640.8s (entry 7/40)
+[rank 0/4] entry seed=5348 precision=bf16 dim=256 layers=4 params=10,751,232
+[rank 0] warmup: 20 steps before timer
+[rank 0] warmup complete, real timer starts now
+[rank 0/4] done entry seed=5348: bpb=1.5665 steps=429 steps/s=0.71 peak_vram=16118.6 MB
+[rank 0] completed bf16_all_seed5348_s5348 in 640.6s (entry 8/40)
+[rank 0/4] entry seed=1337 precision=bf16 dim=256 layers=4 params=10,751,232
+[rank 0] warmup: 20 steps before timer
+[rank 0] warmup complete, real timer starts now
+[rank 0/4] done entry seed=1337: bpb=1.5587 steps=429 steps/s=0.71 peak_vram=16118.6 MB
+[rank 0] completed bf16_no_fused_clip_seed1337_s1337 in 640.5s (entry 9/40)
+[rank 0/4] entry seed=2674 precision=bf16 dim=256 layers=4 params=10,751,232
+[rank 0] warmup: 20 steps before timer
+[rank 0] warmup complete, real timer starts now
+[rank 0/4] done entry seed=2674: bpb=1.5613 steps=429 steps/s=0.71 peak_vram=16118.6 MB
+[rank 0] completed bf16_no_fused_clip_seed2674_s2674 in 640.8s (entry 10/40)
+[rank 0/4] entry seed=4011 precision=bf16 dim=256 layers=4 params=10,751,232
+[rank 0] warmup: 20 steps before timer
+[rank 0] warmup complete, real timer starts now
+[rank 0/4] done entry seed=4011: bpb=1.5646 steps=429 steps/s=0.71 peak_vram=16118.6 MB
+[rank 0] completed bf16_no_fused_clip_seed4011_s4011 in 640.3s (entry 11/40)
+[rank 0/4] entry seed=5348 precision=bf16 dim=256 layers=4 params=10,751,232
+[rank 0] warmup: 20 steps before timer
+[rank 0] warmup complete, real timer starts now
+[rank 0/4] done entry seed=5348: bpb=1.5672 steps=429 steps/s=0.71 peak_vram=16118.6 MB
+[rank 0] completed bf16_no_fused_clip_seed5348_s5348 in 640.2s (entry 12/40)
+[rank 0/4] entry seed=1337 precision=bf16 dim=256 layers=4 params=10,751,232
+[rank 0] warmup: 20 steps before timer
+[rank 0] warmup complete, real timer starts now
+[rank 0/4] done entry seed=1337: bpb=1.5644 steps=426 steps/s=0.71 peak_vram=16118.5 MB
+[rank 0] completed bf16_no_fused_muon_seed1337_s1337 in 638.7s (entry 13/40)
+[rank 0/4] entry seed=2674 precision=bf16 dim=256 layers=4 params=10,751,232
+[rank 0] warmup: 20 steps before timer
+[rank 0] warmup complete, real timer starts now
+[rank 0/4] done entry seed=2674: bpb=1.5646 steps=426 steps/s=0.71 peak_vram=16118.5 MB
+[rank 0] completed bf16_no_fused_muon_seed2674_s2674 in 639.1s (entry 14/40)
+[rank 0/4] entry seed=4011 precision=bf16 dim=256 layers=4 params=10,751,232
+[rank 0] warmup: 20 steps before timer
+[rank 0] warmup complete, real timer starts now
+[rank 0/4] done entry seed=4011: bpb=1.5620 steps=426 steps/s=0.71 peak_vram=16118.5 MB
+[rank 0] completed bf16_no_fused_muon_seed4011_s4011 in 638.8s (entry 15/40)
+[rank 0/4] entry seed=5348 precision=bf16 dim=256 layers=4 params=10,751,232
+[rank 0] warmup: 20 steps before timer
+[rank 0] warmup complete, real timer starts now
+[rank 0/4] done entry seed=5348: bpb=1.5645 steps=426 steps/s=0.71 peak_vram=16118.5 MB
+[rank 0] completed bf16_no_fused_muon_seed5348_s5348 in 638.8s (entry 16/40)
+[rank 0/4] entry seed=1337 precision=bf16 dim=256 layers=4 params=10,751,232
+[rank 0] warmup: 20 steps before timer
+[rank 0] warmup complete, real timer starts now
+[rank 0/4] done entry seed=1337: bpb=1.4920 steps=1118 steps/s=1.86 peak_vram=16117.9 MB
+[rank 0] completed bf16_no_compile_seed1337_s1337 in 621.6s (entry 17/40)
+[rank 0/4] entry seed=2674 precision=bf16 dim=256 layers=4 params=10,751,232
+[rank 0] warmup: 20 steps before timer
+[rank 0] warmup complete, real timer starts now
+[rank 0/4] done entry seed=2674: bpb=1.4874 steps=1118 steps/s=1.86 peak_vram=16117.9 MB
+[rank 0] completed bf16_no_compile_seed2674_s2674 in 621.7s (entry 18/40)
+[rank 0/4] entry seed=4011 precision=bf16 dim=256 layers=4 params=10,751,232
+[rank 0] warmup: 20 steps before timer
+[rank 0] warmup complete, real timer starts now
+[rank 0/4] done entry seed=4011: bpb=1.4863 steps=1118 steps/s=1.86 peak_vram=16117.9 MB
+[rank 0] completed bf16_no_compile_seed4011_s4011 in 621.5s (entry 19/40)
+[rank 0/4] entry seed=5348 precision=bf16 dim=256 layers=4 params=10,751,232
+[rank 0] warmup: 20 steps before timer
+[rank 0] warmup complete, real timer starts now
+[rank 0/4] done entry seed=5348: bpb=1.4856 steps=1118 steps/s=1.86 peak_vram=16117.9 MB
+[rank 0] completed bf16_no_compile_seed5348_s5348 in 621.3s (entry 20/40)
+[rank 0] promoted 29 nn.Linear -> FusedFP8Linear for fp8_fused
+[rank 0/4] entry seed=1337 precision=fp8_fused dim=256 layers=4 params=10,751,232
+[rank 0] warmup: 20 steps before timer
+[rank 0] warmup complete, real timer starts now
+[rank 0/4] done entry seed=1337: bpb=1.5308 steps=645 steps/s=1.07 peak_vram=16117.8 MB
+[rank 0] completed fp8_fused_stock_seed1337_s1337 in 629.5s (entry 21/40)
+[rank 0] promoted 29 nn.Linear -> FusedFP8Linear for fp8_fused
+[rank 0/4] entry seed=2674 precision=fp8_fused dim=256 layers=4 params=10,751,232
+[rank 0] warmup: 20 steps before timer
+[rank 0] warmup complete, real timer starts now
+[rank 0/4] done entry seed=2674: bpb=1.5262 steps=646 steps/s=1.08 peak_vram=16117.8 MB
+[rank 0] completed fp8_fused_stock_seed2674_s2674 in 628.9s (entry 22/40)
+[rank 0] promoted 29 nn.Linear -> FusedFP8Linear for fp8_fused
+[rank 0/4] entry seed=4011 precision=fp8_fused dim=256 layers=4 params=10,751,232
+[rank 0] warmup: 20 steps before timer
+[rank 0] warmup complete, real timer starts now
+[rank 0/4] done entry seed=4011: bpb=1.5283 steps=645 steps/s=1.07 peak_vram=16117.8 MB
+[rank 0] completed fp8_fused_stock_seed4011_s4011 in 628.8s (entry 23/40)
+[rank 0] promoted 29 nn.Linear -> FusedFP8Linear for fp8_fused
+[rank 0/4] entry seed=5348 precision=fp8_fused dim=256 layers=4 params=10,751,232
+[rank 0] warmup: 20 steps before timer
+[rank 0] warmup complete, real timer starts now
+[rank 0/4] done entry seed=5348: bpb=1.5276 steps=645 steps/s=1.07 peak_vram=16117.8 MB
+[rank 0] completed fp8_fused_stock_seed5348_s5348 in 629.4s (entry 24/40)
+[rank 0] promoted 29 nn.Linear -> FusedFP8Linear for fp8_fused
+[rank 0/4] entry seed=1337 precision=fp8_fused dim=256 layers=4 params=10,751,232
+[rank 0] warmup: 20 steps before timer
+/usr/local/lib/python3.12/dist-packages/torch/_dynamo/variables/functions.py:1598: UserWarning: Dynamo does not know how to trace the builtin `chaoscontrol.kernels._cublaslt._C.pybind11_detail_function_record_v1_system_libstdcpp_gxx_abi_1xxx_use_cxx11_abi_1.cublaslt_fp8_linear_bwd_x.` This function is either a Python builtin (e.g. _warnings.warn) or a third-party C/C++ Python extension (perhaps created with pybind).
+If it is a Python builtin, please file an issue on GitHub so the PyTorch team can add support for it and see the next case for a workaround.
+If it is a third-party C/C++ Python extension, please either wrap it into a PyTorch-understood custom operator (see https://pytorch.org/tutorials/advanced/custom_ops_landing_page.html for more details) or, if it is traceable, use `torch.compiler.allow_in_graph`.
+  torch._dynamo.utils.warn_once(explanation + "\n" + "\n".join(hints))
+/usr/local/lib/python3.12/dist-packages/torch/_dynamo/variables/functions.py:1598: UserWarning: Dynamo does not know how to trace the builtin `chaoscontrol.kernels._cublaslt._C.pybind11_detail_function_record_v1_system_libstdcpp_gxx_abi_1xxx_use_cxx11_abi_1.cublaslt_fp8_linear_bwd_x.` This function is either a Python builtin (e.g. _warnings.warn) or a third-party C/C++ Python extension (perhaps created with pybind).
+If it is a Python builtin, please file an issue on GitHub so the PyTorch team can add support for it and see the next case for a workaround.
+If it is a third-party C/C++ Python extension, please either wrap it into a PyTorch-understood custom operator (see https://pytorch.org/tutorials/advanced/custom_ops_landing_page.html for more details) or, if it is traceable, use `torch.compiler.allow_in_graph`.
+  torch._dynamo.utils.warn_once(explanation + "\n" + "\n".join(hints))
+/usr/local/lib/python3.12/dist-packages/torch/_dynamo/variables/functions.py:1598: UserWarning: Dynamo does not know how to trace the builtin `chaoscontrol.kernels._cublaslt._C.pybind11_detail_function_record_v1_system_libstdcpp_gxx_abi_1xxx_use_cxx11_abi_1.cublaslt_fp8_linear_bwd_x.` This function is either a Python builtin (e.g. _warnings.warn) or a third-party C/C++ Python extension (perhaps created with pybind).
+If it is a Python builtin, please file an issue on GitHub so the PyTorch team can add support for it and see the next case for a workaround.
+If it is a third-party C/C++ Python extension, please either wrap it into a PyTorch-understood custom operator (see https://pytorch.org/tutorials/advanced/custom_ops_landing_page.html for more details) or, if it is traceable, use `torch.compiler.allow_in_graph`.
+  torch._dynamo.utils.warn_once(explanation + "\n" + "\n".join(hints))
+/usr/local/lib/python3.12/dist-packages/torch/_dynamo/variables/functions.py:1598: UserWarning: Dynamo does not know how to trace the builtin `chaoscontrol.kernels._cublaslt._C.pybind11_detail_function_record_v1_system_libstdcpp_gxx_abi_1xxx_use_cxx11_abi_1.cublaslt_fp8_linear_bwd_x.` This function is either a Python builtin (e.g. _warnings.warn) or a third-party C/C++ Python extension (perhaps created with pybind).
+If it is a Python builtin, please file an issue on GitHub so the PyTorch team can add support for it and see the next case for a workaround.
+If it is a third-party C/C++ Python extension, please either wrap it into a PyTorch-understood custom operator (see https://pytorch.org/tutorials/advanced/custom_ops_landing_page.html for more details) or, if it is traceable, use `torch.compiler.allow_in_graph`.
+  torch._dynamo.utils.warn_once(explanation + "\n" + "\n".join(hints))
+[rank 0] ERROR on fp8_fused_all_seed1337_s1337: Unsupported: Attempted to call function marked as skipped
+  Explanation: Dynamo does not know how to trace the builtin `chaoscontrol.kernels._cublaslt._C.pybind11_detail_function_record_v1_system_libstdcpp_gxx_abi_1xxx_use_cxx11_abi_1.cublaslt_fp8_linear_bwd_x.` This function is either a Python builtin (e.g. _warnings.warn) or a third-party C/C++ Python extension (perhaps created with pybind).
+  Hint: If it is a Python builtin, please file an issue on GitHub so the PyTorch team can add support for it and see the next case for a workaround.
+  Hint: If it is a third-party C/C++ Python extension, please either wrap it into a PyTorch-understood custom operator (see https://pytorch.org/tutorials/advanced/custom_ops_landing_page.html for more details) or, if it is traceable, use `torch.compiler.allow_in_graph`.
+
+  Developer debug context: module: chaoscontrol.kernels._cublaslt._C, qualname: pybind11_detail_function_record_v1_system_libstdcpp_gxx_abi_1xxx_use_cxx11_abi_1.cublaslt_fp8_linear_bwd_x, skip reason: <missing reason>
+
+ For more details about this graph break, please visit: https://meta-pytorch.github.io/compile-graph-break-site/gb/gb0007.html
+
+from user code:
+   File "/workspace/chaoscontrol/src/chaoscontrol/train_ssm.py", line 183, in _encode_only
+    return model.encode(inputs)
+  File "/workspace/chaoscontrol/src/chaoscontrol/model.py", line 1080, in encode
+    x = _checkpoint(layer, x, return_jacobian_stats=False, use_reentrant=False)
+  File "/workspace/chaoscontrol/src/chaoscontrol/model.py", line 105, in forward
+    result = self.core(
+  File "/workspace/chaoscontrol/src/chaoscontrol/core.py", line 574, in forward
+    decay, update, gate = self._diag_terms(x)
+  File "/workspace/chaoscontrol/src/chaoscontrol/core.py", line 403, in _diag_terms
+    delta = F.softplus(self.delta_proj(x)).clamp_min(1e-4)
+  File "/workspace/chaoscontrol/src/chaoscontrol/kernels/fp8_linear.py", line 404, in forward
+    y_flat = _FusedFP8LinearFn.apply(
+  File "/workspace/chaoscontrol/src/chaoscontrol/kernels/fp8_linear.py", line 223, in backward
+    grad_x_flat = cublaslt_fp8_linear_bwd_x(
+  File "/workspace/chaoscontrol/src/chaoscontrol/kernels/_cublaslt/__init__.py", line 244, in cublaslt_fp8_linear_bwd_x
+    return _C.cublaslt_fp8_linear_bwd_x(
+
+Set TORCHDYNAMO_VERBOSE=1 for the internal stack trace (please do this especially if you're reporting a bug to PyTorch). For even more developer context, set TORCH_LOGS="+dynamo"
+
+Traceback (most recent call last):
+  File "/workspace/chaoscontrol/experiments/19_prereqs/runner_persistent_ddp.py", line 730, in main
+    run_one_seed(
+  File "/workspace/chaoscontrol/experiments/19_prereqs/runner_persistent_ddp.py", line 431, in run_one_seed
+    optimizer = _warmup_and_restore(
+                ^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/chaoscontrol/experiments/19_prereqs/runner_persistent_ddp.py", line 261, in _warmup_and_restore
+    warmup_call_fn()
+  File "/workspace/chaoscontrol/experiments/19_prereqs/runner_persistent_ddp.py", line 405, in _run_warmup
+    train_ssm_for_budget(
+  File "/workspace/chaoscontrol/src/chaoscontrol/train_ssm.py", line 393, in train_ssm_for_budget
+    loss = train_ssm_step(
+           ^^^^^^^^^^^^^^^
+  File "/workspace/chaoscontrol/src/chaoscontrol/train_ssm.py", line 281, in train_ssm_step
+    hidden = _compiled_step_fn()(model, inputs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/torch/_dynamo/eval_frame.py", line 841, in compile_wrapper
+    raise e.with_traceback(None) from e.__cause__  # User compiler error
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+torch._dynamo.exc.Unsupported: Attempted to call function marked as skipped
+  Explanation: Dynamo does not know how to trace the builtin `chaoscontrol.kernels._cublaslt._C.pybind11_detail_function_record_v1_system_libstdcpp_gxx_abi_1xxx_use_cxx11_abi_1.cublaslt_fp8_linear_bwd_x.` This function is either a Python builtin (e.g. _warnings.warn) or a third-party C/C++ Python extension (perhaps created with pybind).
+  Hint: If it is a Python builtin, please file an issue on GitHub so the PyTorch team can add support for it and see the next case for a workaround.
+  Hint: If it is a third-party C/C++ Python extension, please either wrap it into a PyTorch-understood custom operator (see https://pytorch.org/tutorials/advanced/custom_ops_landing_page.html for more details) or, if it is traceable, use `torch.compiler.allow_in_graph`.
+
+  Developer debug context: module: chaoscontrol.kernels._cublaslt._C, qualname: pybind11_detail_function_record_v1_system_libstdcpp_gxx_abi_1xxx_use_cxx11_abi_1.cublaslt_fp8_linear_bwd_x, skip reason: <missing reason>
+
+ For more details about this graph break, please visit: https://meta-pytorch.github.io/compile-graph-break-site/gb/gb0007.html
+
+from user code:
+   File "/workspace/chaoscontrol/src/chaoscontrol/train_ssm.py", line 183, in _encode_only
+    return model.encode(inputs)
+  File "/workspace/chaoscontrol/src/chaoscontrol/model.py", line 1080, in encode
+    x = _checkpoint(layer, x, return_jacobian_stats=False, use_reentrant=False)
+  File "/workspace/chaoscontrol/src/chaoscontrol/model.py", line 105, in forward
+    result = self.core(
+  File "/workspace/chaoscontrol/src/chaoscontrol/core.py", line 574, in forward
+    decay, update, gate = self._diag_terms(x)
+  File "/workspace/chaoscontrol/src/chaoscontrol/core.py", line 403, in _diag_terms
+    delta = F.softplus(self.delta_proj(x)).clamp_min(1e-4)
+  File "/workspace/chaoscontrol/src/chaoscontrol/kernels/fp8_linear.py", line 404, in forward
+    y_flat = _FusedFP8LinearFn.apply(
+  File "/workspace/chaoscontrol/src/chaoscontrol/kernels/fp8_linear.py", line 223, in backward
+    grad_x_flat = cublaslt_fp8_linear_bwd_x(
+  File "/workspace/chaoscontrol/src/chaoscontrol/kernels/_cublaslt/__init__.py", line 244, in cublaslt_fp8_linear_bwd_x
+    return _C.cublaslt_fp8_linear_bwd_x(
+
+Set TORCHDYNAMO_VERBOSE=1 for the internal stack trace (please do this especially if you're reporting a bug to PyTorch). For even more developer context, set TORCH_LOGS="+dynamo"
+
+
+/usr/local/lib/python3.12/dist-packages/torch/distributed/distributed_c10d.py:4876: UserWarning: barrier(): using the device under current context. You can specify `device_id` in `init_process_group` to mute this warning.
+  warnings.warn(  # warn only once
+[rank 0] promoted 29 nn.Linear -> FusedFP8Linear for fp8_fused
+[rank 0/4] entry seed=2674 precision=fp8_fused dim=256 layers=4 params=10,751,232
+[rank 0] warmup: 20 steps before timer
+[rank 0] ERROR on fp8_fused_all_seed2674_s2674: Unsupported: Attempted to call function marked as skipped
+  Explanation: Dynamo does not know how to trace the builtin `chaoscontrol.kernels._cublaslt._C.pybind11_detail_function_record_v1_system_libstdcpp_gxx_abi_1xxx_use_cxx11_abi_1.cublaslt_fp8_linear_bwd_x.` This function is either a Python builtin (e.g. _warnings.warn) or a third-party C/C++ Python extension (perhaps created with pybind).
+  Hint: If it is a Python builtin, please file an issue on GitHub so the PyTorch team can add support for it and see the next case for a workaround.
+  Hint: If it is a third-party C/C++ Python extension, please either wrap it into a PyTorch-understood custom operator (see https://pytorch.org/tutorials/advanced/custom_ops_landing_page.html for more details) or, if it is traceable, use `torch.compiler.allow_in_graph`.
+
+  Developer debug context: module: chaoscontrol.kernels._cublaslt._C, qualname: pybind11_detail_function_record_v1_system_libstdcpp_gxx_abi_1xxx_use_cxx11_abi_1.cublaslt_fp8_linear_bwd_x, skip reason: <missing reason>
+
+ For more details about this graph break, please visit: https://meta-pytorch.github.io/compile-graph-break-site/gb/gb0007.html
+
+from user code:
+   File "/workspace/chaoscontrol/src/chaoscontrol/train_ssm.py", line 183, in _encode_only
+    return model.encode(inputs)
+  File "/workspace/chaoscontrol/src/chaoscontrol/model.py", line 1080, in encode
+    x = _checkpoint(layer, x, return_jacobian_stats=False, use_reentrant=False)
+  File "/workspace/chaoscontrol/src/chaoscontrol/model.py", line 105, in forward
+    result = self.core(
+  File "/workspace/chaoscontrol/src/chaoscontrol/core.py", line 574, in forward
+    decay, update, gate = self._diag_terms(x)
+  File "/workspace/chaoscontrol/src/chaoscontrol/core.py", line 403, in _diag_terms
+    delta = F.softplus(self.delta_proj(x)).clamp_min(1e-4)
+  File "/workspace/chaoscontrol/src/chaoscontrol/kernels/fp8_linear.py", line 404, in forward
+    y_flat = _FusedFP8LinearFn.apply(
+  File "/workspace/chaoscontrol/src/chaoscontrol/kernels/fp8_linear.py", line 223, in backward
+    grad_x_flat = cublaslt_fp8_linear_bwd_x(
+  File "/workspace/chaoscontrol/src/chaoscontrol/kernels/_cublaslt/__init__.py", line 244, in cublaslt_fp8_linear_bwd_x
+    return _C.cublaslt_fp8_linear_bwd_x(
+
+Set TORCHDYNAMO_VERBOSE=1 for the internal stack trace (please do this especially if you're reporting a bug to PyTorch). For even more developer context, set TORCH_LOGS="+dynamo"
+
+Traceback (most recent call last):
+  File "/workspace/chaoscontrol/experiments/19_prereqs/runner_persistent_ddp.py", line 730, in main
+    run_one_seed(
+  File "/workspace/chaoscontrol/experiments/19_prereqs/runner_persistent_ddp.py", line 431, in run_one_seed
+    optimizer = _warmup_and_restore(
+                ^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/chaoscontrol/experiments/19_prereqs/runner_persistent_ddp.py", line 261, in _warmup_and_restore
+    warmup_call_fn()
+  File "/workspace/chaoscontrol/experiments/19_prereqs/runner_persistent_ddp.py", line 405, in _run_warmup
+    train_ssm_for_budget(
+  File "/workspace/chaoscontrol/src/chaoscontrol/train_ssm.py", line 393, in train_ssm_for_budget
+    loss = train_ssm_step(
+           ^^^^^^^^^^^^^^^
+  File "/workspace/chaoscontrol/src/chaoscontrol/train_ssm.py", line 281, in train_ssm_step
+    hidden = _compiled_step_fn()(model, inputs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/torch/_dynamo/eval_frame.py", line 841, in compile_wrapper
+    raise e.with_traceback(None) from e.__cause__  # User compiler error
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+torch._dynamo.exc.Unsupported: Attempted to call function marked as skipped
+  Explanation: Dynamo does not know how to trace the builtin `chaoscontrol.kernels._cublaslt._C.pybind11_detail_function_record_v1_system_libstdcpp_gxx_abi_1xxx_use_cxx11_abi_1.cublaslt_fp8_linear_bwd_x.` This function is either a Python builtin (e.g. _warnings.warn) or a third-party C/C++ Python extension (perhaps created with pybind).
+  Hint: If it is a Python builtin, please file an issue on GitHub so the PyTorch team can add support for it and see the next case for a workaround.
+  Hint: If it is a third-party C/C++ Python extension, please either wrap it into a PyTorch-understood custom operator (see https://pytorch.org/tutorials/advanced/custom_ops_landing_page.html for more details) or, if it is traceable, use `torch.compiler.allow_in_graph`.
+
+  Developer debug context: module: chaoscontrol.kernels._cublaslt._C, qualname: pybind11_detail_function_record_v1_system_libstdcpp_gxx_abi_1xxx_use_cxx11_abi_1.cublaslt_fp8_linear_bwd_x, skip reason: <missing reason>
+
+ For more details about this graph break, please visit: https://meta-pytorch.github.io/compile-graph-break-site/gb/gb0007.html
+
+from user code:
+   File "/workspace/chaoscontrol/src/chaoscontrol/train_ssm.py", line 183, in _encode_only
+    return model.encode(inputs)
+  File "/workspace/chaoscontrol/src/chaoscontrol/model.py", line 1080, in encode
+    x = _checkpoint(layer, x, return_jacobian_stats=False, use_reentrant=False)
+  File "/workspace/chaoscontrol/src/chaoscontrol/model.py", line 105, in forward
+    result = self.core(
+  File "/workspace/chaoscontrol/src/chaoscontrol/core.py", line 574, in forward
+    decay, update, gate = self._diag_terms(x)
+  File "/workspace/chaoscontrol/src/chaoscontrol/core.py", line 403, in _diag_terms
+    delta = F.softplus(self.delta_proj(x)).clamp_min(1e-4)
+  File "/workspace/chaoscontrol/src/chaoscontrol/kernels/fp8_linear.py", line 404, in forward
+    y_flat = _FusedFP8LinearFn.apply(
+  File "/workspace/chaoscontrol/src/chaoscontrol/kernels/fp8_linear.py", line 223, in backward
+    grad_x_flat = cublaslt_fp8_linear_bwd_x(
+  File "/workspace/chaoscontrol/src/chaoscontrol/kernels/_cublaslt/__init__.py", line 244, in cublaslt_fp8_linear_bwd_x
+    return _C.cublaslt_fp8_linear_bwd_x(
+
+Set TORCHDYNAMO_VERBOSE=1 for the internal stack trace (please do this especially if you're reporting a bug to PyTorch). For even more developer context, set TORCH_LOGS="+dynamo"
+
+
+/usr/local/lib/python3.12/dist-packages/torch/distributed/distributed_c10d.py:4876: UserWarning: barrier(): using the device under current context. You can specify `device_id` in `init_process_group` to mute this warning.
+  warnings.warn(  # warn only once
+[rank 0] promoted 29 nn.Linear -> FusedFP8Linear for fp8_fused
+[rank 0/4] entry seed=4011 precision=fp8_fused dim=256 layers=4 params=10,751,232
+[rank 0] warmup: 20 steps before timer
+[rank 0] ERROR on fp8_fused_all_seed4011_s4011: Unsupported: Attempted to call function marked as skipped
+  Explanation: Dynamo does not know how to trace the builtin `chaoscontrol.kernels._cublaslt._C.pybind11_detail_function_record_v1_system_libstdcpp_gxx_abi_1xxx_use_cxx11_abi_1.cublaslt_fp8_linear_bwd_x.` This function is either a Python builtin (e.g. _warnings.warn) or a third-party C/C++ Python extension (perhaps created with pybind).
+  Hint: If it is a Python builtin, please file an issue on GitHub so the PyTorch team can add support for it and see the next case for a workaround.
+  Hint: If it is a third-party C/C++ Python extension, please either wrap it into a PyTorch-understood custom operator (see https://pytorch.org/tutorials/advanced/custom_ops_landing_page.html for more details) or, if it is traceable, use `torch.compiler.allow_in_graph`.
+
+  Developer debug context: module: chaoscontrol.kernels._cublaslt._C, qualname: pybind11_detail_function_record_v1_system_libstdcpp_gxx_abi_1xxx_use_cxx11_abi_1.cublaslt_fp8_linear_bwd_x, skip reason: <missing reason>
+
+ For more details about this graph break, please visit: https://meta-pytorch.github.io/compile-graph-break-site/gb/gb0007.html
+
+from user code:
+   File "/workspace/chaoscontrol/src/chaoscontrol/train_ssm.py", line 183, in _encode_only
+    return model.encode(inputs)
+  File "/workspace/chaoscontrol/src/chaoscontrol/model.py", line 1080, in encode
+    x = _checkpoint(layer, x, return_jacobian_stats=False, use_reentrant=False)
+  File "/workspace/chaoscontrol/src/chaoscontrol/model.py", line 105, in forward
+    result = self.core(
+  File "/workspace/chaoscontrol/src/chaoscontrol/core.py", line 574, in forward
+    decay, update, gate = self._diag_terms(x)
+  File "/workspace/chaoscontrol/src/chaoscontrol/core.py", line 403, in _diag_terms
+    delta = F.softplus(self.delta_proj(x)).clamp_min(1e-4)
+  File "/workspace/chaoscontrol/src/chaoscontrol/kernels/fp8_linear.py", line 404, in forward
+    y_flat = _FusedFP8LinearFn.apply(
+  File "/workspace/chaoscontrol/src/chaoscontrol/kernels/fp8_linear.py", line 223, in backward
+    grad_x_flat = cublaslt_fp8_linear_bwd_x(
+  File "/workspace/chaoscontrol/src/chaoscontrol/kernels/_cublaslt/__init__.py", line 244, in cublaslt_fp8_linear_bwd_x
+    return _C.cublaslt_fp8_linear_bwd_x(
+
+Set TORCHDYNAMO_VERBOSE=1 for the internal stack trace (please do this especially if you're reporting a bug to PyTorch). For even more developer context, set TORCH_LOGS="+dynamo"
+
+Traceback (most recent call last):
+  File "/workspace/chaoscontrol/experiments/19_prereqs/runner_persistent_ddp.py", line 730, in main
+    run_one_seed(
+  File "/workspace/chaoscontrol/experiments/19_prereqs/runner_persistent_ddp.py", line 431, in run_one_seed
+    optimizer = _warmup_and_restore(
+                ^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/chaoscontrol/experiments/19_prereqs/runner_persistent_ddp.py", line 261, in _warmup_and_restore
+    warmup_call_fn()
+  File "/workspace/chaoscontrol/experiments/19_prereqs/runner_persistent_ddp.py", line 405, in _run_warmup
+    train_ssm_for_budget(
+  File "/workspace/chaoscontrol/src/chaoscontrol/train_ssm.py", line 393, in train_ssm_for_budget
+    loss = train_ssm_step(
+           ^^^^^^^^^^^^^^^
+  File "/workspace/chaoscontrol/src/chaoscontrol/train_ssm.py", line 281, in train_ssm_step
+    hidden = _compiled_step_fn()(model, inputs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/torch/_dynamo/eval_frame.py", line 841, in compile_wrapper
+    raise e.with_traceback(None) from e.__cause__  # User compiler error
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+torch._dynamo.exc.Unsupported: Attempted to call function marked as skipped
+  Explanation: Dynamo does not know how to trace the builtin `chaoscontrol.kernels._cublaslt._C.pybind11_detail_function_record_v1_system_libstdcpp_gxx_abi_1xxx_use_cxx11_abi_1.cublaslt_fp8_linear_bwd_x.` This function is either a Python builtin (e.g. _warnings.warn) or a third-party C/C++ Python extension (perhaps created with pybind).
+  Hint: If it is a Python builtin, please file an issue on GitHub so the PyTorch team can add support for it and see the next case for a workaround.
+  Hint: If it is a third-party C/C++ Python extension, please either wrap it into a PyTorch-understood custom operator (see https://pytorch.org/tutorials/advanced/custom_ops_landing_page.html for more details) or, if it is traceable, use `torch.compiler.allow_in_graph`.
+
+  Developer debug context: module: chaoscontrol.kernels._cublaslt._C, qualname: pybind11_detail_function_record_v1_system_libstdcpp_gxx_abi_1xxx_use_cxx11_abi_1.cublaslt_fp8_linear_bwd_x, skip reason: <missing reason>
+
+ For more details about this graph break, please visit: https://meta-pytorch.github.io/compile-graph-break-site/gb/gb0007.html
+
+from user code:
+   File "/workspace/chaoscontrol/src/chaoscontrol/train_ssm.py", line 183, in _encode_only
+    return model.encode(inputs)
+  File "/workspace/chaoscontrol/src/chaoscontrol/model.py", line 1080, in encode
+    x = _checkpoint(layer, x, return_jacobian_stats=False, use_reentrant=False)
+  File "/workspace/chaoscontrol/src/chaoscontrol/model.py", line 105, in forward
+    result = self.core(
+  File "/workspace/chaoscontrol/src/chaoscontrol/core.py", line 574, in forward
+    decay, update, gate = self._diag_terms(x)
+  File "/workspace/chaoscontrol/src/chaoscontrol/core.py", line 403, in _diag_terms
+    delta = F.softplus(self.delta_proj(x)).clamp_min(1e-4)
+  File "/workspace/chaoscontrol/src/chaoscontrol/kernels/fp8_linear.py", line 404, in forward
+    y_flat = _FusedFP8LinearFn.apply(
+  File "/workspace/chaoscontrol/src/chaoscontrol/kernels/fp8_linear.py", line 223, in backward
+    grad_x_flat = cublaslt_fp8_linear_bwd_x(
+  File "/workspace/chaoscontrol/src/chaoscontrol/kernels/_cublaslt/__init__.py", line 244, in cublaslt_fp8_linear_bwd_x
+    return _C.cublaslt_fp8_linear_bwd_x(
+
+Set TORCHDYNAMO_VERBOSE=1 for the internal stack trace (please do this especially if you're reporting a bug to PyTorch). For even more developer context, set TORCH_LOGS="+dynamo"
+
+
+/usr/local/lib/python3.12/dist-packages/torch/distributed/distributed_c10d.py:4876: UserWarning: barrier(): using the device under current context. You can specify `device_id` in `init_process_group` to mute this warning.
+  warnings.warn(  # warn only once
+[rank 0] promoted 29 nn.Linear -> FusedFP8Linear for fp8_fused
+[rank 0/4] entry seed=5348 precision=fp8_fused dim=256 layers=4 params=10,751,232
+[rank 0] warmup: 20 steps before timer
+[rank 0] ERROR on fp8_fused_all_seed5348_s5348: Unsupported: Attempted to call function marked as skipped
+  Explanation: Dynamo does not know how to trace the builtin `chaoscontrol.kernels._cublaslt._C.pybind11_detail_function_record_v1_system_libstdcpp_gxx_abi_1xxx_use_cxx11_abi_1.cublaslt_fp8_linear_bwd_x.` This function is either a Python builtin (e.g. _warnings.warn) or a third-party C/C++ Python extension (perhaps created with pybind).
+  Hint: If it is a Python builtin, please file an issue on GitHub so the PyTorch team can add support for it and see the next case for a workaround.
+  Hint: If it is a third-party C/C++ Python extension, please either wrap it into a PyTorch-understood custom operator (see https://pytorch.org/tutorials/advanced/custom_ops_landing_page.html for more details) or, if it is traceable, use `torch.compiler.allow_in_graph`.
+
+  Developer debug context: module: chaoscontrol.kernels._cublaslt._C, qualname: pybind11_detail_function_record_v1_system_libstdcpp_gxx_abi_1xxx_use_cxx11_abi_1.cublaslt_fp8_linear_bwd_x, skip reason: <missing reason>
+
+ For more details about this graph break, please visit: https://meta-pytorch.github.io/compile-graph-break-site/gb/gb0007.html
+
+from user code:
+   File "/workspace/chaoscontrol/src/chaoscontrol/train_ssm.py", line 183, in _encode_only
+    return model.encode(inputs)
+  File "/workspace/chaoscontrol/src/chaoscontrol/model.py", line 1080, in encode
+    x = _checkpoint(layer, x, return_jacobian_stats=False, use_reentrant=False)
+  File "/workspace/chaoscontrol/src/chaoscontrol/model.py", line 105, in forward
+    result = self.core(
+  File "/workspace/chaoscontrol/src/chaoscontrol/core.py", line 574, in forward
+    decay, update, gate = self._diag_terms(x)
+  File "/workspace/chaoscontrol/src/chaoscontrol/core.py", line 403, in _diag_terms
+    delta = F.softplus(self.delta_proj(x)).clamp_min(1e-4)
+  File "/workspace/chaoscontrol/src/chaoscontrol/kernels/fp8_linear.py", line 404, in forward
+    y_flat = _FusedFP8LinearFn.apply(
+  File "/workspace/chaoscontrol/src/chaoscontrol/kernels/fp8_linear.py", line 223, in backward
+    grad_x_flat = cublaslt_fp8_linear_bwd_x(
+  File "/workspace/chaoscontrol/src/chaoscontrol/kernels/_cublaslt/__init__.py", line 244, in cublaslt_fp8_linear_bwd_x
+    return _C.cublaslt_fp8_linear_bwd_x(
+
+Set TORCHDYNAMO_VERBOSE=1 for the internal stack trace (please do this especially if you're reporting a bug to PyTorch). For even more developer context, set TORCH_LOGS="+dynamo"
+
+Traceback (most recent call last):
+  File "/workspace/chaoscontrol/experiments/19_prereqs/runner_persistent_ddp.py", line 730, in main
+    run_one_seed(
+  File "/workspace/chaoscontrol/experiments/19_prereqs/runner_persistent_ddp.py", line 431, in run_one_seed
+    optimizer = _warmup_and_restore(
+                ^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/chaoscontrol/experiments/19_prereqs/runner_persistent_ddp.py", line 261, in _warmup_and_restore
+    warmup_call_fn()
+  File "/workspace/chaoscontrol/experiments/19_prereqs/runner_persistent_ddp.py", line 405, in _run_warmup
+    train_ssm_for_budget(
+  File "/workspace/chaoscontrol/src/chaoscontrol/train_ssm.py", line 393, in train_ssm_for_budget
+    loss = train_ssm_step(
+           ^^^^^^^^^^^^^^^
+  File "/workspace/chaoscontrol/src/chaoscontrol/train_ssm.py", line 281, in train_ssm_step
+    hidden = _compiled_step_fn()(model, inputs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/torch/_dynamo/eval_frame.py", line 841, in compile_wrapper
+    raise e.with_traceback(None) from e.__cause__  # User compiler error
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+torch._dynamo.exc.Unsupported: Attempted to call function marked as skipped
+  Explanation: Dynamo does not know how to trace the builtin `chaoscontrol.kernels._cublaslt._C.pybind11_detail_function_record_v1_system_libstdcpp_gxx_abi_1xxx_use_cxx11_abi_1.cublaslt_fp8_linear_bwd_x.` This function is either a Python builtin (e.g. _warnings.warn) or a third-party C/C++ Python extension (perhaps created with pybind).
+  Hint: If it is a Python builtin, please file an issue on GitHub so the PyTorch team can add support for it and see the next case for a workaround.
+  Hint: If it is a third-party C/C++ Python extension, please either wrap it into a PyTorch-understood custom operator (see https://pytorch.org/tutorials/advanced/custom_ops_landing_page.html for more details) or, if it is traceable, use `torch.compiler.allow_in_graph`.
+
+  Developer debug context: module: chaoscontrol.kernels._cublaslt._C, qualname: pybind11_detail_function_record_v1_system_libstdcpp_gxx_abi_1xxx_use_cxx11_abi_1.cublaslt_fp8_linear_bwd_x, skip reason: <missing reason>
+
+ For more details about this graph break, please visit: https://meta-pytorch.github.io/compile-graph-break-site/gb/gb0007.html
+
+from user code:
+   File "/workspace/chaoscontrol/src/chaoscontrol/train_ssm.py", line 183, in _encode_only
+    return model.encode(inputs)
+  File "/workspace/chaoscontrol/src/chaoscontrol/model.py", line 1080, in encode
+    x = _checkpoint(layer, x, return_jacobian_stats=False, use_reentrant=False)
+  File "/workspace/chaoscontrol/src/chaoscontrol/model.py", line 105, in forward
+    result = self.core(
+  File "/workspace/chaoscontrol/src/chaoscontrol/core.py", line 574, in forward
+    decay, update, gate = self._diag_terms(x)
+  File "/workspace/chaoscontrol/src/chaoscontrol/core.py", line 403, in _diag_terms
+    delta = F.softplus(self.delta_proj(x)).clamp_min(1e-4)
+  File "/workspace/chaoscontrol/src/chaoscontrol/kernels/fp8_linear.py", line 404, in forward
+    y_flat = _FusedFP8LinearFn.apply(
+  File "/workspace/chaoscontrol/src/chaoscontrol/kernels/fp8_linear.py", line 223, in backward
+    grad_x_flat = cublaslt_fp8_linear_bwd_x(
+  File "/workspace/chaoscontrol/src/chaoscontrol/kernels/_cublaslt/__init__.py", line 244, in cublaslt_fp8_linear_bwd_x
+    return _C.cublaslt_fp8_linear_bwd_x(
+
+Set TORCHDYNAMO_VERBOSE=1 for the internal stack trace (please do this especially if you're reporting a bug to PyTorch). For even more developer context, set TORCH_LOGS="+dynamo"
+
+
+/usr/local/lib/python3.12/dist-packages/torch/distributed/distributed_c10d.py:4876: UserWarning: barrier(): using the device under current context. You can specify `device_id` in `init_process_group` to mute this warning.
+  warnings.warn(  # warn only once
+[rank 0] promoted 29 nn.Linear -> FusedFP8Linear for fp8_fused
+[rank 0/4] entry seed=1337 precision=fp8_fused dim=256 layers=4 params=10,751,232
+[rank 0] warmup: 20 steps before timer
+[rank 0] ERROR on fp8_fused_no_fused_clip_seed1337_s1337: Unsupported: Attempted to call function marked as skipped
+  Explanation: Dynamo does not know how to trace the builtin `chaoscontrol.kernels._cublaslt._C.pybind11_detail_function_record_v1_system_libstdcpp_gxx_abi_1xxx_use_cxx11_abi_1.cublaslt_fp8_linear_bwd_x.` This function is either a Python builtin (e.g. _warnings.warn) or a third-party C/C++ Python extension (perhaps created with pybind).
+  Hint: If it is a Python builtin, please file an issue on GitHub so the PyTorch team can add support for it and see the next case for a workaround.
+  Hint: If it is a third-party C/C++ Python extension, please either wrap it into a PyTorch-understood custom operator (see https://pytorch.org/tutorials/advanced/custom_ops_landing_page.html for more details) or, if it is traceable, use `torch.compiler.allow_in_graph`.
+
+  Developer debug context: module: chaoscontrol.kernels._cublaslt._C, qualname: pybind11_detail_function_record_v1_system_libstdcpp_gxx_abi_1xxx_use_cxx11_abi_1.cublaslt_fp8_linear_bwd_x, skip reason: <missing reason>
+
+ For more details about this graph break, please visit: https://meta-pytorch.github.io/compile-graph-break-site/gb/gb0007.html
+
+from user code:
+   File "/workspace/chaoscontrol/src/chaoscontrol/train_ssm.py", line 183, in _encode_only
+    return model.encode(inputs)
+  File "/workspace/chaoscontrol/src/chaoscontrol/model.py", line 1080, in encode
+    x = _checkpoint(layer, x, return_jacobian_stats=False, use_reentrant=False)
+  File "/workspace/chaoscontrol/src/chaoscontrol/model.py", line 105, in forward
+    result = self.core(
+  File "/workspace/chaoscontrol/src/chaoscontrol/core.py", line 574, in forward
+    decay, update, gate = self._diag_terms(x)
+  File "/workspace/chaoscontrol/src/chaoscontrol/core.py", line 403, in _diag_terms
+    delta = F.softplus(self.delta_proj(x)).clamp_min(1e-4)
+  File "/workspace/chaoscontrol/src/chaoscontrol/kernels/fp8_linear.py", line 404, in forward
+    y_flat = _FusedFP8LinearFn.apply(
+  File "/workspace/chaoscontrol/src/chaoscontrol/kernels/fp8_linear.py", line 223, in backward
+    grad_x_flat = cublaslt_fp8_linear_bwd_x(
+  File "/workspace/chaoscontrol/src/chaoscontrol/kernels/_cublaslt/__init__.py", line 244, in cublaslt_fp8_linear_bwd_x
+    return _C.cublaslt_fp8_linear_bwd_x(
+
+Set TORCHDYNAMO_VERBOSE=1 for the internal stack trace (please do this especially if you're reporting a bug to PyTorch). For even more developer context, set TORCH_LOGS="+dynamo"
+
+Traceback (most recent call last):
+  File "/workspace/chaoscontrol/experiments/19_prereqs/runner_persistent_ddp.py", line 730, in main
+    run_one_seed(
+  File "/workspace/chaoscontrol/experiments/19_prereqs/runner_persistent_ddp.py", line 431, in run_one_seed
+    optimizer = _warmup_and_restore(
+                ^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/chaoscontrol/experiments/19_prereqs/runner_persistent_ddp.py", line 261, in _warmup_and_restore
+    warmup_call_fn()
+  File "/workspace/chaoscontrol/experiments/19_prereqs/runner_persistent_ddp.py", line 405, in _run_warmup
+    train_ssm_for_budget(
+  File "/workspace/chaoscontrol/src/chaoscontrol/train_ssm.py", line 393, in train_ssm_for_budget
+    loss = train_ssm_step(
+           ^^^^^^^^^^^^^^^
+  File "/workspace/chaoscontrol/src/chaoscontrol/train_ssm.py", line 281, in train_ssm_step
+    hidden = _compiled_step_fn()(model, inputs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/torch/_dynamo/eval_frame.py", line 841, in compile_wrapper
+    raise e.with_traceback(None) from e.__cause__  # User compiler error
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+torch._dynamo.exc.Unsupported: Attempted to call function marked as skipped
+  Explanation: Dynamo does not know how to trace the builtin `chaoscontrol.kernels._cublaslt._C.pybind11_detail_function_record_v1_system_libstdcpp_gxx_abi_1xxx_use_cxx11_abi_1.cublaslt_fp8_linear_bwd_x.` This function is either a Python builtin (e.g. _warnings.warn) or a third-party C/C++ Python extension (perhaps created with pybind).
+  Hint: If it is a Python builtin, please file an issue on GitHub so the PyTorch team can add support for it and see the next case for a workaround.
+  Hint: If it is a third-party C/C++ Python extension, please either wrap it into a PyTorch-understood custom operator (see https://pytorch.org/tutorials/advanced/custom_ops_landing_page.html for more details) or, if it is traceable, use `torch.compiler.allow_in_graph`.
+
+  Developer debug context: module: chaoscontrol.kernels._cublaslt._C, qualname: pybind11_detail_function_record_v1_system_libstdcpp_gxx_abi_1xxx_use_cxx11_abi_1.cublaslt_fp8_linear_bwd_x, skip reason: <missing reason>
+
+ For more details about this graph break, please visit: https://meta-pytorch.github.io/compile-graph-break-site/gb/gb0007.html
+
+from user code:
+   File "/workspace/chaoscontrol/src/chaoscontrol/train_ssm.py", line 183, in _encode_only
+    return model.encode(inputs)
+  File "/workspace/chaoscontrol/src/chaoscontrol/model.py", line 1080, in encode
+    x = _checkpoint(layer, x, return_jacobian_stats=False, use_reentrant=False)
+  File "/workspace/chaoscontrol/src/chaoscontrol/model.py", line 105, in forward
+    result = self.core(
+  File "/workspace/chaoscontrol/src/chaoscontrol/core.py", line 574, in forward
+    decay, update, gate = self._diag_terms(x)
+  File "/workspace/chaoscontrol/src/chaoscontrol/core.py", line 403, in _diag_terms
+    delta = F.softplus(self.delta_proj(x)).clamp_min(1e-4)
+  File "/workspace/chaoscontrol/src/chaoscontrol/kernels/fp8_linear.py", line 404, in forward
+    y_flat = _FusedFP8LinearFn.apply(
+  File "/workspace/chaoscontrol/src/chaoscontrol/kernels/fp8_linear.py", line 223, in backward
+    grad_x_flat = cublaslt_fp8_linear_bwd_x(
+  File "/workspace/chaoscontrol/src/chaoscontrol/kernels/_cublaslt/__init__.py", line 244, in cublaslt_fp8_linear_bwd_x
+    return _C.cublaslt_fp8_linear_bwd_x(
+
+Set TORCHDYNAMO_VERBOSE=1 for the internal stack trace (please do this especially if you're reporting a bug to PyTorch). For even more developer context, set TORCH_LOGS="+dynamo"
+
+
+/usr/local/lib/python3.12/dist-packages/torch/distributed/distributed_c10d.py:4876: UserWarning: barrier(): using the device under current context. You can specify `device_id` in `init_process_group` to mute this warning.
+  warnings.warn(  # warn only once
+[rank 0] promoted 29 nn.Linear -> FusedFP8Linear for fp8_fused
+[rank 0/4] entry seed=2674 precision=fp8_fused dim=256 layers=4 params=10,751,232
+[rank 0] warmup: 20 steps before timer
+[rank 0] ERROR on fp8_fused_no_fused_clip_seed2674_s2674: Unsupported: Attempted to call function marked as skipped
+  Explanation: Dynamo does not know how to trace the builtin `chaoscontrol.kernels._cublaslt._C.pybind11_detail_function_record_v1_system_libstdcpp_gxx_abi_1xxx_use_cxx11_abi_1.cublaslt_fp8_linear_bwd_x.` This function is either a Python builtin (e.g. _warnings.warn) or a third-party C/C++ Python extension (perhaps created with pybind).
+  Hint: If it is a Python builtin, please file an issue on GitHub so the PyTorch team can add support for it and see the next case for a workaround.
+  Hint: If it is a third-party C/C++ Python extension, please either wrap it into a PyTorch-understood custom operator (see https://pytorch.org/tutorials/advanced/custom_ops_landing_page.html for more details) or, if it is traceable, use `torch.compiler.allow_in_graph`.
+
+  Developer debug context: module: chaoscontrol.kernels._cublaslt._C, qualname: pybind11_detail_function_record_v1_system_libstdcpp_gxx_abi_1xxx_use_cxx11_abi_1.cublaslt_fp8_linear_bwd_x, skip reason: <missing reason>
+
+ For more details about this graph break, please visit: https://meta-pytorch.github.io/compile-graph-break-site/gb/gb0007.html
+
+from user code:
+   File "/workspace/chaoscontrol/src/chaoscontrol/train_ssm.py", line 183, in _encode_only
+    return model.encode(inputs)
+  File "/workspace/chaoscontrol/src/chaoscontrol/model.py", line 1080, in encode
+    x = _checkpoint(layer, x, return_jacobian_stats=False, use_reentrant=False)
+  File "/workspace/chaoscontrol/src/chaoscontrol/model.py", line 105, in forward
+    result = self.core(
+  File "/workspace/chaoscontrol/src/chaoscontrol/core.py", line 574, in forward
+    decay, update, gate = self._diag_terms(x)
+  File "/workspace/chaoscontrol/src/chaoscontrol/core.py", line 403, in _diag_terms
+    delta = F.softplus(self.delta_proj(x)).clamp_min(1e-4)
+  File "/workspace/chaoscontrol/src/chaoscontrol/kernels/fp8_linear.py", line 404, in forward
+    y_flat = _FusedFP8LinearFn.apply(
+  File "/workspace/chaoscontrol/src/chaoscontrol/kernels/fp8_linear.py", line 223, in backward
+    grad_x_flat = cublaslt_fp8_linear_bwd_x(
+  File "/workspace/chaoscontrol/src/chaoscontrol/kernels/_cublaslt/__init__.py", line 244, in cublaslt_fp8_linear_bwd_x
+    return _C.cublaslt_fp8_linear_bwd_x(
+
+Set TORCHDYNAMO_VERBOSE=1 for the internal stack trace (please do this especially if you're reporting a bug to PyTorch). For even more developer context, set TORCH_LOGS="+dynamo"
+
+Traceback (most recent call last):
+  File "/workspace/chaoscontrol/experiments/19_prereqs/runner_persistent_ddp.py", line 730, in main
+    run_one_seed(
+  File "/workspace/chaoscontrol/experiments/19_prereqs/runner_persistent_ddp.py", line 431, in run_one_seed
+    optimizer = _warmup_and_restore(
+                ^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/chaoscontrol/experiments/19_prereqs/runner_persistent_ddp.py", line 261, in _warmup_and_restore
+    warmup_call_fn()
+  File "/workspace/chaoscontrol/experiments/19_prereqs/runner_persistent_ddp.py", line 405, in _run_warmup
+    train_ssm_for_budget(
+  File "/workspace/chaoscontrol/src/chaoscontrol/train_ssm.py", line 393, in train_ssm_for_budget
+    loss = train_ssm_step(
+           ^^^^^^^^^^^^^^^
+  File "/workspace/chaoscontrol/src/chaoscontrol/train_ssm.py", line 281, in train_ssm_step
+    hidden = _compiled_step_fn()(model, inputs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/torch/_dynamo/eval_frame.py", line 841, in compile_wrapper
+    raise e.with_traceback(None) from e.__cause__  # User compiler error
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+torch._dynamo.exc.Unsupported: Attempted to call function marked as skipped
+  Explanation: Dynamo does not know how to trace the builtin `chaoscontrol.kernels._cublaslt._C.pybind11_detail_function_record_v1_system_libstdcpp_gxx_abi_1xxx_use_cxx11_abi_1.cublaslt_fp8_linear_bwd_x.` This function is either a Python builtin (e.g. _warnings.warn) or a third-party C/C++ Python extension (perhaps created with pybind).
+  Hint: If it is a Python builtin, please file an issue on GitHub so the PyTorch team can add support for it and see the next case for a workaround.
+  Hint: If it is a third-party C/C++ Python extension, please either wrap it into a PyTorch-understood custom operator (see https://pytorch.org/tutorials/advanced/custom_ops_landing_page.html for more details) or, if it is traceable, use `torch.compiler.allow_in_graph`.
+
+  Developer debug context: module: chaoscontrol.kernels._cublaslt._C, qualname: pybind11_detail_function_record_v1_system_libstdcpp_gxx_abi_1xxx_use_cxx11_abi_1.cublaslt_fp8_linear_bwd_x, skip reason: <missing reason>
+
+ For more details about this graph break, please visit: https://meta-pytorch.github.io/compile-graph-break-site/gb/gb0007.html
+
+from user code:
+   File "/workspace/chaoscontrol/src/chaoscontrol/train_ssm.py", line 183, in _encode_only
+    return model.encode(inputs)
+  File "/workspace/chaoscontrol/src/chaoscontrol/model.py", line 1080, in encode
+    x = _checkpoint(layer, x, return_jacobian_stats=False, use_reentrant=False)
+  File "/workspace/chaoscontrol/src/chaoscontrol/model.py", line 105, in forward
+    result = self.core(
+  File "/workspace/chaoscontrol/src/chaoscontrol/core.py", line 574, in forward
+    decay, update, gate = self._diag_terms(x)
+  File "/workspace/chaoscontrol/src/chaoscontrol/core.py", line 403, in _diag_terms
+    delta = F.softplus(self.delta_proj(x)).clamp_min(1e-4)
+  File "/workspace/chaoscontrol/src/chaoscontrol/kernels/fp8_linear.py", line 404, in forward
+    y_flat = _FusedFP8LinearFn.apply(
+  File "/workspace/chaoscontrol/src/chaoscontrol/kernels/fp8_linear.py", line 223, in backward
+    grad_x_flat = cublaslt_fp8_linear_bwd_x(
+  File "/workspace/chaoscontrol/src/chaoscontrol/kernels/_cublaslt/__init__.py", line 244, in cublaslt_fp8_linear_bwd_x
+    return _C.cublaslt_fp8_linear_bwd_x(
+
+Set TORCHDYNAMO_VERBOSE=1 for the internal stack trace (please do this especially if you're reporting a bug to PyTorch). For even more developer context, set TORCH_LOGS="+dynamo"
+
+
+/usr/local/lib/python3.12/dist-packages/torch/distributed/distributed_c10d.py:4876: UserWarning: barrier(): using the device under current context. You can specify `device_id` in `init_process_group` to mute this warning.
+  warnings.warn(  # warn only once
+[rank 0] promoted 29 nn.Linear -> FusedFP8Linear for fp8_fused
+[rank 0/4] entry seed=4011 precision=fp8_fused dim=256 layers=4 params=10,751,232
+[rank 0] warmup: 20 steps before timer
+[rank 0] ERROR on fp8_fused_no_fused_clip_seed4011_s4011: Unsupported: Attempted to call function marked as skipped
+  Explanation: Dynamo does not know how to trace the builtin `chaoscontrol.kernels._cublaslt._C.pybind11_detail_function_record_v1_system_libstdcpp_gxx_abi_1xxx_use_cxx11_abi_1.cublaslt_fp8_linear_bwd_x.` This function is either a Python builtin (e.g. _warnings.warn) or a third-party C/C++ Python extension (perhaps created with pybind).
+  Hint: If it is a Python builtin, please file an issue on GitHub so the PyTorch team can add support for it and see the next case for a workaround.
+  Hint: If it is a third-party C/C++ Python extension, please either wrap it into a PyTorch-understood custom operator (see https://pytorch.org/tutorials/advanced/custom_ops_landing_page.html for more details) or, if it is traceable, use `torch.compiler.allow_in_graph`.
+
+  Developer debug context: module: chaoscontrol.kernels._cublaslt._C, qualname: pybind11_detail_function_record_v1_system_libstdcpp_gxx_abi_1xxx_use_cxx11_abi_1.cublaslt_fp8_linear_bwd_x, skip reason: <missing reason>
+
+ For more details about this graph break, please visit: https://meta-pytorch.github.io/compile-graph-break-site/gb/gb0007.html
+
+from user code:
+   File "/workspace/chaoscontrol/src/chaoscontrol/train_ssm.py", line 183, in _encode_only
+    return model.encode(inputs)
+  File "/workspace/chaoscontrol/src/chaoscontrol/model.py", line 1080, in encode
+    x = _checkpoint(layer, x, return_jacobian_stats=False, use_reentrant=False)
+  File "/workspace/chaoscontrol/src/chaoscontrol/model.py", line 105, in forward
+    result = self.core(
+  File "/workspace/chaoscontrol/src/chaoscontrol/core.py", line 574, in forward
+    decay, update, gate = self._diag_terms(x)
+  File "/workspace/chaoscontrol/src/chaoscontrol/core.py", line 403, in _diag_terms
+    delta = F.softplus(self.delta_proj(x)).clamp_min(1e-4)
+  File "/workspace/chaoscontrol/src/chaoscontrol/kernels/fp8_linear.py", line 404, in forward
+    y_flat = _FusedFP8LinearFn.apply(
+  File "/workspace/chaoscontrol/src/chaoscontrol/kernels/fp8_linear.py", line 223, in backward
+    grad_x_flat = cublaslt_fp8_linear_bwd_x(
+  File "/workspace/chaoscontrol/src/chaoscontrol/kernels/_cublaslt/__init__.py", line 244, in cublaslt_fp8_linear_bwd_x
+    return _C.cublaslt_fp8_linear_bwd_x(
+
+Set TORCHDYNAMO_VERBOSE=1 for the internal stack trace (please do this especially if you're reporting a bug to PyTorch). For even more developer context, set TORCH_LOGS="+dynamo"
+
+Traceback (most recent call last):
+  File "/workspace/chaoscontrol/experiments/19_prereqs/runner_persistent_ddp.py", line 730, in main
+    run_one_seed(
+  File "/workspace/chaoscontrol/experiments/19_prereqs/runner_persistent_ddp.py", line 431, in run_one_seed
+    optimizer = _warmup_and_restore(
+                ^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/chaoscontrol/experiments/19_prereqs/runner_persistent_ddp.py", line 261, in _warmup_and_restore
+    warmup_call_fn()
+  File "/workspace/chaoscontrol/experiments/19_prereqs/runner_persistent_ddp.py", line 405, in _run_warmup
+    train_ssm_for_budget(
+  File "/workspace/chaoscontrol/src/chaoscontrol/train_ssm.py", line 393, in train_ssm_for_budget
+    loss = train_ssm_step(
+           ^^^^^^^^^^^^^^^
+  File "/workspace/chaoscontrol/src/chaoscontrol/train_ssm.py", line 281, in train_ssm_step
+    hidden = _compiled_step_fn()(model, inputs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/torch/_dynamo/eval_frame.py", line 841, in compile_wrapper
+    raise e.with_traceback(None) from e.__cause__  # User compiler error
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+torch._dynamo.exc.Unsupported: Attempted to call function marked as skipped
+  Explanation: Dynamo does not know how to trace the builtin `chaoscontrol.kernels._cublaslt._C.pybind11_detail_function_record_v1_system_libstdcpp_gxx_abi_1xxx_use_cxx11_abi_1.cublaslt_fp8_linear_bwd_x.` This function is either a Python builtin (e.g. _warnings.warn) or a third-party C/C++ Python extension (perhaps created with pybind).
+  Hint: If it is a Python builtin, please file an issue on GitHub so the PyTorch team can add support for it and see the next case for a workaround.
+  Hint: If it is a third-party C/C++ Python extension, please either wrap it into a PyTorch-understood custom operator (see https://pytorch.org/tutorials/advanced/custom_ops_landing_page.html for more details) or, if it is traceable, use `torch.compiler.allow_in_graph`.
+
+  Developer debug context: module: chaoscontrol.kernels._cublaslt._C, qualname: pybind11_detail_function_record_v1_system_libstdcpp_gxx_abi_1xxx_use_cxx11_abi_1.cublaslt_fp8_linear_bwd_x, skip reason: <missing reason>
+
+ For more details about this graph break, please visit: https://meta-pytorch.github.io/compile-graph-break-site/gb/gb0007.html
+
+from user code:
+   File "/workspace/chaoscontrol/src/chaoscontrol/train_ssm.py", line 183, in _encode_only
+    return model.encode(inputs)
+  File "/workspace/chaoscontrol/src/chaoscontrol/model.py", line 1080, in encode
+    x = _checkpoint(layer, x, return_jacobian_stats=False, use_reentrant=False)
+  File "/workspace/chaoscontrol/src/chaoscontrol/model.py", line 105, in forward
+    result = self.core(
+  File "/workspace/chaoscontrol/src/chaoscontrol/core.py", line 574, in forward
+    decay, update, gate = self._diag_terms(x)
+  File "/workspace/chaoscontrol/src/chaoscontrol/core.py", line 403, in _diag_terms
+    delta = F.softplus(self.delta_proj(x)).clamp_min(1e-4)
+  File "/workspace/chaoscontrol/src/chaoscontrol/kernels/fp8_linear.py", line 404, in forward
+    y_flat = _FusedFP8LinearFn.apply(
+  File "/workspace/chaoscontrol/src/chaoscontrol/kernels/fp8_linear.py", line 223, in backward
+    grad_x_flat = cublaslt_fp8_linear_bwd_x(
+  File "/workspace/chaoscontrol/src/chaoscontrol/kernels/_cublaslt/__init__.py", line 244, in cublaslt_fp8_linear_bwd_x
+    return _C.cublaslt_fp8_linear_bwd_x(
+
+Set TORCHDYNAMO_VERBOSE=1 for the internal stack trace (please do this especially if you're reporting a bug to PyTorch). For even more developer context, set TORCH_LOGS="+dynamo"
+
+
+/usr/local/lib/python3.12/dist-packages/torch/distributed/distributed_c10d.py:4876: UserWarning: barrier(): using the device under current context. You can specify `device_id` in `init_process_group` to mute this warning.
+  warnings.warn(  # warn only once
+[rank 0] promoted 29 nn.Linear -> FusedFP8Linear for fp8_fused
+[rank 0/4] entry seed=5348 precision=fp8_fused dim=256 layers=4 params=10,751,232
+[rank 0] warmup: 20 steps before timer
+[rank 0] ERROR on fp8_fused_no_fused_clip_seed5348_s5348: Unsupported: Attempted to call function marked as skipped
+  Explanation: Dynamo does not know how to trace the builtin `chaoscontrol.kernels._cublaslt._C.pybind11_detail_function_record_v1_system_libstdcpp_gxx_abi_1xxx_use_cxx11_abi_1.cublaslt_fp8_linear_bwd_x.` This function is either a Python builtin (e.g. _warnings.warn) or a third-party C/C++ Python extension (perhaps created with pybind).
+  Hint: If it is a Python builtin, please file an issue on GitHub so the PyTorch team can add support for it and see the next case for a workaround.
+  Hint: If it is a third-party C/C++ Python extension, please either wrap it into a PyTorch-understood custom operator (see https://pytorch.org/tutorials/advanced/custom_ops_landing_page.html for more details) or, if it is traceable, use `torch.compiler.allow_in_graph`.
+
+  Developer debug context: module: chaoscontrol.kernels._cublaslt._C, qualname: pybind11_detail_function_record_v1_system_libstdcpp_gxx_abi_1xxx_use_cxx11_abi_1.cublaslt_fp8_linear_bwd_x, skip reason: <missing reason>
+
+ For more details about this graph break, please visit: https://meta-pytorch.github.io/compile-graph-break-site/gb/gb0007.html
+
+from user code:
+   File "/workspace/chaoscontrol/src/chaoscontrol/train_ssm.py", line 183, in _encode_only
+    return model.encode(inputs)
+  File "/workspace/chaoscontrol/src/chaoscontrol/model.py", line 1080, in encode
+    x = _checkpoint(layer, x, return_jacobian_stats=False, use_reentrant=False)
+  File "/workspace/chaoscontrol/src/chaoscontrol/model.py", line 105, in forward
+    result = self.core(
+  File "/workspace/chaoscontrol/src/chaoscontrol/core.py", line 574, in forward
+    decay, update, gate = self._diag_terms(x)
+  File "/workspace/chaoscontrol/src/chaoscontrol/core.py", line 403, in _diag_terms
+    delta = F.softplus(self.delta_proj(x)).clamp_min(1e-4)
+  File "/workspace/chaoscontrol/src/chaoscontrol/kernels/fp8_linear.py", line 404, in forward
+    y_flat = _FusedFP8LinearFn.apply(
+  File "/workspace/chaoscontrol/src/chaoscontrol/kernels/fp8_linear.py", line 223, in backward
+    grad_x_flat = cublaslt_fp8_linear_bwd_x(
+  File "/workspace/chaoscontrol/src/chaoscontrol/kernels/_cublaslt/__init__.py", line 244, in cublaslt_fp8_linear_bwd_x
+    return _C.cublaslt_fp8_linear_bwd_x(
+
+Set TORCHDYNAMO_VERBOSE=1 for the internal stack trace (please do this especially if you're reporting a bug to PyTorch). For even more developer context, set TORCH_LOGS="+dynamo"
+
+Traceback (most recent call last):
+  File "/workspace/chaoscontrol/experiments/19_prereqs/runner_persistent_ddp.py", line 730, in main
+    run_one_seed(
+  File "/workspace/chaoscontrol/experiments/19_prereqs/runner_persistent_ddp.py", line 431, in run_one_seed
+    optimizer = _warmup_and_restore(
+                ^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/chaoscontrol/experiments/19_prereqs/runner_persistent_ddp.py", line 261, in _warmup_and_restore
+    warmup_call_fn()
+  File "/workspace/chaoscontrol/experiments/19_prereqs/runner_persistent_ddp.py", line 405, in _run_warmup
+    train_ssm_for_budget(
+  File "/workspace/chaoscontrol/src/chaoscontrol/train_ssm.py", line 393, in train_ssm_for_budget
+    loss = train_ssm_step(
+           ^^^^^^^^^^^^^^^
+  File "/workspace/chaoscontrol/src/chaoscontrol/train_ssm.py", line 281, in train_ssm_step
+    hidden = _compiled_step_fn()(model, inputs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/torch/_dynamo/eval_frame.py", line 841, in compile_wrapper
+    raise e.with_traceback(None) from e.__cause__  # User compiler error
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+torch._dynamo.exc.Unsupported: Attempted to call function marked as skipped
+  Explanation: Dynamo does not know how to trace the builtin `chaoscontrol.kernels._cublaslt._C.pybind11_detail_function_record_v1_system_libstdcpp_gxx_abi_1xxx_use_cxx11_abi_1.cublaslt_fp8_linear_bwd_x.` This function is either a Python builtin (e.g. _warnings.warn) or a third-party C/C++ Python extension (perhaps created with pybind).
+  Hint: If it is a Python builtin, please file an issue on GitHub so the PyTorch team can add support for it and see the next case for a workaround.
+  Hint: If it is a third-party C/C++ Python extension, please either wrap it into a PyTorch-understood custom operator (see https://pytorch.org/tutorials/advanced/custom_ops_landing_page.html for more details) or, if it is traceable, use `torch.compiler.allow_in_graph`.
+
+  Developer debug context: module: chaoscontrol.kernels._cublaslt._C, qualname: pybind11_detail_function_record_v1_system_libstdcpp_gxx_abi_1xxx_use_cxx11_abi_1.cublaslt_fp8_linear_bwd_x, skip reason: <missing reason>
+
+ For more details about this graph break, please visit: https://meta-pytorch.github.io/compile-graph-break-site/gb/gb0007.html
+
+from user code:
+   File "/workspace/chaoscontrol/src/chaoscontrol/train_ssm.py", line 183, in _encode_only
+    return model.encode(inputs)
+  File "/workspace/chaoscontrol/src/chaoscontrol/model.py", line 1080, in encode
+    x = _checkpoint(layer, x, return_jacobian_stats=False, use_reentrant=False)
+  File "/workspace/chaoscontrol/src/chaoscontrol/model.py", line 105, in forward
+    result = self.core(
+  File "/workspace/chaoscontrol/src/chaoscontrol/core.py", line 574, in forward
+    decay, update, gate = self._diag_terms(x)
+  File "/workspace/chaoscontrol/src/chaoscontrol/core.py", line 403, in _diag_terms
+    delta = F.softplus(self.delta_proj(x)).clamp_min(1e-4)
+  File "/workspace/chaoscontrol/src/chaoscontrol/kernels/fp8_linear.py", line 404, in forward
+    y_flat = _FusedFP8LinearFn.apply(
+  File "/workspace/chaoscontrol/src/chaoscontrol/kernels/fp8_linear.py", line 223, in backward
+    grad_x_flat = cublaslt_fp8_linear_bwd_x(
+  File "/workspace/chaoscontrol/src/chaoscontrol/kernels/_cublaslt/__init__.py", line 244, in cublaslt_fp8_linear_bwd_x
+    return _C.cublaslt_fp8_linear_bwd_x(
+
+Set TORCHDYNAMO_VERBOSE=1 for the internal stack trace (please do this especially if you're reporting a bug to PyTorch). For even more developer context, set TORCH_LOGS="+dynamo"
+
+
+/usr/local/lib/python3.12/dist-packages/torch/distributed/distributed_c10d.py:4876: UserWarning: barrier(): using the device under current context. You can specify `device_id` in `init_process_group` to mute this warning.
+  warnings.warn(  # warn only once
+[rank 0] promoted 29 nn.Linear -> FusedFP8Linear for fp8_fused
+[rank 0/4] entry seed=1337 precision=fp8_fused dim=256 layers=4 params=10,751,232
+[rank 0] warmup: 20 steps before timer
+[rank 0] ERROR on fp8_fused_no_fused_muon_seed1337_s1337: Unsupported: Attempted to call function marked as skipped
+  Explanation: Dynamo does not know how to trace the builtin `chaoscontrol.kernels._cublaslt._C.pybind11_detail_function_record_v1_system_libstdcpp_gxx_abi_1xxx_use_cxx11_abi_1.cublaslt_fp8_linear_bwd_x.` This function is either a Python builtin (e.g. _warnings.warn) or a third-party C/C++ Python extension (perhaps created with pybind).
+  Hint: If it is a Python builtin, please file an issue on GitHub so the PyTorch team can add support for it and see the next case for a workaround.
+  Hint: If it is a third-party C/C++ Python extension, please either wrap it into a PyTorch-understood custom operator (see https://pytorch.org/tutorials/advanced/custom_ops_landing_page.html for more details) or, if it is traceable, use `torch.compiler.allow_in_graph`.
+
+  Developer debug context: module: chaoscontrol.kernels._cublaslt._C, qualname: pybind11_detail_function_record_v1_system_libstdcpp_gxx_abi_1xxx_use_cxx11_abi_1.cublaslt_fp8_linear_bwd_x, skip reason: <missing reason>
+
+ For more details about this graph break, please visit: https://meta-pytorch.github.io/compile-graph-break-site/gb/gb0007.html
+
+from user code:
+   File "/workspace/chaoscontrol/src/chaoscontrol/train_ssm.py", line 183, in _encode_only
+    return model.encode(inputs)
+  File "/workspace/chaoscontrol/src/chaoscontrol/model.py", line 1080, in encode
+    x = _checkpoint(layer, x, return_jacobian_stats=False, use_reentrant=False)
+  File "/workspace/chaoscontrol/src/chaoscontrol/model.py", line 105, in forward
+    result = self.core(
+  File "/workspace/chaoscontrol/src/chaoscontrol/core.py", line 574, in forward
+    decay, update, gate = self._diag_terms(x)
+  File "/workspace/chaoscontrol/src/chaoscontrol/core.py", line 403, in _diag_terms
+    delta = F.softplus(self.delta_proj(x)).clamp_min(1e-4)
+  File "/workspace/chaoscontrol/src/chaoscontrol/kernels/fp8_linear.py", line 404, in forward
+    y_flat = _FusedFP8LinearFn.apply(
+  File "/workspace/chaoscontrol/src/chaoscontrol/kernels/fp8_linear.py", line 223, in backward
+    grad_x_flat = cublaslt_fp8_linear_bwd_x(
+  File "/workspace/chaoscontrol/src/chaoscontrol/kernels/_cublaslt/__init__.py", line 244, in cublaslt_fp8_linear_bwd_x
+    return _C.cublaslt_fp8_linear_bwd_x(
+
+Set TORCHDYNAMO_VERBOSE=1 for the internal stack trace (please do this especially if you're reporting a bug to PyTorch). For even more developer context, set TORCH_LOGS="+dynamo"
+
+Traceback (most recent call last):
+  File "/workspace/chaoscontrol/experiments/19_prereqs/runner_persistent_ddp.py", line 730, in main
+    run_one_seed(
+  File "/workspace/chaoscontrol/experiments/19_prereqs/runner_persistent_ddp.py", line 431, in run_one_seed
+    optimizer = _warmup_and_restore(
+                ^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/chaoscontrol/experiments/19_prereqs/runner_persistent_ddp.py", line 261, in _warmup_and_restore
+    warmup_call_fn()
+  File "/workspace/chaoscontrol/experiments/19_prereqs/runner_persistent_ddp.py", line 405, in _run_warmup
+    train_ssm_for_budget(
+  File "/workspace/chaoscontrol/src/chaoscontrol/train_ssm.py", line 393, in train_ssm_for_budget
+    loss = train_ssm_step(
+           ^^^^^^^^^^^^^^^
+  File "/workspace/chaoscontrol/src/chaoscontrol/train_ssm.py", line 281, in train_ssm_step
+    hidden = _compiled_step_fn()(model, inputs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/torch/_dynamo/eval_frame.py", line 841, in compile_wrapper
+    raise e.with_traceback(None) from e.__cause__  # User compiler error
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+torch._dynamo.exc.Unsupported: Attempted to call function marked as skipped
+  Explanation: Dynamo does not know how to trace the builtin `chaoscontrol.kernels._cublaslt._C.pybind11_detail_function_record_v1_system_libstdcpp_gxx_abi_1xxx_use_cxx11_abi_1.cublaslt_fp8_linear_bwd_x.` This function is either a Python builtin (e.g. _warnings.warn) or a third-party C/C++ Python extension (perhaps created with pybind).
+  Hint: If it is a Python builtin, please file an issue on GitHub so the PyTorch team can add support for it and see the next case for a workaround.
+  Hint: If it is a third-party C/C++ Python extension, please either wrap it into a PyTorch-understood custom operator (see https://pytorch.org/tutorials/advanced/custom_ops_landing_page.html for more details) or, if it is traceable, use `torch.compiler.allow_in_graph`.
+
+  Developer debug context: module: chaoscontrol.kernels._cublaslt._C, qualname: pybind11_detail_function_record_v1_system_libstdcpp_gxx_abi_1xxx_use_cxx11_abi_1.cublaslt_fp8_linear_bwd_x, skip reason: <missing reason>
+
+ For more details about this graph break, please visit: https://meta-pytorch.github.io/compile-graph-break-site/gb/gb0007.html
+
+from user code:
+   File "/workspace/chaoscontrol/src/chaoscontrol/train_ssm.py", line 183, in _encode_only
+    return model.encode(inputs)
+  File "/workspace/chaoscontrol/src/chaoscontrol/model.py", line 1080, in encode
+    x = _checkpoint(layer, x, return_jacobian_stats=False, use_reentrant=False)
+  File "/workspace/chaoscontrol/src/chaoscontrol/model.py", line 105, in forward
+    result = self.core(
+  File "/workspace/chaoscontrol/src/chaoscontrol/core.py", line 574, in forward
+    decay, update, gate = self._diag_terms(x)
+  File "/workspace/chaoscontrol/src/chaoscontrol/core.py", line 403, in _diag_terms
+    delta = F.softplus(self.delta_proj(x)).clamp_min(1e-4)
+  File "/workspace/chaoscontrol/src/chaoscontrol/kernels/fp8_linear.py", line 404, in forward
+    y_flat = _FusedFP8LinearFn.apply(
+  File "/workspace/chaoscontrol/src/chaoscontrol/kernels/fp8_linear.py", line 223, in backward
+    grad_x_flat = cublaslt_fp8_linear_bwd_x(
+  File "/workspace/chaoscontrol/src/chaoscontrol/kernels/_cublaslt/__init__.py", line 244, in cublaslt_fp8_linear_bwd_x
+    return _C.cublaslt_fp8_linear_bwd_x(
+
+Set TORCHDYNAMO_VERBOSE=1 for the internal stack trace (please do this especially if you're reporting a bug to PyTorch). For even more developer context, set TORCH_LOGS="+dynamo"
+
+
+/usr/local/lib/python3.12/dist-packages/torch/distributed/distributed_c10d.py:4876: UserWarning: barrier(): using the device under current context. You can specify `device_id` in `init_process_group` to mute this warning.
+  warnings.warn(  # warn only once
+[rank 0] promoted 29 nn.Linear -> FusedFP8Linear for fp8_fused
+[rank 0/4] entry seed=2674 precision=fp8_fused dim=256 layers=4 params=10,751,232
+[rank 0] warmup: 20 steps before timer
+[rank 0] ERROR on fp8_fused_no_fused_muon_seed2674_s2674: Unsupported: Attempted to call function marked as skipped
+  Explanation: Dynamo does not know how to trace the builtin `chaoscontrol.kernels._cublaslt._C.pybind11_detail_function_record_v1_system_libstdcpp_gxx_abi_1xxx_use_cxx11_abi_1.cublaslt_fp8_linear_bwd_x.` This function is either a Python builtin (e.g. _warnings.warn) or a third-party C/C++ Python extension (perhaps created with pybind).
+  Hint: If it is a Python builtin, please file an issue on GitHub so the PyTorch team can add support for it and see the next case for a workaround.
+  Hint: If it is a third-party C/C++ Python extension, please either wrap it into a PyTorch-understood custom operator (see https://pytorch.org/tutorials/advanced/custom_ops_landing_page.html for more details) or, if it is traceable, use `torch.compiler.allow_in_graph`.
+
+  Developer debug context: module: chaoscontrol.kernels._cublaslt._C, qualname: pybind11_detail_function_record_v1_system_libstdcpp_gxx_abi_1xxx_use_cxx11_abi_1.cublaslt_fp8_linear_bwd_x, skip reason: <missing reason>
+
+ For more details about this graph break, please visit: https://meta-pytorch.github.io/compile-graph-break-site/gb/gb0007.html
+
+from user code:
+   File "/workspace/chaoscontrol/src/chaoscontrol/train_ssm.py", line 183, in _encode_only
+    return model.encode(inputs)
+  File "/workspace/chaoscontrol/src/chaoscontrol/model.py", line 1080, in encode
+    x = _checkpoint(layer, x, return_jacobian_stats=False, use_reentrant=False)
+  File "/workspace/chaoscontrol/src/chaoscontrol/model.py", line 105, in forward
+    result = self.core(
+  File "/workspace/chaoscontrol/src/chaoscontrol/core.py", line 574, in forward
+    decay, update, gate = self._diag_terms(x)
+  File "/workspace/chaoscontrol/src/chaoscontrol/core.py", line 403, in _diag_terms
+    delta = F.softplus(self.delta_proj(x)).clamp_min(1e-4)
+  File "/workspace/chaoscontrol/src/chaoscontrol/kernels/fp8_linear.py", line 404, in forward
+    y_flat = _FusedFP8LinearFn.apply(
+  File "/workspace/chaoscontrol/src/chaoscontrol/kernels/fp8_linear.py", line 223, in backward
+    grad_x_flat = cublaslt_fp8_linear_bwd_x(
+  File "/workspace/chaoscontrol/src/chaoscontrol/kernels/_cublaslt/__init__.py", line 244, in cublaslt_fp8_linear_bwd_x
+    return _C.cublaslt_fp8_linear_bwd_x(
+
+Set TORCHDYNAMO_VERBOSE=1 for the internal stack trace (please do this especially if you're reporting a bug to PyTorch). For even more developer context, set TORCH_LOGS="+dynamo"
+
+Traceback (most recent call last):
+  File "/workspace/chaoscontrol/experiments/19_prereqs/runner_persistent_ddp.py", line 730, in main
+    run_one_seed(
+  File "/workspace/chaoscontrol/experiments/19_prereqs/runner_persistent_ddp.py", line 431, in run_one_seed
+    optimizer = _warmup_and_restore(
+                ^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/chaoscontrol/experiments/19_prereqs/runner_persistent_ddp.py", line 261, in _warmup_and_restore
+    warmup_call_fn()
+  File "/workspace/chaoscontrol/experiments/19_prereqs/runner_persistent_ddp.py", line 405, in _run_warmup
+    train_ssm_for_budget(
+  File "/workspace/chaoscontrol/src/chaoscontrol/train_ssm.py", line 393, in train_ssm_for_budget
+    loss = train_ssm_step(
+           ^^^^^^^^^^^^^^^
+  File "/workspace/chaoscontrol/src/chaoscontrol/train_ssm.py", line 281, in train_ssm_step
+    hidden = _compiled_step_fn()(model, inputs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/torch/_dynamo/eval_frame.py", line 841, in compile_wrapper
+    raise e.with_traceback(None) from e.__cause__  # User compiler error
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+torch._dynamo.exc.Unsupported: Attempted to call function marked as skipped
+  Explanation: Dynamo does not know how to trace the builtin `chaoscontrol.kernels._cublaslt._C.pybind11_detail_function_record_v1_system_libstdcpp_gxx_abi_1xxx_use_cxx11_abi_1.cublaslt_fp8_linear_bwd_x.` This function is either a Python builtin (e.g. _warnings.warn) or a third-party C/C++ Python extension (perhaps created with pybind).
+  Hint: If it is a Python builtin, please file an issue on GitHub so the PyTorch team can add support for it and see the next case for a workaround.
+  Hint: If it is a third-party C/C++ Python extension, please either wrap it into a PyTorch-understood custom operator (see https://pytorch.org/tutorials/advanced/custom_ops_landing_page.html for more details) or, if it is traceable, use `torch.compiler.allow_in_graph`.
+
+  Developer debug context: module: chaoscontrol.kernels._cublaslt._C, qualname: pybind11_detail_function_record_v1_system_libstdcpp_gxx_abi_1xxx_use_cxx11_abi_1.cublaslt_fp8_linear_bwd_x, skip reason: <missing reason>
+
+ For more details about this graph break, please visit: https://meta-pytorch.github.io/compile-graph-break-site/gb/gb0007.html
+
+from user code:
+   File "/workspace/chaoscontrol/src/chaoscontrol/train_ssm.py", line 183, in _encode_only
+    return model.encode(inputs)
+  File "/workspace/chaoscontrol/src/chaoscontrol/model.py", line 1080, in encode
+    x = _checkpoint(layer, x, return_jacobian_stats=False, use_reentrant=False)
+  File "/workspace/chaoscontrol/src/chaoscontrol/model.py", line 105, in forward
+    result = self.core(
+  File "/workspace/chaoscontrol/src/chaoscontrol/core.py", line 574, in forward
+    decay, update, gate = self._diag_terms(x)
+  File "/workspace/chaoscontrol/src/chaoscontrol/core.py", line 403, in _diag_terms
+    delta = F.softplus(self.delta_proj(x)).clamp_min(1e-4)
+  File "/workspace/chaoscontrol/src/chaoscontrol/kernels/fp8_linear.py", line 404, in forward
+    y_flat = _FusedFP8LinearFn.apply(
+  File "/workspace/chaoscontrol/src/chaoscontrol/kernels/fp8_linear.py", line 223, in backward
+    grad_x_flat = cublaslt_fp8_linear_bwd_x(
+  File "/workspace/chaoscontrol/src/chaoscontrol/kernels/_cublaslt/__init__.py", line 244, in cublaslt_fp8_linear_bwd_x
+    return _C.cublaslt_fp8_linear_bwd_x(
+
+Set TORCHDYNAMO_VERBOSE=1 for the internal stack trace (please do this especially if you're reporting a bug to PyTorch). For even more developer context, set TORCH_LOGS="+dynamo"
+
+
+/usr/local/lib/python3.12/dist-packages/torch/distributed/distributed_c10d.py:4876: UserWarning: barrier(): using the device under current context. You can specify `device_id` in `init_process_group` to mute this warning.
+  warnings.warn(  # warn only once
+[rank 0] promoted 29 nn.Linear -> FusedFP8Linear for fp8_fused
+[rank 0/4] entry seed=4011 precision=fp8_fused dim=256 layers=4 params=10,751,232
+[rank 0] warmup: 20 steps before timer
+[rank 0] ERROR on fp8_fused_no_fused_muon_seed4011_s4011: Unsupported: Attempted to call function marked as skipped
+  Explanation: Dynamo does not know how to trace the builtin `chaoscontrol.kernels._cublaslt._C.pybind11_detail_function_record_v1_system_libstdcpp_gxx_abi_1xxx_use_cxx11_abi_1.cublaslt_fp8_linear_bwd_x.` This function is either a Python builtin (e.g. _warnings.warn) or a third-party C/C++ Python extension (perhaps created with pybind).
+  Hint: If it is a Python builtin, please file an issue on GitHub so the PyTorch team can add support for it and see the next case for a workaround.
+  Hint: If it is a third-party C/C++ Python extension, please either wrap it into a PyTorch-understood custom operator (see https://pytorch.org/tutorials/advanced/custom_ops_landing_page.html for more details) or, if it is traceable, use `torch.compiler.allow_in_graph`.
+
+  Developer debug context: module: chaoscontrol.kernels._cublaslt._C, qualname: pybind11_detail_function_record_v1_system_libstdcpp_gxx_abi_1xxx_use_cxx11_abi_1.cublaslt_fp8_linear_bwd_x, skip reason: <missing reason>
+
+ For more details about this graph break, please visit: https://meta-pytorch.github.io/compile-graph-break-site/gb/gb0007.html
+
+from user code:
+   File "/workspace/chaoscontrol/src/chaoscontrol/train_ssm.py", line 183, in _encode_only
+    return model.encode(inputs)
+  File "/workspace/chaoscontrol/src/chaoscontrol/model.py", line 1080, in encode
+    x = _checkpoint(layer, x, return_jacobian_stats=False, use_reentrant=False)
+  File "/workspace/chaoscontrol/src/chaoscontrol/model.py", line 105, in forward
+    result = self.core(
+  File "/workspace/chaoscontrol/src/chaoscontrol/core.py", line 574, in forward
+    decay, update, gate = self._diag_terms(x)
+  File "/workspace/chaoscontrol/src/chaoscontrol/core.py", line 403, in _diag_terms
+    delta = F.softplus(self.delta_proj(x)).clamp_min(1e-4)
+  File "/workspace/chaoscontrol/src/chaoscontrol/kernels/fp8_linear.py", line 404, in forward
+    y_flat = _FusedFP8LinearFn.apply(
+  File "/workspace/chaoscontrol/src/chaoscontrol/kernels/fp8_linear.py", line 223, in backward
+    grad_x_flat = cublaslt_fp8_linear_bwd_x(
+  File "/workspace/chaoscontrol/src/chaoscontrol/kernels/_cublaslt/__init__.py", line 244, in cublaslt_fp8_linear_bwd_x
+    return _C.cublaslt_fp8_linear_bwd_x(
+
+Set TORCHDYNAMO_VERBOSE=1 for the internal stack trace (please do this especially if you're reporting a bug to PyTorch). For even more developer context, set TORCH_LOGS="+dynamo"
+
+Traceback (most recent call last):
+  File "/workspace/chaoscontrol/experiments/19_prereqs/runner_persistent_ddp.py", line 730, in main
+    run_one_seed(
+  File "/workspace/chaoscontrol/experiments/19_prereqs/runner_persistent_ddp.py", line 431, in run_one_seed
+    optimizer = _warmup_and_restore(
+                ^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/chaoscontrol/experiments/19_prereqs/runner_persistent_ddp.py", line 261, in _warmup_and_restore
+    warmup_call_fn()
+  File "/workspace/chaoscontrol/experiments/19_prereqs/runner_persistent_ddp.py", line 405, in _run_warmup
+    train_ssm_for_budget(
+  File "/workspace/chaoscontrol/src/chaoscontrol/train_ssm.py", line 393, in train_ssm_for_budget
+    loss = train_ssm_step(
+           ^^^^^^^^^^^^^^^
+  File "/workspace/chaoscontrol/src/chaoscontrol/train_ssm.py", line 281, in train_ssm_step
+    hidden = _compiled_step_fn()(model, inputs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/torch/_dynamo/eval_frame.py", line 841, in compile_wrapper
+    raise e.with_traceback(None) from e.__cause__  # User compiler error
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+torch._dynamo.exc.Unsupported: Attempted to call function marked as skipped
+  Explanation: Dynamo does not know how to trace the builtin `chaoscontrol.kernels._cublaslt._C.pybind11_detail_function_record_v1_system_libstdcpp_gxx_abi_1xxx_use_cxx11_abi_1.cublaslt_fp8_linear_bwd_x.` This function is either a Python builtin (e.g. _warnings.warn) or a third-party C/C++ Python extension (perhaps created with pybind).
+  Hint: If it is a Python builtin, please file an issue on GitHub so the PyTorch team can add support for it and see the next case for a workaround.
+  Hint: If it is a third-party C/C++ Python extension, please either wrap it into a PyTorch-understood custom operator (see https://pytorch.org/tutorials/advanced/custom_ops_landing_page.html for more details) or, if it is traceable, use `torch.compiler.allow_in_graph`.
+
+  Developer debug context: module: chaoscontrol.kernels._cublaslt._C, qualname: pybind11_detail_function_record_v1_system_libstdcpp_gxx_abi_1xxx_use_cxx11_abi_1.cublaslt_fp8_linear_bwd_x, skip reason: <missing reason>
+
+ For more details about this graph break, please visit: https://meta-pytorch.github.io/compile-graph-break-site/gb/gb0007.html
+
+from user code:
+   File "/workspace/chaoscontrol/src/chaoscontrol/train_ssm.py", line 183, in _encode_only
+    return model.encode(inputs)
+  File "/workspace/chaoscontrol/src/chaoscontrol/model.py", line 1080, in encode
+    x = _checkpoint(layer, x, return_jacobian_stats=False, use_reentrant=False)
+  File "/workspace/chaoscontrol/src/chaoscontrol/model.py", line 105, in forward
+    result = self.core(
+  File "/workspace/chaoscontrol/src/chaoscontrol/core.py", line 574, in forward
+    decay, update, gate = self._diag_terms(x)
+  File "/workspace/chaoscontrol/src/chaoscontrol/core.py", line 403, in _diag_terms
+    delta = F.softplus(self.delta_proj(x)).clamp_min(1e-4)
+  File "/workspace/chaoscontrol/src/chaoscontrol/kernels/fp8_linear.py", line 404, in forward
+    y_flat = _FusedFP8LinearFn.apply(
+  File "/workspace/chaoscontrol/src/chaoscontrol/kernels/fp8_linear.py", line 223, in backward
+    grad_x_flat = cublaslt_fp8_linear_bwd_x(
+  File "/workspace/chaoscontrol/src/chaoscontrol/kernels/_cublaslt/__init__.py", line 244, in cublaslt_fp8_linear_bwd_x
+    return _C.cublaslt_fp8_linear_bwd_x(
+
+Set TORCHDYNAMO_VERBOSE=1 for the internal stack trace (please do this especially if you're reporting a bug to PyTorch). For even more developer context, set TORCH_LOGS="+dynamo"
+
+
+/usr/local/lib/python3.12/dist-packages/torch/distributed/distributed_c10d.py:4876: UserWarning: barrier(): using the device under current context. You can specify `device_id` in `init_process_group` to mute this warning.
+  warnings.warn(  # warn only once
+[rank 0] promoted 29 nn.Linear -> FusedFP8Linear for fp8_fused
+[rank 0/4] entry seed=5348 precision=fp8_fused dim=256 layers=4 params=10,751,232
+[rank 0] warmup: 20 steps before timer
+[rank 0] ERROR on fp8_fused_no_fused_muon_seed5348_s5348: Unsupported: Attempted to call function marked as skipped
+  Explanation: Dynamo does not know how to trace the builtin `chaoscontrol.kernels._cublaslt._C.pybind11_detail_function_record_v1_system_libstdcpp_gxx_abi_1xxx_use_cxx11_abi_1.cublaslt_fp8_linear_bwd_x.` This function is either a Python builtin (e.g. _warnings.warn) or a third-party C/C++ Python extension (perhaps created with pybind).
+  Hint: If it is a Python builtin, please file an issue on GitHub so the PyTorch team can add support for it and see the next case for a workaround.
+  Hint: If it is a third-party C/C++ Python extension, please either wrap it into a PyTorch-understood custom operator (see https://pytorch.org/tutorials/advanced/custom_ops_landing_page.html for more details) or, if it is traceable, use `torch.compiler.allow_in_graph`.
+
+  Developer debug context: module: chaoscontrol.kernels._cublaslt._C, qualname: pybind11_detail_function_record_v1_system_libstdcpp_gxx_abi_1xxx_use_cxx11_abi_1.cublaslt_fp8_linear_bwd_x, skip reason: <missing reason>
+
+ For more details about this graph break, please visit: https://meta-pytorch.github.io/compile-graph-break-site/gb/gb0007.html
+
+from user code:
+   File "/workspace/chaoscontrol/src/chaoscontrol/train_ssm.py", line 183, in _encode_only
+    return model.encode(inputs)
+  File "/workspace/chaoscontrol/src/chaoscontrol/model.py", line 1080, in encode
+    x = _checkpoint(layer, x, return_jacobian_stats=False, use_reentrant=False)
+  File "/workspace/chaoscontrol/src/chaoscontrol/model.py", line 105, in forward
+    result = self.core(
+  File "/workspace/chaoscontrol/src/chaoscontrol/core.py", line 574, in forward
+    decay, update, gate = self._diag_terms(x)
+  File "/workspace/chaoscontrol/src/chaoscontrol/core.py", line 403, in _diag_terms
+    delta = F.softplus(self.delta_proj(x)).clamp_min(1e-4)
+  File "/workspace/chaoscontrol/src/chaoscontrol/kernels/fp8_linear.py", line 404, in forward
+    y_flat = _FusedFP8LinearFn.apply(
+  File "/workspace/chaoscontrol/src/chaoscontrol/kernels/fp8_linear.py", line 223, in backward
+    grad_x_flat = cublaslt_fp8_linear_bwd_x(
+  File "/workspace/chaoscontrol/src/chaoscontrol/kernels/_cublaslt/__init__.py", line 244, in cublaslt_fp8_linear_bwd_x
+    return _C.cublaslt_fp8_linear_bwd_x(
+
+Set TORCHDYNAMO_VERBOSE=1 for the internal stack trace (please do this especially if you're reporting a bug to PyTorch). For even more developer context, set TORCH_LOGS="+dynamo"
+
+Traceback (most recent call last):
+  File "/workspace/chaoscontrol/experiments/19_prereqs/runner_persistent_ddp.py", line 730, in main
+    run_one_seed(
+  File "/workspace/chaoscontrol/experiments/19_prereqs/runner_persistent_ddp.py", line 431, in run_one_seed
+    optimizer = _warmup_and_restore(
+                ^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/chaoscontrol/experiments/19_prereqs/runner_persistent_ddp.py", line 261, in _warmup_and_restore
+    warmup_call_fn()
+  File "/workspace/chaoscontrol/experiments/19_prereqs/runner_persistent_ddp.py", line 405, in _run_warmup
+    train_ssm_for_budget(
+  File "/workspace/chaoscontrol/src/chaoscontrol/train_ssm.py", line 393, in train_ssm_for_budget
+    loss = train_ssm_step(
+           ^^^^^^^^^^^^^^^
+  File "/workspace/chaoscontrol/src/chaoscontrol/train_ssm.py", line 281, in train_ssm_step
+    hidden = _compiled_step_fn()(model, inputs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/torch/_dynamo/eval_frame.py", line 841, in compile_wrapper
+    raise e.with_traceback(None) from e.__cause__  # User compiler error
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+torch._dynamo.exc.Unsupported: Attempted to call function marked as skipped
+  Explanation: Dynamo does not know how to trace the builtin `chaoscontrol.kernels._cublaslt._C.pybind11_detail_function_record_v1_system_libstdcpp_gxx_abi_1xxx_use_cxx11_abi_1.cublaslt_fp8_linear_bwd_x.` This function is either a Python builtin (e.g. _warnings.warn) or a third-party C/C++ Python extension (perhaps created with pybind).
+  Hint: If it is a Python builtin, please file an issue on GitHub so the PyTorch team can add support for it and see the next case for a workaround.
+  Hint: If it is a third-party C/C++ Python extension, please either wrap it into a PyTorch-understood custom operator (see https://pytorch.org/tutorials/advanced/custom_ops_landing_page.html for more details) or, if it is traceable, use `torch.compiler.allow_in_graph`.
+
+  Developer debug context: module: chaoscontrol.kernels._cublaslt._C, qualname: pybind11_detail_function_record_v1_system_libstdcpp_gxx_abi_1xxx_use_cxx11_abi_1.cublaslt_fp8_linear_bwd_x, skip reason: <missing reason>
+
+ For more details about this graph break, please visit: https://meta-pytorch.github.io/compile-graph-break-site/gb/gb0007.html
+
+from user code:
+   File "/workspace/chaoscontrol/src/chaoscontrol/train_ssm.py", line 183, in _encode_only
+    return model.encode(inputs)
+  File "/workspace/chaoscontrol/src/chaoscontrol/model.py", line 1080, in encode
+    x = _checkpoint(layer, x, return_jacobian_stats=False, use_reentrant=False)
+  File "/workspace/chaoscontrol/src/chaoscontrol/model.py", line 105, in forward
+    result = self.core(
+  File "/workspace/chaoscontrol/src/chaoscontrol/core.py", line 574, in forward
+    decay, update, gate = self._diag_terms(x)
+  File "/workspace/chaoscontrol/src/chaoscontrol/core.py", line 403, in _diag_terms
+    delta = F.softplus(self.delta_proj(x)).clamp_min(1e-4)
+  File "/workspace/chaoscontrol/src/chaoscontrol/kernels/fp8_linear.py", line 404, in forward
+    y_flat = _FusedFP8LinearFn.apply(
+  File "/workspace/chaoscontrol/src/chaoscontrol/kernels/fp8_linear.py", line 223, in backward
+    grad_x_flat = cublaslt_fp8_linear_bwd_x(
+  File "/workspace/chaoscontrol/src/chaoscontrol/kernels/_cublaslt/__init__.py", line 244, in cublaslt_fp8_linear_bwd_x
+    return _C.cublaslt_fp8_linear_bwd_x(
+
+Set TORCHDYNAMO_VERBOSE=1 for the internal stack trace (please do this especially if you're reporting a bug to PyTorch). For even more developer context, set TORCH_LOGS="+dynamo"
+
+
+/usr/local/lib/python3.12/dist-packages/torch/distributed/distributed_c10d.py:4876: UserWarning: barrier(): using the device under current context. You can specify `device_id` in `init_process_group` to mute this warning.
+  warnings.warn(  # warn only once
+[rank 0] promoted 29 nn.Linear -> FusedFP8Linear for fp8_fused
+[rank 0/4] entry seed=1337 precision=fp8_fused dim=256 layers=4 params=10,751,232
+[rank 0] warmup: 20 steps before timer
+[rank 0] warmup complete, real timer starts now
+[rank 0/4] done entry seed=1337: bpb=1.5281 steps=650 steps/s=1.08 peak_vram=16163.1 MB
+[rank 0] completed fp8_fused_no_compile_seed1337_s1337 in 630.9s (entry 37/40)
+[rank 0] promoted 29 nn.Linear -> FusedFP8Linear for fp8_fused
+[rank 0/4] entry seed=2674 precision=fp8_fused dim=256 layers=4 params=10,751,232
+[rank 0] warmup: 20 steps before timer
+[rank 0] warmup complete, real timer starts now
+[rank 0/4] done entry seed=2674: bpb=1.5254 steps=649 steps/s=1.08 peak_vram=16117.8 MB
+[rank 0] completed fp8_fused_no_compile_seed2674_s2674 in 629.4s (entry 38/40)
+[rank 0] promoted 29 nn.Linear -> FusedFP8Linear for fp8_fused
+[rank 0/4] entry seed=4011 precision=fp8_fused dim=256 layers=4 params=10,751,232
+[rank 0] warmup: 20 steps before timer
+[rank 0] warmup complete, real timer starts now
+[rank 0/4] done entry seed=4011: bpb=1.5247 steps=649 steps/s=1.08 peak_vram=16117.8 MB
+[rank 0] completed fp8_fused_no_compile_seed4011_s4011 in 629.2s (entry 39/40)
+[rank 0] promoted 29 nn.Linear -> FusedFP8Linear for fp8_fused
+[rank 0/4] entry seed=5348 precision=fp8_fused dim=256 layers=4 params=10,751,232
+[rank 0] warmup: 20 steps before timer
+[rank 0] warmup complete, real timer starts now
+[rank 0/4] done entry seed=5348: bpb=1.5319 steps=649 steps/s=1.08 peak_vram=16117.8 MB
+[rank 0] completed fp8_fused_no_compile_seed5348_s5348 in 629.3s (entry 40/40)
+[rank 0] matrix done: completed=28 skipped=0 errored=12 elapsed=18630.0s
+[launcher] outputs: success=28 benign_skip=0 errors=12 total_expected=40
+[launcher] real errors in outputs:
+  - fp8_fused_all_seed1337_s1337: error=Unsupported: Attempted to call function marked as skipped
+  Explanation: Dynamo does not know how to trace the builtin `chaoscontrol.kernels._cublaslt._C.pybind11_detail_function_record_v1_system_libstdcpp_gxx_abi_1xxx_use_cxx11_abi_1.cublaslt_fp8_linear_bwd_x.` This function is either a Python builtin (e.g. _warnings.warn) or a third-party C/C++ Python extension (perhaps created with pybind).
+  Hint: If it is a Python builtin, please file an issue on GitHub so the PyTorch team can add support for it and see the next case for a workaround.
+  Hint: If it is a third-party C/C++ Python extension, please either wrap it into a PyTorch-understood custom operator (see https://pytorch.org/tutorials/advanced/custom_ops_landing_page.html for more details) or, if it is traceable, use `torch.compiler.allow_in_graph`.
+
+  Developer debug context: module: chaoscontrol.kernels._cublaslt._C, qualname: pybind11_detail_function_record_v1_system_libstdcpp_gxx_abi_1xxx_use_cxx11_abi_1.cublaslt_fp8_linear_bwd_x, skip reason: <missing reason>
+
+ For more details about this graph break, please visit: https://meta-pytorch.github.io/compile-graph-break-site/gb/gb0007.html
+
+from user code:
+   File "/workspace/chaoscontrol/src/chaoscontrol/train_ssm.py", line 183, in _encode_only
+    return model.encode(inputs)
+  File "/workspace/chaoscontrol/src/chaoscontrol/model.py", line 1080, in encode
+    x = _checkpoint(layer, x, return_jacobian_stats=False, use_reentrant=False)
+  File "/workspace/chaoscontrol/src/chaoscontrol/model.py", line 105, in forward
+    result = self.core(
+  File "/workspace/chaoscontrol/src/chaoscontrol/core.py", line 574, in forward
+    decay, update, gate = self._diag_terms(x)
+  File "/workspace/chaoscontrol/src/chaoscontrol/core.py", line 403, in _diag_terms
+    delta = F.softplus(self.delta_proj(x)).clamp_min(1e-4)
+  File "/workspace/chaoscontrol/src/chaoscontrol/kernels/fp8_linear.py", line 404, in forward
+    y_flat = _FusedFP8LinearFn.apply(
+  File "/workspace/chaoscontrol/src/chaoscontrol/kernels/fp8_linear.py", line 223, in backward
+    grad_x_flat = cublaslt_fp8_linear_bwd_x(
+  File "/workspace/chaoscontrol/src/chaoscontrol/kernels/_cublaslt/__init__.py", line 244, in cublaslt_fp8_linear_bwd_x
+    return _C.cublaslt_fp8_linear_bwd_x(
+
+Set TORCHDYNAMO_VERBOSE=1 for the internal stack trace (please do this especially if you're reporting a bug to PyTorch). For even more developer context, set TORCH_LOGS="+dynamo"
+
+  - fp8_fused_all_seed2674_s2674: error=Unsupported: Attempted to call function marked as skipped
+  Explanation: Dynamo does not know how to trace the builtin `chaoscontrol.kernels._cublaslt._C.pybind11_detail_function_record_v1_system_libstdcpp_gxx_abi_1xxx_use_cxx11_abi_1.cublaslt_fp8_linear_bwd_x.` This function is either a Python builtin (e.g. _warnings.warn) or a third-party C/C++ Python extension (perhaps created with pybind).
+  Hint: If it is a Python builtin, please file an issue on GitHub so the PyTorch team can add support for it and see the next case for a workaround.
+  Hint: If it is a third-party C/C++ Python extension, please either wrap it into a PyTorch-understood custom operator (see https://pytorch.org/tutorials/advanced/custom_ops_landing_page.html for more details) or, if it is traceable, use `torch.compiler.allow_in_graph`.
+
+  Developer debug context: module: chaoscontrol.kernels._cublaslt._C, qualname: pybind11_detail_function_record_v1_system_libstdcpp_gxx_abi_1xxx_use_cxx11_abi_1.cublaslt_fp8_linear_bwd_x, skip reason: <missing reason>
+
+ For more details about this graph break, please visit: https://meta-pytorch.github.io/compile-graph-break-site/gb/gb0007.html
+
+from user code:
+   File "/workspace/chaoscontrol/src/chaoscontrol/train_ssm.py", line 183, in _encode_only
+    return model.encode(inputs)
+  File "/workspace/chaoscontrol/src/chaoscontrol/model.py", line 1080, in encode
+    x = _checkpoint(layer, x, return_jacobian_stats=False, use_reentrant=False)
+  File "/workspace/chaoscontrol/src/chaoscontrol/model.py", line 105, in forward
+    result = self.core(
+  File "/workspace/chaoscontrol/src/chaoscontrol/core.py", line 574, in forward
+    decay, update, gate = self._diag_terms(x)
+  File "/workspace/chaoscontrol/src/chaoscontrol/core.py", line 403, in _diag_terms
+    delta = F.softplus(self.delta_proj(x)).clamp_min(1e-4)
+  File "/workspace/chaoscontrol/src/chaoscontrol/kernels/fp8_linear.py", line 404, in forward
+    y_flat = _FusedFP8LinearFn.apply(
+  File "/workspace/chaoscontrol/src/chaoscontrol/kernels/fp8_linear.py", line 223, in backward
+    grad_x_flat = cublaslt_fp8_linear_bwd_x(
+  File "/workspace/chaoscontrol/src/chaoscontrol/kernels/_cublaslt/__init__.py", line 244, in cublaslt_fp8_linear_bwd_x
+    return _C.cublaslt_fp8_linear_bwd_x(
+
+Set TORCHDYNAMO_VERBOSE=1 for the internal stack trace (please do this especially if you're reporting a bug to PyTorch). For even more developer context, set TORCH_LOGS="+dynamo"
+
+  - fp8_fused_all_seed4011_s4011: error=Unsupported: Attempted to call function marked as skipped
+  Explanation: Dynamo does not know how to trace the builtin `chaoscontrol.kernels._cublaslt._C.pybind11_detail_function_record_v1_system_libstdcpp_gxx_abi_1xxx_use_cxx11_abi_1.cublaslt_fp8_linear_bwd_x.` This function is either a Python builtin (e.g. _warnings.warn) or a third-party C/C++ Python extension (perhaps created with pybind).
+  Hint: If it is a Python builtin, please file an issue on GitHub so the PyTorch team can add support for it and see the next case for a workaround.
+  Hint: If it is a third-party C/C++ Python extension, please either wrap it into a PyTorch-understood custom operator (see https://pytorch.org/tutorials/advanced/custom_ops_landing_page.html for more details) or, if it is traceable, use `torch.compiler.allow_in_graph`.
+
+  Developer debug context: module: chaoscontrol.kernels._cublaslt._C, qualname: pybind11_detail_function_record_v1_system_libstdcpp_gxx_abi_1xxx_use_cxx11_abi_1.cublaslt_fp8_linear_bwd_x, skip reason: <missing reason>
+
+ For more details about this graph break, please visit: https://meta-pytorch.github.io/compile-graph-break-site/gb/gb0007.html
+
+from user code:
+   File "/workspace/chaoscontrol/src/chaoscontrol/train_ssm.py", line 183, in _encode_only
+    return model.encode(inputs)
+  File "/workspace/chaoscontrol/src/chaoscontrol/model.py", line 1080, in encode
+    x = _checkpoint(layer, x, return_jacobian_stats=False, use_reentrant=False)
+  File "/workspace/chaoscontrol/src/chaoscontrol/model.py", line 105, in forward
+    result = self.core(
+  File "/workspace/chaoscontrol/src/chaoscontrol/core.py", line 574, in forward
+    decay, update, gate = self._diag_terms(x)
+  File "/workspace/chaoscontrol/src/chaoscontrol/core.py", line 403, in _diag_terms
+    delta = F.softplus(self.delta_proj(x)).clamp_min(1e-4)
+  File "/workspace/chaoscontrol/src/chaoscontrol/kernels/fp8_linear.py", line 404, in forward
+    y_flat = _FusedFP8LinearFn.apply(
+  File "/workspace/chaoscontrol/src/chaoscontrol/kernels/fp8_linear.py", line 223, in backward
+    grad_x_flat = cublaslt_fp8_linear_bwd_x(
+  File "/workspace/chaoscontrol/src/chaoscontrol/kernels/_cublaslt/__init__.py", line 244, in cublaslt_fp8_linear_bwd_x
+    return _C.cublaslt_fp8_linear_bwd_x(
+
+Set TORCHDYNAMO_VERBOSE=1 for the internal stack trace (please do this especially if you're reporting a bug to PyTorch). For even more developer context, set TORCH_LOGS="+dynamo"
+
+  - fp8_fused_all_seed5348_s5348: error=Unsupported: Attempted to call function marked as skipped
+  Explanation: Dynamo does not know how to trace the builtin `chaoscontrol.kernels._cublaslt._C.pybind11_detail_function_record_v1_system_libstdcpp_gxx_abi_1xxx_use_cxx11_abi_1.cublaslt_fp8_linear_bwd_x.` This function is either a Python builtin (e.g. _warnings.warn) or a third-party C/C++ Python extension (perhaps created with pybind).
+  Hint: If it is a Python builtin, please file an issue on GitHub so the PyTorch team can add support for it and see the next case for a workaround.
+  Hint: If it is a third-party C/C++ Python extension, please either wrap it into a PyTorch-understood custom operator (see https://pytorch.org/tutorials/advanced/custom_ops_landing_page.html for more details) or, if it is traceable, use `torch.compiler.allow_in_graph`.
+
+  Developer debug context: module: chaoscontrol.kernels._cublaslt._C, qualname: pybind11_detail_function_record_v1_system_libstdcpp_gxx_abi_1xxx_use_cxx11_abi_1.cublaslt_fp8_linear_bwd_x, skip reason: <missing reason>
+
+ For more details about this graph break, please visit: https://meta-pytorch.github.io/compile-graph-break-site/gb/gb0007.html
+
+from user code:
+   File "/workspace/chaoscontrol/src/chaoscontrol/train_ssm.py", line 183, in _encode_only
+    return model.encode(inputs)
+  File "/workspace/chaoscontrol/src/chaoscontrol/model.py", line 1080, in encode
+    x = _checkpoint(layer, x, return_jacobian_stats=False, use_reentrant=False)
+  File "/workspace/chaoscontrol/src/chaoscontrol/model.py", line 105, in forward
+    result = self.core(
+  File "/workspace/chaoscontrol/src/chaoscontrol/core.py", line 574, in forward
+    decay, update, gate = self._diag_terms(x)
+  File "/workspace/chaoscontrol/src/chaoscontrol/core.py", line 403, in _diag_terms
+    delta = F.softplus(self.delta_proj(x)).clamp_min(1e-4)
+  File "/workspace/chaoscontrol/src/chaoscontrol/kernels/fp8_linear.py", line 404, in forward
+    y_flat = _FusedFP8LinearFn.apply(
+  File "/workspace/chaoscontrol/src/chaoscontrol/kernels/fp8_linear.py", line 223, in backward
+    grad_x_flat = cublaslt_fp8_linear_bwd_x(
+  File "/workspace/chaoscontrol/src/chaoscontrol/kernels/_cublaslt/__init__.py", line 244, in cublaslt_fp8_linear_bwd_x
+    return _C.cublaslt_fp8_linear_bwd_x(
+
+Set TORCHDYNAMO_VERBOSE=1 for the internal stack trace (please do this especially if you're reporting a bug to PyTorch). For even more developer context, set TORCH_LOGS="+dynamo"
+
+  - fp8_fused_no_fused_clip_seed1337_s1337: error=Unsupported: Attempted to call function marked as skipped
+  Explanation: Dynamo does not know how to trace the builtin `chaoscontrol.kernels._cublaslt._C.pybind11_detail_function_record_v1_system_libstdcpp_gxx_abi_1xxx_use_cxx11_abi_1.cublaslt_fp8_linear_bwd_x.` This function is either a Python builtin (e.g. _warnings.warn) or a third-party C/C++ Python extension (perhaps created with pybind).
+  Hint: If it is a Python builtin, please file an issue on GitHub so the PyTorch team can add support for it and see the next case for a workaround.
+  Hint: If it is a third-party C/C++ Python extension, please either wrap it into a PyTorch-understood custom operator (see https://pytorch.org/tutorials/advanced/custom_ops_landing_page.html for more details) or, if it is traceable, use `torch.compiler.allow_in_graph`.
+
+  Developer debug context: module: chaoscontrol.kernels._cublaslt._C, qualname: pybind11_detail_function_record_v1_system_libstdcpp_gxx_abi_1xxx_use_cxx11_abi_1.cublaslt_fp8_linear_bwd_x, skip reason: <missing reason>
+
+ For more details about this graph break, please visit: https://meta-pytorch.github.io/compile-graph-break-site/gb/gb0007.html
+
+from user code:
+   File "/workspace/chaoscontrol/src/chaoscontrol/train_ssm.py", line 183, in _encode_only
+    return model.encode(inputs)
+  File "/workspace/chaoscontrol/src/chaoscontrol/model.py", line 1080, in encode
+    x = _checkpoint(layer, x, return_jacobian_stats=False, use_reentrant=False)
+  File "/workspace/chaoscontrol/src/chaoscontrol/model.py", line 105, in forward
+    result = self.core(
+  File "/workspace/chaoscontrol/src/chaoscontrol/core.py", line 574, in forward
+    decay, update, gate = self._diag_terms(x)
+  File "/workspace/chaoscontrol/src/chaoscontrol/core.py", line 403, in _diag_terms
+    delta = F.softplus(self.delta_proj(x)).clamp_min(1e-4)
+  File "/workspace/chaoscontrol/src/chaoscontrol/kernels/fp8_linear.py", line 404, in forward
+    y_flat = _FusedFP8LinearFn.apply(
+  File "/workspace/chaoscontrol/src/chaoscontrol/kernels/fp8_linear.py", line 223, in backward
+    grad_x_flat = cublaslt_fp8_linear_bwd_x(
+  File "/workspace/chaoscontrol/src/chaoscontrol/kernels/_cublaslt/__init__.py", line 244, in cublaslt_fp8_linear_bwd_x
+    return _C.cublaslt_fp8_linear_bwd_x(
+
+Set TORCHDYNAMO_VERBOSE=1 for the internal stack trace (please do this especially if you're reporting a bug to PyTorch). For even more developer context, set TORCH_LOGS="+dynamo"
+
+  - fp8_fused_no_fused_clip_seed2674_s2674: error=Unsupported: Attempted to call function marked as skipped
+  Explanation: Dynamo does not know how to trace the builtin `chaoscontrol.kernels._cublaslt._C.pybind11_detail_function_record_v1_system_libstdcpp_gxx_abi_1xxx_use_cxx11_abi_1.cublaslt_fp8_linear_bwd_x.` This function is either a Python builtin (e.g. _warnings.warn) or a third-party C/C++ Python extension (perhaps created with pybind).
+  Hint: If it is a Python builtin, please file an issue on GitHub so the PyTorch team can add support for it and see the next case for a workaround.
+  Hint: If it is a third-party C/C++ Python extension, please either wrap it into a PyTorch-understood custom operator (see https://pytorch.org/tutorials/advanced/custom_ops_landing_page.html for more details) or, if it is traceable, use `torch.compiler.allow_in_graph`.
+
+  Developer debug context: module: chaoscontrol.kernels._cublaslt._C, qualname: pybind11_detail_function_record_v1_system_libstdcpp_gxx_abi_1xxx_use_cxx11_abi_1.cublaslt_fp8_linear_bwd_x, skip reason: <missing reason>
+
+ For more details about this graph break, please visit: https://meta-pytorch.github.io/compile-graph-break-site/gb/gb0007.html
+
+from user code:
+   File "/workspace/chaoscontrol/src/chaoscontrol/train_ssm.py", line 183, in _encode_only
+    return model.encode(inputs)
+  File "/workspace/chaoscontrol/src/chaoscontrol/model.py", line 1080, in encode
+    x = _checkpoint(layer, x, return_jacobian_stats=False, use_reentrant=False)
+  File "/workspace/chaoscontrol/src/chaoscontrol/model.py", line 105, in forward
+    result = self.core(
+  File "/workspace/chaoscontrol/src/chaoscontrol/core.py", line 574, in forward
+    decay, update, gate = self._diag_terms(x)
+  File "/workspace/chaoscontrol/src/chaoscontrol/core.py", line 403, in _diag_terms
+    delta = F.softplus(self.delta_proj(x)).clamp_min(1e-4)
+  File "/workspace/chaoscontrol/src/chaoscontrol/kernels/fp8_linear.py", line 404, in forward
+    y_flat = _FusedFP8LinearFn.apply(
+  File "/workspace/chaoscontrol/src/chaoscontrol/kernels/fp8_linear.py", line 223, in backward
+    grad_x_flat = cublaslt_fp8_linear_bwd_x(
+  File "/workspace/chaoscontrol/src/chaoscontrol/kernels/_cublaslt/__init__.py", line 244, in cublaslt_fp8_linear_bwd_x
+    return _C.cublaslt_fp8_linear_bwd_x(
+
+Set TORCHDYNAMO_VERBOSE=1 for the internal stack trace (please do this especially if you're reporting a bug to PyTorch). For even more developer context, set TORCH_LOGS="+dynamo"
+
+  - fp8_fused_no_fused_clip_seed4011_s4011: error=Unsupported: Attempted to call function marked as skipped
+  Explanation: Dynamo does not know how to trace the builtin `chaoscontrol.kernels._cublaslt._C.pybind11_detail_function_record_v1_system_libstdcpp_gxx_abi_1xxx_use_cxx11_abi_1.cublaslt_fp8_linear_bwd_x.` This function is either a Python builtin (e.g. _warnings.warn) or a third-party C/C++ Python extension (perhaps created with pybind).
+  Hint: If it is a Python builtin, please file an issue on GitHub so the PyTorch team can add support for it and see the next case for a workaround.
+  Hint: If it is a third-party C/C++ Python extension, please either wrap it into a PyTorch-understood custom operator (see https://pytorch.org/tutorials/advanced/custom_ops_landing_page.html for more details) or, if it is traceable, use `torch.compiler.allow_in_graph`.
+
+  Developer debug context: module: chaoscontrol.kernels._cublaslt._C, qualname: pybind11_detail_function_record_v1_system_libstdcpp_gxx_abi_1xxx_use_cxx11_abi_1.cublaslt_fp8_linear_bwd_x, skip reason: <missing reason>
+
+ For more details about this graph break, please visit: https://meta-pytorch.github.io/compile-graph-break-site/gb/gb0007.html
+
+from user code:
+   File "/workspace/chaoscontrol/src/chaoscontrol/train_ssm.py", line 183, in _encode_only
+    return model.encode(inputs)
+  File "/workspace/chaoscontrol/src/chaoscontrol/model.py", line 1080, in encode
+    x = _checkpoint(layer, x, return_jacobian_stats=False, use_reentrant=False)
+  File "/workspace/chaoscontrol/src/chaoscontrol/model.py", line 105, in forward
+    result = self.core(
+  File "/workspace/chaoscontrol/src/chaoscontrol/core.py", line 574, in forward
+    decay, update, gate = self._diag_terms(x)
+  File "/workspace/chaoscontrol/src/chaoscontrol/core.py", line 403, in _diag_terms
+    delta = F.softplus(self.delta_proj(x)).clamp_min(1e-4)
+  File "/workspace/chaoscontrol/src/chaoscontrol/kernels/fp8_linear.py", line 404, in forward
+    y_flat = _FusedFP8LinearFn.apply(
+  File "/workspace/chaoscontrol/src/chaoscontrol/kernels/fp8_linear.py", line 223, in backward
+    grad_x_flat = cublaslt_fp8_linear_bwd_x(
+  File "/workspace/chaoscontrol/src/chaoscontrol/kernels/_cublaslt/__init__.py", line 244, in cublaslt_fp8_linear_bwd_x
+    return _C.cublaslt_fp8_linear_bwd_x(
+
+Set TORCHDYNAMO_VERBOSE=1 for the internal stack trace (please do this especially if you're reporting a bug to PyTorch). For even more developer context, set TORCH_LOGS="+dynamo"
+
+  - fp8_fused_no_fused_clip_seed5348_s5348: error=Unsupported: Attempted to call function marked as skipped
+  Explanation: Dynamo does not know how to trace the builtin `chaoscontrol.kernels._cublaslt._C.pybind11_detail_function_record_v1_system_libstdcpp_gxx_abi_1xxx_use_cxx11_abi_1.cublaslt_fp8_linear_bwd_x.` This function is either a Python builtin (e.g. _warnings.warn) or a third-party C/C++ Python extension (perhaps created with pybind).
+  Hint: If it is a Python builtin, please file an issue on GitHub so the PyTorch team can add support for it and see the next case for a workaround.
+  Hint: If it is a third-party C/C++ Python extension, please either wrap it into a PyTorch-understood custom operator (see https://pytorch.org/tutorials/advanced/custom_ops_landing_page.html for more details) or, if it is traceable, use `torch.compiler.allow_in_graph`.
+
+  Developer debug context: module: chaoscontrol.kernels._cublaslt._C, qualname: pybind11_detail_function_record_v1_system_libstdcpp_gxx_abi_1xxx_use_cxx11_abi_1.cublaslt_fp8_linear_bwd_x, skip reason: <missing reason>
+
+ For more details about this graph break, please visit: https://meta-pytorch.github.io/compile-graph-break-site/gb/gb0007.html
+
+from user code:
+   File "/workspace/chaoscontrol/src/chaoscontrol/train_ssm.py", line 183, in _encode_only
+    return model.encode(inputs)
+  File "/workspace/chaoscontrol/src/chaoscontrol/model.py", line 1080, in encode
+    x = _checkpoint(layer, x, return_jacobian_stats=False, use_reentrant=False)
+  File "/workspace/chaoscontrol/src/chaoscontrol/model.py", line 105, in forward
+    result = self.core(
+  File "/workspace/chaoscontrol/src/chaoscontrol/core.py", line 574, in forward
+    decay, update, gate = self._diag_terms(x)
+  File "/workspace/chaoscontrol/src/chaoscontrol/core.py", line 403, in _diag_terms
+    delta = F.softplus(self.delta_proj(x)).clamp_min(1e-4)
+  File "/workspace/chaoscontrol/src/chaoscontrol/kernels/fp8_linear.py", line 404, in forward
+    y_flat = _FusedFP8LinearFn.apply(
+  File "/workspace/chaoscontrol/src/chaoscontrol/kernels/fp8_linear.py", line 223, in backward
+    grad_x_flat = cublaslt_fp8_linear_bwd_x(
+  File "/workspace/chaoscontrol/src/chaoscontrol/kernels/_cublaslt/__init__.py", line 244, in cublaslt_fp8_linear_bwd_x
+    return _C.cublaslt_fp8_linear_bwd_x(
+
+Set TORCHDYNAMO_VERBOSE=1 for the internal stack trace (please do this especially if you're reporting a bug to PyTorch). For even more developer context, set TORCH_LOGS="+dynamo"
+
+  - fp8_fused_no_fused_muon_seed1337_s1337: error=Unsupported: Attempted to call function marked as skipped
+  Explanation: Dynamo does not know how to trace the builtin `chaoscontrol.kernels._cublaslt._C.pybind11_detail_function_record_v1_system_libstdcpp_gxx_abi_1xxx_use_cxx11_abi_1.cublaslt_fp8_linear_bwd_x.` This function is either a Python builtin (e.g. _warnings.warn) or a third-party C/C++ Python extension (perhaps created with pybind).
+  Hint: If it is a Python builtin, please file an issue on GitHub so the PyTorch team can add support for it and see the next case for a workaround.
+  Hint: If it is a third-party C/C++ Python extension, please either wrap it into a PyTorch-understood custom operator (see https://pytorch.org/tutorials/advanced/custom_ops_landing_page.html for more details) or, if it is traceable, use `torch.compiler.allow_in_graph`.
+
+  Developer debug context: module: chaoscontrol.kernels._cublaslt._C, qualname: pybind11_detail_function_record_v1_system_libstdcpp_gxx_abi_1xxx_use_cxx11_abi_1.cublaslt_fp8_linear_bwd_x, skip reason: <missing reason>
+
+ For more details about this graph break, please visit: https://meta-pytorch.github.io/compile-graph-break-site/gb/gb0007.html
+
+from user code:
+   File "/workspace/chaoscontrol/src/chaoscontrol/train_ssm.py", line 183, in _encode_only
+    return model.encode(inputs)
+  File "/workspace/chaoscontrol/src/chaoscontrol/model.py", line 1080, in encode
+    x = _checkpoint(layer, x, return_jacobian_stats=False, use_reentrant=False)
+  File "/workspace/chaoscontrol/src/chaoscontrol/model.py", line 105, in forward
+    result = self.core(
+  File "/workspace/chaoscontrol/src/chaoscontrol/core.py", line 574, in forward
+    decay, update, gate = self._diag_terms(x)
+  File "/workspace/chaoscontrol/src/chaoscontrol/core.py", line 403, in _diag_terms
+    delta = F.softplus(self.delta_proj(x)).clamp_min(1e-4)
+  File "/workspace/chaoscontrol/src/chaoscontrol/kernels/fp8_linear.py", line 404, in forward
+    y_flat = _FusedFP8LinearFn.apply(
+  File "/workspace/chaoscontrol/src/chaoscontrol/kernels/fp8_linear.py", line 223, in backward
+    grad_x_flat = cublaslt_fp8_linear_bwd_x(
+  File "/workspace/chaoscontrol/src/chaoscontrol/kernels/_cublaslt/__init__.py", line 244, in cublaslt_fp8_linear_bwd_x
+    return _C.cublaslt_fp8_linear_bwd_x(
+
+Set TORCHDYNAMO_VERBOSE=1 for the internal stack trace (please do this especially if you're reporting a bug to PyTorch). For even more developer context, set TORCH_LOGS="+dynamo"
+
+  - fp8_fused_no_fused_muon_seed2674_s2674: error=Unsupported: Attempted to call function marked as skipped
+  Explanation: Dynamo does not know how to trace the builtin `chaoscontrol.kernels._cublaslt._C.pybind11_detail_function_record_v1_system_libstdcpp_gxx_abi_1xxx_use_cxx11_abi_1.cublaslt_fp8_linear_bwd_x.` This function is either a Python builtin (e.g. _warnings.warn) or a third-party C/C++ Python extension (perhaps created with pybind).
+  Hint: If it is a Python builtin, please file an issue on GitHub so the PyTorch team can add support for it and see the next case for a workaround.
+  Hint: If it is a third-party C/C++ Python extension, please either wrap it into a PyTorch-understood custom operator (see https://pytorch.org/tutorials/advanced/custom_ops_landing_page.html for more details) or, if it is traceable, use `torch.compiler.allow_in_graph`.
+
+  Developer debug context: module: chaoscontrol.kernels._cublaslt._C, qualname: pybind11_detail_function_record_v1_system_libstdcpp_gxx_abi_1xxx_use_cxx11_abi_1.cublaslt_fp8_linear_bwd_x, skip reason: <missing reason>
+
+ For more details about this graph break, please visit: https://meta-pytorch.github.io/compile-graph-break-site/gb/gb0007.html
+
+from user code:
+   File "/workspace/chaoscontrol/src/chaoscontrol/train_ssm.py", line 183, in _encode_only
+    return model.encode(inputs)
+  File "/workspace/chaoscontrol/src/chaoscontrol/model.py", line 1080, in encode
+    x = _checkpoint(layer, x, return_jacobian_stats=False, use_reentrant=False)
+  File "/workspace/chaoscontrol/src/chaoscontrol/model.py", line 105, in forward
+    result = self.core(
+  File "/workspace/chaoscontrol/src/chaoscontrol/core.py", line 574, in forward
+    decay, update, gate = self._diag_terms(x)
+  File "/workspace/chaoscontrol/src/chaoscontrol/core.py", line 403, in _diag_terms
+    delta = F.softplus(self.delta_proj(x)).clamp_min(1e-4)
+  File "/workspace/chaoscontrol/src/chaoscontrol/kernels/fp8_linear.py", line 404, in forward
+    y_flat = _FusedFP8LinearFn.apply(
+  File "/workspace/chaoscontrol/src/chaoscontrol/kernels/fp8_linear.py", line 223, in backward
+    grad_x_flat = cublaslt_fp8_linear_bwd_x(
+  File "/workspace/chaoscontrol/src/chaoscontrol/kernels/_cublaslt/__init__.py", line 244, in cublaslt_fp8_linear_bwd_x
+    return _C.cublaslt_fp8_linear_bwd_x(
+
+Set TORCHDYNAMO_VERBOSE=1 for the internal stack trace (please do this especially if you're reporting a bug to PyTorch). For even more developer context, set TORCH_LOGS="+dynamo"
+
+  - fp8_fused_no_fused_muon_seed4011_s4011: error=Unsupported: Attempted to call function marked as skipped
+  Explanation: Dynamo does not know how to trace the builtin `chaoscontrol.kernels._cublaslt._C.pybind11_detail_function_record_v1_system_libstdcpp_gxx_abi_1xxx_use_cxx11_abi_1.cublaslt_fp8_linear_bwd_x.` This function is either a Python builtin (e.g. _warnings.warn) or a third-party C/C++ Python extension (perhaps created with pybind).
+  Hint: If it is a Python builtin, please file an issue on GitHub so the PyTorch team can add support for it and see the next case for a workaround.
+  Hint: If it is a third-party C/C++ Python extension, please either wrap it into a PyTorch-understood custom operator (see https://pytorch.org/tutorials/advanced/custom_ops_landing_page.html for more details) or, if it is traceable, use `torch.compiler.allow_in_graph`.
+
+  Developer debug context: module: chaoscontrol.kernels._cublaslt._C, qualname: pybind11_detail_function_record_v1_system_libstdcpp_gxx_abi_1xxx_use_cxx11_abi_1.cublaslt_fp8_linear_bwd_x, skip reason: <missing reason>
+
+ For more details about this graph break, please visit: https://meta-pytorch.github.io/compile-graph-break-site/gb/gb0007.html
+
+from user code:
+   File "/workspace/chaoscontrol/src/chaoscontrol/train_ssm.py", line 183, in _encode_only
+    return model.encode(inputs)
+  File "/workspace/chaoscontrol/src/chaoscontrol/model.py", line 1080, in encode
+    x = _checkpoint(layer, x, return_jacobian_stats=False, use_reentrant=False)
+  File "/workspace/chaoscontrol/src/chaoscontrol/model.py", line 105, in forward
+    result = self.core(
+  File "/workspace/chaoscontrol/src/chaoscontrol/core.py", line 574, in forward
+    decay, update, gate = self._diag_terms(x)
+  File "/workspace/chaoscontrol/src/chaoscontrol/core.py", line 403, in _diag_terms
+    delta = F.softplus(self.delta_proj(x)).clamp_min(1e-4)
+  File "/workspace/chaoscontrol/src/chaoscontrol/kernels/fp8_linear.py", line 404, in forward
+    y_flat = _FusedFP8LinearFn.apply(
+  File "/workspace/chaoscontrol/src/chaoscontrol/kernels/fp8_linear.py", line 223, in backward
+    grad_x_flat = cublaslt_fp8_linear_bwd_x(
+  File "/workspace/chaoscontrol/src/chaoscontrol/kernels/_cublaslt/__init__.py", line 244, in cublaslt_fp8_linear_bwd_x
+    return _C.cublaslt_fp8_linear_bwd_x(
+
+Set TORCHDYNAMO_VERBOSE=1 for the internal stack trace (please do this especially if you're reporting a bug to PyTorch). For even more developer context, set TORCH_LOGS="+dynamo"
+
+  - fp8_fused_no_fused_muon_seed5348_s5348: error=Unsupported: Attempted to call function marked as skipped
+  Explanation: Dynamo does not know how to trace the builtin `chaoscontrol.kernels._cublaslt._C.pybind11_detail_function_record_v1_system_libstdcpp_gxx_abi_1xxx_use_cxx11_abi_1.cublaslt_fp8_linear_bwd_x.` This function is either a Python builtin (e.g. _warnings.warn) or a third-party C/C++ Python extension (perhaps created with pybind).
+  Hint: If it is a Python builtin, please file an issue on GitHub so the PyTorch team can add support for it and see the next case for a workaround.
+  Hint: If it is a third-party C/C++ Python extension, please either wrap it into a PyTorch-understood custom operator (see https://pytorch.org/tutorials/advanced/custom_ops_landing_page.html for more details) or, if it is traceable, use `torch.compiler.allow_in_graph`.
+
+  Developer debug context: module: chaoscontrol.kernels._cublaslt._C, qualname: pybind11_detail_function_record_v1_system_libstdcpp_gxx_abi_1xxx_use_cxx11_abi_1.cublaslt_fp8_linear_bwd_x, skip reason: <missing reason>
+
+ For more details about this graph break, please visit: https://meta-pytorch.github.io/compile-graph-break-site/gb/gb0007.html
+
+from user code:
+   File "/workspace/chaoscontrol/src/chaoscontrol/train_ssm.py", line 183, in _encode_only
+    return model.encode(inputs)
+  File "/workspace/chaoscontrol/src/chaoscontrol/model.py", line 1080, in encode
+    x = _checkpoint(layer, x, return_jacobian_stats=False, use_reentrant=False)
+  File "/workspace/chaoscontrol/src/chaoscontrol/model.py", line 105, in forward
+    result = self.core(
+  File "/workspace/chaoscontrol/src/chaoscontrol/core.py", line 574, in forward
+    decay, update, gate = self._diag_terms(x)
+  File "/workspace/chaoscontrol/src/chaoscontrol/core.py", line 403, in _diag_terms
+    delta = F.softplus(self.delta_proj(x)).clamp_min(1e-4)
+  File "/workspace/chaoscontrol/src/chaoscontrol/kernels/fp8_linear.py", line 404, in forward
+    y_flat = _FusedFP8LinearFn.apply(
+  File "/workspace/chaoscontrol/src/chaoscontrol/kernels/fp8_linear.py", line 223, in backward
+    grad_x_flat = cublaslt_fp8_linear_bwd_x(
+  File "/workspace/chaoscontrol/src/chaoscontrol/kernels/_cublaslt/__init__.py", line 244, in cublaslt_fp8_linear_bwd_x
+    return _C.cublaslt_fp8_linear_bwd_x(
+
+Set TORCHDYNAMO_VERBOSE=1 for the internal stack trace (please do this especially if you're reporting a bug to PyTorch). For even more developer context, set TORCH_LOGS="+dynamo"

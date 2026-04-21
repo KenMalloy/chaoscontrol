@@ -1,0 +1,18 @@
+Launching ssm_shuffled seed=42 slot=0 gpus=[0, 1] rdzv=:38685
+Launching ssm_shuffled seed=123 slot=1 gpus=[2, 3] rdzv=:59001
+Launching ssm_shuffled seed=7 slot=1 gpus=[2, 3] rdzv=:48391
+Launching ssm_shuffled seed=8 slot=0 gpus=[0, 1] rdzv=:46229
+Launching ssm_zero seed=1337 slot=0 gpus=[0, 1] rdzv=:38165
+Launching ssm_zero seed=42 slot=1 gpus=[2, 3] rdzv=:45707
+Launching ssm_zero seed=123 slot=1 gpus=[2, 3] rdzv=:34983
+Launching ssm_zero seed=7 slot=0 gpus=[0, 1] rdzv=:41067
+Launching ssm_zero seed=8 slot=1 gpus=[2, 3] rdzv=:35933
+
+Full-cov moment-match:
+  ssm_fullcov      n=5 (finite=5) mean_bpb=1.5244  seeds=[7, 8, 42, 123, 1337]
+
+Shuffled-row control:
+  ssm_shuffled     n=5 (finite=5) mean_bpb=1.5357  seeds=[7, 8, 42, 123, 1337]
+
+Zero-init floor:
+  ssm_zero         n=5 (finite=5) mean_bpb=1.8891  seeds=[7, 8, 42, 123, 1337]

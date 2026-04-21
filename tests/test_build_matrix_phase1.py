@@ -151,6 +151,16 @@ def test_base_config_merged():
         assert entry["precision"] == "bf16"
 
 
+def test_default_matrix_declares_launcher_world_size():
+    """Default entries must pass the persistent launcher's world-size gate."""
+    mod = _load_module()
+    entries = mod.build_matrix_phase1(
+        seeds=[1337], include_fp8=True,
+    )
+    assert entries
+    assert {entry.get("world_size") for entry in entries} == {4}
+
+
 def test_cli_stdout_roundtrip(tmp_path):
     """`python build_matrix_phase1.py --seeds 1337` prints JSON to stdout."""
     result = subprocess.run(

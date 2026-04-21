@@ -5,6 +5,16 @@ import numpy as np
 from pathlib import Path
 import torch
 
+from scripts.run_exp20_eval import _build_optimizer
+
+
+def test_build_optimizer_uses_fused_muon_for_eval_ttt():
+    param = torch.nn.Parameter(torch.randn(4, 4))
+    optimizers = _build_optimizer([param], lr=0.016)
+
+    assert len(optimizers) == 1
+    assert getattr(optimizers[0], "_fused") is True
+
 
 def test_driver_runs_tiny_stream(tmp_path):
     # Tiny SP model + JSONL doc file — matches the DocStreamer retrofit
