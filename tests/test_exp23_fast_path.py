@@ -180,7 +180,7 @@ def test_stage_a_matrix_names_and_fast_defaults():
         assert entry["cuda_graph_mode"] == "none"
         assert entry["cuda_graph_min_total_speedup"] == 0.05
         assert entry["cuda_graph_max_capture_seconds"] == 30.0
-        assert entry["lm_head_backward_mode"] == "chunked"
+        assert entry["lm_head_backward_mode"] == "fused"
         assert entry["prefetch_batches"] is True
         assert entry["eval_batches"] == 0
         assert entry["warmup_steps"] == 5

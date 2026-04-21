@@ -3,8 +3,8 @@
 
 This is deliberately narrower than the previous experiment launchers.
 It keeps only the final bare-SSM training path and makes the 600s hot
-loop explicit: vectorized batch gather, fixed-shape chunked CE, fused
-Muon/grad-clip knobs, amortized stop checks, and compact timing JSON.
+loop explicit: vectorized batch gather, fused linear+CE head/loss,
+fused Muon/grad-clip knobs, amortized stop checks, and compact timing JSON.
 """
 from __future__ import annotations
 
@@ -132,7 +132,7 @@ def _run_train_step(
     ddp_active: bool,
     world_size: int,
     compile_full_path: bool = False,
-    lm_head_backward_mode: str = "chunked",
+    lm_head_backward_mode: str = "fused",
 ) -> torch.Tensor:
     _reject_unsupported(model)
     with autocast_context(precision, device_type=inputs.device.type):
@@ -209,7 +209,7 @@ def train_fast_for_budget(
     max_steps: int | None = None,
     compile_full_path: bool = False,
     prefetch_batches: bool = False,
-    lm_head_backward_mode: str = "chunked",
+    lm_head_backward_mode: str = "fused",
 ) -> dict[str, Any]:
     rank_ = int(rank)
     world_size_ = int(world_size)
@@ -376,7 +376,7 @@ def _warmup(
         max_steps=steps,
         compile_full_path=bool(config.get("compile_full_path", False)),
         prefetch_batches=bool(config.get("prefetch_batches", True)),
-        lm_head_backward_mode=str(config.get("lm_head_backward_mode", "chunked")),
+        lm_head_backward_mode=str(config.get("lm_head_backward_mode", "fused")),
     )
 
 
@@ -491,7 +491,7 @@ def run_condition(
         vocab_size=vocab_size,
         compile_full_path=bool(config.get("compile_full_path", False)),
         prefetch_batches=bool(config.get("prefetch_batches", True)),
-        lm_head_backward_mode=str(config.get("lm_head_backward_mode", "chunked")),
+        lm_head_backward_mode=str(config.get("lm_head_backward_mode", "fused")),
     )
 
     if ddp_active:

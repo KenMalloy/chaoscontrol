@@ -53,7 +53,7 @@ def _base_fast_config(*, world_size: int, vocab_size: int) -> dict[str, Any]:
         "cuda_graph_mode": "none",
         "cuda_graph_min_total_speedup": 0.05,
         "cuda_graph_max_capture_seconds": 30.0,
-        "lm_head_backward_mode": "chunked",
+        "lm_head_backward_mode": "fused",
         "warmup_steps": 5,
         "restore_after_warmup": False,
         "stop_check_interval": 4,

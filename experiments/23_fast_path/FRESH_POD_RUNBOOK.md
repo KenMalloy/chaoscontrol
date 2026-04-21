@@ -204,9 +204,10 @@ batch 2048, chunk 128, ckpt: OOM, 16GB CE allocation
 batch 2048, chunk 256, ckpt: OOM, 32GB CE allocation
 ```
 
-For Stage A, start around per-rank batch 1024 and chunk 64/128. Larger batches
-can fit with chunk 64, but the short H100 probe was slower and should not be
-the first expensive sweep branch.
+After adding native fused linear+CE, the same 1xH100 `batch=1024, seq=512`
+smoke improved from 2.13M tok/s / 42.8GB peak VRAM to 2.56M tok/s / 30.9GB
+peak VRAM. Stage A now defaults `lm_head_backward_mode: fused`; keep the
+chunked rows above as the historical pre-fused baseline.
 
 Current local H100 probe artifacts:
 
@@ -480,7 +481,7 @@ files before stopping the pod.
 
 CUDA graph training is a probe, not a default. Count graph warmup and capture
 inside the same wall-clock budget as training. Before a graph-mode result can
-replace eager/chunked as the Stage A winner, record:
+replace eager/fused as the Stage A winner, record:
 
 ```text
 capture_seconds
