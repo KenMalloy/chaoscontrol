@@ -476,6 +476,27 @@ When the run finishes, harvest
 `experiments/23_fast_path/results_stage_a/summary.json` and the per-cell JSON
 files before stopping the pod.
 
+## CUDA Graph Probe Gate
+
+CUDA graph training is a probe, not a default. Count graph warmup and capture
+inside the same wall-clock budget as training. Before a graph-mode result can
+replace eager/chunked as the Stage A winner, record:
+
+```text
+capture_seconds
+warmup_seconds
+warmup_steps
+eager_step_seconds
+graph_step_seconds
+break_even_seconds
+projected_total_speedup
+```
+
+Use `fast_path.summarize_cuda_graph_gate(...)` with the submission budget. The
+default Stage A policy requires at least 5% projected total-budget throughput
+gain after overhead, and rejects capture taking more than 30 seconds. If graph
+capture is slow or brittle, keep `cuda_graph_mode: none` and move on.
+
 ## Stage B Reminder
 
 Stage B can run immediately from the best Stage A speed config, but the current

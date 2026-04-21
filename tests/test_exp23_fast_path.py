@@ -83,7 +83,7 @@ def test_vectorized_batch_matches_reference_batcher():
 
     assert torch.equal(got_inputs, ref_inputs)
     assert torch.equal(got_targets, ref_targets)
-    assert got_inputs.dtype == torch.long
+    assert got_inputs.dtype == torch.int32
     assert got_targets.dtype == torch.long
 
 
@@ -177,6 +177,9 @@ def test_stage_a_matrix_names_and_fast_defaults():
         assert entry["fused_grad_clip"] is True
         assert entry["fused_muon"] is True
         assert entry["compile_full_path"] is False
+        assert entry["cuda_graph_mode"] == "none"
+        assert entry["cuda_graph_min_total_speedup"] == 0.05
+        assert entry["cuda_graph_max_capture_seconds"] == 30.0
         assert entry["lm_head_backward_mode"] == "chunked"
         assert entry["prefetch_batches"] is True
         assert entry["eval_batches"] == 0
@@ -250,6 +253,54 @@ def test_token_accounting_summary_uses_global_tokens():
     assert summary["tokens_per_step"] == 96
     assert summary["aggregate_tokens_per_sec"] == 480.0
     assert summary["per_gpu_tokens_per_sec"] == 160.0
+
+
+def test_cuda_graph_gate_counts_capture_against_budget():
+    mod = _load_module()
+
+    accepted = mod.summarize_cuda_graph_gate(
+        budget_seconds=600.0,
+        capture_seconds=10.0,
+        warmup_seconds=5.0,
+        warmup_steps=3,
+        eager_step_seconds=0.25,
+        graph_step_seconds=0.20,
+        min_total_speedup=0.05,
+        max_capture_seconds=30.0,
+    )
+    rejected_slow_capture = mod.summarize_cuda_graph_gate(
+        budget_seconds=600.0,
+        capture_seconds=31.0,
+        warmup_seconds=0.0,
+        warmup_steps=0,
+        eager_step_seconds=0.25,
+        graph_step_seconds=0.10,
+        min_total_speedup=0.05,
+        max_capture_seconds=30.0,
+    )
+    rejected_small_win = mod.summarize_cuda_graph_gate(
+        budget_seconds=600.0,
+        capture_seconds=10.0,
+        warmup_seconds=5.0,
+        warmup_steps=3,
+        eager_step_seconds=0.25,
+        graph_step_seconds=0.245,
+        min_total_speedup=0.05,
+        max_capture_seconds=30.0,
+    )
+
+    assert accepted["accepted"] is True
+    assert accepted["overhead_seconds"] == 15.0
+    assert accepted["projected_eager_steps"] == 2400.0
+    assert accepted["projected_graph_steps"] == 2925.0
+    assert accepted["projected_total_speedup"] > 0.05
+    assert abs(accepted["break_even_steps"] - 300.0) < 1e-9
+    assert abs(accepted["break_even_seconds"] - 75.0) < 1e-9
+
+    assert rejected_slow_capture["accepted"] is False
+    assert "capture_seconds_exceeds_limit" in rejected_slow_capture["reasons"]
+    assert rejected_small_win["accepted"] is False
+    assert "projected_speedup_below_minimum" in rejected_small_win["reasons"]
 
 
 def test_run_train_step_uses_compiled_encoder_when_enabled(monkeypatch):

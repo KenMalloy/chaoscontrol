@@ -50,6 +50,9 @@ def _base_fast_config(*, world_size: int, vocab_size: int) -> dict[str, Any]:
         "fused_grad_clip": True,
         "fused_muon": True,
         "compile_full_path": False,
+        "cuda_graph_mode": "none",
+        "cuda_graph_min_total_speedup": 0.05,
+        "cuda_graph_max_capture_seconds": 30.0,
         "lm_head_backward_mode": "chunked",
         "warmup_steps": 5,
         "restore_after_warmup": False,
@@ -165,13 +168,98 @@ def batch_from_start_tensor(
     """
     if starts.ndim != 1:
         raise ValueError(f"starts must be 1D, got shape={tuple(starts.shape)}")
-    offsets = torch.arange(seq_len + 1, dtype=torch.long, device=starts.device)
-    positions = starts.to(dtype=torch.long)[:, None] + offsets[None, :]
-    batch = tokens[positions.reshape(-1)].view(starts.numel(), seq_len + 1)
-    batch = batch.to(device=device, dtype=torch.long, non_blocking=True)
+    start_idx = starts.to(device=tokens.device, dtype=torch.long, non_blocking=True)
+    offsets = torch.arange(seq_len + 1, dtype=torch.long, device=tokens.device)
+    positions = start_idx[:, None] + offsets[None, :]
+    flat_positions = positions.reshape(-1)
+    batch = torch.index_select(tokens, 0, flat_positions).view(
+        starts.numel(), seq_len + 1,
+    )
     if vocab_size is not None:
         batch.clamp_(0, int(vocab_size) - 1)
-    return batch[:, :-1], batch[:, 1:]
+    inputs = batch[:, :-1].to(device=device, dtype=torch.int32, non_blocking=True)
+    targets = batch[:, 1:].to(device=device, dtype=torch.long, non_blocking=True)
+    return inputs, targets
+
+
+def summarize_cuda_graph_gate(
+    *,
+    budget_seconds: float,
+    capture_seconds: float,
+    warmup_seconds: float,
+    warmup_steps: int,
+    eager_step_seconds: float,
+    graph_step_seconds: float,
+    min_total_speedup: float = 0.05,
+    max_capture_seconds: float = 30.0,
+) -> dict[str, Any]:
+    """Summarize whether CUDA graph capture is worth enabling.
+
+    Capture and warmup are counted inside the same budget as training.
+    The gate is intentionally conservative: graph replay must improve total
+    projected 600s throughput, not just steady-state step time.
+    """
+    budget = float(budget_seconds)
+    capture = max(0.0, float(capture_seconds))
+    warmup = max(0.0, float(warmup_seconds))
+    overhead = capture + warmup
+    eager_step = float(eager_step_seconds)
+    graph_step = float(graph_step_seconds)
+    reasons: list[str] = []
+
+    if budget <= 0.0:
+        reasons.append("budget_seconds_must_be_positive")
+    if eager_step <= 0.0:
+        reasons.append("eager_step_seconds_must_be_positive")
+    if graph_step <= 0.0:
+        reasons.append("graph_step_seconds_must_be_positive")
+
+    projected_eager_steps = 0.0
+    projected_graph_steps = 0.0
+    projected_total_speedup = float("-inf")
+    break_even_steps = float("inf")
+    break_even_seconds = float("inf")
+
+    if budget > 0.0 and eager_step > 0.0:
+        projected_eager_steps = budget / eager_step
+    if budget > overhead and graph_step > 0.0:
+        projected_graph_steps = (budget - overhead) / graph_step
+    elif overhead >= budget:
+        reasons.append("capture_overhead_exhausts_budget")
+
+    if projected_eager_steps > 0.0:
+        projected_total_speedup = projected_graph_steps / projected_eager_steps - 1.0
+
+    per_step_savings = eager_step - graph_step
+    if per_step_savings <= 0.0:
+        reasons.append("graph_step_not_faster")
+    else:
+        break_even_steps = overhead / per_step_savings
+        break_even_seconds = break_even_steps * eager_step
+
+    if capture > float(max_capture_seconds):
+        reasons.append("capture_seconds_exceeds_limit")
+    if projected_total_speedup < float(min_total_speedup):
+        reasons.append("projected_speedup_below_minimum")
+
+    return {
+        "accepted": not reasons,
+        "reasons": reasons,
+        "budget_seconds": budget,
+        "capture_seconds": capture,
+        "warmup_seconds": warmup,
+        "warmup_steps": int(warmup_steps),
+        "overhead_seconds": overhead,
+        "eager_step_seconds": eager_step,
+        "graph_step_seconds": graph_step,
+        "projected_eager_steps": projected_eager_steps,
+        "projected_graph_steps": projected_graph_steps,
+        "projected_total_speedup": projected_total_speedup,
+        "min_total_speedup": float(min_total_speedup),
+        "max_capture_seconds": float(max_capture_seconds),
+        "break_even_steps": break_even_steps,
+        "break_even_seconds": break_even_seconds,
+    }
 
 
 def _build_prefetched_lm_batch(
