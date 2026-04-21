@@ -1,0 +1,2 @@
+[rank 0/1] h100_b1024_c64_fused_graph_none vocab=16384 batch=1024 chunk=64 ckpt=False params=10,751,232
+[rank 0/1] done steps=56 tok/s=2550800 loss=9.0625 vram=30865.1MB
