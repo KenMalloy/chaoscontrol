@@ -305,8 +305,12 @@ def cmd_deploy(args: argparse.Namespace) -> None:
         print("Use --bootstrap only when you intentionally want tools/pod_bootstrap.sh.")
         return
 
-    print("\n=== Running bootstrap (venv + smoke test + batch benchmark) ===")
-    ssh_cmd = build_ssh_command(pod_id, f"bash {DEFAULT_REMOTE_REPO_ROOT}/tools/pod_bootstrap.sh")
+    print("\n=== Running legacy broad bootstrap (venv + smoke test + batch benchmark) ===")
+    ssh_cmd = build_ssh_command(
+        pod_id,
+        "CHAOSCONTROL_ALLOW_BROAD_BOOTSTRAP=1 "
+        f"bash {DEFAULT_REMOTE_REPO_ROOT}/tools/pod_bootstrap.sh",
+    )
     run_passthrough(ssh_cmd)
 
 
@@ -414,7 +418,7 @@ def build_parser() -> argparse.ArgumentParser:
     deploy.add_argument(
         "--bootstrap",
         action="store_true",
-        help="also run tools/pod_bootstrap.sh after sync (broad environment mutation)",
+        help="also run tools/pod_bootstrap.sh after sync (legacy broad environment mutation)",
     )
     deploy.set_defaults(handler=cmd_deploy)
 

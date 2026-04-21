@@ -2,13 +2,31 @@
 # =============================================================================
 # pod_bootstrap.sh — Bootstrap a RunPod GPU instance for ChaosControl experiments
 #
-# Run ON the pod after rsyncing the repo:
-#   bash /workspace/chaoscontrol/tools/pod_bootstrap.sh
+# Legacy broad bootstrap path. It mutates the Python environment, may install
+# Torch/Mamba dependencies, and runs extra benchmarks. Prefer the narrow fresh
+# pod setup documented in experiments/23_fast_path/FRESH_POD_RUNBOOK.md.
+#
+# Run ON the pod only when you intentionally want the broad path:
+#   CHAOSCONTROL_ALLOW_BROAD_BOOTSTRAP=1 bash /workspace/chaoscontrol/tools/pod_bootstrap.sh
 #
 # Idempotent: safe to run multiple times. Skips steps that are already done.
 # Expects: NVIDIA GPU(s), Ubuntu-based RunPod image, network volume at /workspace
 # =============================================================================
 set -euo pipefail
+
+if [ "${CHAOSCONTROL_ALLOW_BROAD_BOOTSTRAP:-}" != "1" ]; then
+    cat >&2 <<'EOF'
+ERROR: tools/pod_bootstrap.sh is the legacy broad bootstrap path.
+
+It can create/modify the venv, install or replace Torch, install optional
+Mamba dependencies, and run extra benchmarks. For Exp23 / Parameter Golf pods,
+use the narrow setup in experiments/23_fast_path/FRESH_POD_RUNBOOK.md instead.
+
+If you intentionally want the broad mutating path, rerun with:
+  CHAOSCONTROL_ALLOW_BROAD_BOOTSTRAP=1 bash /workspace/chaoscontrol/tools/pod_bootstrap.sh
+EOF
+    exit 2
+fi
 
 REPO="/workspace/chaoscontrol"
 DATA="/workspace/data"

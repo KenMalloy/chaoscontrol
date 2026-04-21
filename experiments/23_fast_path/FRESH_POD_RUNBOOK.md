@@ -111,8 +111,10 @@ PY
 Use `tools/runpod.py deploy <pod_id>` only for repo sync. The command now skips
 `tools/pod_bootstrap.sh` by default and excludes local `.git`, `.claude`, and
 `.venv` state from rsync. Pass `--bootstrap` only when you intentionally want
-the broad bootstrap path, because it installs optional Mamba dependencies and
-can replace the working image torch if used carelessly.
+the legacy broad bootstrap path, because it installs optional Mamba dependencies
+and can replace the working image torch if used carelessly. Direct manual use of
+`tools/pod_bootstrap.sh` is also guarded and requires
+`CHAOSCONTROL_ALLOW_BROAD_BOOTSTRAP=1`.
 
 The exact failure signature from the bad bootstrap was a venv torch reporting
 CUDA unavailable on a CUDA-visible host. The system torch reported
