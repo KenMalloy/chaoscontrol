@@ -25,11 +25,16 @@ import pytest
 import torch
 import torch.nn as nn
 
+from chaoscontrol.optim import SemanticOptimizer as PackageSemanticOptimizer
 from chaoscontrol.optim.muon import Muon
 from chaoscontrol.optim.semantic import (
     SemanticOptimizer,
     default_beta_from_log_a,
 )
+
+
+def test_package_exports_semantic_optimizer() -> None:
+    assert PackageSemanticOptimizer is SemanticOptimizer
 
 
 class TestDefaultBetaFromLogA:
