@@ -50,6 +50,7 @@ from chaoscontrol.train_ssm import (  # noqa: E402
     _compiled_step_fn,
     _reject_unsupported,
     chunked_lm_head_backward,
+    fused_lm_head_backend_for_mode,
     fused_lm_head_backward,
     full_lm_head_backward,
 )
@@ -158,25 +159,14 @@ def _run_train_step(
             "fused_streaming_v2",
             "fused_norm_streaming_v2",
         }:
+            backend_name = fused_lm_head_backend_for_mode(lm_head_backward_mode)
             loss = fused_lm_head_backward(
                 hidden=hidden,
                 final_norm=model.final_norm,
                 lm_head=model.lm_head,
                 targets=targets,
                 tile_size=int(lm_head_tile_size),
-                backend=(
-                    "norm_streaming_v2"
-                    if lm_head_backward_mode == "fused_norm_streaming_v2"
-                    else (
-                        "streaming_v2"
-                        if lm_head_backward_mode == "fused_streaming_v2"
-                        else (
-                            "streaming"
-                            if lm_head_backward_mode == "fused_streaming"
-                            else "auto"
-                        )
-                    )
-                ),
+                backend=backend_name,
             )
         elif lm_head_backward_mode == "chunked":
             hidden_for_ce = hidden.detach().requires_grad_(True)

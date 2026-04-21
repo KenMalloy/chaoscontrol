@@ -210,8 +210,9 @@ batch 2048, chunk 256, ckpt: OOM, 32GB CE allocation
 
 After adding native fused linear+CE, the same 1xH100 `batch=1024, seq=512`
 smoke improved from 2.13M tok/s / 42.8GB peak VRAM to 2.56M tok/s / 30.9GB
-peak VRAM. Stage A now defaults `lm_head_backward_mode: fused`; keep the
-chunked rows above as the historical pre-fused baseline.
+peak VRAM. Stage A now defaults `lm_head_backward_mode: fused_streaming_v2`
+with `lm_head_tile_size: 8192`; keep the chunked rows above as the historical
+pre-fused baseline.
 
 Current local H100 probe artifacts:
 

@@ -195,6 +195,26 @@ def fused_lm_head_backward(
     return loss.detach()
 
 
+_FUSED_LM_HEAD_BACKENDS: dict[str, str] = {
+    "fused": "auto",
+    "fused_streaming": "streaming",
+    "fused_streaming_v2": "streaming_v2",
+    "fused_norm_streaming_v2": "norm_streaming_v2",
+}
+
+
+def fused_lm_head_backend_for_mode(lm_head_backward_mode: str) -> str:
+    """Map a fused LM-head mode to the backend name used by the head hook."""
+    try:
+        return _FUSED_LM_HEAD_BACKENDS[str(lm_head_backward_mode).strip().lower()]
+    except KeyError as exc:
+        raise ValueError(
+            "lm_head_backward_mode must be 'fused', 'fused_streaming', "
+            "'fused_streaming_v2', or 'fused_norm_streaming_v2', got "
+            f"{lm_head_backward_mode!r}"
+        ) from exc
+
+
 _UNSUPPORTED_ATTRS: tuple[tuple[str, str], ...] = (
     ("wernicke", "wernicke layer"),
     ("outer_model", "outer_model / typed buffer"),
@@ -307,6 +327,7 @@ def train_ssm_step(
     precision: str = "bf16",
     compile_full_path: bool = False,
     lm_head_backward_mode: str = "chunked",
+    lm_head_tile_size: int = 1024,
 ) -> torch.Tensor:
     """One forward + chunked-backward cycle for a bare-SSM model.
 
@@ -316,9 +337,11 @@ def train_ssm_step(
     gradients into a detached hidden tensor before one encoder backward.
     In ``"single"`` mode it materializes full logits and calls
     ``loss.backward()`` once, which removes the detached-hidden bridge at
-    the cost of higher peak memory. ``"fused"`` is the Exp23 native path:
-    currently fused RMSNorm + PyTorch/cuBLAS LM head + CE. When DDP is
-    active, per-parameter gradients are all-reduced (AVG) before return.
+    the cost of higher peak memory. ``"fused"`` and the
+    ``"fused_streaming*"`` modes are Exp23 native LM-head paths: fused
+    RMSNorm plus tiled linear+CE backends. ``lm_head_tile_size`` controls
+    the vocab tile width for those fused backends. When DDP is active,
+    per-parameter gradients are all-reduced (AVG) before return.
 
     The caller owns ``optimizer.step()`` and ``optimizer.zero_grad()``
     — this function only computes gradients and leaves them on the
@@ -369,12 +392,14 @@ def train_ssm_step(
                 lm_head=model.lm_head,
                 targets=targets,
             )
-        elif lm_head_backward_mode == "fused":
+        elif str(lm_head_backward_mode).strip().lower() in _FUSED_LM_HEAD_BACKENDS:
             loss = fused_lm_head_backward(
                 hidden=hidden,
                 final_norm=model.final_norm,
                 lm_head=model.lm_head,
                 targets=targets,
+                backend=fused_lm_head_backend_for_mode(lm_head_backward_mode),
+                tile_size=int(lm_head_tile_size),
             )
         elif lm_head_backward_mode == "chunked":
             # Detach to form a boundary between the chunked LM-head graph and
@@ -398,8 +423,10 @@ def train_ssm_step(
             hidden.backward(gradient=hidden_for_ce.grad)
         else:
             raise ValueError(
-                "lm_head_backward_mode must be 'chunked', 'single', or "
-                f"'fused', got {lm_head_backward_mode!r}"
+                "lm_head_backward_mode must be 'chunked', 'single', "
+                "'fused', 'fused_streaming', 'fused_streaming_v2', or "
+                "'fused_norm_streaming_v2', got "
+                f"{lm_head_backward_mode!r}"
             )
 
     if ddp_active and world_size > 1:
@@ -429,6 +456,7 @@ def train_ssm_for_budget(
     compile_full_path: bool = False,
     max_steps: int | None = None,
     lm_head_backward_mode: str = "chunked",
+    lm_head_tile_size: int = 1024,
 ) -> dict[str, Any]:
     """Bare-SSM wall-clock training loop.
 
@@ -444,8 +472,9 @@ def train_ssm_for_budget(
     can drive the budget loop deterministically without depending on
     machine speed.
 
-    ``precision`` is threaded through to every ``train_ssm_step`` call;
-    see the step docstring for the autocast policy it selects.
+    ``precision``, ``lm_head_backward_mode``, and ``lm_head_tile_size`` are
+    threaded through to every ``train_ssm_step`` call; see the step docstring
+    for the autocast and LM-head policies they select.
     """
     _reject_unsupported(model)
 
@@ -501,6 +530,7 @@ def train_ssm_for_budget(
             precision=precision,
             compile_full_path=compile_full_path,
             lm_head_backward_mode=lm_head_backward_mode,
+            lm_head_tile_size=int(lm_head_tile_size),
         )
         if grad_clip_norm > 0.0:
             if fused_grad_clip:

@@ -192,6 +192,12 @@ def test_fused_linear_cross_entropy_rejects_bad_reduction():
         fused_linear_cross_entropy(x, w, targets, reduction="none")
 
 
+def test_public_exports_include_norm_linear_ce_entry_point():
+    assert "fused_linear_cross_entropy" in lm_head_loss.__all__
+    assert "fused_rms_linear_cross_entropy" in lm_head_loss.__all__
+    assert "fused_rms_norm" in lm_head_loss.__all__
+
+
 def test_fused_linear_cross_entropy_cuda_kernel_matches_reference_if_available():
     if (
         not torch.cuda.is_available()

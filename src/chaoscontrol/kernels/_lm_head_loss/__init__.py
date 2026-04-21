@@ -640,5 +640,6 @@ def fused_rms_linear_cross_entropy(
 
 __all__ = [
     "fused_linear_cross_entropy",
+    "fused_rms_linear_cross_entropy",
     "fused_rms_norm",
 ]

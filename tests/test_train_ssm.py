@@ -24,6 +24,7 @@ import torch.nn.functional as F
 from chaoscontrol.model import ChaosStudentLM
 from chaoscontrol.training import chunked_cross_entropy
 from chaoscontrol.train_ssm import (
+    fused_lm_head_backend_for_mode,
     fused_lm_head_backward,
     train_ssm_for_budget,
     train_ssm_step,
@@ -61,6 +62,21 @@ def _compile_works() -> bool:
 
 
 _COMPILE_WORKS = _compile_works()
+
+
+def test_fused_lm_head_backend_for_mode_maps_all_exp23_modes() -> None:
+    assert fused_lm_head_backend_for_mode("fused") == "auto"
+    assert fused_lm_head_backend_for_mode("fused_streaming") == "streaming"
+    assert fused_lm_head_backend_for_mode("fused_streaming_v2") == "streaming_v2"
+    assert (
+        fused_lm_head_backend_for_mode("fused_norm_streaming_v2")
+        == "norm_streaming_v2"
+    )
+
+
+def test_fused_lm_head_backend_for_mode_rejects_unknown_mode() -> None:
+    with pytest.raises(ValueError, match="lm_head_backward_mode"):
+        fused_lm_head_backend_for_mode("fused_typo")
 
 
 @pytest.fixture(autouse=True)
@@ -476,6 +492,58 @@ class TestTrainSSMStepEquivalence:
             )
         ]
 
+    @pytest.mark.parametrize(
+        ("mode", "backend"),
+        [
+            ("fused", "auto"),
+            ("fused_streaming", "streaming"),
+            ("fused_streaming_v2", "streaming_v2"),
+            ("fused_norm_streaming_v2", "norm_streaming_v2"),
+        ],
+    )
+    def test_fused_step_modes_thread_backend_and_tile_size(
+        self,
+        bare_ssm_model: ChaosStudentLM,
+        monkeypatch,
+        mode: str,
+        backend: str,
+    ) -> None:
+        calls: list[tuple[str, int]] = []
+
+        def fake_fused_lm_head_backward(
+            hidden,
+            final_norm,
+            lm_head,
+            targets,
+            *,
+            backend,
+            tile_size,
+        ):
+            calls.append((backend, tile_size))
+            loss = hidden.float().sum() * 0.0
+            loss.backward()
+            return loss.detach()
+
+        import chaoscontrol.train_ssm as train_ssm_mod
+
+        monkeypatch.setattr(
+            train_ssm_mod,
+            "fused_lm_head_backward",
+            fake_fused_lm_head_backward,
+        )
+        inputs, targets = _make_batch(batch=2, seq=8, vocab=64, seed=24)
+
+        train_ssm_step(
+            model=bare_ssm_model,
+            inputs=inputs,
+            targets=targets,
+            chunk_size=4,
+            lm_head_backward_mode=mode,
+            lm_head_tile_size=8192,
+        )
+
+        assert calls == [(backend, 8192)]
+
 
 class TestTrainSSMStepRejectsUnsupportedConfigs:
     """Configs that ``training.py`` supports but ``train_ssm`` does not
@@ -578,6 +646,47 @@ class TestTrainSSMForBudget:
             max_steps=3,
         )
         assert result["steps"] == 3
+
+    def test_loop_threads_lm_head_tile_size_to_step(
+        self,
+        bare_ssm_model: ChaosStudentLM,
+        monkeypatch,
+    ) -> None:
+        calls: list[tuple[str, int]] = []
+
+        def fake_train_ssm_step(*, lm_head_backward_mode, lm_head_tile_size, **kwargs):
+            calls.append((lm_head_backward_mode, lm_head_tile_size))
+            return torch.tensor(1.0)
+
+        import chaoscontrol.train_ssm as train_ssm_mod
+
+        monkeypatch.setattr(
+            train_ssm_mod,
+            "train_ssm_step",
+            fake_train_ssm_step,
+        )
+        g = torch.Generator().manual_seed(25)
+        vocab = bare_ssm_model.vocab_size
+        train_tokens = torch.randint(0, vocab, (128,), generator=g)
+        train_starts = list(range(0, 128 - 8, 4))
+        optimizer = torch.optim.AdamW(bare_ssm_model.parameters(), lr=1e-3)
+
+        train_ssm_for_budget(
+            model=bare_ssm_model,
+            train_tokens=train_tokens,
+            train_starts=train_starts,
+            seq_len=8,
+            batch_size=2,
+            device=torch.device("cpu"),
+            optimizer=optimizer,
+            budget_seconds=10.0,
+            chunk_size=4,
+            max_steps=1,
+            lm_head_backward_mode="fused_streaming_v2",
+            lm_head_tile_size=8192,
+        )
+
+        assert calls == [("fused_streaming_v2", 8192)]
 
 
 class TestLossAccumulatorParity:
