@@ -79,6 +79,7 @@ from fast_path import (  # noqa: E402
     choose_lm_starts_lazy,
     should_stop_training_loop,
     sample_sharded_lm_starts,
+    steady_state_step_seconds,
     summarize_cuda_graph_gate,
     summarize_train_timing,
 )
@@ -425,11 +426,17 @@ def _train_fast_for_budget_cuda_graph(
         warmup_steps = max(1, int(cuda_graph_warmup_steps))
         warmup_stream = torch.cuda.Stream(device=device)
         warmup_stream.wait_stream(torch.cuda.current_stream(device))
+        # Per-step wall times, used to estimate steady-state eager cost
+        # for the gate. Drops the first-step spike (JIT / algo select /
+        # allocator warmup) rather than feeding it into the projection.
+        eager_step_times: list[float] = []
         with torch.cuda.stream(warmup_stream):
             for _ in range(warmup_steps):
                 inputs, targets = next_batch()
                 static_inputs.copy_(inputs, non_blocking=True)
                 static_targets.copy_(targets, non_blocking=True)
+                torch.cuda.synchronize(device)
+                step_start = time.perf_counter()
                 optimizer.zero_grad(set_to_none=False)
                 loss = _run_train_step(
                     model=model,
@@ -450,6 +457,8 @@ def _train_fast_for_budget_cuda_graph(
                     fused_grad_clip=fused_grad_clip,
                 )
                 optimizer.step()
+                torch.cuda.synchronize(device)
+                eager_step_times.append(time.perf_counter() - step_start)
                 losses.append(loss.detach())
         torch.cuda.current_stream(device).wait_stream(warmup_stream)
         torch.cuda.synchronize(device)
@@ -534,7 +543,19 @@ def _train_fast_for_budget_cuda_graph(
         world_size=world_size_,
     )
     graph_step_seconds = replay_seconds / max(steps, 1)
-    eager_step_seconds = warmup_seconds / max(warmup_steps, 1)
+    # Steady-state eager baseline: median of warmup step times with the
+    # first sample dropped. The older ``warmup_seconds / warmup_steps``
+    # mean folded first-step overhead (cuBLAS algo selection, JIT,
+    # allocator growth) into the projection and caused the gate to
+    # accept graphs whose replay was actually slower than a warm eager
+    # step at submission scale. See ``steady_state_step_seconds`` in
+    # ``fast_path.py`` for the rationale.
+    eager_warmup_mean = warmup_seconds / max(warmup_steps, 1)
+    eager_step_seconds = (
+        steady_state_step_seconds(eager_step_times)
+        if eager_step_times
+        else eager_warmup_mean
+    )
     graph_summary = summarize_cuda_graph_gate(
         budget_seconds=budget_seconds,
         capture_seconds=capture_seconds,
@@ -551,6 +572,8 @@ def _train_fast_for_budget_cuda_graph(
         "replay_seconds": replay_seconds,
         "capture_counted_as_training_step": True,
         "optimizer_step_captured": False,
+        "eager_step_times": [float(t) for t in eager_step_times],
+        "eager_warmup_mean_seconds": float(eager_warmup_mean),
     })
     return {
         "steps": steps,

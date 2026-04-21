@@ -11,6 +11,7 @@ from __future__ import annotations
 import copy
 import json
 import random
+import statistics
 import threading
 from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
@@ -181,6 +182,38 @@ def batch_from_start_tensor(
     inputs = batch[:, :-1].to(device=device, dtype=torch.int32, non_blocking=True)
     targets = batch[:, 1:].to(device=device, dtype=torch.long, non_blocking=True)
     return inputs, targets
+
+
+def steady_state_step_seconds(step_times: list[float] | tuple[float, ...]) -> float:
+    """Estimate steady-state per-step wall time from a sequence of measurements.
+
+    The first step of any warmup loop is dominated by one-time overhead
+    (cuBLAS algo selection, CUDA module JIT, allocator growth, Inductor
+    compile) that the 600 s timed budget pays once, not once per step.
+    Averaging the full warmup window and projecting that to 600 s
+    double-counts the first-step overhead and makes downstream decisions
+    (for example the CUDA graph gate) over-optimistic on per-step
+    savings. Dropping the first sample and taking the median of the rest
+    is robust to both the first-call spike and a single late allocator
+    blip, while preserving every sample that represents honest
+    steady-state work.
+
+    Args:
+        step_times: per-step elapsed wall times, in seconds, in the order
+            they were measured. Must contain at least one sample.
+
+    Returns:
+        Float seconds-per-step suitable for projecting to a larger budget.
+        With a single sample that sample is returned as-is (no trimming
+        possible); with multiple samples the first is dropped and the
+        median of the trailing samples is returned.
+    """
+    if not step_times:
+        raise ValueError("step_times must be non-empty")
+    if len(step_times) == 1:
+        return float(step_times[0])
+    trailing = [float(t) for t in step_times[1:]]
+    return float(statistics.median(trailing))
 
 
 def summarize_cuda_graph_gate(

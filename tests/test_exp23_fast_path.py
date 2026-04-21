@@ -1,15 +1,50 @@
 """Tests for Exp 23 fastest-path training helpers."""
 from __future__ import annotations
 
+import importlib
 import importlib.util
 import os
+import sys
+import warnings
 from pathlib import Path
 
+import pytest
 import torch
 import torch.nn as nn
 
 from chaoscontrol.data import batch_from_starts
 from chaoscontrol import train_ssm
+
+
+_BACKEND_ENV_KEYS = (
+    "CHAOSCONTROL_DIAG_SCAN_BACKEND",
+    "CHAOSCONTROL_POST_SCAN_BACKEND",
+)
+
+
+@pytest.fixture(autouse=True)
+def _restore_backend_env_after_test():
+    """Restore Exp23 backend env vars after every test in this module.
+
+    ``_load_runner_module`` invokes ``configure_exp23_fast_backend_defaults``
+    at module import time, which mutates ``os.environ`` via ``setdefault``.
+    That is invisible to pytest's ``monkeypatch`` fixture and leaks the
+    runner's default backend selection into later tests — specifically
+    ``tests/test_core.py`` resolvers would pick up
+    ``CHAOSCONTROL_DIAG_SCAN_BACKEND=ssm_scan`` and emit a harmless-but-noisy
+    RuntimeWarning on dev machines without the extension built. This fixture
+    snapshots the relevant keys before each test and restores them after,
+    so the leak does not cross test boundaries.
+    """
+    snapshot = {key: os.environ.get(key) for key in _BACKEND_ENV_KEYS}
+    try:
+        yield
+    finally:
+        for key, value in snapshot.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
 
 
 REPO = Path(__file__).resolve().parents[1]
@@ -64,9 +99,19 @@ def _load_launch_module():
     return mod
 
 
-def test_runner_defaults_to_native_scan_without_inductor(monkeypatch):
-    monkeypatch.delenv("CHAOSCONTROL_DIAG_SCAN_BACKEND", raising=False)
-    monkeypatch.delenv("CHAOSCONTROL_POST_SCAN_BACKEND", raising=False)
+def _clear_backend_env() -> None:
+    """Clear backend env vars so ``setdefault`` in the runner actually fires.
+
+    Pair this with the autouse ``_restore_backend_env_after_test`` fixture —
+    the fixture handles post-test restoration, so we only need to clear at
+    the start of tests that depend on a clean slate.
+    """
+    for key in _BACKEND_ENV_KEYS:
+        os.environ.pop(key, None)
+
+
+def test_runner_defaults_to_native_scan_without_inductor():
+    _clear_backend_env()
 
     _load_runner_module()
 
@@ -82,6 +127,85 @@ def test_runner_preserves_explicit_backend_overrides(monkeypatch):
 
     assert os.environ["CHAOSCONTROL_DIAG_SCAN_BACKEND"] == "chunked"
     assert os.environ["CHAOSCONTROL_POST_SCAN_BACKEND"] == "compile"
+
+
+def _reload_backend_modules() -> None:
+    """Reload the lazy backend modules so their resolver caches start clean.
+
+    Without this, a prior test that triggered resolution leaves a cached
+    backend in place and subsequent tests would not actually exercise the
+    env-var path.
+    """
+    for mod_name in ("chaoscontrol.core_fused", "chaoscontrol.core"):
+        if mod_name in sys.modules:
+            importlib.reload(sys.modules[mod_name])
+
+
+def test_runner_configure_steers_resolvers_even_when_core_imported_first():
+    """Runner's backend defaults must take effect even when
+    ``chaoscontrol.core`` is imported *before* the runner module.
+
+    The resolvers in ``chaoscontrol.core`` / ``chaoscontrol.core_fused`` are
+    lazy — env vars are read on the first resolver call, not at import
+    time. Exp23's ``configure_exp23_fast_backend_defaults`` sets
+    ``CHAOSCONTROL_DIAG_SCAN_BACKEND`` and
+    ``CHAOSCONTROL_POST_SCAN_BACKEND`` at runner module load, BEFORE
+    its own chaoscontrol imports. This test pins the ordering contract:
+    even when core is already imported into the process, the runner's
+    configure still steers the eventual resolver call away from Inductor.
+
+    Without this, the earlier ``test_runner_defaults_to_native_scan_without_inductor``
+    check would pass even if the env-var set were moved after the
+    chaoscontrol imports, because it only asserts the final env state,
+    not the resolver-vs-configure ordering the fix actually depends on.
+    """
+    _clear_backend_env()
+
+    _reload_backend_modules()
+
+    # Import core and core_fused BEFORE the runner. This is the ordering
+    # under test: a consumer of chaoscontrol that touches the SSM core
+    # before loading the Exp23 runner must still end up on the
+    # no-Inductor path once the runner's configure runs.
+    import chaoscontrol.core as cc_core
+    import chaoscontrol.core_fused as cc_fused
+
+    # Importing the modules does NOT resolve the backend; resolution is
+    # deferred to the first resolver call. This is the invariant that
+    # lets the lazy-env-var fix work.
+    assert cc_core._diag_recurrence_impl is None
+    assert cc_fused._post_scan_impl is None
+
+    # Load the runner. configure_exp23_fast_backend_defaults runs at
+    # module top and sets the env vars before any chaoscontrol import
+    # in the runner's own body.
+    _load_runner_module()
+
+    assert os.environ["CHAOSCONTROL_DIAG_SCAN_BACKEND"] == "ssm_scan"
+    assert os.environ["CHAOSCONTROL_POST_SCAN_BACKEND"] == "eager"
+
+    # The key assertion: resolving the backend NOW, on the already-imported
+    # core module, honours the env var the runner set after import. If
+    # configure ran too late, or if the resolver cached a pre-configure
+    # decision, this would land on ``compile`` and Inductor would fire at
+    # the next training step. On H100 pods the native extension is
+    # available and backend == "ssm_scan"; on dev machines without the
+    # built wheel the resolver warns and falls back to "chunked". Both
+    # are acceptable — the invariant is that neither is "compile".
+    with warnings.catch_warnings():
+        # The ssm_scan fallback on dev machines emits a legitimate
+        # RuntimeWarning; it is informational, not a failure. Silence it
+        # here so the test stays green on both pod and dev.
+        warnings.simplefilter("ignore", RuntimeWarning)
+        diag_info = cc_core.get_diag_recurrence_backend()
+        post_info = cc_fused.get_post_scan_backend()
+
+    assert diag_info["backend"] in {"ssm_scan", "chunked"}, diag_info
+    assert diag_info["backend"] != "compile", diag_info
+    assert post_info["backend"] == "eager", post_info
+
+    # Reset so later tests start from a clean resolver cache.
+    _reload_backend_modules()
 
 
 def test_vectorized_batch_matches_reference_batcher():
@@ -323,6 +447,89 @@ def test_cuda_graph_gate_counts_capture_against_budget():
     assert "capture_seconds_exceeds_limit" in rejected_slow_capture["reasons"]
     assert rejected_small_win["accepted"] is False
     assert "projected_speedup_below_minimum" in rejected_small_win["reasons"]
+
+
+def test_steady_state_step_seconds_drops_first_step_spike():
+    mod = _load_module()
+
+    # Typical H100 warmup shape: first step is ~3× slower than steady
+    # state due to cuBLAS algo selection and allocator growth. The
+    # steady-state estimator must not let that first sample drag the
+    # projection upward.
+    samples = [0.62, 0.21, 0.20, 0.21]
+    assert mod.steady_state_step_seconds(samples) == 0.21
+
+    # With exactly two samples the drop-first-then-median reduces to
+    # the single trailing sample — that is the right call because a
+    # single warm sample is still more honest than the first-call spike.
+    assert mod.steady_state_step_seconds([0.50, 0.18]) == 0.18
+
+
+def test_steady_state_step_seconds_handles_single_sample():
+    mod = _load_module()
+
+    # Only one warmup step gives the caller nothing to discard. Return
+    # the sample as-is rather than raising; the call site (CUDA graph
+    # gate) still applies its own conservative checks downstream.
+    assert mod.steady_state_step_seconds([0.25]) == 0.25
+
+
+def test_steady_state_step_seconds_rejects_empty():
+    mod = _load_module()
+
+    with pytest.raises(ValueError):
+        mod.steady_state_step_seconds([])
+
+
+def test_cuda_graph_gate_rejects_when_steady_state_baseline_is_honest():
+    """Regression for the 2026-04-21 native-scan probe.
+
+    With the legacy ``warmup_seconds / warmup_steps`` baseline, the gate
+    saw the probe's ``eager_step_seconds = 0.212`` (inflated by a single
+    first-call spike in a 3-step warmup) vs ``graph_step_seconds = 0.174``
+    and accepted the graph. The true steady-state eager step on the same
+    pod was ``~0.170`` — graphs were actually slower than a warm eager
+    step. Feeding the median-based baseline into the gate flips the
+    decision to the right one.
+    """
+    mod = _load_module()
+
+    # Four samples: one first-call spike plus three steady-state.
+    # Dropping the first leaves [0.170, 0.171, 0.172]; median is 0.171.
+    per_step_warmup = [0.636, 0.170, 0.171, 0.172]
+    steady_state_eager = mod.steady_state_step_seconds(per_step_warmup)
+
+    assert steady_state_eager == 0.171
+
+    legacy_mean = sum(per_step_warmup) / len(per_step_warmup)
+    legacy_accepted = mod.summarize_cuda_graph_gate(
+        budget_seconds=20.0,
+        capture_seconds=0.15,
+        warmup_seconds=sum(per_step_warmup),
+        warmup_steps=len(per_step_warmup),
+        eager_step_seconds=legacy_mean,
+        graph_step_seconds=0.1739,
+        min_total_speedup=0.05,
+        max_capture_seconds=30.0,
+    )
+    honest_rejected = mod.summarize_cuda_graph_gate(
+        budget_seconds=20.0,
+        capture_seconds=0.15,
+        warmup_seconds=sum(per_step_warmup),
+        warmup_steps=len(per_step_warmup),
+        eager_step_seconds=steady_state_eager,
+        graph_step_seconds=0.1739,
+        min_total_speedup=0.05,
+        max_capture_seconds=30.0,
+    )
+
+    assert legacy_accepted["accepted"] is True, (
+        "legacy baseline is the bug under test; if this starts rejecting, "
+        "the probe conditions or the gate math changed and the regression "
+        "scenario needs rebuilding"
+    )
+    assert honest_rejected["accepted"] is False
+    assert "graph_step_not_faster" in honest_rejected["reasons"]
 
 
 def test_cuda_graph_probe_rejects_cpu_and_runs_eager() -> None:
