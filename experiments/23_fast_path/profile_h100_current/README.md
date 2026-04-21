@@ -57,6 +57,22 @@ The largest visible CUDA buckets are:
 - Batch assembly: `aten::index` is about 216-244 ms CPU total over 10 active
   steps and appears outside the main GPU compute section.
 
+The biggest static-code suspect for that cast/copy bucket is the head loss:
+
+```python
+chunk_loss = F.cross_entropy(
+    logits_chunk.reshape(-1, vocab).float(),
+    tgt_chunk.reshape(-1),
+    reduction="sum",
+) / total_tokens
+```
+
+At `B=1024,T=512,V=16384`, each fp32 full-logits equivalent is about 34 GB.
+Chunking keeps peak memory legal, but it still streams enormous fp32 logits
+through log-softmax across the step. This is why "just unchunk it" is unlikely
+to fit cleanly on 80 GB, and why a fused linear-cross-entropy path is a real
+optimization candidate rather than polish.
+
 `chunk_size=128` reduces launch count versus 64, but does not improve the
 instrumented step time and costs much more VRAM. At this batch/model shape,
 `chunk_size=64` remains the more attractive default until the head path is
@@ -96,4 +112,3 @@ Stage A sweep.
    path. Full unchunked logits are likely not viable at the current
    `B=1024,T=512,V=16384` shape without a fused CE implementation.
 5. Revisit DDP gradient overlap after the single-GPU hot loop is denser.
-
