@@ -69,6 +69,10 @@ def test_fused_lm_head_backend_for_mode_maps_all_exp23_modes() -> None:
     assert fused_lm_head_backend_for_mode("fused_streaming") == "streaming"
     assert fused_lm_head_backend_for_mode("fused_streaming_v2") == "streaming_v2"
     assert (
+        fused_lm_head_backend_for_mode("fused_streaming_cached")
+        == "streaming_cached"
+    )
+    assert (
         fused_lm_head_backend_for_mode("fused_norm_streaming_v2")
         == "norm_streaming_v2"
     )
@@ -498,6 +502,7 @@ class TestTrainSSMStepEquivalence:
             ("fused", "auto"),
             ("fused_streaming", "streaming"),
             ("fused_streaming_v2", "streaming_v2"),
+            ("fused_streaming_cached", "streaming_cached"),
             ("fused_norm_streaming_v2", "norm_streaming_v2"),
         ],
     )

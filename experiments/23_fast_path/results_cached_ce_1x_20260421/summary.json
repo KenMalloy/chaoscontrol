@@ -1,0 +1,32 @@
+[
+  {
+    "name": "streaming_v2_a",
+    "mode": "fused_streaming_v2",
+    "steps": 104,
+    "elapsed_s": 17.865931465057656,
+    "tokens_per_sec": 3051951.257433307,
+    "step_s": 0.1717878025486313,
+    "peak_vram_mb": 44946.0849609375,
+    "final_loss": 9.704030990600586
+  },
+  {
+    "name": "streaming_cached",
+    "mode": "fused_streaming_cached",
+    "steps": 108,
+    "elapsed_s": 17.61336319206748,
+    "tokens_per_sec": 3214780.9241508916,
+    "step_s": 0.16308669622284705,
+    "peak_vram_mb": 53138.13427734375,
+    "final_loss": 9.704158782958984
+  },
+  {
+    "name": "streaming_v2_b",
+    "mode": "fused_streaming_v2",
+    "steps": 104,
+    "elapsed_s": 17.8090851099696,
+    "tokens_per_sec": 3061693.0439327364,
+    "step_s": 0.17124120298047693,
+    "peak_vram_mb": 44946.13427734375,
+    "final_loss": 9.704458236694336
+  }
+]

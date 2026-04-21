@@ -199,6 +199,7 @@ _FUSED_LM_HEAD_BACKENDS: dict[str, str] = {
     "fused": "auto",
     "fused_streaming": "streaming",
     "fused_streaming_v2": "streaming_v2",
+    "fused_streaming_cached": "streaming_cached",
     "fused_norm_streaming_v2": "norm_streaming_v2",
 }
 
@@ -210,8 +211,8 @@ def fused_lm_head_backend_for_mode(lm_head_backward_mode: str) -> str:
     except KeyError as exc:
         raise ValueError(
             "lm_head_backward_mode must be 'fused', 'fused_streaming', "
-            "'fused_streaming_v2', or 'fused_norm_streaming_v2', got "
-            f"{lm_head_backward_mode!r}"
+            "'fused_streaming_v2', 'fused_streaming_cached', or "
+            f"'fused_norm_streaming_v2', got {lm_head_backward_mode!r}"
         ) from exc
 
 
@@ -338,9 +339,9 @@ def train_ssm_step(
     In ``"single"`` mode it materializes full logits and calls
     ``loss.backward()`` once, which removes the detached-hidden bridge at
     the cost of higher peak memory. ``"fused"`` and the
-    ``"fused_streaming*"`` modes are Exp23 native LM-head paths: fused
-    RMSNorm plus tiled linear+CE backends. ``lm_head_tile_size`` controls
-    the vocab tile width for those fused backends. When DDP is active,
+        ``"fused_streaming*"`` modes are Exp23 native LM-head paths: fused
+        RMSNorm plus tiled linear+CE backends. ``lm_head_tile_size`` controls
+        the vocab tile width for those fused backends. When DDP is active,
     per-parameter gradients are all-reduced (AVG) before return.
 
     The caller owns ``optimizer.step()`` and ``optimizer.zero_grad()``
@@ -425,8 +426,8 @@ def train_ssm_step(
             raise ValueError(
                 "lm_head_backward_mode must be 'chunked', 'single', "
                 "'fused', 'fused_streaming', 'fused_streaming_v2', or "
-                "'fused_norm_streaming_v2', got "
-                f"{lm_head_backward_mode!r}"
+                "'fused_streaming_cached', or 'fused_norm_streaming_v2', "
+                f"got {lm_head_backward_mode!r}"
             )
 
     if ddp_active and world_size > 1:

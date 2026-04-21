@@ -126,6 +126,9 @@ def _is_linear_ce_kernel_eligible(
     elif backend == "streaming_v2":
         forward_name = "linear_ce_streaming_v2_forward"
         backward_name = "linear_ce_streaming_v2_backward"
+    elif backend == "streaming_cached":
+        forward_name = "linear_ce_streaming_cached_forward"
+        backward_name = "linear_ce_streaming_cached_backward"
     else:
         forward_name = "linear_ce_forward"
         backward_name = "linear_ce_backward"
@@ -321,6 +324,60 @@ class _StreamingV2LinearCrossEntropyFn(torch.autograd.Function):
         return grad_x.reshape(ctx.x_shape), grad_weight, None, None, None
 
 
+class _StreamingCachedLinearCrossEntropyFn(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        targets: torch.Tensor,
+        reduction: str,
+        tile_size: int,
+    ) -> torch.Tensor:
+        flat_x = x.reshape(-1, x.size(-1)).contiguous()
+        flat_targets = targets.reshape(-1).contiguous()
+        compute_weight = weight.contiguous()
+        if compute_weight.dtype != flat_x.dtype:
+            compute_weight = compute_weight.to(dtype=flat_x.dtype)
+        reduction_id = 0 if reduction == "mean" else 1
+        loss, lse, logits_cache = _C.linear_ce_streaming_cached_forward(
+            flat_x,
+            compute_weight,
+            flat_targets,
+            reduction_id,
+            int(tile_size),
+        )
+        ctx.save_for_backward(
+            flat_x,
+            compute_weight,
+            flat_targets,
+            lse,
+            logits_cache,
+        )
+        ctx.x_shape = tuple(x.shape)
+        ctx.weight_dtype = weight.dtype
+        ctx.reduction_id = reduction_id
+        ctx.tile_size = int(tile_size)
+        return loss
+
+    @staticmethod
+    def backward(ctx, grad_loss: torch.Tensor):  # type: ignore[override]
+        flat_x, weight, flat_targets, lse, logits_cache = ctx.saved_tensors
+        grad_x, grad_weight = _C.linear_ce_streaming_cached_backward(
+            grad_loss.contiguous(),
+            flat_x,
+            weight,
+            flat_targets,
+            lse.contiguous(),
+            logits_cache,
+            ctx.reduction_id,
+            ctx.tile_size,
+        )
+        if grad_weight.dtype != ctx.weight_dtype:
+            grad_weight = grad_weight.to(dtype=ctx.weight_dtype)
+        return grad_x.reshape(ctx.x_shape), grad_weight, None, None, None
+
+
 class _FusedRMSLinearCrossEntropyFn(torch.autograd.Function):
     @staticmethod
     def forward(
@@ -500,10 +557,10 @@ def fused_linear_cross_entropy(
     backend_name = str(backend).strip().lower()
     if backend_name == "auto":
         backend_name = "v1"
-    if backend_name not in {"v1", "streaming", "streaming_v2"}:
+    if backend_name not in {"v1", "streaming", "streaming_v2", "streaming_cached"}:
         raise ValueError(
             "fused_linear_cross_entropy: backend must be 'auto', 'v1', "
-            f"'streaming', or 'streaming_v2', got {backend!r}"
+            f"'streaming', 'streaming_v2', or 'streaming_cached', got {backend!r}"
         )
     if x.size(-1) != weight.size(-1):
         raise ValueError(
@@ -534,6 +591,20 @@ def fused_linear_cross_entropy(
         x, weight, targets, backend="streaming_v2"
     ):
         return _StreamingV2LinearCrossEntropyFn.apply(
+            x,
+            weight,
+            targets,
+            reduction,
+            int(tile_size),
+        )
+    if (
+        backend_name == "streaming_cached"
+        and weight.size(0) % int(tile_size) == 0
+        and _is_linear_ce_kernel_eligible(
+            x, weight, targets, backend="streaming_cached"
+        )
+    ):
+        return _StreamingCachedLinearCrossEntropyFn.apply(
             x,
             weight,
             targets,

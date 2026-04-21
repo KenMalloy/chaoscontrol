@@ -177,6 +177,7 @@ def _run_train_step(
             "fused",
             "fused_streaming",
             "fused_streaming_v2",
+            "fused_streaming_cached",
             "fused_norm_streaming_v2",
         }:
             backend_name = fused_lm_head_backend_for_mode(lm_head_backward_mode)
@@ -202,8 +203,8 @@ def _run_train_step(
             raise ValueError(
                 "lm_head_backward_mode must be 'chunked', 'single', "
                 "'fused', 'fused_streaming', 'fused_streaming_v2', or "
-                "'fused_norm_streaming_v2', got "
-                f"{lm_head_backward_mode!r}"
+                "'fused_streaming_cached', or 'fused_norm_streaming_v2', "
+                f"got {lm_head_backward_mode!r}"
             )
     if ddp_active and world_size > 1:
         mode = str(grad_allreduce_mode).strip().lower()
@@ -256,6 +257,7 @@ def _cuda_graph_rejection_reasons(
         "fused",
         "fused_streaming",
         "fused_streaming_v2",
+        "fused_streaming_cached",
         "fused_norm_streaming_v2",
     }:
         reasons.append("fused_lm_head_required")
