@@ -16,6 +16,14 @@ void launch_linear_ce_accum_sum(
     const at::Tensor& row_max,
     at::Tensor& row_sum);
 
+void launch_linear_ce_update_online(
+    const at::Tensor& logits,
+    const at::Tensor& targets,
+    at::Tensor& row_max,
+    at::Tensor& row_sum,
+    at::Tensor& target_logits,
+    int64_t tile_start);
+
 void launch_linear_ce_fill_grad_logits(
     const at::Tensor& logits,
     const at::Tensor& targets,

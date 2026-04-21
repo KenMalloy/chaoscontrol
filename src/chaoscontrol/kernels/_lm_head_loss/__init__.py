@@ -87,6 +87,8 @@ def _is_linear_ce_kernel_eligible(
     x: torch.Tensor,
     weight: torch.Tensor,
     targets: torch.Tensor,
+    *,
+    backend: str = "v1",
 ) -> bool:
     if _C is None:
         return False
@@ -100,7 +102,13 @@ def _is_linear_ce_kernel_eligible(
         weight.dtype == torch.float32 and x.dtype in {torch.bfloat16, torch.float16}
     ):
         return False
-    if not hasattr(_C, "linear_ce_forward") or not hasattr(_C, "linear_ce_backward"):
+    if backend == "streaming":
+        forward_name = "linear_ce_streaming_forward"
+        backward_name = "linear_ce_streaming_backward"
+    else:
+        forward_name = "linear_ce_forward"
+        backward_name = "linear_ce_backward"
+    if not hasattr(_C, forward_name) or not hasattr(_C, backward_name):
         return False
     if not targets.is_cuda:
         return False
@@ -178,6 +186,53 @@ class _FusedLinearCrossEntropyFn(torch.autograd.Function):
         return grad_x.reshape(ctx.x_shape), grad_weight, None, None, None
 
 
+class _StreamingLinearCrossEntropyFn(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        targets: torch.Tensor,
+        reduction: str,
+        tile_size: int,
+    ) -> torch.Tensor:
+        flat_x = x.reshape(-1, x.size(-1)).contiguous()
+        flat_targets = targets.reshape(-1).contiguous()
+        compute_weight = weight.contiguous()
+        if compute_weight.dtype != flat_x.dtype:
+            compute_weight = compute_weight.to(dtype=flat_x.dtype)
+        reduction_id = 0 if reduction == "mean" else 1
+        loss, lse = _C.linear_ce_streaming_forward(
+            flat_x,
+            compute_weight,
+            flat_targets,
+            reduction_id,
+            int(tile_size),
+        )
+        ctx.save_for_backward(flat_x, compute_weight, flat_targets, lse)
+        ctx.x_shape = tuple(x.shape)
+        ctx.weight_dtype = weight.dtype
+        ctx.reduction_id = reduction_id
+        ctx.tile_size = int(tile_size)
+        return loss
+
+    @staticmethod
+    def backward(ctx, grad_loss: torch.Tensor):  # type: ignore[override]
+        flat_x, weight, flat_targets, lse = ctx.saved_tensors
+        grad_x, grad_weight = _C.linear_ce_streaming_backward(
+            grad_loss.contiguous(),
+            flat_x,
+            weight,
+            flat_targets,
+            lse.contiguous(),
+            ctx.reduction_id,
+            ctx.tile_size,
+        )
+        if grad_weight.dtype != ctx.weight_dtype:
+            grad_weight = grad_weight.to(dtype=ctx.weight_dtype)
+        return grad_x.reshape(ctx.x_shape), grad_weight, None, None, None
+
+
 def fused_rms_norm(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -206,6 +261,7 @@ def fused_linear_cross_entropy(
     *,
     reduction: str = "mean",
     tile_size: int = 1024,
+    backend: str = "auto",
 ) -> torch.Tensor:
     """Linear projection plus cross entropy without changing math.
 
@@ -217,6 +273,14 @@ def fused_linear_cross_entropy(
         raise ValueError(
             "fused_linear_cross_entropy: reduction must be 'mean' or 'sum', "
             f"got {reduction!r}"
+        )
+    backend_name = str(backend).strip().lower()
+    if backend_name == "auto":
+        backend_name = "v1"
+    if backend_name not in {"v1", "streaming"}:
+        raise ValueError(
+            "fused_linear_cross_entropy: backend must be 'auto', 'v1', "
+            f"or 'streaming', got {backend!r}"
         )
     if x.size(-1) != weight.size(-1):
         raise ValueError(
@@ -233,7 +297,19 @@ def fused_linear_cross_entropy(
         raise ValueError(
             f"fused_linear_cross_entropy: tile_size must be positive, got {tile_size}"
         )
-    if _is_linear_ce_kernel_eligible(x, weight, targets):
+    if backend_name == "streaming" and _is_linear_ce_kernel_eligible(
+        x, weight, targets, backend="streaming"
+    ):
+        return _StreamingLinearCrossEntropyFn.apply(
+            x,
+            weight,
+            targets,
+            reduction,
+            int(tile_size),
+        )
+    if backend_name == "v1" and _is_linear_ce_kernel_eligible(
+        x, weight, targets, backend="v1"
+    ):
         return _FusedLinearCrossEntropyFn.apply(
             x,
             weight,

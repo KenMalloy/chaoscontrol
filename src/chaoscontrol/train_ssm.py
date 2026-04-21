@@ -149,6 +149,8 @@ def fused_lm_head_backward(
     final_norm: nn.Module,
     lm_head: nn.Linear,
     targets: torch.Tensor,
+    *,
+    backend: str = "auto",
 ) -> torch.Tensor:
     """LM-head backward using native fused pieces where available.
 
@@ -168,6 +170,7 @@ def fused_lm_head_backward(
         lm_head.weight,
         targets,
         reduction="mean",
+        backend=backend,
     )
     loss.backward()
     return loss.detach()

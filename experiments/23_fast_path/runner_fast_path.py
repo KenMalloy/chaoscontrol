@@ -148,12 +148,17 @@ def _run_train_step(
                 lm_head=model.lm_head,
                 targets=targets,
             )
-        elif lm_head_backward_mode == "fused":
+        elif lm_head_backward_mode in {"fused", "fused_streaming"}:
             loss = fused_lm_head_backward(
                 hidden=hidden,
                 final_norm=model.final_norm,
                 lm_head=model.lm_head,
                 targets=targets,
+                backend=(
+                    "streaming"
+                    if lm_head_backward_mode == "fused_streaming"
+                    else "auto"
+                ),
             )
         elif lm_head_backward_mode == "chunked":
             hidden_for_ce = hidden.detach().requires_grad_(True)
@@ -167,8 +172,9 @@ def _run_train_step(
             hidden.backward(gradient=hidden_for_ce.grad)
         else:
             raise ValueError(
-                "lm_head_backward_mode must be 'chunked', 'single', or "
-                f"'fused', got {lm_head_backward_mode!r}"
+                "lm_head_backward_mode must be 'chunked', 'single', "
+                "'fused', or 'fused_streaming', got "
+                f"{lm_head_backward_mode!r}"
             )
     if ddp_active and world_size > 1:
         allreduce_grads(model, world_size)
@@ -200,7 +206,7 @@ def _cuda_graph_rejection_reasons(
         reasons.append("ddp_not_supported")
     if compile_full_path:
         reasons.append("compile_full_path_not_supported")
-    if lm_head_backward_mode != "fused":
+    if lm_head_backward_mode not in {"fused", "fused_streaming"}:
         reasons.append("fused_lm_head_required")
     return reasons
 

@@ -559,10 +559,10 @@ def test_run_train_step_can_use_single_backward(monkeypatch):
 def test_run_train_step_can_use_fused_backward(monkeypatch):
     mod = _load_runner_module()
 
-    calls: list[str] = []
+    calls: list[str | None] = []
 
     def fake_fused(**kwargs):
-        calls.append("fused")
+        calls.append(kwargs.get("backend"))
         hidden = kwargs["hidden"]
         loss = hidden.float().pow(2).mean()
         loss.backward()
@@ -587,7 +587,42 @@ def test_run_train_step_can_use_fused_backward(monkeypatch):
     )
 
     assert loss.ndim == 0
-    assert calls == ["fused"]
+    assert calls == ["auto"]
+    assert model.encoder.weight.grad is not None
+
+
+def test_run_train_step_can_use_streaming_fused_backward(monkeypatch):
+    mod = _load_runner_module()
+
+    calls: list[str | None] = []
+
+    def fake_fused(**kwargs):
+        calls.append(kwargs.get("backend"))
+        hidden = kwargs["hidden"]
+        loss = hidden.float().pow(2).mean()
+        loss.backward()
+        return loss.detach()
+
+    monkeypatch.setattr(mod, "fused_lm_head_backward", fake_fused)
+
+    model = _TinyTrainStepModel()
+    inputs = torch.randn(2, 3, 4)
+    targets = torch.zeros(2, 3, dtype=torch.long)
+
+    loss = mod._run_train_step(
+        model=model,
+        inputs=inputs,
+        targets=targets,
+        chunk_size=2,
+        precision="bf16",
+        ddp_active=False,
+        world_size=1,
+        compile_full_path=False,
+        lm_head_backward_mode="fused_streaming",
+    )
+
+    assert loss.ndim == 0
+    assert calls == ["streaming"]
     assert model.encoder.weight.grad is not None
 
 

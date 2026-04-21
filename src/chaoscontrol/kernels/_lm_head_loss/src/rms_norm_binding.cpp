@@ -132,6 +132,45 @@ std::tuple<at::Tensor, at::Tensor> linear_ce_forward(
     return {loss, lse};
 }
 
+std::tuple<at::Tensor, at::Tensor> linear_ce_streaming_forward(
+    const at::Tensor& x,
+    const at::Tensor& weight,
+    const at::Tensor& targets,
+    int64_t reduction,
+    int64_t tile_size) {
+    check_linear_ce_inputs(
+        x, weight, targets, reduction, tile_size,
+        "lm_head_loss linear_ce_streaming_forward");
+
+    const auto rows = x.size(0);
+    const auto vocab = weight.size(0);
+    auto stats_options = x.options().dtype(at::kFloat);
+    auto row_max = at::full(
+        {rows},
+        -std::numeric_limits<float>::infinity(),
+        stats_options);
+    auto row_sum = at::zeros({rows}, stats_options);
+    auto target_logits = at::full(
+        {rows},
+        -std::numeric_limits<float>::infinity(),
+        stats_options);
+
+    for (int64_t start = 0; start < vocab; start += tile_size) {
+        const int64_t cols = std::min<int64_t>(tile_size, vocab - start);
+        auto weight_tile = weight.narrow(0, start, cols);
+        auto logits = at::matmul(x, weight_tile.transpose(0, 1)).contiguous();
+        launch_linear_ce_update_online(
+            logits, targets, row_max, row_sum, target_logits, start);
+    }
+
+    auto lse = row_max + row_sum.log();
+    auto loss_rows = lse - target_logits;
+    auto loss = reduction == static_cast<int64_t>(Reduction::Mean)
+        ? loss_rows.mean()
+        : loss_rows.sum();
+    return {loss, lse};
+}
+
 std::tuple<at::Tensor, at::Tensor> linear_ce_backward(
     const at::Tensor& grad_loss,
     const at::Tensor& x,
@@ -175,6 +214,18 @@ std::tuple<at::Tensor, at::Tensor> linear_ce_backward(
     return {grad_x, grad_weight};
 }
 
+std::tuple<at::Tensor, at::Tensor> linear_ce_streaming_backward(
+    const at::Tensor& grad_loss,
+    const at::Tensor& x,
+    const at::Tensor& weight,
+    const at::Tensor& targets,
+    const at::Tensor& lse,
+    int64_t reduction,
+    int64_t tile_size) {
+    return linear_ce_backward(
+        grad_loss, x, weight, targets, lse, reduction, tile_size);
+}
+
 }  // namespace cc_lm_head_loss
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -186,4 +237,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "Tiled linear+cross-entropy forward for Exp23 LM-head path");
     m.def("linear_ce_backward", &cc_lm_head_loss::linear_ce_backward,
           "Tiled linear+cross-entropy backward for Exp23 LM-head path");
+    m.def("linear_ce_streaming_forward", &cc_lm_head_loss::linear_ce_streaming_forward,
+          "One-pass tiled linear+cross-entropy forward for Exp23 LM-head path");
+    m.def("linear_ce_streaming_backward", &cc_lm_head_loss::linear_ce_streaming_backward,
+          "Tiled linear+cross-entropy backward for one-pass Exp23 LM-head path");
 }
