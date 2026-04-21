@@ -35,7 +35,7 @@ from chaoscontrol.distributed import (
     resolve_ddp_context,
     should_stop_now,
 )
-from chaoscontrol.kernels._lm_head_loss import fused_rms_norm
+from chaoscontrol.kernels._lm_head_loss import fused_linear_cross_entropy, fused_rms_norm
 from chaoscontrol.precision import autocast_context
 
 
@@ -152,23 +152,21 @@ def fused_lm_head_backward(
 ) -> torch.Tensor:
     """LM-head backward using native fused pieces where available.
 
-    Today the fused piece is RMSNorm immediately before the head. The
-    projection and CE still use PyTorch/cuBLAS, which is intentional:
-    the GEMM is not where we want a hand-written replacement. This mode
-    gives Exp23 a stable native hook that can absorb more of the head/loss
-    path once profiler evidence justifies it.
+    This path is the single-backward fast hook for the Exp23 head/loss
+    hot spot: native RMSNorm where eligible, then the fused linear+CE
+    API. On dev machines or unsupported tensor layouts the CE API falls
+    back to the exact PyTorch ``linear -> cross_entropy`` expression.
     """
     weight = getattr(final_norm, "weight", None)
     eps = float(getattr(final_norm, "eps", 1e-6))
     if weight is None:
         return full_lm_head_backward(hidden, final_norm, lm_head, targets)
 
-    vocab = lm_head.out_features
     normed = fused_rms_norm(hidden, weight, eps=eps)
-    logits = lm_head(normed)
-    loss = F.cross_entropy(
-        logits.reshape(-1, vocab).float(),
-        targets.reshape(-1),
+    loss = fused_linear_cross_entropy(
+        normed,
+        lm_head.weight,
+        targets,
         reduction="mean",
     )
     loss.backward()

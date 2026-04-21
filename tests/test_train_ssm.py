@@ -23,7 +23,11 @@ import torch.nn.functional as F
 
 from chaoscontrol.model import ChaosStudentLM
 from chaoscontrol.training import chunked_cross_entropy
-from chaoscontrol.train_ssm import train_ssm_for_budget, train_ssm_step
+from chaoscontrol.train_ssm import (
+    fused_lm_head_backward,
+    train_ssm_for_budget,
+    train_ssm_step,
+)
 
 
 def _compile_works() -> bool:
@@ -433,6 +437,31 @@ class TestTrainSSMStepEquivalence:
         for name in old_grads:
             d = (old_grads[name] - new_grads[name]).abs().max().item()
             assert d < 1e-5, f"fused-backward grad mismatch on {name!r}: {d}"
+
+    def test_fused_backward_uses_fused_linear_ce_hook(self, monkeypatch) -> None:
+        calls: list[tuple[torch.Size, torch.Size, torch.Size]] = []
+
+        def fake_fused_linear_ce(x, weight, targets, **kwargs):
+            calls.append((x.shape, weight.shape, targets.shape))
+            loss = x.float().pow(2).mean() + weight.float().pow(2).mean() * 0.0
+            return loss
+
+        import chaoscontrol.train_ssm as train_ssm_mod
+
+        monkeypatch.setattr(
+            train_ssm_mod,
+            "fused_linear_cross_entropy",
+            fake_fused_linear_ce,
+        )
+        hidden = torch.randn(2, 3, 4, requires_grad=True)
+        final_norm = torch.nn.RMSNorm(4, eps=1e-6)
+        lm_head = torch.nn.Linear(4, 6, bias=False)
+        targets = torch.zeros(2, 3, dtype=torch.long)
+
+        loss = fused_lm_head_backward(hidden, final_norm, lm_head, targets)
+
+        assert loss.ndim == 0
+        assert calls == [(torch.Size([2, 3, 4]), torch.Size([6, 4]), torch.Size([2, 3]))]
 
 
 class TestTrainSSMStepRejectsUnsupportedConfigs:

@@ -45,8 +45,9 @@ def build_ext_modules() -> list:
     this_dir = Path(__file__).resolve().parent
     repo_root = this_dir.parents[3]
     cpp_rel = this_dir.relative_to(repo_root) / "src" / "rms_norm_binding.cpp"
-    cu_rel = this_dir.relative_to(repo_root) / "src" / "rms_norm.cu"
-    sources = [str(cpp_rel), str(cu_rel)]
+    rms_norm_cu_rel = this_dir.relative_to(repo_root) / "src" / "rms_norm.cu"
+    linear_ce_cu_rel = this_dir.relative_to(repo_root) / "src" / "linear_ce.cu"
+    sources = [str(cpp_rel), str(rms_norm_cu_rel), str(linear_ce_cu_rel)]
 
     src_dir = this_dir / "src"
     cxx_args = ["-O3", "-std=c++17"]

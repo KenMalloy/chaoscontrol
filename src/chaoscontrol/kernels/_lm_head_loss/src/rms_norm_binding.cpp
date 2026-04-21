@@ -1,7 +1,9 @@
 #include <torch/extension.h>
 
+#include <limits>
 #include <vector>
 
+#include "linear_ce.h"
 #include "rms_norm.h"
 
 namespace cc_lm_head_loss {
@@ -54,6 +56,125 @@ std::tuple<at::Tensor, at::Tensor> rms_norm_backward(
     return {grad_x, grad_weight};
 }
 
+enum class Reduction : int64_t {
+    Mean = 0,
+    Sum = 1,
+};
+
+void check_linear_ce_inputs(
+    const at::Tensor& x,
+    const at::Tensor& weight,
+    const at::Tensor& targets,
+    int64_t reduction,
+    int64_t tile_size,
+    const char* op_name) {
+    TORCH_CHECK(x.is_cuda(), op_name, ": x must be CUDA");
+    TORCH_CHECK(weight.is_cuda(), op_name, ": weight must be CUDA");
+    TORCH_CHECK(targets.is_cuda(), op_name, ": targets must be CUDA");
+    TORCH_CHECK(x.is_contiguous(), op_name, ": x must be contiguous");
+    TORCH_CHECK(weight.is_contiguous(), op_name, ": weight must be contiguous");
+    TORCH_CHECK(targets.is_contiguous(), op_name, ": targets must be contiguous");
+    TORCH_CHECK(x.dim() == 2, op_name, ": x must be 2D");
+    TORCH_CHECK(weight.dim() == 2, op_name, ": weight must be 2D");
+    TORCH_CHECK(targets.dim() == 1, op_name, ": targets must be 1D");
+    TORCH_CHECK(x.size(0) == targets.size(0), op_name, ": x/targets row mismatch");
+    TORCH_CHECK(x.size(1) == weight.size(1), op_name, ": x/weight dim mismatch");
+    TORCH_CHECK(targets.scalar_type() == at::kLong, op_name, ": targets must be int64");
+    TORCH_CHECK(x.scalar_type() == weight.scalar_type(),
+                op_name, ": x and weight dtype must match");
+    TORCH_CHECK(reduction == static_cast<int64_t>(Reduction::Mean) ||
+                    reduction == static_cast<int64_t>(Reduction::Sum),
+                op_name, ": reduction must be 0 (mean) or 1 (sum)");
+    TORCH_CHECK(tile_size > 0, op_name, ": tile_size must be positive");
+    TORCH_CHECK(weight.size(0) > 0, op_name, ": vocab dimension must be positive");
+}
+
+std::tuple<at::Tensor, at::Tensor> linear_ce_forward(
+    const at::Tensor& x,
+    const at::Tensor& weight,
+    const at::Tensor& targets,
+    int64_t reduction,
+    int64_t tile_size) {
+    check_linear_ce_inputs(
+        x, weight, targets, reduction, tile_size,
+        "lm_head_loss linear_ce_forward");
+
+    const auto rows = x.size(0);
+    const auto vocab = weight.size(0);
+    auto stats_options = x.options().dtype(at::kFloat);
+    auto row_max = at::full(
+        {rows},
+        -std::numeric_limits<float>::infinity(),
+        stats_options);
+    auto target_logits = at::empty({rows}, stats_options);
+
+    for (int64_t start = 0; start < vocab; start += tile_size) {
+        const int64_t cols = std::min<int64_t>(tile_size, vocab - start);
+        auto weight_tile = weight.narrow(0, start, cols);
+        auto logits = at::matmul(x, weight_tile.transpose(0, 1)).contiguous();
+        launch_linear_ce_update_max_and_target(
+            logits, targets, row_max, target_logits, start);
+    }
+
+    auto row_sum = at::zeros({rows}, stats_options);
+    for (int64_t start = 0; start < vocab; start += tile_size) {
+        const int64_t cols = std::min<int64_t>(tile_size, vocab - start);
+        auto weight_tile = weight.narrow(0, start, cols);
+        auto logits = at::matmul(x, weight_tile.transpose(0, 1)).contiguous();
+        launch_linear_ce_accum_sum(logits, row_max, row_sum);
+    }
+
+    auto lse = row_max + row_sum.log();
+    auto loss_rows = lse - target_logits;
+    auto loss = reduction == static_cast<int64_t>(Reduction::Mean)
+        ? loss_rows.mean()
+        : loss_rows.sum();
+    return {loss, lse};
+}
+
+std::tuple<at::Tensor, at::Tensor> linear_ce_backward(
+    const at::Tensor& grad_loss,
+    const at::Tensor& x,
+    const at::Tensor& weight,
+    const at::Tensor& targets,
+    const at::Tensor& lse,
+    int64_t reduction,
+    int64_t tile_size) {
+    check_linear_ce_inputs(
+        x, weight, targets, reduction, tile_size,
+        "lm_head_loss linear_ce_backward");
+    TORCH_CHECK(grad_loss.is_cuda(), "lm_head_loss linear_ce_backward: grad_loss must be CUDA");
+    TORCH_CHECK(lse.is_cuda(), "lm_head_loss linear_ce_backward: lse must be CUDA");
+    TORCH_CHECK(grad_loss.numel() == 1, "lm_head_loss linear_ce_backward: grad_loss must be scalar");
+    TORCH_CHECK(lse.is_contiguous(), "lm_head_loss linear_ce_backward: lse must be contiguous");
+    TORCH_CHECK(lse.dim() == 1 && lse.size(0) == x.size(0),
+                "lm_head_loss linear_ce_backward: lse row mismatch");
+
+    const auto rows = x.size(0);
+    const auto vocab = weight.size(0);
+    const double divisor = reduction == static_cast<int64_t>(Reduction::Mean)
+        ? static_cast<double>(rows)
+        : 1.0;
+    auto grad_loss_f = grad_loss.to(at::kFloat).contiguous();
+    auto grad_x = at::zeros_like(x);
+    auto grad_weight = at::empty_like(weight);
+
+    for (int64_t start = 0; start < vocab; start += tile_size) {
+        const int64_t cols = std::min<int64_t>(tile_size, vocab - start);
+        auto weight_tile = weight.narrow(0, start, cols);
+        auto logits = at::matmul(x, weight_tile.transpose(0, 1)).contiguous();
+        auto grad_logits = at::empty({rows, cols}, x.options());
+        launch_linear_ce_fill_grad_logits(
+            logits, targets, lse, grad_loss_f, grad_logits, start, divisor);
+
+        grad_x.add_(at::matmul(grad_logits, weight_tile));
+        grad_weight.narrow(0, start, cols).copy_(
+            at::matmul(grad_logits.transpose(0, 1), x));
+    }
+
+    return {grad_x, grad_weight};
+}
+
 }  // namespace cc_lm_head_loss
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -61,4 +182,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "Fused RMSNorm forward for Exp23 LM-head path");
     m.def("rms_norm_backward", &cc_lm_head_loss::rms_norm_backward,
           "Fused RMSNorm backward for Exp23 LM-head path");
+    m.def("linear_ce_forward", &cc_lm_head_loss::linear_ce_forward,
+          "Tiled linear+cross-entropy forward for Exp23 LM-head path");
+    m.def("linear_ce_backward", &cc_lm_head_loss::linear_ce_backward,
+          "Tiled linear+cross-entropy backward for Exp23 LM-head path");
 }
