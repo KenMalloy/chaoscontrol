@@ -121,7 +121,7 @@ def load_fineweb_tokens(data_dir: str) -> tuple[torch.Tensor, torch.Tensor]:
     # values < 32768; sp1024 vocab max is 1023). torch.from_numpy shares
     # the mmap backing. Multiple processes reading the same cache file
     # share OS page cache — no per-process duplication.
-    # batch_from_starts does .to(dtype=torch.long) per-batch.
+    # The Exp23 fast path keeps inputs int32 and casts targets to int64 per batch.
     train_tokens = torch.from_numpy(train_mmap.view(np.int16))
     val_tokens = torch.from_numpy(val_mmap.view(np.int16))
     return train_tokens, val_tokens

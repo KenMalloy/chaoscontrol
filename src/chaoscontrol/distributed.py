@@ -65,6 +65,81 @@ def allreduce_grads(model: torch.nn.Module, world_size: int) -> None:
         g.copy_(s)
 
 
+class AsyncGradAllReducer:
+    """Launch per-parameter async all-reduces as grads materialize.
+
+    This is an optional measurement path for the fastest Exp23 runner. The
+    existing ``allreduce_grads`` coalesces every gradient into one post-backward
+    collective; that minimizes NCCL launch overhead but cannot overlap with
+    backward. This reducer flips that trade: each parameter's post-accumulate
+    hook launches an async collective immediately, and the training loop calls
+    ``wait()`` before clipping or stepping the optimizer.
+
+    It is intentionally explicit and opt-in because per-parameter collectives
+    can be slower than one coalesced collective. The point is to measure whether
+    overlap wins for the current tiny-model, 8xH100 regime.
+    """
+
+    def __init__(self, model: torch.nn.Module, world_size: int) -> None:
+        if int(world_size) <= 1:
+            raise ValueError(
+                "AsyncGradAllReducer requires world_size > 1; use the "
+                "single-device path without gradient synchronization."
+            )
+        self.world_size = int(world_size)
+        self._works: list[object] = []
+        self._handles: list[torch.utils.hooks.RemovableHandle] = []
+        for param in model.parameters():
+            if not param.requires_grad:
+                continue
+            if not hasattr(param, "register_post_accumulate_grad_hook"):
+                raise RuntimeError(
+                    "AsyncGradAllReducer requires "
+                    "Tensor.register_post_accumulate_grad_hook, which is "
+                    "available in modern PyTorch builds."
+                )
+            self._handles.append(
+                param.register_post_accumulate_grad_hook(self._make_hook())
+            )
+
+    @property
+    def pending_work_count(self) -> int:
+        return len(self._works)
+
+    def _make_hook(self):
+        def hook(param: torch.nn.Parameter) -> None:
+            grad = param.grad
+            if grad is None:
+                return
+            work = dist.all_reduce(
+                grad,
+                op=dist.ReduceOp.AVG,
+                async_op=True,
+            )
+            if work is not None:
+                self._works.append(work)
+
+        return hook
+
+    def reset(self) -> None:
+        self._works.clear()
+
+    def wait(self) -> None:
+        try:
+            for work in self._works:
+                wait = getattr(work, "wait", None)
+                if wait is not None:
+                    wait()
+        finally:
+            self.reset()
+
+    def close(self) -> None:
+        for handle in self._handles:
+            handle.remove()
+        self._handles.clear()
+        self.reset()
+
+
 def clip_grad_norm_fused(
     parameters: Iterable[torch.nn.Parameter],
     max_norm: float,

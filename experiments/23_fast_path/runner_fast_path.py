@@ -37,6 +37,7 @@ from chaoscontrol.data import (  # noqa: E402
     resolve_param_dtype,
 )
 from chaoscontrol.distributed import (  # noqa: E402
+    AsyncGradAllReducer,
     allreduce_grads,
     broadcast_params,
     clip_grad_norm_fused,
@@ -135,6 +136,8 @@ def _run_train_step(
     compile_full_path: bool = False,
     lm_head_backward_mode: str = "fused",
     lm_head_tile_size: int = 1024,
+    grad_allreduce_mode: str = "bulk",
+    async_grad_reducer: AsyncGradAllReducer | None = None,
 ) -> torch.Tensor:
     _reject_unsupported(model)
     with autocast_context(precision, device_type=inputs.device.type):
@@ -149,7 +152,12 @@ def _run_train_step(
                 lm_head=model.lm_head,
                 targets=targets,
             )
-        elif lm_head_backward_mode in {"fused", "fused_streaming", "fused_streaming_v2"}:
+        elif lm_head_backward_mode in {
+            "fused",
+            "fused_streaming",
+            "fused_streaming_v2",
+            "fused_norm_streaming_v2",
+        }:
             loss = fused_lm_head_backward(
                 hidden=hidden,
                 final_norm=model.final_norm,
@@ -157,12 +165,16 @@ def _run_train_step(
                 targets=targets,
                 tile_size=int(lm_head_tile_size),
                 backend=(
-                    "streaming_v2"
-                    if lm_head_backward_mode == "fused_streaming_v2"
+                    "norm_streaming_v2"
+                    if lm_head_backward_mode == "fused_norm_streaming_v2"
                     else (
-                        "streaming"
-                        if lm_head_backward_mode == "fused_streaming"
-                        else "auto"
+                        "streaming_v2"
+                        if lm_head_backward_mode == "fused_streaming_v2"
+                        else (
+                            "streaming"
+                            if lm_head_backward_mode == "fused_streaming"
+                            else "auto"
+                        )
                     )
                 ),
             )
@@ -179,11 +191,26 @@ def _run_train_step(
         else:
             raise ValueError(
                 "lm_head_backward_mode must be 'chunked', 'single', "
-                "'fused', 'fused_streaming', or 'fused_streaming_v2', got "
+                "'fused', 'fused_streaming', 'fused_streaming_v2', or "
+                "'fused_norm_streaming_v2', got "
                 f"{lm_head_backward_mode!r}"
             )
     if ddp_active and world_size > 1:
-        allreduce_grads(model, world_size)
+        mode = str(grad_allreduce_mode).strip().lower()
+        if mode == "bulk":
+            allreduce_grads(model, world_size)
+        elif mode == "async_param":
+            if async_grad_reducer is None:
+                raise ValueError(
+                    "grad_allreduce_mode='async_param' requires an "
+                    "AsyncGradAllReducer instance"
+                )
+            async_grad_reducer.wait()
+        else:
+            raise ValueError(
+                "grad_allreduce_mode must be 'bulk' or 'async_param', "
+                f"got {grad_allreduce_mode!r}"
+            )
     return loss
 
 
@@ -202,6 +229,7 @@ def _cuda_graph_rejection_reasons(
     *,
     device: torch.device,
     ddp_active: bool,
+    activation_checkpoint: bool,
     compile_full_path: bool,
     lm_head_backward_mode: str,
 ) -> list[str]:
@@ -210,9 +238,16 @@ def _cuda_graph_rejection_reasons(
         reasons.append("cuda_required")
     if ddp_active:
         reasons.append("ddp_not_supported")
+    if activation_checkpoint:
+        reasons.append("activation_checkpoint_not_supported")
     if compile_full_path:
         reasons.append("compile_full_path_not_supported")
-    if lm_head_backward_mode not in {"fused", "fused_streaming", "fused_streaming_v2"}:
+    if lm_head_backward_mode not in {
+        "fused",
+        "fused_streaming",
+        "fused_streaming_v2",
+        "fused_norm_streaming_v2",
+    }:
         reasons.append("fused_lm_head_required")
     return reasons
 
@@ -342,6 +377,7 @@ def _train_fast_for_budget_cuda_graph(
     cuda_graph_min_total_speedup: float,
     cuda_graph_max_capture_seconds: float,
     cuda_graph_warmup_steps: int,
+    grad_allreduce_mode: str = "bulk",
 ) -> dict[str, Any]:
     rank_ = int(rank)
     world_size_ = int(world_size)
@@ -397,6 +433,7 @@ def _train_fast_for_budget_cuda_graph(
                     compile_full_path=compile_full_path,
                     lm_head_backward_mode=lm_head_backward_mode,
                     lm_head_tile_size=lm_head_tile_size,
+                    grad_allreduce_mode=grad_allreduce_mode,
                 )
                 _apply_grad_clip(
                     model=model,
@@ -428,6 +465,7 @@ def _train_fast_for_budget_cuda_graph(
                 compile_full_path=compile_full_path,
                 lm_head_backward_mode=lm_head_backward_mode,
                 lm_head_tile_size=lm_head_tile_size,
+                grad_allreduce_mode=grad_allreduce_mode,
             )
             _apply_grad_clip(
                 model=model,
@@ -543,6 +581,7 @@ def train_fast_for_budget(
     stop_margin_seconds: float,
     vocab_size: int,
     max_steps: int | None = None,
+    activation_checkpoint: bool = False,
     compile_full_path: bool = False,
     prefetch_batches: bool = False,
     lm_head_backward_mode: str = "fused",
@@ -551,12 +590,19 @@ def train_fast_for_budget(
     cuda_graph_min_total_speedup: float = 0.05,
     cuda_graph_max_capture_seconds: float = 30.0,
     cuda_graph_warmup_steps: int = 3,
+    grad_allreduce_mode: str = "bulk",
 ) -> dict[str, Any]:
     rank_ = int(rank)
     world_size_ = int(world_size)
     ddp_active = world_size_ > 1
     if ddp_active:
         broadcast_params(model)
+    grad_allreduce_mode_ = str(grad_allreduce_mode).strip().lower()
+    if grad_allreduce_mode_ not in {"bulk", "async_param"}:
+        raise ValueError(
+            "grad_allreduce_mode must be 'bulk' or 'async_param', "
+            f"got {grad_allreduce_mode!r}"
+        )
 
     graph_mode = str(cuda_graph_mode).strip().lower()
     if graph_mode not in {"none", "probe"}:
@@ -569,6 +615,7 @@ def train_fast_for_budget(
         graph_rejections = _cuda_graph_rejection_reasons(
             device=device,
             ddp_active=ddp_active,
+            activation_checkpoint=activation_checkpoint,
             compile_full_path=compile_full_path,
             lm_head_backward_mode=lm_head_backward_mode,
         )
@@ -611,6 +658,7 @@ def train_fast_for_budget(
                     cuda_graph_min_total_speedup=cuda_graph_min_total_speedup,
                     cuda_graph_max_capture_seconds=cuda_graph_max_capture_seconds,
                     cuda_graph_warmup_steps=cuda_graph_warmup_steps,
+                    grad_allreduce_mode=grad_allreduce_mode_,
                 )
             except RuntimeError as exc:
                 graph_summary = _rejected_cuda_graph_summary(
@@ -634,6 +682,11 @@ def train_fast_for_budget(
         torch.cuda.reset_peak_memory_stats(device)
 
     prefetcher = None
+    async_grad_reducer = (
+        AsyncGradAllReducer(model, world_size_)
+        if ddp_active and grad_allreduce_mode_ == "async_param"
+        else None
+    )
     if prefetch_batches:
         prefetcher = Exp23BatchPrefetcher(
             tokens=train_tokens,
@@ -686,6 +739,8 @@ def train_fast_for_budget(
                 )
 
             optimizer.zero_grad(set_to_none=True)
+            if async_grad_reducer is not None:
+                async_grad_reducer.reset()
             loss = _run_train_step(
                 model=model,
                 inputs=inputs,
@@ -697,6 +752,8 @@ def train_fast_for_budget(
                 compile_full_path=compile_full_path,
                 lm_head_backward_mode=lm_head_backward_mode,
                 lm_head_tile_size=lm_head_tile_size,
+                grad_allreduce_mode=grad_allreduce_mode_,
+                async_grad_reducer=async_grad_reducer,
             )
             if grad_clip_norm > 0.0:
                 if fused_grad_clip:
@@ -709,6 +766,8 @@ def train_fast_for_budget(
     finally:
         if prefetcher is not None:
             prefetcher.close()
+        if async_grad_reducer is not None:
+            async_grad_reducer.close()
 
     if ddp_active:
         dist.barrier()
@@ -901,6 +960,7 @@ def run_condition(
         stop_check_interval=int(config.get("stop_check_interval", 4)),
         stop_margin_seconds=float(config.get("stop_margin_seconds", 2.0)),
         vocab_size=vocab_size,
+        activation_checkpoint=bool(config.get("activation_checkpoint", False)),
         compile_full_path=bool(config.get("compile_full_path", False)),
         prefetch_batches=bool(config.get("prefetch_batches", True)),
         lm_head_backward_mode=str(config.get("lm_head_backward_mode", "fused")),
@@ -913,6 +973,7 @@ def run_condition(
             config.get("cuda_graph_max_capture_seconds", 30.0)
         ),
         cuda_graph_warmup_steps=int(config.get("cuda_graph_warmup_steps", 3)),
+        grad_allreduce_mode=str(config.get("grad_allreduce_mode", "bulk")),
     )
 
     if ddp_active:

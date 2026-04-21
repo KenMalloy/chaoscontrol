@@ -35,7 +35,11 @@ from chaoscontrol.distributed import (
     resolve_ddp_context,
     should_stop_now,
 )
-from chaoscontrol.kernels._lm_head_loss import fused_linear_cross_entropy, fused_rms_norm
+from chaoscontrol.kernels._lm_head_loss import (
+    fused_linear_cross_entropy,
+    fused_rms_linear_cross_entropy,
+    fused_rms_norm,
+)
 from chaoscontrol.precision import autocast_context
 
 
@@ -165,15 +169,28 @@ def fused_lm_head_backward(
     if weight is None:
         return full_lm_head_backward(hidden, final_norm, lm_head, targets)
 
-    normed = fused_rms_norm(hidden, weight, eps=eps)
-    loss = fused_linear_cross_entropy(
-        normed,
-        lm_head.weight,
-        targets,
-        reduction="mean",
-        backend=backend,
-        tile_size=int(tile_size),
-    )
+    backend_name = str(backend).strip().lower()
+    if backend_name == "norm_streaming_v2":
+        loss = fused_rms_linear_cross_entropy(
+            hidden,
+            weight,
+            lm_head.weight,
+            targets,
+            eps=eps,
+            reduction="mean",
+            backend="streaming_v2",
+            tile_size=int(tile_size),
+        )
+    else:
+        normed = fused_rms_norm(hidden, weight, eps=eps)
+        loss = fused_linear_cross_entropy(
+            normed,
+            lm_head.weight,
+            targets,
+            reduction="mean",
+            backend=backend,
+            tile_size=int(tile_size),
+        )
     loss.backward()
     return loss.detach()
 

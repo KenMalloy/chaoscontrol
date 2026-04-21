@@ -66,6 +66,24 @@ def _fallback_linear_cross_entropy(
     )
 
 
+def _fallback_rms_linear_cross_entropy(
+    x: torch.Tensor,
+    norm_weight: torch.Tensor,
+    linear_weight: torch.Tensor,
+    targets: torch.Tensor,
+    *,
+    eps: float,
+    reduction: str,
+) -> torch.Tensor:
+    normed = _fallback_rms_norm(x, norm_weight, float(eps))
+    return _fallback_linear_cross_entropy(
+        normed,
+        linear_weight,
+        targets,
+        reduction=reduction,
+    )
+
+
 def _is_kernel_eligible(x: torch.Tensor, weight: torch.Tensor) -> bool:
     if _C is None:
         return False
@@ -118,6 +136,26 @@ def _is_linear_ce_kernel_eligible(
     if targets.dtype != torch.long:
         return False
     return True
+
+
+def _is_rms_linear_ce_kernel_eligible(
+    x: torch.Tensor,
+    norm_weight: torch.Tensor,
+    linear_weight: torch.Tensor,
+    targets: torch.Tensor,
+    *,
+    backend: str,
+) -> bool:
+    if not _is_kernel_eligible(x, norm_weight):
+        return False
+    # Eligibility for linear CE is checked against the post-RMS tensor shape and
+    # dtype; it matches x except that it is definitely contiguous.
+    return _is_linear_ce_kernel_eligible(
+        x,
+        linear_weight,
+        targets,
+        backend=backend,
+    )
 
 
 class _FusedRMSNormFn(torch.autograd.Function):
@@ -283,6 +321,141 @@ class _StreamingV2LinearCrossEntropyFn(torch.autograd.Function):
         return grad_x.reshape(ctx.x_shape), grad_weight, None, None, None
 
 
+class _FusedRMSLinearCrossEntropyFn(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        x: torch.Tensor,
+        norm_weight: torch.Tensor,
+        linear_weight: torch.Tensor,
+        targets: torch.Tensor,
+        eps: float,
+        reduction: str,
+        tile_size: int,
+        backend: str,
+    ) -> torch.Tensor:
+        x_contig = x.contiguous()
+        norm_weight_contig = norm_weight.contiguous()
+        flat_targets = targets.reshape(-1).contiguous()
+        reduction_id = 0 if reduction == "mean" else 1
+
+        normed, inv_rms = _C.rms_norm_forward(
+            x_contig,
+            norm_weight_contig,
+            float(eps),
+        )
+        flat_normed = normed.reshape(-1, normed.size(-1)).contiguous()
+        compute_weight = linear_weight.contiguous()
+        if compute_weight.dtype != flat_normed.dtype:
+            compute_weight = compute_weight.to(dtype=flat_normed.dtype)
+
+        if backend == "streaming_v2":
+            loss, lse = _C.linear_ce_streaming_v2_forward(
+                flat_normed,
+                compute_weight,
+                flat_targets,
+                reduction_id,
+                int(tile_size),
+            )
+        elif backend == "streaming":
+            loss, lse = _C.linear_ce_streaming_forward(
+                flat_normed,
+                compute_weight,
+                flat_targets,
+                reduction_id,
+                int(tile_size),
+            )
+        else:
+            loss, lse = _C.linear_ce_forward(
+                flat_normed,
+                compute_weight,
+                flat_targets,
+                reduction_id,
+                int(tile_size),
+            )
+
+        ctx.save_for_backward(
+            x_contig,
+            norm_weight_contig,
+            inv_rms,
+            flat_normed,
+            compute_weight,
+            flat_targets,
+            lse,
+        )
+        ctx.x_shape = tuple(x.shape)
+        ctx.linear_weight_dtype = linear_weight.dtype
+        ctx.reduction_id = reduction_id
+        ctx.tile_size = int(tile_size)
+        ctx.backend = backend
+        return loss
+
+    @staticmethod
+    def backward(ctx, grad_loss: torch.Tensor):  # type: ignore[override]
+        (
+            x,
+            norm_weight,
+            inv_rms,
+            flat_normed,
+            linear_weight,
+            flat_targets,
+            lse,
+        ) = ctx.saved_tensors
+        grad_loss_contig = grad_loss.contiguous()
+
+        if ctx.backend == "streaming_v2":
+            grad_normed, grad_linear_weight = _C.linear_ce_streaming_v2_backward(
+                grad_loss_contig,
+                flat_normed,
+                linear_weight,
+                flat_targets,
+                lse.contiguous(),
+                ctx.reduction_id,
+                ctx.tile_size,
+            )
+        elif ctx.backend == "streaming":
+            grad_normed, grad_linear_weight = _C.linear_ce_streaming_backward(
+                grad_loss_contig,
+                flat_normed,
+                linear_weight,
+                flat_targets,
+                lse.contiguous(),
+                ctx.reduction_id,
+                ctx.tile_size,
+            )
+        else:
+            grad_normed, grad_linear_weight = _C.linear_ce_backward(
+                grad_loss_contig,
+                flat_normed,
+                linear_weight,
+                flat_targets,
+                lse.contiguous(),
+                ctx.reduction_id,
+                ctx.tile_size,
+            )
+
+        grad_hidden, grad_norm_weight = _C.rms_norm_backward(
+            grad_normed.reshape(ctx.x_shape).contiguous(),
+            x,
+            norm_weight,
+            inv_rms,
+        )
+        if grad_linear_weight.dtype != ctx.linear_weight_dtype:
+            grad_linear_weight = grad_linear_weight.to(
+                dtype=ctx.linear_weight_dtype
+            )
+        return (
+            grad_hidden,
+            grad_norm_weight,
+            grad_linear_weight,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+
+
 def fused_rms_norm(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -381,6 +554,86 @@ def fused_linear_cross_entropy(
         x,
         weight,
         targets,
+        reduction=reduction,
+    )
+
+
+def fused_rms_linear_cross_entropy(
+    x: torch.Tensor,
+    norm_weight: torch.Tensor,
+    linear_weight: torch.Tensor,
+    targets: torch.Tensor,
+    *,
+    eps: float = 1e-6,
+    reduction: str = "mean",
+    tile_size: int = 1024,
+    backend: str = "auto",
+) -> torch.Tensor:
+    """RMSNorm + linear projection + cross entropy as one exact op.
+
+    The CUDA fast path reuses the same native RMSNorm and tiled CE kernels as
+    the separate calls, but presents them as one autograd node. That trims the
+    Python/autograd orchestration around the Exp23 final head path and gives
+    the deeper CUDA fusion work a single stable public entry point.
+    """
+    if reduction not in {"mean", "sum"}:
+        raise ValueError(
+            "fused_rms_linear_cross_entropy: reduction must be 'mean' or 'sum', "
+            f"got {reduction!r}"
+        )
+    backend_name = str(backend).strip().lower()
+    if backend_name == "auto":
+        backend_name = "v1"
+    if backend_name not in {"v1", "streaming", "streaming_v2"}:
+        raise ValueError(
+            "fused_rms_linear_cross_entropy: backend must be 'auto', 'v1', "
+            f"'streaming', or 'streaming_v2', got {backend!r}"
+        )
+    if x.size(-1) != norm_weight.numel():
+        raise ValueError(
+            "fused_rms_linear_cross_entropy: x last dimension must match "
+            f"norm_weight length, got {x.size(-1)} and {norm_weight.numel()}"
+        )
+    if x.size(-1) != linear_weight.size(-1):
+        raise ValueError(
+            "fused_rms_linear_cross_entropy: x last dimension must match "
+            f"linear_weight input dimension, got {x.size(-1)} and "
+            f"{linear_weight.size(-1)}"
+        )
+    if targets.numel() != x.numel() // x.size(-1):
+        raise ValueError(
+            "fused_rms_linear_cross_entropy: targets must contain one class "
+            f"index per input row, got {targets.numel()} targets for "
+            f"{x.numel() // x.size(-1)} rows"
+        )
+    if int(tile_size) <= 0:
+        raise ValueError(
+            "fused_rms_linear_cross_entropy: tile_size must be positive, "
+            f"got {tile_size}"
+        )
+    if _is_rms_linear_ce_kernel_eligible(
+        x,
+        norm_weight,
+        linear_weight,
+        targets,
+        backend=backend_name,
+    ):
+        return _FusedRMSLinearCrossEntropyFn.apply(
+            x,
+            norm_weight,
+            linear_weight,
+            targets,
+            float(eps),
+            reduction,
+            int(tile_size),
+            backend_name,
+        )
+    return _fallback_rms_linear_cross_entropy(
+        x,
+        norm_weight,
+        linear_weight,
+        targets,
+        eps=float(eps),
         reduction=reduction,
     )
 

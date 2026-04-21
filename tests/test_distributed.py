@@ -18,7 +18,11 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 
-from chaoscontrol.distributed import allreduce_grads, resolve_ddp_context
+from chaoscontrol.distributed import (
+    AsyncGradAllReducer,
+    allreduce_grads,
+    resolve_ddp_context,
+)
 
 
 class TestClipGradNormFused:
@@ -224,6 +228,35 @@ class _MockAllReduce:
         tensor.mul_(1.5).add_(0.05)
 
 
+class _MockAsyncWork:
+    def __init__(self) -> None:
+        self.wait_calls = 0
+
+    def wait(self) -> None:
+        self.wait_calls += 1
+
+
+class _MockAsyncAllReduce:
+    def __init__(self) -> None:
+        self.calls: list[tuple[tuple[int, ...], bool]] = []
+        self.works: list[_MockAsyncWork] = []
+
+    def __call__(
+        self,
+        tensor: torch.Tensor,
+        op: object = None,
+        group: object = None,
+        async_op: bool = False,
+    ) -> _MockAsyncWork | None:
+        self.calls.append((tuple(tensor.shape), bool(async_op)))
+        tensor.mul_(1.5).add_(0.05)
+        if async_op:
+            work = _MockAsyncWork()
+            self.works.append(work)
+            return work
+        return None
+
+
 class TestAllreduceGradsCoalesced:
     """Lock in the coalesced flatten/reduce/unflatten path against regression.
 
@@ -358,4 +391,61 @@ class TestAllreduceGradsCoalesced:
         # No backward has run; p.grad is None for every parameter.
         assert all(p.grad is None for p in model.parameters())
         allreduce_grads(model, world_size=4)
+        assert mock.calls == []
+
+
+class TestAsyncGradAllReducer:
+    def test_post_accumulate_hooks_launch_async_collectives_and_wait(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        mock = _MockAsyncAllReduce()
+        monkeypatch.setattr(dist, "all_reduce", mock)
+
+        torch.manual_seed(51)
+        model = nn.Sequential(nn.Linear(3, 4), nn.Linear(4, 2))
+        reducer = AsyncGradAllReducer(model, world_size=2)
+        try:
+            loss = model(torch.randn(5, 3)).pow(2).mean()
+            loss.backward()
+
+            params_with_grad = [
+                p for p in model.parameters() if p.grad is not None
+            ]
+            assert len(mock.calls) == len(params_with_grad)
+            assert all(async_op for _shape, async_op in mock.calls)
+
+            reducer.wait()
+            assert mock.works
+            assert all(work.wait_calls == 1 for work in mock.works)
+        finally:
+            reducer.close()
+
+    def test_reset_clears_waited_work_before_next_backward(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        mock = _MockAsyncAllReduce()
+        monkeypatch.setattr(dist, "all_reduce", mock)
+
+        torch.manual_seed(52)
+        model = nn.Linear(3, 2)
+        reducer = AsyncGradAllReducer(model, world_size=2)
+        try:
+            model(torch.randn(4, 3)).sum().backward()
+            assert mock.works
+            reducer.wait()
+            reducer.reset()
+            assert reducer.pending_work_count == 0
+        finally:
+            reducer.close()
+
+    def test_close_removes_hooks(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        mock = _MockAsyncAllReduce()
+        monkeypatch.setattr(dist, "all_reduce", mock)
+
+        torch.manual_seed(53)
+        model = nn.Linear(3, 2)
+        reducer = AsyncGradAllReducer(model, world_size=2)
+        reducer.close()
+
+        model(torch.randn(4, 3)).sum().backward()
         assert mock.calls == []

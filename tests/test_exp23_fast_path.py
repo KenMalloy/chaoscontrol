@@ -342,6 +342,52 @@ def test_cuda_graph_probe_rejects_cpu_and_runs_eager() -> None:
     assert "cuda_required" in result["cuda_graph"]["reasons"]
 
 
+def test_cuda_graph_probe_rejects_activation_checkpoint_before_capture(
+    monkeypatch,
+) -> None:
+    mod = _load_runner_module()
+    torch.manual_seed(7)
+    model = _TinyTokenTrainModel()
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+    train_tokens = torch.arange(128, dtype=torch.int16)
+
+    def unexpected_graph_runner(**_kwargs):
+        raise AssertionError("activation checkpoint should reject graph capture")
+
+    monkeypatch.setattr(mod, "_train_fast_for_budget_cuda_graph", unexpected_graph_runner)
+
+    result = mod.train_fast_for_budget(
+        model,
+        train_tokens=train_tokens,
+        train_num_tokens=int(train_tokens.numel()),
+        stride=4,
+        seq_len=8,
+        batch_size=4,
+        device=torch.device("cpu"),
+        optimizer=optimizer,
+        budget_seconds=30.0,
+        chunk_size=4,
+        grad_clip_norm=0.0,
+        fused_grad_clip=False,
+        rank=0,
+        world_size=1,
+        seed=123,
+        precision="fp32",
+        stop_check_interval=1,
+        stop_margin_seconds=0.0,
+        vocab_size=6,
+        max_steps=2,
+        activation_checkpoint=True,
+        prefetch_batches=False,
+        lm_head_backward_mode="fused",
+        cuda_graph_mode="probe",
+    )
+
+    assert result["steps"] == 2
+    assert result["cuda_graph"]["accepted"] is False
+    assert "activation_checkpoint_not_supported" in result["cuda_graph"]["reasons"]
+
+
 def test_cuda_graph_probe_delegates_when_eligible(monkeypatch) -> None:
     mod = _load_runner_module()
     model = _TinyTokenTrainModel()
@@ -663,6 +709,42 @@ def test_run_train_step_can_use_streaming_v2_fused_backward(monkeypatch):
     assert model.encoder.weight.grad is not None
 
 
+def test_run_train_step_can_use_norm_streaming_v2_fused_backward(monkeypatch):
+    mod = _load_runner_module()
+
+    calls: list[tuple[str | None, int]] = []
+
+    def fake_fused(**kwargs):
+        calls.append((kwargs.get("backend"), kwargs["tile_size"]))
+        hidden = kwargs["hidden"]
+        loss = hidden.float().pow(2).mean()
+        loss.backward()
+        return loss.detach()
+
+    monkeypatch.setattr(mod, "fused_lm_head_backward", fake_fused)
+
+    model = _TinyTrainStepModel()
+    inputs = torch.randn(2, 3, 4)
+    targets = torch.zeros(2, 3, dtype=torch.long)
+
+    loss = mod._run_train_step(
+        model=model,
+        inputs=inputs,
+        targets=targets,
+        chunk_size=2,
+        precision="bf16",
+        ddp_active=False,
+        world_size=1,
+        compile_full_path=False,
+        lm_head_backward_mode="fused_norm_streaming_v2",
+        lm_head_tile_size=8192,
+    )
+
+    assert loss.ndim == 0
+    assert calls == [("norm_streaming_v2", 8192)]
+    assert model.encoder.weight.grad is not None
+
+
 def test_train_fast_for_budget_can_use_batch_prefetcher(monkeypatch):
     mod = _load_runner_module()
     instances = []
@@ -726,6 +808,67 @@ def test_train_fast_for_budget_can_use_batch_prefetcher(monkeypatch):
     assert prefetcher.kwargs["seq_len"] == 3
     assert prefetcher.kwargs["batch_size"] == 2
     assert prefetcher.kwargs["vocab_size"] == 6
+
+
+def test_train_fast_for_budget_can_use_async_param_allreduce(monkeypatch):
+    mod = _load_runner_module()
+
+    events: list[str] = []
+
+    class FakeAsyncReducer:
+        def __init__(self, model, world_size):
+            self.model = model
+            self.world_size = world_size
+            events.append(f"init:{world_size}")
+
+        def reset(self):
+            events.append("reset")
+
+        def wait(self):
+            events.append("wait")
+
+        def close(self):
+            events.append("close")
+
+    def fail_bulk_allreduce(*_args, **_kwargs):
+        raise AssertionError("async_param mode must not call bulk allreduce")
+
+    monkeypatch.setattr(mod, "broadcast_params", lambda _model: None)
+    monkeypatch.setattr(mod, "should_stop_now", lambda local, *_args: local)
+    monkeypatch.setattr(mod.dist, "barrier", lambda: None)
+    monkeypatch.setattr(mod, "allreduce_grads", fail_bulk_allreduce)
+    monkeypatch.setattr(mod, "AsyncGradAllReducer", FakeAsyncReducer)
+
+    model = _TinyTokenTrainModel()
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+
+    result = mod.train_fast_for_budget(
+        model,
+        train_tokens=torch.arange(128, dtype=torch.int16),
+        train_num_tokens=128,
+        stride=4,
+        seq_len=3,
+        batch_size=2,
+        device=torch.device("cpu"),
+        optimizer=optimizer,
+        budget_seconds=300.0,
+        chunk_size=2,
+        grad_clip_norm=0.0,
+        fused_grad_clip=False,
+        rank=0,
+        world_size=2,
+        seed=123,
+        precision="bf16",
+        stop_check_interval=1,
+        stop_margin_seconds=0.0,
+        vocab_size=6,
+        max_steps=1,
+        prefetch_batches=False,
+        grad_allreduce_mode="async_param",
+    )
+
+    assert result["steps"] == 1
+    assert events == ["init:2", "reset", "wait", "close"]
 
 
 def test_training_stop_predicate_can_stop_on_fixed_warmup_steps():
