@@ -239,7 +239,8 @@ def build_rsync_push_command(*, pod_id: str, local_path: Path, remote_path: str)
     ssh_key = str(ssh_info["ssh_key"]["path"])
     return [
         "rsync", "-az", "--no-o", "--no-g", "--progress",
-        "--exclude", ".venv", "--exclude", "__pycache__",
+        "--exclude", ".git", "--exclude", ".claude", "--exclude", ".venv",
+        "--exclude", ".DS_Store", "--exclude", "__pycache__",
         "--exclude", "*.pyc", "--exclude", "results/", "-e",
         f"ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i {ssh_key} -p {port}",
         str(local_path) + "/",
@@ -289,7 +290,7 @@ def cmd_create(args: argparse.Namespace) -> None:
 
 
 def cmd_deploy(args: argparse.Namespace) -> None:
-    """Push repo to pod, run bootstrap (no data download — use prep_data.sh for that)."""
+    """Push repo to pod; optionally run the broad bootstrap script."""
     pod_id = args.pod_id
     print("=== Pushing repo to pod ===")
     push_cmd = build_rsync_push_command(
@@ -298,6 +299,11 @@ def cmd_deploy(args: argparse.Namespace) -> None:
         remote_path=str(DEFAULT_REMOTE_REPO_ROOT),
     )
     run_passthrough(push_cmd)
+
+    if not args.bootstrap:
+        print("\n=== Skipping bootstrap ===")
+        print("Use --bootstrap only when you intentionally want tools/pod_bootstrap.sh.")
+        return
 
     print("\n=== Running bootstrap (venv + smoke test + batch benchmark) ===")
     ssh_cmd = build_ssh_command(pod_id, f"bash {DEFAULT_REMOTE_REPO_ROOT}/tools/pod_bootstrap.sh")
@@ -403,8 +409,13 @@ def build_parser() -> argparse.ArgumentParser:
     add_lease_args(create)
     create.set_defaults(handler=cmd_create)
 
-    deploy = sub.add_parser("deploy", help="Push repo to pod, set up venv, download data")
+    deploy = sub.add_parser("deploy", help="Push repo to pod")
     deploy.add_argument("pod_id")
+    deploy.add_argument(
+        "--bootstrap",
+        action="store_true",
+        help="also run tools/pod_bootstrap.sh after sync (broad environment mutation)",
+    )
     deploy.set_defaults(handler=cmd_deploy)
 
     start = sub.add_parser("start", help="Start a stopped pod")

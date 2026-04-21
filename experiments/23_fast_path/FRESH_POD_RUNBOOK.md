@@ -108,9 +108,11 @@ assert torch.cuda.device_count() >= 1
 PY
 ```
 
-Avoid `tools/runpod.py deploy` for this specific flow unless it has learned a
-skip-bootstrap mode, because it runs `tools/pod_bootstrap.sh`, which installs
-optional Mamba dependencies and can replace the working image torch.
+Use `tools/runpod.py deploy <pod_id>` only for repo sync. The command now skips
+`tools/pod_bootstrap.sh` by default and excludes local `.git`, `.claude`, and
+`.venv` state from rsync. Pass `--bootstrap` only when you intentionally want
+the broad bootstrap path, because it installs optional Mamba dependencies and
+can replace the working image torch if used carelessly.
 
 The exact failure signature from the bad bootstrap was a venv torch reporting
 CUDA unavailable on a CUDA-visible host. The system torch reported
