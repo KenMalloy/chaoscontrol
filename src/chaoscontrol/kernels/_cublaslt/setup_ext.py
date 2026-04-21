@@ -14,6 +14,37 @@ from pathlib import Path
 from typing import List
 
 
+def _nvcc_gencode_args(default_arch_list: str = "9.0") -> list[str]:
+    """Return nvcc ``-gencode`` flags from the requested CUDA arch list.
+
+    Production wheels default to H100-only (``sm_90``), but scratch CUDA
+    13 build pods can be cheaper Ada machines. ``TORCH_CUDA_ARCH_LIST``
+    or ``CHAOSCONTROL_CUDA_ARCH_LIST`` can request both, e.g. ``8.9;9.0``.
+    """
+    raw = (
+        os.environ.get("CHAOSCONTROL_CUDA_ARCH_LIST")
+        or os.environ.get("TORCH_CUDA_ARCH_LIST")
+        or default_arch_list
+    )
+    args: List[str] = []
+    for arch in raw.replace(",", ";").split(";"):
+        arch = arch.strip()
+        if not arch:
+            continue
+        emit_ptx = arch.upper().endswith("+PTX")
+        if emit_ptx:
+            arch = arch[:-4].strip()
+        digits = arch.replace(".", "")
+        if not digits.isdigit():
+            continue
+        args.append(f"-gencode=arch=compute_{digits},code=sm_{digits}")
+        if emit_ptx:
+            args.append(f"-gencode=arch=compute_{digits},code=compute_{digits}")
+    if args:
+        return args
+    return ["-gencode=arch=compute_90,code=sm_90"]
+
+
 def build_ext_modules() -> list:
     """Return the list of extension objects to pass to ``setuptools.setup``.
 
@@ -152,13 +183,12 @@ def build_ext_modules() -> list:
     # The extension now includes a .cu kernel (``fused_amax_cast.cu``) so
     # we need nvcc in the loop. Split extra_compile_args by compiler.
     cxx_args = ["-O3", "-std=c++17"]
-    # nvcc must match the host C++ standard and target the H100's sm_90
-    # (our only production GPU). Keep the list short; adding -O3 tells
-    # nvcc to pass -O3 to the device compiler too.
+    # nvcc must match the host C++ standard. The production default is
+    # H100 sm_90; scratch build pods can override via CUDA arch list.
     nvcc_args = [
         "-O3",
         "-std=c++17",
-        "-gencode=arch=compute_90,code=sm_90",
+        *_nvcc_gencode_args(),
         "--expt-relaxed-constexpr",
         "-Xcompiler=-fPIC",
     ]

@@ -1,0 +1,27 @@
+[rank 0/1] probe_h100_b2048_c128_ckpt vocab=16384 batch=2048 chunk=128 ckpt=True params=10,751,232
+Traceback (most recent call last):
+  File "/workspace/chaoscontrol/experiments/23_fast_path/runner_fast_path.py", line 523, in <module>
+    raise SystemExit(main())
+                     ^^^^^^
+  File "/workspace/chaoscontrol/experiments/23_fast_path/runner_fast_path.py", line 510, in main
+    run_condition(
+  File "/workspace/chaoscontrol/experiments/23_fast_path/runner_fast_path.py", line 412, in run_condition
+    train_result = train_fast_for_budget(
+                   ^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/chaoscontrol/experiments/23_fast_path/runner_fast_path.py", line 232, in train_fast_for_budget
+    loss = _run_train_step(
+           ^^^^^^^^^^^^^^^^
+  File "/workspace/chaoscontrol/experiments/23_fast_path/runner_fast_path.py", line 135, in _run_train_step
+    loss = chunked_lm_head_backward(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/chaoscontrol/src/chaoscontrol/train_ssm.py", line 115, in chunked_lm_head_backward
+    chunk_loss.backward()
+  File "/usr/local/lib/python3.12/dist-packages/torch/_tensor.py", line 625, in backward
+    torch.autograd.backward(
+  File "/usr/local/lib/python3.12/dist-packages/torch/autograd/__init__.py", line 354, in backward
+    _engine_run_backward(
+  File "/usr/local/lib/python3.12/dist-packages/torch/autograd/graph.py", line 841, in _engine_run_backward
+    return Variable._execution_engine.run_backward(  # Calls into the C++ engine to run the backward pass
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 16.00 GiB. GPU 0 has a total capacity of 79.18 GiB of which 10.89 GiB is free. Including non-PyTorch memory, this process has 68.28 GiB memory in use. Of the allocated memory 43.64 GiB is allocated by PyTorch, and 23.92 GiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
+status=1

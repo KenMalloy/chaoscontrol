@@ -1,0 +1,4 @@
+[rank 0/1] probe_h100_b2048_c64_ckpt vocab=16384 batch=2048 chunk=64 ckpt=True params=10,751,232
+[rank 0/1] done steps=18 tok/s=1846087 loss=9.6444 vram=32142.1MB
+[W421 02:30:18.166556114 AllocatorConfig.cpp:28] Warning: PYTORCH_CUDA_ALLOC_CONF is deprecated, use PYTORCH_ALLOC_CONF instead (function operator())
+status=0

@@ -9,6 +9,40 @@ from __future__ import annotations
 from pathlib import Path
 
 
+def _nvcc_gencode_args(default_arch_list: str = "9.0") -> list[str]:
+    """Return nvcc ``-gencode`` flags from the requested CUDA arch list.
+
+    The production default stays H100-only (``sm_90``), but scratch build
+    pods may be Ada/Lovelace. Honoring ``TORCH_CUDA_ARCH_LIST`` lets us
+    compile a wheel that can be smoke-tested on the build GPU while still
+    carrying H100 cubins for the expensive pod.
+    """
+    import os
+
+    raw = (
+        os.environ.get("CHAOSCONTROL_CUDA_ARCH_LIST")
+        or os.environ.get("TORCH_CUDA_ARCH_LIST")
+        or default_arch_list
+    )
+    args: list[str] = []
+    for arch in raw.replace(",", ";").split(";"):
+        arch = arch.strip()
+        if not arch:
+            continue
+        emit_ptx = arch.upper().endswith("+PTX")
+        if emit_ptx:
+            arch = arch[:-4].strip()
+        digits = arch.replace(".", "")
+        if not digits.isdigit():
+            continue
+        args.append(f"-gencode=arch=compute_{digits},code=sm_{digits}")
+        if emit_ptx:
+            args.append(f"-gencode=arch=compute_{digits},code=compute_{digits}")
+    if args:
+        return args
+    return ["-gencode=arch=compute_90,code=sm_90"]
+
+
 def build_ext_modules() -> list:
     """Return the list of extension objects to pass to ``setuptools.setup``.
 
@@ -49,7 +83,7 @@ def build_ext_modules() -> list:
     nvcc_args = [
         "-O3",
         "-std=c++17",
-        "-gencode=arch=compute_90,code=sm_90",
+        *_nvcc_gencode_args(),
         "--expt-relaxed-constexpr",
         "-Xcompiler=-fPIC",
         # Use fast-math. `-use_fast_math` bundles several nvcc flags:

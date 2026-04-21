@@ -1,0 +1,2 @@
+[rank 0/1] probe_h100_b1024_c128 vocab=16384 batch=1024 chunk=128 ckpt=False params=10,751,232
+[rank 0/1] done steps=41 tok/s=2144866 loss=8.5433 vram=57242.1MB

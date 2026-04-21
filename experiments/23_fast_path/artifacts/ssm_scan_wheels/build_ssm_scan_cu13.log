@@ -1,0 +1,108 @@
+Using pip 26.0.1 from /workspace/chaoscontrol/.venv/lib/python3.12/site-packages/pip (python 3.12)
+Obtaining file:///workspace/chaoscontrol
+  Checking if build backend supports build_editable: started
+  Running command Checking if build backend supports build_editable
+  Checking if build backend supports build_editable: finished with status 'done'
+  Preparing editable metadata (pyproject.toml): started
+  Running command Preparing editable metadata (pyproject.toml)
+  running dist_info
+  creating /tmp/pip-modern-metadata-3ss4x3wt/semanticengine_ssm.egg-info
+  writing /tmp/pip-modern-metadata-3ss4x3wt/semanticengine_ssm.egg-info/PKG-INFO
+  writing dependency_links to /tmp/pip-modern-metadata-3ss4x3wt/semanticengine_ssm.egg-info/dependency_links.txt
+  writing requirements to /tmp/pip-modern-metadata-3ss4x3wt/semanticengine_ssm.egg-info/requires.txt
+  writing top-level names to /tmp/pip-modern-metadata-3ss4x3wt/semanticengine_ssm.egg-info/top_level.txt
+  writing manifest file '/tmp/pip-modern-metadata-3ss4x3wt/semanticengine_ssm.egg-info/SOURCES.txt'
+  reading manifest file '/tmp/pip-modern-metadata-3ss4x3wt/semanticengine_ssm.egg-info/SOURCES.txt'
+  writing manifest file '/tmp/pip-modern-metadata-3ss4x3wt/semanticengine_ssm.egg-info/SOURCES.txt'
+  creating '/tmp/pip-modern-metadata-3ss4x3wt/semanticengine_ssm-0.2.0.dist-info'
+  Preparing editable metadata (pyproject.toml): finished with status 'done'
+Requirement already satisfied: torch>=2.0 in /usr/local/lib/python3.12/dist-packages (from semanticengine-ssm==0.2.0) (2.9.1+cu130)
+Requirement already satisfied: numpy in ./.venv/lib/python3.12/site-packages (from semanticengine-ssm==0.2.0) (2.4.4)
+Requirement already satisfied: pyyaml in /usr/local/lib/python3.12/dist-packages (from semanticengine-ssm==0.2.0) (6.0.3)
+Requirement already satisfied: sentencepiece in ./.venv/lib/python3.12/site-packages (from semanticengine-ssm==0.2.0) (0.2.1)
+Requirement already satisfied: filelock in /usr/local/lib/python3.12/dist-packages (from torch>=2.0->semanticengine-ssm==0.2.0) (3.20.1)
+Requirement already satisfied: typing-extensions>=4.10.0 in /usr/local/lib/python3.12/dist-packages (from torch>=2.0->semanticengine-ssm==0.2.0) (4.15.0)
+Requirement already satisfied: setuptools in ./.venv/lib/python3.12/site-packages (from torch>=2.0->semanticengine-ssm==0.2.0) (82.0.1)
+Requirement already satisfied: sympy>=1.13.3 in /usr/local/lib/python3.12/dist-packages (from torch>=2.0->semanticengine-ssm==0.2.0) (1.14.0)
+Requirement already satisfied: networkx>=2.5.1 in /usr/local/lib/python3.12/dist-packages (from torch>=2.0->semanticengine-ssm==0.2.0) (3.6.1)
+Requirement already satisfied: jinja2 in /usr/local/lib/python3.12/dist-packages (from torch>=2.0->semanticengine-ssm==0.2.0) (3.1.6)
+Requirement already satisfied: fsspec>=0.8.5 in /usr/local/lib/python3.12/dist-packages (from torch>=2.0->semanticengine-ssm==0.2.0) (2025.12.0)
+Requirement already satisfied: nvidia-cuda-nvrtc==13.0.48 in /usr/local/lib/python3.12/dist-packages (from torch>=2.0->semanticengine-ssm==0.2.0) (13.0.48)
+Requirement already satisfied: nvidia-cuda-runtime==13.0.48 in /usr/local/lib/python3.12/dist-packages (from torch>=2.0->semanticengine-ssm==0.2.0) (13.0.48)
+Requirement already satisfied: nvidia-cuda-cupti==13.0.48 in /usr/local/lib/python3.12/dist-packages (from torch>=2.0->semanticengine-ssm==0.2.0) (13.0.48)
+Requirement already satisfied: nvidia-cudnn-cu13==9.13.0.50 in /usr/local/lib/python3.12/dist-packages (from torch>=2.0->semanticengine-ssm==0.2.0) (9.13.0.50)
+Requirement already satisfied: nvidia-cublas==13.0.0.19 in /usr/local/lib/python3.12/dist-packages (from torch>=2.0->semanticengine-ssm==0.2.0) (13.0.0.19)
+Requirement already satisfied: nvidia-cufft==12.0.0.15 in /usr/local/lib/python3.12/dist-packages (from torch>=2.0->semanticengine-ssm==0.2.0) (12.0.0.15)
+Requirement already satisfied: nvidia-curand==10.4.0.35 in /usr/local/lib/python3.12/dist-packages (from torch>=2.0->semanticengine-ssm==0.2.0) (10.4.0.35)
+Requirement already satisfied: nvidia-cusolver==12.0.3.29 in /usr/local/lib/python3.12/dist-packages (from torch>=2.0->semanticengine-ssm==0.2.0) (12.0.3.29)
+Requirement already satisfied: nvidia-cusparse==12.6.2.49 in /usr/local/lib/python3.12/dist-packages (from torch>=2.0->semanticengine-ssm==0.2.0) (12.6.2.49)
+Requirement already satisfied: nvidia-cusparselt-cu13==0.8.0 in /usr/local/lib/python3.12/dist-packages (from torch>=2.0->semanticengine-ssm==0.2.0) (0.8.0)
+Requirement already satisfied: nvidia-nccl-cu13==2.27.7 in /usr/local/lib/python3.12/dist-packages (from torch>=2.0->semanticengine-ssm==0.2.0) (2.27.7)
+Requirement already satisfied: nvidia-nvshmem-cu13==3.3.24 in /usr/local/lib/python3.12/dist-packages (from torch>=2.0->semanticengine-ssm==0.2.0) (3.3.24)
+Requirement already satisfied: nvidia-nvtx==13.0.39 in /usr/local/lib/python3.12/dist-packages (from torch>=2.0->semanticengine-ssm==0.2.0) (13.0.39)
+Requirement already satisfied: nvidia-nvjitlink==13.0.39 in /usr/local/lib/python3.12/dist-packages (from torch>=2.0->semanticengine-ssm==0.2.0) (13.0.39)
+Requirement already satisfied: nvidia-cufile==1.15.0.42 in /usr/local/lib/python3.12/dist-packages (from torch>=2.0->semanticengine-ssm==0.2.0) (1.15.0.42)
+Requirement already satisfied: triton==3.5.1 in /usr/local/lib/python3.12/dist-packages (from torch>=2.0->semanticengine-ssm==0.2.0) (3.5.1)
+Requirement already satisfied: mpmath<1.4,>=1.1.0 in /usr/local/lib/python3.12/dist-packages (from sympy>=1.13.3->torch>=2.0->semanticengine-ssm==0.2.0) (1.3.0)
+Requirement already satisfied: MarkupSafe>=2.0 in /usr/local/lib/python3.12/dist-packages (from jinja2->torch>=2.0->semanticengine-ssm==0.2.0) (3.0.3)
+Building wheels for collected packages: semanticengine-ssm
+  Building editable for semanticengine-ssm (pyproject.toml): started
+  Running command Building editable for semanticengine-ssm (pyproject.toml)
+  running editable_wheel
+  creating /tmp/pip-ephem-wheel-cache-x2w6viqx/wheels/28/c4/bd/79da125bfcaac9e7e0049cb886ff567573387bb20a4ff167f0/tmpxqfsq2m5/.tmp-e2e188k8/semanticengine_ssm.egg-info
+  writing /tmp/pip-ephem-wheel-cache-x2w6viqx/wheels/28/c4/bd/79da125bfcaac9e7e0049cb886ff567573387bb20a4ff167f0/tmpxqfsq2m5/.tmp-e2e188k8/semanticengine_ssm.egg-info/PKG-INFO
+  writing dependency_links to /tmp/pip-ephem-wheel-cache-x2w6viqx/wheels/28/c4/bd/79da125bfcaac9e7e0049cb886ff567573387bb20a4ff167f0/tmpxqfsq2m5/.tmp-e2e188k8/semanticengine_ssm.egg-info/dependency_links.txt
+  writing requirements to /tmp/pip-ephem-wheel-cache-x2w6viqx/wheels/28/c4/bd/79da125bfcaac9e7e0049cb886ff567573387bb20a4ff167f0/tmpxqfsq2m5/.tmp-e2e188k8/semanticengine_ssm.egg-info/requires.txt
+  writing top-level names to /tmp/pip-ephem-wheel-cache-x2w6viqx/wheels/28/c4/bd/79da125bfcaac9e7e0049cb886ff567573387bb20a4ff167f0/tmpxqfsq2m5/.tmp-e2e188k8/semanticengine_ssm.egg-info/top_level.txt
+  writing manifest file '/tmp/pip-ephem-wheel-cache-x2w6viqx/wheels/28/c4/bd/79da125bfcaac9e7e0049cb886ff567573387bb20a4ff167f0/tmpxqfsq2m5/.tmp-e2e188k8/semanticengine_ssm.egg-info/SOURCES.txt'
+  reading manifest file '/tmp/pip-ephem-wheel-cache-x2w6viqx/wheels/28/c4/bd/79da125bfcaac9e7e0049cb886ff567573387bb20a4ff167f0/tmpxqfsq2m5/.tmp-e2e188k8/semanticengine_ssm.egg-info/SOURCES.txt'
+  writing manifest file '/tmp/pip-ephem-wheel-cache-x2w6viqx/wheels/28/c4/bd/79da125bfcaac9e7e0049cb886ff567573387bb20a4ff167f0/tmpxqfsq2m5/.tmp-e2e188k8/semanticengine_ssm.egg-info/SOURCES.txt'
+  creating '/tmp/pip-ephem-wheel-cache-x2w6viqx/wheels/28/c4/bd/79da125bfcaac9e7e0049cb886ff567573387bb20a4ff167f0/tmpxqfsq2m5/.tmp-e2e188k8/semanticengine_ssm-0.2.0.dist-info'
+  creating /tmp/pip-ephem-wheel-cache-x2w6viqx/wheels/28/c4/bd/79da125bfcaac9e7e0049cb886ff567573387bb20a4ff167f0/tmpxqfsq2m5/.tmp-e2e188k8/semanticengine_ssm-0.2.0.dist-info/WHEEL
+  running build_py
+  running build_ext
+  W0421 01:49:22.812000 705 torch/utils/cpp_extension.py:531] There are no x86_64-linux-gnu-g++ version bounds defined for CUDA version 13.0
+  building 'chaoscontrol.kernels._cublaslt._C' extension
+  creating /tmp/tmpl9yohuqd.build-temp/src/chaoscontrol/kernels/_cublaslt/src
+  [1/3] c++ -MMD -MF /tmp/tmpl9yohuqd.build-temp/src/chaoscontrol/kernels/_cublaslt/src/descriptor_cache.o.d -fno-strict-overflow -Wsign-compare -DNDEBUG -g -O2 -Wall -fPIC -I/workspace/chaoscontrol/src/chaoscontrol/kernels/_cublaslt/src -I/usr/local/lib/python3.12/dist-packages/nvidia/cu13/include -I/usr/local/cuda/include -I/usr/local/lib/python3.12/dist-packages/torch/include -I/usr/local/lib/python3.12/dist-packages/torch/include/torch/csrc/api/include -I/usr/local/cuda-13.0/include -I/workspace/chaoscontrol/.venv/include -I/usr/include/python3.12 -c -c /workspace/chaoscontrol/src/chaoscontrol/kernels/_cublaslt/src/descriptor_cache.cpp -o /tmp/tmpl9yohuqd.build-temp/src/chaoscontrol/kernels/_cublaslt/src/descriptor_cache.o -O3 -std=c++17 -DTORCH_API_INCLUDE_EXTENSION_H -DTORCH_EXTENSION_NAME=_C
+  [2/3] /usr/local/cuda-13.0/bin/nvcc --generate-dependencies-with-compile --dependency-output /tmp/tmpl9yohuqd.build-temp/src/chaoscontrol/kernels/_cublaslt/src/fused_amax_cast.o.d -I/workspace/chaoscontrol/src/chaoscontrol/kernels/_cublaslt/src -I/usr/local/lib/python3.12/dist-packages/nvidia/cu13/include -I/usr/local/cuda/include -I/usr/local/lib/python3.12/dist-packages/torch/include -I/usr/local/lib/python3.12/dist-packages/torch/include/torch/csrc/api/include -I/usr/local/cuda-13.0/include -I/workspace/chaoscontrol/.venv/include -I/usr/include/python3.12 -c -c /workspace/chaoscontrol/src/chaoscontrol/kernels/_cublaslt/src/fused_amax_cast.cu -o /tmp/tmpl9yohuqd.build-temp/src/chaoscontrol/kernels/_cublaslt/src/fused_amax_cast.o -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__ -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__ --expt-relaxed-constexpr --compiler-options ''"'"'-fPIC'"'"'' -O3 -std=c++17 -gencode=arch=compute_89,code=sm_89 -gencode=arch=compute_90,code=sm_90 --expt-relaxed-constexpr -Xcompiler=-fPIC -DTORCH_API_INCLUDE_EXTENSION_H -DTORCH_EXTENSION_NAME=_C
+  [3/3] c++ -MMD -MF /tmp/tmpl9yohuqd.build-temp/src/chaoscontrol/kernels/_cublaslt/src/cublaslt_fp8_matmul.o.d -fno-strict-overflow -Wsign-compare -DNDEBUG -g -O2 -Wall -fPIC -I/workspace/chaoscontrol/src/chaoscontrol/kernels/_cublaslt/src -I/usr/local/lib/python3.12/dist-packages/nvidia/cu13/include -I/usr/local/cuda/include -I/usr/local/lib/python3.12/dist-packages/torch/include -I/usr/local/lib/python3.12/dist-packages/torch/include/torch/csrc/api/include -I/usr/local/cuda-13.0/include -I/workspace/chaoscontrol/.venv/include -I/usr/include/python3.12 -c -c /workspace/chaoscontrol/src/chaoscontrol/kernels/_cublaslt/src/cublaslt_fp8_matmul.cpp -o /tmp/tmpl9yohuqd.build-temp/src/chaoscontrol/kernels/_cublaslt/src/cublaslt_fp8_matmul.o -O3 -std=c++17 -DTORCH_API_INCLUDE_EXTENSION_H -DTORCH_EXTENSION_NAME=_C
+  creating /tmp/tmp6ksj34vb.build-lib/chaoscontrol/kernels/_cublaslt
+  x86_64-linux-gnu-g++ -fno-strict-overflow -Wsign-compare -DNDEBUG -g -O2 -Wall -shared -Wl,-O1 -Wl,-Bsymbolic-functions /tmp/tmpl9yohuqd.build-temp/src/chaoscontrol/kernels/_cublaslt/src/cublaslt_fp8_matmul.o /tmp/tmpl9yohuqd.build-temp/src/chaoscontrol/kernels/_cublaslt/src/descriptor_cache.o /tmp/tmpl9yohuqd.build-temp/src/chaoscontrol/kernels/_cublaslt/src/fused_amax_cast.o -L/usr/local/lib/python3.12/dist-packages/nvidia/cu13/lib -L/usr/local/lib/python3.12/dist-packages/torch/lib -L/usr/local/cuda-13.0/lib64 -L/usr/lib/x86_64-linux-gnu -Wl,--enable-new-dtags,-rpath,/usr/local/lib/python3.12/dist-packages/nvidia/cu13/lib -lc10 -ltorch -ltorch_cpu -ltorch_python -lcudart -lc10_cuda -ltorch_cuda -o /tmp/tmp6ksj34vb.build-lib/chaoscontrol/kernels/_cublaslt/_C.cpython-312-x86_64-linux-gnu.so -l:libcublasLt.so.13 -l:libcublas.so.13 -l:libcudart.so.13
+  building 'chaoscontrol.kernels._ssm_scan._C' extension
+  creating /tmp/tmpl9yohuqd.build-temp/src/chaoscontrol/kernels/_ssm_scan/src
+  [1/3] /usr/local/cuda-13.0/bin/nvcc --generate-dependencies-with-compile --dependency-output /tmp/tmpl9yohuqd.build-temp/src/chaoscontrol/kernels/_ssm_scan/src/ssm_scan_bwd.o.d -I/workspace/chaoscontrol/src/chaoscontrol/kernels/_ssm_scan/src -I/usr/local/lib/python3.12/dist-packages/torch/include -I/usr/local/lib/python3.12/dist-packages/torch/include/torch/csrc/api/include -I/usr/local/cuda-13.0/include -I/workspace/chaoscontrol/.venv/include -I/usr/include/python3.12 -c -c /workspace/chaoscontrol/src/chaoscontrol/kernels/_ssm_scan/src/ssm_scan_bwd.cu -o /tmp/tmpl9yohuqd.build-temp/src/chaoscontrol/kernels/_ssm_scan/src/ssm_scan_bwd.o -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__ -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__ --expt-relaxed-constexpr --compiler-options ''"'"'-fPIC'"'"'' -O3 -std=c++17 -gencode=arch=compute_89,code=sm_89 -gencode=arch=compute_90,code=sm_90 --expt-relaxed-constexpr -Xcompiler=-fPIC -use_fast_math -DCCCL_DISABLE_CTK_COMPATIBILITY_CHECK -DTORCH_API_INCLUDE_EXTENSION_H -DTORCH_EXTENSION_NAME=_C
+  [2/3] /usr/local/cuda-13.0/bin/nvcc --generate-dependencies-with-compile --dependency-output /tmp/tmpl9yohuqd.build-temp/src/chaoscontrol/kernels/_ssm_scan/src/ssm_scan_fwd.o.d -I/workspace/chaoscontrol/src/chaoscontrol/kernels/_ssm_scan/src -I/usr/local/lib/python3.12/dist-packages/torch/include -I/usr/local/lib/python3.12/dist-packages/torch/include/torch/csrc/api/include -I/usr/local/cuda-13.0/include -I/workspace/chaoscontrol/.venv/include -I/usr/include/python3.12 -c -c /workspace/chaoscontrol/src/chaoscontrol/kernels/_ssm_scan/src/ssm_scan_fwd.cu -o /tmp/tmpl9yohuqd.build-temp/src/chaoscontrol/kernels/_ssm_scan/src/ssm_scan_fwd.o -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__ -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__ --expt-relaxed-constexpr --compiler-options ''"'"'-fPIC'"'"'' -O3 -std=c++17 -gencode=arch=compute_89,code=sm_89 -gencode=arch=compute_90,code=sm_90 --expt-relaxed-constexpr -Xcompiler=-fPIC -use_fast_math -DCCCL_DISABLE_CTK_COMPATIBILITY_CHECK -DTORCH_API_INCLUDE_EXTENSION_H -DTORCH_EXTENSION_NAME=_C
+  [3/3] c++ -MMD -MF /tmp/tmpl9yohuqd.build-temp/src/chaoscontrol/kernels/_ssm_scan/src/ssm_scan_binding.o.d -fno-strict-overflow -Wsign-compare -DNDEBUG -g -O2 -Wall -fPIC -I/workspace/chaoscontrol/src/chaoscontrol/kernels/_ssm_scan/src -I/usr/local/lib/python3.12/dist-packages/torch/include -I/usr/local/lib/python3.12/dist-packages/torch/include/torch/csrc/api/include -I/usr/local/cuda-13.0/include -I/workspace/chaoscontrol/.venv/include -I/usr/include/python3.12 -c -c /workspace/chaoscontrol/src/chaoscontrol/kernels/_ssm_scan/src/ssm_scan_binding.cpp -o /tmp/tmpl9yohuqd.build-temp/src/chaoscontrol/kernels/_ssm_scan/src/ssm_scan_binding.o -O3 -std=c++17 -DTORCH_API_INCLUDE_EXTENSION_H -DTORCH_EXTENSION_NAME=_C
+  creating /tmp/tmp6ksj34vb.build-lib/chaoscontrol/kernels/_ssm_scan
+  x86_64-linux-gnu-g++ -fno-strict-overflow -Wsign-compare -DNDEBUG -g -O2 -Wall -shared -Wl,-O1 -Wl,-Bsymbolic-functions /tmp/tmpl9yohuqd.build-temp/src/chaoscontrol/kernels/_ssm_scan/src/ssm_scan_binding.o /tmp/tmpl9yohuqd.build-temp/src/chaoscontrol/kernels/_ssm_scan/src/ssm_scan_bwd.o /tmp/tmpl9yohuqd.build-temp/src/chaoscontrol/kernels/_ssm_scan/src/ssm_scan_fwd.o -L/usr/local/lib/python3.12/dist-packages/torch/lib -L/usr/local/cuda-13.0/lib64 -L/usr/lib/x86_64-linux-gnu -lc10 -ltorch -ltorch_cpu -ltorch_python -lcudart -lc10_cuda -ltorch_cuda -o /tmp/tmp6ksj34vb.build-lib/chaoscontrol/kernels/_ssm_scan/_C.cpython-312-x86_64-linux-gnu.so
+  copying /tmp/tmp6ksj34vb.build-lib/chaoscontrol/kernels/_cublaslt/_C.cpython-312-x86_64-linux-gnu.so -> src/chaoscontrol/kernels/_cublaslt
+  copying /tmp/tmp6ksj34vb.build-lib/chaoscontrol/kernels/_ssm_scan/_C.cpython-312-x86_64-linux-gnu.so -> src/chaoscontrol/kernels/_ssm_scan
+  running egg_info
+  creating /tmp/tmpl9yohuqd.build-temp/semanticengine_ssm.egg-info
+  writing /tmp/tmpl9yohuqd.build-temp/semanticengine_ssm.egg-info/PKG-INFO
+  writing dependency_links to /tmp/tmpl9yohuqd.build-temp/semanticengine_ssm.egg-info/dependency_links.txt
+  writing requirements to /tmp/tmpl9yohuqd.build-temp/semanticengine_ssm.egg-info/requires.txt
+  writing top-level names to /tmp/tmpl9yohuqd.build-temp/semanticengine_ssm.egg-info/top_level.txt
+  writing manifest file '/tmp/tmpl9yohuqd.build-temp/semanticengine_ssm.egg-info/SOURCES.txt'
+  reading manifest file '/tmp/tmpl9yohuqd.build-temp/semanticengine_ssm.egg-info/SOURCES.txt'
+  writing manifest file '/tmp/tmpl9yohuqd.build-temp/semanticengine_ssm.egg-info/SOURCES.txt'
+
+          Editable install will be performed using .pth file to extend `sys.path` with:
+          ['src']
+
+  Options like `package-data`, `include/exclude-package-data` or
+  `packages.find.exclude/include` may have no effect.
+
+  adding '__editable__.semanticengine_ssm-0.2.0.pth'
+  creating '/tmp/pip-ephem-wheel-cache-x2w6viqx/wheels/28/c4/bd/79da125bfcaac9e7e0049cb886ff567573387bb20a4ff167f0/tmpxqfsq2m5/.tmp-e2e188k8/semanticengine_ssm-0.2.0-0.editable-cp312-cp312-linux_x86_64.whl' and adding '/tmp/tmppyq3v8l9semanticengine_ssm-0.2.0-0.editable-cp312-cp312-linux_x86_64.whl' to it
+  adding 'semanticengine_ssm-0.2.0.dist-info/METADATA'
+  adding 'semanticengine_ssm-0.2.0.dist-info/WHEEL'
+  adding 'semanticengine_ssm-0.2.0.dist-info/top_level.txt'
+  adding 'semanticengine_ssm-0.2.0.dist-info/RECORD'
+  Building editable for semanticengine-ssm (pyproject.toml): finished with status 'done'
+  Created wheel for semanticengine-ssm: filename=semanticengine_ssm-0.2.0-0.editable-cp312-cp312-linux_x86_64.whl size=1481 sha256=47dba60f96b7683ba2d07cfe670950a23fe047e3c99ef0dbf0b54fcf2c76ed67
+  Stored in directory: /tmp/pip-ephem-wheel-cache-x2w6viqx/wheels/28/c4/bd/79da125bfcaac9e7e0049cb886ff567573387bb20a4ff167f0
+Successfully built semanticengine-ssm
+Installing collected packages: semanticengine-ssm
+Successfully installed semanticengine-ssm

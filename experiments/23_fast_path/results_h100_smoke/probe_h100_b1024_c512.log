@@ -1,0 +1,24 @@
+[rank 0/1] probe_h100_b1024_c512 vocab=16384 batch=1024 chunk=512 ckpt=False params=10,751,232
+Traceback (most recent call last):
+  File "/workspace/chaoscontrol/experiments/23_fast_path/runner_fast_path.py", line 523, in <module>
+    raise SystemExit(main())
+                     ^^^^^^
+  File "/workspace/chaoscontrol/experiments/23_fast_path/runner_fast_path.py", line 510, in main
+    run_condition(
+  File "/workspace/chaoscontrol/experiments/23_fast_path/runner_fast_path.py", line 412, in run_condition
+    train_result = train_fast_for_budget(
+                   ^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/chaoscontrol/experiments/23_fast_path/runner_fast_path.py", line 232, in train_fast_for_budget
+    loss = _run_train_step(
+           ^^^^^^^^^^^^^^^^
+  File "/workspace/chaoscontrol/experiments/23_fast_path/runner_fast_path.py", line 135, in _run_train_step
+    loss = chunked_lm_head_backward(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/chaoscontrol/src/chaoscontrol/train_ssm.py", line 110, in chunked_lm_head_backward
+    chunk_loss = F.cross_entropy(
+                 ^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/torch/nn/functional.py", line 3458, in cross_entropy
+    return torch._C._nn.cross_entropy_loss(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 32.00 GiB. GPU 0 has a total capacity of 79.18 GiB of which 1.70 GiB is free. Including non-PyTorch memory, this process has 77.47 GiB memory in use. Of the allocated memory 76.33 GiB is allocated by PyTorch, and 495.42 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
+status=1

@@ -1,0 +1,309 @@
+#!/usr/bin/env python3
+"""Exp 23 fastest-path helpers.
+
+This module holds the parts of the fast-path experiment that are useful
+to test locally: matrix construction, vectorized batch assembly, and
+token-accounting summaries. The CUDA/DDP runner imports these helpers
+so the expensive path and the tests share one contract.
+"""
+from __future__ import annotations
+
+import copy
+import json
+import random
+from pathlib import Path
+from typing import Any
+
+import torch
+import yaml
+
+
+DEFAULT_STAGE_A_SEED = 1337
+DEFAULT_STAGE_B_SEEDS = (1337, 2674, 4011, 5348)
+
+
+def _base_fast_config(*, world_size: int, vocab_size: int) -> dict[str, Any]:
+    return {
+        "model_type": "ssm",
+        "mode": "speed_sweep",
+        "world_size": int(world_size),
+        "vocab_size": int(vocab_size),
+        "model_dim": 256,
+        "num_layers": 4,
+        "ff_mult": 2,
+        "seq_len": 512,
+        "stride": 256,
+        "eval_batches": 0,
+        "a_mode": "diag",
+        "base_lr": 0.128,
+        "weight_decay": 0.01,
+        "grad_clip_norm": 1.0,
+        "optimizer": "muon",
+        "local_attn_window": 0,
+        "local_attn_heads": 1,
+        "local_attn_dim": 64,
+        "device": "auto",
+        "dtype": "bf16",
+        "precision": "bf16",
+        "fused_grad_clip": True,
+        "fused_muon": True,
+        "compile_full_path": False,
+        "warmup_steps": 5,
+        "restore_after_warmup": False,
+        "stop_check_interval": 4,
+        "stop_margin_seconds": 2.0,
+        "budget_seconds": 90.0,
+    }
+
+
+def build_stage_a_matrix(
+    *,
+    seeds: list[int] | tuple[int, ...] = (DEFAULT_STAGE_A_SEED,),
+    vocab_sizes: list[int] | tuple[int, ...] = (16384,),
+    batch_sizes: list[int] | tuple[int, ...] = (1024, 2048, 4096),
+    chunk_sizes: list[int] | tuple[int, ...] = (64, 128, 256, 512),
+    activation_checkpoints: list[bool] | tuple[bool, ...] = (True,),
+    world_size: int = 8,
+    budget_seconds: float = 90.0,
+    base_lr: float = 0.128,
+) -> list[dict[str, Any]]:
+    """Build the Stage A speed-ceiling matrix.
+
+    Stage A is intentionally quality-light: no eval, short budget, one
+    seed by default. It exists to discover the fastest stable hot-loop
+    envelope before we spend 600s runs on base selection.
+    """
+    entries: list[dict[str, Any]] = []
+    for vocab_size in vocab_sizes:
+        base = _base_fast_config(world_size=world_size, vocab_size=vocab_size)
+        base["budget_seconds"] = float(budget_seconds)
+        base["base_lr"] = float(base_lr)
+        for batch_size in batch_sizes:
+            for chunk_size in chunk_sizes:
+                for activation_checkpoint in activation_checkpoints:
+                    ckpt_label = "ckpt" if activation_checkpoint else "nockpt"
+                    for seed in seeds:
+                        entry = copy.deepcopy(base)
+                        entry.update({
+                            "name": (
+                                f"stageA_v{vocab_size}_b{batch_size}_"
+                                f"c{chunk_size}_{ckpt_label}_s{seed}"
+                            ),
+                            "seed": int(seed),
+                            "batch_size": int(batch_size),
+                            "chunk_size": int(chunk_size),
+                            "activation_checkpoint": bool(activation_checkpoint),
+                        })
+                        entries.append(entry)
+    return entries
+
+
+def build_stage_b_matrix(
+    *,
+    speed_config: dict[str, Any],
+    seeds: list[int] | tuple[int, ...] = DEFAULT_STAGE_B_SEEDS,
+    vocab_sizes: list[int] | tuple[int, ...] = (8192, 16384),
+    init_paths: dict[int, dict[str, str]] | None = None,
+    world_size: int = 8,
+    budget_seconds: float = 600.0,
+) -> list[dict[str, Any]]:
+    """Build the Stage B base-lock matrix from a Stage A winner config."""
+    init_paths = init_paths or {}
+    entries: list[dict[str, Any]] = []
+    init_order = ("random", "meanstd", "fullcov")
+    for vocab_size in vocab_sizes:
+        base = _base_fast_config(world_size=world_size, vocab_size=vocab_size)
+        base.update(copy.deepcopy(speed_config))
+        base.update({
+            "mode": "base_lock",
+            "world_size": int(world_size),
+            "vocab_size": int(vocab_size),
+            "eval_batches": int(speed_config.get("stage_b_eval_batches", 16)),
+            "budget_seconds": float(budget_seconds),
+            "warmup_steps": int(speed_config.get("warmup_steps", 20)),
+            "restore_after_warmup": bool(
+                speed_config.get("restore_after_warmup", True)
+            ),
+        })
+        for init_name in init_order:
+            if init_name == "random":
+                path = None
+            else:
+                vocab_paths = init_paths.get(int(vocab_size), {})
+                if init_name not in vocab_paths:
+                    continue
+                path = vocab_paths[init_name]
+            for seed in seeds:
+                entry = copy.deepcopy(base)
+                entry.update({
+                    "name": f"stageB_v{vocab_size}_{init_name}_s{seed}",
+                    "seed": int(seed),
+                    "embed_init": init_name,
+                    "embed_init_path": path,
+                })
+                entries.append(entry)
+    return entries
+
+
+def batch_from_start_tensor(
+    *,
+    tokens: torch.Tensor,
+    starts: torch.Tensor,
+    seq_len: int,
+    device: torch.device,
+    vocab_size: int | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Vectorized equivalent of ``chaoscontrol.data.batch_from_starts``.
+
+    The old helper builds a Python list of ``B`` slices and stacks it.
+    This creates the whole ``(B, T+1)`` gather index tensor at once,
+    which removes Python per-example slicing from the hot loop.
+    """
+    if starts.ndim != 1:
+        raise ValueError(f"starts must be 1D, got shape={tuple(starts.shape)}")
+    offsets = torch.arange(seq_len + 1, dtype=torch.long, device=starts.device)
+    positions = starts.to(dtype=torch.long)[:, None] + offsets[None, :]
+    batch = tokens[positions.reshape(-1)].view(starts.numel(), seq_len + 1)
+    batch = batch.to(device=device, dtype=torch.long, non_blocking=True)
+    if vocab_size is not None:
+        batch.clamp_(0, int(vocab_size) - 1)
+    return batch[:, :-1], batch[:, 1:]
+
+
+def count_lm_starts(num_tokens: int, seq_len: int, stride: int) -> int:
+    """Count ``range(0, num_tokens - seq_len - 1, stride)`` without listing it."""
+    if stride <= 0:
+        raise ValueError(f"stride must be positive, got {stride}")
+    stop = int(num_tokens) - int(seq_len) - 1
+    if stop <= 0:
+        return 0
+    return ((stop - 1) // int(stride)) + 1
+
+
+def count_sharded_lm_starts(
+    *,
+    total_starts: int,
+    rank: int,
+    world_size: int,
+) -> int:
+    """Count starts with global start-index ``i`` where ``i % world_size == rank``."""
+    total_starts = int(total_starts)
+    rank = int(rank)
+    world_size = int(world_size)
+    if world_size <= 0:
+        raise ValueError(f"world_size must be positive, got {world_size}")
+    if rank < 0 or rank >= world_size:
+        raise ValueError(f"rank must be in [0, {world_size}), got {rank}")
+    if rank >= total_starts:
+        return 0
+    return ((total_starts - 1 - rank) // world_size) + 1
+
+
+def sample_sharded_lm_starts(
+    *,
+    num_tokens: int,
+    seq_len: int,
+    stride: int,
+    batch_size: int,
+    rank: int,
+    world_size: int,
+    generator: torch.Generator,
+) -> torch.Tensor:
+    """Sample valid LM start offsets for one DDP rank without materializing all starts.
+
+    The eager baseline uses ``build_lm_starts(...)[rank::world_size]`` and then
+    samples from that list. For 10B tokens that list is tens of millions of
+    Python integers. This helper samples the equivalent sharded start-index
+    range directly and maps indices back to byte/token offsets.
+    """
+    total = count_lm_starts(num_tokens, seq_len, stride)
+    sharded = count_sharded_lm_starts(
+        total_starts=total,
+        rank=rank,
+        world_size=world_size,
+    )
+    if sharded <= 0:
+        raise RuntimeError(
+            f"rank {rank} has no train starts after world_size={world_size} sharding"
+        )
+    local_idx = torch.randint(
+        low=0,
+        high=sharded,
+        size=(int(batch_size),),
+        generator=generator,
+        dtype=torch.long,
+    )
+    global_idx = int(rank) + local_idx * int(world_size)
+    return global_idx * int(stride)
+
+
+def choose_lm_starts_lazy(
+    *,
+    num_tokens: int,
+    seq_len: int,
+    stride: int,
+    batch_size: int,
+    eval_batches: int,
+    seed: int,
+) -> list[int]:
+    """Choose eval starts without building the full validation-start list."""
+    needed = int(batch_size) * int(eval_batches)
+    if needed <= 0:
+        return []
+    total = count_lm_starts(num_tokens, seq_len, stride)
+    if total <= 0:
+        return []
+    if total <= needed:
+        return [idx * int(stride) for idx in range(total)]
+    rng = random.Random(int(seed))
+    return [idx * int(stride) for idx in rng.sample(range(total), needed)]
+
+
+def summarize_train_timing(
+    *,
+    steps: int,
+    elapsed_s: float,
+    batch_size: int,
+    seq_len: int,
+    world_size: int,
+) -> dict[str, float | int]:
+    tokens_per_step = int(batch_size) * int(seq_len) * int(world_size)
+    aggregate = (int(steps) * tokens_per_step) / max(float(elapsed_s), 1e-9)
+    return {
+        "tokens_per_step": tokens_per_step,
+        "aggregate_tokens_per_sec": float(aggregate),
+        "per_gpu_tokens_per_sec": float(aggregate / max(int(world_size), 1)),
+    }
+
+
+def should_stop_training_loop(
+    *,
+    steps: int,
+    elapsed_s: float,
+    budget_seconds: float,
+    stop_margin_seconds: float,
+    max_steps: int | None = None,
+) -> bool:
+    """Shared stop predicate for budgeted training and fixed-step warmup."""
+    if int(steps) <= 0:
+        return False
+    if max_steps is not None and int(steps) >= int(max_steps):
+        return True
+    effective_budget = max(0.0, float(budget_seconds) - float(stop_margin_seconds))
+    return float(elapsed_s) >= effective_budget
+
+
+def write_matrix(path: Path, entries: list[dict[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(entries, indent=2, default=str))
+
+
+def read_speed_config(path: Path) -> dict[str, Any]:
+    text = path.read_text()
+    if path.suffix.lower() in {".yaml", ".yml"}:
+        data = yaml.safe_load(text)
+    else:
+        data = json.loads(text)
+    if "config" in data:
+        return dict(data["config"])
+    return dict(data)

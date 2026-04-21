@@ -1,0 +1,9 @@
+Processing ./.
+  Preparing metadata (pyproject.toml): started
+  Preparing metadata (pyproject.toml): finished with status 'done'
+Building wheels for collected packages: semanticengine-ssm
+  Building wheel for semanticengine-ssm (pyproject.toml): started
+  Building wheel for semanticengine-ssm (pyproject.toml): finished with status 'done'
+  Created wheel for semanticengine-ssm: filename=semanticengine_ssm-0.2.0-cp312-cp312-linux_x86_64.whl size=6403713 sha256=45c0ac043af237af2f95a88c3546c30431243a72b4e0341143963c621636bec5
+  Stored in directory: /tmp/pip-ephem-wheel-cache-xv0pxuc7/wheels/28/c4/bd/79da125bfcaac9e7e0049cb886ff567573387bb20a4ff167f0
+Successfully built semanticengine-ssm
