@@ -171,6 +171,67 @@ std::tuple<at::Tensor, at::Tensor> linear_ce_streaming_forward(
     return {loss, lse};
 }
 
+at::Tensor make_tile_workspace(
+    const at::Tensor& x,
+    int64_t rows,
+    int64_t vocab,
+    int64_t tile_size) {
+    const int64_t cols = std::min<int64_t>(tile_size, vocab);
+    return at::empty({rows, cols}, x.options());
+}
+
+at::Tensor full_or_partial_tile(
+    const at::Tensor& workspace,
+    const at::Tensor& x,
+    int64_t rows,
+    int64_t cols) {
+    if (cols == workspace.size(1)) {
+        return workspace;
+    }
+    return at::empty({rows, cols}, x.options());
+}
+
+std::tuple<at::Tensor, at::Tensor> linear_ce_streaming_v2_forward(
+    const at::Tensor& x,
+    const at::Tensor& weight,
+    const at::Tensor& targets,
+    int64_t reduction,
+    int64_t tile_size) {
+    check_linear_ce_inputs(
+        x, weight, targets, reduction, tile_size,
+        "lm_head_loss linear_ce_streaming_v2_forward");
+
+    const auto rows = x.size(0);
+    const auto vocab = weight.size(0);
+    auto stats_options = x.options().dtype(at::kFloat);
+    auto row_max = at::full(
+        {rows},
+        -std::numeric_limits<float>::infinity(),
+        stats_options);
+    auto row_sum = at::zeros({rows}, stats_options);
+    auto target_logits = at::full(
+        {rows},
+        -std::numeric_limits<float>::infinity(),
+        stats_options);
+    auto logits_workspace = make_tile_workspace(x, rows, vocab, tile_size);
+
+    for (int64_t start = 0; start < vocab; start += tile_size) {
+        const int64_t cols = std::min<int64_t>(tile_size, vocab - start);
+        auto weight_tile = weight.narrow(0, start, cols);
+        auto logits = full_or_partial_tile(logits_workspace, x, rows, cols);
+        at::mm_out(logits, x, weight_tile.transpose(0, 1));
+        launch_linear_ce_update_online(
+            logits, targets, row_max, row_sum, target_logits, start);
+    }
+
+    auto lse = row_max + row_sum.log();
+    auto loss_rows = lse - target_logits;
+    auto loss = reduction == static_cast<int64_t>(Reduction::Mean)
+        ? loss_rows.mean()
+        : loss_rows.sum();
+    return {loss, lse};
+}
+
 std::tuple<at::Tensor, at::Tensor> linear_ce_backward(
     const at::Tensor& grad_loss,
     const at::Tensor& x,
@@ -226,6 +287,53 @@ std::tuple<at::Tensor, at::Tensor> linear_ce_streaming_backward(
         grad_loss, x, weight, targets, lse, reduction, tile_size);
 }
 
+std::tuple<at::Tensor, at::Tensor> linear_ce_streaming_v2_backward(
+    const at::Tensor& grad_loss,
+    const at::Tensor& x,
+    const at::Tensor& weight,
+    const at::Tensor& targets,
+    const at::Tensor& lse,
+    int64_t reduction,
+    int64_t tile_size) {
+    check_linear_ce_inputs(
+        x, weight, targets, reduction, tile_size,
+        "lm_head_loss linear_ce_streaming_v2_backward");
+    TORCH_CHECK(grad_loss.is_cuda(), "lm_head_loss linear_ce_streaming_v2_backward: grad_loss must be CUDA");
+    TORCH_CHECK(lse.is_cuda(), "lm_head_loss linear_ce_streaming_v2_backward: lse must be CUDA");
+    TORCH_CHECK(grad_loss.numel() == 1, "lm_head_loss linear_ce_streaming_v2_backward: grad_loss must be scalar");
+    TORCH_CHECK(lse.is_contiguous(), "lm_head_loss linear_ce_streaming_v2_backward: lse must be contiguous");
+    TORCH_CHECK(lse.dim() == 1 && lse.size(0) == x.size(0),
+                "lm_head_loss linear_ce_streaming_v2_backward: lse row mismatch");
+
+    const auto rows = x.size(0);
+    const auto vocab = weight.size(0);
+    const double divisor = reduction == static_cast<int64_t>(Reduction::Mean)
+        ? static_cast<double>(rows)
+        : 1.0;
+    auto grad_loss_f = grad_loss.to(at::kFloat).contiguous();
+    auto grad_x = at::zeros_like(x);
+    auto grad_weight = at::empty_like(weight);
+    auto logits_workspace = make_tile_workspace(x, rows, vocab, tile_size);
+    auto grad_logits_workspace = make_tile_workspace(x, rows, vocab, tile_size);
+
+    for (int64_t start = 0; start < vocab; start += tile_size) {
+        const int64_t cols = std::min<int64_t>(tile_size, vocab - start);
+        auto weight_tile = weight.narrow(0, start, cols);
+        auto logits = full_or_partial_tile(logits_workspace, x, rows, cols);
+        auto grad_logits = full_or_partial_tile(
+            grad_logits_workspace, x, rows, cols);
+        at::mm_out(logits, x, weight_tile.transpose(0, 1));
+        launch_linear_ce_fill_grad_logits(
+            logits, targets, lse, grad_loss_f, grad_logits, start, divisor);
+
+        at::addmm_out(grad_x, grad_x, grad_logits, weight_tile, 1.0, 1.0);
+        auto grad_weight_tile = grad_weight.narrow(0, start, cols);
+        at::mm_out(grad_weight_tile, grad_logits.transpose(0, 1), x);
+    }
+
+    return {grad_x, grad_weight};
+}
+
 }  // namespace cc_lm_head_loss
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -241,4 +349,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "One-pass tiled linear+cross-entropy forward for Exp23 LM-head path");
     m.def("linear_ce_streaming_backward", &cc_lm_head_loss::linear_ce_streaming_backward,
           "Tiled linear+cross-entropy backward for one-pass Exp23 LM-head path");
+    m.def("linear_ce_streaming_v2_forward", &cc_lm_head_loss::linear_ce_streaming_v2_forward,
+          "Workspace-backed one-pass tiled linear+cross-entropy forward for Exp23");
+    m.def("linear_ce_streaming_v2_backward", &cc_lm_head_loss::linear_ce_streaming_v2_backward,
+          "Workspace-backed tiled linear+cross-entropy backward for Exp23");
 }

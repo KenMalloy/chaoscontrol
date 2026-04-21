@@ -134,6 +134,7 @@ def _run_train_step(
     world_size: int,
     compile_full_path: bool = False,
     lm_head_backward_mode: str = "fused",
+    lm_head_tile_size: int = 1024,
 ) -> torch.Tensor:
     _reject_unsupported(model)
     with autocast_context(precision, device_type=inputs.device.type):
@@ -148,16 +149,21 @@ def _run_train_step(
                 lm_head=model.lm_head,
                 targets=targets,
             )
-        elif lm_head_backward_mode in {"fused", "fused_streaming"}:
+        elif lm_head_backward_mode in {"fused", "fused_streaming", "fused_streaming_v2"}:
             loss = fused_lm_head_backward(
                 hidden=hidden,
                 final_norm=model.final_norm,
                 lm_head=model.lm_head,
                 targets=targets,
+                tile_size=int(lm_head_tile_size),
                 backend=(
-                    "streaming"
-                    if lm_head_backward_mode == "fused_streaming"
-                    else "auto"
+                    "streaming_v2"
+                    if lm_head_backward_mode == "fused_streaming_v2"
+                    else (
+                        "streaming"
+                        if lm_head_backward_mode == "fused_streaming"
+                        else "auto"
+                    )
                 ),
             )
         elif lm_head_backward_mode == "chunked":
@@ -173,7 +179,7 @@ def _run_train_step(
         else:
             raise ValueError(
                 "lm_head_backward_mode must be 'chunked', 'single', "
-                "'fused', or 'fused_streaming', got "
+                "'fused', 'fused_streaming', or 'fused_streaming_v2', got "
                 f"{lm_head_backward_mode!r}"
             )
     if ddp_active and world_size > 1:
@@ -206,7 +212,7 @@ def _cuda_graph_rejection_reasons(
         reasons.append("ddp_not_supported")
     if compile_full_path:
         reasons.append("compile_full_path_not_supported")
-    if lm_head_backward_mode not in {"fused", "fused_streaming"}:
+    if lm_head_backward_mode not in {"fused", "fused_streaming", "fused_streaming_v2"}:
         reasons.append("fused_lm_head_required")
     return reasons
 
@@ -331,6 +337,7 @@ def _train_fast_for_budget_cuda_graph(
     compile_full_path: bool,
     prefetch_batches: bool,
     lm_head_backward_mode: str,
+    lm_head_tile_size: int,
     cuda_graph_mode: str,
     cuda_graph_min_total_speedup: float,
     cuda_graph_max_capture_seconds: float,
@@ -389,6 +396,7 @@ def _train_fast_for_budget_cuda_graph(
                     world_size=world_size_,
                     compile_full_path=compile_full_path,
                     lm_head_backward_mode=lm_head_backward_mode,
+                    lm_head_tile_size=lm_head_tile_size,
                 )
                 _apply_grad_clip(
                     model=model,
@@ -419,6 +427,7 @@ def _train_fast_for_budget_cuda_graph(
                 world_size=world_size_,
                 compile_full_path=compile_full_path,
                 lm_head_backward_mode=lm_head_backward_mode,
+                lm_head_tile_size=lm_head_tile_size,
             )
             _apply_grad_clip(
                 model=model,
@@ -537,6 +546,7 @@ def train_fast_for_budget(
     compile_full_path: bool = False,
     prefetch_batches: bool = False,
     lm_head_backward_mode: str = "fused",
+    lm_head_tile_size: int = 1024,
     cuda_graph_mode: str = "none",
     cuda_graph_min_total_speedup: float = 0.05,
     cuda_graph_max_capture_seconds: float = 30.0,
@@ -596,6 +606,7 @@ def train_fast_for_budget(
                     compile_full_path=compile_full_path,
                     prefetch_batches=prefetch_batches,
                     lm_head_backward_mode=lm_head_backward_mode,
+                    lm_head_tile_size=lm_head_tile_size,
                     cuda_graph_mode=graph_mode,
                     cuda_graph_min_total_speedup=cuda_graph_min_total_speedup,
                     cuda_graph_max_capture_seconds=cuda_graph_max_capture_seconds,
@@ -685,6 +696,7 @@ def train_fast_for_budget(
                 world_size=world_size_,
                 compile_full_path=compile_full_path,
                 lm_head_backward_mode=lm_head_backward_mode,
+                lm_head_tile_size=lm_head_tile_size,
             )
             if grad_clip_norm > 0.0:
                 if fused_grad_clip:
@@ -775,6 +787,7 @@ def _warmup(
         compile_full_path=bool(config.get("compile_full_path", False)),
         prefetch_batches=bool(config.get("prefetch_batches", True)),
         lm_head_backward_mode=str(config.get("lm_head_backward_mode", "fused")),
+        lm_head_tile_size=int(config.get("lm_head_tile_size", 1024)),
         cuda_graph_mode="none",
     )
 
@@ -891,6 +904,7 @@ def run_condition(
         compile_full_path=bool(config.get("compile_full_path", False)),
         prefetch_batches=bool(config.get("prefetch_batches", True)),
         lm_head_backward_mode=str(config.get("lm_head_backward_mode", "fused")),
+        lm_head_tile_size=int(config.get("lm_head_tile_size", 1024)),
         cuda_graph_mode=str(config.get("cuda_graph_mode", "none")),
         cuda_graph_min_total_speedup=float(
             config.get("cuda_graph_min_total_speedup", 0.05)

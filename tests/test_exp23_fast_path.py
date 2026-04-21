@@ -180,7 +180,8 @@ def test_stage_a_matrix_names_and_fast_defaults():
         assert entry["cuda_graph_mode"] == "none"
         assert entry["cuda_graph_min_total_speedup"] == 0.05
         assert entry["cuda_graph_max_capture_seconds"] == 30.0
-        assert entry["lm_head_backward_mode"] == "fused"
+        assert entry["lm_head_backward_mode"] == "fused_streaming_v2"
+        assert entry["lm_head_tile_size"] == 8192
         assert entry["prefetch_batches"] is True
         assert entry["eval_batches"] == 0
         assert entry["warmup_steps"] == 5
@@ -623,6 +624,42 @@ def test_run_train_step_can_use_streaming_fused_backward(monkeypatch):
 
     assert loss.ndim == 0
     assert calls == ["streaming"]
+    assert model.encoder.weight.grad is not None
+
+
+def test_run_train_step_can_use_streaming_v2_fused_backward(monkeypatch):
+    mod = _load_runner_module()
+
+    calls: list[tuple[str | None, int]] = []
+
+    def fake_fused(**kwargs):
+        calls.append((kwargs.get("backend"), kwargs["tile_size"]))
+        hidden = kwargs["hidden"]
+        loss = hidden.float().pow(2).mean()
+        loss.backward()
+        return loss.detach()
+
+    monkeypatch.setattr(mod, "fused_lm_head_backward", fake_fused)
+
+    model = _TinyTrainStepModel()
+    inputs = torch.randn(2, 3, 4)
+    targets = torch.zeros(2, 3, dtype=torch.long)
+
+    loss = mod._run_train_step(
+        model=model,
+        inputs=inputs,
+        targets=targets,
+        chunk_size=2,
+        precision="bf16",
+        ddp_active=False,
+        world_size=1,
+        compile_full_path=False,
+        lm_head_backward_mode="fused_streaming_v2",
+        lm_head_tile_size=4096,
+    )
+
+    assert loss.ndim == 0
+    assert calls == [("streaming_v2", 4096)]
     assert model.encoder.weight.grad is not None
 
 

@@ -124,6 +124,32 @@ def test_fused_linear_cross_entropy_streaming_cpu_fallback_matches_reference_bac
     assert torch.allclose(w_ref.grad, w_new.grad, atol=0.0, rtol=0.0)
 
 
+def test_fused_linear_cross_entropy_streaming_v2_cpu_fallback_matches_reference_backward():
+    torch.manual_seed(222)
+    x_ref = torch.randn(3, 5, 7, requires_grad=True)
+    w_ref = (torch.randn(11, 7) * 0.1).requires_grad_(True)
+    targets = torch.randint(0, 11, (3, 5), dtype=torch.long)
+    x_new = x_ref.detach().clone().requires_grad_(True)
+    w_new = w_ref.detach().clone().requires_grad_(True)
+
+    loss_ref = _reference_linear_ce(x_ref, w_ref, targets)
+    loss_new = fused_linear_cross_entropy(
+        x_new,
+        w_new,
+        targets,
+        reduction="mean",
+        tile_size=4,
+        backend="streaming_v2",
+    )
+
+    assert torch.allclose(loss_ref, loss_new, atol=0.0, rtol=0.0)
+    loss_ref.backward()
+    loss_new.backward()
+
+    assert torch.allclose(x_ref.grad, x_new.grad, atol=0.0, rtol=0.0)
+    assert torch.allclose(w_ref.grad, w_new.grad, atol=0.0, rtol=0.0)
+
+
 def test_fused_linear_cross_entropy_rejects_bad_reduction():
     x = torch.randn(2, 3, requires_grad=True)
     w = torch.randn(5, 3, requires_grad=True)
@@ -199,6 +225,45 @@ def test_fused_linear_cross_entropy_cuda_streaming_matches_reference_if_availabl
         reduction="mean",
         tile_size=5,
         backend="streaming",
+    )
+
+    assert torch.allclose(loss_ref, loss_new, atol=2e-5, rtol=2e-5)
+    loss_ref.backward()
+    loss_new.backward()
+
+    assert torch.allclose(x_ref.grad, x_new.grad, atol=2e-5, rtol=2e-5)
+    assert torch.allclose(w_ref.grad, w_new.grad, atol=2e-5, rtol=2e-5)
+
+
+def test_fused_linear_cross_entropy_cuda_streaming_v2_matches_reference_if_available():
+    if (
+        not torch.cuda.is_available()
+        or lm_head_loss._C is None
+    ):
+        pytest.skip(
+            "CUDA fused linear+CE kernel is not available in this environment; "
+            "run fallback tests locally and this test on a CUDA pod."
+        )
+    assert hasattr(lm_head_loss._C, "linear_ce_streaming_v2_forward")
+    assert hasattr(lm_head_loss._C, "linear_ce_streaming_v2_backward")
+
+    torch.manual_seed(333)
+    x_ref = torch.randn(
+        4, 6, 9, device="cuda", dtype=torch.float32, requires_grad=True,
+    )
+    w_ref = (torch.randn(17, 9, device="cuda") * 0.1).requires_grad_(True)
+    targets = torch.randint(0, 17, (4, 6), device="cuda", dtype=torch.long)
+    x_new = x_ref.detach().clone().requires_grad_(True)
+    w_new = w_ref.detach().clone().requires_grad_(True)
+
+    loss_ref = _reference_linear_ce(x_ref, w_ref, targets)
+    loss_new = fused_linear_cross_entropy(
+        x_new,
+        w_new,
+        targets,
+        reduction="mean",
+        tile_size=5,
+        backend="streaming_v2",
     )
 
     assert torch.allclose(loss_ref, loss_new, atol=2e-5, rtol=2e-5)

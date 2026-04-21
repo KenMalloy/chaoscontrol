@@ -439,10 +439,10 @@ class TestTrainSSMStepEquivalence:
             assert d < 1e-5, f"fused-backward grad mismatch on {name!r}: {d}"
 
     def test_fused_backward_uses_fused_linear_ce_hook(self, monkeypatch) -> None:
-        calls: list[tuple[torch.Size, torch.Size, torch.Size]] = []
+        calls: list[tuple[torch.Size, torch.Size, torch.Size, int]] = []
 
         def fake_fused_linear_ce(x, weight, targets, **kwargs):
-            calls.append((x.shape, weight.shape, targets.shape))
+            calls.append((x.shape, weight.shape, targets.shape, kwargs["tile_size"]))
             loss = x.float().pow(2).mean() + weight.float().pow(2).mean() * 0.0
             return loss
 
@@ -458,10 +458,23 @@ class TestTrainSSMStepEquivalence:
         lm_head = torch.nn.Linear(4, 6, bias=False)
         targets = torch.zeros(2, 3, dtype=torch.long)
 
-        loss = fused_lm_head_backward(hidden, final_norm, lm_head, targets)
+        loss = fused_lm_head_backward(
+            hidden,
+            final_norm,
+            lm_head,
+            targets,
+            tile_size=4096,
+        )
 
         assert loss.ndim == 0
-        assert calls == [(torch.Size([2, 3, 4]), torch.Size([6, 4]), torch.Size([2, 3]))]
+        assert calls == [
+            (
+                torch.Size([2, 3, 4]),
+                torch.Size([6, 4]),
+                torch.Size([2, 3]),
+                4096,
+            )
+        ]
 
 
 class TestTrainSSMStepRejectsUnsupportedConfigs:
