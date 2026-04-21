@@ -1,0 +1,2 @@
+=== running h100_b1024_c64_prefetch_compile ===
+[rank 0/1] h100_b1024_c64_prefetch_compile vocab=16384 batch=1024 chunk=64 ckpt=False params=10,751,232

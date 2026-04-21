@@ -1,0 +1,2 @@
+[rank 0/1] h100_b1024_c128_prefetch vocab=16384 batch=1024 chunk=128 ckpt=False params=10,751,232
+[rank 0/1] done steps=40 tok/s=2165168 loss=8.3455 vram=57225.6MB
