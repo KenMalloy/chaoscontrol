@@ -11,8 +11,10 @@ from __future__ import annotations
 import copy
 import json
 import random
+import threading
+from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import torch
 import yaml
@@ -52,6 +54,7 @@ def _base_fast_config(*, world_size: int, vocab_size: int) -> dict[str, Any]:
         "restore_after_warmup": False,
         "stop_check_interval": 4,
         "stop_margin_seconds": 2.0,
+        "prefetch_batches": True,
         "budget_seconds": 90.0,
     }
 
@@ -168,6 +171,151 @@ def batch_from_start_tensor(
     if vocab_size is not None:
         batch.clamp_(0, int(vocab_size) - 1)
     return batch[:, :-1], batch[:, 1:]
+
+
+def _build_prefetched_lm_batch(
+    *,
+    tokens: torch.Tensor,
+    seq_len: int,
+    stride: int,
+    batch_size: int,
+    rank: int,
+    world_size: int,
+    generator: torch.Generator,
+    device: torch.device,
+    vocab_size: int | None,
+    batch_sampler: Callable[..., torch.Tensor],
+    batch_builder: Callable[..., tuple[torch.Tensor, torch.Tensor]],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    starts = batch_sampler(
+        num_tokens=int(tokens.numel()),
+        seq_len=int(seq_len),
+        stride=int(stride),
+        batch_size=int(batch_size),
+        rank=int(rank),
+        world_size=int(world_size),
+        generator=generator,
+    )
+    return batch_builder(
+        tokens=tokens,
+        starts=starts,
+        seq_len=int(seq_len),
+        device=device,
+        vocab_size=vocab_size,
+    )
+
+
+class Exp23BatchPrefetcher:
+    """One-step-ahead LM batch prefetcher for Exp23.
+
+    Call ``prime()`` once before the hot loop. Each ``next()`` returns the
+    batch that was prefetched on the previous step and immediately starts
+    preparing the following batch.
+    """
+
+    def __init__(
+        self,
+        *,
+        tokens: torch.Tensor,
+        seq_len: int,
+        stride: int,
+        batch_size: int,
+        rank: int,
+        world_size: int,
+        device: torch.device,
+        generator: torch.Generator,
+        vocab_size: int | None = None,
+        batch_sampler: Callable[..., torch.Tensor] | None = None,
+        batch_builder: Callable[..., tuple[torch.Tensor, torch.Tensor]] = batch_from_start_tensor,
+        executor: ThreadPoolExecutor | None = None,
+    ) -> None:
+        self._tokens = tokens
+        self._seq_len = int(seq_len)
+        self._stride = int(stride)
+        self._batch_size = int(batch_size)
+        self._rank = int(rank)
+        self._world_size = int(world_size)
+        self._device = torch.device(device)
+        self._generator = generator
+        self._vocab_size = None if vocab_size is None else int(vocab_size)
+        self._batch_sampler = batch_sampler or sample_sharded_lm_starts
+        self._batch_builder = batch_builder
+        self._executor = executor or ThreadPoolExecutor(max_workers=1)
+        self._owns_executor = executor is None
+        self._pending: Future[tuple[torch.Tensor, torch.Tensor]] | None = None
+        self._closed = False
+        self._lock = threading.Lock()
+
+    def _submit_next(self) -> Future[tuple[torch.Tensor, torch.Tensor]]:
+        return self._executor.submit(
+            _build_prefetched_lm_batch,
+            tokens=self._tokens,
+            seq_len=self._seq_len,
+            stride=self._stride,
+            batch_size=self._batch_size,
+            rank=self._rank,
+            world_size=self._world_size,
+            generator=self._generator,
+            device=self._device,
+            vocab_size=self._vocab_size,
+            batch_sampler=self._batch_sampler,
+            batch_builder=self._batch_builder,
+        )
+
+    def prime(self) -> "Exp23BatchPrefetcher":
+        """Start prefetching the first batch."""
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("prefetcher is closed")
+            if self._pending is None:
+                self._pending = self._submit_next()
+        return self
+
+    def next(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return the current prefetched batch and queue the next one."""
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("prefetcher is closed")
+            pending = self._pending
+            if pending is None:
+                batch = _build_prefetched_lm_batch(
+                    tokens=self._tokens,
+                    seq_len=self._seq_len,
+                    stride=self._stride,
+                    batch_size=self._batch_size,
+                    rank=self._rank,
+                    world_size=self._world_size,
+                    generator=self._generator,
+                    device=self._device,
+                    vocab_size=self._vocab_size,
+                    batch_sampler=self._batch_sampler,
+                    batch_builder=self._batch_builder,
+                )
+            else:
+                self._pending = None
+                batch = pending.result()
+            if self._closed:
+                return batch
+            self._pending = self._submit_next()
+        return batch
+
+    def close(self) -> None:
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            pending = self._pending
+            self._pending = None
+        if pending is not None:
+            pending.cancel()
+        if self._owns_executor:
+            self._executor.shutdown(wait=True, cancel_futures=True)
+
+    def __enter__(self) -> "Exp23BatchPrefetcher":
+        return self.prime()
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.close()
 
 
 def count_lm_starts(num_tokens: int, seq_len: int, stride: int) -> int:

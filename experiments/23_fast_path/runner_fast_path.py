@@ -46,10 +46,12 @@ from chaoscontrol.optim.lamb import LAMB  # noqa: E402
 from chaoscontrol.optim.muon import Muon  # noqa: E402
 from chaoscontrol.precision import autocast_context  # noqa: E402
 from chaoscontrol.train_ssm import (  # noqa: E402
+    _compiled_step_fn,
     _reject_unsupported,
     chunked_lm_head_backward,
 )
 from fast_path import (  # noqa: E402
+    Exp23BatchPrefetcher,
     batch_from_start_tensor,
     choose_lm_starts_lazy,
     should_stop_training_loop,
@@ -127,10 +129,14 @@ def _run_train_step(
     precision: str,
     ddp_active: bool,
     world_size: int,
+    compile_full_path: bool = False,
 ) -> torch.Tensor:
     _reject_unsupported(model)
     with autocast_context(precision, device_type=inputs.device.type):
-        hidden = model.encode(inputs)
+        if compile_full_path:
+            hidden = _compiled_step_fn()(model, inputs)
+        else:
+            hidden = model.encode(inputs)
         hidden_for_ce = hidden.detach().requires_grad_(True)
         loss = chunked_lm_head_backward(
             hidden=hidden_for_ce,
@@ -178,6 +184,8 @@ def train_fast_for_budget(
     stop_margin_seconds: float,
     vocab_size: int,
     max_steps: int | None = None,
+    compile_full_path: bool = False,
+    prefetch_batches: bool = False,
 ) -> dict[str, Any]:
     rank_ = int(rank)
     world_size_ = int(world_size)
@@ -196,56 +204,80 @@ def train_fast_for_budget(
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
 
-    while True:
-        check_interval = max(1, int(stop_check_interval))
-        max_steps_reached = max_steps is not None and steps >= int(max_steps)
-        if steps == 0 or steps % check_interval == 0 or max_steps_reached:
-            elapsed = time.perf_counter() - start_time
-            local_stop = should_stop_training_loop(
-                steps=steps,
-                elapsed_s=elapsed,
-                budget_seconds=budget_seconds,
-                stop_margin_seconds=stop_margin_seconds,
-                max_steps=max_steps,
-            )
-            if should_stop_now(local_stop, device, ddp_active):
-                break
-
-        starts = sample_sharded_lm_starts(
-            num_tokens=train_num_tokens,
+    prefetcher = None
+    if prefetch_batches:
+        prefetcher = Exp23BatchPrefetcher(
+            tokens=train_tokens,
             seq_len=seq_len,
             stride=stride,
             batch_size=batch_size,
             rank=rank_,
             world_size=world_size_,
-            generator=rng,
-        )
-        inputs, targets = batch_from_start_tensor(
-            tokens=train_tokens,
-            starts=starts,
-            seq_len=seq_len,
             device=device,
+            generator=rng,
             vocab_size=vocab_size,
         )
 
-        optimizer.zero_grad(set_to_none=True)
-        loss = _run_train_step(
-            model=model,
-            inputs=inputs,
-            targets=targets,
-            chunk_size=chunk_size,
-            precision=precision,
-            ddp_active=ddp_active,
-            world_size=world_size_,
-        )
-        if grad_clip_norm > 0.0:
-            if fused_grad_clip:
-                clip_grad_norm_fused(model.parameters(), grad_clip_norm)
+    try:
+        while True:
+            check_interval = max(1, int(stop_check_interval))
+            max_steps_reached = max_steps is not None and steps >= int(max_steps)
+            if steps == 0 or steps % check_interval == 0 or max_steps_reached:
+                elapsed = time.perf_counter() - start_time
+                local_stop = should_stop_training_loop(
+                    steps=steps,
+                    elapsed_s=elapsed,
+                    budget_seconds=budget_seconds,
+                    stop_margin_seconds=stop_margin_seconds,
+                    max_steps=max_steps,
+                )
+                if should_stop_now(local_stop, device, ddp_active):
+                    break
+
+            if prefetcher is not None:
+                if steps == 0:
+                    prefetcher.prime()
+                inputs, targets = prefetcher.next()
             else:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
-        optimizer.step()
-        losses.append(loss.detach())
-        steps += 1
+                starts = sample_sharded_lm_starts(
+                    num_tokens=train_num_tokens,
+                    seq_len=seq_len,
+                    stride=stride,
+                    batch_size=batch_size,
+                    rank=rank_,
+                    world_size=world_size_,
+                    generator=rng,
+                )
+                inputs, targets = batch_from_start_tensor(
+                    tokens=train_tokens,
+                    starts=starts,
+                    seq_len=seq_len,
+                    device=device,
+                    vocab_size=vocab_size,
+                )
+
+            optimizer.zero_grad(set_to_none=True)
+            loss = _run_train_step(
+                model=model,
+                inputs=inputs,
+                targets=targets,
+                chunk_size=chunk_size,
+                precision=precision,
+                ddp_active=ddp_active,
+                world_size=world_size_,
+                compile_full_path=compile_full_path,
+            )
+            if grad_clip_norm > 0.0:
+                if fused_grad_clip:
+                    clip_grad_norm_fused(model.parameters(), grad_clip_norm)
+                else:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
+            optimizer.step()
+            losses.append(loss.detach())
+            steps += 1
+    finally:
+        if prefetcher is not None:
+            prefetcher.close()
 
     if ddp_active:
         dist.barrier()
@@ -317,6 +349,8 @@ def _warmup(
         stop_margin_seconds=0.0,
         vocab_size=vocab_size,
         max_steps=steps,
+        compile_full_path=bool(config.get("compile_full_path", False)),
+        prefetch_batches=bool(config.get("prefetch_batches", True)),
     )
 
 
@@ -429,6 +463,8 @@ def run_condition(
         stop_check_interval=int(config.get("stop_check_interval", 4)),
         stop_margin_seconds=float(config.get("stop_margin_seconds", 2.0)),
         vocab_size=vocab_size,
+        compile_full_path=bool(config.get("compile_full_path", False)),
+        prefetch_batches=bool(config.get("prefetch_batches", True)),
     )
 
     if ddp_active:

@@ -5,12 +5,15 @@ import importlib.util
 from pathlib import Path
 
 import torch
+import torch.nn as nn
 
 from chaoscontrol.data import batch_from_starts
+from chaoscontrol import train_ssm
 
 
 REPO = Path(__file__).resolve().parents[1]
 MODULE_PATH = REPO / "experiments" / "23_fast_path" / "fast_path.py"
+RUNNER_PATH = REPO / "experiments" / "23_fast_path" / "runner_fast_path.py"
 LAUNCH_PATH = REPO / "experiments" / "23_fast_path" / "launch.py"
 
 
@@ -20,6 +23,36 @@ def _load_module():
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
+
+
+def _load_runner_module():
+    spec = importlib.util.spec_from_file_location("exp23_runner_fast_path", RUNNER_PATH)
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+class _TinyTrainStepModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.encoder = nn.Linear(4, 4, bias=False)
+        self.final_norm = nn.Identity()
+        self.lm_head = nn.Linear(4, 6, bias=False)
+
+    def encode(self, inputs: torch.Tensor) -> torch.Tensor:
+        return self.encoder(inputs)
+
+
+class _TinyTokenTrainModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.embed = nn.Embedding(6, 4)
+        self.final_norm = nn.Identity()
+        self.lm_head = nn.Linear(4, 6, bias=False)
+
+    def encode(self, inputs: torch.Tensor) -> torch.Tensor:
+        return self.embed(inputs)
 
 
 def _load_launch_module():
@@ -144,6 +177,7 @@ def test_stage_a_matrix_names_and_fast_defaults():
         assert entry["fused_grad_clip"] is True
         assert entry["fused_muon"] is True
         assert entry["compile_full_path"] is False
+        assert entry["prefetch_batches"] is True
         assert entry["eval_batches"] == 0
         assert entry["warmup_steps"] == 5
         assert entry["stop_check_interval"] == 4
@@ -197,6 +231,7 @@ def test_stage_b_matrix_crosses_vocab_and_embedding_inits():
     assert meanstd_16384["batch_size"] == 2048
     assert meanstd_16384["chunk_size"] == 256
     assert meanstd_16384["activation_checkpoint"] is True
+    assert meanstd_16384["prefetch_batches"] is True
     assert meanstd_16384["eval_batches"] == 16
     assert meanstd_16384["budget_seconds"] == 600.0
 
@@ -214,6 +249,145 @@ def test_token_accounting_summary_uses_global_tokens():
     assert summary["tokens_per_step"] == 96
     assert summary["aggregate_tokens_per_sec"] == 480.0
     assert summary["per_gpu_tokens_per_sec"] == 160.0
+
+
+def test_run_train_step_uses_compiled_encoder_when_enabled(monkeypatch):
+    mod = _load_runner_module()
+    if hasattr(train_ssm._compiled_step_fn, "cache_clear"):
+        train_ssm._compiled_step_fn.cache_clear()
+
+    compile_calls: list[tuple[str, bool, bool]] = []
+
+    def fake_compile(fn, *, fullgraph, dynamic):
+        compile_calls.append((fn.__name__, fullgraph, dynamic))
+
+        def compiled(model, inputs):
+            compile_calls.append(("compiled", True, True))
+            return fn(model, inputs)
+
+        return compiled
+
+    monkeypatch.setattr(mod.torch, "compile", fake_compile)
+
+    model = _TinyTrainStepModel()
+    inputs = torch.randn(2, 3, 4)
+    targets = torch.zeros(2, 3, dtype=torch.long)
+
+    try:
+        loss = mod._run_train_step(
+            model=model,
+            inputs=inputs,
+            targets=targets,
+            chunk_size=2,
+            precision="bf16",
+            ddp_active=False,
+            world_size=1,
+            compile_full_path=True,
+        )
+
+        assert loss.ndim == 0
+        assert compile_calls == [
+            ("_encode_only", True, False),
+            ("compiled", True, True),
+        ]
+    finally:
+        if hasattr(train_ssm._compiled_step_fn, "cache_clear"):
+            train_ssm._compiled_step_fn.cache_clear()
+
+
+def test_run_train_step_leaves_encoder_eager_when_compile_disabled(monkeypatch):
+    mod = _load_runner_module()
+
+    compile_calls: list[tuple[str, bool, bool]] = []
+
+    def fake_compile(fn, *, fullgraph, dynamic):
+        compile_calls.append((fn.__name__, fullgraph, dynamic))
+        return fn
+
+    monkeypatch.setattr(mod.torch, "compile", fake_compile)
+
+    model = _TinyTrainStepModel()
+    inputs = torch.randn(2, 3, 4)
+    targets = torch.zeros(2, 3, dtype=torch.long)
+
+    loss = mod._run_train_step(
+        model=model,
+        inputs=inputs,
+        targets=targets,
+        chunk_size=2,
+        precision="bf16",
+        ddp_active=False,
+        world_size=1,
+        compile_full_path=False,
+    )
+
+    assert loss.ndim == 0
+    assert compile_calls == []
+
+
+def test_train_fast_for_budget_can_use_batch_prefetcher(monkeypatch):
+    mod = _load_runner_module()
+    instances = []
+
+    class FakePrefetcher:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+            self.prime_calls = 0
+            self.next_calls = 0
+            self.close_calls = 0
+            instances.append(self)
+
+        def prime(self):
+            self.prime_calls += 1
+            return self
+
+        def next(self):
+            self.next_calls += 1
+            inputs = torch.zeros(2, 3, dtype=torch.long)
+            targets = torch.zeros(2, 3, dtype=torch.long)
+            return inputs, targets
+
+        def close(self):
+            self.close_calls += 1
+
+    monkeypatch.setattr(mod, "Exp23BatchPrefetcher", FakePrefetcher)
+
+    model = _TinyTokenTrainModel()
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+
+    result = mod.train_fast_for_budget(
+        model,
+        train_tokens=torch.arange(128, dtype=torch.int16),
+        train_num_tokens=128,
+        stride=4,
+        seq_len=3,
+        batch_size=2,
+        device=torch.device("cpu"),
+        optimizer=optimizer,
+        budget_seconds=300.0,
+        chunk_size=2,
+        grad_clip_norm=0.0,
+        fused_grad_clip=False,
+        rank=0,
+        world_size=1,
+        seed=123,
+        precision="bf16",
+        stop_check_interval=1,
+        stop_margin_seconds=0.0,
+        vocab_size=6,
+        max_steps=2,
+        prefetch_batches=True,
+    )
+
+    assert result["steps"] == 2
+    assert len(instances) == 1
+    prefetcher = instances[0]
+    assert prefetcher.prime_calls == 1
+    assert prefetcher.next_calls == 2
+    assert prefetcher.close_calls == 1
+    assert prefetcher.kwargs["seq_len"] == 3
+    assert prefetcher.kwargs["batch_size"] == 2
+    assert prefetcher.kwargs["vocab_size"] == 6
 
 
 def test_training_stop_predicate_can_stop_on_fixed_warmup_steps():
