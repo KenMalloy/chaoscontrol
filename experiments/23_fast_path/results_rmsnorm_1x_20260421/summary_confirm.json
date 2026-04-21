@@ -1,0 +1,22 @@
+[
+  {
+    "name": "legacy_block_streaming_v2",
+    "mode": "fused_streaming_v2",
+    "steps": 68,
+    "elapsed_s": 11.590648220852017,
+    "tokens_per_sec": 3075892.160704303,
+    "step_s": 0.17045070913017674,
+    "peak_vram_mb": 44946.08837890625,
+    "final_loss": 9.70451545715332
+  },
+  {
+    "name": "legacy_block_norm_streaming_v2",
+    "mode": "fused_norm_streaming_v2",
+    "steps": 68,
+    "elapsed_s": 11.59942345879972,
+    "tokens_per_sec": 3073565.1755996104,
+    "step_s": 0.1705797567470547,
+    "peak_vram_mb": 44946.1142578125,
+    "final_loss": 9.704564094543457
+  }
+]

@@ -1,0 +1,42 @@
+[
+  {
+    "name": "current_streaming_v2_a",
+    "mode": "fused_streaming_v2",
+    "old_block_rms": false,
+    "steps": 88,
+    "elapsed_s": 15.843253707513213,
+    "tokens_per_sec": 2912112.931583029,
+    "peak_vram_mb": 40850.11669921875,
+    "final_loss": 9.704667091369629
+  },
+  {
+    "name": "norm_streaming_v2",
+    "mode": "fused_norm_streaming_v2",
+    "old_block_rms": false,
+    "steps": 88,
+    "elapsed_s": 15.848538756370544,
+    "tokens_per_sec": 2911141.8225515867,
+    "peak_vram_mb": 40850.1220703125,
+    "final_loss": 9.704919815063477
+  },
+  {
+    "name": "old_block_rms_streaming_v2",
+    "mode": "fused_streaming_v2",
+    "old_block_rms": true,
+    "steps": 92,
+    "elapsed_s": 15.756720131263137,
+    "tokens_per_sec": 3061201.544368186,
+    "peak_vram_mb": 44945.12890625,
+    "final_loss": 9.70463752746582
+  },
+  {
+    "name": "current_streaming_v2_b",
+    "mode": "fused_streaming_v2",
+    "old_block_rms": false,
+    "steps": 88,
+    "elapsed_s": 15.854767008684576,
+    "tokens_per_sec": 2909998.2342678327,
+    "peak_vram_mb": 40850.12451171875,
+    "final_loss": 9.70406723022461
+  }
+]

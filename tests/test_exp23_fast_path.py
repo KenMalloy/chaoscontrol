@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import importlib.util
+import os
 from pathlib import Path
 
 import torch
@@ -61,6 +62,26 @@ def _load_launch_module():
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
+
+
+def test_runner_defaults_to_native_scan_without_inductor(monkeypatch):
+    monkeypatch.delenv("CHAOSCONTROL_DIAG_SCAN_BACKEND", raising=False)
+    monkeypatch.delenv("CHAOSCONTROL_POST_SCAN_BACKEND", raising=False)
+
+    _load_runner_module()
+
+    assert os.environ["CHAOSCONTROL_DIAG_SCAN_BACKEND"] == "ssm_scan"
+    assert os.environ["CHAOSCONTROL_POST_SCAN_BACKEND"] == "eager"
+
+
+def test_runner_preserves_explicit_backend_overrides(monkeypatch):
+    monkeypatch.setenv("CHAOSCONTROL_DIAG_SCAN_BACKEND", "chunked")
+    monkeypatch.setenv("CHAOSCONTROL_POST_SCAN_BACKEND", "compile")
+
+    _load_runner_module()
+
+    assert os.environ["CHAOSCONTROL_DIAG_SCAN_BACKEND"] == "chunked"
+    assert os.environ["CHAOSCONTROL_POST_SCAN_BACKEND"] == "compile"
 
 
 def test_vectorized_batch_matches_reference_batcher():

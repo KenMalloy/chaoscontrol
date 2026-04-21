@@ -30,6 +30,25 @@ sys.path.insert(0, str(REPO / "experiments" / "17_local_attn_sidecar"))
 sys.path.insert(0, str(REPO / "experiments" / "21_sgns_tokenizer"))
 sys.path.insert(0, str(EXPERIMENT))
 
+
+def configure_exp23_fast_backend_defaults(
+    env: dict[str, str] | os._Environ[str] = os.environ,
+) -> None:
+    """Default Exp23 to the no-Inductor submission hot path.
+
+    The core modules keep torch.compile as their historical default for
+    standalone experiments. Exp23 is different: it is the competition-speed
+    runner and already requires the native `_ssm_scan` extension on H100 pods.
+    Falling back into Inductor during `verify_diag_recurrence()` can burn
+    minutes before the timed loop starts, so opt into the native scan here
+    unless the launcher deliberately asks for a different backend.
+    """
+    env.setdefault("CHAOSCONTROL_DIAG_SCAN_BACKEND", "ssm_scan")
+    env.setdefault("CHAOSCONTROL_POST_SCAN_BACKEND", "eager")
+
+
+configure_exp23_fast_backend_defaults()
+
 from chaoscontrol.core import verify_diag_recurrence  # noqa: E402
 from chaoscontrol.data import (  # noqa: E402
     load_fineweb_tokens,

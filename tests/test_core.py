@@ -6,30 +6,22 @@ import unittest
 
 import torch
 
-import chaoscontrol.core as core_mod
 from chaoscontrol.core import ChaosSSMCore, RMSNorm, criticality_loss
 
 
-def test_rms_norm_module_delegates_to_fused_helper(monkeypatch) -> None:
-    calls: list[tuple[torch.Size, torch.Size, float]] = []
-
-    def fake_fused_rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float):
-        calls.append((x.shape, weight.shape, eps))
-        return torch.full_like(x, 7.0)
-
-    monkeypatch.setattr(
-        core_mod,
-        "fused_rms_norm",
-        fake_fused_rms_norm,
-        raising=False,
-    )
+def test_rms_norm_module_keeps_legacy_pytorch_math() -> None:
     layer = RMSNorm(4, eps=1e-5)
-    x = torch.randn(2, 3, 4)
+    x = torch.randn(2, 3, 4, dtype=torch.bfloat16)
 
     out = layer(x)
+    expected = (
+        torch.nn.functional.rms_norm(x.float(), (x.size(-1),), eps=layer.eps)
+        .to(x.dtype)
+        * layer.weight
+    )
 
-    assert torch.equal(out, torch.full_like(x, 7.0))
-    assert calls == [(torch.Size([2, 3, 4]), torch.Size([4]), 1e-5)]
+    assert out.dtype == expected.dtype
+    assert torch.equal(out, expected)
 
 
 class TestChaosSSMCore(unittest.TestCase):

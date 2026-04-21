@@ -10,8 +10,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from chaoscontrol.kernels._lm_head_loss import fused_rms_norm
-
 
 def _diag_recurrence_inner(decay: torch.Tensor, update: torch.Tensor) -> torch.Tensor:
     """Sequential linear recurrence: state_t = decay_t * state_{t-1} + update_t.
@@ -307,7 +305,8 @@ class RMSNorm(nn.Module):
         self.eps = eps
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return fused_rms_norm(x, self.weight, eps=self.eps)
+        normed = F.rms_norm(x.float(), (x.size(-1),), eps=self.eps)
+        return normed.to(x.dtype) * self.weight
 
 
 class FeedForward(nn.Module):
