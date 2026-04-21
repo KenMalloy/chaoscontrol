@@ -49,6 +49,7 @@ from chaoscontrol.train_ssm import (  # noqa: E402
     _compiled_step_fn,
     _reject_unsupported,
     chunked_lm_head_backward,
+    fused_lm_head_backward,
     full_lm_head_backward,
 )
 from fast_path import (  # noqa: E402
@@ -131,7 +132,7 @@ def _run_train_step(
     ddp_active: bool,
     world_size: int,
     compile_full_path: bool = False,
-    lm_head_backward_mode: str = "single",
+    lm_head_backward_mode: str = "fused",
 ) -> torch.Tensor:
     _reject_unsupported(model)
     with autocast_context(precision, device_type=inputs.device.type):
@@ -141,6 +142,13 @@ def _run_train_step(
             hidden = model.encode(inputs)
         if lm_head_backward_mode == "single":
             loss = full_lm_head_backward(
+                hidden=hidden,
+                final_norm=model.final_norm,
+                lm_head=model.lm_head,
+                targets=targets,
+            )
+        elif lm_head_backward_mode == "fused":
+            loss = fused_lm_head_backward(
                 hidden=hidden,
                 final_norm=model.final_norm,
                 lm_head=model.lm_head,
@@ -158,8 +166,8 @@ def _run_train_step(
             hidden.backward(gradient=hidden_for_ce.grad)
         else:
             raise ValueError(
-                "lm_head_backward_mode must be 'chunked' or 'single', got "
-                f"{lm_head_backward_mode!r}"
+                "lm_head_backward_mode must be 'chunked', 'single', or "
+                f"'fused', got {lm_head_backward_mode!r}"
             )
     if ddp_active and world_size > 1:
         allreduce_grads(model, world_size)
@@ -201,7 +209,7 @@ def train_fast_for_budget(
     max_steps: int | None = None,
     compile_full_path: bool = False,
     prefetch_batches: bool = False,
-    lm_head_backward_mode: str = "single",
+    lm_head_backward_mode: str = "fused",
 ) -> dict[str, Any]:
     rank_ = int(rank)
     world_size_ = int(world_size)
@@ -368,7 +376,7 @@ def _warmup(
         max_steps=steps,
         compile_full_path=bool(config.get("compile_full_path", False)),
         prefetch_batches=bool(config.get("prefetch_batches", True)),
-        lm_head_backward_mode=str(config.get("lm_head_backward_mode", "single")),
+        lm_head_backward_mode=str(config.get("lm_head_backward_mode", "fused")),
     )
 
 
@@ -483,7 +491,7 @@ def run_condition(
         vocab_size=vocab_size,
         compile_full_path=bool(config.get("compile_full_path", False)),
         prefetch_batches=bool(config.get("prefetch_batches", True)),
-        lm_head_backward_mode=str(config.get("lm_head_backward_mode", "single")),
+        lm_head_backward_mode=str(config.get("lm_head_backward_mode", "fused")),
     )
 
     if ddp_active:

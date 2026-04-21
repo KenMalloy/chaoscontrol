@@ -378,6 +378,35 @@ class TestTrainSSMStepEquivalence:
             d = (old_grads[name] - new_grads[name]).abs().max().item()
             assert d < 1e-5, f"single-backward grad mismatch on {name!r}: {d}"
 
+    def test_fused_backward_mode_matches_bare_ssm_old_path(
+        self, bare_ssm_model: ChaosStudentLM,
+    ) -> None:
+        """Fused mode is allowed to use native RMSNorm but not change math."""
+        inputs, targets = _make_batch(batch=2, seq=16, vocab=64, seed=20)
+        model_old = bare_ssm_model
+        model_new = copy.deepcopy(model_old)
+
+        old_grads = _old_path_grads(model_old, inputs, targets)
+
+        model_new.zero_grad(set_to_none=True)
+        _loss = train_ssm_step(
+            model=model_new,
+            inputs=inputs,
+            targets=targets,
+            chunk_size=4,
+            lm_head_backward_mode="fused",
+        )
+        new_grads = {
+            name: p.grad.detach().clone()
+            for name, p in model_new.named_parameters()
+            if p.grad is not None
+        }
+
+        assert set(old_grads.keys()) == set(new_grads.keys())
+        for name in old_grads:
+            d = (old_grads[name] - new_grads[name]).abs().max().item()
+            assert d < 1e-5, f"fused-backward grad mismatch on {name!r}: {d}"
+
 
 class TestTrainSSMStepRejectsUnsupportedConfigs:
     """Configs that ``training.py`` supports but ``train_ssm`` does not

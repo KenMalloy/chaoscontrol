@@ -35,6 +35,7 @@ from chaoscontrol.distributed import (
     resolve_ddp_context,
     should_stop_now,
 )
+from chaoscontrol.kernels._lm_head_loss import fused_rms_norm
 from chaoscontrol.precision import autocast_context
 
 
@@ -134,6 +135,37 @@ def full_lm_head_backward(
     """
     vocab = lm_head.out_features
     logits = lm_head(final_norm(hidden))
+    loss = F.cross_entropy(
+        logits.reshape(-1, vocab).float(),
+        targets.reshape(-1),
+        reduction="mean",
+    )
+    loss.backward()
+    return loss.detach()
+
+
+def fused_lm_head_backward(
+    hidden: torch.Tensor,
+    final_norm: nn.Module,
+    lm_head: nn.Linear,
+    targets: torch.Tensor,
+) -> torch.Tensor:
+    """LM-head backward using native fused pieces where available.
+
+    Today the fused piece is RMSNorm immediately before the head. The
+    projection and CE still use PyTorch/cuBLAS, which is intentional:
+    the GEMM is not where we want a hand-written replacement. This mode
+    gives Exp23 a stable native hook that can absorb more of the head/loss
+    path once profiler evidence justifies it.
+    """
+    weight = getattr(final_norm, "weight", None)
+    eps = float(getattr(final_norm, "eps", 1e-6))
+    if weight is None:
+        return full_lm_head_backward(hidden, final_norm, lm_head, targets)
+
+    vocab = lm_head.out_features
+    normed = fused_rms_norm(hidden, weight, eps=eps)
+    logits = lm_head(normed)
     loss = F.cross_entropy(
         logits.reshape(-1, vocab).float(),
         targets.reshape(-1),
@@ -264,8 +296,9 @@ def train_ssm_step(
     gradients into a detached hidden tensor before one encoder backward.
     In ``"single"`` mode it materializes full logits and calls
     ``loss.backward()`` once, which removes the detached-hidden bridge at
-    the cost of higher peak memory. When DDP is active, per-parameter
-    gradients are all-reduced (AVG) before return.
+    the cost of higher peak memory. ``"fused"`` is the Exp23 native path:
+    currently fused RMSNorm + PyTorch/cuBLAS LM head + CE. When DDP is
+    active, per-parameter gradients are all-reduced (AVG) before return.
 
     The caller owns ``optimizer.step()`` and ``optimizer.zero_grad()``
     — this function only computes gradients and leaves them on the
@@ -316,6 +349,13 @@ def train_ssm_step(
                 lm_head=model.lm_head,
                 targets=targets,
             )
+        elif lm_head_backward_mode == "fused":
+            loss = fused_lm_head_backward(
+                hidden=hidden,
+                final_norm=model.final_norm,
+                lm_head=model.lm_head,
+                targets=targets,
+            )
         elif lm_head_backward_mode == "chunked":
             # Detach to form a boundary between the chunked LM-head graph and
             # the encoder graph. The chunked backward accumulates gradient
@@ -338,8 +378,8 @@ def train_ssm_step(
             hidden.backward(gradient=hidden_for_ce.grad)
         else:
             raise ValueError(
-                "lm_head_backward_mode must be 'chunked' or 'single', got "
-                f"{lm_head_backward_mode!r}"
+                "lm_head_backward_mode must be 'chunked', 'single', or "
+                f"'fused', got {lm_head_backward_mode!r}"
             )
 
     if ddp_active and world_size > 1:

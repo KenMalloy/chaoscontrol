@@ -1,0 +1,94 @@
+"""Tests for native LM-head/loss helper fallbacks and build wiring."""
+from __future__ import annotations
+
+import importlib.util
+from pathlib import Path
+
+import pytest
+import torch
+import torch.nn.functional as F
+
+import chaoscontrol.kernels._lm_head_loss as lm_head_loss
+from chaoscontrol.kernels._lm_head_loss import fused_rms_norm
+
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def _load_setup_ext():
+    path = ROOT / "src" / "chaoscontrol" / "kernels" / "_lm_head_loss" / "setup_ext.py"
+    spec = importlib.util.spec_from_file_location("lm_head_loss_setup_ext_test", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _reference_rms_norm(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+) -> torch.Tensor:
+    return F.rms_norm(x.float(), (x.size(-1),), eps=eps).to(x.dtype) * weight
+
+
+def test_fused_rms_norm_cpu_fallback_matches_reference_forward_and_backward():
+    torch.manual_seed(0)
+    x_ref = torch.randn(3, 5, 7, requires_grad=True)
+    w_ref = (torch.randn(7) * 0.1 + 1.0).requires_grad_(True)
+    x_new = x_ref.detach().clone().requires_grad_(True)
+    w_new = w_ref.detach().clone().requires_grad_(True)
+    grad = torch.randn_like(x_ref)
+
+    y_ref = _reference_rms_norm(x_ref, w_ref, eps=1e-6)
+    y_new = fused_rms_norm(x_new, w_new, eps=1e-6)
+
+    assert torch.allclose(y_ref, y_new, atol=0.0, rtol=0.0)
+    y_ref.backward(grad)
+    y_new.backward(grad)
+
+    assert torch.allclose(x_ref.grad, x_new.grad, atol=0.0, rtol=0.0)
+    assert torch.allclose(w_ref.grad, w_new.grad, atol=0.0, rtol=0.0)
+
+
+def test_lm_head_loss_build_hook_honors_cuda_arch_env(monkeypatch):
+    module = _load_setup_ext()
+    monkeypatch.setenv("TORCH_CUDA_ARCH_LIST", "8.9;9.0")
+
+    assert module._nvcc_gencode_args() == [
+        "-gencode=arch=compute_89,code=sm_89",
+        "-gencode=arch=compute_90,code=sm_90",
+    ]
+
+
+def test_fused_rms_norm_cuda_kernel_matches_reference_if_available():
+    if not torch.cuda.is_available() or lm_head_loss._C is None:
+        pytest.skip(
+            "CUDA fused RMSNorm kernel is not available in this environment; "
+            "run the focused CPU fallback test locally and this test on a pod."
+        )
+
+    torch.manual_seed(1)
+    x_ref = torch.randn(
+        4, 9, 16, device="cuda", dtype=torch.bfloat16, requires_grad=True,
+    )
+    w_ref = (
+        torch.randn(16, device="cuda", dtype=torch.bfloat16) * 0.1 + 1.0
+    ).requires_grad_(True)
+    x_new = x_ref.detach().clone().requires_grad_(True)
+    w_new = w_ref.detach().clone().requires_grad_(True)
+    grad = torch.randn_like(x_ref)
+
+    y_ref = _reference_rms_norm(x_ref, w_ref, eps=1e-6)
+    y_new = fused_rms_norm(x_new, w_new, eps=1e-6)
+
+    assert torch.allclose(y_ref.float(), y_new.float(), atol=5e-3, rtol=5e-3)
+    y_ref.backward(grad)
+    y_new.backward(grad)
+
+    assert torch.allclose(
+        x_ref.grad.float(), x_new.grad.float(), atol=5e-3, rtol=5e-3,
+    )
+    assert torch.allclose(
+        w_ref.grad.float(), w_new.grad.float(), atol=5e-3, rtol=5e-3,
+    )

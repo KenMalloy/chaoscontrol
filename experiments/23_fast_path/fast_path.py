@@ -50,7 +50,7 @@ def _base_fast_config(*, world_size: int, vocab_size: int) -> dict[str, Any]:
         "fused_grad_clip": True,
         "fused_muon": True,
         "compile_full_path": False,
-        "lm_head_backward_mode": "single",
+        "lm_head_backward_mode": "fused",
         "warmup_steps": 5,
         "restore_after_warmup": False,
         "stop_check_interval": 4,
