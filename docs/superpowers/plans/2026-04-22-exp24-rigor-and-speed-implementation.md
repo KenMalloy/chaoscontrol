@@ -49,10 +49,37 @@ warmup-restore bit equality, and bf16 loss handling.
 from __future__ import annotations
 
 import importlib.util
+import os
 from pathlib import Path
 
 import pytest
 import torch
+
+
+_BACKEND_ENV_KEYS = (
+    "CHAOSCONTROL_DIAG_SCAN_BACKEND",
+    "CHAOSCONTROL_POST_SCAN_BACKEND",
+)
+
+
+@pytest.fixture(autouse=True)
+def _restore_backend_env_after_test():
+    """Restore Exp23 backend env vars after runner module imports.
+
+    `_load_runner_module()` imports `runner_fast_path.py`, whose module import
+    sets `CHAOSCONTROL_DIAG_SCAN_BACKEND` and `CHAOSCONTROL_POST_SCAN_BACKEND`
+    via `setdefault`. Without this fixture, the new Exp24 file would leak the
+    same env mutations that `tests/test_exp23_fast_path.py` already guards.
+    """
+    snapshot = {key: os.environ.get(key) for key in _BACKEND_ENV_KEYS}
+    try:
+        yield
+    finally:
+        for key, value in snapshot.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
 
 
 _RUNNER_PATH = (
@@ -72,7 +99,7 @@ def _load_runner_module():
     return module
 ```
 
-- [ ] Create the file with the header and `_load_runner_module` helper above.
+- [ ] Create the file with the header, env-restore fixture, and `_load_runner_module` helper above.
 
 **Step 2: Move the two gate tests**
 
@@ -124,7 +151,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 
-def _gate_worker(rank, world_size, init_file, per_rank_loss, result_path):
+def _gate_worker(rank, world_size, init_file, per_rank_loss_map, result_path):
     """Spawned-process worker: init gloo, run one gate update, write result."""
     dist.init_process_group(
         backend="gloo",
@@ -136,10 +163,11 @@ def _gate_worker(rank, world_size, init_file, per_rank_loss, result_path):
         mod = _load_runner_module()
         gate = mod.LossTriggeredReplayEMA(decay=0.5, warmup_steps=1)
         # Seed the EMA so the next update is post-warmup.
-        gate.update(torch.tensor(per_rank_loss[0]))
+        seed_loss, trigger_loss = per_rank_loss_map[rank]
+        gate.update(torch.tensor(seed_loss))
         decision = gate.update(
-            torch.tensor(per_rank_loss[1]),
-            threshold=1.10,
+            torch.tensor(trigger_loss),
+            threshold=1.25,
             pressure_threshold=0.05,
             ddp_active=True,
             world_size=world_size,
@@ -165,12 +193,13 @@ def test_gloo_four_rank_lockstep_and_boundary(tmp_path):
     """
     world_size = 4
     # First loss seeds the EMA (decay=0.5 means ema_after = 2.0 for all ranks).
-    # Second loss drives the ratio; rank 2 sits exactly at threshold.
+    # Second loss drives the ratio; rank 2 sits exactly at threshold. Use
+    # float32-exact literals for the threshold case: 2.50 / 2.0 == 1.25 exactly.
     per_rank_loss = {
-        0: (2.0, 2.60),  # ratio 1.30, above threshold 1.10: fires
+        0: (2.0, 2.75),  # ratio 1.375, above threshold 1.25: fires
         1: (2.0, 2.00),  # ratio 1.00, below: no fire
-        2: (2.0, 2.20),  # ratio 1.10, exactly at threshold: no fire (boundary)
-        3: (2.0, 2.80),  # ratio 1.40, above: fires
+        2: (2.0, 2.50),  # ratio 1.25, exactly at threshold: no fire (boundary)
+        3: (2.0, 3.00),  # ratio 1.50, above: fires
     }
 
     result_path = tmp_path / "decisions"
@@ -181,7 +210,7 @@ def test_gloo_four_rank_lockstep_and_boundary(tmp_path):
 
     mp.spawn(
         _gate_worker,
-        args=(world_size, str(init_file), None, str(result_path)),
+        args=(world_size, str(init_file), per_rank_loss, str(result_path)),
         nprocs=world_size,
         join=True,
     )
@@ -198,8 +227,8 @@ def test_gloo_four_rank_lockstep_and_boundary(tmp_path):
             f"{expected_local_fire[rank]}"
         )
 
-    # Rank 2 boundary: ratio exactly 1.10 -> local_pressure exactly 0 -> no fire.
-    assert abs(decisions[2]["local_ratio"] - 1.10) < 1e-6
+    # Rank 2 boundary: ratio exactly 1.25 -> local_pressure exactly 0 -> no fire.
+    assert decisions[2]["local_ratio"] == pytest.approx(1.25, abs=0.0)
     assert decisions[2]["local_fire"] is False
 
     # Lockstep: every rank must agree on the global decision fields.
@@ -213,27 +242,7 @@ def test_gloo_four_rank_lockstep_and_boundary(tmp_path):
         assert dec["triggered"] is triggered_ref
 ```
 
-A note on the worker signature: the fourth positional arg is unused (`None`) because `_gate_worker` does not take `per_rank_loss` via mp.spawn directly; each rank constructs its own loss from the `rank` index. The cleaner version passes a literal dict through; amend the worker if the linter complains.
-
-Actually, amend the worker to receive the per-rank loss map:
-
-```python
-def _gate_worker(rank, world_size, init_file, per_rank_loss_map, result_path):
-    # ... same body, but use `per_rank_loss_map[rank]` instead of `per_rank_loss`
-```
-
-And update the call:
-
-```python
-    mp.spawn(
-        _gate_worker,
-        args=(world_size, str(init_file), per_rank_loss, str(result_path)),
-        nprocs=world_size,
-        join=True,
-    )
-```
-
-- [ ] Add the worker function and test to the file with the dict-threaded version.
+- [ ] Add the worker function and test exactly as above. Do not change the rank-2 threshold values to decimal 1.10/2.20: `torch.tensor(2.20)` is float32 `2.200000047683716`, making the ratio slightly above threshold and incorrectly firing the boundary rank.
 
 **Step 3: Run the test**
 
@@ -243,7 +252,7 @@ pytest tests/test_exp24_event_sleep.py::test_gloo_four_rank_lockstep_and_boundar
 
 Expected: PASS. Total runtime should be under 10 seconds on a laptop.
 
-If it fails: check `dist.init_process_group` file permissions and MASTER_PORT resolution. The memory entry `feedback_mp_spawn_flake.md` flags occasional hangs after a killed prior pytest - rerun once.
+If it fails: check `dist.init_process_group` file permissions and the `file://` rendezvous path. The memory entry `feedback_mp_spawn_flake.md` flags occasional hangs after a killed prior pytest - rerun once.
 
 **Step 4: Commit**
 
@@ -391,7 +400,7 @@ def test_event_sleep_replay_lands_one_step_after_trigger(monkeypatch):
 pytest tests/test_exp24_event_sleep.py::test_event_sleep_replay_lands_one_step_after_trigger -v
 ```
 
-Expected: PASS. If it fails with `sampled_steps == [5]` or similar, the replay branch in `train_fast_for_budget` is evaluating the trigger too early - a real bug. Fix by ensuring the gate `update` call happens *after* the step's `_run_scopt_train_step` so the decision comes from step N's completed loss, and the resulting `event_sleep_pending = True` is checked at the top of step N+1.
+Expected: PASS. If it fails with `sampled_steps == [5]` or similar, the replay branch in `train_fast_for_budget` is evaluating the trigger too early - a real bug. Fix by ensuring the gate `update` call happens *after* the step's `_run_train_step` so the decision comes from step N's completed loss, and the resulting `event_sleep_pending = True` is checked at the top of step N+1.
 
 **Step 3: Commit**
 
@@ -632,9 +641,35 @@ git commit -m "tests: pin event_sleep gate bf16 loss dtype path"
 
 **Step 1: Write the profile script**
 
-Create `experiments/24_training_time_bundle/profile_event_sleep_arm.py` with CUDA-event timings around the train step's major sections. The script should: load a minimal model, construct a single-seed `fast_slow_dreamworld_event_sleep` config, run ~30 seconds (or 500 steps, whichever is first), emit a JSON with per-section wall-clock milliseconds and per-section share of the inside-budget total.
+Create `experiments/24_training_time_bundle/profile_event_sleep_arm.py` with host-wall timings around the train step's major sections, plus CUDA-event timings for sections that launch GPU work. The script should: load a minimal model, construct a single-seed `fast_slow_dreamworld_event_sleep` config, run ~30 seconds (or 500 steps, whichever is first), emit a JSON with per-section host-wall milliseconds, optional CUDA milliseconds, and per-section share of the inside-budget host-wall total.
 
-Sections to time (wrap each in a `torch.cuda.Event` pair with `elapsed_time`):
+**Measurement rule (load-bearing):** rank by synchronized host wall time, not CUDA-event time. CUDA events miss Python overhead and can hide synchronization waits from `.item()`, diagnostics, and control-flow branches. For any section that might synchronize (`event_sleep_gate`, `fast_slow_ema`, diagnostics, optimizer step), synchronize before and after timing on CUDA:
+
+```python
+def time_section(name, fn):
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
+        start_event.record()
+    else:
+        start_event = end_event = None
+
+    t0 = time.perf_counter()
+    result = fn()
+
+    if device.type == "cuda":
+        end_event.record()
+        torch.cuda.synchronize(device)
+        cuda_ms = float(start_event.elapsed_time(end_event))
+    else:
+        cuda_ms = None
+    wall_ms = (time.perf_counter() - t0) * 1000.0
+    section_timers[name].append({"wall_ms": wall_ms, "cuda_ms": cuda_ms})
+    return result
+```
+
+Sections to time:
 
 - `encode_forward` - `model.encode(...)` call
 - `logits_and_loss` - LM head + CE
@@ -654,8 +689,14 @@ Emit results to `experiments/24_training_time_bundle/profile_event_sleep_arm_out
   "steps": 500,
   "total_inside_budget_ms": 12345.6,
   "sections": [
-    {"name": "encode_forward", "mean_ms": 2.1, "share": 0.34},
-    ...
+    {
+      "name": "encode_forward",
+      "mean_wall_ms": 2.1,
+      "p50_wall_ms": 2.0,
+      "p95_wall_ms": 2.8,
+      "mean_cuda_ms": 1.9,
+      "share_wall": 0.34
+    }
   ]
 }
 ```
@@ -682,7 +723,7 @@ Expected: JSON output file, total runtime under 2 minutes.
 Create `docs/plans/2026-04-22-exp24-runner-profile.md` with:
 
 - Total inside-budget wall-clock per step (mean and p50/p95).
-- Ranked hotspot table (name, mean ms, share %).
+- Ranked hotspot table by `share_wall` (name, mean/p50/p95 wall ms, optional mean CUDA ms, share %).
 - Initial verdict per candidate from the design doc: "landing-target", "needs-audit", "negligible-skip".
 
 - [ ] Write the report.
@@ -800,7 +841,7 @@ Expected: PASS including the new equivalence test.
 
 **Step 4: Measure**
 
-Re-run the profile script (Task 7) and compare `fast_slow_ema` section mean ms before/after. Append the delta to `docs/plans/2026-04-22-exp24-runner-profile.md` under a "Verdicts" section.
+Re-run the profile script (Task 7) and compare `fast_slow_ema` section mean/p50/p95 host-wall ms before/after. CUDA-event deltas are secondary. Append the wall-clock delta to `docs/plans/2026-04-22-exp24-runner-profile.md` under a "Verdicts" section.
 
 - [ ] Re-run profile.
 - [ ] Write delta in verdicts section.
@@ -815,14 +856,14 @@ git commit -m "exp23: fast_slow EMA via torch._foreach_lerp_"
 
 ### Task 9: Event-sleep EMA on-device refactor
 
-**Lands regardless** (small sync per step inside budget; reviewer-visible fix).
+**Measured landing target, not unconditional.** Implement as a guarded experiment and keep it only if the Task 7 host-wall profile shows `event_sleep_gate` improves or is neutral without making the code harder to reason about. The current caller immediately branches on `decision.triggered` and stores Python floats in diagnostics (runner_fast_path.py:1711-1743), so moving arithmetic on-device does not automatically remove every GPU→CPU synchronization.
 
 **Files:**
 - Modify: `experiments/23_fast_path/runner_fast_path.py:537-607` (LossTriggeredReplayEMA)
 
 **Step 1: Update the EMA to keep state on the loss tensor's device**
 
-Current `LossTriggeredReplayEMA` stores `self.value` as a Python float and calls `.item()` on the loss every step. The refactor keeps `self.value` as a same-device tensor and only syncs when the DDP all-reduce already requires a sync.
+Current `LossTriggeredReplayEMA` stores `self.value` as a Python float and calls `.item()` on the loss every step. The candidate refactor keeps `self.value` as a same-device tensor and moves the ratio / pressure comparison into tensor ops. Because the returned `LossTriggeredReplayDecision` still contains Python floats/bools and the caller consumes them immediately, the refactor must be judged by measured host-wall timing, not by assumed sync elimination.
 
 Key change outline:
 
@@ -830,9 +871,9 @@ Key change outline:
 - First update: `self.value = loss.detach().float()` (no `.item()`).
 - Subsequent updates: compute ratio / pressure as tensor ops on-device.
 - The `all_reduce` path already requires a device tensor; assemble `[local_pressure, float(local_fire)]` directly from tensor ops.
-- Single `.item()` calls remain at the very end to fill the `LossTriggeredReplayDecision` dataclass fields (which are declared as Python floats). Those syncs are effectively the same as the existing ones for `global_pressure` and `fire_count`.
+- Single `.item()` calls remain at the very end to fill the `LossTriggeredReplayDecision` dataclass fields (declared as Python floats/bools). Make this sync point explicit in the code rather than claiming it disappeared.
 
-The net win: one fewer GPU→CPU sync per step at the top of `update()`, and the ratio compare happens on-device.
+Potential win: less Python scalar arithmetic in the gate and a cleaner DDP tensor payload. Non-goal: claiming "one fewer sync per step" unless the host-wall profile proves it.
 
 - [ ] Implement the refactor.
 
@@ -852,10 +893,10 @@ If the trajectory changes beyond "small shift on one or two steps" (e.g. no fire
 
 **Step 3: Measure**
 
-Re-run the profile script. Compare `event_sleep_gate` section mean ms before/after. Append delta.
+Re-run the profile script. Compare `event_sleep_gate` section mean/p50/p95 host-wall ms before/after; CUDA-event timing is secondary because `.item()` waits and Python branching are host-visible. Append delta.
 
 - [ ] Re-run profile.
-- [ ] Write delta.
+- [ ] Write delta and verdict. If `event_sleep_gate` host-wall timing regresses or is noise-level neutral with worse readability, revert the implementation and record "deferred - no measured host-wall win" in the report.
 
 **Step 4: Commit**
 
@@ -886,15 +927,81 @@ def test_spectral_reg_vectorized_matches_reference():
     import torch
     mod = _load_module()  # importlib helper as in Task 8
     spectral_regularization_loss = mod.spectral_regularization_loss
-    # ... build a model with multiple SSM layers of varying size, compute old
-    # and new spectral loss, assert torch.equal on both.
+
+    class UnevenSpectralModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layer0 = torch.nn.Module()
+            self.layer0.core = torch.nn.Module()
+            self.layer0.core.log_a = torch.nn.Parameter(
+                torch.tensor([-5.0, -1.0, 0.0])
+            )
+            self.layer1 = torch.nn.Module()
+            self.layer1.core = torch.nn.Module()
+            self.layer1.core.log_a = torch.nn.Parameter(
+                torch.tensor([0.5, 1.0, 2.0, 3.0, 4.0])
+            )
+
+    model = UnevenSpectralModel()
+    kwargs = {
+        "lambda_dead": 2.0,
+        "lambda_sticky": 3.0,
+        "min_a": 0.1,
+        "max_a": 0.9,
+    }
+
+    penalties = []
+    flat_penalties = []
+    for _, log_a in mod.iter_log_a_params(model):
+        a = torch.sigmoid(log_a.float())
+        penalty = (
+            torch.relu(kwargs["min_a"] - a).pow(2) * kwargs["lambda_dead"]
+            + torch.relu(a - kwargs["max_a"]).pow(2) * kwargs["lambda_sticky"]
+        )
+        penalties.append(penalty.mean())
+        flat_penalties.append(penalty.reshape(-1))
+    expected = torch.stack(penalties).mean()
+    concat_weighted = torch.cat(flat_penalties).mean()
+
+    # This fixture is intentionally uneven-sized. A naive concat+mean changes
+    # semantics by weighting larger layers more heavily; the test must catch it.
+    assert not torch.equal(expected, concat_weighted)
+
+    actual = spectral_regularization_loss(model=model, **kwargs)
+    assert actual is not None
+    assert torch.equal(actual, expected)
 ```
 
 - [ ] Write the test.
 
 **Step 3: Refactor preserving semantics**
 
-Use `torch.nested` tensors or a Python-level prescan to compute per-layer means then stack, which can still be a single fused op chain. Alternative: if mean-per-layer is numerically fine to approximate as mean-across-elements (investigate whether the layers are same-sized in practice), simplify and document the change.
+Preserve mean-per-layer then mean-across-layers semantics exactly. A safe refactor is allowed only if it still passes the uneven-sized-layer test above:
+
+```python
+def spectral_regularization_loss(
+    model: torch.nn.Module,
+    lambda_dead: float,
+    lambda_sticky: float,
+    min_a: float,
+    max_a: float,
+) -> torch.Tensor | None:
+    log_a_params = [log_a.float() for _, log_a in iter_log_a_params(model)]
+    if not log_a_params:
+        return None
+
+    penalty_means = []
+    for log_a in log_a_params:
+        a = torch.sigmoid(log_a)
+        penalty = (
+            torch.relu(min_a - a).pow(2) * lambda_dead
+            + torch.relu(a - max_a).pow(2) * lambda_sticky
+        )
+        penalty_means.append(penalty.mean())
+    return torch.stack(penalty_means).mean()
+```
+
+Do not replace this with `torch.cat(...).mean()` unless the profile report explicitly proves every production `log_a` tensor in this arm has identical shape and the report documents the intentional semantic change. If the safe refactor does not improve host-wall timing, leave the implementation unchanged and record "negligible - skipped".
 
 - [ ] Implement.
 - [ ] Run tests.
@@ -904,23 +1011,84 @@ Use `torch.nested` tensors or a Python-level prescan to compute per-layer means 
 - [ ] Re-run profile.
 - [ ] Commit with numbers.
 
-### Task 11: Graph-break audit on `_run_scopt_train_step` (conditional)
+### Task 11: Graph-break audit on `_run_train_step` (conditional)
 
-**Condition:** Execute if profile shows the combined `encode_forward + logits_and_loss + backward` share is above 60% AND `torch._logging.set_logs(graph_breaks=True)` reveals breaks inside hot sections.
+**Condition:** Execute if profile shows the combined `encode_forward + logits_and_loss + backward` share is above 60% AND the `fast_slow_dreamworld_event_sleep` arm has `compile_full_path=True`. If `compile_full_path=False` (current base config), graph-break work is not on the active hot path; record "not applicable - compile_full_path disabled" in the profile report and skip code changes.
 
 **Files (if executing):**
 - Modify: `experiments/23_fast_path/runner_fast_path.py` (various, depending on findings)
+- Optional create: `experiments/24_training_time_bundle/audit_train_step_graph_breaks.py`
 
 **Step 1: Enable graph break logging**
 
-```bash
-TORCH_LOGS=graph_breaks python -c "
+Create `experiments/24_training_time_bundle/audit_train_step_graph_breaks.py` only if the condition above is true:
+
+```python
+"""One-step graph-break audit for Exp24's active train-step path."""
+
+from __future__ import annotations
+
+import importlib.util
+from pathlib import Path
+
 import torch
-# set up a one-step call to _run_scopt_train_step and run it
-"
+
+
+REPO = Path(__file__).resolve().parents[2]
+RUNNER_PATH = REPO / "experiments" / "23_fast_path" / "runner_fast_path.py"
+
+
+def _load_runner_module():
+    spec = importlib.util.spec_from_file_location(
+        "exp23_runner_fast_path_graph_audit", RUNNER_PATH
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+class TinyTokenTrainModel(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.embed = torch.nn.Embedding(6, 4)
+        self.final_norm = torch.nn.Identity()
+        self.lm_head = torch.nn.Linear(4, 6, bias=False)
+
+    def encode(self, inputs: torch.Tensor) -> torch.Tensor:
+        return self.embed(inputs)
+
+
+def main() -> None:
+    mod = _load_runner_module()
+    model = TinyTokenTrainModel()
+    inputs = (torch.arange(12, dtype=torch.int64).reshape(2, 6) % 6).to(torch.int32)
+    targets = (torch.arange(12, dtype=torch.int64).reshape(2, 6) % 6).to(torch.long)
+    mod._run_train_step(
+        model=model,
+        inputs=inputs,
+        targets=targets,
+        chunk_size=2,
+        precision="fp32",
+        ddp_active=False,
+        world_size=1,
+        compile_full_path=True,
+        lm_head_backward_mode="single",
+        grad_allreduce_mode="bulk",
+    )
+
+
+if __name__ == "__main__":
+    main()
 ```
 
-- [ ] Run graph-break logging on one train step.
+Run:
+
+```bash
+TORCH_LOGS=graph_breaks python experiments/24_training_time_bundle/audit_train_step_graph_breaks.py
+```
+
+- [ ] Run graph-break logging on one train step only if the active arm enables `compile_full_path`.
 - [ ] Document each break with file:line and reason.
 
 **Step 2: Fix the cheap ones**
@@ -929,7 +1097,7 @@ import torch
 - Python-side conditionals that depend on tensor values break graphs. Replace with `torch.where` or lift to outside the compile region.
 - Dict lookups on `.named_parameters()` can break depending on tracing.
 
-- [ ] Apply fixes one at a time, retest, commit individually.
+- [ ] Apply fixes one at a time, retest, commit individually. Do not touch `_run_scopt_train_step`; ScOpt is outside the `fast_slow_dreamworld_event_sleep` arm and is out of scope for this session.
 
 **Step 3: Measure and commit**
 
@@ -1024,3 +1192,11 @@ git commit -m "exp24: close out rigor-and-speed session with results"
 - **Task 3 (priming dependency).** Promoted `dreamworld_cache_interval=1, dreamworld_min_size=1` from "boilerplate" to "load-bearing" in the plan prose and documented that the synthetic entry's `.step`/`.states`/`.replay_tokens` attributes match `dream_buffer.add`'s production contract.
 - **Task 4 (observed anchor).** The hand-computed anchor `[12, 24, 35]` was unverified. Replaced with an explicit two-step procedure: first run emits the real trajectory as a test failure, second run locks it. Commit message must state the observed list.
 - **Task 9 → Task 4 dependency.** On-device tensor float32 reductions are not bit-equivalent to Python float arithmetic, so Task 9 will shift the Task 4 anchor. Added explicit guidance: bundle the re-anchor into Task 9's own commit with both old and new anchors named. If the trajectory changes beyond a small shift, the refactor is broken — fix the implementation, do not bless the new anchor.
+
+**2026-04-22 — inline review follow-ups before implementation.** A second pre-implementation review found additional execution hazards; the plan now includes these fixes.
+
+- **Task 1 (env fixture).** The new Exp24 test file now carries the backend env restore fixture from `tests/test_exp23_fast_path.py`; importing `runner_fast_path.py` mutates `CHAOSCONTROL_DIAG_SCAN_BACKEND` and `CHAOSCONTROL_POST_SCAN_BACKEND` via `setdefault`.
+- **Task 2 (float-exact threshold).** Replaced the decimal `2.20 / 2.0 == 1.10` boundary with exactly representable `2.50 / 2.0 == 1.25`. `torch.tensor(2.20)` becomes `2.200000047683716`, causing the boundary rank to fire.
+- **Task 7/9 (measurement).** The profile harness now ranks by synchronized host-wall time, with CUDA-event timing secondary. Task 9 is measured, not unconditional, because the caller still consumes Python bools/floats from `LossTriggeredReplayDecision`.
+- **Task 10 (placeholder removal).** Replaced the placeholder spectral-regression test with a concrete uneven-sized-layer test that catches naive `cat(...).mean()` semantic drift.
+- **Task 11 (wrong hot path).** Retargeted the graph-break audit from `_run_scopt_train_step` to `_run_train_step`, and made it conditional on `compile_full_path=True`; ScOpt is not in the active `fast_slow_dreamworld_event_sleep` arm.
