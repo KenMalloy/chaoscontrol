@@ -1,0 +1,102 @@
+"""Tests for Exp 23 training-time hook helpers."""
+from __future__ import annotations
+
+import importlib.util
+from pathlib import Path
+
+import torch
+import torch.nn as nn
+
+
+REPO = Path(__file__).resolve().parents[1]
+MODULE_PATH = REPO / "experiments" / "23_fast_path" / "training_hooks.py"
+
+
+def _load_module():
+    spec = importlib.util.spec_from_file_location("exp23_training_hooks", MODULE_PATH)
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+class _FastSlowModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.linear = nn.Linear(4, 2, bias=False)
+
+
+class _LogAModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.spectrum = nn.Module()
+        self.spectrum.log_a = nn.Parameter(torch.tensor([-4.0, 0.0, 5.0]))
+
+
+class _EmbeddingModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.embed = nn.Embedding(8, 4)
+
+
+def test_fast_slow_consolidator_from_config_and_sync_and_copy():
+    mod = _load_module()
+    model = _FastSlowModel()
+    consolidator = mod.FastSlowConsolidator.from_config(
+        model,
+        {
+            "fast_slow_enabled": True,
+            "fast_slow_interval": 1,
+            "fast_slow_alpha": 0.5,
+        },
+    )
+
+    assert consolidator.enabled
+    assert consolidator.interval == 1
+    assert consolidator.alpha == 0.5
+    assert torch.equal(consolidator.slow_state["linear.weight"], model.linear.weight.detach())
+
+    with torch.no_grad():
+        model.linear.weight.add_(1.0)
+    consolidator.after_optimizer_step(model, step=1)
+
+    diagnostics = consolidator.diagnostics(model)
+    assert diagnostics["enabled"]
+    assert diagnostics["sync_count"] == 1
+    assert diagnostics["fast_slow_l2"] > 0.0
+
+    consolidator.copy_slow_to_model(model)
+    assert torch.equal(model.linear.weight, consolidator.slow_state["linear.weight"])
+
+
+def test_spectral_regularization_loss_and_summary():
+    mod = _load_module()
+    model = _LogAModel()
+    penalty = mod.spectral_regularization_loss(
+        model=model,
+        lambda_dead=2.0,
+        lambda_sticky=3.0,
+        min_a=0.1,
+        max_a=0.9,
+    )
+
+    assert penalty is not None
+    assert penalty.item() > 0
+
+    summary = mod.spectral_summary(model)
+    assert summary["log_a_param_count"] == 1
+    assert summary["a_min"] < 0.1
+    assert summary["a_max"] > 0.9
+
+
+def test_zero_embedding_grad_until():
+    mod = _load_module()
+    model = _EmbeddingModel()
+    model.embed.weight.grad = torch.ones_like(model.embed.weight)
+
+    mod.zero_embedding_grad_until(model, step=2, freeze_steps=3)
+    assert torch.count_nonzero(model.embed.weight.grad).item() == 0
+
+    model.embed.weight.grad = torch.ones_like(model.embed.weight)
+    mod.zero_embedding_grad_until(model, step=3, freeze_steps=3)
+    assert torch.count_nonzero(model.embed.weight.grad).item() == model.embed.weight.grad.numel()
