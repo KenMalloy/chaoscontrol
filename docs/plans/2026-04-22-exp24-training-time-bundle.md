@@ -8,7 +8,7 @@ This experiment is about training-time mechanisms only.
 
 Evaluation is just the fixed measurement harness after training:
 
-- train under a fixed 600s budget on the current Exp23 fast SSM base
+- train under a fixed 600s wall-clock budget on the current Exp23 fast SSM base
 - save the checkpoint
 - score with the same full fixed validation evaluation
 - compare BPB, train wall time, tokens processed, and any mechanism diagnostics
@@ -22,16 +22,82 @@ The control must be apples-to-apples with every mechanism arm:
 
 - same current fastest SSM base
 - same hardware target
-- same train budget
+- same timed 600s wall-clock training budget
 - same final full-validation scorer
 - same artifact/export path when relevant
 
 Smoke results are useful diagnostics, but they are not controls for Exp24.
 
+Ring 0 control must establish the numerical noise floor before mechanism arms
+are interpreted:
+
+- target: 3 control seeds
+- minimum: 2 control seeds if budget forces a triage run
+- seeds: use the Exp23 seed ladder (`1337`, `2674`, `4011`) unless the runner
+  has a stronger local convention
+- report: mean BPB, sample standard deviation, min/max, train elapsed, eval
+  elapsed, tokens/sec, and artifact size per seed
+
+Single-run mechanism deltas smaller than the Ring 0 BPB standard deviation are
+not paper-quality wins. They can still motivate a follow-up, but the report must
+label them as within the current noise floor.
+
 The Exp23 full-corpus run proved the fast path can process the full SP16384
 training corpus in about 530s on 8xH100. That matters because it creates room
 for training-time complexity. It does not mean full corpus completion is itself
 the goal. Full corpus completion is a metric, not a gate.
+
+## Budget Axis
+
+The primary budget axis is wall-clock training time.
+
+Every training arm gets the same timed 600s training budget on the same hardware
+class. Mechanism overhead counts against that 600s. A slower mechanism can win
+only by producing a better final full-validation BPB under the same wall-clock
+training budget.
+
+Secondary equal-cost views are allowed for diagnosis, but they are not the main
+Exp24 claim:
+
+- equal-step comparisons explain optimizer/update dynamics
+- equal-token comparisons explain data-efficiency
+- wall-clock comparisons decide whether a mechanism belongs in the submission
+  path
+
+The docs and result summaries should use "matched 600s wall-clock" rather than
+ambiguous "matched budget" wording.
+
+## Artifact-Size Bookkeeping
+
+Every arm must be tagged with its 16MB submission-artifact impact before it is
+run:
+
+- `artifact_neutral`: no extra parameters or persisted buffers at eval/export
+- `artifact_changes_weights_only`: final learned weights differ, but no new
+  tensors are added
+- `artifact_adds_export_param`: the arm adds parameters that would need to fit
+  in the submitted artifact
+- `artifact_training_only`: extra state exists during training but is dropped
+  before export/eval
+- `artifact_invalid_until_stripped`: the arm adds training-only state, but the
+  export path does not yet prove it is stripped
+
+Expected tags:
+
+| Candidate | Artifact impact |
+|---|---|
+| Fast/slow weights | `artifact_training_only` if exporting one copy; `artifact_changes_weights_only` for the chosen final copy |
+| Spectral regularization | `artifact_changes_weights_only` |
+| Predictive coding auxiliary | `artifact_training_only`; invalid unless aux head is excluded from export and optimizer checkpoints |
+| SemanticOptimizer | `artifact_changes_weights_only` |
+| SGNS init | `artifact_changes_weights_only`; precomputed init provenance must be recorded separately |
+| SGNS freeze | `artifact_changes_weights_only` |
+| Replay/sampling policy | `artifact_changes_weights_only` |
+| Neurogenesis | `artifact_adds_export_param`; must re-check compressed artifact size |
+| STDP supplement | `artifact_changes_weights_only` if no learned gate; `artifact_adds_export_param` if gated by learned parameters |
+
+Every result JSON should record `artifact_impact`, final compressed artifact
+bytes when available, and whether the export path is submit-valid.
 
 ## Operating Assumptions
 
@@ -79,6 +145,14 @@ Why it fits:
 - compatible with Muon and SemanticOptimizer
 - gives the sleep/consolidation intuition a performant test
 
+Old implementation status:
+
+- no old fast-path implementation exists
+- old sleep machinery is the conceptual ancestor, but it is not the code path
+  to reuse
+- implement as a small training-loop wrapper, not as a revival of
+  `sleep.py`
+
 Minimal version:
 
 ```python
@@ -94,7 +168,7 @@ Open design choice: which weights are evaluated at the end?
 - evaluate both: cheap after a run, useful for interpretation
 
 Kill condition: no interpolation interval/ratio improves full-val BPB or
-stability versus single-copy Muon at matched 600s.
+stability versus single-copy Muon at matched 600s wall-clock.
 
 Promote condition: equal or better BPB with modest overhead, especially if the
 slow copy beats the fast copy at final eval.
@@ -115,6 +189,15 @@ Why it fits:
 - directly targets recurrence dynamics
 - easy to diagnose by logging the A distribution
 
+Old implementation status:
+
+- older criticality work lived outside the final fast path and should not be
+  reused as machinery
+- this version is a plain differentiable loss term on diagonal recurrence
+  parameters
+- implementation should be local to the Exp23/Exp24 training step and disabled
+  by default
+
 Sketch:
 
 ```python
@@ -131,7 +214,7 @@ Kill condition: it moves the A distribution but does not improve BPB, or it
 improves diagnostics while harming token prediction.
 
 Promote condition: measurable BPB improvement, lower gradient/pathology tails,
-or a better train-loss-to-val-BPB conversion at the same budget.
+or a better train-loss-to-val-BPB conversion at matched 600s wall-clock.
 
 ### 3. Predictive Coding Auxiliary
 
@@ -149,6 +232,13 @@ Why it fits:
 - can be disabled entirely for artifact/eval
 - likely cheaper than replay if implemented inside the existing forward
 
+Old implementation status:
+
+- no current fast-path implementation exists
+- older state/memory machinery is only conceptual background
+- must be implemented so the auxiliary head and hidden-state buffers are
+  training-only and do not affect eval/export
+
 Sketch:
 
 ```python
@@ -165,8 +255,8 @@ Risks:
 - storing hidden sequences may increase VRAM or fight the fused head path
 - auxiliary head parameters must not contaminate final artifact accounting
 
-Kill condition: no auxiliary horizon/weight improves full-val BPB under a fair
-600s budget.
+Kill condition: no auxiliary horizon/weight improves full-val BPB under matched
+600s wall-clock.
 
 Promote condition: BPB improves without a large throughput hit, or the same BPB
 is reached with less training wall time.
@@ -192,6 +282,15 @@ Fast-path requirement:
 - bind real model parameter names
 - log beta/tau summaries
 - benchmark overhead before spending 8xH100 time
+
+Pre-run overhead gate:
+
+- benchmark against Muon on the same 1xH100 fast-path smoke shape
+- kill before provisioning an 8xH100 run if steady-state step time overhead is
+  greater than 8% without a compensating short-smoke loss/BPB signal
+- promote to 8xH100 only if overhead is less than or equal to 8%, or if a
+  smaller smoke shows enough quality lift to justify explicitly buying that
+  overhead
 
 Possible minimal test shape:
 
@@ -225,6 +324,15 @@ was not against the final fast path. The clean fast-path question is whether
 semantic geometry at initialization still helps once the base can see a large
 amount of data quickly.
 
+Exp21 relationship:
+
+- Exp24 does not replace the historical Exp21 4-cell thesis result
+- Exp24 does subsume the practical submission question: should SGNS-derived
+  initialization be used in the fastest SSM training recipe?
+- Any Exp24 SGNS win should be reported as "fast-path training recipe lift";
+  semantic-vs-distributional causality still depends on the Exp21-style
+  controls (`fullcov`, shuffled, zero/norm-only) if we need a paper claim
+
 Arms worth discussing:
 
 - random init control
@@ -250,8 +358,8 @@ Implementation detail: toggling `requires_grad` mid-run can interact with
 optimizer state. A cleaner fast-path version may leave gradients computed and
 zero the embedding grad until the unfreeze step.
 
-Kill condition: SGNS arms do not beat random under the fixed 600s/full-val
-contract, or freeze only preserves geometry while hurting BPB.
+Kill condition: SGNS arms do not beat random under the fixed 600s wall-clock
+plus full-val contract, or freeze only preserves geometry while hurting BPB.
 
 Promote condition: SGNS improves BPB on the fast base, especially if full-cov
 or freeze differentiates semantic geometry from row-scale conditioning.
@@ -262,7 +370,7 @@ Priority: design carefully; do not let it become a separate data-order project.
 
 Full corpus completion is no longer sacred. The objective is final BPB after
 600s. Training order is legal to change, but the comparison must be honest:
-same budget, same eval, same base.
+matched 600s wall-clock, same eval, same base.
 
 Candidate policies:
 
@@ -276,8 +384,15 @@ This is where "sleep/replay" can become performant. Token replay is cheap and
 may approximate consolidation without old semantic-engine overhead. Hidden-state
 replay is more SSM-native, but it has the state/weight staleness problem.
 
+Old implementation status:
+
+- old sleep/replay implementations are not assumed performant
+- token replay can be implemented as a sampling policy first
+- hidden-state replay needs a separate mechanism brief because cached states
+  can go stale as weights move
+
 Kill condition: no exposure/replay policy beats the simple control on full-val
-BPB at matched budget.
+BPB at matched 600s wall-clock.
 
 Promote condition: a policy lets us keep most of the fast-path data exposure
 while improving final BPB.
@@ -294,7 +409,8 @@ fused kernels, checkpoint export, and dead-channel initialization.
 
 Keep for 24b unless a prototype looks simpler than expected.
 
-Kill condition: wider-from-start beats grow-during-train at matched wall clock.
+Kill condition: wider-from-start beats grow-during-train at matched 600s
+wall-clock.
 
 ### STDP-Inspired Hebbian Supplement
 
@@ -330,9 +446,37 @@ Mechanism diagnostics:
 
 ## Suggested Execution Shape
 
-Phase A: write mechanism briefs and sort candidates.
+Phase 0: Ring 0 control and noise floor.
 
-Phase B: implement only the lowest-risk fast-path scaffolding:
+- run the current fixed-control recipe for 2-3 seeds
+- report BPB mean/std and wall-clock throughput spread
+- use this noise floor for Phase A interpretation
+
+Phase A: training-data exposure policy gate.
+
+- run no-extra-mechanism sampling/exposure policies under matched 600s
+  wall-clock
+- compare against the Phase 0 control noise floor
+- choose the default policy for Phase B
+- if Phase A promotes a new policy, run at least 2 seeds of that policy before
+  using it as the control for mechanism arms
+
+Candidate Phase A policies:
+
+- current fixed-control policy
+- deterministic sequential epoch
+- shuffled epoch
+- random windows
+- mixed coverage plus bounded hard-window replay
+
+Phase B: mechanism briefs and implementation sorting.
+
+For each candidate, write the mechanism brief and decide whether the candidate
+is ready for fast-path scaffolding. The brief is not decorative; it must include
+the old-implementation status, artifact-impact tag, mechanism diagnostics, and
+pre-run kill gate where applicable.
+
+Phase C: implement only the lowest-risk fast-path scaffolding:
 
 - fast/slow weight wrapper
 - spectral regularizer
@@ -341,12 +485,12 @@ Phase B: implement only the lowest-risk fast-path scaffolding:
 - SGNS/freeze hooks if artifacts are ready
 - replay/sampling policy hooks
 
-Phase C: run short 1xH100 smokes only to prove runtime and diagnostics.
+Phase D: run short 1xH100 smokes only to prove runtime and diagnostics.
 
-Phase D: spend 8xH100 time only on arms whose mechanism fired and whose overhead
-does not obviously erase the budget.
+Phase E: spend 8xH100 time only on arms whose mechanism fired and whose overhead
+does not obviously erase the matched 600s wall-clock budget.
 
-Phase E: compose only mechanisms that individually helped or were nearly free.
+Phase F: compose only mechanisms that individually helped or were nearly free.
 
 ## Current Recommendation
 
@@ -359,6 +503,15 @@ Order the first implementation pass:
 5. SGNS critical-period freeze
 6. replay/sampling policy
 
-The order is not a claim of scientific importance. It is a risk-adjusted path:
-start with mechanisms that are cheap, training-only, SSM-native, and unlikely to
-break the fast path.
+The order is not a claim of scientific importance. It is a risk-adjusted path
+based on expected lift, implementation risk, and how directly the mechanism
+answers the current failure mode.
+
+| Candidate | Expected lift | Main risk | Why this position |
+|---|---|---|---|
+| Fast/slow weights | medium | low/medium overhead from shadow copy and sync | Most direct performant replacement for old sleep/consolidation ideas |
+| Spectral regularization | low/medium | wrong band can improve diagnostics while hurting BPB | Cheapest SSM-native recurrence-shaping test |
+| Predictive coding auxiliary | medium/high | hidden storage and aux head can slow or contaminate export | Best state-shaping idea if hidden access is cheap |
+| SemanticOptimizer | medium | current implementation may be too slow unfused | Conceptually important, but must pass the overhead gate first |
+| SGNS critical-period freeze | medium | artifact/provenance and optimizer-state details | Good prior signal, but Exp21 causality remains separate |
+| Replay/sampling policy | medium/high | can become an open-ended data-order project | Phase A handles sampling first; extra replay waits for a mechanism brief |
