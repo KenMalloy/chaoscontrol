@@ -80,6 +80,24 @@ class _TinyTrainStepModel(nn.Module):
         return self.encoder(inputs)
 
 
+class _TinySemanticModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.layers = nn.ModuleList([nn.Module()])
+        self.layers[0].core = nn.Module()
+        self.layers[0].core.log_a = nn.Parameter(torch.randn(3))
+        self.layers[0].core.in_proj = nn.Linear(4, 3, bias=False)
+        self.layers[0].core.select_proj = nn.Linear(4, 3, bias=False)
+        self.layers[0].core.gate_proj = nn.Linear(4, 3, bias=False)
+        self.layers[0].core.delta_proj = nn.Linear(4, 3, bias=False)
+        self.layers[0].core.out_proj = nn.Linear(3, 4, bias=False)
+        self.final_norm = nn.Identity()
+        self.lm_head = nn.Linear(4, 6, bias=False)
+
+    def encode(self, inputs: torch.Tensor) -> torch.Tensor:
+        return inputs
+
+
 class _TinyTokenTrainModel(nn.Module):
     def __init__(self):
         super().__init__()
@@ -108,6 +126,52 @@ def _clear_backend_env() -> None:
     """
     for key in _BACKEND_ENV_KEYS:
         os.environ.pop(key, None)
+
+
+def test_build_optimizer_can_create_semantic_optimizer(monkeypatch):
+    mod = _load_runner_module()
+
+    class FakeSemanticOptimizer(torch.optim.SGD):
+        def __init__(self, params, **kwargs):
+            self.kwargs = dict(kwargs)
+            super().__init__(params, lr=kwargs["lr"])
+            self.bound_named_params = None
+
+        def bind_param_names(self, named_params):
+            self.bound_named_params = list(named_params)
+
+        def beta_trace(self):
+            return {
+                "beta_min": 0.1,
+                "beta_max": 0.9,
+                "beta_mean": 0.5,
+            }
+
+    monkeypatch.setattr(mod, "SemanticOptimizer", FakeSemanticOptimizer)
+
+    model = _TinySemanticModel()
+    optimizer = mod._build_optimizer(
+        {
+            "optimizer": "semantic",
+            "base_lr": 0.01,
+            "weight_decay": 0.02,
+            "semantic_layer_index": 0,
+            "semantic_momentum_min": 0.25,
+        },
+        model,
+    )
+
+    assert isinstance(optimizer, FakeSemanticOptimizer)
+    assert optimizer.kwargs["a_param_name"] == "layers.0.core.log_a"
+    assert optimizer.kwargs["channel_map"] == {
+        "layers.0.core.in_proj.weight": 0,
+        "layers.0.core.select_proj.weight": 0,
+        "layers.0.core.gate_proj.weight": 0,
+        "layers.0.core.delta_proj.weight": 0,
+        "layers.0.core.out_proj.weight": 1,
+    }
+    assert optimizer.kwargs["momentum_min"] == 0.25
+    assert optimizer.bound_named_params is not None
 
 
 def test_runner_defaults_to_native_scan_without_inductor():

@@ -137,6 +137,36 @@ def build_phase_a_sampling_matrix(
     return entries
 
 
+def build_semantic_overhead_gate_matrix(
+    *,
+    speed_config: dict[str, Any],
+    seed: int = 1337,
+    world_size: int = 1,
+    budget_seconds: float = 90.0,
+) -> list[dict[str, Any]]:
+    base = _base_entry(
+        speed_config=speed_config,
+        world_size=world_size,
+        budget_seconds=budget_seconds,
+    )
+    base["artifact_impact"] = ARTIFACT_CHANGES_WEIGHTS_ONLY
+    entries: list[dict[str, Any]] = []
+    for optimizer_name in ("muon", "semantic"):
+        opt_base = copy.deepcopy(base)
+        opt_base["optimizer"] = optimizer_name
+        entries.append(
+            _named_entry(
+                base=opt_base,
+                phase="smoke",
+                mechanism="semantic_optimizer_gate",
+                arm=f"semantic_gate_{optimizer_name}",
+                seed=seed,
+            )
+        )
+
+    return entries
+
+
 def summarize_control_noise(results: list[dict[str, Any]]) -> dict[str, Any]:
     rows = [
         {

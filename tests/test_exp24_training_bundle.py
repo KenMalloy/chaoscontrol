@@ -96,3 +96,28 @@ def test_control_noise_summary_uses_sample_std_and_min_max():
     assert summary["bpb_min"] == 1.05
     assert summary["bpb_max"] == 1.07
     assert summary["tokens_per_sec_mean"] == 42.0
+
+
+def test_build_semantic_overhead_gate_matrix_has_muon_and_semantic_rows():
+    mod = _load_exp24()
+
+    entries = mod.build_semantic_overhead_gate_matrix(
+        speed_config={"batch_size": 1024, "chunk_size": 64},
+        seed=1337,
+        world_size=1,
+        budget_seconds=90.0,
+    )
+
+    assert len(entries) == 2
+    assert [entry["name"] for entry in entries] == [
+        "exp24_smoke_semantic_gate_muon_s1337",
+        "exp24_smoke_semantic_gate_semantic_s1337",
+    ]
+    assert [entry["optimizer"] for entry in entries] == ["muon", "semantic"]
+    for entry in entries:
+        assert entry["world_size"] == 1
+        assert entry["budget_seconds"] == 90.0
+        assert entry["semantic_overhead_gate"] == 0.08
+        assert entry["exp24_phase"] == "smoke"
+        assert entry["exp24_mechanism"] == "semantic_optimizer_gate"
+        assert entry["artifact_impact"] == "artifact_changes_weights_only"

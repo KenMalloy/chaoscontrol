@@ -64,6 +64,7 @@ from chaoscontrol.distributed import (  # noqa: E402
 )
 from chaoscontrol.optim.lamb import LAMB  # noqa: E402
 from chaoscontrol.optim.muon import Muon  # noqa: E402
+from chaoscontrol.optim.semantic import SemanticOptimizer  # noqa: E402
 from chaoscontrol.precision import autocast_context  # noqa: E402
 from chaoscontrol.train_ssm import (  # noqa: E402
     _compiled_step_fn,
@@ -155,7 +156,75 @@ def _build_optimizer(
         )
         opt.bind_param_names(list(model.named_parameters()))
         return opt
+    if name == "semantic":
+        semantic_cfg = _semantic_optimizer_config(
+            model,
+            int(config.get("semantic_layer_index", 0)),
+        )
+        opt = SemanticOptimizer(
+            params,
+            lr=base_lr,
+            weight_decay=weight_decay,
+            adamw_lr=base_lr,
+            adamw_weight_decay=weight_decay,
+            momentum_min=float(config.get("semantic_momentum_min", 0.5)),
+            **semantic_cfg,
+        )
+        opt.bind_param_names(list(model.named_parameters()))
+        return opt
     raise ValueError(f"unknown optimizer {name!r}")
+
+
+def _semantic_optimizer_config(
+    model: torch.nn.Module,
+    layer_index: int,
+) -> dict[str, Any]:
+    prefix = f"layers.{int(layer_index)}.core"
+    a_param_name = f"{prefix}.log_a"
+    named_params = {name for name, _ in model.named_parameters()}
+    if a_param_name not in named_params:
+        raise ValueError(f"semantic optimizer requires {a_param_name!r}")
+
+    candidate_axes = {
+        "in_proj.weight": 0,
+        "select_proj.weight": 0,
+        "gate_proj.weight": 0,
+        "delta_proj.weight": 0,
+        "out_proj.weight": 1,
+    }
+    channel_map: dict[str, int] = {
+        f"{prefix}.{name}": axis
+        for name, axis in candidate_axes.items()
+        if f"{prefix}.{name}" in named_params
+    }
+    if not channel_map:
+        raise ValueError(
+            "semantic optimizer requires at least one channel-coupled matrix "
+            f"under {prefix!r}"
+        )
+
+    return {
+        "a_param_name": a_param_name,
+        "channel_map": channel_map,
+    }
+
+
+def _optimizer_diagnostics(optimizer: torch.optim.Optimizer) -> dict[str, Any]:
+    diagnostics = {
+        "type": optimizer.__class__.__name__,
+    }
+    beta_trace = getattr(optimizer, "beta_trace", None)
+    if callable(beta_trace):
+        trace = optimizer.beta_trace()
+        if trace is None:
+            diagnostics["beta_trace"] = None
+        else:
+            diagnostics["beta_trace"] = {
+                key: float(trace[key])
+                for key in ("beta_min", "beta_max", "beta_mean")
+                if key in trace
+            }
+    return diagnostics
 
 
 def _run_train_step(
@@ -943,6 +1012,7 @@ def train_fast_for_budget(
             float(loss_cpu[-1] - loss_cpu[0]) if loss_cpu.numel() >= 2 else float("nan")
         ),
         "peak_vram_mb": peak_vram_mb,
+        "optimizer": _optimizer_diagnostics(optimizer),
         "sampling_mode": sampling_mode,
         "total_start_count": total_starts,
         "rank_start_count": rank_start_count,
