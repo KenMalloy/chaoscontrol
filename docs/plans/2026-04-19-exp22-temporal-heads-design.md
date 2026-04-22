@@ -19,6 +19,12 @@ In implementation terms, a temporal head is a parallel recurrent trace that:
 
 Parameter-free temporal heads add eval-time compute and recurrent state memory, but do not increase artifact size.
 
+Novelty language should stay narrow. Multi-timescale recurrence, shared-weight
+branches, and probability-space ensembling all have prior art. The defensible
+claim is the composition: a frozen-checkpoint, same-model, separate-state,
+multi-horizon recurrent/SSM self-ensemble with causal probability mixing and no
+new learned mixer parameters in the Phase A conditions.
+
 The primary horizon knob is `log_a_shift`, not the current pre-softplus `delta_scale` hook. `log_a_shift` directly changes the SSM pole term:
 
 ```python
@@ -138,6 +144,7 @@ Phase A is the core experiment. It should run before any learned mixer or traini
 | Tag | Description | Purpose |
 |---|---|---|
 | `score_only` | Final checkpoint, normal eval, `log_a_shift=0.0` | bpb and wall-clock floor |
+| `identical_heads_uniform` | three independent heads all pinned to `log_a_shift=0.0`, mixed uniformly | sanity check that same-checkpoint self-ensemble scaffolding is equivalent to the base predictor when horizons are identical |
 | `single_horizon_sweep` | Fixed single shifts, pre-registered from pilot | find best single horizon |
 | `same_horizon_virtual_depth` | deterministic replay of the same SSM layer group at `log_a_shift=0.0`; see control definition below | equal-compute "more thinking" control |
 | `temporal_heads_3_uniform` | slow/base/fast heads with uniform probability mixture | primary parameter-free temporal head test |
@@ -162,6 +169,7 @@ Phase B is run if Phase A shows a non-trivial signal, or if Phase A is null whil
 
 | Tag | Description | Purpose |
 |---|---|---|
+| `temporal_heads_3_online_exp_weights` | causal exponential-weights mixer over the slow/base/fast traces, updating only after each token's realized loss | tests the highest-ceiling parameter-free causal expert-aggregation variant |
 | `temporal_scale_dropout_train` | train with random per-batch or per-block horizon shifts, eval with temporal heads | reduces eval-only OOD risk |
 | `tiny_mixer` | small frozen-checkpoint mixer trained on held-out calibration stream | measures learned composition without touching base weights |
 | `tiny_ssm_sidecar` | small recurrent sidecar predicts logit deltas for high-priority chunks | deferred expert-SSM bridge |
@@ -180,6 +188,10 @@ Primary comparisons use paired deltas across seeds:
 2. `temporal_heads_3_uniform` vs best pre-registered single horizon,
 3. `temporal_heads_3_uniform` vs `same_horizon_virtual_depth`,
 4. `gated_temporal_heads_3` vs `temporal_heads_3_uniform` on bpb per extra second.
+
+Before interpreting those comparisons, `identical_heads_uniform` must match
+`score_only` within float noise. A failure there means the runner or state
+threading is adding behavior beyond the declared horizon mechanism.
 
 If only one final checkpoint exists, Exp 22 can still answer the engineering question, but it must not report seed-level p-values. Doc bootstrap confidence intervals may be included as diagnostics only; they do not replace independent checkpoint seeds.
 
@@ -242,6 +254,18 @@ else:
 ```
 
 That secondary policy is exploratory until it is frozen on a calibration stream and re-run on the primary stream. The threshold should be chosen on a calibration stream or smoke split, then frozen for the primary eval stream. If the threshold is tuned on the primary eval stream, the run must be labeled exploratory.
+
+The online exponential-weights mixer follows the same legality rule at token
+granularity. Token `t` is scored with weights computed from tokens `< t`; only
+after token `t` has been scored may its per-head losses update weights for
+token `t+1`:
+
+```text
+log_w_{t+1,k} = log_softmax(log_w_{t,k} - eta * nll_{t,k})
+```
+
+Any per-token oracle chooser or future-token weight update is an invalid score
+and may only be reported as an explicitly leaky diagnostic.
 
 ## Metrics
 
@@ -311,8 +335,11 @@ Minimal API:
 @dataclass(frozen=True)
 class TemporalHeadConfig:
     horizon_shifts: tuple[float, ...] = (-0.5, 0.0, 0.5)
+    head_ids: tuple[str, ...] | None = None  # required when shifts repeat
     horizon_knob: Literal["log_a_shift", "delta_post_scale", "delta_pre_scale"] = "log_a_shift"
-    mixer: Literal["uniform_logprob", "logit_mean"] = "uniform_logprob"
+    mixer: Literal["uniform_logprob", "base_prior_logprob", "online_exp_weights_logprob", "logit_mean"] = "uniform_logprob"
+    online_eta: float = 1.0
+    online_initial_weights: tuple[float, ...] | None = None
     policy: Literal["always", "previous_chunk_priority"] = "always"
     threshold: float | None = None
 ```
@@ -333,12 +360,14 @@ Load-bearing tests:
 1. `horizon_shifts=(0.0,)` matches `score_only` within float noise.
 2. Uniform log-prob mixture with one head matches that head exactly.
 3. Each head carries independent recurrent state.
-4. Gating for chunk `k` cannot read target-dependent stats from chunk `k`.
-5. Wall-clock accounting charges every temporal-head forward pass.
-6. Artifact bytes are unchanged for parameter-free conditions.
-7. `log_a_shift=0.0` temporal path is bit-compatible with the existing Exp 20 `DeltaModulator` path.
-8. `same_horizon_virtual_depth` uses one state bundle and a deterministic virtual-layer replay; it does not instantiate multiple identical temporal-head states.
-9. Gating after a base-only chunk ignores head disagreement or uses only the pre-registered decayed cache.
+4. Repeated `horizon_shifts=(0.0, 0.0, 0.0)` with explicit `head_ids` matches `score_only` within float noise while preserving independent state objects.
+5. Online exponential weighting uses pre-update weights for token `t`, then updates only from token `t` losses for token `t+1`.
+6. Gating for chunk `k` cannot read target-dependent stats from chunk `k`.
+7. Wall-clock accounting charges every temporal-head forward pass.
+8. Artifact bytes are unchanged for parameter-free conditions.
+9. `log_a_shift=0.0` temporal path is bit-compatible with the existing Exp 20 `DeltaModulator` path.
+10. `same_horizon_virtual_depth` uses one state bundle and a deterministic virtual-layer replay; it does not instantiate multiple identical temporal-head states.
+11. Gating after a base-only chunk ignores head disagreement or uses only the pre-registered decayed cache.
 
 ## Risks
 

@@ -6,10 +6,22 @@ from chaoscontrol.eval_stream.temporal_heads import (
     TemporalHeadConfig,
     make_same_horizon_virtual_depth_config,
     score_temporal_heads_chunk,
+    online_exp_weighted_logprob_mixture,
     uniform_logprob_mixture,
     weighted_logprob_mixture,
 )
 from chaoscontrol.model import ChaosStudentLM
+
+
+def _mutate_suffix(tokens: torch.Tensor, *, cut: int, vocab_size: int) -> torch.Tensor:
+    mutant = tokens.clone()
+    offsets = torch.arange(
+        1,
+        tokens.size(1) - cut + 1,
+        device=tokens.device,
+    ).unsqueeze(0)
+    mutant[:, cut:] = (mutant[:, cut:] + offsets) % vocab_size
+    return mutant
 
 
 def test_uniform_logprob_mixture_one_head_is_identity():
@@ -44,6 +56,35 @@ def test_weighted_logprob_mixture_matches_probability_average():
     assert torch.allclose(mixed, expected)
 
 
+def test_model_prefix_logprobs_are_suffix_invariant():
+    torch.manual_seed(17)
+    vocab_size = 64
+    model = ChaosStudentLM(
+        vocab_size=vocab_size,
+        dim=16,
+        num_layers=2,
+        block_type="ssm",
+        a_mode="diag",
+    )
+    model.eval()
+
+    for _trial in range(4):
+        tokens = torch.randint(0, vocab_size, (1, 18))
+        for cut in (3, 7, 12, 16):
+            mutant = _mutate_suffix(tokens, cut=cut, vocab_size=vocab_size)
+
+            with torch.no_grad():
+                original_log_probs = F.log_softmax(model(tokens)["logits"], dim=-1)
+                mutant_log_probs = F.log_softmax(model(mutant)["logits"], dim=-1)
+
+            torch.testing.assert_close(
+                original_log_probs[:, :cut],
+                mutant_log_probs[:, :cut],
+                rtol=0.0,
+                atol=0.0,
+            )
+
+
 def test_weighted_logprob_mixture_rejects_bad_weights():
     logp = torch.log_softmax(torch.randn(1, 2, 3), dim=-1)
 
@@ -53,6 +94,81 @@ def test_weighted_logprob_mixture_rejects_bad_weights():
         assert "weights length" in str(exc)
     else:
         raise AssertionError("expected bad weight length to fail")
+
+
+def test_online_exp_weighted_mixture_updates_after_each_token_loss():
+    head_a = torch.log(
+        torch.tensor(
+            [
+                [
+                    [0.90, 0.10],
+                    [0.90, 0.10],
+                    [0.50, 0.50],
+                ]
+            ]
+        )
+    )
+    head_b = torch.log(
+        torch.tensor(
+            [
+                [
+                    [0.10, 0.90],
+                    [0.10, 0.90],
+                    [0.50, 0.50],
+                ]
+            ]
+        )
+    )
+    targets = torch.tensor([[0, 0]])
+
+    mixed = online_exp_weighted_logprob_mixture(
+        [head_a, head_b],
+        targets,
+        eta=4.0,
+    )
+    uniform = uniform_logprob_mixture([head_a, head_b])
+
+    assert torch.allclose(mixed[:, 0], uniform[:, 0])
+    assert mixed.exp()[0, 1, 0] > uniform.exp()[0, 1, 0]
+
+
+def test_online_exp_weighted_mixture_does_not_let_future_targets_change_current_mix():
+    head_a = torch.log(
+        torch.tensor(
+            [
+                [
+                    [0.80, 0.20],
+                    [0.70, 0.30],
+                    [0.50, 0.50],
+                ]
+            ]
+        )
+    )
+    head_b = torch.log(
+        torch.tensor(
+            [
+                [
+                    [0.20, 0.80],
+                    [0.30, 0.70],
+                    [0.50, 0.50],
+                ]
+            ]
+        )
+    )
+
+    future_zero = online_exp_weighted_logprob_mixture(
+        [head_a, head_b],
+        torch.tensor([[0, 0]]),
+        eta=2.0,
+    )
+    future_one = online_exp_weighted_logprob_mixture(
+        [head_a, head_b],
+        torch.tensor([[0, 1]]),
+        eta=2.0,
+    )
+
+    assert torch.equal(future_zero[:, 0], future_one[:, 0])
+    assert torch.equal(future_zero[:, 1], future_one[:, 1])
 
 
 def test_single_zero_shift_matches_direct_model():
@@ -86,6 +202,56 @@ def test_single_zero_shift_matches_direct_model():
     assert torch.isclose(torch.tensor(result.loss_nats), direct_loss)
     assert result.tokens_scored == chunk.size(1) - 1
     assert set(result.final_states_by_shift) == {0.0}
+
+
+def test_identical_uniform_heads_match_direct_model_with_independent_states():
+    torch.manual_seed(0)
+    model = ChaosStudentLM(
+        vocab_size=64,
+        dim=16,
+        num_layers=2,
+        block_type="ssm",
+        a_mode="diag",
+    )
+    chunk = torch.randint(0, 64, (1, 12))
+    cfg = TemporalHeadConfig(
+        horizon_shifts=(0.0, 0.0, 0.0),
+        head_ids=("same_a", "same_b", "same_c"),
+    )
+
+    result = score_temporal_heads_chunk(
+        model,
+        chunk,
+        states_by_shift={head_id: None for head_id in cfg.head_ids},
+        cfg=cfg,
+    )
+
+    with torch.no_grad():
+        out = model(chunk)
+        direct_log_probs = F.log_softmax(out["logits"], dim=-1)
+        direct_loss = F.cross_entropy(
+            out["logits"][:, :-1].reshape(-1, 64),
+            chunk[:, 1:].reshape(-1),
+            reduction="sum",
+        )
+
+    assert torch.allclose(result.mixed_log_probs, direct_log_probs)
+    assert torch.isclose(torch.tensor(result.loss_nats), direct_loss)
+    assert set(result.final_states_by_shift) == {"same_a", "same_b", "same_c"}
+    assert result.winner_counts_by_shift == {
+        "same_a": result.tokens_scored,
+        "same_b": 0,
+        "same_c": 0,
+    }
+    for layer_idx in range(2):
+        assert (
+            result.final_states_by_shift["same_a"][layer_idx].data_ptr()
+            != result.final_states_by_shift["same_b"][layer_idx].data_ptr()
+        )
+        assert (
+            result.final_states_by_shift["same_b"][layer_idx].data_ptr()
+            != result.final_states_by_shift["same_c"][layer_idx].data_ptr()
+        )
 
 
 def test_base_prior_mixer_protects_base_probability():
