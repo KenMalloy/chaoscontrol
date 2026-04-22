@@ -309,3 +309,134 @@ def test_rare_adjusted_direction_records_alignment_telemetry() -> None:
     assert "cos_rare_common" in trace
     assert "r_orth_over_common" in trace
     assert trace["cos_rare_common"]["count"] >= 1
+
+
+def test_two_sided_matrix_scarcity_applies_sqrt_factors_before_ns(monkeypatch) -> None:
+    """Design spec lines 122-135: L·G·R with L=sqrt(out), R=sqrt(in)."""
+    monkeypatch.setattr(
+        "chaoscontrol.optim.scopt.newton_schulz_orthogonalize",
+        lambda grad, **_: grad,
+    )
+    w = nn.Parameter(torch.zeros(3, 2))
+    opt = ScarcityAwareOptimizer(
+        [w],
+        lr=1.0,
+        momentum=0.0,
+        nesterov=False,
+        ns_steps=1,
+        weight_decay=0.0,
+        warmup_steps=0,
+        row_param_names=set(),  # Turn off row scarcity to isolate two-sided path.
+        matrix_scarcity_map={"w": ("w.__out__", "w.__in__")},
+        tau_out_floor=1.0,
+        tau_in_floor=1.0,
+        tau_std_scale=0.0,
+        compute_dtype=torch.float32,
+    )
+    opt.bind_param_names([("w", w)])
+    # Pressures chosen so tanh(p/τ)+1 produces clean factors.
+    # out_pressure has 3 rows; in_pressure has 2 cols.
+    opt.set_channel_pressure({
+        "w.__out__": torch.tensor([0.0, 1.0, 4.0]),
+        "w.__in__": torch.tensor([0.0, 2.0]),
+    })
+
+    w.grad = torch.ones_like(w)
+    opt.step()
+
+    out_factor = torch.tanh(torch.tensor([0.0, 1.0, 4.0])) + 1.0
+    in_factor = torch.tanh(torch.tensor([0.0, 2.0])) + 1.0
+    expected_scaled = out_factor.sqrt()[:, None] * torch.ones(3, 2) * in_factor.sqrt()[None, :]
+    rectangular_scale = (3.0 / 2.0) ** 0.5  # rows/cols scale from Muon update.
+    applied = -w.detach()
+    assert torch.allclose(applied, expected_scaled * rectangular_scale, atol=1e-6)
+
+
+def test_energy_enrichment_ratio_greater_than_one_when_scarce_rows_dominate(monkeypatch) -> None:
+    """Design spec lines 278-284: enrichment ratio should exceed 1 when
+    scarce rows receive disproportionate NS-output energy.
+
+    Uses 4 distinct per-row pressures so torch.median picks an unambiguous
+    split — bimodal pressure (e.g. [0,0,3,3]) would put the median at the
+    low cluster and leave the common branch empty, silently skipping the
+    telemetry record.
+    """
+    monkeypatch.setattr(
+        "chaoscontrol.optim.scopt.newton_schulz_orthogonalize",
+        lambda grad, **_: grad,
+    )
+    w = nn.Parameter(torch.zeros(4, 2))
+    opt = ScarcityAwareOptimizer(
+        [w],
+        lr=1.0,
+        momentum=0.0,
+        nesterov=False,
+        ns_steps=1,
+        weight_decay=0.0,
+        warmup_steps=0,
+        row_param_names={"embed.weight"},
+        row_scarcity_power=1.0,
+        tau_row_floor=1.0,
+        tau_std_scale=0.0,
+        compute_dtype=torch.float32,
+    )
+    opt.bind_param_names([("embed.weight", w)])
+    opt.set_row_pressure_ema(torch.tensor([0.0, 1.0, 2.0, 3.0]))
+
+    w.grad = torch.ones_like(w)
+    opt.step()
+    trace = opt.scarcity_trace()
+
+    assert "ns_row_energy_enrichment" in trace
+    ratio = trace["ns_row_energy_enrichment"]["median"]
+    # Analytical ratio is ~3.6× (scarce rows get factor ≈ [1.76, 1.96, 1.99]
+    # while common row stays at 1.0); use 1.5× as a loose floor.
+    assert ratio > 1.5, f"scarce rows should carry >1.5× common-row energy, got {ratio}"
+
+
+def test_recurrence_scarcity_with_timescale_modulates_per_channel() -> None:
+    """Design spec lines 148-161: long-half-life channels with high pressure
+    get amplified updates; zero timescale disables the modulation channel-wise.
+
+    Exercises ``_apply_recurrence_scarcity`` directly. AdamW's denom
+    normalization inside ``step()`` would wash out the per-channel factor,
+    so step()-level observation is the wrong scope for this assertion.
+    """
+    log_a = nn.Parameter(torch.zeros(4))
+    opt = ScarcityAwareOptimizer(
+        [log_a],
+        lr=1.0,
+        momentum=0.0,
+        nesterov=False,
+        ns_steps=1,
+        weight_decay=0.0,
+        warmup_steps=0,
+        recurrence_scarcity_map={"log_a": "rec"},
+        recurrence_weight=1.0,
+        tau_out_floor=1.0,
+        tau_std_scale=0.0,
+        compute_dtype=torch.float32,
+    )
+    opt.bind_param_names([("log_a", log_a)])
+
+    pressure = torch.tensor([0.0, 1.0, 2.0, 3.0])
+    timescale = torch.tensor([0.0, 0.0, 1.0, 1.0])
+    opt.set_channel_pressure({"rec": pressure})
+    opt.set_recurrence_timescale({"rec": timescale})
+
+    # Bump past warmup so _scarcity_enabled() returns True inside the helper.
+    opt._step_count = 1
+
+    direction = torch.ones(4)
+    adjusted = opt._apply_recurrence_scarcity("log_a", direction)
+
+    factor_raw = torch.tanh(pressure) + 1.0  # [1, ~1.76, ~1.96, ~1.995]
+    factor_expected = 1.0 + (factor_raw - 1.0) * timescale
+
+    assert torch.allclose(adjusted, direction * factor_expected, atol=1e-6)
+    # Channels 0-1 unmodulated (timescale=0 → factor=1.0).
+    assert adjusted[0].item() == pytest.approx(1.0, abs=1e-6)
+    assert adjusted[1].item() == pytest.approx(1.0, abs=1e-6)
+    # Channels 2-3 see full scarcity amplification.
+    assert adjusted[2].item() > 1.5
+    assert adjusted[3].item() > 1.5
