@@ -468,3 +468,42 @@ def test_warmup_restore_is_bit_equal():
             f"param {name} drifted after warmup-restore: "
             f"max diff {(pre_tensor - post_tensor).abs().max().item()}"
         )
+
+
+def test_gate_handles_bf16_loss_tensor():
+    mod = _load_runner_module()
+
+    losses_fp32 = [2.5, 2.48, 2.46, 2.45, 2.44, 3.20]
+    losses_bf16 = [
+        torch.tensor(value, dtype=torch.bfloat16).float().item()
+        for value in losses_fp32
+    ]
+
+    gate_fp32 = mod.LossTriggeredReplayEMA(decay=0.5, warmup_steps=1)
+    gate_bf16 = mod.LossTriggeredReplayEMA(decay=0.5, warmup_steps=1)
+
+    fp32_decisions = []
+    bf16_decisions = []
+    for loss_fp32, loss_bf16 in zip(losses_bf16, losses_bf16, strict=True):
+        d_fp32 = gate_fp32.update(
+            torch.tensor(loss_fp32, dtype=torch.float32),
+            threshold=1.10,
+            pressure_threshold=0.05,
+        )
+        d_bf16 = gate_bf16.update(
+            torch.tensor(loss_bf16, dtype=torch.bfloat16),
+            threshold=1.10,
+            pressure_threshold=0.05,
+        )
+        fp32_decisions.append(d_fp32)
+        bf16_decisions.append(d_bf16)
+
+    for d_fp32, d_bf16 in zip(fp32_decisions, bf16_decisions, strict=True):
+        if d_fp32 is None:
+            assert d_bf16 is None
+            continue
+        assert d_bf16 is not None
+        assert d_fp32.triggered == d_bf16.triggered
+        assert d_fp32.local_fire == d_bf16.local_fire
+        assert torch.isfinite(torch.tensor(d_bf16.local_loss))
+        assert torch.isfinite(torch.tensor(d_bf16.ema_loss))
