@@ -45,12 +45,25 @@ class FastSlowConsolidator:
             return
 
         model_params = dict(model.named_parameters())
+        slow_list: list[torch.Tensor] = []
+        fast_list: list[torch.Tensor] = []
         with torch.no_grad():
             for name, slow_param in self.slow_state.items():
                 model_param = model_params.get(name)
                 if model_param is None:
                     continue
-                slow_param.lerp_(model_param.detach(), self.alpha)
+                fast_param = model_param.detach()
+                if (
+                    fast_param.device != slow_param.device
+                    or fast_param.dtype != slow_param.dtype
+                ):
+                    slow_param.lerp_(fast_param, self.alpha)
+                    continue
+                slow_list.append(slow_param)
+                fast_list.append(fast_param)
+
+            if slow_list:
+                torch._foreach_lerp_(slow_list, fast_list, self.alpha)
 
         self.sync_count += 1
 

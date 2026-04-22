@@ -16,10 +16,10 @@ Do not treat the CPU numbers below as H100 optimization evidence. They only prov
 
 ## CPU Smoke
 
-Command:
+Latest command after the fast-slow foreach change:
 
 ```bash
-'/Users/kennethmalloy/Local Documents/Developer/chaoscontrol/.venv/bin/python' experiments/24_training_time_bundle/profile_event_sleep_arm.py --steps 10 --seconds 10 --device cpu
+'/Users/kennethmalloy/Local Documents/Developer/chaoscontrol/.venv/bin/python' experiments/24_training_time_bundle/profile_event_sleep_arm.py --steps 64 --seconds 10 --device cpu
 ```
 
 Output JSON: `experiments/24_training_time_bundle/profile_event_sleep_arm_out.json`
@@ -27,24 +27,25 @@ Output JSON: `experiments/24_training_time_bundle/profile_event_sleep_arm_out.js
 Summary:
 
 - Device: `cpu`
-- Steps: 10
+- Steps: 64
 - Tokens per step: 4096
-- Mean inside-budget wall time per step: 7.224 ms
+- Mean inside-budget wall time per step: 6.267 ms
 
 | rank | section | mean wall ms | p50 wall ms | p95 wall ms | share |
 |---:|---|---:|---:|---:|---:|
-| 1 | backward | 4.791 | 3.348 | 11.459 | 66.32% |
-| 2 | logits_and_loss | 1.908 | 1.784 | 2.695 | 26.41% |
-| 3 | optimizer_step | 0.351 | 0.325 | 0.521 | 4.86% |
-| 4 | encode_forward | 0.158 | 0.142 | 0.232 | 2.18% |
-| 5 | event_sleep_gate | 0.015 | 0.014 | 0.023 | 0.21% |
-| 6 | fast_slow_ema | 0.002 | 0.002 | 0.002 | 0.02% |
+| 1 | backward | 3.668 | 3.254 | 4.650 | 58.52% |
+| 2 | logits_and_loss | 1.842 | 1.668 | 2.453 | 29.39% |
+| 3 | optimizer_step | 0.452 | 0.399 | 0.806 | 7.21% |
+| 4 | dreamworld_replay | 1.609 | 1.620 | 1.795 | 2.41% |
+| 5 | encode_forward | 0.135 | 0.129 | 0.168 | 2.15% |
+| 6 | event_sleep_gate | 0.015 | 0.014 | 0.020 | 0.23% |
+| 7 | fast_slow_ema | 0.006 | 0.001 | 0.002 | 0.09% |
 
 ## Initial Verdicts
 
 | candidate | verdict | rationale |
 |---|---|---|
-| Fast-slow foreach lerp | landing-target | Task 8 is small, already covered by an equivalence test, and replaces a visible Python loop. Measure host-wall delta after implementation. |
+| Fast-slow foreach lerp | landed on CPU smoke; H100 delta pending | Replaced the per-parameter slow-weight blend with `torch._foreach_lerp_` for matching dtype/device tensors and retained scalar fallback for mismatches. The 64-step CPU smoke shows `fast_slow_ema` at 0.09% host-wall share after landing. |
 | Event-sleep on-device EMA | needs-audit | Task 9 is not unconditional: the caller immediately consumes Python bools/floats, so a host-wall win must be measured before keeping it. |
 | Spectral regularizer vectorization | negligible-skip unless H100 says otherwise | The active smoke arm did not sample `spectral_reg`; execute only if H100 profile shows >1% host-wall share. |
 | Train-step graph-break audit | not applicable locally | Base config has `compile_full_path: false`; run only if the H100 profile/active arm enables the compiled path. |

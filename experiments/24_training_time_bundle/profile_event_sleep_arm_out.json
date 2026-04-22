@@ -1,70 +1,79 @@
 {
   "arm": "fast_slow_dreamworld_event_sleep",
   "device": "cpu",
-  "elapsed_s": 0.07488216715864837,
-  "mean_inside_budget_ms_per_step": 7.2243626695126295,
+  "elapsed_s": 0.41540941689163446,
+  "mean_inside_budget_ms_per_step": 6.267287164519075,
   "mechanisms": {
-    "dream_buffer_size": 2,
-    "event_sleep_decision_count": 0,
+    "dream_buffer_size": 8,
+    "event_sleep_decision_count": 32,
     "event_sleep_replay_count": 0,
     "event_sleep_trigger_count": 0,
-    "fast_slow_sync_count": 0
+    "fast_slow_sync_count": 2
   },
   "precision": "bf16",
   "sections": [
     {
-      "count": 10,
+      "count": 64,
       "mean_cuda_ms": null,
-      "mean_wall_ms": 4.7912124544382095,
+      "mean_wall_ms": 3.66767969171633,
       "name": "backward",
-      "p50_wall_ms": 3.347791964188218,
-      "p95_wall_ms": 11.459203716367467,
-      "share_wall": 0.6632020945816435
+      "p50_wall_ms": 3.2535624923184514,
+      "p95_wall_ms": 4.649784078355878,
+      "share_wall": 0.5852100909752668
     },
     {
-      "count": 10,
+      "count": 64,
       "mean_cuda_ms": null,
-      "mean_wall_ms": 1.9076250027865171,
+      "mean_wall_ms": 1.8417532592138741,
       "name": "logits_and_loss",
-      "p50_wall_ms": 1.7835414037108421,
-      "p95_wall_ms": 2.695166936609893,
-      "share_wall": 0.2640544349796893
+      "p50_wall_ms": 1.6677085077390075,
+      "p95_wall_ms": 2.45267676655203,
+      "share_wall": 0.2938676991921755
     },
     {
-      "count": 10,
+      "count": 64,
       "mean_cuda_ms": null,
-      "mean_wall_ms": 0.35097519867122173,
+      "mean_wall_ms": 0.4518742971413303,
       "name": "optimizer_step",
-      "p50_wall_ms": 0.3253959584981203,
-      "p95_wall_ms": 0.5205561988987027,
-      "share_wall": 0.04858216769104966
+      "p50_wall_ms": 0.39883353747427464,
+      "p95_wall_ms": 0.8058375911787149,
+      "share_wall": 0.07210046153613661
     },
     {
-      "count": 10,
+      "count": 6,
       "mean_cuda_ms": null,
-      "mean_wall_ms": 0.15755838248878717,
+      "mean_wall_ms": 1.609291648492217,
+      "name": "dreamworld_replay",
+      "p50_wall_ms": 1.6198749653995037,
+      "p95_wall_ms": 1.7949165194295347,
+      "share_wall": 0.024072790680514884
+    },
+    {
+      "count": 64,
+      "mean_cuda_ms": null,
+      "mean_wall_ms": 0.13476823005476035,
       "name": "encode_forward",
-      "p50_wall_ms": 0.14214601833373308,
-      "p95_wall_ms": 0.231720705050975,
-      "share_wall": 0.02180931241916962
+      "p50_wall_ms": 0.129229505546391,
+      "p95_wall_ms": 0.1678856322541833,
+      "share_wall": 0.021503439449483384
     },
     {
-      "count": 10,
+      "count": 64,
       "mean_cuda_ms": null,
-      "mean_wall_ms": 0.015249918214976788,
+      "mean_wall_ms": 0.01454753873986192,
       "name": "event_sleep_gate",
-      "p50_wall_ms": 0.014249933883547783,
-      "p95_wall_ms": 0.023056240752339356,
-      "share_wall": 0.0021109015303637266
+      "p50_wall_ms": 0.014228979125618935,
+      "p95_wall_ms": 0.0197060639038682,
+      "share_wall": 0.0023211859227098676
     },
     {
-      "count": 10,
+      "count": 64,
       "mean_cuda_ms": null,
-      "mean_wall_ms": 0.0017417129129171371,
+      "mean_wall_ms": 0.005793055606773123,
       "name": "fast_slow_ema",
-      "p50_wall_ms": 0.0017919810488820076,
-      "p95_wall_ms": 0.002308166585862636,
-      "share_wall": 0.0002410887980841965
+      "p50_wall_ms": 0.001333886757493019,
+      "p95_wall_ms": 0.0021936139091849305,
+      "share_wall": 0.0009243322437129235
     },
     {
       "count": 0,
@@ -83,18 +92,9 @@
       "p50_wall_ms": 0.0,
       "p95_wall_ms": 0.0,
       "share_wall": 0.0
-    },
-    {
-      "count": 0,
-      "mean_cuda_ms": null,
-      "mean_wall_ms": 0.0,
-      "name": "dreamworld_replay",
-      "p50_wall_ms": 0.0,
-      "p95_wall_ms": 0.0,
-      "share_wall": 0.0
     }
   ],
-  "steps": 10,
+  "steps": 64,
   "tokens_per_step": 4096,
-  "total_inside_budget_ms": 72.2436266951263
+  "total_inside_budget_ms": 401.1063785292208
 }

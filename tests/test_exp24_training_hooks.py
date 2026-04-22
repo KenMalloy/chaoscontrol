@@ -69,6 +69,40 @@ def test_fast_slow_consolidator_from_config_and_sync_and_copy():
     assert torch.equal(model.linear.weight, consolidator.slow_state["linear.weight"])
 
 
+def test_fastslow_after_optimizer_step_matches_reference_lerp():
+    mod = _load_module()
+    FastSlowConsolidator = mod.FastSlowConsolidator
+
+    torch.manual_seed(0)
+    model = nn.Sequential(nn.Linear(4, 4), nn.Linear(4, 4))
+    consolidator = FastSlowConsolidator.from_config(
+        model,
+        {
+            "fast_slow_enabled": True,
+            "fast_slow_interval": 1,
+            "fast_slow_alpha": 0.1,
+        },
+    )
+    pre_slow = {
+        name: tensor.clone() for name, tensor in consolidator.slow_state.items()
+    }
+
+    with torch.no_grad():
+        for param in model.parameters():
+            param.add_(torch.randn_like(param))
+
+    consolidator.after_optimizer_step(model, step=1)
+
+    model_params = dict(model.named_parameters())
+    for name, pre_slow_tensor in pre_slow.items():
+        expected = torch.lerp(pre_slow_tensor, model_params[name].detach(), 0.1)
+        actual = consolidator.slow_state[name]
+        assert torch.equal(actual, expected), (
+            f"{name} lerp mismatch: max diff "
+            f"{(actual - expected).abs().max().item()}"
+        )
+
+
 def test_spectral_regularization_loss_and_summary():
     mod = _load_module()
     model = _LogAModel()
