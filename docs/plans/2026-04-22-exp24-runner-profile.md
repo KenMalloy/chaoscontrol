@@ -42,15 +42,19 @@ Summary:
 | 7 | fast_slow_ema | 0.037 | 0.001 | 0.003 | 0.59% |
 | 8 | event_sleep_decision_resolve | 0.010 | 0.009 | 0.014 | 0.08% |
 
-## Initial Verdicts
+## Candidate Verdicts
 
 | candidate | verdict | rationale |
 |---|---|---|
 | Fast-slow foreach lerp | landed on CPU smoke; H100 delta pending | Replaced the per-parameter slow-weight blend with `torch._foreach_lerp_` for matching dtype/device tensors and retained scalar fallback for mismatches. The latest CPU smoke shows a 0.001 ms p50 for `fast_slow_ema`; the mean/share are dominated by rare host outliers. |
 | Event-sleep on-device EMA | landed as CUDA-sync avoidance; H100 delta pending | `LossTriggeredReplayEMA` now keeps EMA/pressure as tensors and the runner resolves the prior step's decision at the next step boundary. CPU host-wall for `event_sleep_gate` increased because CPU tensor ops replace scalar math; explicit decision materialization is now isolated in `event_sleep_decision_resolve` at 0.010 ms mean. The intended win is avoiding CUDA `.item()` sync on H100. |
-| Spectral regularizer vectorization | negligible-skip unless H100 says otherwise | The active smoke arm did not sample `spectral_reg`; execute only if H100 profile shows >1% host-wall share. |
-| Train-step graph-break audit | not applicable locally | Base config has `compile_full_path: false`; run only if the H100 profile/active arm enables the compiled path. |
-| Dreamworld replay backward | needs H100 sample | The 10-step CPU smoke did not sample replay; use the longer H100 profile to classify it. |
+| Spectral regularizer vectorization | inactive for this arm; deferred | The `fast_slow_dreamworld_event_sleep` arm leaves `spectral_reg_lambda_*` at `0.0`, and the profile records `spectral_reg` with count 0/share 0.0%. No vectorization landed because it cannot move this arm's 600-second budget. |
+| Train-step graph-break audit | not applicable for active config | Base Exp 23/24 configs have `compile_full_path: false`; there is no compiled train-step region for `TORCH_LOGS=graph_breaks` to inspect in this arm. |
+| Dreamworld replay backward | audited; no code change | Replay already does a state-conditioned teacher-forced forward and LM-head backward from cached detached states. The sampled entry can be old/random, so reusing current-step activations would change the replay contract rather than just remove recomputation. CPU smoke samples replay at 2.49% host-wall share; H100 share still pending. |
+
+## Dreamworld Backward Audit
+
+`dreamworld_replay_backward` subsamples the replay entry if configured, moves cached states and replay tokens to the model device, runs `model.encode(replay_inputs, initial_states=states, return_final_states=False)`, then backpropagates through either `full_lm_head_backward` or the fused LM-head path. It does not reuse main-step activations, and that is intentional: replay entries are detached buffer samples, not guaranteed to be from the current batch or current step. Reusing live activations would couple replay semantics to the current minibatch and break the buffer contract.
 
 ## H100 Run
 
