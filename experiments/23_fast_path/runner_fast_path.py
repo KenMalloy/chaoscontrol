@@ -75,10 +75,15 @@ from chaoscontrol.train_ssm import (  # noqa: E402
 )
 from fast_path import (  # noqa: E402
     Exp23BatchPrefetcher,
+    SequentialShardedStartSampler,
     batch_from_start_tensor,
     choose_lm_starts_lazy,
+    count_lm_starts,
+    count_sharded_lm_starts,
     should_stop_training_loop,
     sample_sharded_lm_starts,
+    sequential_epoch_steps,
+    sequential_sharded_lm_starts,
     steady_state_step_seconds,
     summarize_cuda_graph_gate,
     summarize_train_timing,
@@ -625,6 +630,7 @@ def train_fast_for_budget(
     cuda_graph_max_capture_seconds: float = 30.0,
     cuda_graph_warmup_steps: int = 3,
     grad_allreduce_mode: str = "bulk",
+    train_sampling_mode: str = "random",
 ) -> dict[str, Any]:
     rank_ = int(rank)
     world_size_ = int(world_size)
@@ -637,6 +643,29 @@ def train_fast_for_budget(
             "grad_allreduce_mode must be 'bulk' or 'async_param', "
             f"got {grad_allreduce_mode!r}"
         )
+    sampling_mode = str(train_sampling_mode).strip().lower()
+    if sampling_mode not in {"random", "sequential_epoch"}:
+        raise ValueError(
+            "train_sampling_mode must be 'random' or 'sequential_epoch', "
+            f"got {train_sampling_mode!r}"
+        )
+    total_starts = count_lm_starts(train_num_tokens, seq_len, stride)
+    rank_start_count = count_sharded_lm_starts(
+        total_starts=total_starts,
+        rank=rank_,
+        world_size=world_size_,
+    )
+    epoch_steps = None
+    if sampling_mode == "sequential_epoch":
+        epoch_steps = sequential_epoch_steps(
+            num_tokens=train_num_tokens,
+            seq_len=seq_len,
+            stride=stride,
+            batch_size=batch_size,
+            world_size=world_size_,
+        )
+        if max_steps is None:
+            max_steps = epoch_steps
 
     graph_mode = str(cuda_graph_mode).strip().lower()
     if graph_mode not in {"none", "probe"}:
@@ -653,6 +682,8 @@ def train_fast_for_budget(
             compile_full_path=compile_full_path,
             lm_head_backward_mode=lm_head_backward_mode,
         )
+        if sampling_mode != "random":
+            graph_rejections.append("train_sampling_mode_not_supported")
         if graph_rejections:
             graph_summary = _rejected_cuda_graph_summary(
                 mode=graph_mode,
@@ -721,6 +752,11 @@ def train_fast_for_budget(
         if ddp_active and grad_allreduce_mode_ == "async_param"
         else None
     )
+    sequential_sampler = (
+        SequentialShardedStartSampler()
+        if sampling_mode == "sequential_epoch"
+        else None
+    )
     if prefetch_batches:
         prefetcher = Exp23BatchPrefetcher(
             tokens=train_tokens,
@@ -732,6 +768,7 @@ def train_fast_for_budget(
             device=device,
             generator=rng,
             vocab_size=vocab_size,
+            batch_sampler=sequential_sampler,
         )
 
     try:
@@ -755,15 +792,26 @@ def train_fast_for_budget(
                     prefetcher.prime()
                 inputs, targets = prefetcher.next()
             else:
-                starts = sample_sharded_lm_starts(
-                    num_tokens=train_num_tokens,
-                    seq_len=seq_len,
-                    stride=stride,
-                    batch_size=batch_size,
-                    rank=rank_,
-                    world_size=world_size_,
-                    generator=rng,
-                )
+                if sampling_mode == "sequential_epoch":
+                    starts = sequential_sharded_lm_starts(
+                        num_tokens=train_num_tokens,
+                        seq_len=seq_len,
+                        stride=stride,
+                        batch_size=batch_size,
+                        rank=rank_,
+                        world_size=world_size_,
+                        step=steps,
+                    )
+                else:
+                    starts = sample_sharded_lm_starts(
+                        num_tokens=train_num_tokens,
+                        seq_len=seq_len,
+                        stride=stride,
+                        batch_size=batch_size,
+                        rank=rank_,
+                        world_size=world_size_,
+                        generator=rng,
+                    )
                 inputs, targets = batch_from_start_tensor(
                     tokens=train_tokens,
                     starts=starts,
@@ -829,6 +877,20 @@ def train_fast_for_budget(
             float(loss_cpu[-1] - loss_cpu[0]) if loss_cpu.numel() >= 2 else float("nan")
         ),
         "peak_vram_mb": peak_vram_mb,
+        "sampling_mode": sampling_mode,
+        "total_start_count": total_starts,
+        "rank_start_count": rank_start_count,
+        "epoch_steps": epoch_steps,
+        "unique_start_count": (
+            min(total_starts, steps * int(batch_size) * world_size_)
+            if sampling_mode == "sequential_epoch"
+            else None
+        ),
+        "epoch_complete": (
+            steps >= int(epoch_steps)
+            if epoch_steps is not None
+            else None
+        ),
         **timing,
     }
     if graph_summary is not None:
@@ -1008,6 +1070,7 @@ def run_condition(
         ),
         cuda_graph_warmup_steps=int(config.get("cuda_graph_warmup_steps", 3)),
         grad_allreduce_mode=str(config.get("grad_allreduce_mode", "bulk")),
+        train_sampling_mode=str(config.get("train_sampling_mode", "random")),
     )
 
     if ddp_active:

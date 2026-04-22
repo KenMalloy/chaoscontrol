@@ -54,6 +54,7 @@ def _base_fast_config(*, world_size: int, vocab_size: int) -> dict[str, Any]:
         "cuda_graph_mode": "none",
         "cuda_graph_min_total_speedup": 0.05,
         "cuda_graph_max_capture_seconds": 30.0,
+        "train_sampling_mode": "random",
         "lm_head_backward_mode": "fused_streaming_v2",
         "lm_head_tile_size": 8192,
         "warmup_steps": 5,
@@ -506,6 +507,98 @@ def sample_sharded_lm_starts(
     )
     global_idx = int(rank) + local_idx * int(world_size)
     return global_idx * int(stride)
+
+
+def sequential_epoch_steps(
+    *,
+    num_tokens: int,
+    seq_len: int,
+    stride: int,
+    batch_size: int,
+    world_size: int,
+) -> int:
+    """Return fixed-shape DDP steps needed to cover every valid start once.
+
+    Ranks own starts by ``global_start_index % world_size``. The run length is
+    the maximum per-rank shard length rounded up to the fixed per-rank batch
+    size; ranks with shorter shards pad their final batch with their last valid
+    start so all DDP ranks keep identical shapes.
+    """
+    total = count_lm_starts(num_tokens, seq_len, stride)
+    if total <= 0:
+        return 0
+    batch = max(1, int(batch_size))
+    world = max(1, int(world_size))
+    max_rank_starts = max(
+        count_sharded_lm_starts(total_starts=total, rank=rank, world_size=world)
+        for rank in range(world)
+    )
+    return (max_rank_starts + batch - 1) // batch
+
+
+def sequential_sharded_lm_starts(
+    *,
+    num_tokens: int,
+    seq_len: int,
+    stride: int,
+    batch_size: int,
+    rank: int,
+    world_size: int,
+    step: int,
+) -> torch.Tensor:
+    """Return deterministic fixed-size starts for one sequential epoch step."""
+    total = count_lm_starts(num_tokens, seq_len, stride)
+    sharded = count_sharded_lm_starts(
+        total_starts=total,
+        rank=rank,
+        world_size=world_size,
+    )
+    if sharded <= 0:
+        raise RuntimeError(
+            f"rank {rank} has no train starts after world_size={world_size} sharding"
+        )
+    first = int(step) * int(batch_size)
+    local_idx = torch.arange(
+        first,
+        first + int(batch_size),
+        dtype=torch.long,
+    )
+    local_idx.clamp_(max=sharded - 1)
+    global_idx = int(rank) + local_idx * int(world_size)
+    return global_idx * int(stride)
+
+
+class SequentialShardedStartSampler:
+    """Stateful sampler compatible with ``Exp23BatchPrefetcher``."""
+
+    def __init__(self) -> None:
+        self._step = 0
+        self._lock = threading.Lock()
+
+    def __call__(
+        self,
+        *,
+        num_tokens: int,
+        seq_len: int,
+        stride: int,
+        batch_size: int,
+        rank: int,
+        world_size: int,
+        generator: torch.Generator,
+    ) -> torch.Tensor:
+        del generator
+        with self._lock:
+            step = self._step
+            self._step += 1
+        return sequential_sharded_lm_starts(
+            num_tokens=num_tokens,
+            seq_len=seq_len,
+            stride=stride,
+            batch_size=batch_size,
+            rank=rank,
+            world_size=world_size,
+            step=step,
+        )
 
 
 def choose_lm_starts_lazy(
