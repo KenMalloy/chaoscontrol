@@ -81,6 +81,8 @@ def summarize_result_dir(results_dir: Path) -> dict[str, Any]:
             errors.append({"name": name, "error": str(data["error"])})
             continue
         train = data.get("train") or {}
+        artifact = data.get("artifact") or {}
+        exp24 = data.get("exp24") or {}
         ranked.append({
             "name": name,
             "tokens_per_sec": float(train.get("aggregate_tokens_per_sec", 0.0)),
@@ -88,6 +90,10 @@ def summarize_result_dir(results_dir: Path) -> dict[str, Any]:
             "steps": int(train.get("steps", 0)),
             "final_loss": float(train.get("final_loss", float("nan"))),
             "peak_vram_mb": float(train.get("peak_vram_mb", 0.0)),
+            "artifact_impact": artifact.get("artifact_impact"),
+            "submit_valid": artifact.get("submit_valid"),
+            "exp24_phase": exp24.get("phase"),
+            "exp24_mechanism": exp24.get("mechanism"),
             "path": str(path),
         })
     ranked.sort(key=lambda row: row["tokens_per_sec"], reverse=True)

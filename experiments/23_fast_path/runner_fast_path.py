@@ -1389,11 +1389,29 @@ def run_condition(
     if ddp_active:
         dist.barrier()
 
+    artifact = {
+        "artifact_impact": str(
+            config.get("artifact_impact", "artifact_changes_weights_only")
+        ),
+        "submit_valid": bool(config.get("submit_valid", True)),
+        "artifact_bytes_estimate": (
+            int(model.artifact_bytes())
+            if hasattr(model, "artifact_bytes")
+            else int(model_params * 2)
+        ),
+        "compressed_artifact_bytes": config.get("compressed_artifact_bytes"),
+    }
+    exp24 = {
+        "phase": config.get("exp24_phase"),
+        "mechanism": config.get("exp24_mechanism"),
+    }
     result = {
         "config": config,
         "params": model_params,
         "train": train_result,
         "eval": eval_result,
+        "artifact": artifact,
+        "exp24": exp24,
     }
 
     if is_rank0:

@@ -1650,7 +1650,9 @@ def test_summarize_results_ranks_successes_and_records_errors(tmp_path):
         '{"config":{"name":"slow"},"train":{"aggregate_tokens_per_sec":10.0}}'
     )
     (results / "fast.json").write_text(
-        '{"config":{"name":"fast"},"train":{"aggregate_tokens_per_sec":20.0}}'
+        '{"config":{"name":"fast"},"train":{"aggregate_tokens_per_sec":20.0},'
+        '"artifact":{"artifact_impact":"artifact_training_only","submit_valid":false},'
+        '"exp24":{"phase":"first_wave","mechanism":"dreamworld"}}'
     )
     (results / "bad.json").write_text(
         '{"config":{"name":"bad"},"error":"oom"}'
@@ -1660,4 +1662,84 @@ def test_summarize_results_ranks_successes_and_records_errors(tmp_path):
     summary = mod.summarize_result_dir(results)
 
     assert [row["name"] for row in summary["ranked"]] == ["fast", "slow"]
+    assert summary["ranked"][0]["artifact_impact"] == "artifact_training_only"
+    assert summary["ranked"][0]["submit_valid"] is False
+    assert summary["ranked"][0]["exp24_phase"] == "first_wave"
+    assert summary["ranked"][0]["exp24_mechanism"] == "dreamworld"
     assert summary["errors"] == [{"name": "bad", "error": "oom"}]
+
+
+def test_run_condition_result_preserves_exp24_artifact_metadata(monkeypatch):
+    mod = _load_runner_module()
+
+    monkeypatch.setattr(mod, "_init_distributed", lambda _world_size: (0, 1, 0))
+    monkeypatch.setattr(mod, "_pick_device", lambda _rank, _device: torch.device("cpu"))
+    monkeypatch.setattr(mod, "resolve_param_dtype", lambda _dtype, _device: torch.float32)
+    monkeypatch.setattr(mod, "verify_diag_recurrence", lambda _device: None)
+    monkeypatch.setattr(
+        mod,
+        "load_fineweb_tokens",
+        lambda _path: (
+            torch.arange(64, dtype=torch.int16),
+            torch.arange(64, dtype=torch.int16),
+        ),
+    )
+    monkeypatch.setattr(mod, "build_sentencepiece_luts", lambda *_args: (None, None, None))
+    monkeypatch.setattr(mod, "choose_lm_starts_lazy", lambda **_kwargs: [])
+    monkeypatch.setattr(mod, "build_model", lambda *_args: _TinyTokenTrainModel())
+    monkeypatch.setattr(mod, "_apply_embed_init", lambda *_args: None)
+    monkeypatch.setattr(mod, "_reject_unsupported", lambda _model: None)
+    monkeypatch.setattr(mod, "_warmup", lambda **_kwargs: None)
+    monkeypatch.setattr(
+        mod,
+        "_build_optimizer",
+        lambda _config, model: torch.optim.SGD(model.parameters(), lr=0.01),
+    )
+    monkeypatch.setattr(
+        mod,
+        "train_fast_for_budget",
+        lambda *args, **kwargs: {
+            "steps": 1,
+            "elapsed_s": 1.0,
+            "initial_loss": 1.0,
+            "final_loss": 0.5,
+            "aggregate_tokens_per_sec": 1.0,
+            "peak_vram_mb": 0.0,
+        },
+    )
+
+    class FakeSP:
+        def Load(self, _path):
+            return True
+
+    monkeypatch.setitem(
+        sys.modules,
+        "sentencepiece",
+        type("M", (), {"SentencePieceProcessor": FakeSP}),
+    )
+
+    result = mod.run_condition(
+        {
+            "name": "metadata_smoke",
+            "vocab_size": 6,
+            "seq_len": 3,
+            "stride": 1,
+            "batch_size": 2,
+            "artifact_impact": "artifact_training_only",
+            "submit_valid": False,
+            "exp24_phase": "first_wave",
+            "exp24_mechanism": "predictive_aux",
+        },
+        data_path="unused",
+        sp_model_path="unused.model",
+        budget_seconds=1.0,
+        output_json=None,
+        output_ckpt=None,
+        world_size_override=1,
+    )
+
+    assert result["artifact"]["artifact_impact"] == "artifact_training_only"
+    assert result["artifact"]["submit_valid"] is False
+    assert result["artifact"]["artifact_bytes_estimate"] > 0
+    assert result["exp24"]["phase"] == "first_wave"
+    assert result["exp24"]["mechanism"] == "predictive_aux"
