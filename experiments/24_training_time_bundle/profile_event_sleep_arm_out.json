@@ -1,0 +1,100 @@
+{
+  "arm": "fast_slow_dreamworld_event_sleep",
+  "device": "cpu",
+  "elapsed_s": 0.07488216715864837,
+  "mean_inside_budget_ms_per_step": 7.2243626695126295,
+  "mechanisms": {
+    "dream_buffer_size": 2,
+    "event_sleep_decision_count": 0,
+    "event_sleep_replay_count": 0,
+    "event_sleep_trigger_count": 0,
+    "fast_slow_sync_count": 0
+  },
+  "precision": "bf16",
+  "sections": [
+    {
+      "count": 10,
+      "mean_cuda_ms": null,
+      "mean_wall_ms": 4.7912124544382095,
+      "name": "backward",
+      "p50_wall_ms": 3.347791964188218,
+      "p95_wall_ms": 11.459203716367467,
+      "share_wall": 0.6632020945816435
+    },
+    {
+      "count": 10,
+      "mean_cuda_ms": null,
+      "mean_wall_ms": 1.9076250027865171,
+      "name": "logits_and_loss",
+      "p50_wall_ms": 1.7835414037108421,
+      "p95_wall_ms": 2.695166936609893,
+      "share_wall": 0.2640544349796893
+    },
+    {
+      "count": 10,
+      "mean_cuda_ms": null,
+      "mean_wall_ms": 0.35097519867122173,
+      "name": "optimizer_step",
+      "p50_wall_ms": 0.3253959584981203,
+      "p95_wall_ms": 0.5205561988987027,
+      "share_wall": 0.04858216769104966
+    },
+    {
+      "count": 10,
+      "mean_cuda_ms": null,
+      "mean_wall_ms": 0.15755838248878717,
+      "name": "encode_forward",
+      "p50_wall_ms": 0.14214601833373308,
+      "p95_wall_ms": 0.231720705050975,
+      "share_wall": 0.02180931241916962
+    },
+    {
+      "count": 10,
+      "mean_cuda_ms": null,
+      "mean_wall_ms": 0.015249918214976788,
+      "name": "event_sleep_gate",
+      "p50_wall_ms": 0.014249933883547783,
+      "p95_wall_ms": 0.023056240752339356,
+      "share_wall": 0.0021109015303637266
+    },
+    {
+      "count": 10,
+      "mean_cuda_ms": null,
+      "mean_wall_ms": 0.0017417129129171371,
+      "name": "fast_slow_ema",
+      "p50_wall_ms": 0.0017919810488820076,
+      "p95_wall_ms": 0.002308166585862636,
+      "share_wall": 0.0002410887980841965
+    },
+    {
+      "count": 0,
+      "mean_cuda_ms": null,
+      "mean_wall_ms": 0.0,
+      "name": "spectral_reg",
+      "p50_wall_ms": 0.0,
+      "p95_wall_ms": 0.0,
+      "share_wall": 0.0
+    },
+    {
+      "count": 0,
+      "mean_cuda_ms": null,
+      "mean_wall_ms": 0.0,
+      "name": "predictive_aux",
+      "p50_wall_ms": 0.0,
+      "p95_wall_ms": 0.0,
+      "share_wall": 0.0
+    },
+    {
+      "count": 0,
+      "mean_cuda_ms": null,
+      "mean_wall_ms": 0.0,
+      "name": "dreamworld_replay",
+      "p50_wall_ms": 0.0,
+      "p95_wall_ms": 0.0,
+      "share_wall": 0.0
+    }
+  ],
+  "steps": 10,
+  "tokens_per_step": 4096,
+  "total_inside_budget_ms": 72.2436266951263
+}
