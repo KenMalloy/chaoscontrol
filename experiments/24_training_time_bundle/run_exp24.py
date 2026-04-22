@@ -23,6 +23,7 @@ sys.path.insert(0, str(EXP24))
 sys.path.insert(0, str(REPO / "src"))
 
 from exp24 import (  # noqa: E402
+    DEFAULT_CONTROL_SEEDS,
     build_first_wave_mechanism_matrix,
     build_phase_a_sampling_matrix,
     build_ring0_control_matrix,
@@ -144,7 +145,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     parser.add_argument("--output-dir", type=Path, default=EXP24 / "results")
-    parser.add_argument("--seeds", type=int, nargs="+", default=[1337])
+    parser.add_argument("--seeds", type=int, nargs="+", default=list(DEFAULT_CONTROL_SEEDS))
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--show", action="store_true")
     parser.add_argument("--limit", type=int, default=None)

@@ -667,3 +667,8 @@ answers the current failure mode.
 | SemanticOptimizer | medium | current implementation may be too slow unfused | Conceptually important, but must pass the overhead gate first |
 | SGNS critical-period freeze | medium | artifact/provenance and optimizer-state details | Good prior signal, but Exp21 causality remains separate |
 | Replay/sampling policy | medium/high | can become an open-ended data-order project | Phase A handles sampling first; extra replay waits for a mechanism brief |
+
+## Implementation Plan
+
+Implementation checklist:
+`docs/superpowers/plans/2026-04-22-exp24-training-time-bundle-implementation.md`

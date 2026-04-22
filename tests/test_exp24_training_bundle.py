@@ -214,3 +214,29 @@ def test_run_exp24_cli_dry_run_prints_first_wave_plan(tmp_path):
     assert "exp24_spectral_dead1e-04_sticky1e-04_s1337" in stdout
     assert '"exp24_mechanism": "fast_slow"' in stdout
     assert '"exp24_mechanism": "spectral"' in stdout
+
+
+def test_run_exp24_cli_ring0_defaults_to_control_seed_ladder(tmp_path):
+    script = REPO / "experiments" / "24_training_time_bundle" / "run_exp24.py"
+    output_dir = tmp_path / "exp24-ring0-dryrun"
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(script),
+            "--matrix",
+            "ring0_control",
+            "--dry-run",
+            "--output-dir",
+            str(output_dir),
+        ],
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    stdout = result.stdout
+    assert "entries=3" in stdout
+    assert "exp24_ring0_control_s1337" in stdout
+    assert "exp24_ring0_control_s2674" in stdout
+    assert "exp24_ring0_control_s4011" in stdout
