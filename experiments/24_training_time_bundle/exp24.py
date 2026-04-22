@@ -368,6 +368,58 @@ def build_fastslow_dreamworld_matrix(
     return entries
 
 
+def build_phase0_dreamworld_sweep(
+    *,
+    speed_config: dict[str, Any],
+    world_size: int = 4,
+    budget_seconds: float = 600.0,
+    seed_values: Sequence[int] = (1337,),
+) -> list[dict[str, Any]]:
+    """Phase 0 rung 1: sweep DW interval x weight with FS pinned at anchor."""
+    intervals = [4, 8, 16]
+    weights = [0.10, 0.25, 0.50]
+    entries: list[dict[str, Any]] = []
+    for interval in intervals:
+        for weight in weights:
+            arm = {
+                "name_arm": f"fs_i32a050_dw_c{interval}i{interval}_w{int(weight * 100):03d}",
+                "exp24_mechanism": "fast_slow_dreamworld",
+                "artifact_impact": ARTIFACT_TRAINING_ONLY,
+                "fast_slow_enabled": True,
+                "fast_slow_interval": 32,
+                "fast_slow_alpha": 0.50,
+                "fast_slow_eval_copy": "slow",
+                "dreamworld_enabled": True,
+                "dreamworld_cache_interval": interval,
+                "dreamworld_interval": interval,
+                "dreamworld_weight": weight,
+                "dreamworld_prefix_tokens": 128,
+                "dreamworld_replay_tokens": 64,
+                "dreamworld_replay_batch_size": 128,
+                "dreamworld_buffer_size": 16,
+                "dreamworld_min_size": 2,
+                "dreamworld_max_age_steps": 256,
+            }
+            for seed in seed_values:
+                entry = _base_entry(
+                    speed_config=speed_config,
+                    world_size=world_size,
+                    budget_seconds=budget_seconds,
+                )
+                entry.update(arm)
+                name_arm = str(entry.pop("name_arm"))
+                entries.append(
+                    _named_entry(
+                        base=entry,
+                        phase="phase0",
+                        mechanism=str(entry["exp24_mechanism"]),
+                        arm=name_arm,
+                        seed=int(seed),
+                    )
+                )
+    return entries
+
+
 def build_first_wave_matrix(
     *,
     speed_config: dict[str, Any],

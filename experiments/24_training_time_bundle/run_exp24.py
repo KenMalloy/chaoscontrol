@@ -28,6 +28,7 @@ from exp24 import (  # noqa: E402
     build_fastslow_dreamworld_matrix,
     build_first_wave_mechanism_matrix,
     build_phase_a_sampling_matrix,
+    build_phase0_dreamworld_sweep,
     build_ring0_control_matrix,
     build_semantic_overhead_gate_matrix,
 )
@@ -166,6 +167,13 @@ def _build_entries(
             budget_seconds=budget_seconds,
             seed_values=seeds,
         )
+    if matrix == "phase0_dreamworld_sweep":
+        return build_phase0_dreamworld_sweep(
+            speed_config=speed_config,
+            world_size=world_size,
+            budget_seconds=budget_seconds,
+            seed_values=seeds,
+        )
     if matrix == "all":
         entries: list[dict[str, Any]] = []
         entries.extend(
@@ -215,6 +223,7 @@ def main(argv: list[str] | None = None) -> int:
             "semantic_overhead_gate",
             "first_wave",
             "fastslow_dreamworld",
+            "phase0_dreamworld_sweep",
             "all",
         ],
         default="all",
