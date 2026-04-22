@@ -8,7 +8,7 @@
 
 **Out of scope for base selection (but in scope for same-pod execution):** `event_sleep`, predictive aux, spectral, ScOpt — none of these run in this plan. The rigor+speed plan for `fast_slow_dreamworld_event_sleep` (`2026-04-22-exp24-rigor-and-speed-implementation.md`) stays frozen until Phase 0 lands, because its test anchors and profile harness bake in FS+DW defaults that Phase 0 is about to choose. Entropy-gated reread (Phase 0b) runs same-pod after base lock, on the locked checkpoint — in scope for execution, sealed from base selection.
 
-**Tech Stack:** Python, existing `run_exp24.py` / `exp24.py` matrix dispatch, 8×H100 pod, 600s train budget, full-val eval (~82s on 8x per memory), FineWeb data already staged on the pod volume.
+**Tech Stack:** Python, existing `run_exp24.py` / `exp24.py` matrix dispatch, **4×H100 pod** (cost choice, not technical requirement — see Budget section for ranking-transfer tradeoff vs ws=8 submission regime), 600s train budget, full-val eval (~164s on 4x per memory), FineWeb data already staged on the pod volume.
 
 ---
 
@@ -73,7 +73,7 @@ Add after `build_fastslow_dreamworld_matrix`:
 def build_phase0_dreamworld_sweep(
     *,
     speed_config: dict[str, Any],
-    world_size: int = 8,
+    world_size: int = 4,
     budget_seconds: float = 600.0,
     seed_values: Sequence[int] = (1337,),
 ) -> list[dict[str, Any]]:
@@ -144,7 +144,7 @@ Also add `build_phase0_dreamworld_sweep` to the import list from `exp24` at the 
 
 ```bash
 cd experiments/24_training_time_bundle
-python run_exp24.py --matrix phase0_dreamworld_sweep --seeds 1337 --show
+python run_exp24.py --matrix phase0_dreamworld_sweep --seeds 1337 --world-size 4 --show
 ```
 
 Expected: 9 entries named `exp24_phase0_fast_slow_dreamworld_phase0_fs_i32a050_dw_c{4,8,16}i{4,8,16}_w{010,025,050}_s1337`.
@@ -158,10 +158,10 @@ git commit -m "exp24: add phase0 dreamworld interval×weight sweep matrix"
 
 ---
 
-## Task 2: Launch Phase 0 DW sweep on 8×H100
+## Task 2: Launch Phase 0 DW sweep on 4×H100
 
 **Files:**
-- Output dir: `experiments/24_training_time_bundle/phase0_dw_sweep_8x_<timestamp>/`
+- Output dir: `experiments/24_training_time_bundle/phase0_dw_sweep_4x_<timestamp>/`
 
 **Step 1: Verify pod state**
 
@@ -169,7 +169,7 @@ git commit -m "exp24: add phase0 dreamworld interval×weight sweep matrix"
 runpodctl get pod --all
 ```
 
-Ensure an 8×H100 pod is RUNNING with `/workspace/venv` and FineWeb shards on the volume. If stopped, start it and wait for SSH.
+Ensure a 4×H100 pod is RUNNING with `/workspace/venv` and FineWeb shards on the volume. If stopped, start it and wait for SSH.
 
 **Step 2: Commit current branch and push**
 
@@ -187,11 +187,11 @@ source /workspace/venv/bin/activate
 cd /workspace/chaoscontrol
 git pull
 cd experiments/24_training_time_bundle
-OUT=phase0_dw_sweep_8x_$(date -u +%Y%m%dT%H%M%SZ)
-python run_exp24.py --matrix phase0_dreamworld_sweep --seeds 1337 --output-dir $OUT
+OUT=phase0_dw_sweep_4x_$(date -u +%Y%m%dT%H%M%SZ)
+python run_exp24.py --matrix phase0_dreamworld_sweep --seeds 1337 --world-size 4 --output-dir $OUT
 ```
 
-Expected: 9 runs × ~700s each (600s train + ~82s full-val + ~20s startup) ≈ 105 min total wall time on 8x (runs execute sequentially, not in parallel — each uses all 8 ranks).
+Expected: 9 runs × ~785s each (600s train + ~164s full-val + ~20s startup) ≈ 118 min total wall time on 4x (runs execute sequentially, not in parallel — each uses all 4 ranks). Note: `run_exp24.py` has `default_world_size=8` hardcoded for non-`semantic_overhead_gate` matrices; pass `--world-size 4` on every launch to override.
 
 **Step 4: Monitor**
 
@@ -207,7 +207,7 @@ rsync -av <pod>:/workspace/chaoscontrol/experiments/24_training_time_bundle/$OUT
 **Step 6: Commit results**
 
 ```bash
-git add experiments/24_training_time_bundle/phase0_dw_sweep_8x_*/
+git add experiments/24_training_time_bundle/phase0_dw_sweep_4x_*/
 git commit -m "exp24: record phase0 dreamworld sweep results"
 ```
 
@@ -224,7 +224,7 @@ From `summary.json`, extract `val_bpb` per arm. Sort ascending.
 
 **Step 2: Sanity checks**
 
-- Does the winner pass the control floor (prior 8x control ran 1.53ish per project memory, seed 1337 alone will vary a bit)? If no arm beats its control-seed baseline, flag and decide whether Phase 0 continues or we retune fast-slow first.
+- Sanity floor at ws=4. The sweep has no control arm (all 9 are FS+DW). Cross-check by comparing against today's 8x `dreamworld_c4_i4_w025` run's BPB at seed=2674 or seed=4011 (from `exp24_muon_fullval_8x_20260422T143312Z/`). At ws=4 the same arm should score *worse* (smaller effective batch, less data) — if Phase 0's `c4i4_w025` cell at seed=1337 beats the 8x run, something is wrong (dataset mismatch, bug). If it scores within ~0.05–0.10 BPB worse, that's the expected ws=4 penalty.
 - Is the winner at a corner of the grid? If so, note this is a "sweep boundary" — the true optimum may be outside (e.g., interval=32 or weight=0.75). Mark as a follow-up question but don't expand Phase 0 unconditionally.
 - Is the top-to-second gap > plausible seed noise? With only seed=1337, ordering within ~0.01 BPB is unreliable. If top 3 are within noise, carry all three into Task 5 (not just 1).
 
@@ -257,7 +257,7 @@ Hardcode the Task 3 winner's DW settings in the builder (simpler than threading 
 def build_phase0_fastslow_sweep(
     *,
     speed_config: dict[str, Any],
-    world_size: int = 8,
+    world_size: int = 4,
     budget_seconds: float = 600.0,
     seed_values: Sequence[int] = (1337,),
 ) -> list[dict[str, Any]]:
@@ -322,7 +322,7 @@ def build_phase0_fastslow_sweep(
 **Step 3: Dry-run — verify 6 entries**
 
 ```bash
-python run_exp24.py --matrix phase0_fastslow_sweep --seeds 1337 --show
+python run_exp24.py --matrix phase0_fastslow_sweep --seeds 1337 --world-size 4 --show
 ```
 
 **Step 4: Commit**
@@ -334,21 +334,21 @@ git commit -m "exp24: add phase0 fast-slow sweep around DW winner"
 
 ---
 
-## Task 5: Launch Phase 0 FS sweep on 8×H100
+## Task 5: Launch Phase 0 FS sweep on 4×H100
 
 Same pattern as Task 2. 6 arms × ~700s ≈ 70 min.
 
 **Step 1: Push commits, pull on pod, launch**
 
 ```bash
-OUT=phase0_fs_sweep_8x_$(date -u +%Y%m%dT%H%M%SZ)
-python run_exp24.py --matrix phase0_fastslow_sweep --seeds 1337 --output-dir $OUT
+OUT=phase0_fs_sweep_4x_$(date -u +%Y%m%dT%H%M%SZ)
+python run_exp24.py --matrix phase0_fastslow_sweep --seeds 1337 --world-size 4 --output-dir $OUT
 ```
 
 **Step 2: Rsync back, commit**
 
 ```bash
-git add experiments/24_training_time_bundle/phase0_fs_sweep_8x_*/
+git add experiments/24_training_time_bundle/phase0_fs_sweep_4x_*/
 git commit -m "exp24: record phase0 fast-slow sweep results"
 ```
 
@@ -390,7 +390,7 @@ git commit -m "exp24: pick phase0 top-2 configs for confirm"
 def build_phase0_confirm(
     *,
     speed_config: dict[str, Any],
-    world_size: int = 8,
+    world_size: int = 4,
     budget_seconds: float = 600.0,
     seed_values: Sequence[int] = (1337, 2674, 4011),
 ) -> list[dict[str, Any]]:
@@ -428,14 +428,14 @@ def build_phase0_confirm(
 **Step 3: Dry-run — verify 6 entries (2 configs × 3 seeds)**
 
 ```bash
-python run_exp24.py --matrix phase0_confirm --show
+python run_exp24.py --matrix phase0_confirm --world-size 4 --show
 ```
 
 **Step 4: Launch on pod**
 
 ```bash
-OUT=phase0_confirm_8x_$(date -u +%Y%m%dT%H%M%SZ)
-python run_exp24.py --matrix phase0_confirm --output-dir $OUT
+OUT=phase0_confirm_4x_$(date -u +%Y%m%dT%H%M%SZ)
+python run_exp24.py --matrix phase0_confirm --world-size 4 --output-dir $OUT
 ```
 
 6 runs × ~700s ≈ 70 min.
@@ -443,7 +443,7 @@ python run_exp24.py --matrix phase0_confirm --output-dir $OUT
 **Step 5: Rsync, commit results**
 
 ```bash
-git add experiments/24_training_time_bundle/phase0_confirm_8x_*/
+git add experiments/24_training_time_bundle/phase0_confirm_4x_*/
 git add experiments/24_training_time_bundle/exp24.py experiments/24_training_time_bundle/run_exp24.py
 git commit -m "exp24: run phase0 top-2 × 3-seed confirm"
 ```
@@ -624,11 +624,15 @@ git commit -m "plan: rebase exp24 event_sleep plan on phase0 base lock"
 
 ## Budget & risk notes
 
-**Total compute:** 9 + 6 + 6 = 21 runs × ~700s = ~4.1 hours of 8×H100 wall time for base lock, plus Phase 0b eval-only on locked checkpoint (see below). Plus ~30 min of rsync/analysis between rungs. Plan on one full day end-to-end, same pod.
+**Total compute:** 9 + 6 + 6 = 21 runs × ~785s = **~4.6 hours of 4×H100 wall time** for base lock, plus Phase 0b eval-only on locked checkpoint (see below). Plus ~30 min of rsync/analysis between rungs. Plan on one full day end-to-end, same pod.
 
-**Phase 0b compute (same pod, after base lock).** Eval-only on the locked checkpoint — no training. Ballpark: 4 primary arms (`score_only`, `scheduled_reread_same_budget`, `entropy_reread_shift0`, `entropy_reread_bidirectional_blend`) × 3 seeds for confirm + ~4 diagnostic calibration runs on a held-out stream = ~16 runs × ~100s (full-val ~82s + startup ~20s) ≈ 27 min. If Task 9 pre-registration sweeps multiple thresholds or `K` values before picking one, add 20–40 min. Total Phase 0b wall time ≤ ~1 h; Phase 0 + 0b combined ≤ ~5.5 h on one pod day.
+**Cost estimate.** 4×H100 at ~$12/hr × ~4.6h ≈ **~$55** for base lock. Phase 0b ≤ ~1h × $12/hr ≈ ~$12. **Total ≤ ~$70** for Phase 0 + 0b combined. (Reference: the original 8×H100 draft was ~$100 for base lock alone.)
 
-**Single-seed screening risk.** Rungs 1 and 2 run seed=1337 only. If the true seed noise is ~0.01 BPB (plausible from prior 8x runs), cells within that band are indistinguishable. Task 3 and Task 6 include explicit noise-band handling; if >3 configs tie, escalate for a seed=2674 mini-replication rather than guessing.
+**Phase 0b compute (same pod, after base lock).** Eval-only on the locked checkpoint — no training. Ballpark: 4 primary arms (`score_only`, `scheduled_reread_same_budget`, `entropy_reread_shift0`, `entropy_reread_bidirectional_blend`) × 3 seeds for confirm + ~4 diagnostic calibration runs on a held-out stream = ~16 runs × ~185s (full-val ~164s + startup ~20s) ≈ 50 min. If Task 9 pre-registration sweeps multiple thresholds or `K` values before picking one, add 20–40 min. Total Phase 0b wall time ≤ ~1.5 h on 4x.
+
+**Ranking-transfer risk (ws=4 → ws=8 submission).** All Phase 0 rungs run at ws=4 (effective batch 4096) to cut cost. Submission regime is ws=8 (effective batch 8192). FS+DW knob rankings are expected to be roughly invariant to effective batch at this scale — interval/weight tune replay frequency, not batch dynamics — but "expected" is not "certain." The locked `exp24_base.yaml` may be suboptimal at ws=8. Catch happens at submit-time: when we first run the locked config on 8x, if BPB is off from the 4x-tuned expectation, re-run the FS sweep at ws=8 around the winner (6 arms × 1 seed × 8x ≈ 60 min, one-shot correction). LR stays at 0.064 per Exp 18 Test 5b validation at bs=1024/rank across ws∈{2,4,8}, so no LR re-tune needed for the ws swap.
+
+**Single-seed screening risk.** Rungs 1 and 2 run seed=1337 only. Seed noise at ws=4 is plausibly larger than the ~0.01 BPB seen in prior 8x runs because the smaller effective batch (4096 vs 8192) yields noisier step trajectories — budget the noise band as ~0.015 BPB until the 3-seed confirm rung measures it directly. Task 3 and Task 6 include explicit noise-band handling; if >3 configs tie, escalate for a seed=2674 mini-replication rather than guessing.
 
 **Sweep-boundary risk.** Both sweeps are 3-point grids at fixed endpoints. If a winner sits at a corner (e.g., interval=16 or weight=0.50 for DW), the true optimum may be outside the grid. Document as a Phase 0b candidate, don't expand Phase 0 mid-flight.
 
