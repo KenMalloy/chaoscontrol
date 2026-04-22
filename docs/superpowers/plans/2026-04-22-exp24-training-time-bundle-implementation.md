@@ -1571,6 +1571,14 @@ SSM state. Do not add token-by-token autoregressive sampling, generation
 helpers, or a dream rollout loop in this task. Autoregressive dreams are a v1+
 diagnostic because they break fast-path parity.
 
+**State/token alignment invariant:** Cache state before the replay seed token,
+not after it. With `prefix_tokens = p`, `capture_dream_entry()` must encode
+`inputs[:, : p - 1]` and cache replay tokens
+`inputs[:, p - 1 : p + replay_tokens]`. During replay, shifted CE consumes the
+seed token once and supervises the next `replay_tokens` real tokens. Do not
+cache state after `inputs[:, :p]` and then replay from `inputs[:, p - 1]`; that
+double-consumes the boundary token.
+
 - [ ] **Step 1: Write failing encode-state tests**
 
 Append to `tests/test_encode_forward_equivalence.py`:
@@ -1786,6 +1794,29 @@ def test_build_dream_replay_tokens_slices_seed_plus_targets():
     ]
 
 
+def test_capture_dream_entry_uses_state_before_replay_seed():
+    dream = _load_dreamworld()
+    model = _TinyDreamModel()
+    inputs = torch.arange(2 * 10).view(2, 10) % 16
+
+    entry = dream.capture_dream_entry(
+        model,
+        inputs,
+        step=7,
+        prefix_tokens=4,
+        replay_tokens=3,
+    )
+
+    assert entry.step == 7
+    assert entry.replay_tokens.tolist() == [
+        [3, 4, 5, 6],
+        [13, 14, 15, 0],
+    ]
+    assert model.encode_calls == [
+        {"shape": (2, 3), "has_initial_states": False},
+    ]
+
+
 def test_dreamworld_replay_backward_uses_cached_initial_state():
     dream = _load_dreamworld()
     model = _TinyDreamModel()
@@ -1827,8 +1858,9 @@ Create `experiments/23_fast_path/dreamworld.py`:
 ```python
 """Dreamworld hidden-state replay primitives for Exp24.
 
-V0 is deliberately teacher-forced: cache compact SSM states plus real
-continuation tokens, then replay the continuation from that state with CE loss.
+V0 is deliberately teacher-forced: cache compact SSM state immediately before
+a replay seed token plus the real seed-and-target continuation, then replay
+that continuation from the cached state with CE loss.
 The replay pass is the same batched forward shape as waking training, only over
 short cached continuations. Autoregressive generation is a diagnostic/later
 variant; teacher forcing keeps the first measured arm on the fast path.
@@ -1927,6 +1959,13 @@ def build_dream_replay_tokens(
     prefix_tokens: int,
     replay_tokens: int,
 ) -> torch.Tensor:
+    """Return seed-plus-target tokens for teacher-forced replay.
+
+    With `prefix_tokens = p`, the returned slice is
+    `inputs[:, p - 1 : p + replay_tokens]`. The cached state must be produced
+    by encoding `inputs[:, : p - 1]`, so replay consumes the seed token exactly
+    once and predicts the next `replay_tokens` real tokens.
+    """
     prefix = int(prefix_tokens)
     replay = int(replay_tokens)
     if prefix <= 0:
@@ -1951,13 +1990,19 @@ def capture_dream_entry(
     prefix_tokens: int,
     replay_tokens: int,
 ) -> DreamReplayEntry:
-    prefix = inputs[:, :int(prefix_tokens)]
+    prefix = int(prefix_tokens)
+    if prefix <= 1:
+        raise ValueError(
+            "prefix_tokens must be at least 2 so Dreamworld can encode state "
+            "before the replay seed token"
+        )
+    prefix_input = inputs[:, : prefix - 1]
     replay = build_dream_replay_tokens(
         inputs,
         prefix_tokens=prefix_tokens,
         replay_tokens=replay_tokens,
     )
-    _hidden, states = model.encode(prefix, return_final_states=True)
+    _hidden, states = model.encode(prefix_input, return_final_states=True)
     return DreamReplayEntry(
         step=int(step),
         states=[state.detach().clone() for state in states],
@@ -2019,7 +2064,9 @@ Add these keyword arguments to `train_fast_for_budget`:
     dreamworld_max_age_steps: int = 256,
 ```
 
-Add these keyword arguments to `_run_train_step`:
+Add these keyword arguments to `_run_train_step`. The current signature already
+uses a bare `*`, so keep these keyword-only and do not create or rely on
+positional call sites:
 
 ```python
     dreamworld_entry: Any | None = None,
@@ -2122,6 +2169,11 @@ Add result diagnostics:
                 ),
             },
 ```
+
+V0 intentionally implements hard age-out only through
+`dreamworld_max_age_steps`. Do not implement soft-decay replay weights in this
+task; if hard age-out looks brittle, add soft decay as a v1 mechanism with its
+own config key and tests.
 
 - [ ] **Step 8: Write runner integration test**
 
@@ -2673,7 +2725,7 @@ Implementation checklist:
 Run:
 
 ```bash
-.venv/bin/python -m pytest tests/test_exp24_training_bundle.py tests/test_exp24_training_hooks.py tests/test_exp23_fast_path.py -q
+.venv/bin/python -m pytest tests/test_exp24_training_bundle.py tests/test_exp24_training_hooks.py tests/test_exp24_dreamworld.py tests/test_encode_forward_equivalence.py tests/test_exp23_fast_path.py -q
 .venv/bin/python experiments/24_training_time_bundle/run_exp24.py \
   --phase ring0 \
   --speed-config experiments/23_fast_path/configs/base_seq_epoch_lr0064_full_corpus.yaml \
@@ -2701,4 +2753,5 @@ git commit -m "docs: document exp24 execution path"
 - SemanticOptimizer is gated by measured wall-clock overhead, not by taste.
 - Predictive auxiliary is `artifact_training_only`; if any checkpoint path saves its aux projection, mark that arm `artifact_invalid_until_stripped` until fixed.
 - Dreamworld v0 is teacher-forced hidden-state replay from cached SSM states. Token-by-token autoregressive dreaming is a later diagnostic unless the ring-buffer CE arm earns more work.
+- The Dreamworld unit tests verify single-GPU replay ordering. The first 8xH100 Dreamworld smoke should inspect per-rank final losses and gradient/all-reduce diagnostics for divergence, because there is no cheap local NCCL regression test in this plan.
 - Shuffled epoch is a sampling-policy arm, not a record claim by itself. The record claim still depends on fixed full-validation scoring after training.

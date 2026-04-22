@@ -414,10 +414,14 @@ notes make the non-port explicit.
 
 The SSM-native strip-down keeps only what the compact diagonal state provides:
 
-- **Seed:** cache `(state, next_M_tokens)` pairs at document boundaries (or
-  every K waking steps) into a buffer. State is O(channels × inner); M is the
-  dream rollout length. The SSM's compact state makes this storable at scale —
-  a transformer's equivalent would require caching the full KV prefix.
+- **Seed:** cache `(state_before_seed, seed_plus_M_targets)` pairs at document
+  boundaries (or every K waking steps) into a buffer. For a window with
+  `prefix_tokens = p`, encode tokens `[0, p - 1)` to get the cached state, then
+  cache tokens `[p - 1, p + M)` as the replay sequence. This preserves the
+  boundary transition: the replay seed token is consumed once and predicts the
+  first cached continuation token. State is O(channels × inner); M is the dream
+  rollout length. The SSM's compact state makes this storable at scale — a
+  transformer's equivalent would require caching the full KV prefix.
 - **Dream replay (v0):** sample a cached pair, run the fast-path SSM forward
   once over the cached real tokens with the cached state as initial hidden
   state. Teacher-forced, same batched forward as waking — no autoregressive
@@ -479,7 +483,15 @@ Sketch (ring-buffer baseline):
 
 ```python
 if step % cache_interval == 0:
-    buffer.append((state.detach().clone(), next_tokens.detach().clone()))
+    _hidden, prefix_states = model.encode(
+        tokens[:, : prefix_tokens - 1],
+        return_final_states=True,
+    )
+    replay_window = tokens[:, prefix_tokens - 1 : prefix_tokens + replay_len]
+    buffer.append((
+        [state.detach().clone() for state in prefix_states],
+        replay_window.detach().clone(),
+    ))
     if len(buffer) > buffer_cap:
         buffer.popleft()
 
@@ -512,6 +524,9 @@ Staleness policy choices:
 - refresh: periodically re-run the cached prefix to produce a fresh
   `(state, continuation)` pair (expensive; only if hard age-out and soft decay
   both fail)
+
+V0 should implement hard age-out only. Soft decay and refresh are follow-ups if
+hard age-out looks too brittle or too wasteful in the first smoke.
 
 Artifact impact: `artifact_training_only`. The buffer and any retrieval
 transformer exist only during training and are not exported. Export path must
