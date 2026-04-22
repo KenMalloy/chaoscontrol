@@ -419,3 +419,52 @@ def test_gate_produces_exact_trigger_trajectory():
     assert fired_steps == [12, 24, 35], (
         f"trigger trajectory drifted: got {fired_steps}, expected [12, 24, 35]"
     )
+
+
+def test_warmup_restore_is_bit_equal():
+    mod = _load_runner_module()
+
+    model = _TinyTokenTrainModel()
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+
+    config = {
+        "warmup_steps": 4,
+        "chunk_size": 2,
+        "grad_clip_norm": 0.0,
+        "fused_grad_clip": False,
+        "precision": "bf16",
+        "prefetch_batches": False,
+    }
+
+    saved_state = mod._state_dict_clone(model)
+    mod._warmup(
+        model=model,
+        train_tokens=torch.arange(128, dtype=torch.int16) % 6,
+        train_num_tokens=128,
+        stride=4,
+        seq_len=6,
+        batch_size=2,
+        device=torch.device("cpu"),
+        optimizer=optimizer,
+        config=config,
+        rank=0,
+        world_size=1,
+        seed=1337,
+        vocab_size=6,
+    )
+
+    mid_state = model.state_dict()
+    drifted = any(
+        not torch.equal(saved_state[name], mid_state[name]) for name in saved_state
+    )
+    assert drifted, "_warmup did not mutate any params - test is vacuous"
+
+    mod._restore_state_dict(model, saved_state)
+    post_state = model.state_dict()
+
+    for name, pre_tensor in saved_state.items():
+        post_tensor = post_state[name]
+        assert torch.equal(pre_tensor, post_tensor), (
+            f"param {name} drifted after warmup-restore: "
+            f"max diff {(pre_tensor - post_tensor).abs().max().item()}"
+        )
