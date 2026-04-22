@@ -141,6 +141,7 @@ def test_first_wave_mechanism_matrix_names_and_tags():
         "exp24_predictive_h4_w010_s1337",
         "exp24_dreamworld_c4_i4_w025_s1337",
         "exp24_fastslow_i32_a050_dreamworld_c8_i8_w025_sub128_s1337",
+        "exp24_fastslow_i32_a050_dreamworld_eventsleep_r110_p005_sub128_s1337",
     ]
 
     mechanisms = {entry["exp24_mechanism"] for entry in entries}
@@ -150,6 +151,7 @@ def test_first_wave_mechanism_matrix_names_and_tags():
         "predictive_aux",
         "dreamworld",
         "fast_slow_dreamworld",
+        "fast_slow_dreamworld_event_sleep",
     }
 
     fastslow = next(
@@ -203,6 +205,22 @@ def test_first_wave_mechanism_matrix_names_and_tags():
     assert stack["dreamworld_weight"] == 0.25
     assert stack["dreamworld_replay_batch_size"] == 128
     assert stack["artifact_impact"] == "artifact_training_only"
+
+    event_stack = next(
+        entry
+        for entry in entries
+        if entry["name"]
+        == "exp24_fastslow_i32_a050_dreamworld_eventsleep_r110_p005_sub128_s1337"
+    )
+    assert event_stack["exp24_mechanism"] == "fast_slow_dreamworld_event_sleep"
+    assert event_stack["fast_slow_enabled"] is True
+    assert event_stack["dreamworld_enabled"] is True
+    assert event_stack["event_sleep_enabled"] is True
+    assert event_stack["event_sleep_loss_ratio"] == 1.10
+    assert event_stack["event_sleep_pressure_threshold"] == 0.05
+    assert event_stack["event_sleep_min_interval"] == 8
+    assert event_stack["dreamworld_replay_batch_size"] == 128
+    assert event_stack["artifact_impact"] == "artifact_training_only"
 
 
 def test_fastslow_dreamworld_matrix_is_stack_only():

@@ -11,7 +11,8 @@ temporal heads, or scoring-time state changes belong in this bundle.
    Ring 0 noise floor.
 3. SemanticOptimizer overhead gate on 1xH100 before any 8xH100 semantic run.
 4. First-wave mechanisms: fast/slow, spectral regularization, predictive
-   auxiliary, and Dreamworld hidden-state replay.
+   auxiliary, scheduled Dreamworld hidden-state replay, and loss-triggered
+   Dreamworld event replay.
 
 ## Dry Runs
 

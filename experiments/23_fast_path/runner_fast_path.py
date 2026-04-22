@@ -500,6 +500,116 @@ def _apply_scopt_pending(
         optimizer.set_channel_pressure(dict(pending.channel_pressure_items))
 
 
+class LossTriggeredReplayDecision:
+    __slots__ = (
+        "local_loss",
+        "ema_loss",
+        "local_ratio",
+        "local_pressure",
+        "global_pressure",
+        "fire_count",
+        "local_fire",
+        "triggered",
+    )
+
+    def __init__(
+        self,
+        *,
+        local_loss: float,
+        ema_loss: float,
+        local_ratio: float,
+        local_pressure: float,
+        global_pressure: float,
+        fire_count: int,
+        local_fire: bool,
+        triggered: bool,
+    ) -> None:
+        self.local_loss = local_loss
+        self.ema_loss = ema_loss
+        self.local_ratio = local_ratio
+        self.local_pressure = local_pressure
+        self.global_pressure = global_pressure
+        self.fire_count = fire_count
+        self.local_fire = local_fire
+        self.triggered = triggered
+
+
+class LossTriggeredReplayEMA:
+    """EMA loss-pressure gate for synchronized event-triggered replay.
+
+    The runner uses this to schedule *next-step* dream replay. The one-step
+    delay keeps the normal train-step gradient/all-reduce order intact: the
+    event decision is computed from the just-finished loss, then every rank
+    agrees on whether the following step should include replay.
+    """
+
+    def __init__(
+        self,
+        *,
+        decay: float = 0.99,
+        warmup_steps: int = 32,
+        eps: float = 1e-8,
+    ) -> None:
+        if not 0.0 <= float(decay) < 1.0:
+            raise ValueError(f"decay must be in [0, 1), got {decay}")
+        if int(warmup_steps) < 0:
+            raise ValueError(f"warmup_steps must be >= 0, got {warmup_steps}")
+        self.decay = float(decay)
+        self.warmup_steps = int(warmup_steps)
+        self.eps = float(eps)
+        self.value: float | None = None
+        self.observations = 0
+
+    def update(
+        self,
+        loss: torch.Tensor,
+        *,
+        threshold: float = 1.10,
+        pressure_threshold: float = 0.05,
+        ddp_active: bool = False,
+        world_size: int = 1,
+        device: torch.device | None = None,
+    ) -> LossTriggeredReplayDecision | None:
+        loss_value = float(loss.detach().float().item())
+        if self.value is None:
+            self.value = loss_value
+            self.observations = 1
+            return None
+
+        ema_before = float(self.value)
+        self.value = self.decay * self.value + (1.0 - self.decay) * loss_value
+        self.observations += 1
+        if self.observations <= self.warmup_steps:
+            return None
+
+        ratio = loss_value / max(ema_before, self.eps)
+        local_pressure = max(0.0, ratio - float(threshold))
+        local_fire = local_pressure > 0.0
+        if ddp_active and int(world_size) > 1:
+            reduce_device = device if device is not None else loss.device
+            pressure_and_fire = torch.tensor(
+                [local_pressure, float(local_fire)],
+                dtype=torch.float32,
+                device=reduce_device,
+            )
+            dist.all_reduce(pressure_and_fire, op=dist.ReduceOp.SUM)
+            global_pressure = float(pressure_and_fire[0].item()) / float(world_size)
+            fire_count = int(pressure_and_fire[1].item())
+        else:
+            global_pressure = local_pressure
+            fire_count = int(local_fire)
+        return LossTriggeredReplayDecision(
+            local_loss=loss_value,
+            ema_loss=ema_before,
+            local_ratio=ratio,
+            local_pressure=local_pressure,
+            global_pressure=global_pressure,
+            fire_count=fire_count,
+            local_fire=local_fire,
+            triggered=global_pressure > float(pressure_threshold),
+        )
+
+
 def _run_scopt_train_step(
     *,
     model: torch.nn.Module,
@@ -1211,6 +1321,13 @@ def train_fast_for_budget(
     dreamworld_buffer_size: int = 16,
     dreamworld_min_size: int = 2,
     dreamworld_max_age_steps: int = 256,
+    event_sleep_enabled: bool = False,
+    event_sleep_loss_ratio: float = 1.10,
+    event_sleep_pressure_threshold: float = 0.05,
+    event_sleep_ema_decay: float = 0.99,
+    event_sleep_warmup_steps: int = 32,
+    event_sleep_min_interval: int = 8,
+    event_sleep_weight: float = 0.0,
     scopt_split_interval: int = 4,
     scopt_baseline_buckets: int = 16,
     scopt_baseline_decay: float = 0.99,
@@ -1234,11 +1351,14 @@ def train_fast_for_budget(
         or spectral_reg_lambda_sticky > 0.0
         or predictive_aux_weight > 0.0
         or dreamworld_weight > 0.0
+        or event_sleep_enabled
     ):
         raise ValueError(
             "ScOpt training path currently supports CE-only training; "
             "disable spectral, predictive_aux, and dreamworld mechanisms"
         )
+    if event_sleep_enabled and not dreamworld_enabled:
+        raise ValueError("event_sleep_enabled requires dreamworld_enabled=True")
     sampling_mode = str(train_sampling_mode).strip().lower()
     if sampling_mode not in {"random", "sequential_epoch", "shuffled_epoch"}:
         raise ValueError(
@@ -1371,6 +1491,21 @@ def train_fast_for_budget(
         if dreamworld_enabled
         else None
     )
+    event_sleep_gate = (
+        LossTriggeredReplayEMA(
+            decay=float(event_sleep_ema_decay),
+            warmup_steps=int(event_sleep_warmup_steps),
+        )
+        if event_sleep_enabled
+        else None
+    )
+    event_sleep_pending = False
+    event_sleep_last_replay_step = -10**9
+    event_sleep_trigger_count = 0
+    event_sleep_replay_count = 0
+    event_sleep_decision_count = 0
+    event_sleep_pressure_sum = 0.0
+    event_sleep_last_decision: dict[str, Any] | None = None
     spectral_before = spectral_summary(model)
     losses: list[torch.Tensor] = []
     steps = 0
@@ -1485,14 +1620,24 @@ def train_fast_for_budget(
                 )
 
             dream_entry = None
-            if (
+            scheduled_dream_replay = (
                 dream_buffer is not None
                 and dreamworld_interval > 0
                 and dreamworld_weight > 0.0
                 and len(dream_buffer) >= int(dreamworld_min_size)
                 and steps % dreamworld_interval == 0
-            ):
+            )
+            event_dream_replay = (
+                event_sleep_pending
+                and dream_buffer is not None
+                and len(dream_buffer) >= int(dreamworld_min_size)
+            )
+            if scheduled_dream_replay or event_dream_replay:
                 dream_entry = dream_buffer.sample(generator=rng, current_step=steps)
+                if event_dream_replay:
+                    event_sleep_replay_count += 1
+                    event_sleep_pending = False
+                    event_sleep_last_replay_step = steps
 
             if (
                 dream_buffer is not None
@@ -1555,10 +1700,47 @@ def train_fast_for_budget(
                     predictive_aux_horizon=predictive_aux_horizon,
                     predictive_aux_projection=predictive_aux_projection,
                     dreamworld_entry=dream_entry,
-                    dreamworld_weight=dreamworld_weight,
+                    dreamworld_weight=(
+                        float(event_sleep_weight)
+                        if event_dream_replay and float(event_sleep_weight) > 0.0
+                        else dreamworld_weight
+                    ),
                     dreamworld_replay_batch_size=dreamworld_replay_batch_size,
                     dreamworld_generator=rng,
                 )
+            if event_sleep_gate is not None:
+                decision = event_sleep_gate.update(
+                    loss,
+                    threshold=float(event_sleep_loss_ratio),
+                    pressure_threshold=float(event_sleep_pressure_threshold),
+                    ddp_active=ddp_active,
+                    world_size=world_size_,
+                    device=device,
+                )
+                if decision is not None:
+                    event_sleep_decision_count += 1
+                    event_sleep_pressure_sum += decision.global_pressure
+                    event_sleep_last_decision = {
+                        "local_loss": decision.local_loss,
+                        "ema_loss": decision.ema_loss,
+                        "local_ratio": decision.local_ratio,
+                        "local_pressure": decision.local_pressure,
+                        "global_pressure": decision.global_pressure,
+                        "fire_count": decision.fire_count,
+                        "local_fire": decision.local_fire,
+                        "triggered": decision.triggered,
+                    }
+                    interval_ready = (
+                        steps - event_sleep_last_replay_step
+                        >= int(event_sleep_min_interval)
+                    )
+                    buffer_ready = (
+                        dream_buffer is not None
+                        and len(dream_buffer) >= int(dreamworld_min_size)
+                    )
+                    if decision.triggered and interval_ready and buffer_ready:
+                        event_sleep_trigger_count += 1
+                        event_sleep_pending = True
             if ddp_active and predictive_aux_projection is not None:
                 allreduce_grads(predictive_aux_projection, world_size_)
             zero_embedding_grad_until(
@@ -1681,6 +1863,30 @@ def train_fast_for_budget(
                     if dream_buffer is not None
                     else None
                 ),
+            },
+            "event_sleep": {
+                "enabled": event_sleep_gate is not None,
+                "loss_ratio": float(event_sleep_loss_ratio),
+                "pressure_threshold": float(event_sleep_pressure_threshold),
+                "ema_decay": float(event_sleep_ema_decay),
+                "warmup_steps": int(event_sleep_warmup_steps),
+                "min_interval": int(event_sleep_min_interval),
+                "weight": (
+                    float(event_sleep_weight)
+                    if float(event_sleep_weight) > 0.0
+                    else float(dreamworld_weight)
+                ),
+                "trigger_count": int(event_sleep_trigger_count),
+                "replay_count": int(event_sleep_replay_count),
+                "decision_count": int(event_sleep_decision_count),
+                "mean_global_pressure": (
+                    event_sleep_pressure_sum / event_sleep_decision_count
+                    if event_sleep_decision_count
+                    else 0.0
+                ),
+                "pending": bool(event_sleep_pending),
+                "last_decision": event_sleep_last_decision,
+                "artifact_impact": "artifact_training_only",
             },
         },
         **timing,
@@ -1897,6 +2103,15 @@ def run_condition(
         dreamworld_buffer_size=int(config.get("dreamworld_buffer_size", 16)),
         dreamworld_min_size=int(config.get("dreamworld_min_size", 2)),
         dreamworld_max_age_steps=int(config.get("dreamworld_max_age_steps", 256)),
+        event_sleep_enabled=bool(config.get("event_sleep_enabled", False)),
+        event_sleep_loss_ratio=float(config.get("event_sleep_loss_ratio", 1.10)),
+        event_sleep_pressure_threshold=float(
+            config.get("event_sleep_pressure_threshold", 0.05)
+        ),
+        event_sleep_ema_decay=float(config.get("event_sleep_ema_decay", 0.99)),
+        event_sleep_warmup_steps=int(config.get("event_sleep_warmup_steps", 32)),
+        event_sleep_min_interval=int(config.get("event_sleep_min_interval", 8)),
+        event_sleep_weight=float(config.get("event_sleep_weight", 0.0)),
         scopt_split_interval=int(config.get("scopt_split_interval", 4)),
         scopt_baseline_buckets=int(config.get("scopt_baseline_buckets", 16)),
         scopt_baseline_decay=float(config.get("scopt_baseline_decay", 0.99)),

@@ -94,6 +94,7 @@ Expected tags:
 | SGNS freeze | `artifact_changes_weights_only` |
 | Replay/sampling policy | `artifact_changes_weights_only` |
 | Dreamworld / hidden-state replay | `artifact_training_only`; buffer and any retrieval transformer exist only during training |
+| Dreamworld event sleep / loss-triggered replay | `artifact_training_only`; uses the Dreamworld buffer plus DDP-synced scalar trigger state only during training |
 | Neurogenesis | `artifact_adds_export_param`; must re-check compressed artifact size |
 | STDP supplement | `artifact_changes_weights_only` if no learned gate; `artifact_adds_export_param` if gated by learned parameters |
 
@@ -430,6 +431,19 @@ The SSM-native strip-down keeps only what the compact diagonal state provides:
   tokens. Same primary loss as waking; no auxiliary objective added. Only the
   input distribution changes.
 
+Two replay triggers now belong to v0:
+
+- **Scheduled Dreamworld:** replay every `dreamworld_interval` steps when the
+  buffer is warm enough. This is the ordinary fixed-cadence hidden-state replay
+  arm.
+- **Event sleep:** "sleep" here is just the old project nickname for
+  loss-triggered replay. After an ordinary wake step, compare the local loss to
+  a previous-loss EMA, convert excess into nonnegative pressure, then all-reduce
+  pressure across DDP ranks with `SUM` and divide by `world_size`. If global
+  pressure beats `event_sleep_pressure_threshold`, set a pending replay flag.
+  The replay is consumed on the next training step, so every rank keeps the
+  same optimizer-step cadence; no GPU takes private extra steps.
+
 Autoregressive dream generation — sampling the model's own tokens forward from
 the cached state, rather than teacher-forcing against the cached real
 continuation — is a v1+ variant. It tests whether self-generated trajectories
@@ -506,6 +520,16 @@ if step % dream_interval == 0 and len(buffer) >= min_dream_size:
         tokens[:, 1:].reshape(-1),
     )
     (dream_weight * loss_dream).backward()
+
+decision = event_gate.update(
+    loss,
+    threshold=event_sleep_loss_ratio,
+    pressure_threshold=event_sleep_pressure_threshold,
+    ddp_active=world_size > 1,
+    world_size=world_size,
+)
+if decision and decision.triggered and steps - last_event_replay >= min_interval:
+    event_sleep_pending = True  # consumed by the next train step
 ```
 
 Risks:
@@ -514,6 +538,10 @@ Risks:
   must age out or be refreshed
 - dream gradients can dominate fresh gradients if `dream_interval` and
   `dream_weight` are poorly tuned
+- event-trigger calibration can collapse to always-on replay if the loss EMA is
+  too sluggish or the pressure threshold is too low
+- DDP safety requires the trigger to be based on an all-reduced global pressure;
+  rank-local replay decisions are not allowed
 - storage option 3 can quietly cost more than the replay lift if the retrieval
   transformer is trained inside the 600s budget
 
@@ -529,7 +557,8 @@ V0 should implement hard age-out only. Soft decay and refresh are follow-ups if
 hard age-out looks too brittle or too wasteful in the first smoke.
 
 Artifact impact: `artifact_training_only`. The buffer and any retrieval
-transformer exist only during training and are not exported. Export path must
+transformer exist only during training and are not exported. Event-sleep EMA
+and trigger counters are also training-only diagnostics. Export path must
 assert their exclusion.
 
 Mechanism diagnostics:
@@ -537,6 +566,8 @@ Mechanism diagnostics:
 - cache fill rate and turnover
 - replay-vs-fresh gradient ratio
 - staleness distribution at replay time
+- event_sleep trigger count, replay count, mean global pressure, global
+  fire_count, pending flag, and last local/global decision
 - BPB of replay-only vs fresh-only vs combined arms
 - if storage option 3: retrieval hit distribution over cached contexts
 
@@ -595,6 +626,8 @@ Mechanism diagnostics:
 - replay policy: replay fraction, unique-window count, hard-window selection rule
 - Dreamworld: buffer fill/turnover, replay-vs-fresh gradient ratio, and
   staleness distribution at replay time
+- event_sleep: local loss ratio, all-reduced global pressure, global
+  fire_count, trigger count, replay count, and min-interval skips
 
 ## Suggested Execution Shape
 
@@ -633,6 +666,8 @@ Phase C: implement only the lowest-risk fast-path scaffolding:
 - fast/slow weight wrapper
 - spectral regularizer
 - predictive auxiliary if hidden access is cheap
+- Dreamworld scheduled replay and the fast/slow+Dreamworld stack
+- event_sleep loss-triggered Dreamworld replay, gated by DDP-summed pressure
 - SemanticOptimizer runner wiring if overhead looks bounded
 - SGNS/freeze hooks if artifacts are ready
 - replay/sampling policy hooks
@@ -651,9 +686,9 @@ Order the first implementation pass:
 1. fast/slow weights
 2. spectral recurrence regularization
 3. predictive coding auxiliary
-4. SemanticOptimizer fast-path wiring
-5. SGNS critical-period freeze
-6. replay/sampling policy
+4. scheduled Dreamworld hidden-state replay
+5. fast/slow + Dreamworld stack
+6. fast/slow + Dreamworld + event_sleep trigger
 
 The order is not a claim of scientific importance. It is a risk-adjusted path
 based on expected lift, implementation risk, and how directly the mechanism
@@ -664,7 +699,10 @@ answers the current failure mode.
 | Fast/slow weights | medium | low/medium overhead from shadow copy and sync | Most direct performant replacement for old sleep/consolidation ideas |
 | Spectral regularization | low/medium | wrong band can improve diagnostics while hurting BPB | Cheapest SSM-native recurrence-shaping test |
 | Predictive coding auxiliary | medium/high | hidden storage and aux head can slow or contaminate export | Best state-shaping idea if hidden access is cheap |
-| SemanticOptimizer | medium | current implementation may be too slow unfused | Conceptually important, but must pass the overhead gate first |
+| Dreamworld scheduled replay | medium/high | stale cached states or replay gradients overpower fresh gradients | SSM-native replay without reviving the heavy sleep stack |
+| Fast/slow + Dreamworld stack | medium/high | mechanism interactions can hide which part helped | Tests whether stabilization and hidden-state replay are complementary |
+| Event sleep trigger | medium/high | bad threshold makes replay always-on or inert | Turns the "polyphasic" intuition into a DDP-safe loss-pressure gate |
+| SemanticOptimizer / ScOpt | medium | optimizer research can consume the whole bundle | Park behind separate overhead and legality gates unless first-wave results demand it |
 | SGNS critical-period freeze | medium | artifact/provenance and optimizer-state details | Good prior signal, but Exp21 causality remains separate |
 | Replay/sampling policy | medium/high | can become an open-ended data-order project | Phase A handles sampling first; extra replay waits for a mechanism brief |
 

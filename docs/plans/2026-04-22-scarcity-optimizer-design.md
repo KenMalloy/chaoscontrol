@@ -1,7 +1,7 @@
 # Scarcity-Aware Optimizer — Design
 
 **Date:** 2026-04-22
-**Status:** Design. Not on the Exp24 first-wave critical path. Target: Exp25+.
+**Status:** Design plus initial fallback implementation. Not on the Exp24 first-wave critical path. Target: Exp25+.
 **Supersedes:** SemanticOptimizer (killed 2026-04-22 after matched-step + LR-sweep probes landed it behind Muon at every LR tested) and several earlier iterations of this design that used parameter statistics as scarcity proxies.
 
 ## Thesis
@@ -30,7 +30,7 @@ Per step:
     Step 2.  Pressure is a constant weight on ce — compute detached:
                 with torch.no_grad():
                     rarity[t]   = token_frequency_weight(target[t])
-                    baseline[t] = attention_baseline(context[t])
+                    baseline[t] = calibrated_baseline(context[t], target[t])
                     pressure[t] = clamp_positive(rarity[t] · (ce[t] - baseline[t]))
                 total_loss = ce.mean()
                 rare_loss  = (ce · pressure).sum() / pressure.sum().clamp_min(1)
@@ -67,16 +67,18 @@ Per token `t` in the batch:
 
 ```
 rarity[t]   = 1 / log(1 + freq(target[t]))      # precomputed from training corpus
-baseline[t] = attention_baseline(context[t])    # offline-trained, see below
+baseline[t] = calibrated_baseline(context[t], target[t])
 excess[t]   = max(0, ce[t] - baseline[t])       # only positive excess counts
 pressure[t] = rarity[t] · excess[t]             # element-wise in [0, ∞)
 ```
 
 **`rarity`** is a static property of the target token — same precomputed unigram table as earlier designs, ~64KB at V=16384.
 
-**`baseline[t]`** is the attention-head-predicted expected CE for this token given its context. A small offline-trained attention head (1-2 layers, dim 128, ~200-500K params) produces `baseline[t]` from a context window around position `t`. Trained offline on FineWeb to predict CE-under-a-reference-model from local context. Frozen during the 600s training run; used only to compute `excess`.
+**`baseline[t]`** is the predicted expected CE for this token. The design target is an attention-head-predicted baseline given local context: a small offline-trained attention head (1-2 layers, dim 128, ~200-500K params) produces `baseline[t]` from a context window around position `t`, is frozen during the 600s training run, and is used only to compute `excess`.
 
-Why attention for this and not for the main model: this is where attention's strength (retrieval-style lookup from local context) is genuinely the right tool. SSM state would also work but would conflate the baseline with the model's own dynamics. A frozen, context-aware baseline gives a cleaner "excess" signal than a per-frequency-bucket running mean.
+Current implementation note (2026-04-22): because the community/legal question on a pretrained helper artifact is still unanswered, the runner defaults to `FrequencyBucketBaseline`, an in-run per-frequency-bucket EMA. That keeps ScOpt self-contained and avoids placing pretrained baseline shards on HF, but it is a weaker calibration signal. The `pressure_stats` telemetry is therefore mandatory: the fallback is allowed to miss the 5-25% positive-pressure target without implying the rest of the mechanism failed.
+
+Why attention is still the preferred calibration upgrade: this is where attention's strength (retrieval-style lookup from local context) is genuinely the right tool. SSM state would also work but would conflate the baseline with the model's own dynamics. A frozen, context-aware baseline gives a cleaner "excess" signal than a per-frequency-bucket running mean.
 
 **`excess`** is clipped at zero — tokens where the model is better than baseline contribute no pressure. This is what makes the system self-correcting: a rare token the model masters drops out of the pressure signal until new rare tokens appear.
 
@@ -180,7 +182,7 @@ c_* = 0.5      # Gerber-style standard
   - `rare_channel_pressure[L, c]` — all-reduce + mean across ranks before it feeds `out_scarcity` / `in_scarcity` / recurrence `update_scale`.
   - `row_pressure_ema[token]` — all-reduce + mean across ranks before it feeds `row_scarcity`.
   Cost: 2 extra collectives per split step (rare_grads already flat-bucketed; scarcity tensors are small). Off-split steps: EMA advances locally, but must be all-reduced again before first use after the next split step (cheap; already-synchronized EMA inputs mean EMA outputs are only locally drifted by clamps/no-ops).
-- **Attention baseline head.** Frozen during training. Loaded from disk once per pod setup. ~200-500K params × fp32 = ~2MB. Training-time-only; not in the shipped artifact.
+- **Baseline provider.** The implemented default is `FrequencyBucketBaseline`, so no external weights are loaded. The optional attention baseline head remains a future calibration upgrade: frozen during training, loaded from disk once per pod setup, ~200-500K params × fp32 = ~2MB, training-time-only, and not in the shipped artifact.
 - **Frobenius vs spectral normalization.** Current Muon (`muon.py:41`) uses Frobenius norm `X / max(‖X‖_F, ε)`. Two-sided metric inputs `L · G · R` have a different condition number than raw `G`; verify NS convergence empirically on scarcity-scaled inputs (Tier 0 probe 0.2) before committing.
 - **CUDA graph compatibility.** The variable-cadence split step (every N steps, not every step) and the autograd.grad call pattern will break naive CUDA graph capture. Expect to run the ScOpt path without CUDA graphs initially; revisit only if Tier -1 shows the graph-less path losing >20% throughput to Muon.
 - **Step-skip on gradient clip.** If the raw gradient norm exceeded the clip threshold, skip the rare_grad_ema update for that step. Clipped gradients are noisy; don't pollute the rare/common decomposition.
@@ -188,13 +190,14 @@ c_* = 0.5      # Gerber-style standard
 ## Artifact budget and legality
 
 - **Precomputed unigram frequency table** at V=16384: ~64KB. Shipped.
-- **Offline-trained attention baseline**: ~2MB weights. Training-time-only; used to compute `excess[t]` during the 600s training run. Never evaluated. Treated as optimizer state, not as part of the shipped artifact.
+- **Default frequency-bucket baseline**: in-run EMA state only. Training-time-only; never evaluated or exported.
+- **Optional offline-trained attention baseline**: ~2MB weights if approved. Training-time-only; used to compute `excess[t]` during the 600s training run. Never evaluated. Treated as optimizer state, not as part of the shipped artifact.
 - **Rare-grad EMA buffers**: ~40MB at bf16 for 10M params. Training-time state.
 - **Optimizer code**: ~few hundred lines of Python. Shipped. Fits easily in the 16MB artifact cap.
 
-**Legality.** The attention baseline is novel relative to current Param Golf submissions. It's offline-trained on FineWeb training data (same precedent class as the SP tokenizer); its output is used only during training (no TTT on it, no inference-time role). Per `reference_param_golf_rules.md` and `feedback_precedent_over_permission.md`, before implementing: run `gh pr list -R openai/parameter-golf` to check for analogous precedent. If none exists, file a clarifying issue with the exact mechanism described, before building.
+**Legality.** The attention baseline is novel relative to current Param Golf submissions. It's offline-trained on FineWeb training data (same precedent class as the SP tokenizer); its output is used only during training (no TTT on it, no inference-time role). Until the discussion/clarification resolves, do not rely on a pretrained helper artifact. The current implementation uses the frequency-bucket fallback as the conservative path.
 
-If the attention baseline is ruled inadmissible, the fallback is a running-mean baseline per frequency bucket. Slightly noisier; the rest of the mechanism still works.
+Before reintroducing the attention baseline: run `gh pr list -R openai/parameter-golf` to check for analogous precedent. If none exists, file a clarifying issue with the exact mechanism described, then decide whether the helper weights live as training-only artifacts on HF or stay private to the pod setup.
 
 ## Test sequence
 
@@ -297,7 +300,7 @@ These make the difference between "null result, can't explain" and "null result,
 
 ## Scope discipline
 
-- **Not** an Exp24 first-wave arm. First-wave matrix (fast_slow, spectral, predictive_aux, dreamworld) ships first.
+- **Not** an Exp24 first-wave arm. First-wave matrix (fast_slow, spectral, predictive_aux, scheduled dreamworld, and dreamworld event_sleep) ships first.
 - **Not** a revival of SemanticOptimizer. Matched-step + LR-sweep probes landed that design behind Muon at every LR tested on 2026-04-22.
 - **Not** an architectural-law claim. Scoped to "our SSM at this scale on this benchmark"; transformer comparison is a follow-up experiment, not baked into this evaluation plan.
 - Implementation plan comes after first-wave results land and the optimizer-research slot reopens.

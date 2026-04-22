@@ -71,6 +71,23 @@ def _base_entry(
             "dreamworld_max_age_steps": int(
                 entry.get("dreamworld_max_age_steps", 256)
             ),
+            "event_sleep_enabled": bool(entry.get("event_sleep_enabled", False)),
+            "event_sleep_loss_ratio": float(
+                entry.get("event_sleep_loss_ratio", 1.10)
+            ),
+            "event_sleep_pressure_threshold": float(
+                entry.get("event_sleep_pressure_threshold", 0.05)
+            ),
+            "event_sleep_ema_decay": float(
+                entry.get("event_sleep_ema_decay", 0.99)
+            ),
+            "event_sleep_warmup_steps": int(
+                entry.get("event_sleep_warmup_steps", 32)
+            ),
+            "event_sleep_min_interval": int(
+                entry.get("event_sleep_min_interval", 8)
+            ),
+            "event_sleep_weight": float(entry.get("event_sleep_weight", 0.0)),
             "embed_freeze_steps": int(entry.get("embed_freeze_steps", 0)),
             "semantic_layer_index": int(entry.get("semantic_layer_index", 0)),
             "semantic_momentum_min": float(
@@ -254,6 +271,31 @@ def build_first_wave_mechanism_matrix(
             "dreamworld_buffer_size": 16,
             "dreamworld_min_size": 2,
             "dreamworld_max_age_steps": 256,
+        },
+        {
+            "name_arm": "fastslow_i32_a050_dreamworld_eventsleep_r110_p005_sub128",
+            "exp24_mechanism": "fast_slow_dreamworld_event_sleep",
+            "artifact_impact": ARTIFACT_TRAINING_ONLY,
+            "fast_slow_enabled": True,
+            "fast_slow_interval": 32,
+            "fast_slow_alpha": 0.50,
+            "fast_slow_eval_copy": "slow",
+            "dreamworld_enabled": True,
+            "dreamworld_cache_interval": 8,
+            "dreamworld_interval": 8,
+            "dreamworld_weight": 0.25,
+            "dreamworld_prefix_tokens": 128,
+            "dreamworld_replay_tokens": 64,
+            "dreamworld_replay_batch_size": 128,
+            "dreamworld_buffer_size": 16,
+            "dreamworld_min_size": 2,
+            "dreamworld_max_age_steps": 256,
+            "event_sleep_enabled": True,
+            "event_sleep_loss_ratio": 1.10,
+            "event_sleep_pressure_threshold": 0.05,
+            "event_sleep_ema_decay": 0.99,
+            "event_sleep_warmup_steps": 32,
+            "event_sleep_min_interval": 8,
         },
     ]
 

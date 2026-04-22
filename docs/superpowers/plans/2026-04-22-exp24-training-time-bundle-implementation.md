@@ -2,6 +2,14 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+> **Status update, 2026-04-22:** the implemented first-wave matrix now includes
+> scheduled Dreamworld replay, a fast/slow+Dreamworld stack, and an
+> `event_sleep` loss-triggered Dreamworld replay arm. `event_sleep` is the
+> project nickname for a DDP-summed loss-pressure gate; it is not rank-local
+> partitioned sleep and it does not let one GPU take private optimizer steps.
+> Treat the checked-in source/tests as authority where this historical plan
+> shows earlier SGNS/SemanticOptimizer ordering.
+
 **Goal:** Build a tested Exp24 fast-path training harness that can run apples-to-apples 600s training-time mechanism ablations on the current fastest SSM base.
 
 **Architecture:** Keep Exp23 as the hot-loop substrate and add Exp24 as a thin experiment layer around it. New matrix/build/report code lives under `experiments/24_training_time_bundle/`; reusable low-level hooks go beside the Exp23 runner because they are training-loop capabilities, not one-off analysis scripts.
@@ -57,6 +65,13 @@ dreamworld_replay_tokens: 64
 dreamworld_buffer_size: 16
 dreamworld_min_size: 2
 dreamworld_max_age_steps: 256
+event_sleep_enabled: false
+event_sleep_loss_ratio: 1.10
+event_sleep_pressure_threshold: 0.05
+event_sleep_ema_decay: 0.99
+event_sleep_warmup_steps: 32
+event_sleep_min_interval: 8
+event_sleep_weight: 0.0
 semantic_layer_index: 0
 semantic_momentum_min: 0.5
 semantic_overhead_gate: 0.08
@@ -2682,8 +2697,9 @@ temporal heads, or scoring-time state changes belong in this bundle.
 2. Phase A sampling policy gate: no extra mechanism, same budget, compare to
    Ring 0 noise floor.
 3. SemanticOptimizer overhead gate on 1xH100 before any 8xH100 semantic run.
-4. First-wave mechanisms: fast/slow, spectral, SGNS freeze, Dreamworld ring
-   buffer, predictive aux if the smoke proves overhead is acceptable.
+4. First-wave mechanisms: fast/slow, spectral, predictive auxiliary,
+   scheduled Dreamworld ring-buffer replay, fast/slow+Dreamworld, and
+   fast/slow+Dreamworld+event_sleep.
 
 ## Dry Run
 
