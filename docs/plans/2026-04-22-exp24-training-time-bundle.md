@@ -93,6 +93,7 @@ Expected tags:
 | SGNS init | `artifact_changes_weights_only`; precomputed init provenance must be recorded separately |
 | SGNS freeze | `artifact_changes_weights_only` |
 | Replay/sampling policy | `artifact_changes_weights_only` |
+| Dreamworld / hidden-state replay | `artifact_training_only`; buffer and any retrieval transformer exist only during training |
 | Neurogenesis | `artifact_adds_export_param`; must re-check compressed artifact size |
 | STDP supplement | `artifact_changes_weights_only` if no learned gate; `artifact_adds_export_param` if gated by learned parameters |
 
@@ -397,6 +398,140 @@ BPB at matched 600s wall-clock.
 Promote condition: a policy lets us keep most of the fast-path data exposure
 while improving final BPB.
 
+### 7. Dreamworld / Hidden-State Replay
+
+Priority: parallel to §6 replay policy; needs its own mechanism brief before
+entering the first implementation pass.
+
+The conceptual ancestor is the Exp11 sleep design
+(`docs/plans/2026-04-08-sleep-cycle-design.md`), where the SSM dreamed by
+generating token sequences from memory-slot centroids and scored them
+teacher-forced against cached real continuations. That design depended on
+apparatus the fast path does not have: Wernicke buckets, memory slots,
+semantic bases, latent traces, a regret table, and a full-tier `dream_step()`
+on `ChaosStudentLM`. Exp11 killed that machinery at the 600s budget; Exp20's
+notes make the non-port explicit.
+
+The SSM-native strip-down keeps only what the compact diagonal state provides:
+
+- **Seed:** cache `(state, next_M_tokens)` pairs at document boundaries (or
+  every K waking steps) into a buffer. State is O(channels × inner); M is the
+  dream rollout length. The SSM's compact state makes this storable at scale —
+  a transformer's equivalent would require caching the full KV prefix.
+- **Dream replay (v0):** sample a cached pair, run the fast-path SSM forward
+  once over the cached real tokens with the cached state as initial hidden
+  state. Teacher-forced, same batched forward as waking — no autoregressive
+  sampling in v0.
+- **Training signal:** cross-entropy against the cached real continuation
+  tokens. Same primary loss as waking; no auxiliary objective added. Only the
+  input distribution changes.
+
+Autoregressive dream generation — sampling the model's own tokens forward from
+the cached state, rather than teacher-forcing against the cached real
+continuation — is a v1+ variant. It tests whether self-generated trajectories
+add signal beyond replay of real continuations, but it breaks fast-path parity
+because generation is inherently sequential. Do not run it as the first
+measured version.
+
+Why it fits:
+
+- training-time only, does not touch the submission artifact or eval path
+- reuses the existing fast-path forward and loss; v0 teacher-forces against
+  the cached real tokens, so per-step throughput matches waking training — no
+  sequential inference loop in the hot path
+- consumes cached waking data rather than fresh FineWeb tokens — the "SSM
+  running without new stream data" framing
+- SSM-native in a way transformers cannot cheaply replicate, because
+  transformer "state" equals the full KV prefix
+
+Storage ladder for the `(state, continuation)` cache:
+
+1. **Ring buffer, uniform sampling.** No model. Cache pairs, shuffle, replay.
+   Baseline; run first.
+2. **Vector store (FAISS or equivalent).** Nearest-neighbor retrieval over a
+   state-derived embedding. Still no additional model.
+3. **Transformer-based associative memory.** Query = current wake-time context;
+   keys = cached state descriptors; values = pointers into the
+   `(state, continuation)` buffer. The transformer picks which cached states
+   to replay based on current regime. Fits the project thesis that "database
+   is the transformer answer to a question SSMs don't ask": storage and
+   retrieval is that kind of question, and offloading it to transformer
+   machinery keeps the SSM on the streaming side.
+
+Option 3 earns its seat only by beating 1-2. If the ring buffer does not lift
+BPB, learned retrieval will not rescue it. If option 3 is run, the retrieval
+transformer should be pre-trained offline against state traces from a
+preliminary control run and frozen during the measured arm. Training a
+transformer inside the 600s budget steals SSM compute and confuses the
+comparison axis. Offline pre-training is analogous to the
+SGNS-is-offline-legal precedent on the submission side; here the transformer
+is training-time infrastructure that never ships.
+
+Old implementation status:
+
+- `sleep.py` and `dream_step()` exist but require the heavy model path and
+  memory apparatus; do not revive
+- no current fast-path implementation exists
+- implement as a training-loop wrapper over `runner_fast_path.py`, with the
+  buffer as an in-memory deque in the simplest version
+
+Sketch (ring-buffer baseline):
+
+```python
+if step % cache_interval == 0:
+    buffer.append((state.detach().clone(), next_tokens.detach().clone()))
+    if len(buffer) > buffer_cap:
+        buffer.popleft()
+
+if step % dream_interval == 0 and len(buffer) >= min_dream_size:
+    states, tokens = random.choice(buffer)
+    # Teacher-forced fast-path forward with cached state as initial hidden
+    # state. Same batched forward as waking; no autoregressive loop in v0.
+    hidden = model.encode(tokens[:, :-1], initial_states=states)
+    logits = model.lm_head(model.final_norm(hidden))
+    loss_dream = F.cross_entropy(
+        logits.reshape(-1, V),
+        tokens[:, 1:].reshape(-1),
+    )
+    (dream_weight * loss_dream).backward()
+```
+
+Risks:
+
+- cached states drift out of distribution as the SSM weights move; the buffer
+  must age out or be refreshed
+- dream gradients can dominate fresh gradients if `dream_interval` and
+  `dream_weight` are poorly tuned
+- storage option 3 can quietly cost more than the replay lift if the retrieval
+  transformer is trained inside the 600s budget
+
+Staleness policy choices:
+
+- hard age-out: drop entries older than `S` optimizer steps
+- soft decay: weight replay gradient by `exp(-age / tau)`
+- refresh: periodically re-run the cached prefix to produce a fresh
+  `(state, continuation)` pair (expensive; only if hard age-out and soft decay
+  both fail)
+
+Artifact impact: `artifact_training_only`. The buffer and any retrieval
+transformer exist only during training and are not exported. Export path must
+assert their exclusion.
+
+Mechanism diagnostics:
+
+- cache fill rate and turnover
+- replay-vs-fresh gradient ratio
+- staleness distribution at replay time
+- BPB of replay-only vs fresh-only vs combined arms
+- if storage option 3: retrieval hit distribution over cached contexts
+
+Kill condition: no cache policy plus dream-weight combination improves
+full-val BPB over the §6 replay/sampling baseline at matched 600s wall-clock.
+Option 3 additionally kills if it does not beat option 1 at matched 600s.
+
+Promote condition: dream arm lifts BPB over both the Exp23 control and the
+best §6 sampling policy, or matches them at clearly lower train wall-clock.
+
 ## Parked For 24b
 
 ### Neurogenesis: Channel Addition During Training
@@ -443,6 +578,8 @@ Mechanism diagnostics:
 - SemanticOptimizer: beta/tau summaries and overhead versus Muon
 - SGNS: embedding cosine drift and row-norm drift
 - replay policy: replay fraction, unique-window count, hard-window selection rule
+- Dreamworld: buffer fill/turnover, replay-vs-fresh gradient ratio, and
+  staleness distribution at replay time
 
 ## Suggested Execution Shape
 

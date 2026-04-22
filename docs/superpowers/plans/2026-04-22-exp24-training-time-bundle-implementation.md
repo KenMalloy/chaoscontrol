@@ -15,11 +15,15 @@
 - Create `experiments/24_training_time_bundle/exp24.py`: Exp24 matrix builders, artifact-impact tags, seed-noise summary helpers, and result-row normalization.
 - Create `experiments/24_training_time_bundle/run_exp24.py`: CLI for Ring 0, Phase A, and named mechanism matrices using the existing `launch.run_matrix_entries`.
 - Create `experiments/24_training_time_bundle/README.md`: runbook for local dry runs, 1xH100 smokes, 8xH100 gates, and result interpretation.
+- Create `experiments/23_fast_path/dreamworld.py`: Dreamworld ring-buffer state replay primitives for the fast-path runner.
 - Create `tests/test_exp24_training_bundle.py`: tests for Exp24 matrix construction and summaries.
 - Create `tests/test_exp24_training_hooks.py`: tests for fast/slow, spectral, embedding-freeze, and predictive-aux hook behavior.
+- Create `tests/test_exp24_dreamworld.py`: tests for Dreamworld buffer, state capture, and replay loss.
+- Modify `src/chaoscontrol/model.py`: let `ChaosStudentLM.encode()` return final SSM states and accept cached initial states without materializing logits.
 - Modify `experiments/23_fast_path/fast_path.py`: add O(1) shuffled-epoch sampling helpers and matrix-friendly defaults.
 - Modify `experiments/23_fast_path/runner_fast_path.py`: thread training-time mechanisms through `_run_train_step`, `train_fast_for_budget`, `_build_optimizer`, and result JSON.
 - Modify `tests/test_exp23_fast_path.py`: pin new sampling mode and runner integration behavior.
+- Modify `tests/test_encode_forward_equivalence.py`: pin state-returning encode equivalence against `forward()`.
 - Modify `docs/plans/2026-04-22-exp24-training-time-bundle.md`: link to this implementation plan after code lands.
 
 ## Shared Config Keys
@@ -44,6 +48,15 @@ predictive_aux_weight: 0.0
 predictive_aux_horizon: 0
 predictive_aux_dim: 0
 embed_freeze_steps: 0
+dreamworld_enabled: false
+dreamworld_cache_interval: 0
+dreamworld_interval: 0
+dreamworld_weight: 0.0
+dreamworld_prefix_tokens: 128
+dreamworld_replay_tokens: 64
+dreamworld_buffer_size: 16
+dreamworld_min_size: 2
+dreamworld_max_age_steps: 256
 semantic_layer_index: 0
 semantic_momentum_min: 0.5
 semantic_overhead_gate: 0.08
@@ -1542,7 +1555,666 @@ git add experiments/23_fast_path/training_hooks.py experiments/23_fast_path/runn
 git commit -m "exp24: add predictive coding auxiliary hook"
 ```
 
-## Task 7: Exp24 Mechanism Matrices And Launcher
+## Task 7: Dreamworld Ring-Buffer Hidden-State Replay
+
+**Files:**
+- Modify: `src/chaoscontrol/model.py`
+- Create: `experiments/23_fast_path/dreamworld.py`
+- Modify: `experiments/23_fast_path/runner_fast_path.py`
+- Modify: `tests/test_encode_forward_equivalence.py`
+- Create: `tests/test_exp24_dreamworld.py`
+- Modify: `tests/test_exp23_fast_path.py`
+
+**Scope invariant:** Dreamworld v0 is teacher-forced hidden-state replay. It
+must run one batched forward over cached real continuation tokens from cached
+SSM state. Do not add token-by-token autoregressive sampling, generation
+helpers, or a dream rollout loop in this task. Autoregressive dreams are a v1+
+diagnostic because they break fast-path parity.
+
+- [ ] **Step 1: Write failing encode-state tests**
+
+Append to `tests/test_encode_forward_equivalence.py`:
+
+```python
+    def test_encode_can_return_final_states(self, bare_ssm_model: ChaosStudentLM) -> None:
+        model = bare_ssm_model
+        inputs = _make_input(batch=2, seq=12, vocab=64, seed=4)
+
+        with torch.no_grad():
+            forward_out = model(inputs)
+            hidden, final_states = model.encode(inputs, return_final_states=True)
+
+        assert torch.equal(forward_out["hidden"], hidden)
+        assert len(final_states) == len(model.layers)
+        for got, expected in zip(final_states, forward_out["final_states"]):
+            assert torch.equal(got, expected)
+
+    def test_encode_accepts_initial_states(self, bare_ssm_model: ChaosStudentLM) -> None:
+        model = bare_ssm_model
+        inputs = _make_input(batch=2, seq=12, vocab=64, seed=5)
+        initial_states = model.init_states(
+            batch_size=2,
+            device=inputs.device,
+            dtype=next(model.parameters()).dtype,
+        )
+        for idx, state in enumerate(initial_states):
+            state.fill_(0.1 * (idx + 1))
+
+        with torch.no_grad():
+            forward_out = model(inputs, initial_states=initial_states)
+            hidden, final_states = model.encode(
+                inputs,
+                initial_states=initial_states,
+                return_final_states=True,
+            )
+
+        assert torch.equal(forward_out["hidden"], hidden)
+        for got, expected in zip(final_states, forward_out["final_states"]):
+            assert torch.equal(got, expected)
+```
+
+- [ ] **Step 2: Run encode tests and verify they fail**
+
+Run:
+
+```bash
+.venv/bin/python -m pytest tests/test_encode_forward_equivalence.py::TestEncodeBareSSMEquivalence::test_encode_can_return_final_states tests/test_encode_forward_equivalence.py::TestEncodeBareSSMEquivalence::test_encode_accepts_initial_states -q
+```
+
+Expected: both tests fail because `ChaosStudentLM.encode()` does not accept `return_final_states` or `initial_states`.
+
+- [ ] **Step 3: Extend `ChaosStudentLM.encode()`**
+
+In `src/chaoscontrol/model.py`, change the signature to:
+
+```python
+    def encode(
+        self,
+        input_ids: torch.Tensor,
+        *,
+        initial_states: list[torch.Tensor] | None = None,
+        return_final_states: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
+```
+
+At the beginning of `encode()`, add the same length check used by `forward()`:
+
+```python
+        if initial_states is not None:
+            if len(initial_states) != len(self.layers):
+                raise ValueError(
+                    f"initial_states length {len(initial_states)} does not match "
+                    f"num_layers {len(self.layers)}"
+                )
+```
+
+Replace the layer loop in `encode()` with this state-aware version:
+
+```python
+        use_ckpt = self.activation_checkpoint and torch.is_grad_enabled() and x.requires_grad
+        final_states: list[torch.Tensor | None] = [None] * len(self.layers)
+        for layer_idx in self._virtual_layer_indices:
+            layer = self.layers[layer_idx]
+            init_state = initial_states[layer_idx] if initial_states is not None else None
+            if use_ckpt:
+                result = _checkpoint(
+                    layer,
+                    x,
+                    return_jacobian_stats=False,
+                    initial_state=init_state,
+                    return_final_state=return_final_states,
+                    use_reentrant=False,
+                )
+            else:
+                result = layer(
+                    x,
+                    return_jacobian_stats=False,
+                    initial_state=init_state,
+                    return_final_state=return_final_states,
+                )
+            if return_final_states:
+                x, fstate = result
+                final_states[layer_idx] = fstate
+            else:
+                x = result
+```
+
+At the end of `encode()`, return states only when requested:
+
+```python
+        if return_final_states:
+            assert all(s is not None for s in final_states), (
+                "final_states has unvisited slots — virtual layer indices did not "
+                "cover every physical layer"
+            )
+            return x, final_states
+        return x
+```
+
+Keep the default `model.encode(inputs)` behavior byte-identical for existing Exp23 calls.
+
+- [ ] **Step 4: Write failing Dreamworld primitive tests**
+
+Create `tests/test_exp24_dreamworld.py`:
+
+```python
+"""Tests for Exp24 Dreamworld hidden-state replay primitives."""
+from __future__ import annotations
+
+import importlib.util
+from pathlib import Path
+
+import torch
+import torch.nn as nn
+
+
+REPO = Path(__file__).resolve().parents[1]
+DREAM_PATH = REPO / "experiments" / "23_fast_path" / "dreamworld.py"
+
+
+def _load_dreamworld():
+    spec = importlib.util.spec_from_file_location("exp23_dreamworld", DREAM_PATH)
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+class _TinyDreamModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.embed = nn.Embedding(16, 4)
+        self.final_norm = nn.Identity()
+        self.lm_head = nn.Linear(4, 16, bias=False)
+        self.layers = nn.ModuleList([nn.Identity()])
+        self.encode_calls: list[dict[str, object]] = []
+
+    def encode(
+        self,
+        inputs: torch.Tensor,
+        *,
+        initial_states: list[torch.Tensor] | None = None,
+        return_final_states: bool = False,
+    ):
+        self.encode_calls.append({
+            "shape": tuple(inputs.shape),
+            "has_initial_states": initial_states is not None,
+        })
+        hidden = self.embed(inputs)
+        if initial_states is None:
+            carry = torch.zeros(inputs.size(0), 4, device=inputs.device)
+        else:
+            carry = initial_states[0].to(inputs.device)
+        hidden = hidden + carry[:, None, :]
+        final_state = hidden[:, -1, :].detach()
+        if return_final_states:
+            return hidden, [final_state]
+        return hidden
+
+
+def test_dream_replay_buffer_detaches_evicts_and_ages_entries():
+    dream = _load_dreamworld()
+    buffer = dream.DreamReplayBuffer(max_entries=2, max_age_steps=5)
+    states = [torch.ones(2, 4, requires_grad=True)]
+    tokens = torch.arange(10).view(2, 5)
+
+    buffer.add(step=1, states=states, replay_tokens=tokens)
+    buffer.add(step=2, states=[torch.full((2, 4), 2.0)], replay_tokens=tokens + 1)
+    buffer.add(step=9, states=[torch.full((2, 4), 3.0)], replay_tokens=tokens + 2)
+
+    assert len(buffer) == 1
+    entry = buffer.sample(generator=torch.Generator().manual_seed(0), current_step=9)
+    assert entry is not None
+    assert entry.step == 9
+    assert entry.states[0].requires_grad is False
+    assert entry.replay_tokens.requires_grad is False
+
+
+def test_build_dream_replay_tokens_slices_seed_plus_targets():
+    dream = _load_dreamworld()
+    inputs = torch.arange(2 * 10).view(2, 10)
+
+    replay = dream.build_dream_replay_tokens(
+        inputs,
+        prefix_tokens=4,
+        replay_tokens=3,
+    )
+
+    assert replay.tolist() == [
+        [3, 4, 5, 6],
+        [13, 14, 15, 16],
+    ]
+
+
+def test_dreamworld_replay_backward_uses_cached_initial_state():
+    dream = _load_dreamworld()
+    model = _TinyDreamModel()
+    replay_tokens = torch.tensor([[1, 2, 3], [4, 5, 6]], dtype=torch.long)
+    entry = dream.DreamReplayEntry(
+        step=0,
+        states=[torch.ones(2, 4)],
+        replay_tokens=replay_tokens,
+    )
+
+    loss = dream.dreamworld_replay_backward(
+        model,
+        entry=entry,
+        weight=0.25,
+    )
+
+    assert loss.ndim == 0
+    assert model.encode_calls == [
+        {"shape": (2, 2), "has_initial_states": True},
+    ]
+    assert model.embed.weight.grad is not None
+    assert model.lm_head.weight.grad is not None
+```
+
+- [ ] **Step 5: Run Dreamworld tests and verify they fail**
+
+Run:
+
+```bash
+.venv/bin/python -m pytest tests/test_exp24_dreamworld.py -q
+```
+
+Expected: collection fails because `experiments/23_fast_path/dreamworld.py` does not exist.
+
+- [ ] **Step 6: Implement Dreamworld primitives**
+
+Create `experiments/23_fast_path/dreamworld.py`:
+
+```python
+"""Dreamworld hidden-state replay primitives for Exp24.
+
+V0 is deliberately teacher-forced: cache compact SSM states plus real
+continuation tokens, then replay the continuation from that state with CE loss.
+The replay pass is the same batched forward shape as waking training, only over
+short cached continuations. Autoregressive generation is a diagnostic/later
+variant; teacher forcing keeps the first measured arm on the fast path.
+"""
+from __future__ import annotations
+
+from collections import deque
+from dataclasses import dataclass
+
+import torch
+import torch.nn.functional as F
+
+
+@dataclass
+class DreamReplayEntry:
+    step: int
+    states: list[torch.Tensor]
+    replay_tokens: torch.Tensor
+
+
+class DreamReplayBuffer:
+    def __init__(self, *, max_entries: int, max_age_steps: int) -> None:
+        self.max_entries = int(max_entries)
+        self.max_age_steps = int(max_age_steps)
+        self._entries: deque[DreamReplayEntry] = deque()
+        self.add_count = 0
+        self.sample_count = 0
+        self.drop_count = 0
+
+    def __len__(self) -> int:
+        return len(self._entries)
+
+    def _drop_stale(self, *, current_step: int) -> None:
+        if self.max_age_steps <= 0:
+            return
+        while self._entries and int(current_step) - self._entries[0].step > self.max_age_steps:
+            self._entries.popleft()
+            self.drop_count += 1
+
+    def add(
+        self,
+        *,
+        step: int,
+        states: list[torch.Tensor],
+        replay_tokens: torch.Tensor,
+    ) -> None:
+        self._drop_stale(current_step=step)
+        entry = DreamReplayEntry(
+            step=int(step),
+            states=[state.detach().clone() for state in states],
+            replay_tokens=replay_tokens.detach().clone(),
+        )
+        self._entries.append(entry)
+        self.add_count += 1
+        while len(self._entries) > self.max_entries:
+            self._entries.popleft()
+            self.drop_count += 1
+
+    def sample(
+        self,
+        *,
+        generator: torch.Generator,
+        current_step: int,
+    ) -> DreamReplayEntry | None:
+        self._drop_stale(current_step=current_step)
+        if not self._entries:
+            return None
+        idx = int(torch.randint(
+            low=0,
+            high=len(self._entries),
+            size=(),
+            generator=generator,
+        ).item())
+        self.sample_count += 1
+        return self._entries[idx]
+
+    def diagnostics(self, *, current_step: int) -> dict[str, int | float]:
+        self._drop_stale(current_step=current_step)
+        ages = [int(current_step) - entry.step for entry in self._entries]
+        return {
+            "size": len(self._entries),
+            "max_entries": self.max_entries,
+            "max_age_steps": self.max_age_steps,
+            "add_count": self.add_count,
+            "sample_count": self.sample_count,
+            "drop_count": self.drop_count,
+            "age_min": min(ages) if ages else 0,
+            "age_max": max(ages) if ages else 0,
+            "age_mean": float(sum(ages) / len(ages)) if ages else 0.0,
+        }
+
+
+def build_dream_replay_tokens(
+    inputs: torch.Tensor,
+    *,
+    prefix_tokens: int,
+    replay_tokens: int,
+) -> torch.Tensor:
+    prefix = int(prefix_tokens)
+    replay = int(replay_tokens)
+    if prefix <= 0:
+        raise ValueError(f"prefix_tokens must be positive, got {prefix}")
+    if replay <= 0:
+        raise ValueError(f"replay_tokens must be positive, got {replay}")
+    end = prefix + replay
+    if end > inputs.size(1):
+        raise ValueError(
+            f"prefix_tokens + replay_tokens must fit inside inputs: "
+            f"{prefix} + {replay} > {inputs.size(1)}"
+        )
+    return inputs[:, prefix - 1:end].detach()
+
+
+@torch.no_grad()
+def capture_dream_entry(
+    model: torch.nn.Module,
+    inputs: torch.Tensor,
+    *,
+    step: int,
+    prefix_tokens: int,
+    replay_tokens: int,
+) -> DreamReplayEntry:
+    prefix = inputs[:, :int(prefix_tokens)]
+    replay = build_dream_replay_tokens(
+        inputs,
+        prefix_tokens=prefix_tokens,
+        replay_tokens=replay_tokens,
+    )
+    _hidden, states = model.encode(prefix, return_final_states=True)
+    return DreamReplayEntry(
+        step=int(step),
+        states=[state.detach().clone() for state in states],
+        replay_tokens=replay.detach().clone(),
+    )
+
+
+def dreamworld_replay_backward(
+    model: torch.nn.Module,
+    *,
+    entry: DreamReplayEntry,
+    weight: float,
+) -> torch.Tensor:
+    """Backprop one teacher-forced replay pass.
+
+    This intentionally calls `model.encode()` once on the shifted cached real
+    continuation. There is no autoregressive sampling loop in Dreamworld v0.
+    """
+    replay = entry.replay_tokens
+    device = next(model.parameters()).device
+    replay = replay.to(device=device, non_blocking=True)
+    states = [state.to(device=device, non_blocking=True) for state in entry.states]
+    replay_inputs = replay[:, :-1].to(dtype=torch.int32)
+    targets = replay[:, 1:].to(dtype=torch.long)
+    hidden = model.encode(replay_inputs, initial_states=states)
+    logits = model.lm_head(model.final_norm(hidden))
+    loss = F.cross_entropy(
+        logits.reshape(-1, logits.size(-1)).float(),
+        targets.reshape(-1),
+        reduction="mean",
+    )
+    (float(weight) * loss).backward()
+    return loss.detach()
+```
+
+- [ ] **Step 7: Thread Dreamworld through the runner**
+
+In `runner_fast_path.py`, import:
+
+```python
+from dreamworld import (
+    DreamReplayBuffer,
+    capture_dream_entry,
+    dreamworld_replay_backward,
+)
+```
+
+Add these keyword arguments to `train_fast_for_budget`:
+
+```python
+    dreamworld_enabled: bool = False,
+    dreamworld_cache_interval: int = 0,
+    dreamworld_interval: int = 0,
+    dreamworld_weight: float = 0.0,
+    dreamworld_prefix_tokens: int = 128,
+    dreamworld_replay_tokens: int = 64,
+    dreamworld_buffer_size: int = 16,
+    dreamworld_min_size: int = 2,
+    dreamworld_max_age_steps: int = 256,
+```
+
+Add these keyword arguments to `_run_train_step`:
+
+```python
+    dreamworld_entry: Any | None = None,
+    dreamworld_weight: float = 0.0,
+```
+
+Inside `_run_train_step`, call Dreamworld replay before the existing DDP
+all-reduce block so replay gradients are reduced together with waking gradients:
+
+```python
+    if dreamworld_entry is not None and dreamworld_weight > 0.0:
+        dreamworld_replay_backward(
+            model,
+            entry=dreamworld_entry,
+            weight=dreamworld_weight,
+        )
+```
+
+Before the loop, create:
+
+```python
+    dream_buffer = (
+        DreamReplayBuffer(
+            max_entries=dreamworld_buffer_size,
+            max_age_steps=dreamworld_max_age_steps,
+        )
+        if dreamworld_enabled
+        else None
+    )
+```
+
+After batch assembly and before `optimizer.zero_grad(set_to_none=True)`, cache entries:
+
+```python
+            if (
+                dream_buffer is not None
+                and dreamworld_cache_interval > 0
+                and steps % dreamworld_cache_interval == 0
+            ):
+                entry = capture_dream_entry(
+                    model,
+                    inputs,
+                    step=steps,
+                    prefix_tokens=dreamworld_prefix_tokens,
+                    replay_tokens=dreamworld_replay_tokens,
+                )
+                dream_buffer.add(
+                    step=entry.step,
+                    states=entry.states,
+                    replay_tokens=entry.replay_tokens,
+                )
+```
+
+Before calling `_run_train_step`, sample a replay entry:
+
+```python
+            dream_entry = None
+            if (
+                dream_buffer is not None
+                and dreamworld_interval > 0
+                and dreamworld_weight > 0.0
+                and len(dream_buffer) >= int(dreamworld_min_size)
+                and steps % dreamworld_interval == 0
+            ):
+                dream_entry = dream_buffer.sample(generator=rng, current_step=steps)
+```
+
+Pass `dreamworld_entry=dream_entry` and `dreamworld_weight=dreamworld_weight`
+into `_run_train_step`.
+
+Pass Dreamworld config from `run_condition` into `train_fast_for_budget`:
+
+```python
+        dreamworld_enabled=bool(config.get("dreamworld_enabled", False)),
+        dreamworld_cache_interval=int(config.get("dreamworld_cache_interval", 0)),
+        dreamworld_interval=int(config.get("dreamworld_interval", 0)),
+        dreamworld_weight=float(config.get("dreamworld_weight", 0.0)),
+        dreamworld_prefix_tokens=int(config.get("dreamworld_prefix_tokens", 128)),
+        dreamworld_replay_tokens=int(config.get("dreamworld_replay_tokens", 64)),
+        dreamworld_buffer_size=int(config.get("dreamworld_buffer_size", 16)),
+        dreamworld_min_size=int(config.get("dreamworld_min_size", 2)),
+        dreamworld_max_age_steps=int(config.get("dreamworld_max_age_steps", 256)),
+```
+
+Add result diagnostics:
+
+```python
+            "dreamworld": {
+                "enabled": dream_buffer is not None,
+                "weight": float(dreamworld_weight),
+                "cache_interval": int(dreamworld_cache_interval),
+                "dream_interval": int(dreamworld_interval),
+                "prefix_tokens": int(dreamworld_prefix_tokens),
+                "replay_tokens": int(dreamworld_replay_tokens),
+                "artifact_impact": "artifact_training_only",
+                "buffer": (
+                    dream_buffer.diagnostics(current_step=steps)
+                    if dream_buffer is not None
+                    else None
+                ),
+            },
+```
+
+- [ ] **Step 8: Write runner integration test**
+
+Append to `tests/test_exp23_fast_path.py`:
+
+```python
+def test_train_fast_for_budget_runs_dreamworld_replay(monkeypatch):
+    mod = _load_runner_module()
+    events = []
+
+    class FakeDreamBuffer:
+        def __init__(self, **kwargs):
+            self.entries = []
+            events.append(("buffer", kwargs))
+
+        def __len__(self):
+            return len(self.entries)
+
+        def add(self, *, step, states, replay_tokens):
+            self.entries.append((step, states, replay_tokens))
+            events.append(("add", step))
+
+        def sample(self, *, generator, current_step):
+            events.append(("sample", current_step))
+            return object()
+
+        def diagnostics(self, *, current_step):
+            return {"size": len(self.entries), "current_step": current_step}
+
+    monkeypatch.setattr(mod, "DreamReplayBuffer", FakeDreamBuffer)
+    monkeypatch.setattr(mod, "capture_dream_entry", lambda model, inputs, **kwargs: type("E", (), {
+        "step": kwargs["step"],
+        "states": [torch.zeros(inputs.size(0), 4)],
+        "replay_tokens": inputs[:, :3],
+    })())
+    monkeypatch.setattr(mod, "dreamworld_replay_backward", lambda model, *, entry, weight: torch.tensor(0.1))
+
+    model = _TinyTokenTrainModel()
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+    result = mod.train_fast_for_budget(
+        model,
+        train_tokens=torch.arange(128, dtype=torch.int16) % 6,
+        train_num_tokens=128,
+        stride=4,
+        seq_len=6,
+        batch_size=2,
+        device=torch.device("cpu"),
+        optimizer=optimizer,
+        budget_seconds=300.0,
+        chunk_size=2,
+        grad_clip_norm=0.0,
+        fused_grad_clip=False,
+        rank=0,
+        world_size=1,
+        seed=123,
+        precision="bf16",
+        stop_check_interval=1,
+        stop_margin_seconds=0.0,
+        vocab_size=6,
+        max_steps=2,
+        prefetch_batches=False,
+        dreamworld_enabled=True,
+        dreamworld_cache_interval=1,
+        dreamworld_interval=1,
+        dreamworld_weight=0.25,
+        dreamworld_prefix_tokens=3,
+        dreamworld_replay_tokens=2,
+        dreamworld_min_size=1,
+    )
+
+    assert ("sample", 0) in events
+    assert result["mechanisms"]["dreamworld"]["enabled"] is True
+    assert result["mechanisms"]["dreamworld"]["artifact_impact"] == "artifact_training_only"
+```
+
+- [ ] **Step 9: Run targeted Dreamworld tests**
+
+Run:
+
+```bash
+.venv/bin/python -m pytest tests/test_encode_forward_equivalence.py tests/test_exp24_dreamworld.py tests/test_exp23_fast_path.py::test_train_fast_for_budget_runs_dreamworld_replay -q
+```
+
+Expected: targeted tests pass.
+
+- [ ] **Step 10: Commit**
+
+```bash
+git add src/chaoscontrol/model.py experiments/23_fast_path/dreamworld.py experiments/23_fast_path/runner_fast_path.py tests/test_encode_forward_equivalence.py tests/test_exp24_dreamworld.py tests/test_exp23_fast_path.py
+git commit -m "exp24: add dreamworld hidden-state replay hook"
+```
+
+## Task 8: Exp24 Mechanism Matrices And Launcher
 
 **Files:**
 - Modify: `experiments/24_training_time_bundle/exp24.py`
@@ -1566,6 +2238,7 @@ def test_first_wave_mechanism_matrix_names_and_tags():
     assert "exp24_fastslow_i16_a050_s1337" in names
     assert "exp24_spectral_d001_s001_s1337" in names
     assert "exp24_sgns_freeze100_s1337" in names
+    assert "exp24_dreamworld_c4_i4_w025_s1337" in names
 
     fastslow = next(entry for entry in entries if entry["name"] == "exp24_fastslow_i16_a050_s1337")
     assert fastslow["fast_slow_enabled"] is True
@@ -1579,6 +2252,13 @@ def test_first_wave_mechanism_matrix_names_and_tags():
     freeze = next(entry for entry in entries if entry["name"] == "exp24_sgns_freeze100_s1337")
     assert freeze["embed_freeze_steps"] == 100
     assert freeze["artifact_impact"] == "artifact_changes_weights_only"
+
+    dream = next(entry for entry in entries if entry["name"] == "exp24_dreamworld_c4_i4_w025_s1337")
+    assert dream["dreamworld_enabled"] is True
+    assert dream["dreamworld_cache_interval"] == 4
+    assert dream["dreamworld_interval"] == 4
+    assert dream["dreamworld_weight"] == 0.25
+    assert dream["artifact_impact"] == "artifact_training_only"
 ```
 
 - [ ] **Step 2: Run the test and verify it fails**
@@ -1626,6 +2306,20 @@ def build_first_wave_matrix(
             "exp24_mechanism": "sgns_freeze",
             "artifact_impact": ARTIFACT_CHANGES_WEIGHTS_ONLY,
             "embed_freeze_steps": 100,
+        },
+        {
+            "name_arm": "dreamworld_c4_i4_w025",
+            "exp24_mechanism": "dreamworld",
+            "artifact_impact": ARTIFACT_TRAINING_ONLY,
+            "dreamworld_enabled": True,
+            "dreamworld_cache_interval": 4,
+            "dreamworld_interval": 4,
+            "dreamworld_weight": 0.25,
+            "dreamworld_prefix_tokens": 128,
+            "dreamworld_replay_tokens": 64,
+            "dreamworld_buffer_size": 16,
+            "dreamworld_min_size": 2,
+            "dreamworld_max_age_steps": 256,
         },
     ]
     for arm in arms:
@@ -1782,7 +2476,7 @@ git add experiments/24_training_time_bundle/exp24.py experiments/24_training_tim
 git commit -m "exp24: add first-wave launcher"
 ```
 
-## Task 8: Result Metadata And Artifact Bookkeeping
+## Task 9: Result Metadata And Artifact Bookkeeping
 
 **Files:**
 - Modify: `experiments/23_fast_path/runner_fast_path.py`
@@ -1913,7 +2607,7 @@ git add experiments/23_fast_path/runner_fast_path.py experiments/23_fast_path/la
 git commit -m "exp23: record exp24 artifact metadata"
 ```
 
-## Task 9: Documentation And Final Verification
+## Task 10: Documentation And Final Verification
 
 **Files:**
 - Create: `experiments/24_training_time_bundle/README.md`
@@ -1936,8 +2630,8 @@ temporal heads, or scoring-time state changes belong in this bundle.
 2. Phase A sampling policy gate: no extra mechanism, same budget, compare to
    Ring 0 noise floor.
 3. SemanticOptimizer overhead gate on 1xH100 before any 8xH100 semantic run.
-4. First-wave mechanisms: fast/slow, spectral, SGNS freeze, predictive aux if
-   the smoke proves overhead is acceptable.
+4. First-wave mechanisms: fast/slow, spectral, SGNS freeze, Dreamworld ring
+   buffer, predictive aux if the smoke proves overhead is acceptable.
 
 ## Dry Run
 
@@ -2006,4 +2700,5 @@ git commit -m "docs: document exp24 execution path"
 - Ring 0 is not optional if we want paper-quality interpretation; use at least two seeds if credits force triage.
 - SemanticOptimizer is gated by measured wall-clock overhead, not by taste.
 - Predictive auxiliary is `artifact_training_only`; if any checkpoint path saves its aux projection, mark that arm `artifact_invalid_until_stripped` until fixed.
+- Dreamworld v0 is teacher-forced hidden-state replay from cached SSM states. Token-by-token autoregressive dreaming is a later diagnostic unless the ring-buffer CE arm earns more work.
 - Shuffled epoch is a sampling-policy arm, not a record claim by itself. The record claim still depends on fixed full-validation scoring after training.
