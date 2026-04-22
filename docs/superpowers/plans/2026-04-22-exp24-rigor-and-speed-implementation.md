@@ -120,17 +120,12 @@ Every Phase 2 task is TDD-shaped: write test, run expecting either pass (coverag
 Add this test to `tests/test_exp24_event_sleep.py`:
 
 ```python
-import os
-import tempfile
-
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
 
 def _gate_worker(rank, world_size, init_file, per_rank_loss, result_path):
     """Spawned-process worker: init gloo, run one gate update, write result."""
-    os.environ["MASTER_ADDR"] = "127.0.0.1"
-    os.environ["MASTER_PORT"] = "0"  # gloo ignores; init_file carries rendezvous
     dist.init_process_group(
         backend="gloo",
         init_method=f"file://{init_file}",
@@ -180,7 +175,9 @@ def test_gloo_four_rank_lockstep_and_boundary(tmp_path):
 
     result_path = tmp_path / "decisions"
     init_file = tmp_path / "rendezvous"
-    init_file.touch()
+    # Do NOT create the file: torch's file:// rendezvous requires the path
+    # not exist at start so rank 0 can create it with exclusive-lock semantics.
+    # A pre-existing file is treated as stale rendezvous and errors/hangs.
 
     mp.spawn(
         _gate_worker,
@@ -263,6 +260,11 @@ git commit -m "tests: add real gloo 4-rank event_sleep lockstep test"
 **Step 1: Add the test**
 
 The test forces a trigger at step K and asserts the very next `dream_buffer.sample` call happens at step K+1. We instrument `DreamReplayBuffer` with a real buffer seeded with one entry so `len(buffer) >= min_size`, let the gate fire on a specific step, and record sample-call step indices.
+
+**Load-bearing details (do not soften):**
+
+- `dreamworld_cache_interval=1, dreamworld_min_size=1` is a real dependency, not boilerplate. `cache_interval=1` makes the first step's cache call fill the buffer; `min_size=1` means `sample` is eligible starting step 1. Together they guarantee the buffer is ready by the trigger step (5). Changing either value breaks the test.
+- The synthetic entry returned by the `capture_dream_entry` monkeypatch must match `dream_buffer.add(step=, states=, replay_tokens=)` at runner_fast_path.py:1654. The anonymous `type("E", (), {...})` builds an object with `.step`, `.states`, `.replay_tokens` — that is the production contract, not decoration. If the real entry type gains a field, the monkeypatch must add it too.
 
 ```python
 def test_event_sleep_replay_lands_one_step_after_trigger(monkeypatch):
@@ -437,23 +439,33 @@ def test_gate_produces_exact_trigger_trajectory():
         if decision is not None and decision.triggered:
             fired_steps.append(step)
 
-    # Recomputed manually from the sequence above; this anchor must match
-    # exactly. If it drifts, inspect the change to decay/warmup/threshold or
-    # to the ratio computation order inside update().
-    assert fired_steps == [12, 24, 35], (
-        f"trigger trajectory drifted: got {fired_steps}, expected [12, 24, 35]"
+    # Anchor is OBSERVED from the first passing run, not pre-computed. See
+    # Step 2 below. Silent anchor updates defeat the point of this test;
+    # every change to this list requires a written justification in the
+    # commit message (modified EMA order, different decay, etc.).
+    assert fired_steps == [ANCHOR], (
+        f"trigger trajectory drifted: got {fired_steps}, expected [ANCHOR]"
     )
 ```
 
-- [ ] Add the test.
+- [ ] Add the test with a placeholder anchor (e.g. `[0]`) so it runs but fails loudly.
 
-**Step 2: Run**
+**Step 2: Run to observe the real anchor**
 
 ```bash
 pytest tests/test_exp24_event_sleep.py::test_gate_produces_exact_trigger_trajectory -v
 ```
 
-Expected: PASS. If it fails: write the actual `fired_steps` into the test as the new anchor ONLY if you understand why the trajectory changed (e.g. you intentionally modified the EMA order). Silent anchor updates defeat the point of this test.
+Expected: FAIL on the first run — the failure message reveals the real `fired_steps`. Inspect the trajectory for plausibility (spikes drive triggers; non-spike steps should not). If it looks right, replace `[ANCHOR]` in the source with the observed list.
+
+**Step 2b: Commit the observed anchor**
+
+- [ ] Paste the observed `fired_steps` into the test as the anchor.
+- [ ] Re-run: expect PASS.
+
+The commit message for this task MUST state the observed anchor and note that it was observed from this exact loss sequence on this exact `LossTriggeredReplayEMA` implementation. Future changes to either invalidate the anchor and require an explicit update (not a silent overwrite).
+
+**Warning.** Task 9 (on-device EMA refactor) will likely change this anchor: tensor-level float32 reductions on-device are not bit-equivalent to Python float arithmetic. Sequence Task 9 BEFORE locking Task 4's anchor, or expect to re-anchor after Task 9.
 
 **Step 3: Commit**
 
@@ -467,45 +479,61 @@ git commit -m "tests: seed-anchor event_sleep trigger trajectory"
 **Files:**
 - Modify: `tests/test_exp24_event_sleep.py`
 
+**Layer note.** The `restore_after_warmup` contract is NOT owned by `_warmup` itself. `_warmup` (runner_fast_path.py:1900-1948) only runs warmup steps — it does not snapshot or restore. The real contract lives in `run_condition` at lines 2015-2038: clone state via `_state_dict_clone`, call `_warmup`, then restore via `_restore_state_dict` and rebuild the optimizer. This test exercises that wrapper directly (without the full data-loading plumbing `run_condition` needs) so it tests the contract at the right layer.
+
 **Step 1: Add the test**
 
-The Parameter Golf warmup contract is bit-exact. Run `_warmup` with `restore_after_warmup=True`, snapshot state before, assert `torch.equal` against every restored tensor after.
+Mimic the production flow from runner_fast_path.py:2015-2038 minus the DDP barrier: snapshot → `_warmup` → restore → assert bit-equality on every state_dict entry. `_warmup` is keyword-only and requires `optimizer`, `rank`, `world_size`, `seed`, and `vocab_size`; the call must supply them.
 
 ```python
 def test_warmup_restore_is_bit_equal():
     mod = _load_runner_module()
 
     model = _TinyTokenTrainModel()
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
 
-    # Snapshot pre-warmup state (deep clone so the model can mutate freely).
-    pre_state = {
-        name: param.detach().clone() for name, param in model.state_dict().items()
-    }
-
-    # Drive _warmup with a restore_after_warmup semantics call. The actual
-    # production call path is inside run_condition(); here we exercise the
-    # primitive directly.
     config = {
         "warmup_steps": 4,
-        "restore_after_warmup": True,
-        "seed": 1337,
+        "chunk_size": 2,
+        "grad_clip_norm": 0.0,
+        "fused_grad_clip": False,
+        "precision": "bf16",
+        "prefetch_batches": False,
     }
+
+    # Production pattern (runner_fast_path.py:2015-2038): snapshot, warmup,
+    # restore. _warmup itself does NOT own the restore, so the test has to
+    # perform the snapshot/restore around it.
+    saved_state = mod._state_dict_clone(model)
     mod._warmup(
-        model,
+        model=model,
         train_tokens=torch.arange(128, dtype=torch.int16) % 6,
         train_num_tokens=128,
         stride=4,
         seq_len=6,
         batch_size=2,
         device=torch.device("cpu"),
+        optimizer=optimizer,
         config=config,
+        rank=0,
+        world_size=1,
+        seed=1337,
         vocab_size=6,
     )
-    # _warmup should have restored state internally when restore_after_warmup is True.
 
+    # Sanity check: _warmup must have actually mutated the model. If not,
+    # the test does not exercise what it claims to.
+    mid_state = model.state_dict()
+    drifted = any(
+        not torch.equal(saved_state[name], mid_state[name])
+        for name in saved_state
+    )
+    assert drifted, "_warmup did not mutate any params — test is vacuous"
+
+    mod._restore_state_dict(model, saved_state)
     post_state = model.state_dict()
 
-    for name, pre_tensor in pre_state.items():
+    for name, pre_tensor in saved_state.items():
         post_tensor = post_state[name]
         assert torch.equal(pre_tensor, post_tensor), (
             f"param {name} drifted after warmup-restore: "
@@ -513,10 +541,7 @@ def test_warmup_restore_is_bit_equal():
         )
 ```
 
-Before writing the test: read `_warmup` at `experiments/23_fast_path/runner_fast_path.py:1900` and the `restore_after_warmup` handling at line 2016, then adjust the call signature above to match. The test body above is the assertion contract; the exact call shape depends on the private function's kwargs.
-
-- [ ] Read `_warmup` and `_restore_state_dict` source.
-- [ ] Add the test, adjusting the call signature to match.
+- [ ] Add the test exactly as above.
 
 **Step 2: Run**
 
@@ -524,7 +549,7 @@ Before writing the test: read `_warmup` at `experiments/23_fast_path/runner_fast
 pytest tests/test_exp24_event_sleep.py::test_warmup_restore_is_bit_equal -v
 ```
 
-Expected: PASS. If it fails: the warmup path is mutating state that `_restore_state_dict` does not roll back - optimizer state, RNG, or buffers. Fix by snapshotting and restoring whatever is mutating.
+Expected: PASS. If the vacuity assertion fires: `_warmup` with these tiny inputs short-circuited (check `warmup_steps`, `train_num_tokens`, batch/seq sizing). If bit-equality fails: `_restore_state_dict` uses `model.load_state_dict(state, strict=True)` — if that ever switches to `strict=False` or omits any state (e.g., persistent buffers that load_state_dict does not cover), the contract is broken and the real fix is in `_state_dict_clone`/`_restore_state_dict`.
 
 **Step 3: Commit**
 
@@ -689,11 +714,13 @@ Before changing the implementation, add a test that two `FastSlowConsolidator` i
 
 Actually simpler: the test asserts the *current* behavior against a hand-computed reference, so the replaced implementation has a target to match.
 
+Load the module via `importlib.util.spec_from_file_location`. Directory `experiments/23_fast_path/` has no `__init__.py`, and `23_fast_path` starts with a digit — it cannot be imported as a package. The canonical pattern lives at `tests/test_exp24_training_hooks.py:11-20` (`_load_module` helper around `MODULE_PATH = REPO / "experiments" / "23_fast_path" / "training_hooks.py"`). Reuse that helper if it is already in the target test file; otherwise copy it in.
+
 ```python
 def test_fastslow_after_optimizer_step_matches_reference_lerp():
     import torch
-    from experiments._23_fast_path.training_hooks import FastSlowConsolidator
-    # import path may differ; adjust after reading training_hooks.py
+    mod = _load_module()  # importlib helper — see tests/test_exp24_training_hooks.py:15
+    FastSlowConsolidator = mod.FastSlowConsolidator
 
     torch.manual_seed(0)
     model = torch.nn.Sequential(torch.nn.Linear(4, 4), torch.nn.Linear(4, 4))
@@ -815,7 +842,13 @@ The net win: one fewer GPU→CPU sync per step at the top of `update()`, and the
 pytest tests/test_exp24_event_sleep.py -v
 ```
 
-Expected: all 5 tests PASS, including bf16 and the seed-anchored trajectory. If the trajectory test fails, the on-device EMA may accumulate differently than the float path. Either make the computations bit-match (e.g. keep all operations in `float32` on-device) or update the anchor with a clear note.
+Expected: all 5 tests PASS, including bf16. The seed-anchored trajectory test (Task 4) will likely FAIL with a new `fired_steps` list because tensor-level float32 reductions on-device diverge from Python float arithmetic — this is expected, not a bug. Handling:
+
+1. Confirm the new trajectory still fires on plausible steps (the planted spikes).
+2. Update the Task 4 anchor to the new list.
+3. **Bundle the anchor update into THIS task's commit** so the reason for the change is explicit in one place. Commit message must state both the old and new anchors and identify Task 9 as the cause.
+
+If the trajectory changes beyond "small shift on one or two steps" (e.g. no fires at all, or fires on non-spike steps), the refactor broke the gate — fix the implementation, do not update the anchor.
 
 **Step 3: Measure**
 
@@ -851,7 +884,8 @@ Note the current behavior computes `penalty.mean()` per layer and then means acr
 ```python
 def test_spectral_reg_vectorized_matches_reference():
     import torch
-    from experiments._23_fast_path.training_hooks import spectral_regularization_loss
+    mod = _load_module()  # importlib helper as in Task 8
+    spectral_regularization_loss = mod.spectral_regularization_loss
     # ... build a model with multiple SSM layers of varying size, compute old
     # and new spectral loss, assert torch.equal on both.
 ```
@@ -979,3 +1013,14 @@ git commit -m "exp24: close out rigor-and-speed session with results"
 - **If a test anchor changes** (seed-anchored trajectory, warmup-restore bit-equality), update the anchor only with a written justification in the commit message. Silent anchor updates defeat the point.
 - **Profile-before-fix discipline**: Tasks 10 and 11 are conditional. Do not refactor speculatively.
 - **Off-clock boundaries**: ScOpt internals and Muon orthogonalization are out of scope even if they show up in the profile.
+
+## Revision log
+
+**2026-04-22 — dry-run review fixes.** Before the first code task, the plan was reviewed against live source by a code-review subagent. The fixes below landed in response; they resolve three blockers and three should-fix items.
+
+- **Task 2 (gloo rendezvous).** Dropped `init_file.touch()`; torch's `file://` init_method requires the file not exist at start (rank 0 creates it under exclusive-lock semantics). Removed the stray `MASTER_ADDR`/`MASTER_PORT` env vars and the now-unused `import os`; gloo with `file://` ignores them.
+- **Task 5 (warmup-restore layer).** The restore contract is owned by `run_condition` (runner_fast_path.py:2015-2038), NOT by `_warmup`. Rewrote the test to mimic the production snapshot/restore pattern directly: `_state_dict_clone` → `_warmup` → `_restore_state_dict` → assert bit-equality. Also fixed the `_warmup` call site to supply all required keyword-only kwargs (`optimizer`, `rank`, `world_size`, `seed`, `vocab_size`) and added a vacuity check that `_warmup` mutated the model at all.
+- **Task 8 (module import).** `experiments/23_fast_path/` has no `__init__.py` and the leading digit makes `23_fast_path` a non-identifier. Replaced the `from experiments._23_fast_path...` import with the `importlib.util.spec_from_file_location` pattern used at `tests/test_exp24_training_hooks.py:11-20`. Same fix applied to Task 10's equivalence test.
+- **Task 3 (priming dependency).** Promoted `dreamworld_cache_interval=1, dreamworld_min_size=1` from "boilerplate" to "load-bearing" in the plan prose and documented that the synthetic entry's `.step`/`.states`/`.replay_tokens` attributes match `dream_buffer.add`'s production contract.
+- **Task 4 (observed anchor).** The hand-computed anchor `[12, 24, 35]` was unverified. Replaced with an explicit two-step procedure: first run emits the real trajectory as a test failure, second run locks it. Commit message must state the observed list.
+- **Task 9 → Task 4 dependency.** On-device tensor float32 reductions are not bit-equivalent to Python float arithmetic, so Task 9 will shift the Task 4 anchor. Added explicit guidance: bundle the re-anchor into Task 9's own commit with both old and new anchors named. If the trajectory changes beyond a small shift, the refactor is broken — fix the implementation, do not bless the new anchor.
