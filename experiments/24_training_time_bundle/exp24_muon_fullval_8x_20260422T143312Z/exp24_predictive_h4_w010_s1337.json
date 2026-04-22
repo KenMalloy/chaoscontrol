@@ -1,0 +1,147 @@
+{
+  "config": {
+    "a_mode": "diag",
+    "activation_checkpoint": false,
+    "artifact_impact": "artifact_training_only",
+    "base_lr": 0.064,
+    "batch_size": 1024,
+    "budget_seconds": 600.0,
+    "chunk_size": 64,
+    "compile_full_path": false,
+    "cuda_graph_mode": "none",
+    "device": "auto",
+    "dtype": "bf16",
+    "embed_freeze_steps": 0,
+    "eval_batches": 0,
+    "exp24_mechanism": "predictive_aux",
+    "exp24_phase": "first_wave",
+    "fast_slow_alpha": 0.0,
+    "fast_slow_enabled": false,
+    "fast_slow_eval_copy": "fast",
+    "fast_slow_interval": 0,
+    "ff_mult": 2,
+    "fused_grad_clip": true,
+    "fused_muon": true,
+    "grad_allreduce_mode": "bulk",
+    "grad_clip_norm": 1.0,
+    "lm_head_backward_mode": "fused_streaming_cached",
+    "lm_head_tile_size": 8192,
+    "local_attn_dim": 64,
+    "local_attn_heads": 1,
+    "local_attn_window": 0,
+    "mode": "exp24_muon_training_time_bundle_fullval",
+    "model_dim": 256,
+    "model_type": "ssm",
+    "name": "exp24_predictive_h4_w010_s1337",
+    "num_layers": 4,
+    "optimizer": "muon",
+    "precision": "bf16",
+    "predictive_aux_dim": 0,
+    "predictive_aux_horizon": 4,
+    "predictive_aux_weight": 0.1,
+    "prefetch_batches": true,
+    "restore_after_warmup": false,
+    "seed": 1337,
+    "semantic_layer_index": 0,
+    "semantic_momentum_min": 0.5,
+    "semantic_overhead_gate": 0.08,
+    "seq_len": 512,
+    "spectral_reg_lambda_dead": 0.0,
+    "spectral_reg_lambda_sticky": 0.0,
+    "spectral_reg_max_a": 0.98,
+    "spectral_reg_min_a": 0.05,
+    "stop_check_interval": 4,
+    "stop_margin_seconds": 2.0,
+    "stride": 512,
+    "submit_valid": true,
+    "train_sampling_mode": "sequential_epoch",
+    "vocab_size": 16384,
+    "warmup_steps": 0,
+    "weight_decay": 0.01,
+    "world_size": 8
+  },
+  "params": 10751232,
+  "train": {
+    "steps": 2536,
+    "elapsed_s": 598.4358203308657,
+    "rank": 0,
+    "world_size": 8,
+    "initial_loss": 9.865870475769043,
+    "final_loss": 4.918405532836914,
+    "loss_delta": -4.947464942932129,
+    "peak_vram_mb": 54950.0966796875,
+    "optimizer": {
+      "type": "Muon"
+    },
+    "sampling_mode": "sequential_epoch",
+    "total_start_count": 25903968,
+    "rank_start_count": 3237996,
+    "epoch_steps": 3163,
+    "unique_start_count": 20774912,
+    "epoch_complete": false,
+    "mechanisms": {
+      "fast_slow": {
+        "enabled": false,
+        "interval": 0,
+        "alpha": 0.0,
+        "sync_count": 0,
+        "fast_slow_l2": 3042.804353091407
+      },
+      "spectral": {
+        "enabled": false,
+        "before": {
+          "log_a_param_count": 4,
+          "a_min": 0.5,
+          "a_max": 0.5,
+          "a_mean": 0.5,
+          "a_p05": 0.5,
+          "a_p50": 0.5,
+          "a_p95": 0.5
+        },
+        "after": {
+          "log_a_param_count": 4,
+          "a_min": 0.028007520362734795,
+          "a_max": 0.9986329674720764,
+          "a_mean": 0.8770016431808472,
+          "a_p05": 0.2537260949611664,
+          "a_p50": 0.9946974515914917,
+          "a_p95": 0.9984021782875061
+        }
+      },
+      "embed_freeze": {
+        "freeze_steps": 0,
+        "enabled": false
+      },
+      "predictive_aux": {
+        "enabled": true,
+        "weight": 0.1,
+        "horizon": 4,
+        "artifact_impact": "artifact_training_only"
+      },
+      "dreamworld": {
+        "enabled": false,
+        "weight": 0.0,
+        "cache_interval": 0,
+        "dream_interval": 0,
+        "prefix_tokens": 128,
+        "replay_tokens": 64,
+        "artifact_impact": "artifact_training_only",
+        "buffer": null
+      }
+    },
+    "tokens_per_step": 4194304,
+    "aggregate_tokens_per_sec": 17774261.804915197,
+    "per_gpu_tokens_per_sec": 2221782.7256143996
+  },
+  "eval": {},
+  "artifact": {
+    "artifact_impact": "artifact_training_only",
+    "submit_valid": true,
+    "artifact_bytes_estimate": 21502464,
+    "compressed_artifact_bytes": null
+  },
+  "exp24": {
+    "phase": "first_wave",
+    "mechanism": "predictive_aux"
+  }
+}
