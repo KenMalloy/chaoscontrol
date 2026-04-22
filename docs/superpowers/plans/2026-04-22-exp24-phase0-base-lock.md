@@ -38,22 +38,27 @@ The first Phase 0b version is intentionally small, but these four pieces are not
 - **Direction is target-free at the primary path.** Because the primary path blends before scoring, the direction signal cannot use target-`t` loss — the target is still unrevealed. Pick direction from a target-free candidate signal: reread-vs-base state divergence, predictive-entropy delta across candidate rereads, or agreement across `log_a_shift` sign candidates. A deferred-blend variant (score with base, use target-`t` loss to pick direction for `t+1` state) is allowed as a secondary arm, not the promoted mechanism — its mechanism and control set are called out below.
 - **The rewind is short.** The reread is "I am confused now; reread what I just saw differently." Start with a tight suffix (`K` in `{32, 64}`, with `128` as an explicit boundary diagnostic), not long windows that drag in unrelated context.
 
-**Matched-budget controls (procedural pin).** Run entropy-gated first, record its realized fire count `N_fire` and total reread token count over the full eval stream. Then configure each matched control so it sees the same per-stream reread-token budget:
+**Matched-budget controls (procedural pin).** The primary is bidirectional, so each trigger runs **two** reread passes (`+log_a_shift` and `-log_a_shift`). Define the per-stream reread-token budget as
 
-- **Score-only floor** — no reread, `600s` eval budget. This is the apples-to-apples base.
-- **Scheduled-reread control** — fire every `stream_length / N_fire` steps with the same `K`, same blend. Matched fire count.
-- **Entropy-gated same-horizon control** — same gate, `log_a_shift=0.0`. Isolates the effect of the decay-rate change from the effect of the reread pass itself.
-- **Entropy-gated bidirectional control** — candidates are `+log_a_shift` and `-log_a_shift`, direction chosen per-fire from the target-free signal.
-- **Fixed-direction shifted reread** — ablation only, not promoted.
+```
+B_reread = N_fire × K × num_candidate_passes
+```
 
-All controls use the same `600s` eval budget (per `feedback_train_eval_budget_separation`); reread compute is accounted against eval, never training.
+Run entropy-gated bidirectional primary first, record `N_fire` and `B_reread` over the full eval stream. Each compute-matched control must reproduce `B_reread` — *not* `N_fire` alone, which is only fire-count-matched and confounds gate-mechanism with compute:
+
+- **Score-only floor** — `B_reread = 0`. Baseline; measures pure reread-compute value vs no reread.
+- **Scheduled-reread compute-matched** — scheduled single-pass rereads at `2 × N_fire` total fires × `K` tokens = `B_reread`. Isolates *entropy-gated vs scheduled* at identical total reread compute.
+- **Entropy-gated shift=0 compute-matched** — same entropy gate, same `N_fire`, but 2 redundant passes at `log_a_shift = 0.0` per fire = `B_reread`. Isolates *decay-shift effect vs mere refresh compute* while holding gate identity and budget fixed.
+- **Fixed-direction shifted reread** — ablation only (single pass per fire, *not* budget-matched); not promoted. Run only if the bidirectional direction-picker underperforms, to diagnose whether the picker is broken or the mechanism itself is flat.
+
+All controls use the same `600s` eval budget (per `feedback_train_eval_budget_separation`); reread compute is accounted against eval, never training. If any compute-matched control exhausts the `600s` eval budget before finishing the stream, record that as a failed feasibility check, not a win for the unmatched arm.
 
 **Preregistered success criteria.** Written before the run, not after:
 
-- **Promote to eval-time arm if:** entropy-gated primary beats score-only floor by `>= 0.015 BPB` mean over 3 seeds AND beats scheduled-reread control by `>= 0.005 BPB` mean over 3 seeds AND seed-to-seed stddev `< 0.01 BPB`. Both thresholds must hold.
-- **Shelve and record consistent-with-Exp-20 if:** entropy-gated primary is within `0.005 BPB` of score-only floor (either direction), OR entropy-gated primary beats scheduled-reread by `< 0.002 BPB`. In either case, the mechanism is not doing native-SSM work beyond generic reread compute.
-- **Ambiguous / warrants follow-up if:** primary beats score-only floor by `0.005 to 0.015 BPB` but doesn't clear the scheduled-reread gap. Record, do not promote, design a sharper follow-up.
-- **Deferred-blend secondary** is evaluated on the same thresholds but against its own score-only floor at matched reread-token budget; it promotes only if primary also promotes (otherwise deferred-blend alone is not enough to claim an eval-time arm).
+- **Promote to eval-time arm if all four hold:** (1) primary beats score-only floor by `≥ 0.015 BPB` mean over 3 seeds (clears ws=4 seed noise band ~0.015); (2) beats `scheduled_reread_compute_matched` by `≥ 0.005 BPB` mean (gate-type value at matched compute); (3) beats `entropy_reread_shift0_compute_matched` by `≥ 0.005 BPB` mean (decay-shift value beyond refresh compute); (4) seed-to-seed stddev `< 0.01 BPB`.
+- **Shelve and record consistent-with-Exp-20 if:** primary is within `0.005 BPB` of score-only floor (either direction), OR beats `scheduled_reread_compute_matched` by `< 0.002 BPB`. The mechanism is not doing native-SSM work beyond generic reread compute.
+- **Ambiguous / warrants follow-up if:** primary beats score-only floor by `0.005 to 0.015 BPB` but fails any of the other three promotion gates. Record, do not promote, design a sharper follow-up.
+- **Deferred-blend secondary** is evaluated on the same four thresholds against its own matched-budget control set; it promotes only if primary also promotes (deferred-blend alone is not enough to claim an eval-time arm).
 
 This addendum is not a fourth base-lock rung — it cannot influence which config lands in `exp24_base.yaml`. But it does run same-pod, immediately after base lock, against the locked checkpoint. Task 9 implements the preregistration doc and the eval runs. Task 10 handles the event_sleep plan rebase.
 
@@ -529,16 +534,16 @@ Use a calibration stream that is not the primary full-val scoring stream. Record
 
 Do not tune thresholds or shifts on the primary full-val stream. If that happens, mark the run exploratory and rerun with frozen settings.
 
-**Step 3: Pre-register controls**
+**Step 3: Pre-register controls (compute-matched per addendum)**
 
-Run the locked checkpoint under:
+Run the locked checkpoint under the addendum's compute-matched control set. Budget `B_reread = N_fire × K × 2` is measured from the primary (`entropy_reread_bidirectional_blend`) run first; each control then reproduces that same total reread-token count.
 
-1. `score_only`: no reread.
-2. `scheduled_reread_same_budget`: deterministic/scheduled rereads at the same observed fire rate.
-3. `entropy_reread_shift0`: entropy gate with `log_a_shift=0.0`, isolating extra scan/state-refresh compute from memory-horizon traversal.
-4. `entropy_reread_bidirectional_blend`: entropy gate, short rewind, both shift directions available, soft state blend.
-5. Diagnostic only: fixed longer-memory shift and fixed shorter-memory shift. These are not the promoted mechanism unless they expose that the direction picker is broken.
-6. Optional diagnostic only: always-on best single shift. This is not the promoted mechanism unless it beats gating at lower or equal wall time.
+1. `score_only`: no reread. `B_reread = 0`.
+2. `scheduled_reread_compute_matched`: scheduled single-pass rereads at `2 × N_fire` fires × `K` tokens. Matches `B_reread`. Isolates gate-type (entropy vs schedule) at matched compute.
+3. `entropy_reread_shift0_compute_matched`: entropy gate at `N_fire` fires × 2 redundant passes at `log_a_shift = 0.0`. Matches `B_reread`. Isolates decay-shift effect from refresh compute.
+4. `entropy_reread_bidirectional_blend`: the primary. `N_fire` fires × 2 passes (`+log_a_shift`, `-log_a_shift`) × `K` tokens = `B_reread`.
+5. Ablation only (not budget-matched): fixed longer-memory shift, fixed shorter-memory shift. Single pass per fire. Run these only if the direction-picker in control 4 underperforms, to diagnose whether the picker is broken or the mechanism itself is flat.
+6. Ablation only (not budget-matched): always-on best single shift. Run only if controls 2–4 all fail to promote, to check whether gating itself is the dead mechanism.
 
 **Step 4: Legality contract**
 
@@ -566,14 +571,22 @@ Surprise/loss may be logged for analysis and may feed a lagged direction update,
 
 **Step 5: Success and kill criteria**
 
-Promote the mechanism only if `entropy_reread_bidirectional_blend`:
+Thresholds are inherited from the addendum (lines 53–56) and are load-bearing — do not weaken them without a revision-log entry:
 
-- improves full-val BPB over `score_only` by at least `0.003` and preferably `0.005`,
-- beats `scheduled_reread_same_budget` on BPB per extra eval second,
-- beats `entropy_reread_shift0`, showing that the gain is horizon traversal rather than mere repeated compute,
-- beats both fixed-direction diagnostics or explains the fixed-direction winner as a stable regime worth splitting into a follow-up,
-- fires on no more than 20% of chunks unless the eval budget still has obvious slack,
-- stays within the 600s eval-time accounting rules used for the Param Golf path.
+- **Promote** `entropy_reread_bidirectional_blend` **only if all four hold**:
+  1. Beats `score_only` floor by `≥ 0.015 BPB` mean over 3 seeds (clears ws=4 seed noise band ~0.015).
+  2. Beats `scheduled_reread_compute_matched` by `≥ 0.005 BPB` mean over 3 seeds (gate adds value at identical compute).
+  3. Beats `entropy_reread_shift0_compute_matched` by `≥ 0.005 BPB` mean over 3 seeds (decay-shift adds value beyond refresh compute).
+  4. Seed-to-seed stddev `< 0.01 BPB` across the 3 seeds (result is stable, not seed-picked).
+- **Shelve and record consistent-with-Exp-20 if:** primary is within `0.005 BPB` of `score_only` (either direction), OR beats `scheduled_reread_compute_matched` by `< 0.002 BPB`. The mechanism is not doing native-SSM work beyond generic reread compute.
+- **Ambiguous / follow-up if:** primary beats `score_only` by `0.005 to 0.015 BPB` but fails any of the other three promotion gates. Record, do not promote, design a sharper follow-up.
+
+Additional operational constraints (always applied, orthogonal to promotion):
+
+- Primary must fire on `≤ 20%` of chunks unless the eval budget still has obvious slack after a full pass.
+- All controls and the primary must stay within the `600s` eval-time accounting rule; any arm that exhausts the eval budget before finishing the stream is recorded as a failed feasibility check, not a result.
+- Fixed-direction diagnostic arms (5, 6) do *not* gate promotion — they only inform post-hoc diagnosis of which component (gate / picker / shift) is the bottleneck if the primary fails.
+- Deferred-blend secondary is evaluated on the same four thresholds against its own matched-budget control set; it promotes only if the primary also promotes.
 
 Kill or park the mechanism if same-horizon reread matches it, if the best always-on single shift is faster and better, if soft blending collapses to replacement/zero-blend across most triggers, or if any leakage review finds target-dependent current-chunk gating.
 
@@ -628,7 +641,7 @@ git commit -m "plan: rebase exp24 event_sleep plan on phase0 base lock"
 
 **Cost estimate.** 4×H100 at ~$12/hr × ~4.6h ≈ **~$55** for base lock. Phase 0b ≤ ~1h × $12/hr ≈ ~$12. **Total ≤ ~$70** for Phase 0 + 0b combined. (Reference: the original 8×H100 draft was ~$100 for base lock alone.)
 
-**Phase 0b compute (same pod, after base lock).** Eval-only on the locked checkpoint — no training. Ballpark: 4 primary arms (`score_only`, `scheduled_reread_same_budget`, `entropy_reread_shift0`, `entropy_reread_bidirectional_blend`) × 3 seeds for confirm + ~4 diagnostic calibration runs on a held-out stream = ~16 runs × ~185s (full-val ~164s + startup ~20s) ≈ 50 min. If Task 9 pre-registration sweeps multiple thresholds or `K` values before picking one, add 20–40 min. Total Phase 0b wall time ≤ ~1.5 h on 4x.
+**Phase 0b compute (same pod, after base lock).** Eval-only on the locked checkpoint — no training. Ballpark: 4 primary arms (`score_only`, `scheduled_reread_compute_matched`, `entropy_reread_shift0_compute_matched`, `entropy_reread_bidirectional_blend`) × 3 seeds for confirm + ~4 diagnostic calibration runs on a held-out stream = ~16 runs × ~185s (full-val ~164s + startup ~20s) ≈ 50 min. Compute-matched controls 2 and 3 each do the same total reread-token work as the bidirectional primary (`B_reread = N_fire × K × 2`), so their per-run wall time is comparable. If Task 9 pre-registration sweeps multiple thresholds or `K` values before picking one, add 20–40 min. Total Phase 0b wall time ≤ ~1.5 h on 4x.
 
 **Ranking-transfer risk (ws=4 → ws=8 submission).** All Phase 0 rungs run at ws=4 (effective batch 4096) to cut cost. Submission regime is ws=8 (effective batch 8192). FS+DW knob rankings are expected to be roughly invariant to effective batch at this scale — interval/weight tune replay frequency, not batch dynamics — but "expected" is not "certain." The locked `exp24_base.yaml` may be suboptimal at ws=8. Catch happens at submit-time: when we first run the locked config on 8x, if BPB is off from the 4x-tuned expectation, re-run the FS sweep at ws=8 around the winner (6 arms × 1 seed × 8x ≈ 60 min, one-shot correction). LR stays at 0.064 per Exp 18 Test 5b validation at bs=1024/rank across ws∈{2,4,8}, so no LR re-tune needed for the ws swap.
 
