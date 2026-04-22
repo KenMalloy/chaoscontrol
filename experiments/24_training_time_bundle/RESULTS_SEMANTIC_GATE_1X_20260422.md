@@ -43,14 +43,22 @@ tests/test_exp24_training_bundle.py::test_run_exp24_cli_semantic_gate_defaults_t
 | `exp24_smoke_semantic_gate_muon_s1337` | Muon | 532 | 3,154,715 | 4.149150 | 53,158.7 MB |
 | `exp24_smoke_semantic_gate_semantic_s1337` | SemanticOptimizer | 516 | 3,055,098 | 4.178514 | 53,179.3 MB |
 
-SemanticOptimizer was 3.16% slower than Muon on this 1xH100 smoke, which is
-inside the pre-run 8% overhead gate. It did not show a quality hint in this
-short training window: final train loss was worse by 0.0294.
+SemanticOptimizer was 3.16% slower than Muon on this 1xH100 smoke. The train
+loss values above are telemetry, not a quality comparison: this was matched
+wall-clock, not matched steps, and it did not run validation BPB. Muon received
+532 optimizer steps while SemanticOptimizer received 516, so the endpoint train
+loss folds throughput into the optimizer comparison.
 
-Interpretation: the overhead gate passes, but the single-seed smoke does not
-argue for promoting SemanticOptimizer ahead of the first-wave training-time
-mechanisms. If revisited, it should be on idea grounds rather than because this
-implementation showed an immediate fast-path win.
+Interpretation: this run is an environment and overhead smoke only. It says
+SemanticOptimizer works on the fast path and its measured overhead is modest on
+1xH100. It does not answer whether SemanticOptimizer learns better per gradient
+step, nor whether its shipped weights score better on validation under a fixed
+training budget.
+
+The next honest optimizer comparison should use matched optimizer steps, record
+tokens/s separately, and score validation BPB from the resulting weights. The
+wall-clock decision can then be computed from both pieces: per-step quality and
+achievable steps.
 
 Raw harvested artifacts are local under:
 
