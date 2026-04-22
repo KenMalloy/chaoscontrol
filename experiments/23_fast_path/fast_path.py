@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import copy
 import json
+import math
 import random
 import statistics
 import threading
@@ -568,6 +569,49 @@ def sequential_sharded_lm_starts(
     return global_idx * int(stride)
 
 
+def _coprime_stride(size: int, seed: int) -> int:
+    size = int(size)
+    if size <= 1:
+        return 1
+    stride = (abs(int(seed)) % size) | 1
+    while math.gcd(stride, size) != 1:
+        stride += 2
+        if stride >= size:
+            stride = 1
+    return stride
+
+
+def shuffled_epoch_sharded_lm_starts(
+    *,
+    num_tokens: int,
+    seq_len: int,
+    stride: int,
+    batch_size: int,
+    rank: int,
+    world_size: int,
+    step: int,
+    seed: int,
+) -> torch.Tensor:
+    """Return fixed-size starts from an O(1)-memory per-rank permutation."""
+    total = count_lm_starts(num_tokens, seq_len, stride)
+    sharded = count_sharded_lm_starts(
+        total_starts=total,
+        rank=rank,
+        world_size=world_size,
+    )
+    if sharded <= 0:
+        raise RuntimeError(
+            f"rank {rank} has no train starts after world_size={world_size} sharding"
+        )
+    first = int(step) * int(batch_size)
+    raw = torch.arange(first, first + int(batch_size), dtype=torch.long)
+    perm_stride = _coprime_stride(sharded, int(seed) + int(rank) * 104_729)
+    offset = (abs(int(seed)) + int(rank) * 65_537) % sharded
+    local_idx = (raw * perm_stride + offset) % sharded
+    global_idx = int(rank) + local_idx * int(world_size)
+    return global_idx * int(stride)
+
+
 class SequentialShardedStartSampler:
     """Stateful sampler compatible with ``Exp23BatchPrefetcher``."""
 
@@ -598,6 +642,41 @@ class SequentialShardedStartSampler:
             rank=rank,
             world_size=world_size,
             step=step,
+        )
+
+
+class ShuffledEpochShardedStartSampler:
+    """Stateful shuffled-epoch sampler compatible with ``Exp23BatchPrefetcher``."""
+
+    def __init__(self, *, seed: int) -> None:
+        self._seed = int(seed)
+        self._step = 0
+        self._lock = threading.Lock()
+
+    def __call__(
+        self,
+        *,
+        num_tokens: int,
+        seq_len: int,
+        stride: int,
+        batch_size: int,
+        rank: int,
+        world_size: int,
+        generator: torch.Generator,
+    ) -> torch.Tensor:
+        del generator
+        with self._lock:
+            step = self._step
+            self._step += 1
+        return shuffled_epoch_sharded_lm_starts(
+            num_tokens=num_tokens,
+            seq_len=seq_len,
+            stride=stride,
+            batch_size=batch_size,
+            rank=rank,
+            world_size=world_size,
+            step=step,
+            seed=self._seed,
         )
 
 

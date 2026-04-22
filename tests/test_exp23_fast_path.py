@@ -329,6 +329,55 @@ def test_sequential_epoch_start_sampling_covers_shards_with_fixed_batches():
         )
 
 
+def test_shuffled_epoch_sampling_covers_each_rank_without_materializing():
+    mod = _load_module()
+    num_tokens = 34
+    seq_len = 3
+    stride = 3
+    batch_size = 2
+    world_size = 3
+
+    total_starts = mod.count_lm_starts(num_tokens, seq_len, stride)
+    epoch_steps = mod.sequential_epoch_steps(
+        num_tokens=num_tokens,
+        seq_len=seq_len,
+        stride=stride,
+        batch_size=batch_size,
+        world_size=world_size,
+    )
+
+    covered = []
+    shuffled_order = []
+    sequential_order = []
+    for rank in range(world_size):
+        for step in range(epoch_steps):
+            starts = mod.shuffled_epoch_sharded_lm_starts(
+                num_tokens=num_tokens,
+                seq_len=seq_len,
+                stride=stride,
+                batch_size=batch_size,
+                rank=rank,
+                world_size=world_size,
+                step=step,
+                seed=1337,
+            )
+            seq_starts = mod.sequential_sharded_lm_starts(
+                num_tokens=num_tokens,
+                seq_len=seq_len,
+                stride=stride,
+                batch_size=batch_size,
+                rank=rank,
+                world_size=world_size,
+                step=step,
+            )
+            covered.extend(int(start // stride) for start in starts.tolist())
+            shuffled_order.extend(int(start // stride) for start in starts.tolist())
+            sequential_order.extend(int(start // stride) for start in seq_starts.tolist())
+
+    assert sorted(set(covered)) == list(range(total_starts))
+    assert shuffled_order != sequential_order
+
+
 def test_lazy_eval_start_selection_matches_eager_shape():
     mod = _load_module()
 
@@ -1161,6 +1210,43 @@ def test_train_fast_for_budget_sequential_epoch_stops_after_epoch():
 
     assert result["steps"] == 4
     assert result["sampling_mode"] == "sequential_epoch"
+    assert result["epoch_steps"] == 4
+    assert result["unique_start_count"] == 7
+    assert result["epoch_complete"] is True
+
+
+def test_train_fast_for_budget_accepts_shuffled_epoch_sampling():
+    mod = _load_runner_module()
+    model = _TinyTokenTrainModel()
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+
+    result = mod.train_fast_for_budget(
+        model,
+        train_tokens=torch.arange(25, dtype=torch.int16) % 6,
+        train_num_tokens=25,
+        stride=3,
+        seq_len=3,
+        batch_size=2,
+        device=torch.device("cpu"),
+        optimizer=optimizer,
+        budget_seconds=300.0,
+        chunk_size=2,
+        grad_clip_norm=0.0,
+        fused_grad_clip=False,
+        rank=0,
+        world_size=1,
+        seed=123,
+        precision="bf16",
+        stop_check_interval=1,
+        stop_margin_seconds=0.0,
+        vocab_size=6,
+        max_steps=None,
+        prefetch_batches=True,
+        train_sampling_mode="shuffled_epoch",
+    )
+
+    assert result["steps"] == 4
+    assert result["sampling_mode"] == "shuffled_epoch"
     assert result["epoch_steps"] == 4
     assert result["unique_start_count"] == 7
     assert result["epoch_complete"] is True
