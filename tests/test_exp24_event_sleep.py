@@ -280,3 +280,112 @@ def test_train_fast_for_budget_runs_event_sleep_replay(monkeypatch):
     assert event_diag["mean_global_pressure"] == pytest.approx(0.15)
     assert event_diag["last_decision"]["fire_count"] == 1
     assert event_diag["artifact_impact"] == "artifact_training_only"
+
+
+def test_event_sleep_replay_lands_one_step_after_trigger(monkeypatch):
+    mod = _load_runner_module()
+
+    sampled_steps: list[int] = []
+
+    class InstrumentedBuffer(mod.DreamReplayBuffer):
+        def sample(self, *, generator, current_step):
+            sampled_steps.append(int(current_step))
+            return super().sample(generator=generator, current_step=current_step)
+
+    monkeypatch.setattr(mod, "DreamReplayBuffer", InstrumentedBuffer)
+
+    fire_steps = {5}
+
+    class ScriptedGate:
+        def __init__(self, **kwargs):
+            self._step = 0
+
+        def update(self, loss, **kwargs):
+            step = self._step
+            self._step += 1
+            if step in fire_steps:
+                return mod.LossTriggeredReplayDecision(
+                    local_loss=1.0,
+                    ema_loss=1.0,
+                    local_ratio=1.3,
+                    local_pressure=0.2,
+                    global_pressure=0.2,
+                    fire_count=1,
+                    local_fire=True,
+                    triggered=True,
+                )
+            return mod.LossTriggeredReplayDecision(
+                local_loss=1.0,
+                ema_loss=1.0,
+                local_ratio=0.95,
+                local_pressure=0.0,
+                global_pressure=0.0,
+                fire_count=0,
+                local_fire=False,
+                triggered=False,
+            )
+
+    monkeypatch.setattr(mod, "LossTriggeredReplayEMA", ScriptedGate)
+    monkeypatch.setattr(
+        mod,
+        "capture_dream_entry",
+        lambda model, inputs, **kwargs: type(
+            "E",
+            (),
+            {
+                "step": kwargs["step"],
+                "states": [torch.zeros(inputs.size(0), 4)],
+                "replay_tokens": inputs[:, :3],
+            },
+        )(),
+    )
+    monkeypatch.setattr(
+        mod,
+        "dreamworld_replay_backward",
+        lambda *args, **kwargs: torch.tensor(0.1),
+    )
+
+    model = _TinyTokenTrainModel()
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+
+    mod.train_fast_for_budget(
+        model,
+        train_tokens=torch.arange(128, dtype=torch.int16) % 6,
+        train_num_tokens=128,
+        stride=4,
+        seq_len=6,
+        batch_size=2,
+        device=torch.device("cpu"),
+        optimizer=optimizer,
+        budget_seconds=300.0,
+        chunk_size=2,
+        grad_clip_norm=0.0,
+        fused_grad_clip=False,
+        rank=0,
+        world_size=1,
+        seed=123,
+        precision="bf16",
+        stop_check_interval=1,
+        stop_margin_seconds=0.0,
+        vocab_size=6,
+        max_steps=10,
+        prefetch_batches=False,
+        dreamworld_enabled=True,
+        dreamworld_cache_interval=1,
+        dreamworld_interval=0,
+        dreamworld_weight=0.25,
+        dreamworld_prefix_tokens=3,
+        dreamworld_replay_tokens=2,
+        dreamworld_min_size=1,
+        event_sleep_enabled=True,
+        event_sleep_min_interval=1,
+        event_sleep_weight=0.5,
+    )
+
+    assert 5 not in sampled_steps, (
+        f"replay leaked into trigger step: {sampled_steps}"
+    )
+    assert 6 in sampled_steps, (
+        f"replay did not land one step after trigger: {sampled_steps}"
+    )
+    assert sampled_steps == [6], f"replay fired on unexpected steps: {sampled_steps}"
