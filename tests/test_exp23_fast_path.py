@@ -1207,6 +1207,55 @@ def test_run_train_step_applies_predictive_auxiliary(monkeypatch):
     assert calls == [((2, 3, 4), 1, True)]
 
 
+def test_train_fast_for_budget_syncs_predictive_aux_projection_in_ddp(monkeypatch):
+    mod = _load_runner_module()
+    broadcasts = []
+    allreduces = []
+
+    monkeypatch.setattr(mod, "broadcast_params", lambda module: broadcasts.append(type(module).__name__))
+    monkeypatch.setattr(
+        mod,
+        "allreduce_grads",
+        lambda module, world_size: allreduces.append((type(module).__name__, world_size)),
+    )
+    monkeypatch.setattr(mod, "should_stop_now", lambda local, *_args: local)
+    monkeypatch.setattr(mod.dist, "barrier", lambda: None)
+
+    model = _TinyTokenTrainModel()
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+
+    result = mod.train_fast_for_budget(
+        model,
+        train_tokens=torch.arange(128, dtype=torch.int16) % 6,
+        train_num_tokens=128,
+        stride=4,
+        seq_len=3,
+        batch_size=2,
+        device=torch.device("cpu"),
+        optimizer=optimizer,
+        budget_seconds=300.0,
+        chunk_size=2,
+        grad_clip_norm=0.0,
+        fused_grad_clip=False,
+        rank=0,
+        world_size=2,
+        seed=123,
+        precision="bf16",
+        stop_check_interval=1,
+        stop_margin_seconds=0.0,
+        vocab_size=6,
+        max_steps=1,
+        prefetch_batches=False,
+        predictive_aux_weight=0.1,
+        predictive_aux_horizon=1,
+    )
+
+    assert result["steps"] == 1
+    assert broadcasts == ["_TinyTokenTrainModel", "Linear"]
+    assert ("Linear", 2) in allreduces
+    assert result["mechanisms"]["predictive_aux"]["enabled"] is True
+
+
 def test_train_fast_for_budget_can_use_batch_prefetcher(monkeypatch):
     mod = _load_runner_module()
     instances = []
@@ -1511,7 +1560,8 @@ def test_train_fast_for_budget_runs_dreamworld_replay(monkeypatch):
         dreamworld_min_size=1,
     )
 
-    assert ("sample", 0) in events
+    assert ("sample", 0) not in events
+    assert ("sample", 1) in events
     assert result["mechanisms"]["dreamworld"]["enabled"] is True
     assert result["mechanisms"]["dreamworld"]["artifact_impact"] == "artifact_training_only"
 

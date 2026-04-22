@@ -29,6 +29,13 @@ temporal heads, or scoring-time state changes belong in this bundle.
 
 ```bash
 .venv/bin/python experiments/24_training_time_bundle/run_exp24.py \
+  --matrix semantic_overhead_gate \
+  --output-dir /tmp/exp24_semantic_gate_dry \
+  --dry-run
+```
+
+```bash
+.venv/bin/python experiments/24_training_time_bundle/run_exp24.py \
   --matrix first_wave \
   --seeds 1337 \
   --config experiments/23_fast_path/configs/base_seq_epoch_lr0064_full_corpus.yaml \

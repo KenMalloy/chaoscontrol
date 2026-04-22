@@ -240,3 +240,30 @@ def test_run_exp24_cli_ring0_defaults_to_control_seed_ladder(tmp_path):
     assert "exp24_ring0_control_s1337" in stdout
     assert "exp24_ring0_control_s2674" in stdout
     assert "exp24_ring0_control_s4011" in stdout
+
+
+def test_run_exp24_cli_semantic_gate_defaults_to_cheap_smoke(tmp_path):
+    script = REPO / "experiments" / "24_training_time_bundle" / "run_exp24.py"
+    output_dir = tmp_path / "exp24-semantic-gate-dryrun"
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(script),
+            "--matrix",
+            "semantic_overhead_gate",
+            "--dry-run",
+            "--output-dir",
+            str(output_dir),
+        ],
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    stdout = result.stdout
+    assert "matrix=semantic_overhead_gate" in stdout
+    assert "world_size=1" in stdout
+    assert '"budget_seconds": 90.0' in stdout
+    assert "--nproc_per_node=1" in stdout
+    assert '"--budget",\n      "90.0"' in stdout

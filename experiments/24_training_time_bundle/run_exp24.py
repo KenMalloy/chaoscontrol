@@ -149,8 +149,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--show", action="store_true")
     parser.add_argument("--limit", type=int, default=None)
-    parser.add_argument("--world-size", type=int, default=8)
-    parser.add_argument("--budget", type=float, default=600.0)
+    parser.add_argument("--world-size", type=int, default=None)
+    parser.add_argument("--budget", type=float, default=None)
     parser.add_argument("--data-path", type=Path, default=DEFAULT_DATA_PATH)
     parser.add_argument(
         "--sp-model-path-16384",
@@ -160,12 +160,17 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--skip-existing", action="store_true", default=True)
     args = parser.parse_args(argv)
 
+    default_world_size = 1 if args.matrix == "semantic_overhead_gate" else 8
+    default_budget = 90.0 if args.matrix == "semantic_overhead_gate" else 600.0
+    world_size = int(args.world_size) if args.world_size is not None else default_world_size
+    budget = float(args.budget) if args.budget is not None else default_budget
+
     speed_config = read_speed_config(args.config)
     entries = _build_entries(
         matrix=args.matrix,
         speed_config=speed_config,
-        world_size=args.world_size,
-        budget_seconds=args.budget,
+        world_size=world_size,
+        budget_seconds=budget,
         seeds=[int(seed) for seed in args.seeds],
     )
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -176,7 +181,7 @@ def main(argv: list[str] | None = None) -> int:
     if effective_dry_run:
         print(
             f"[exp24] matrix={args.matrix} entries={len(selected)} "
-            f"world_size={args.world_size} dry_run={effective_dry_run}",
+            f"world_size={world_size} dry_run={effective_dry_run}",
             flush=True,
         )
         _print_entries(selected)
@@ -190,7 +195,7 @@ def main(argv: list[str] | None = None) -> int:
         data_path=str(args.data_path),
         sp_model_paths={16384: str(args.sp_model_path_16384)},
         results_dir=args.output_dir,
-        world_size=args.world_size,
+        world_size=world_size,
         limit=args.limit,
         dry_run=effective_dry_run,
         skip_existing=args.skip_existing,

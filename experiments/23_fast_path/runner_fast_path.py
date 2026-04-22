@@ -905,6 +905,8 @@ def train_fast_for_budget(
             lr=float(getattr(optimizer, "param_groups", [{"lr": 0.0}])[0]["lr"]),
             weight_decay=0.0,
         )
+        if ddp_active:
+            broadcast_params(predictive_aux_projection)
     dream_buffer = (
         DreamReplayBuffer(
             max_entries=dreamworld_buffer_size,
@@ -1007,6 +1009,16 @@ def train_fast_for_budget(
                     vocab_size=vocab_size,
                 )
 
+            dream_entry = None
+            if (
+                dream_buffer is not None
+                and dreamworld_interval > 0
+                and dreamworld_weight > 0.0
+                and len(dream_buffer) >= int(dreamworld_min_size)
+                and steps % dreamworld_interval == 0
+            ):
+                dream_entry = dream_buffer.sample(generator=rng, current_step=steps)
+
             if (
                 dream_buffer is not None
                 and dreamworld_cache_interval > 0
@@ -1024,16 +1036,6 @@ def train_fast_for_budget(
                     states=entry.states,
                     replay_tokens=entry.replay_tokens,
                 )
-
-            dream_entry = None
-            if (
-                dream_buffer is not None
-                and dreamworld_interval > 0
-                and dreamworld_weight > 0.0
-                and len(dream_buffer) >= int(dreamworld_min_size)
-                and steps % dreamworld_interval == 0
-            ):
-                dream_entry = dream_buffer.sample(generator=rng, current_step=steps)
 
             optimizer.zero_grad(set_to_none=True)
             if predictive_aux_optimizer is not None:
@@ -1063,6 +1065,8 @@ def train_fast_for_budget(
                 dreamworld_entry=dream_entry,
                 dreamworld_weight=dreamworld_weight,
             )
+            if ddp_active and predictive_aux_projection is not None:
+                allreduce_grads(predictive_aux_projection, world_size_)
             zero_embedding_grad_until(
                 model,
                 step=steps,
