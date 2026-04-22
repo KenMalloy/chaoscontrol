@@ -1,5 +1,7 @@
 # Exp 24 Rigor-and-Speed Implementation Plan
 
+> **STATUS: BLOCKED on Phase 0 base-lock.** Do not start this plan until `docs/superpowers/plans/2026-04-22-exp24-phase0-base-lock.md` lands an `exp24_base.yaml`. Task 3's synthetic config, Task 4's seed-anchored trajectory, and Task 7's profile harness all bake in FS+DW defaults (`fast_slow_interval=32`, `fast_slow_alpha=0.50`, `dreamworld_cache_interval=8`, `dreamworld_interval=8`, `dreamworld_weight=0.25`) that Phase 0 is about to re-pick. Running this plan now produces tests anchored to placeholder values. After Phase 0: Task 9 (of the Phase 0 plan) rebases this plan; then execute normally.
+
 > **For Claude:** REQUIRED SUB-SKILL: Use @superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking. Before starting the first code task, run @superpowers:receiving-code-review on the plan itself and fix anything it flags (per project memory: dry-run plan review before executing).
 
 **Goal:** Add five load-bearing regression tests for the `event_sleep` training-time mechanism and land measured kernel-level speedups on the `fast_slow_dreamworld_event_sleep` arm, inside one session on 1 H100.
