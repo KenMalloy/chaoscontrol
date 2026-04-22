@@ -507,3 +507,24 @@ def test_gate_handles_bf16_loss_tensor():
         assert d_fp32.local_fire == d_bf16.local_fire
         assert torch.isfinite(torch.tensor(d_bf16.local_loss))
         assert torch.isfinite(torch.tensor(d_bf16.ema_loss))
+
+
+def test_gate_keeps_ema_state_on_tensor_device_until_materialized():
+    mod = _load_runner_module()
+
+    gate = mod.LossTriggeredReplayEMA(decay=0.5, warmup_steps=1)
+
+    assert gate.update(torch.tensor(2.0)) is None
+    assert isinstance(gate.value, torch.Tensor)
+    assert gate.value.device.type == "cpu"
+    assert gate.value.dtype == torch.float32
+
+    decision = gate.update(
+        torch.tensor(2.4),
+        threshold=1.10,
+        pressure_threshold=0.05,
+    )
+
+    assert decision is not None
+    assert decision.triggered is True
+    assert decision.local_loss == pytest.approx(2.4)
