@@ -98,6 +98,11 @@ from training_hooks import (  # noqa: E402
     spectral_summary,
     zero_embedding_grad_until,
 )
+from dreamworld import (  # noqa: E402
+    DreamReplayBuffer,
+    capture_dream_entry,
+    dreamworld_replay_backward,
+)
 from runner_exp17 import (  # noqa: E402
     build_sentencepiece_luts,
     evaluate_bpb_sp,
@@ -249,6 +254,8 @@ def _run_train_step(
     predictive_aux_weight: float = 0.0,
     predictive_aux_horizon: int = 0,
     predictive_aux_projection: torch.nn.Module | None = None,
+    dreamworld_entry: Any | None = None,
+    dreamworld_weight: float = 0.0,
 ) -> torch.Tensor:
     _reject_unsupported(model)
     with autocast_context(precision, device_type=inputs.device.type):
@@ -318,6 +325,12 @@ def _run_train_step(
         )
         if spectral_extra is not None:
             spectral_extra.backward()
+    if dreamworld_entry is not None and dreamworld_weight > 0.0:
+        dreamworld_replay_backward(
+            model,
+            entry=dreamworld_entry,
+            weight=dreamworld_weight,
+        )
     if ddp_active and world_size > 1:
         mode = str(grad_allreduce_mode).strip().lower()
         if mode == "bulk":
@@ -750,6 +763,15 @@ def train_fast_for_budget(
     predictive_aux_weight: float = 0.0,
     predictive_aux_horizon: int = 0,
     predictive_aux_dim: int = 0,
+    dreamworld_enabled: bool = False,
+    dreamworld_cache_interval: int = 0,
+    dreamworld_interval: int = 0,
+    dreamworld_weight: float = 0.0,
+    dreamworld_prefix_tokens: int = 128,
+    dreamworld_replay_tokens: int = 64,
+    dreamworld_buffer_size: int = 16,
+    dreamworld_min_size: int = 2,
+    dreamworld_max_age_steps: int = 256,
 ) -> dict[str, Any]:
     rank_ = int(rank)
     world_size_ = int(world_size)
@@ -883,6 +905,14 @@ def train_fast_for_budget(
             lr=float(getattr(optimizer, "param_groups", [{"lr": 0.0}])[0]["lr"]),
             weight_decay=0.0,
         )
+    dream_buffer = (
+        DreamReplayBuffer(
+            max_entries=dreamworld_buffer_size,
+            max_age_steps=dreamworld_max_age_steps,
+        )
+        if dreamworld_enabled
+        else None
+    )
     spectral_before = spectral_summary(model)
     losses: list[torch.Tensor] = []
     steps = 0
@@ -977,6 +1007,34 @@ def train_fast_for_budget(
                     vocab_size=vocab_size,
                 )
 
+            if (
+                dream_buffer is not None
+                and dreamworld_cache_interval > 0
+                and steps % dreamworld_cache_interval == 0
+            ):
+                entry = capture_dream_entry(
+                    model,
+                    inputs,
+                    step=steps,
+                    prefix_tokens=dreamworld_prefix_tokens,
+                    replay_tokens=dreamworld_replay_tokens,
+                )
+                dream_buffer.add(
+                    step=entry.step,
+                    states=entry.states,
+                    replay_tokens=entry.replay_tokens,
+                )
+
+            dream_entry = None
+            if (
+                dream_buffer is not None
+                and dreamworld_interval > 0
+                and dreamworld_weight > 0.0
+                and len(dream_buffer) >= int(dreamworld_min_size)
+                and steps % dreamworld_interval == 0
+            ):
+                dream_entry = dream_buffer.sample(generator=rng, current_step=steps)
+
             optimizer.zero_grad(set_to_none=True)
             if predictive_aux_optimizer is not None:
                 predictive_aux_optimizer.zero_grad(set_to_none=True)
@@ -1002,6 +1060,8 @@ def train_fast_for_budget(
                 predictive_aux_weight=predictive_aux_weight,
                 predictive_aux_horizon=predictive_aux_horizon,
                 predictive_aux_projection=predictive_aux_projection,
+                dreamworld_entry=dream_entry,
+                dreamworld_weight=dreamworld_weight,
             )
             zero_embedding_grad_until(
                 model,
@@ -1088,6 +1148,20 @@ def train_fast_for_budget(
                 "weight": float(predictive_aux_weight),
                 "horizon": int(predictive_aux_horizon),
                 "artifact_impact": "artifact_training_only",
+            },
+            "dreamworld": {
+                "enabled": dream_buffer is not None,
+                "weight": float(dreamworld_weight),
+                "cache_interval": int(dreamworld_cache_interval),
+                "dream_interval": int(dreamworld_interval),
+                "prefix_tokens": int(dreamworld_prefix_tokens),
+                "replay_tokens": int(dreamworld_replay_tokens),
+                "artifact_impact": "artifact_training_only",
+                "buffer": (
+                    dream_buffer.diagnostics(current_step=steps)
+                    if dream_buffer is not None
+                    else None
+                ),
             },
         },
         **timing,
@@ -1284,6 +1358,15 @@ def run_condition(
         predictive_aux_weight=float(config.get("predictive_aux_weight", 0.0)),
         predictive_aux_horizon=int(config.get("predictive_aux_horizon", 0)),
         predictive_aux_dim=int(config.get("predictive_aux_dim", 0)),
+        dreamworld_enabled=bool(config.get("dreamworld_enabled", False)),
+        dreamworld_cache_interval=int(config.get("dreamworld_cache_interval", 0)),
+        dreamworld_interval=int(config.get("dreamworld_interval", 0)),
+        dreamworld_weight=float(config.get("dreamworld_weight", 0.0)),
+        dreamworld_prefix_tokens=int(config.get("dreamworld_prefix_tokens", 128)),
+        dreamworld_replay_tokens=int(config.get("dreamworld_replay_tokens", 64)),
+        dreamworld_buffer_size=int(config.get("dreamworld_buffer_size", 16)),
+        dreamworld_min_size=int(config.get("dreamworld_min_size", 2)),
+        dreamworld_max_age_steps=int(config.get("dreamworld_max_age_steps", 256)),
     )
 
     if ddp_active:

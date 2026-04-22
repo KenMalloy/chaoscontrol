@@ -1435,6 +1435,87 @@ def test_train_fast_for_budget_zeroes_embed_grad_during_freeze(monkeypatch):
     assert zero_calls == [(0, 2), (1, 2)]
 
 
+def test_train_fast_for_budget_runs_dreamworld_replay(monkeypatch):
+    mod = _load_runner_module()
+    events = []
+
+    class FakeDreamBuffer:
+        def __init__(self, **kwargs):
+            self.entries = []
+            events.append(("buffer", kwargs))
+
+        def __len__(self):
+            return len(self.entries)
+
+        def add(self, *, step, states, replay_tokens):
+            self.entries.append((step, states, replay_tokens))
+            events.append(("add", step))
+
+        def sample(self, *, generator, current_step):
+            events.append(("sample", current_step))
+            return object()
+
+        def diagnostics(self, *, current_step):
+            return {"size": len(self.entries), "current_step": current_step}
+
+    monkeypatch.setattr(mod, "DreamReplayBuffer", FakeDreamBuffer)
+    monkeypatch.setattr(
+        mod,
+        "capture_dream_entry",
+        lambda model, inputs, **kwargs: type(
+            "E",
+            (),
+            {
+                "step": kwargs["step"],
+                "states": [torch.zeros(inputs.size(0), 4)],
+                "replay_tokens": inputs[:, :3],
+            },
+        )(),
+    )
+    monkeypatch.setattr(
+        mod,
+        "dreamworld_replay_backward",
+        lambda model, *, entry, weight: torch.tensor(0.1),
+    )
+
+    model = _TinyTokenTrainModel()
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+    result = mod.train_fast_for_budget(
+        model,
+        train_tokens=torch.arange(128, dtype=torch.int16) % 6,
+        train_num_tokens=128,
+        stride=4,
+        seq_len=6,
+        batch_size=2,
+        device=torch.device("cpu"),
+        optimizer=optimizer,
+        budget_seconds=300.0,
+        chunk_size=2,
+        grad_clip_norm=0.0,
+        fused_grad_clip=False,
+        rank=0,
+        world_size=1,
+        seed=123,
+        precision="bf16",
+        stop_check_interval=1,
+        stop_margin_seconds=0.0,
+        vocab_size=6,
+        max_steps=2,
+        prefetch_batches=False,
+        dreamworld_enabled=True,
+        dreamworld_cache_interval=1,
+        dreamworld_interval=1,
+        dreamworld_weight=0.25,
+        dreamworld_prefix_tokens=3,
+        dreamworld_replay_tokens=2,
+        dreamworld_min_size=1,
+    )
+
+    assert ("sample", 0) in events
+    assert result["mechanisms"]["dreamworld"]["enabled"] is True
+    assert result["mechanisms"]["dreamworld"]["artifact_impact"] == "artifact_training_only"
+
+
 def test_train_fast_for_budget_can_use_async_param_allreduce(monkeypatch):
     mod = _load_runner_module()
 
