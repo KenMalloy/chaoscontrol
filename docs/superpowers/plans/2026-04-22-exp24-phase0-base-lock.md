@@ -2,11 +2,11 @@
 
 > **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
-**Goal:** Tune the `fast_slow + scheduled dreamworld` stack on a 3-rung ladder (DW sweep → FS sweep around DW winner → top-2 × 3-seed confirm) and commit the winning config as the Exp 24 base for all downstream arms. Same pod run, immediately after `exp24_base.yaml` is written, execute Phase 0b: entropy-gated `log_a` reread evaluated on the locked checkpoint. Phase 0b may promote an eval-time arm, but it is sealed against base selection — its results cannot rewrite `exp24_base.yaml`.
+**Goal:** Tune the `fast_slow + scheduled dreamworld` stack on a 3-rung ladder (DW sweep → FS sweep around DW winner → top-2 × 3-seed confirm) and commit the winning config as the Exp 24 base for all downstream arms. Write a short Phase 0b preregistration doc as the last step (thesis + success criteria only) and point it at a follow-up plan for the actual implementation.
 
-**Architecture:** Phase 0 runs as a data-collection plan, not a mechanism invention plan. Each tuning rung is a new matrix builder in `experiments/24_training_time_bundle/exp24.py`, dispatched from `run_exp24.py`. Screening rungs (2 & 3) use seed=1337 single-seed; the confirm rung runs top-2 × 3 seeds with full-val. Winner is locked by mean BPB with run-to-run stability as tiebreaker. Phase 0b is deliberately downstream: it uses the locked checkpoint/config, existing `DeltaModulator(log_a_shift=...)` semantics, and a causal gate based on model confidence. Its result can promote a future eval-time arm, but it cannot rewrite `exp24_base.yaml`.
+**Architecture:** Phase 0 runs as a data-collection plan, not a mechanism invention plan. Each tuning rung is a new matrix builder in `experiments/24_training_time_bundle/exp24.py`, dispatched from `run_exp24.py`. Screening rungs use seed=1337 single-seed; the confirm rung runs top-2 × 3 seeds with full-val. Winner is locked by mean BPB with run-to-run stability as tiebreaker. Phase 0b is deferred: entropy-gated `log_a` reread requires a new eval-stream module (pre-score state blend, direction picker, compute-matched control harness, CLI) that does not exist yet — `src/chaoscontrol/eval_stream/temporal_heads.py` only implements post-score log-prob mixing. That engineering belongs in its own plan; this plan only preregisters the thesis and success criteria so the follow-up plan inherits them unchanged.
 
-**Out of scope for base selection (but in scope for same-pod execution):** `event_sleep`, predictive aux, spectral, ScOpt — none of these run in this plan. The rigor+speed plan for `fast_slow_dreamworld_event_sleep` (`2026-04-22-exp24-rigor-and-speed-implementation.md`) stays frozen until Phase 0 lands, because its test anchors and profile harness bake in FS+DW defaults that Phase 0 is about to choose. Entropy-gated reread (Phase 0b) runs same-pod after base lock, on the locked checkpoint — in scope for execution, sealed from base selection.
+**Out of scope:** `event_sleep`, predictive aux, spectral, ScOpt, and the actual Phase 0b implementation. The rigor+speed plan for `fast_slow_dreamworld_event_sleep` (`2026-04-22-exp24-rigor-and-speed-implementation.md`) stays frozen until Phase 0 lands. Phase 0b implementation becomes a follow-up plan after base lock, citing this plan's addendum as its preregistered thesis.
 
 **Tech Stack:** Python, existing `run_exp24.py` / `exp24.py` matrix dispatch, **4×H100 pod** (cost choice, not technical requirement — see Budget section for ranking-transfer tradeoff vs ws=8 submission regime), 600s train budget, full-val eval (~164s on 4x per memory), FineWeb data already staged on the pod volume.
 
@@ -14,7 +14,7 @@
 
 ## Anchor (reference config)
 
-The anchor below is the starting guess the ladder tunes around. It is included as one point in Task 1's DW sweep (the `c8_i8 × w=0.25` cell).
+The anchor below is the starting guess the ladder tunes around. It is included as one point in Task 3's DW sweep (the `c8_i8 × w=0.25` cell).
 
 - `fast_slow_enabled=True`, `fast_slow_interval=32`, `fast_slow_alpha=0.50`, `fast_slow_eval_copy="slow"`
 - `dreamworld_enabled=True`, `dreamworld_cache_interval=8`, `dreamworld_interval=8`, `dreamworld_weight=0.25`
@@ -60,11 +60,207 @@ All controls use the same `600s` eval budget (per `feedback_train_eval_budget_se
 - **Ambiguous / warrants follow-up if:** primary beats score-only floor by `0.005 to 0.015 BPB` but fails any of the other three promotion gates. Record, do not promote, design a sharper follow-up.
 - **Deferred-blend secondary** is evaluated on the same four thresholds against its own matched-budget control set; it promotes only if primary also promotes (deferred-blend alone is not enough to claim an eval-time arm).
 
-This addendum is not a fourth base-lock rung — it cannot influence which config lands in `exp24_base.yaml`. But it does run same-pod, immediately after base lock, against the locked checkpoint. Task 9 implements the preregistration doc and the eval runs. Task 10 handles the event_sleep plan rebase.
+This addendum is not a fourth base-lock rung and does not run in this plan — it cannot influence which config lands in `exp24_base.yaml`. Task 11 writes `PHASE0B_ENTROPY_REREAD.md` as a preregistration doc only (thesis, controls, success criteria) so the follow-up plan inherits it unchanged. No Phase 0b eval runs in this plan. Task 12 handles the event_sleep plan rebase.
 
 ---
 
-## Task 1: Add `build_phase0_dreamworld_sweep` to `exp24.py`
+## Task 1: Extend `run_exp24.py` with checkpoint saving and full-val scoring
+
+**Why this is Task 1.** As of `539307c`, `run_exp24.py` calls `run_matrix_entries` without `checkpoint_dir` (see `experiments/23_fast_path/launch.py:114` — the param is supported but unused) and `launch.py:67 summarize_result_dir` ranks by `tokens_per_sec`, not BPB. The base config has `eval_batches: 0`. Today's `exp24_muon_fullval_8x_20260422T143312Z` run produced BPB via a separate `scripts/run_exp20_fast_score.py` invocation per checkpoint — that orchestration was ad-hoc on the pod, not in the repo. Phase 0 cannot rank on BPB unless this path is wired.
+
+**Files:**
+- Modify: `experiments/24_training_time_bundle/run_exp24.py`
+- Modify: `experiments/23_fast_path/launch.py` (extend `summarize_result_dir` to merge full-val BPB from the `full_val/` dir it writes)
+- Reference: `scripts/run_exp20_fast_score.py:1129-1172` (scorer CLI surface)
+- Reference: `experiments/24_training_time_bundle/exp24_muon_fullval_8x_20260422T143312Z/logs/*.full_val.log` (today's command shape)
+
+**Step 1: Add `--checkpoint-dir` and `--full-val-score` CLI flags to `run_exp24.py`**
+
+```python
+parser.add_argument(
+    "--checkpoint-dir",
+    type=Path,
+    default=None,
+    help="If set, save per-entry training checkpoints here via runner --output-ckpt.",
+)
+parser.add_argument(
+    "--full-val-score",
+    action=argparse.BooleanOptionalAction,
+    default=False,
+    help="After training each entry, run scripts/run_exp20_fast_score.py on the saved checkpoint.",
+)
+parser.add_argument(
+    "--val-cache-dir",
+    type=Path,
+    default=Path("/workspace/cache/exp23_val_16384"),
+    help="Tokenized val cache dir for the fast scorer.",
+)
+parser.add_argument(
+    "--val-budget-seconds",
+    type=float,
+    default=600.0,
+    help="Eval budget passed to run_exp20_fast_score.py.",
+)
+```
+
+Gate: `--full-val-score` requires `--checkpoint-dir` — raise at parse time if one is set without the other.
+
+**Step 2: Pass `checkpoint_dir` into `run_matrix_entries`**
+
+```python
+summary = run_matrix_entries(
+    ...
+    checkpoint_dir=args.checkpoint_dir,
+)
+```
+
+Default `args.checkpoint_dir` to `args.output_dir / "checkpoints"` when `--full-val-score` is set but `--checkpoint-dir` is not (convenience).
+
+**Step 3: After `run_matrix_entries`, if `--full-val-score`, score each entry**
+
+Add a helper in `run_exp24.py`:
+
+```python
+def _score_full_val(
+    *,
+    entries: list[dict[str, Any]],
+    checkpoint_dir: Path,
+    results_dir: Path,
+    world_size: int,
+    cache_dir: Path,
+    budget_seconds: float,
+) -> None:
+    full_val_dir = results_dir / "full_val"
+    full_val_dir.mkdir(parents=True, exist_ok=True)
+    logs_dir = results_dir / "logs"
+    scorer = REPO / "scripts" / "run_exp20_fast_score.py"
+    for entry in entries:
+        name = str(entry["name"])
+        ckpt = checkpoint_dir / f"{name}.pt"
+        if not ckpt.exists():
+            continue  # training errored; launch.py will have recorded it
+        summary_path = full_val_dir / f"{name}.summary.json"
+        if summary_path.exists():
+            continue  # resume-friendly
+        jsonl_path = full_val_dir / f"{name}.jsonl"
+        log_path = logs_dir / f"{name}.full_val.log"
+        cmd = [
+            "python", "-m", "torch.distributed.run",
+            f"--nproc_per_node={world_size}",
+            "--rdzv-endpoint=localhost:0",
+            "--rdzv-backend=c10d",
+            f"--rdzv-id=score_{name}",
+            str(scorer),
+            "--cache-dir", str(cache_dir),
+            "--checkpoint-path", str(ckpt),
+            "--output-path", str(jsonl_path),
+            "--summary-path", str(summary_path),
+            "--chunk-size", "256",
+            "--budget-seconds", str(budget_seconds),
+            "--doc-batch-size", "4096",
+            "--max-forward-tokens", "auto",
+            "--score-boundary-targets",
+            "--doc-packing", "chunk_count_tail",
+        ]
+        with log_path.open("w") as log:
+            subprocess.run(cmd, stdout=log, stderr=subprocess.STDOUT, check=False)
+```
+
+Pattern must match the command shape in today's 8x run logs (cited above). Do not invent flags; copy from the observed working invocation.
+
+**Step 4: Extend `summarize_result_dir` in `launch.py` to include `val_bpb`**
+
+Change `summarize_result_dir` so it reads `full_val/<name>.summary.json` when present and adds `val_bpb` (from `aggregate_bpb`) and `val_docs_scored` to the ranked entry dict. Re-sort by `val_bpb` ascending when all entries have it; fall back to `tokens_per_sec` descending if any entry lacks it. This keeps backward compatibility with the existing non-full-val matrices.
+
+**Step 5: Unit test the new scorer hookup**
+
+Add to `tests/test_exp24_training_bundle.py`:
+
+```python
+def test_run_exp24_full_val_requires_checkpoint_dir():
+    # --full-val-score without --checkpoint-dir must raise at parse time
+    ...
+
+def test_score_full_val_builds_expected_cmd(tmp_path):
+    # Inspect the cmd list (dry-run), assert it matches the observed shape
+    ...
+
+def test_summarize_result_dir_merges_val_bpb(tmp_path):
+    # Write a fake entry json + full_val/*.summary.json, assert val_bpb appears and ranking sorts ascending by BPB
+    ...
+```
+
+**Step 6: Verify locally with `--dry-run --show`**
+
+```bash
+python run_exp24.py --matrix fastslow_dreamworld --full-val-score --checkpoint-dir /tmp/ck --val-cache-dir /tmp/v --world-size 4 --dry-run --show
+```
+
+Expected: no crash, entries printed, `[exp24] full-val-score enabled` note, and the scorer command shape visible in the printed plan. Do not actually execute.
+
+**Step 7: Commit**
+
+```bash
+git add experiments/24_training_time_bundle/run_exp24.py \
+        experiments/23_fast_path/launch.py \
+        tests/test_exp24_training_bundle.py
+git commit -m "exp24: wire checkpoint saving and full-val BPB scoring into run_exp24"
+```
+
+---
+
+## Task 2: Matrix-shape unit tests for the three phase0 builders
+
+**Files:**
+- Modify: `tests/test_exp24_training_bundle.py`
+
+Pin entry count, names, phase tag, and load-bearing knobs for each Phase 0 builder so downstream edits don't silently break the sweep. One test per builder:
+
+```python
+def test_build_phase0_dreamworld_sweep_shape_and_knobs():
+    speed_config = {...minimal valid...}
+    entries = build_phase0_dreamworld_sweep(
+        speed_config=speed_config, world_size=4, budget_seconds=600.0, seed_values=(1337,),
+    )
+    assert len(entries) == 9
+    names = [e["name"] for e in entries]
+    # Exactly the 3x3 grid, names pinned
+    expected = {
+        f"exp24_phase0_fs_i32a050_dw_c{i}i{i}_w{int(w*100):03d}_s1337"
+        for i in (4, 8, 16) for w in (0.10, 0.25, 0.50)
+    }
+    assert set(names) == expected
+    # Fast-slow pinned at anchor across every arm
+    for e in entries:
+        assert e["fast_slow_enabled"] is True
+        assert e["fast_slow_interval"] == 32
+        assert e["fast_slow_alpha"] == 0.50
+        assert e["fast_slow_eval_copy"] == "slow"
+        assert e["dreamworld_enabled"] is True
+        # DW interval and cache move together
+        assert e["dreamworld_cache_interval"] == e["dreamworld_interval"]
+        assert e["exp24_phase"] == "phase0"
+
+
+def test_build_phase0_fastslow_sweep_shape_and_knobs():
+    # 6 entries: 3 FS intervals x 2 alphas, DW pinned at Task 5 winner
+    ...
+
+
+def test_build_phase0_confirm_shape_and_knobs():
+    # 6 entries: 2 configs x 3 seeds, fullval-ready
+    assert any(e["seed"] == 1337 for e in entries)
+    assert any(e["seed"] == 2674 for e in entries)
+    assert any(e["seed"] == 4011 for e in entries)
+```
+
+**Step 1-3: write tests, run them to fail (builders don't exist yet), commit as "tests: pin phase0 matrix shapes and names"**
+
+Builders land in Tasks 3, 6, 9 respectively. Each builder task will re-run its test to green before commit.
+
+---
+
+## Task 3: Add `build_phase0_dreamworld_sweep` to `exp24.py`
 
 **Files:**
 - Modify: `experiments/24_training_time_bundle/exp24.py` (add builder alongside `build_fastslow_dreamworld_matrix` at line 324)
@@ -89,7 +285,7 @@ def build_phase0_dreamworld_sweep(
     for interval in intervals:
         for weight in weights:
             arm = {
-                "name_arm": f"phase0_fs_i32a050_dw_c{interval}i{interval}_w{int(weight*100):03d}",
+                "name_arm": f"fs_i32a050_dw_c{interval}i{interval}_w{int(weight*100):03d}",
                 "exp24_mechanism": "fast_slow_dreamworld",
                 "artifact_impact": ARTIFACT_TRAINING_ONLY,
                 "fast_slow_enabled": True,
@@ -152,7 +348,7 @@ cd experiments/24_training_time_bundle
 python run_exp24.py --matrix phase0_dreamworld_sweep --seeds 1337 --world-size 4 --show
 ```
 
-Expected: 9 entries named `exp24_phase0_fast_slow_dreamworld_phase0_fs_i32a050_dw_c{4,8,16}i{4,8,16}_w{010,025,050}_s1337`.
+Expected: 9 entries named `exp24_phase0_fs_i32a050_dw_c{4,8,16}i{4,8,16}_w{010,025,050}_s1337`. Verify the exact name format by reading `exp24.py:_named_entry` (line ~114) — it formats as `f"exp24_{phase}_{arm}_s{seed}"` when phase is set, so the arm string must not duplicate the `phase0_` prefix.
 
 **Step 4: Commit**
 
@@ -163,7 +359,7 @@ git commit -m "exp24: add phase0 dreamworld interval×weight sweep matrix"
 
 ---
 
-## Task 2: Launch Phase 0 DW sweep on 4×H100
+## Task 4: Launch Phase 0 DW sweep on 4×H100
 
 **Files:**
 - Output dir: `experiments/24_training_time_bundle/phase0_dw_sweep_4x_<timestamp>/`
@@ -193,7 +389,8 @@ cd /workspace/chaoscontrol
 git pull
 cd experiments/24_training_time_bundle
 OUT=phase0_dw_sweep_4x_$(date -u +%Y%m%dT%H%M%SZ)
-python run_exp24.py --matrix phase0_dreamworld_sweep --seeds 1337 --world-size 4 --output-dir $OUT
+python run_exp24.py --matrix phase0_dreamworld_sweep --seeds 1337 --world-size 4 \
+    --checkpoint-dir $OUT/checkpoints --full-val-score --output-dir $OUT
 ```
 
 Expected: 9 runs × ~785s each (600s train + ~164s full-val + ~20s startup) ≈ 118 min total wall time on 4x (runs execute sequentially, not in parallel — each uses all 4 ranks). Note: `run_exp24.py` has `default_world_size=8` hardcoded for non-`semantic_overhead_gate` matrices; pass `--world-size 4` on every launch to override.
@@ -218,20 +415,29 @@ git commit -m "exp24: record phase0 dreamworld sweep results"
 
 ---
 
-## Task 3: Pick DW winner
+## Task 5: Pick DW winner
 
 **Files:**
 - Create: `experiments/24_training_time_bundle/PHASE0_DW_WINNER.md`
 
 **Step 1: Rank the 9 arms by val BPB**
 
-From `summary.json`, extract `val_bpb` per arm. Sort ascending.
+Per Task 1, the `--full-val-score` path writes `full_val/<name>.summary.json` per arm and the extended `summarize_result_dir` merges each arm's `aggregate_bpb` into `summary.json`'s `ranked` list as `val_bpb`. Sort ascending.
+
+```bash
+jq '.ranked | sort_by(.val_bpb) | .[] | {name, val_bpb}' $OUT/summary.json
+```
+
+If `val_bpb` is missing for any arm, inspect that arm's `logs/<name>.full_val.log` — training may have succeeded but scoring errored (e.g., checkpoint corrupt, val cache missing).
 
 **Step 2: Sanity checks**
 
-- Sanity floor at ws=4. The sweep has no control arm (all 9 are FS+DW). Cross-check by comparing against today's 8x `dreamworld_c4_i4_w025` run's BPB at seed=2674 or seed=4011 (from `exp24_muon_fullval_8x_20260422T143312Z/`). At ws=4 the same arm should score *worse* (smaller effective batch, less data) — if Phase 0's `c4i4_w025` cell at seed=1337 beats the 8x run, something is wrong (dataset mismatch, bug). If it scores within ~0.05–0.10 BPB worse, that's the expected ws=4 penalty.
+- Smoke-level sanity (not a pass/fail gate). The 9-arm sweep has no bare control and today's 8x reference (`dreamworld_c4_i4_w025`, FS disabled) is a different mechanism than any Phase 0 arm (all have FS on), so direct cross-run BPB comparison is apples-to-oranges. Loose smoke checks:
+  - No arm's BPB exceeds 2.0 (known-pathological; would signal a bug or dataset mismatch).
+  - Within-sweep ordering is coherent: adjacent grid cells (e.g. `c8i8_w025` vs `c8i8_w050`) differ by less than ~0.3 BPB. Large discontinuities signal a bug in that arm's config.
+  - If any arm errors or hangs, investigate before continuing — do not treat its absence as a ranking signal.
 - Is the winner at a corner of the grid? If so, note this is a "sweep boundary" — the true optimum may be outside (e.g., interval=32 or weight=0.75). Mark as a follow-up question but don't expand Phase 0 unconditionally.
-- Is the top-to-second gap > plausible seed noise? With only seed=1337, ordering within ~0.01 BPB is unreliable. If top 3 are within noise, carry all three into Task 5 (not just 1).
+- Is the top-to-second gap > plausible seed noise? With only seed=1337, ordering within ~0.015 BPB is unreliable (see ws=4 noise budget in Risk section). If top 3 are within noise, carry all three into Task 7 (not just 1).
 
 **Step 3: Write the winner doc**
 
@@ -248,7 +454,7 @@ git commit -m "exp24: record phase0 DW sweep winner"
 
 ---
 
-## Task 4: Add `build_phase0_fastslow_sweep` around DW winner
+## Task 6: Add `build_phase0_fastslow_sweep` around DW winner
 
 **Files:**
 - Modify: `experiments/24_training_time_bundle/exp24.py`
@@ -256,7 +462,7 @@ git commit -m "exp24: record phase0 DW sweep winner"
 
 **Step 1: Add builder with DW-winner values hardcoded**
 
-Hardcode the Task 3 winner's DW settings in the builder (simpler than threading through CLI args for a one-shot sweep). If Task 3 carried forward more than one DW config due to noise, produce one matrix per carried config (expand to e.g. 12 arms: 2 DW candidates × 3 FS intervals × 2 alphas).
+Hardcode the Task 5 winner's DW settings in the builder (simpler than threading through CLI args for a one-shot sweep). If Task 5 carried forward more than one DW config due to noise, produce one matrix per carried config (expand to e.g. 12 arms: 2 DW candidates × 3 FS intervals × 2 alphas).
 
 ```python
 def build_phase0_fastslow_sweep(
@@ -266,10 +472,10 @@ def build_phase0_fastslow_sweep(
     budget_seconds: float = 600.0,
     seed_values: Sequence[int] = (1337,),
 ) -> list[dict[str, Any]]:
-    """Phase 0 rung 2: sweep FS interval × alpha around Task 3 DW winner.
+    """Phase 0 rung 2: sweep FS interval × alpha around Task 5 DW winner.
 
     DW settings below must match PHASE0_DW_WINNER.md. If changed, bump the
-    commit hash in that doc and re-run Task 5 from scratch.
+    commit hash in that doc and re-run Task 7 from scratch.
     """
     dw_cache_interval = <WINNER>  # fill from PHASE0_DW_WINNER.md
     dw_interval = <WINNER>
@@ -282,7 +488,7 @@ def build_phase0_fastslow_sweep(
         for fs_alpha in fs_alphas:
             arm = {
                 "name_arm": (
-                    f"phase0_fs_i{fs_interval}_a{int(fs_alpha*100):03d}_"
+                    f"fs_i{fs_interval}_a{int(fs_alpha*100):03d}_"
                     f"dw_c{dw_cache_interval}i{dw_interval}_w{int(dw_weight*100):03d}"
                 ),
                 "exp24_mechanism": "fast_slow_dreamworld",
@@ -322,7 +528,7 @@ def build_phase0_fastslow_sweep(
     return entries
 ```
 
-**Step 2: Register in `run_exp24.py`** (same pattern as Task 1 Step 2; matrix name `phase0_fastslow_sweep`).
+**Step 2: Register in `run_exp24.py`** (same pattern as Task 3 Step 2; matrix name `phase0_fastslow_sweep`).
 
 **Step 3: Dry-run — verify 6 entries**
 
@@ -339,15 +545,16 @@ git commit -m "exp24: add phase0 fast-slow sweep around DW winner"
 
 ---
 
-## Task 5: Launch Phase 0 FS sweep on 4×H100
+## Task 7: Launch Phase 0 FS sweep on 4×H100
 
-Same pattern as Task 2. 6 arms × ~700s ≈ 70 min.
+Same pattern as Task 4. 6 arms × ~785s ≈ 78 min on 4x.
 
 **Step 1: Push commits, pull on pod, launch**
 
 ```bash
 OUT=phase0_fs_sweep_4x_$(date -u +%Y%m%dT%H%M%SZ)
-python run_exp24.py --matrix phase0_fastslow_sweep --seeds 1337 --world-size 4 --output-dir $OUT
+python run_exp24.py --matrix phase0_fastslow_sweep --seeds 1337 --world-size 4 \
+    --checkpoint-dir $OUT/checkpoints --full-val-score --output-dir $OUT
 ```
 
 **Step 2: Rsync back, commit**
@@ -359,14 +566,14 @@ git commit -m "exp24: record phase0 fast-slow sweep results"
 
 ---
 
-## Task 6: Pick top-2 configs for confirm
+## Task 8: Pick top-2 configs for confirm
 
 **Files:**
 - Create: `experiments/24_training_time_bundle/PHASE0_TOP2.md`
 
 **Step 1: Combine rankings**
 
-Merge: Task 3 sweep (9 arms) ∪ Task 5 sweep (6 arms). Note the DW-sweep anchor cell (FS=32, α=0.50, winner DW) appears in both; dedupe by config, keep the lower BPB as the data point (or average if seed=1337 identical run).
+Merge: Task 4 DW sweep results (9 arms) ∪ Task 7 FS sweep results (6 arms). Note the DW-sweep anchor cell (FS=32, α=0.50, winner DW) appears in both; dedupe by config, keep the lower BPB as the data point (or average if seed=1337 identical run).
 
 **Step 2: Rank merged set by BPB; take top 2**
 
@@ -383,7 +590,7 @@ git commit -m "exp24: pick phase0 top-2 configs for confirm"
 
 ---
 
-## Task 7: Add `build_phase0_confirm` and launch 3-seed confirm
+## Task 9: Add `build_phase0_confirm` and launch 3-seed confirm
 
 **Files:**
 - Modify: `experiments/24_training_time_bundle/exp24.py`
@@ -440,7 +647,8 @@ python run_exp24.py --matrix phase0_confirm --world-size 4 --show
 
 ```bash
 OUT=phase0_confirm_4x_$(date -u +%Y%m%dT%H%M%SZ)
-python run_exp24.py --matrix phase0_confirm --world-size 4 --output-dir $OUT
+python run_exp24.py --matrix phase0_confirm --world-size 4 \
+    --checkpoint-dir $OUT/checkpoints --full-val-score --output-dir $OUT
 ```
 
 6 runs × ~700s ≈ 70 min.
@@ -455,7 +663,7 @@ git commit -m "exp24: run phase0 top-2 × 3-seed confirm"
 
 ---
 
-## Task 8: Lock the Exp 24 base config
+## Task 10: Lock the Exp 24 base config
 
 **Files:**
 - Create: `experiments/24_training_time_bundle/PHASE0_BASE_LOCK.md`
@@ -480,7 +688,7 @@ Full YAML with every knob needed for a reproducible run. Use `base_seq_epoch_lr0
 - Full 2×3 BPB table
 - Picked winner + rationale
 - Any noise-band caveats
-- Any sweep-boundary caveats from Task 3 that might warrant a follow-up Phase 0b
+- Any sweep-boundary caveats from Task 5 that might warrant a follow-up tuning pass
 - Link to `exp24_base.yaml`
 
 **Step 5: Commit**
@@ -493,12 +701,14 @@ git commit -m "exp24: lock phase0 base config"
 
 ---
 
-## Task 9: Preregister Phase 0b entropy-gated `log_a` reread
+## Task 11: Preregister Phase 0b entropy-gated `log_a` reread (doc only)
+
+**No eval runs in this task.** Phase 0b requires a new eval-stream module (pre-score state blend, direction picker, compute-matched control harness, CLI) that does not yet exist. `src/chaoscontrol/eval_stream/temporal_heads.py` only implements post-score log-prob mixing. The actual implementation and evaluation belong in a follow-up plan. This task writes the preregistration doc and stubs the follow-up plan so the thesis, controls, and thresholds are frozen before any implementation starts.
 
 **Files:**
-- Create: `experiments/24_training_time_bundle/PHASE0B_ENTROPY_REREAD.md`
-- Later implementation target, after prereg approval: `src/chaoscontrol/eval_stream/entropy_reread.py` or a thin runner around `src/chaoscontrol/eval_stream/temporal_heads.py`
-- Later tests: `tests/test_eval_stream_entropy_reread.py`
+- Create: `experiments/24_training_time_bundle/PHASE0B_ENTROPY_REREAD.md` (the preregistration — thesis, controls, success criteria, legality contract)
+- Create: `docs/superpowers/plans/2026-04-23-exp24-phase0b-entropy-reread-implementation.md` (follow-up plan stub that cites this preregistration)
+- Future implementation target (not this plan): `src/chaoscontrol/eval_stream/entropy_reread.py`, `scripts/run_exp20_entropy_reread.py`, `tests/test_eval_stream_entropy_reread.py`
 
 **Step 1: Write the preregistration doc**
 
@@ -590,16 +800,28 @@ Additional operational constraints (always applied, orthogonal to promotion):
 
 Kill or park the mechanism if same-horizon reread matches it, if the best always-on single shift is faster and better, if soft blending collapses to replacement/zero-blend across most triggers, or if any leakage review finds target-dependent current-chunk gating.
 
-**Step 6: Commit**
+**Step 6: Write the follow-up plan stub**
+
+Create `docs/superpowers/plans/2026-04-23-exp24-phase0b-entropy-reread-implementation.md` with:
+
+- Header pointing at `PHASE0B_ENTROPY_REREAD.md` as the preregistered thesis (frozen; must not be weakened without a revision-log entry in this Phase 0 plan).
+- Pointer to `PHASE0_BASE_LOCK.md` and `exp24_base.yaml` for the locked checkpoint.
+- Placeholder task list (actual tasks designed in the follow-up plan): build `eval_stream/entropy_reread.py` with pre-score state blend; build direction picker and legality tests; build compute-matched control harness; build CLI `scripts/run_exp20_entropy_reread.py`; calibrate on a held-out stream; run the 4 compute-matched arms × 3 seeds; evaluate against success criteria from the preregistration.
+- Budget placeholder: to be estimated by the follow-up plan once the implementation is designed.
+
+The stub is a pointer, not an implementation plan — the follow-up plan's author uses `superpowers:writing-plans` to expand it.
+
+**Step 7: Commit**
 
 ```bash
-git add experiments/24_training_time_bundle/PHASE0B_ENTROPY_REREAD.md
-git commit -m "exp24: preregister phase0b entropy-gated log-a reread"
+git add experiments/24_training_time_bundle/PHASE0B_ENTROPY_REREAD.md \
+        docs/superpowers/plans/2026-04-23-exp24-phase0b-entropy-reread-implementation.md
+git commit -m "exp24: preregister phase0b entropy-gated log-a reread; stub follow-up plan"
 ```
 
 ---
 
-## Task 10: Unblock the event_sleep rigor+speed plan
+## Task 12: Unblock the event_sleep rigor+speed plan
 
 **Files:**
 - Modify: `docs/superpowers/plans/2026-04-22-exp24-rigor-and-speed-implementation.md`
@@ -627,9 +849,12 @@ git commit -m "plan: rebase exp24 event_sleep plan on phase0 base lock"
 
 ## Final verification
 
+- [ ] `run_exp24.py` supports `--checkpoint-dir` and `--full-val-score`, and a dry-run shows the scorer command shape from today's 8x run logs.
+- [ ] Matrix-shape unit tests (Task 2) pass and pin names/knobs for all three phase0 builders.
 - [ ] `exp24_base.yaml` exists and is reproducible via `run_exp24.py` with the matching matrix entry.
 - [ ] `PHASE0_BASE_LOCK.md` records the full decision trail.
-- [ ] `PHASE0B_ENTROPY_REREAD.md` exists after base lock and explicitly states that Phase 0b cannot alter `exp24_base.yaml`.
+- [ ] `PHASE0B_ENTROPY_REREAD.md` exists as a preregistration doc (thesis, controls, success criteria) and explicitly states Phase 0b cannot alter `exp24_base.yaml`.
+- [ ] `docs/superpowers/plans/2026-04-23-exp24-phase0b-entropy-reread-implementation.md` stub exists and cites the preregistration.
 - [ ] Event_sleep plan references the locked base, not the placeholder anchor.
 - [ ] All 3 matrices (`phase0_dreamworld_sweep`, `phase0_fastslow_sweep`, `phase0_confirm`) remain registered in `run_exp24.py` for reproducibility — do not delete them after locking the base.
 
@@ -637,18 +862,14 @@ git commit -m "plan: rebase exp24 event_sleep plan on phase0 base lock"
 
 ## Budget & risk notes
 
-**Total compute:** 9 + 6 + 6 = 21 runs × ~785s = **~4.6 hours of 4×H100 wall time** for base lock, plus Phase 0b eval-only on locked checkpoint (see below). Plus ~30 min of rsync/analysis between rungs. Plan on one full day end-to-end, same pod.
+**Total compute:** 9 + 6 + 6 = 21 runs × ~785s training + eval-scoring = **~4.6 hours of 4×H100 wall time** for base lock. Plus ~30 min of rsync/analysis between rungs. Plan on one full day end-to-end.
 
-**Cost estimate.** 4×H100 at ~$12/hr × ~4.6h ≈ **~$55** for base lock. Phase 0b ≤ ~1h × $12/hr ≈ ~$12. **Total ≤ ~$70** for Phase 0 + 0b combined. (Reference: the original 8×H100 draft was ~$100 for base lock alone.)
-
-**Phase 0b compute (same pod, after base lock).** Eval-only on the locked checkpoint — no training. Ballpark: 4 primary arms (`score_only`, `scheduled_reread_compute_matched`, `entropy_reread_shift0_compute_matched`, `entropy_reread_bidirectional_blend`) × 3 seeds for confirm + ~4 diagnostic calibration runs on a held-out stream = ~16 runs × ~185s (full-val ~164s + startup ~20s) ≈ 50 min. Compute-matched controls 2 and 3 each do the same total reread-token work as the bidirectional primary (`B_reread = N_fire × K × 2`), so their per-run wall time is comparable. If Task 9 pre-registration sweeps multiple thresholds or `K` values before picking one, add 20–40 min. Total Phase 0b wall time ≤ ~1.5 h on 4x.
+**Cost estimate.** 4×H100 at ~$12/hr × ~4.6h ≈ **~$55** for base lock. (Reference: the original 8×H100 draft was ~$100.) Phase 0b compute is not in this plan's budget — it runs from the follow-up plan after the actual eval-stream implementation lands.
 
 **Ranking-transfer risk (ws=4 → ws=8 submission).** All Phase 0 rungs run at ws=4 (effective batch 4096) to cut cost. Submission regime is ws=8 (effective batch 8192). FS+DW knob rankings are expected to be roughly invariant to effective batch at this scale — interval/weight tune replay frequency, not batch dynamics — but "expected" is not "certain." The locked `exp24_base.yaml` may be suboptimal at ws=8. Catch happens at submit-time: when we first run the locked config on 8x, if BPB is off from the 4x-tuned expectation, re-run the FS sweep at ws=8 around the winner (6 arms × 1 seed × 8x ≈ 60 min, one-shot correction). LR stays at 0.064 per Exp 18 Test 5b validation at bs=1024/rank across ws∈{2,4,8}, so no LR re-tune needed for the ws swap.
 
-**Single-seed screening risk.** Rungs 1 and 2 run seed=1337 only. Seed noise at ws=4 is plausibly larger than the ~0.01 BPB seen in prior 8x runs because the smaller effective batch (4096 vs 8192) yields noisier step trajectories — budget the noise band as ~0.015 BPB until the 3-seed confirm rung measures it directly. Task 3 and Task 6 include explicit noise-band handling; if >3 configs tie, escalate for a seed=2674 mini-replication rather than guessing.
+**Single-seed screening risk.** Rungs for Tasks 4 and 7 run seed=1337 only. Seed noise at ws=4 is plausibly larger than the ~0.01 BPB seen in prior 8x runs because the smaller effective batch (4096 vs 8192) yields noisier step trajectories — budget the noise band as ~0.015 BPB until the 3-seed confirm rung (Task 9) measures it directly. Tasks 5 and 8 include explicit noise-band handling; if >3 configs tie, escalate for a seed=2674 mini-replication rather than guessing.
 
-**Sweep-boundary risk.** Both sweeps are 3-point grids at fixed endpoints. If a winner sits at a corner (e.g., interval=16 or weight=0.50 for DW), the true optimum may be outside the grid. Document as a Phase 0b candidate, don't expand Phase 0 mid-flight.
-
-**Phase 0b leakage risk.** Predictive entropy is legal only when computed before the targets it affects are revealed. Current-token or current-chunk realized loss is not legal as a trigger or direction choice for that same scoring window. If both directions are scored and the lower next-step loss is kept, that choice must be committed only after the current score is recorded, affecting future state rather than the score that generated the loss. Prefer previous-chunk gating for the first implementation because it is easy to audit.
+**Sweep-boundary risk.** Both sweeps are 3-point grids at fixed endpoints. If a winner sits at a corner (e.g., interval=16 or weight=0.50 for DW), the true optimum may be outside the grid. Document as a follow-up candidate, don't expand Phase 0 mid-flight.
 
 **Pod state.** Per project memory, `/workspace/venv` survives stop/start, pip-into-system-python doesn't. Always `source /workspace/venv/bin/activate` before launching. `runpodctl get pod --all` to see stopped pods. RunPod disk migrations copy tree only — if the pod migrates, `/workspace` shards may be gone and need re-staging.
