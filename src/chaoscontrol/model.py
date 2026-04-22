@@ -991,7 +991,13 @@ class ChaosStudentLM(nn.Module):
     def artifact_bytes(self) -> int:
         return int(sum(p.numel() for p in self.parameters()) * 2)
 
-    def encode(self, input_ids: torch.Tensor) -> torch.Tensor:
+    def encode(
+        self,
+        input_ids: torch.Tensor,
+        *,
+        initial_states: list[torch.Tensor] | None = None,
+        return_final_states: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
         """Run every pre-LM-head computation and return the hidden state.
 
         Mirrors the encoder portion of ``forward()`` — embed → wernicke →
@@ -1017,6 +1023,12 @@ class ChaosStudentLM(nn.Module):
         ``lm_head`` and only fire when ``memory_write_mode='append_only'``,
         which is unused by the bare-SSM submission regime).
         """
+        if initial_states is not None:
+            if len(initial_states) != len(self.layers):
+                raise ValueError(
+                    f"initial_states length {len(initial_states)} does not match "
+                    f"num_layers {len(self.layers)}"
+                )
         x = self.embed(input_ids)
 
         # Wernicke layer: compose bytes into typed units before SSM recurrence
@@ -1074,12 +1086,42 @@ class ChaosStudentLM(nn.Module):
         # Virtual-layer loop — weight-tied depth recurrence when configured;
         # otherwise list(range(num_layers)). Matches forward() exactly.
         use_ckpt = self.activation_checkpoint and torch.is_grad_enabled() and x.requires_grad
+        final_states: list[torch.Tensor | None] | None = None
+        if return_final_states:
+            final_states = [None] * len(self.layers)
         for layer_idx in self._virtual_layer_indices:
             layer = self.layers[layer_idx]
+            init_state = initial_states[layer_idx] if initial_states is not None else None
             if use_ckpt:
-                x = _checkpoint(layer, x, return_jacobian_stats=False, use_reentrant=False)
+                if return_final_states:
+                    x, fstate = _checkpoint(
+                        layer,
+                        x,
+                        return_jacobian_stats=False,
+                        initial_state=init_state,
+                        return_final_state=True,
+                        use_reentrant=False,
+                    )
+                    final_states[layer_idx] = fstate
+                else:
+                    x = _checkpoint(
+                        layer,
+                        x,
+                        return_jacobian_stats=False,
+                        initial_state=init_state,
+                        use_reentrant=False,
+                    )
             else:
-                x = layer(x, return_jacobian_stats=False)
+                if return_final_states:
+                    x, fstate = layer(
+                        x,
+                        return_jacobian_stats=False,
+                        initial_state=init_state,
+                        return_final_state=True,
+                    )
+                    final_states[layer_idx] = fstate
+                else:
+                    x = layer(x, return_jacobian_stats=False, initial_state=init_state)
 
         # Posterior correction bias — bare-SSM path has self.posterior is None
         # so the block is skipped.
@@ -1099,6 +1141,13 @@ class ChaosStudentLM(nn.Module):
                 posterior_bias = self.posterior.read(query)
                 x = x + posterior_bias.unsqueeze(1)
 
+        if return_final_states:
+            assert final_states is not None
+            assert all(s is not None for s in final_states), (
+                "final_states has unvisited slots — virtual layer indices did not "
+                "cover every physical layer"
+            )
+            return x, final_states
         return x
 
     def forward(

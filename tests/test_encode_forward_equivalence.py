@@ -101,3 +101,34 @@ class TestEncodeBareSSMEquivalence:
             assert torch.equal(ref_grads[name], new_grads[name]), (
                 f"param {name!r} gradient differs between forward() and encode()"
             )
+
+    def test_encode_can_return_final_states(self, bare_ssm_model: ChaosStudentLM) -> None:
+        model = bare_ssm_model
+        inputs = _make_input(batch=2, seq=16, vocab=64, seed=4)
+
+        with torch.no_grad():
+            forward_out = model(inputs)
+            hidden, final_states = model.encode(inputs, return_final_states=True)
+
+        assert torch.equal(forward_out["hidden"], hidden)
+        assert len(forward_out["final_states"]) == len(final_states)
+        for from_forward, from_encode in zip(forward_out["final_states"], final_states):
+            assert torch.equal(from_forward, from_encode)
+
+    def test_encode_accepts_initial_states(self, bare_ssm_model: ChaosStudentLM) -> None:
+        model = bare_ssm_model
+        inputs = _make_input(batch=2, seq=16, vocab=64, seed=5)
+        init_states = [torch.full((2, 16), 2.0) for _ in range(len(model.layers))]
+
+        with torch.no_grad():
+            forward_out = model(inputs, initial_states=init_states)
+            encoded_hidden, encoded_final_states = model.encode(
+                inputs,
+                initial_states=init_states,
+                return_final_states=True,
+            )
+
+        assert torch.equal(forward_out["hidden"], encoded_hidden)
+        assert len(forward_out["final_states"]) == len(encoded_final_states)
+        for from_forward, from_encode in zip(forward_out["final_states"], encoded_final_states):
+            assert torch.equal(from_forward, from_encode)
