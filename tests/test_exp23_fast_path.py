@@ -1252,6 +1252,94 @@ def test_train_fast_for_budget_accepts_shuffled_epoch_sampling():
     assert result["epoch_complete"] is True
 
 
+def test_train_fast_for_budget_applies_spectral_extra_loss(monkeypatch):
+    mod = _load_runner_module()
+    calls = []
+
+    def fake_spectral_loss(model, **kwargs):
+        calls.append(kwargs)
+        return torch.tensor(0.25, requires_grad=True)
+
+    monkeypatch.setattr(mod, "spectral_regularization_loss", fake_spectral_loss)
+    model = _TinyTokenTrainModel()
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+
+    result = mod.train_fast_for_budget(
+        model,
+        train_tokens=torch.arange(128, dtype=torch.int16) % 6,
+        train_num_tokens=128,
+        stride=4,
+        seq_len=3,
+        batch_size=2,
+        device=torch.device("cpu"),
+        optimizer=optimizer,
+        budget_seconds=300.0,
+        chunk_size=2,
+        grad_clip_norm=0.0,
+        fused_grad_clip=False,
+        rank=0,
+        world_size=1,
+        seed=123,
+        precision="bf16",
+        stop_check_interval=1,
+        stop_margin_seconds=0.0,
+        vocab_size=6,
+        max_steps=1,
+        prefetch_batches=False,
+        spectral_reg_lambda_dead=0.1,
+        spectral_reg_lambda_sticky=0.2,
+    )
+
+    assert calls == [
+        {
+            "lambda_dead": 0.1,
+            "lambda_sticky": 0.2,
+            "min_a": 0.05,
+            "max_a": 0.98,
+        }
+    ]
+    assert result["mechanisms"]["spectral"]["enabled"] is True
+
+
+def test_train_fast_for_budget_zeroes_embed_grad_during_freeze(monkeypatch):
+    mod = _load_runner_module()
+    zero_calls = []
+
+    def fake_zero(model, *, step, freeze_steps):
+        zero_calls.append((step, freeze_steps))
+
+    monkeypatch.setattr(mod, "zero_embedding_grad_until", fake_zero)
+    model = _TinyTokenTrainModel()
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+
+    mod.train_fast_for_budget(
+        model,
+        train_tokens=torch.arange(128, dtype=torch.int16) % 6,
+        train_num_tokens=128,
+        stride=4,
+        seq_len=3,
+        batch_size=2,
+        device=torch.device("cpu"),
+        optimizer=optimizer,
+        budget_seconds=300.0,
+        chunk_size=2,
+        grad_clip_norm=0.0,
+        fused_grad_clip=False,
+        rank=0,
+        world_size=1,
+        seed=123,
+        precision="bf16",
+        stop_check_interval=1,
+        stop_margin_seconds=0.0,
+        vocab_size=6,
+        max_steps=2,
+        prefetch_batches=False,
+        embed_freeze_steps=2,
+    )
+
+    assert zero_calls == [(0, 2), (1, 2)]
+
+
 def test_train_fast_for_budget_can_use_async_param_allreduce(monkeypatch):
     mod = _load_runner_module()
 

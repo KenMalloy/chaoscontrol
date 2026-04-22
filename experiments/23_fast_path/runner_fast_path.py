@@ -90,6 +90,12 @@ from fast_path import (  # noqa: E402
     summarize_cuda_graph_gate,
     summarize_train_timing,
 )
+from training_hooks import (  # noqa: E402
+    FastSlowConsolidator,
+    spectral_regularization_loss,
+    spectral_summary,
+    zero_embedding_grad_until,
+)
 from runner_exp17 import (  # noqa: E402
     build_sentencepiece_luts,
     evaluate_bpb_sp,
@@ -166,6 +172,10 @@ def _run_train_step(
     lm_head_tile_size: int = 1024,
     grad_allreduce_mode: str = "bulk",
     async_grad_reducer: AsyncGradAllReducer | None = None,
+    spectral_reg_lambda_dead: float = 0.0,
+    spectral_reg_lambda_sticky: float = 0.0,
+    spectral_reg_min_a: float = 0.05,
+    spectral_reg_max_a: float = 0.98,
 ) -> torch.Tensor:
     _reject_unsupported(model)
     with autocast_context(precision, device_type=inputs.device.type):
@@ -213,6 +223,16 @@ def _run_train_step(
                 "'fused_streaming_cached', or 'fused_norm_streaming_v2', "
                 f"got {lm_head_backward_mode!r}"
             )
+    if spectral_reg_lambda_dead > 0.0 or spectral_reg_lambda_sticky > 0.0:
+        spectral_extra = spectral_regularization_loss(
+            model,
+            lambda_dead=spectral_reg_lambda_dead,
+            lambda_sticky=spectral_reg_lambda_sticky,
+            min_a=spectral_reg_min_a,
+            max_a=spectral_reg_max_a,
+        )
+        if spectral_extra is not None:
+            spectral_extra.backward()
     if ddp_active and world_size > 1:
         mode = str(grad_allreduce_mode).strip().lower()
         if mode == "bulk":
@@ -633,6 +653,15 @@ def train_fast_for_budget(
     cuda_graph_warmup_steps: int = 3,
     grad_allreduce_mode: str = "bulk",
     train_sampling_mode: str = "random",
+    fast_slow_enabled: bool = False,
+    fast_slow_interval: int = 0,
+    fast_slow_alpha: float = 0.0,
+    fast_slow_eval_copy: str = "fast",
+    spectral_reg_lambda_dead: float = 0.0,
+    spectral_reg_lambda_sticky: float = 0.0,
+    spectral_reg_min_a: float = 0.05,
+    spectral_reg_max_a: float = 0.98,
+    embed_freeze_steps: int = 0,
 ) -> dict[str, Any]:
     rank_ = int(rank)
     world_size_ = int(world_size)
@@ -742,6 +771,15 @@ def train_fast_for_budget(
     rng.manual_seed(int(seed) + rank_)
 
     model.train()
+    fast_slow = FastSlowConsolidator.from_config(
+        model,
+        {
+            "fast_slow_enabled": fast_slow_enabled,
+            "fast_slow_interval": fast_slow_interval,
+            "fast_slow_alpha": fast_slow_alpha,
+        },
+    )
+    spectral_before = spectral_summary(model)
     losses: list[torch.Tensor] = []
     steps = 0
     start_time = time.perf_counter()
@@ -851,6 +889,15 @@ def train_fast_for_budget(
                 lm_head_tile_size=lm_head_tile_size,
                 grad_allreduce_mode=grad_allreduce_mode_,
                 async_grad_reducer=async_grad_reducer,
+                spectral_reg_lambda_dead=spectral_reg_lambda_dead,
+                spectral_reg_lambda_sticky=spectral_reg_lambda_sticky,
+                spectral_reg_min_a=spectral_reg_min_a,
+                spectral_reg_max_a=spectral_reg_max_a,
+            )
+            zero_embedding_grad_until(
+                model,
+                step=steps,
+                freeze_steps=embed_freeze_steps,
             )
             if grad_clip_norm > 0.0:
                 if fused_grad_clip:
@@ -858,6 +905,7 @@ def train_fast_for_budget(
                 else:
                     torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
             optimizer.step()
+            fast_slow.after_optimizer_step(model, step=steps + 1)
             losses.append(loss.detach())
             steps += 1
     finally:
@@ -868,6 +916,9 @@ def train_fast_for_budget(
 
     if ddp_active:
         dist.barrier()
+
+    if fast_slow.enabled and str(fast_slow_eval_copy).strip().lower() == "slow":
+        fast_slow.copy_slow_to_model(model)
 
     elapsed_s = time.perf_counter() - start_time
     loss_cpu = torch.stack(losses).cpu() if losses else torch.empty(0)
@@ -906,6 +957,21 @@ def train_fast_for_budget(
             if epoch_steps is not None
             else None
         ),
+        "mechanisms": {
+            "fast_slow": fast_slow.diagnostics(model),
+            "spectral": {
+                "enabled": (
+                    spectral_reg_lambda_dead > 0.0
+                    or spectral_reg_lambda_sticky > 0.0
+                ),
+                "before": spectral_before,
+                "after": spectral_summary(model),
+            },
+            "embed_freeze": {
+                "freeze_steps": int(embed_freeze_steps),
+                "enabled": int(embed_freeze_steps) > 0,
+            },
+        },
         **timing,
     }
     if graph_summary is not None:
@@ -1086,6 +1152,17 @@ def run_condition(
         cuda_graph_warmup_steps=int(config.get("cuda_graph_warmup_steps", 3)),
         grad_allreduce_mode=str(config.get("grad_allreduce_mode", "bulk")),
         train_sampling_mode=str(config.get("train_sampling_mode", "random")),
+        fast_slow_enabled=bool(config.get("fast_slow_enabled", False)),
+        fast_slow_interval=int(config.get("fast_slow_interval", 0)),
+        fast_slow_alpha=float(config.get("fast_slow_alpha", 0.0)),
+        fast_slow_eval_copy=str(config.get("fast_slow_eval_copy", "fast")),
+        spectral_reg_lambda_dead=float(config.get("spectral_reg_lambda_dead", 0.0)),
+        spectral_reg_lambda_sticky=float(
+            config.get("spectral_reg_lambda_sticky", 0.0)
+        ),
+        spectral_reg_min_a=float(config.get("spectral_reg_min_a", 0.05)),
+        spectral_reg_max_a=float(config.get("spectral_reg_max_a", 0.98)),
+        embed_freeze_steps=int(config.get("embed_freeze_steps", 0)),
     )
 
     if ddp_active:
