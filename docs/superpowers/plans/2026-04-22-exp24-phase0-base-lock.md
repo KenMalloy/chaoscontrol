@@ -2,11 +2,11 @@
 
 > **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
-**Goal:** Tune the `fast_slow + scheduled dreamworld` stack on a 3-rung ladder (DW sweep → FS sweep around DW winner → top-2 × 3-seed confirm) and commit the winning config as the Exp 24 base for all downstream arms. After the base is locked, preregister one eval-only Phase 0b probe: entropy-gated `log_a` reread, which may improve the locked checkpoint but must not influence base selection.
+**Goal:** Tune the `fast_slow + scheduled dreamworld` stack on a 3-rung ladder (DW sweep → FS sweep around DW winner → top-2 × 3-seed confirm) and commit the winning config as the Exp 24 base for all downstream arms. Same pod run, immediately after `exp24_base.yaml` is written, execute Phase 0b: entropy-gated `log_a` reread evaluated on the locked checkpoint. Phase 0b may promote an eval-time arm, but it is sealed against base selection — its results cannot rewrite `exp24_base.yaml`.
 
 **Architecture:** Phase 0 runs as a data-collection plan, not a mechanism invention plan. Each tuning rung is a new matrix builder in `experiments/24_training_time_bundle/exp24.py`, dispatched from `run_exp24.py`. Screening rungs (2 & 3) use seed=1337 single-seed; the confirm rung runs top-2 × 3 seeds with full-val. Winner is locked by mean BPB with run-to-run stability as tiebreaker. Phase 0b is deliberately downstream: it uses the locked checkpoint/config, existing `DeltaModulator(log_a_shift=...)` semantics, and a causal gate based on model confidence. Its result can promote a future eval-time arm, but it cannot rewrite `exp24_base.yaml`.
 
-**Out of scope for base selection:** `event_sleep`, predictive aux, spectral, ScOpt, and any eval-time temporal-head/reread score. The rigor+speed plan for `fast_slow_dreamworld_event_sleep` (`2026-04-22-exp24-rigor-and-speed-implementation.md`) stays frozen until Phase 0 lands, because its test anchors and profile harness bake in FS+DW defaults that Phase 0 is about to choose. Entropy-gated reread is included only as a post-lock Phase 0b probe.
+**Out of scope for base selection (but in scope for same-pod execution):** `event_sleep`, predictive aux, spectral, ScOpt — none of these run in this plan. The rigor+speed plan for `fast_slow_dreamworld_event_sleep` (`2026-04-22-exp24-rigor-and-speed-implementation.md`) stays frozen until Phase 0 lands, because its test anchors and profile harness bake in FS+DW defaults that Phase 0 is about to choose. Entropy-gated reread (Phase 0b) runs same-pod after base lock, on the locked checkpoint — in scope for execution, sealed from base selection.
 
 **Tech Stack:** Python, existing `run_exp24.py` / `exp24.py` matrix dispatch, 8×H100 pod, 600s train budget, full-val eval (~82s on 8x per memory), FineWeb data already staged on the pod volume.
 
@@ -55,7 +55,7 @@ All controls use the same `600s` eval budget (per `feedback_train_eval_budget_se
 - **Ambiguous / warrants follow-up if:** primary beats score-only floor by `0.005 to 0.015 BPB` but doesn't clear the scheduled-reread gap. Record, do not promote, design a sharper follow-up.
 - **Deferred-blend secondary** is evaluated on the same thresholds but against its own score-only floor at matched reread-token budget; it promotes only if primary also promotes (otherwise deferred-blend alone is not enough to claim an eval-time arm).
 
-This addendum is not a fourth base-lock rung. It runs only after `exp24_base.yaml` exists. Phase 0b tasks are out of scope for this plan; it becomes its own implementation plan once the base is locked, and it must cite this addendum as its thesis and preregistration.
+This addendum is not a fourth base-lock rung — it cannot influence which config lands in `exp24_base.yaml`. But it does run same-pod, immediately after base lock, against the locked checkpoint. Task 9 implements the preregistration doc and the eval runs. Task 10 handles the event_sleep plan rebase.
 
 ---
 
@@ -624,9 +624,9 @@ git commit -m "plan: rebase exp24 event_sleep plan on phase0 base lock"
 
 ## Budget & risk notes
 
-**Total compute:** 9 + 6 + 6 = 21 runs × ~700s = ~4.1 hours of 8×H100 wall time, plus ~30 min of rsync/analysis between rungs. Plan on one full day end-to-end.
+**Total compute:** 9 + 6 + 6 = 21 runs × ~700s = ~4.1 hours of 8×H100 wall time for base lock, plus Phase 0b eval-only on locked checkpoint (see below). Plus ~30 min of rsync/analysis between rungs. Plan on one full day end-to-end, same pod.
 
-**Phase 0b compute.** Entropy-gated reread is extra eval-only compute after base lock. It is not included in the 21-run base-lock budget because it reuses the locked checkpoint and does not train new weights.
+**Phase 0b compute (same pod, after base lock).** Eval-only on the locked checkpoint — no training. Ballpark: 4 primary arms (`score_only`, `scheduled_reread_same_budget`, `entropy_reread_shift0`, `entropy_reread_bidirectional_blend`) × 3 seeds for confirm + ~4 diagnostic calibration runs on a held-out stream = ~16 runs × ~100s (full-val ~82s + startup ~20s) ≈ 27 min. If Task 9 pre-registration sweeps multiple thresholds or `K` values before picking one, add 20–40 min. Total Phase 0b wall time ≤ ~1 h; Phase 0 + 0b combined ≤ ~5.5 h on one pod day.
 
 **Single-seed screening risk.** Rungs 1 and 2 run seed=1337 only. If the true seed noise is ~0.01 BPB (plausible from prior 8x runs), cells within that band are indistinguishable. Task 3 and Task 6 include explicit noise-band handling; if >3 configs tie, escalate for a seed=2674 mini-replication rather than guessing.
 
