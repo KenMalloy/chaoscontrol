@@ -93,6 +93,7 @@ from fast_path import (  # noqa: E402
 )
 from training_hooks import (  # noqa: E402
     FastSlowConsolidator,
+    predictive_auxiliary_loss,
     spectral_regularization_loss,
     spectral_summary,
     zero_embedding_grad_until,
@@ -245,6 +246,9 @@ def _run_train_step(
     spectral_reg_lambda_sticky: float = 0.0,
     spectral_reg_min_a: float = 0.05,
     spectral_reg_max_a: float = 0.98,
+    predictive_aux_weight: float = 0.0,
+    predictive_aux_horizon: int = 0,
+    predictive_aux_projection: torch.nn.Module | None = None,
 ) -> torch.Tensor:
     _reject_unsupported(model)
     with autocast_context(precision, device_type=inputs.device.type):
@@ -252,6 +256,18 @@ def _run_train_step(
             hidden = _compiled_step_fn()(model, inputs)
         else:
             hidden = model.encode(inputs)
+        if (
+            predictive_aux_weight > 0.0
+            and predictive_aux_horizon > 0
+            and predictive_aux_projection is not None
+        ):
+            aux = predictive_auxiliary_loss(
+                hidden,
+                projection=predictive_aux_projection,
+                horizon=predictive_aux_horizon,
+            )
+            if aux is not None:
+                (float(predictive_aux_weight) * aux).backward(retain_graph=True)
         if lm_head_backward_mode == "single":
             loss = full_lm_head_backward(
                 hidden=hidden,
@@ -731,6 +747,9 @@ def train_fast_for_budget(
     spectral_reg_min_a: float = 0.05,
     spectral_reg_max_a: float = 0.98,
     embed_freeze_steps: int = 0,
+    predictive_aux_weight: float = 0.0,
+    predictive_aux_horizon: int = 0,
+    predictive_aux_dim: int = 0,
 ) -> dict[str, Any]:
     rank_ = int(rank)
     world_size_ = int(world_size)
@@ -848,6 +867,22 @@ def train_fast_for_budget(
             "fast_slow_alpha": fast_slow_alpha,
         },
     )
+    predictive_aux_projection = None
+    predictive_aux_optimizer = None
+    if predictive_aux_weight > 0.0 and predictive_aux_horizon > 0:
+        dim = int(getattr(model, "dim", 0) or getattr(model.lm_head, "in_features"))
+        aux_dim = int(predictive_aux_dim) if int(predictive_aux_dim) > 0 else dim
+        if aux_dim != dim:
+            raise ValueError("predictive_aux_dim must be 0 or equal to model dim in v1")
+        predictive_aux_projection = torch.nn.Linear(dim, dim, bias=False).to(
+            device=device,
+            dtype=next(model.parameters()).dtype,
+        )
+        predictive_aux_optimizer = torch.optim.AdamW(
+            predictive_aux_projection.parameters(),
+            lr=float(getattr(optimizer, "param_groups", [{"lr": 0.0}])[0]["lr"]),
+            weight_decay=0.0,
+        )
     spectral_before = spectral_summary(model)
     losses: list[torch.Tensor] = []
     steps = 0
@@ -943,6 +978,8 @@ def train_fast_for_budget(
                 )
 
             optimizer.zero_grad(set_to_none=True)
+            if predictive_aux_optimizer is not None:
+                predictive_aux_optimizer.zero_grad(set_to_none=True)
             if async_grad_reducer is not None:
                 async_grad_reducer.reset()
             loss = _run_train_step(
@@ -962,6 +999,9 @@ def train_fast_for_budget(
                 spectral_reg_lambda_sticky=spectral_reg_lambda_sticky,
                 spectral_reg_min_a=spectral_reg_min_a,
                 spectral_reg_max_a=spectral_reg_max_a,
+                predictive_aux_weight=predictive_aux_weight,
+                predictive_aux_horizon=predictive_aux_horizon,
+                predictive_aux_projection=predictive_aux_projection,
             )
             zero_embedding_grad_until(
                 model,
@@ -974,6 +1014,8 @@ def train_fast_for_budget(
                 else:
                     torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
             optimizer.step()
+            if predictive_aux_optimizer is not None:
+                predictive_aux_optimizer.step()
             fast_slow.after_optimizer_step(model, step=steps + 1)
             losses.append(loss.detach())
             steps += 1
@@ -1040,6 +1082,12 @@ def train_fast_for_budget(
             "embed_freeze": {
                 "freeze_steps": int(embed_freeze_steps),
                 "enabled": int(embed_freeze_steps) > 0,
+            },
+            "predictive_aux": {
+                "enabled": predictive_aux_projection is not None,
+                "weight": float(predictive_aux_weight),
+                "horizon": int(predictive_aux_horizon),
+                "artifact_impact": "artifact_training_only",
             },
         },
         **timing,
@@ -1233,6 +1281,9 @@ def run_condition(
         spectral_reg_min_a=float(config.get("spectral_reg_min_a", 0.05)),
         spectral_reg_max_a=float(config.get("spectral_reg_max_a", 0.98)),
         embed_freeze_steps=int(config.get("embed_freeze_steps", 0)),
+        predictive_aux_weight=float(config.get("predictive_aux_weight", 0.0)),
+        predictive_aux_horizon=int(config.get("predictive_aux_horizon", 0)),
+        predictive_aux_dim=int(config.get("predictive_aux_dim", 0)),
     )
 
     if ddp_active:

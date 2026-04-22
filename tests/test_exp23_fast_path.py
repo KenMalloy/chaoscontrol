@@ -1176,6 +1176,37 @@ def test_run_train_step_can_use_norm_streaming_v2_fused_backward(monkeypatch):
     assert model.encoder.weight.grad is not None
 
 
+def test_run_train_step_applies_predictive_auxiliary(monkeypatch):
+    mod = _load_runner_module()
+    calls = []
+
+    def fake_aux(hidden, *, projection, horizon):
+        calls.append((tuple(hidden.shape), horizon, projection is not None))
+        return hidden.float().mean() * 0.0 + 0.5
+
+    monkeypatch.setattr(mod, "predictive_auxiliary_loss", fake_aux)
+    model = _TinyTrainStepModel()
+    inputs = torch.randn(2, 3, 4)
+    targets = torch.zeros(2, 3, dtype=torch.long)
+    aux = nn.Linear(4, 4, bias=False)
+
+    loss = mod._run_train_step(
+        model=model,
+        inputs=inputs,
+        targets=targets,
+        chunk_size=2,
+        precision="bf16",
+        ddp_active=False,
+        world_size=1,
+        predictive_aux_weight=0.1,
+        predictive_aux_horizon=1,
+        predictive_aux_projection=aux,
+    )
+
+    assert loss.ndim == 0
+    assert calls == [((2, 3, 4), 1, True)]
+
+
 def test_train_fast_for_budget_can_use_batch_prefetcher(monkeypatch):
     mod = _load_runner_module()
     instances = []

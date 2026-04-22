@@ -137,6 +137,20 @@ def spectral_summary(model: torch.nn.Module) -> dict[str, float | int]:
     }
 
 
+def predictive_auxiliary_loss(
+    hidden: torch.Tensor,
+    *,
+    projection: torch.nn.Module,
+    horizon: int,
+) -> torch.Tensor | None:
+    horizon = int(horizon)
+    if horizon <= 0 or hidden.size(1) <= horizon:
+        return None
+    pred = projection(hidden[:, :-horizon])
+    target = hidden[:, horizon:].detach()
+    return torch.nn.functional.mse_loss(pred.float(), target.float())
+
+
 def zero_embedding_grad_until(model: torch.nn.Module, step: int, freeze_steps: int) -> None:
     if freeze_steps <= 0 or step >= freeze_steps:
         return

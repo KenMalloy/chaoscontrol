@@ -100,3 +100,20 @@ def test_zero_embedding_grad_until():
     model.embed.weight.grad = torch.ones_like(model.embed.weight)
     mod.zero_embedding_grad_until(model, step=3, freeze_steps=3)
     assert torch.count_nonzero(model.embed.weight.grad).item() == model.embed.weight.grad.numel()
+
+
+def test_predictive_auxiliary_loss_uses_detached_future_hidden():
+    hooks = _load_module()
+    hidden = torch.randn(2, 5, 4, requires_grad=True)
+    proj = nn.Linear(4, 4, bias=False)
+
+    loss = hooks.predictive_auxiliary_loss(
+        hidden,
+        projection=proj,
+        horizon=2,
+    )
+
+    assert loss is not None
+    loss.backward()
+    assert hidden.grad is not None
+    assert proj.weight.grad is not None
