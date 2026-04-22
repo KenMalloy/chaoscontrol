@@ -69,6 +69,7 @@ def _concat_shards_mmap(shard_paths: list[Path], cache_path: Path) -> np.ndarray
     """
     import os
     import time
+    from concurrent.futures import ThreadPoolExecutor
 
     if cache_path.exists():
         return np.memmap(str(cache_path), dtype=np.uint16, mode="c")
@@ -76,10 +77,27 @@ def _concat_shards_mmap(shard_paths: list[Path], cache_path: Path) -> np.ndarray
     # Use per-PID temp file to avoid collisions between parallel processes
     tmp_path = cache_path.with_suffix(f".tmp.{os.getpid()}")
     try:
-        arrays = [np.fromfile(str(s), dtype=np.uint16) for s in shard_paths]
-        combined = np.concatenate(arrays)
+        sizes = [s.stat().st_size for s in shard_paths]
+        if any(sz % 2 for sz in sizes):
+            raise ValueError("shard size not a multiple of 2 bytes (uint16)")
+        elem_counts = [sz // 2 for sz in sizes]
+        offsets = [0]
+        for count in elem_counts[:-1]:
+            offsets.append(offsets[-1] + count)
+        combined = np.empty(sum(elem_counts), dtype=np.uint16)
+
+        def _read_into(idx: int) -> None:
+            end = offsets[idx] + elem_counts[idx]
+            combined[offsets[idx]:end] = np.fromfile(
+                str(shard_paths[idx]), dtype=np.uint16
+            )
+
+        with ThreadPoolExecutor(max_workers=32) as ex:
+            for _ in ex.map(_read_into, range(len(shard_paths))):
+                pass
+
         combined.tofile(str(tmp_path))
-        del combined, arrays
+        del combined
         # Atomic rename — if another process beat us, that's fine
         try:
             tmp_path.rename(cache_path)

@@ -1,12 +1,14 @@
 import tempfile
 from pathlib import Path
 
+import numpy as np
 import torch
 from chaoscontrol.data import (
     batch_from_starts, build_lm_starts, resolve_device, resolve_param_dtype,
     maybe_autocast, maybe_sync_cuda, choose_eval_starts,
     load_fineweb_raw_bytes,
 )
+from chaoscontrol.data import _concat_shards_mmap
 
 def test_build_lm_starts():
     starts = build_lm_starts(100, seq_len=10, stride=5)
@@ -65,6 +67,46 @@ def test_load_fineweb_raw_bytes_multibyte_utf8():
     assert tokens.numel() == 2
     assert tokens[0].item() == 0xC3
     assert tokens[1].item() == 0xA9
+
+
+def test_concat_shards_mmap_matches_sequential(tmp_path):
+    """Parallel shard read must produce identical bytes to sequential concat."""
+    rng = np.random.default_rng(0)
+    shards = []
+    expected_parts = []
+    for i in range(5):
+        shard_path = tmp_path / f"shard_{i}.bin"
+        data = rng.integers(0, 65535, size=1000 + i * 123, dtype=np.uint16)
+        data.tofile(str(shard_path))
+        shards.append(shard_path)
+        expected_parts.append(data)
+    expected = np.concatenate(expected_parts)
+
+    cache_path = tmp_path / ".test_cache.bin"
+    result = _concat_shards_mmap(shards, cache_path)
+
+    assert cache_path.exists()
+    assert result.shape == expected.shape
+    assert np.array_equal(np.asarray(result), expected)
+
+
+def test_concat_shards_mmap_reuses_cache(tmp_path):
+    """Second call with existing cache must return mmap without rebuilding."""
+    shard_path = tmp_path / "shard_0.bin"
+    data = np.arange(100, dtype=np.uint16)
+    data.tofile(str(shard_path))
+    cache_path = tmp_path / ".test_cache.bin"
+
+    first = _concat_shards_mmap([shard_path], cache_path)
+    mtime_first = cache_path.stat().st_mtime_ns
+
+    # Replace the shard on disk — if the cache is rebuilt, the mtime changes.
+    other = np.arange(100, 200, dtype=np.uint16)
+    other.tofile(str(shard_path))
+
+    second = _concat_shards_mmap([shard_path], cache_path)
+    assert cache_path.stat().st_mtime_ns == mtime_first
+    assert np.array_equal(np.asarray(second), np.asarray(first))
 
 
 def test_batch_from_starts_with_raw_bytes():
