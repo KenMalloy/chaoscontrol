@@ -10,10 +10,13 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import sys
 from pathlib import Path
 
 import pytest
 import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
 import torch.nn as nn
 
 
@@ -66,36 +69,86 @@ class _TinyTokenTrainModel(nn.Module):
         return self.embed(inputs)
 
 
-def test_event_sleep_gate_reduces_rank_loss_pressure(monkeypatch):
-    mod = _load_runner_module()
+def _gate_worker(rank, world_size, init_file, per_rank_loss_map, result_path):
+    """Spawned-process worker: init gloo, run one gate update, write result."""
+    dist.init_process_group(
+        backend="gloo",
+        init_method=f"file://{init_file}",
+        rank=rank,
+        world_size=world_size,
+    )
+    try:
+        mod = _load_runner_module()
+        gate = mod.LossTriggeredReplayEMA(decay=0.5, warmup_steps=1)
+        seed_loss, trigger_loss = per_rank_loss_map[rank]
+        gate.update(torch.tensor(seed_loss))
+        decision = gate.update(
+            torch.tensor(trigger_loss),
+            threshold=1.25,
+            pressure_threshold=0.05,
+            ddp_active=True,
+            world_size=world_size,
+            device=torch.device("cpu"),
+        )
+        payload = {
+            "triggered": bool(decision.triggered),
+            "global_pressure": float(decision.global_pressure),
+            "fire_count": int(decision.fire_count),
+            "local_fire": bool(decision.local_fire),
+            "local_ratio": float(decision.local_ratio),
+        }
+        torch.save(payload, f"{result_path}.rank{rank}")
+    finally:
+        dist.destroy_process_group()
 
-    reduced: list[list[float]] = []
 
-    def fake_all_reduce(tensor, op=None):
-        assert op is mod.dist.ReduceOp.SUM
-        reduced.append(tensor.detach().cpu().tolist())
-        tensor.copy_(torch.tensor([1.25, 3.0]))
+def test_gloo_four_rank_lockstep_and_boundary(tmp_path, monkeypatch):
+    """All ranks see identical triggered / global_pressure / fire_count."""
+    world_size = 4
+    per_rank_loss = {
+        0: (2.0, 2.75),  # ratio 1.375, above threshold 1.25: fires
+        1: (2.0, 2.00),  # ratio 1.00, below: no fire
+        2: (2.0, 2.50),  # ratio 1.25, exactly at threshold: no fire
+        3: (2.0, 3.00),  # ratio 1.50, above: fires
+    }
 
-    monkeypatch.setattr(mod.dist, "all_reduce", fake_all_reduce)
+    result_path = tmp_path / "decisions"
+    init_file = tmp_path / "rendezvous"
+    if "GLOO_SOCKET_IFNAME" not in os.environ:
+        monkeypatch.setenv(
+            "GLOO_SOCKET_IFNAME",
+            "lo0" if sys.platform == "darwin" else "lo",
+        )
 
-    ema = mod.LossTriggeredReplayEMA(decay=0.5, warmup_steps=1)
-    assert ema.update(torch.tensor(2.0)) is None
-
-    decision = ema.update(
-        torch.tensor(3.0),
-        threshold=1.10,
-        pressure_threshold=0.05,
-        ddp_active=True,
-        world_size=4,
-        device=torch.device("cpu"),
+    mp.spawn(
+        _gate_worker,
+        args=(world_size, str(init_file), per_rank_loss, str(result_path)),
+        nprocs=world_size,
+        join=True,
     )
 
-    assert decision is not None
-    assert reduced == [[pytest.approx((3.0 / 2.0) - 1.10), 1.0]]
-    assert decision.local_fire is True
-    assert decision.fire_count == 3
-    assert decision.global_pressure == pytest.approx(1.25 / 4.0)
-    assert decision.triggered is True
+    decisions = [
+        torch.load(f"{result_path}.rank{rank}") for rank in range(world_size)
+    ]
+
+    expected_local_fire = [True, False, False, True]
+    for rank, decision in enumerate(decisions):
+        assert decision["local_fire"] is expected_local_fire[rank], (
+            f"rank {rank}: local_fire {decision['local_fire']} != "
+            f"{expected_local_fire[rank]}"
+        )
+
+    assert decisions[2]["local_ratio"] == pytest.approx(1.25, abs=0.0)
+    assert decisions[2]["local_fire"] is False
+
+    fire_count_ref = decisions[0]["fire_count"]
+    global_pressure_ref = decisions[0]["global_pressure"]
+    triggered_ref = decisions[0]["triggered"]
+    assert fire_count_ref == 2, "ranks 0 and 3 fired -> fire_count = 2"
+    for decision in decisions:
+        assert decision["fire_count"] == fire_count_ref
+        assert decision["global_pressure"] == pytest.approx(global_pressure_ref)
+        assert decision["triggered"] is triggered_ref
 
 
 def test_event_sleep_gate_waits_for_warmup_and_threshold():
