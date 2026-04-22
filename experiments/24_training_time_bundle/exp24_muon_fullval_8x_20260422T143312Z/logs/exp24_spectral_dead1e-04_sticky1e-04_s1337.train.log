@@ -1,0 +1,7 @@
++ /workspace/chaoscontrol/.venv/bin/python -m torch.distributed.run --nproc_per_node=8 --rdzv-endpoint=localhost:39451 --rdzv-backend=c10d --rdzv-id=cc_exp23_39451 /workspace/chaoscontrol/experiments/23_fast_path/runner_fast_path.py --config /workspace/chaoscontrol/experiments/24_training_time_bundle/exp24_muon_fullval_8x_20260422T143312Z/configs/exp24_spectral_dead1e-04_sticky1e-04_s1337.yaml --data-path /workspace/chaoscontrol/baselines/parameter_golf/datasets/fineweb10B_sp16384 --sp-model-path /workspace/chaoscontrol/baselines/parameter_golf/tokenizers/fineweb_16384_bpe.model --output-json /workspace/chaoscontrol/experiments/24_training_time_bundle/exp24_muon_fullval_8x_20260422T143312Z/exp24_spectral_dead1e-04_sticky1e-04_s1337.json --output-ckpt /workspace/chaoscontrol/experiments/24_training_time_bundle/exp24_muon_fullval_8x_20260422T143312Z/checkpoints/exp24_spectral_dead1e-04_sticky1e-04_s1337.pt --budget 600.0
+[rank 0/8] exp24_spectral_dead1e-04_sticky1e-04_s1337 vocab=16384 batch=1024 chunk=64 ckpt=False params=10,751,232
+/usr/local/lib/python3.12/dist-packages/torch/distributed/distributed_c10d.py:4876: UserWarning: barrier(): using the device under current context. You can specify `device_id` in `init_process_group` to mute this warning.
+  warnings.warn(  # warn only once
+[rank 0/8] done steps=3163 tok/s=24979935 loss=4.0412 vram=53160.8MB
+
+[returncode] 0

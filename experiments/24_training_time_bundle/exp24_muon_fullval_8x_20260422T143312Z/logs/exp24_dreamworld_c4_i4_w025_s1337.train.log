@@ -1,0 +1,150 @@
++ /workspace/chaoscontrol/.venv/bin/python -m torch.distributed.run --nproc_per_node=8 --rdzv-endpoint=localhost:47433 --rdzv-backend=c10d --rdzv-id=cc_exp23_47433 /workspace/chaoscontrol/experiments/23_fast_path/runner_fast_path.py --config /workspace/chaoscontrol/experiments/24_training_time_bundle/exp24_muon_fullval_8x_20260422T143312Z/configs/exp24_dreamworld_c4_i4_w025_s1337.yaml --data-path /workspace/chaoscontrol/baselines/parameter_golf/datasets/fineweb10B_sp16384 --sp-model-path /workspace/chaoscontrol/baselines/parameter_golf/tokenizers/fineweb_16384_bpe.model --output-json /workspace/chaoscontrol/experiments/24_training_time_bundle/exp24_muon_fullval_8x_20260422T143312Z/exp24_dreamworld_c4_i4_w025_s1337.json --output-ckpt /workspace/chaoscontrol/experiments/24_training_time_bundle/exp24_muon_fullval_8x_20260422T143312Z/checkpoints/exp24_dreamworld_c4_i4_w025_s1337.pt --budget 600.0
+[rank 0/8] exp24_dreamworld_c4_i4_w025_s1337 vocab=16384 batch=1024 chunk=64 ckpt=False params=10,751,232
+[rank5]: Traceback (most recent call last):
+[rank5]:   File "/workspace/chaoscontrol/experiments/23_fast_path/runner_fast_path.py", line 1488, in <module>
+[rank5]:     raise SystemExit(main())
+[rank5]:                      ^^^^^^
+[rank5]:   File "/workspace/chaoscontrol/experiments/23_fast_path/runner_fast_path.py", line 1475, in main
+[rank5]:     run_condition(
+[rank5]:   File "/workspace/chaoscontrol/experiments/23_fast_path/runner_fast_path.py", line 1316, in run_condition
+[rank5]:     train_result = train_fast_for_budget(
+[rank5]:                    ^^^^^^^^^^^^^^^^^^^^^^
+[rank5]:   File "/workspace/chaoscontrol/experiments/23_fast_path/runner_fast_path.py", line 1017, in train_fast_for_budget
+[rank5]:     and len(dream_buffer) >= int(dreamworld_min_size)
+[rank5]:         ^^^^^^^^^^^^^^^^^
+[rank5]: TypeError: object of type 'DreamReplayBuffer' has no len()
+[rank6]: Traceback (most recent call last):
+[rank6]:   File "/workspace/chaoscontrol/experiments/23_fast_path/runner_fast_path.py", line 1488, in <module>
+[rank6]:     raise SystemExit(main())
+[rank6]:                      ^^^^^^
+[rank6]:   File "/workspace/chaoscontrol/experiments/23_fast_path/runner_fast_path.py", line 1475, in main
+[rank6]:     run_condition(
+[rank6]:   File "/workspace/chaoscontrol/experiments/23_fast_path/runner_fast_path.py", line 1316, in run_condition
+[rank6]:     train_result = train_fast_for_budget(
+[rank6]:                    ^^^^^^^^^^^^^^^^^^^^^^
+[rank6]:   File "/workspace/chaoscontrol/experiments/23_fast_path/runner_fast_path.py", line 1017, in train_fast_for_budget
+[rank6]:     and len(dream_buffer) >= int(dreamworld_min_size)
+[rank6]:         ^^^^^^^^^^^^^^^^^
+[rank6]: TypeError: object of type 'DreamReplayBuffer' has no len()
+[rank0]: Traceback (most recent call last):
+[rank0]:   File "/workspace/chaoscontrol/experiments/23_fast_path/runner_fast_path.py", line 1488, in <module>
+[rank0]:     raise SystemExit(main())
+[rank0]:                      ^^^^^^
+[rank0]:   File "/workspace/chaoscontrol/experiments/23_fast_path/runner_fast_path.py", line 1475, in main
+[rank0]:     run_condition(
+[rank0]:   File "/workspace/chaoscontrol/experiments/23_fast_path/runner_fast_path.py", line 1316, in run_condition
+[rank0]:     train_result = train_fast_for_budget(
+[rank0]:                    ^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/workspace/chaoscontrol/experiments/23_fast_path/runner_fast_path.py", line 1017, in train_fast_for_budget
+[rank0]:     and len(dream_buffer) >= int(dreamworld_min_size)
+[rank0]:         ^^^^^^^^^^^^^^^^^
+[rank0]: TypeError: object of type 'DreamReplayBuffer' has no len()
+[rank1]: Traceback (most recent call last):
+[rank1]:   File "/workspace/chaoscontrol/experiments/23_fast_path/runner_fast_path.py", line 1488, in <module>
+[rank1]:     raise SystemExit(main())
+[rank1]:                      ^^^^^^
+[rank1]:   File "/workspace/chaoscontrol/experiments/23_fast_path/runner_fast_path.py", line 1475, in main
+[rank1]:     run_condition(
+[rank1]:   File "/workspace/chaoscontrol/experiments/23_fast_path/runner_fast_path.py", line 1316, in run_condition
+[rank1]:     train_result = train_fast_for_budget(
+[rank1]:                    ^^^^^^^^^^^^^^^^^^^^^^
+[rank1]:   File "/workspace/chaoscontrol/experiments/23_fast_path/runner_fast_path.py", line 1017, in train_fast_for_budget
+[rank1]:     and len(dream_buffer) >= int(dreamworld_min_size)
+[rank1]:         ^^^^^^^^^^^^^^^^^
+[rank1]: TypeError: object of type 'DreamReplayBuffer' has no len()
+[rank3]: Traceback (most recent call last):
+[rank3]:   File "/workspace/chaoscontrol/experiments/23_fast_path/runner_fast_path.py", line 1488, in <module>
+[rank3]:     raise SystemExit(main())
+[rank3]:                      ^^^^^^
+[rank3]:   File "/workspace/chaoscontrol/experiments/23_fast_path/runner_fast_path.py", line 1475, in main
+[rank3]:     run_condition(
+[rank3]:   File "/workspace/chaoscontrol/experiments/23_fast_path/runner_fast_path.py", line 1316, in run_condition
+[rank3]:     train_result = train_fast_for_budget(
+[rank3]:                    ^^^^^^^^^^^^^^^^^^^^^^
+[rank3]:   File "/workspace/chaoscontrol/experiments/23_fast_path/runner_fast_path.py", line 1017, in train_fast_for_budget
+[rank3]:     and len(dream_buffer) >= int(dreamworld_min_size)
+[rank3]:         ^^^^^^^^^^^^^^^^^
+[rank3]: TypeError: object of type 'DreamReplayBuffer' has no len()
+[rank4]: Traceback (most recent call last):
+[rank4]:   File "/workspace/chaoscontrol/experiments/23_fast_path/runner_fast_path.py", line 1488, in <module>
+[rank4]:     raise SystemExit(main())
+[rank4]:                      ^^^^^^
+[rank4]:   File "/workspace/chaoscontrol/experiments/23_fast_path/runner_fast_path.py", line 1475, in main
+[rank4]:     run_condition(
+[rank4]:   File "/workspace/chaoscontrol/experiments/23_fast_path/runner_fast_path.py", line 1316, in run_condition
+[rank4]:     train_result = train_fast_for_budget(
+[rank4]:                    ^^^^^^^^^^^^^^^^^^^^^^
+[rank4]:   File "/workspace/chaoscontrol/experiments/23_fast_path/runner_fast_path.py", line 1017, in train_fast_for_budget
+[rank4]:     and len(dream_buffer) >= int(dreamworld_min_size)
+[rank4]:         ^^^^^^^^^^^^^^^^^
+[rank4]: TypeError: object of type 'DreamReplayBuffer' has no len()
+[rank2]: Traceback (most recent call last):
+[rank2]:   File "/workspace/chaoscontrol/experiments/23_fast_path/runner_fast_path.py", line 1488, in <module>
+[rank2]:     raise SystemExit(main())
+[rank2]:                      ^^^^^^
+[rank2]:   File "/workspace/chaoscontrol/experiments/23_fast_path/runner_fast_path.py", line 1475, in main
+[rank2]:     run_condition(
+[rank2]:   File "/workspace/chaoscontrol/experiments/23_fast_path/runner_fast_path.py", line 1316, in run_condition
+[rank2]:     train_result = train_fast_for_budget(
+[rank2]:                    ^^^^^^^^^^^^^^^^^^^^^^
+[rank2]:   File "/workspace/chaoscontrol/experiments/23_fast_path/runner_fast_path.py", line 1017, in train_fast_for_budget
+[rank2]:     and len(dream_buffer) >= int(dreamworld_min_size)
+[rank2]:         ^^^^^^^^^^^^^^^^^
+[rank2]: TypeError: object of type 'DreamReplayBuffer' has no len()
+[rank7]: Traceback (most recent call last):
+[rank7]:   File "/workspace/chaoscontrol/experiments/23_fast_path/runner_fast_path.py", line 1488, in <module>
+[rank7]:     raise SystemExit(main())
+[rank7]:                      ^^^^^^
+[rank7]:   File "/workspace/chaoscontrol/experiments/23_fast_path/runner_fast_path.py", line 1475, in main
+[rank7]:     run_condition(
+[rank7]:   File "/workspace/chaoscontrol/experiments/23_fast_path/runner_fast_path.py", line 1316, in run_condition
+[rank7]:     train_result = train_fast_for_budget(
+[rank7]:                    ^^^^^^^^^^^^^^^^^^^^^^
+[rank7]:   File "/workspace/chaoscontrol/experiments/23_fast_path/runner_fast_path.py", line 1017, in train_fast_for_budget
+[rank7]:     and len(dream_buffer) >= int(dreamworld_min_size)
+[rank7]:         ^^^^^^^^^^^^^^^^^
+[rank7]: TypeError: object of type 'DreamReplayBuffer' has no len()
+[rank0]:[W422 15:39:09.926519617 ProcessGroupNCCL.cpp:1524] Warning: WARNING: destroy_process_group() was not called before program exit, which can leak resources. For more info, please see https://pytorch.org/docs/stable/distributed.html#shutdown (function operator())
+W0422 15:39:10.219000 3442 torch/distributed/elastic/multiprocessing/api.py:908] Sending process 3448 closing signal SIGTERM
+W0422 15:39:10.222000 3442 torch/distributed/elastic/multiprocessing/api.py:908] Sending process 3449 closing signal SIGTERM
+W0422 15:39:10.223000 3442 torch/distributed/elastic/multiprocessing/api.py:908] Sending process 3450 closing signal SIGTERM
+W0422 15:39:10.225000 3442 torch/distributed/elastic/multiprocessing/api.py:908] Sending process 3451 closing signal SIGTERM
+W0422 15:39:10.227000 3442 torch/distributed/elastic/multiprocessing/api.py:908] Sending process 3452 closing signal SIGTERM
+W0422 15:39:10.228000 3442 torch/distributed/elastic/multiprocessing/api.py:908] Sending process 3453 closing signal SIGTERM
+W0422 15:39:10.230000 3442 torch/distributed/elastic/multiprocessing/api.py:908] Sending process 3454 closing signal SIGTERM
+E0422 15:39:10.790000 3442 torch/distributed/elastic/multiprocessing/api.py:882] failed (exitcode: 1) local_rank: 0 (pid: 3447) of binary: /workspace/chaoscontrol/.venv/bin/python
+Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "/usr/local/lib/python3.12/dist-packages/torch/distributed/run.py", line 940, in <module>
+    main()
+  File "/usr/local/lib/python3.12/dist-packages/torch/distributed/elastic/multiprocessing/errors/__init__.py", line 357, in wrapper
+    return f(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/torch/distributed/run.py", line 936, in main
+    run(args)
+  File "/usr/local/lib/python3.12/dist-packages/torch/distributed/run.py", line 927, in run
+    elastic_launch(
+  File "/usr/local/lib/python3.12/dist-packages/torch/distributed/launcher/api.py", line 156, in __call__
+    return launch_agent(self._config, self._entrypoint, list(args))
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/torch/distributed/launcher/api.py", line 293, in launch_agent
+    raise ChildFailedError(
+torch.distributed.elastic.multiprocessing.errors.ChildFailedError: 
+============================================================
+/workspace/chaoscontrol/experiments/23_fast_path/runner_fast_path.py FAILED
+------------------------------------------------------------
+Failures:
+  <NO_OTHER_FAILURES>
+------------------------------------------------------------
+Root Cause (first observed failure):
+[0]:
+  time      : 2026-04-22_15:39:10
+  host      : 7c1e0c02125e
+  rank      : 0 (local_rank: 0)
+  exitcode  : 1 (pid: 3447)
+  error_file: <N/A>
+  traceback : To enable traceback see: https://pytorch.org/docs/stable/elastic/errors.html
+============================================================
+
+[returncode] 1
