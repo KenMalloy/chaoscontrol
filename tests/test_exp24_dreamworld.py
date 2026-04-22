@@ -160,3 +160,72 @@ def test_dreamworld_replay_backward_uses_cached_initial_state() -> None:
     assert model.encode_calls[0] == {"shape": (2, 2), "has_initial_states": True}
     assert model.embed.weight.grad is not None
     assert model.lm_head.weight.grad is not None
+
+
+def test_dreamworld_replay_backward_can_subbatch_and_use_fused_ce(monkeypatch) -> None:
+    mod = _load_module()
+    model = _TinyDreamModel(vocab_size=8)
+    entry = mod.DreamReplayEntry(
+        step=11,
+        states=[torch.ones(4, 4)],
+        replay_tokens=torch.tensor(
+            [
+                [1, 2, 3, 4],
+                [2, 3, 4, 5],
+                [3, 4, 5, 6],
+                [4, 5, 6, 7],
+            ],
+            dtype=torch.long,
+        ),
+    )
+    calls: dict[str, object] = {}
+
+    def fake_backend_for_mode(mode: str) -> str:
+        calls["mode"] = mode
+        return "streaming_v2"
+
+    def fake_fused_backward(
+        hidden: torch.Tensor,
+        final_norm: nn.Module,
+        lm_head: nn.Linear,
+        targets: torch.Tensor,
+        *,
+        backend: str,
+        tile_size: int,
+        loss_weight: float,
+    ) -> torch.Tensor:
+        calls["hidden_shape"] = tuple(hidden.shape)
+        calls["target_shape"] = tuple(targets.shape)
+        calls["backend"] = backend
+        calls["tile_size"] = tile_size
+        calls["loss_weight"] = loss_weight
+        loss = final_norm(hidden).mean() + 0.01 * lm_head.weight.mean()
+        (loss * loss_weight).backward()
+        return loss.detach()
+
+    monkeypatch.setattr(mod, "fused_lm_head_backend_for_mode", fake_backend_for_mode)
+    monkeypatch.setattr(mod, "fused_lm_head_backward", fake_fused_backward)
+
+    loss = mod.dreamworld_replay_backward(
+        model,
+        entry,
+        weight=0.5,
+        lm_head_backward_mode="fused_streaming_v2",
+        lm_head_tile_size=8192,
+        replay_batch_size=2,
+        generator=torch.Generator().manual_seed(0),
+    )
+
+    assert loss.requires_grad is False
+    assert len(model.encode_calls) == 1
+    assert model.encode_calls[0] == {"shape": (2, 3), "has_initial_states": True}
+    assert calls == {
+        "mode": "fused_streaming_v2",
+        "hidden_shape": (2, 3, 4),
+        "target_shape": (2, 3),
+        "backend": "streaming_v2",
+        "tile_size": 8192,
+        "loss_weight": 0.5,
+    }
+    assert model.embed.weight.grad is not None
+    assert model.lm_head.weight.grad is not None

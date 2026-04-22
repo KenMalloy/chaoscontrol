@@ -129,6 +129,8 @@ def full_lm_head_backward(
     final_norm: nn.Module,
     lm_head: nn.Linear,
     targets: torch.Tensor,
+    *,
+    loss_weight: float = 1.0,
 ) -> torch.Tensor:
     """Run final norm + LM head + CE as one autograd graph.
 
@@ -144,7 +146,7 @@ def full_lm_head_backward(
         targets.reshape(-1),
         reduction="mean",
     )
-    loss.backward()
+    (loss * float(loss_weight)).backward()
     return loss.detach()
 
 
@@ -156,6 +158,7 @@ def fused_lm_head_backward(
     *,
     backend: str = "auto",
     tile_size: int = 1024,
+    loss_weight: float = 1.0,
 ) -> torch.Tensor:
     """LM-head backward using native fused pieces where available.
 
@@ -167,7 +170,13 @@ def fused_lm_head_backward(
     weight = getattr(final_norm, "weight", None)
     eps = float(getattr(final_norm, "eps", 1e-6))
     if weight is None:
-        return full_lm_head_backward(hidden, final_norm, lm_head, targets)
+        return full_lm_head_backward(
+            hidden,
+            final_norm,
+            lm_head,
+            targets,
+            loss_weight=loss_weight,
+        )
 
     backend_name = str(backend).strip().lower()
     if backend_name == "norm_streaming_v2":
@@ -191,7 +200,7 @@ def fused_lm_head_backward(
             backend=backend,
             tile_size=int(tile_size),
         )
-    loss.backward()
+    (loss * float(loss_weight)).backward()
     return loss.detach()
 
 

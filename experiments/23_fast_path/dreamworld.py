@@ -13,6 +13,18 @@ from dataclasses import dataclass
 from typing import Any
 
 import torch
+import torch.nn.functional as F
+
+try:
+    from chaoscontrol.train_ssm import (
+        full_lm_head_backward,
+        fused_lm_head_backend_for_mode,
+        fused_lm_head_backward,
+    )
+except Exception:  # pragma: no cover - local import fallback for primitive tests.
+    full_lm_head_backward = None
+    fused_lm_head_backend_for_mode = None
+    fused_lm_head_backward = None
 
 
 @dataclass
@@ -161,12 +173,43 @@ def capture_dream_entry(
     return DreamReplayEntry(step=step, states=states, replay_tokens=replay)
 
 
+def _subsample_replay_entry(
+    entry: DreamReplayEntry,
+    *,
+    replay_batch_size: int,
+    generator: torch.Generator | None,
+) -> DreamReplayEntry:
+    batch = int(entry.replay_tokens.shape[0])
+    size = int(replay_batch_size)
+    if size <= 0 or size >= batch:
+        return entry
+
+    row_idx_cpu = torch.randperm(batch, generator=generator)[:size]
+    replay_idx = row_idx_cpu.to(device=entry.replay_tokens.device)
+    replay = entry.replay_tokens.index_select(0, replay_idx)
+    states = [
+        state.index_select(0, row_idx_cpu.to(device=state.device))
+        for state in entry.states
+    ]
+    return DreamReplayEntry(step=entry.step, states=states, replay_tokens=replay)
+
+
 def dreamworld_replay_backward(
     model: Any,
     entry: DreamReplayEntry,
     weight: float,
+    *,
+    lm_head_backward_mode: str = "single",
+    lm_head_tile_size: int = 1024,
+    replay_batch_size: int = 0,
+    generator: torch.Generator | None = None,
 ) -> torch.Tensor:
     """Run one teacher-forced replay backward pass and return unweighted loss."""
+    entry = _subsample_replay_entry(
+        entry,
+        replay_batch_size=replay_batch_size,
+        generator=generator,
+    )
     device = next(model.parameters()).device
     states = [state.to(device=device) for state in entry.states]
     replay = entry.replay_tokens.to(device=device)
@@ -174,11 +217,34 @@ def dreamworld_replay_backward(
     targets = replay[:, 1:].to(torch.long)
 
     hidden = model.encode(replay_inputs, initial_states=states, return_final_states=False)
-    logits = model.lm_head(model.final_norm(hidden))
-    loss = torch.nn.functional.cross_entropy(
-        logits.reshape(-1, logits.size(-1)),
-        targets.reshape(-1),
-        reduction="mean",
+    mode = str(lm_head_backward_mode).strip().lower()
+    if mode == "single" or fused_lm_head_backward is None:
+        if full_lm_head_backward is not None:
+            return full_lm_head_backward(
+                hidden,
+                model.final_norm,
+                model.lm_head,
+                targets,
+                loss_weight=float(weight),
+            )
+        logits = model.lm_head(model.final_norm(hidden))
+        loss = F.cross_entropy(
+            logits.reshape(-1, logits.size(-1)),
+            targets.reshape(-1),
+            reduction="mean",
+        )
+        (loss * float(weight)).backward()
+        return loss.detach()
+
+    if fused_lm_head_backend_for_mode is None:
+        raise RuntimeError("fused LM-head backend resolver is unavailable")
+    backend_name = fused_lm_head_backend_for_mode(mode)
+    return fused_lm_head_backward(
+        hidden=hidden,
+        final_norm=model.final_norm,
+        lm_head=model.lm_head,
+        targets=targets,
+        backend=backend_name,
+        tile_size=int(lm_head_tile_size),
+        loss_weight=float(weight),
     )
-    (loss * weight).backward()
-    return loss.detach()

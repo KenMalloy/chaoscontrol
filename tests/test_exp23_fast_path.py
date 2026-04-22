@@ -109,6 +109,19 @@ class _TinyTokenTrainModel(nn.Module):
         return self.embed(inputs)
 
 
+class _TinyScOptLayerModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.embed = nn.Embedding(6, 4)
+        self.layers = nn.ModuleList([nn.Module()])
+        self.layers[0].core = nn.Linear(4, 4, bias=False)
+        self.final_norm = nn.Identity()
+        self.lm_head = nn.Linear(4, 6, bias=False)
+
+    def encode(self, inputs: torch.Tensor) -> torch.Tensor:
+        return self.layers[0].core(self.embed(inputs))
+
+
 def _load_launch_module():
     spec = importlib.util.spec_from_file_location("exp23_launch", LAUNCH_PATH)
     assert spec is not None and spec.loader is not None
@@ -172,6 +185,254 @@ def test_build_optimizer_can_create_semantic_optimizer(monkeypatch):
     }
     assert optimizer.kwargs["momentum_min"] == 0.25
     assert optimizer.bound_named_params is not None
+
+
+def test_build_optimizer_can_create_scarcity_optimizer(monkeypatch):
+    mod = _load_runner_module()
+
+    class FakeScOpt(torch.optim.SGD):
+        def __init__(self, params, **kwargs):
+            self.kwargs = dict(kwargs)
+            super().__init__(params, lr=kwargs["lr"])
+            self.bound_named_params = None
+
+        def bind_param_names(self, named_params):
+            self.bound_named_params = list(named_params)
+
+    monkeypatch.setattr(mod, "ScarcityAwareOptimizer", FakeScOpt)
+
+    model = _TinySemanticModel()
+    optimizer = mod._build_optimizer(
+        {
+            "optimizer": "scopt",
+            "base_lr": 0.01,
+            "weight_decay": 0.02,
+            "scopt_layer_index": 0,
+            "scopt_warmup_steps": 12,
+            "scopt_rare_ema_decay": 0.8,
+            "scopt_rare_orthogonal_weight": 0.75,
+        },
+        model,
+    )
+
+    assert isinstance(optimizer, FakeScOpt)
+    assert optimizer.kwargs["warmup_steps"] == 12
+    assert optimizer.kwargs["rare_ema_decay"] == 0.8
+    assert optimizer.kwargs["rare_orthogonal_weight"] == 0.75
+    assert optimizer.kwargs["row_param_names"] == {"embed.weight", "lm_head.weight"}
+    assert optimizer.kwargs["matrix_scarcity_map"] == {
+        "layers.0.core.in_proj.weight": (
+            "layers.0.core.in_proj.__out__",
+            "layers.0.core.in_proj.__in__",
+        ),
+        "layers.0.core.select_proj.weight": (
+            "layers.0.core.select_proj.__out__",
+            "layers.0.core.select_proj.__in__",
+        ),
+        "layers.0.core.gate_proj.weight": (
+            "layers.0.core.gate_proj.__out__",
+            "layers.0.core.gate_proj.__in__",
+        ),
+        "layers.0.core.delta_proj.weight": (
+            "layers.0.core.delta_proj.__out__",
+            "layers.0.core.delta_proj.__in__",
+        ),
+        "layers.0.core.out_proj.weight": (
+            "layers.0.core.out_proj.__out__",
+            "layers.0.core.out_proj.__in__",
+        ),
+    }
+    assert optimizer.kwargs["recurrence_scarcity_map"] == {
+        "layers.0.core.log_a": "layers.0.core.in_proj.__out__",
+    }
+    assert optimizer.bound_named_params is not None
+
+
+def test_scopt_train_step_updates_rare_and_row_state():
+    mod = _load_runner_module()
+    from chaoscontrol.optim.scopt import ScarcityAwareOptimizer
+
+    torch.manual_seed(0)
+    model = _TinyTokenTrainModel()
+    optimizer = ScarcityAwareOptimizer(
+        model.parameters(),
+        lr=0.01,
+        momentum=0.0,
+        nesterov=False,
+        ns_steps=1,
+        weight_decay=0.0,
+        warmup_steps=0,
+        compute_dtype=torch.float32,
+    )
+    optimizer.bind_param_names(list(model.named_parameters()))
+    inputs = torch.tensor([[0, 1, 2], [1, 2, 3]])
+    targets = torch.tensor([[1, 2, 3], [2, 3, 4]])
+    token_frequencies = torch.ones(6)
+
+    loss, pending = mod._run_scopt_train_step(
+        model=model,
+        optimizer=optimizer,
+        inputs=inputs,
+        targets=targets,
+        token_frequencies=token_frequencies,
+        precision="fp32",
+        ddp_active=False,
+        world_size=1,
+        step=0,
+        split_interval=1,
+    )
+    mod._apply_scopt_pending(optimizer, pending, skip=False)
+
+    assert loss.ndim == 0
+    assert optimizer.state[model.embed.weight]["rare_grad_ema"].abs().sum() > 0
+    assert optimizer.state[model.lm_head.weight]["rare_grad_ema"].abs().sum() > 0
+    trace = optimizer.scarcity_trace()
+    assert trace["row_pressure"]["max"] > 0.0
+    assert "pressure_stats" in trace
+
+
+def test_scopt_train_step_sets_channel_pressure_from_activation_gradients():
+    mod = _load_runner_module()
+    from chaoscontrol.optim.scopt import ScarcityAwareOptimizer
+
+    torch.manual_seed(1)
+    model = _TinyScOptLayerModel()
+    optimizer = ScarcityAwareOptimizer(
+        model.parameters(),
+        lr=0.01,
+        momentum=0.0,
+        nesterov=False,
+        ns_steps=1,
+        weight_decay=0.0,
+        warmup_steps=0,
+        matrix_scarcity_map={
+            "layers.0.core.weight": (
+                "layers.0.core.__out__",
+                "layers.0.core.__in__",
+            ),
+        },
+        compute_dtype=torch.float32,
+    )
+    optimizer.bind_param_names(list(model.named_parameters()))
+
+    _, pending = mod._run_scopt_train_step(
+        model=model,
+        optimizer=optimizer,
+        inputs=torch.tensor([[0, 1, 2]]),
+        targets=torch.tensor([[1, 2, 3]]),
+        token_frequencies=torch.ones(6),
+        precision="fp32",
+        ddp_active=False,
+        world_size=1,
+        step=0,
+        split_interval=1,
+    )
+    mod._apply_scopt_pending(optimizer, pending, skip=False)
+
+    trace = optimizer.scarcity_trace()
+    assert "layers.0.core.__out__" in trace["channel_pressure_keys"]
+    assert "layers.0.core.__in__" in trace["channel_pressure_keys"]
+
+
+def test_scopt_optimizer_config_matches_real_chaos_ssm_core():
+    """Smoke-test against a real ChaosSSMCore. The tiny test models
+    above cover submodule naming convention but can't verify the map
+    actually hits the real block's projections — reviewer flagged this
+    gap after C5/C6 shipped broken last time against the real core."""
+    mod = _load_runner_module()
+    from chaoscontrol.core import ChaosSSMCore
+
+    class _RealCoreShell(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embed = nn.Embedding(8, 6)
+            self.layers = nn.ModuleList([nn.Module()])
+            self.layers[0].core = ChaosSSMCore(dim=6, a_mode="diag")
+            self.final_norm = nn.Identity()
+            self.lm_head = nn.Linear(6, 8, bias=False)
+
+        def encode(self, inputs):
+            x = self.embed(inputs)
+            return self.layers[0].core(x)
+
+    model = _RealCoreShell()
+    config = mod._scopt_optimizer_config(model, layer_index=0)
+    matrix_map = config["matrix_scarcity_map"]
+    expected_weights = {
+        "layers.0.core.in_proj.weight",
+        "layers.0.core.select_proj.weight",
+        "layers.0.core.gate_proj.weight",
+        "layers.0.core.delta_proj.weight",
+        "layers.0.core.out_proj.weight",
+    }
+    assert set(matrix_map.keys()) == expected_weights
+    for param_name, (out_key, in_key) in matrix_map.items():
+        assert out_key is not None and in_key is not None
+        base = param_name.removesuffix(".weight")
+        assert out_key == f"{base}.__out__"
+        assert in_key == f"{base}.__in__"
+    assert config["recurrence_scarcity_map"] == {
+        "layers.0.core.log_a": "layers.0.core.in_proj.__out__",
+    }
+
+
+def test_scopt_realistic_core_hooks_fire_on_real_projections():
+    """Every mapped submodule's pre+post hooks must actually capture
+    tensors during the real ChaosSSMCore forward pass."""
+    mod = _load_runner_module()
+    from chaoscontrol.core import ChaosSSMCore
+    from chaoscontrol.optim.scopt import ScarcityAwareOptimizer
+
+    class _RealCoreShell(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embed = nn.Embedding(8, 6)
+            self.layers = nn.ModuleList([nn.Module()])
+            self.layers[0].core = ChaosSSMCore(dim=6, a_mode="diag")
+            self.final_norm = nn.Identity()
+            self.lm_head = nn.Linear(6, 8, bias=False)
+
+        def encode(self, inputs):
+            x = self.embed(inputs)
+            return self.layers[0].core(x)
+
+    torch.manual_seed(2)
+    model = _RealCoreShell()
+    opt_cfg = mod._scopt_optimizer_config(model, layer_index=0)
+    optimizer = ScarcityAwareOptimizer(
+        model.parameters(),
+        lr=0.01,
+        momentum=0.0,
+        nesterov=False,
+        ns_steps=1,
+        weight_decay=0.0,
+        warmup_steps=0,
+        compute_dtype=torch.float32,
+        **opt_cfg,
+    )
+    optimizer.bind_param_names(list(model.named_parameters()))
+
+    _, pending = mod._run_scopt_train_step(
+        model=model,
+        optimizer=optimizer,
+        inputs=torch.tensor([[0, 1, 2, 3]]),
+        targets=torch.tensor([[1, 2, 3, 4]]),
+        token_frequencies=torch.ones(8),
+        precision="fp32",
+        ddp_active=False,
+        world_size=1,
+        step=0,
+        split_interval=1,
+    )
+    assert pending is not None
+    keys = {key for key, _ in pending.channel_pressure_items}
+    for submodule in ("in_proj", "select_proj", "gate_proj", "delta_proj", "out_proj"):
+        assert f"layers.0.core.{submodule}.__in__" in keys, (
+            f"missing pre-hook for {submodule}"
+        )
+        assert f"layers.0.core.{submodule}.__out__" in keys, (
+            f"missing post-hook for {submodule}"
+        )
 
 
 def test_runner_defaults_to_native_scan_without_inductor():
@@ -1524,7 +1785,7 @@ def test_train_fast_for_budget_runs_dreamworld_replay(monkeypatch):
     monkeypatch.setattr(
         mod,
         "dreamworld_replay_backward",
-        lambda model, *, entry, weight: torch.tensor(0.1),
+        lambda model, *, entry, weight, **kwargs: torch.tensor(0.1),
     )
 
     model = _TinyTokenTrainModel()

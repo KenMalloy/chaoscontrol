@@ -24,6 +24,7 @@ sys.path.insert(0, str(REPO / "src"))
 
 from exp24 import (  # noqa: E402
     DEFAULT_CONTROL_SEEDS,
+    build_fastslow_dreamworld_matrix,
     build_first_wave_mechanism_matrix,
     build_phase_a_sampling_matrix,
     build_ring0_control_matrix,
@@ -91,6 +92,13 @@ def _build_entries(
             budget_seconds=budget_seconds,
             seed_values=seeds,
         )
+    if matrix == "fastslow_dreamworld":
+        return build_fastslow_dreamworld_matrix(
+            speed_config=speed_config,
+            world_size=world_size,
+            budget_seconds=budget_seconds,
+            seed_values=seeds,
+        )
     if matrix == "all":
         entries: list[dict[str, Any]] = []
         entries.extend(
@@ -139,6 +147,7 @@ def main(argv: list[str] | None = None) -> int:
             "phase_a_sampling",
             "semantic_overhead_gate",
             "first_wave",
+            "fastslow_dreamworld",
             "all",
         ],
         default="all",

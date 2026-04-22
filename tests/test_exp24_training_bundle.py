@@ -140,6 +140,7 @@ def test_first_wave_mechanism_matrix_names_and_tags():
         "exp24_spectral_dead1e-04_sticky1e-04_s1337",
         "exp24_predictive_h4_w010_s1337",
         "exp24_dreamworld_c4_i4_w025_s1337",
+        "exp24_fastslow_i32_a050_dreamworld_c8_i8_w025_sub128_s1337",
     ]
 
     mechanisms = {entry["exp24_mechanism"] for entry in entries}
@@ -148,6 +149,7 @@ def test_first_wave_mechanism_matrix_names_and_tags():
         "spectral",
         "predictive_aux",
         "dreamworld",
+        "fast_slow_dreamworld",
     }
 
     fastslow = next(
@@ -183,6 +185,42 @@ def test_first_wave_mechanism_matrix_names_and_tags():
     assert dream["dreamworld_interval"] == 4
     assert dream["dreamworld_weight"] == 0.25
     assert dream["artifact_impact"] == "artifact_training_only"
+
+    stack = next(
+        entry
+        for entry in entries
+        if entry["name"]
+        == "exp24_fastslow_i32_a050_dreamworld_c8_i8_w025_sub128_s1337"
+    )
+    assert stack["exp24_mechanism"] == "fast_slow_dreamworld"
+    assert stack["fast_slow_enabled"] is True
+    assert stack["fast_slow_interval"] == 32
+    assert stack["fast_slow_alpha"] == 0.5
+    assert stack["fast_slow_eval_copy"] == "slow"
+    assert stack["dreamworld_enabled"] is True
+    assert stack["dreamworld_cache_interval"] == 8
+    assert stack["dreamworld_interval"] == 8
+    assert stack["dreamworld_weight"] == 0.25
+    assert stack["dreamworld_replay_batch_size"] == 128
+    assert stack["artifact_impact"] == "artifact_training_only"
+
+
+def test_fastslow_dreamworld_matrix_is_stack_only():
+    mod = _load_exp24()
+
+    entries = mod.build_fastslow_dreamworld_matrix(
+        speed_config={"batch_size": 1024, "chunk_size": 64},
+        seed_values=[1337, 2674],
+        world_size=8,
+    )
+
+    assert [entry["name"] for entry in entries] == [
+        "exp24_fastslow_i32_a050_dreamworld_c8_i8_w025_sub128_s1337",
+        "exp24_fastslow_i32_a050_dreamworld_c8_i8_w025_sub128_s2674",
+    ]
+    assert all(entry["exp24_mechanism"] == "fast_slow_dreamworld" for entry in entries)
+    assert all(entry["fast_slow_enabled"] is True for entry in entries)
+    assert all(entry["dreamworld_enabled"] is True for entry in entries)
 
 
 def test_run_exp24_cli_dry_run_prints_first_wave_plan(tmp_path):
@@ -267,3 +305,31 @@ def test_run_exp24_cli_semantic_gate_defaults_to_cheap_smoke(tmp_path):
     assert '"budget_seconds": 90.0' in stdout
     assert "--nproc_per_node=1" in stdout
     assert '"--budget",\n      "90.0"' in stdout
+
+
+def test_run_exp24_cli_fastslow_dreamworld_matrix_is_stack_only(tmp_path):
+    script = REPO / "experiments" / "24_training_time_bundle" / "run_exp24.py"
+    output_dir = tmp_path / "exp24-fastslow-dreamworld-dryrun"
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(script),
+            "--matrix",
+            "fastslow_dreamworld",
+            "--seeds",
+            "1337",
+            "--dry-run",
+            "--output-dir",
+            str(output_dir),
+        ],
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    stdout = result.stdout
+    assert "matrix=fastslow_dreamworld" in stdout
+    assert "entries=1" in stdout
+    assert "exp24_fastslow_i32_a050_dreamworld_c8_i8_w025_sub128_s1337" in stdout
+    assert '"exp24_mechanism": "fast_slow_dreamworld"' in stdout

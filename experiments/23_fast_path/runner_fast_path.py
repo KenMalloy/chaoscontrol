@@ -21,6 +21,7 @@ from typing import Any
 import numpy as np
 import torch
 import torch.distributed as dist
+import torch.nn.functional as F
 import yaml
 
 REPO = Path(__file__).resolve().parents[2]
@@ -64,6 +65,11 @@ from chaoscontrol.distributed import (  # noqa: E402
 )
 from chaoscontrol.optim.lamb import LAMB  # noqa: E402
 from chaoscontrol.optim.muon import Muon  # noqa: E402
+from chaoscontrol.optim.scopt import (  # noqa: E402
+    FrequencyBucketBaseline,
+    ScarcityAwareOptimizer,
+    scarcity_pressure_from_ce,
+)
 from chaoscontrol.optim.semantic import SemanticOptimizer  # noqa: E402
 from chaoscontrol.precision import autocast_context  # noqa: E402
 from chaoscontrol.train_ssm import (  # noqa: E402
@@ -178,6 +184,28 @@ def _build_optimizer(
         )
         opt.bind_param_names(list(model.named_parameters()))
         return opt
+    if name in {"scopt", "scarcity", "scarcity_aware"}:
+        scopt_cfg = _scopt_optimizer_config(
+            model,
+            int(config.get("scopt_layer_index", 0)),
+        )
+        opt = ScarcityAwareOptimizer(
+            params,
+            lr=base_lr,
+            weight_decay=weight_decay,
+            adamw_lr=base_lr,
+            adamw_weight_decay=weight_decay,
+            warmup_steps=int(config.get("scopt_warmup_steps", 200)),
+            rare_ema_decay=float(config.get("scopt_rare_ema_decay", 0.9)),
+            rare_orthogonal_weight=float(
+                config.get("scopt_rare_orthogonal_weight", 1.0)
+            ),
+            row_scarcity_power=float(config.get("scopt_row_scarcity_power", 0.5)),
+            tau_std_scale=float(config.get("scopt_tau_std_scale", 0.5)),
+            **scopt_cfg,
+        )
+        opt.bind_param_names(list(model.named_parameters()))
+        return opt
     raise ValueError(f"unknown optimizer {name!r}")
 
 
@@ -215,6 +243,75 @@ def _semantic_optimizer_config(
     }
 
 
+def _scopt_optimizer_config(
+    model: torch.nn.Module,
+    layer_index: int,
+) -> dict[str, Any]:
+    """Build ScOpt's per-submatrix two-sided scarcity map.
+
+    For each projection submodule we register both a forward pre-hook
+    (input activation) and a forward hook (output activation). The
+    matrix scarcity map then references each submatrix's own input and
+    output channels so ``L · G · R`` is genuinely two-sided rather than
+    collapsing to a single per-block signal.
+    """
+    prefix = f"layers.{int(layer_index)}.core"
+    named_params = {name for name, _ in model.named_parameters()}
+    named_modules = {name for name, _ in model.named_modules()}
+    if f"{prefix}.log_a" not in named_params:
+        raise ValueError(f"ScOpt requires {prefix + '.log_a'!r}")
+
+    projection_candidates = (
+        "in_proj",
+        "select_proj",
+        "gate_proj",
+        "delta_proj",
+        "out_proj",
+    )
+    present = [s for s in projection_candidates if f"{prefix}.{s}" in named_modules]
+    if not present:
+        raise ValueError(
+            f"ScOpt requires projection submodules under {prefix!r}"
+        )
+
+    matrix_scarcity_map: dict[str, tuple[str | None, str | None]] = {}
+    for sub in present:
+        weight_name = f"{prefix}.{sub}.weight"
+        if weight_name not in named_params:
+            continue
+        # out_key is this submodule's own output; in_key is its input.
+        # For in/select/gate/delta_proj, the input is the block's input
+        # (shared across all four). For out_proj, the input is the
+        # gated state (internal channel).
+        matrix_scarcity_map[weight_name] = (
+            f"{prefix}.{sub}.__out__",
+            f"{prefix}.{sub}.__in__",
+        )
+    if not matrix_scarcity_map:
+        raise ValueError(
+            "ScOpt requires at least one channel-coupled matrix "
+            f"under {prefix!r}"
+        )
+
+    # log_a is per-internal-channel (dim). The in_proj output carries
+    # that axis directly; prefer it, fall back to any projection that's
+    # present (all of in/select/gate_proj share the internal dim).
+    for sub in ("in_proj", "select_proj", "gate_proj"):
+        if sub in present:
+            recurrence_source = f"{prefix}.{sub}.__out__"
+            break
+    else:
+        recurrence_source = f"{prefix}.{present[0]}.__out__"
+
+    recurrence_scarcity_map = {f"{prefix}.log_a": recurrence_source}
+
+    return {
+        "row_param_names": {"embed.weight", "lm_head.weight"},
+        "matrix_scarcity_map": matrix_scarcity_map,
+        "recurrence_scarcity_map": recurrence_scarcity_map,
+    }
+
+
 def _optimizer_diagnostics(optimizer: torch.optim.Optimizer) -> dict[str, Any]:
     diagnostics = {
         "type": optimizer.__class__.__name__,
@@ -230,7 +327,339 @@ def _optimizer_diagnostics(optimizer: torch.optim.Optimizer) -> dict[str, Any]:
                 for key in ("beta_min", "beta_max", "beta_mean")
                 if key in trace
             }
+    scarcity_trace = getattr(optimizer, "scarcity_trace", None)
+    if callable(scarcity_trace):
+        diagnostics["scarcity_trace"] = scarcity_trace()
     return diagnostics
+
+
+def _average_dense_tensors(
+    tensors: list[torch.Tensor],
+    *,
+    world_size: int,
+) -> None:
+    if world_size <= 1:
+        return
+    for tensor in tensors:
+        dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+        tensor.div_(world_size)
+
+
+def _module_by_qualified_name(
+    model: torch.nn.Module,
+    name: str,
+) -> torch.nn.Module | None:
+    modules = dict(model.named_modules())
+    return modules.get(name)
+
+
+def _scopt_activation_keys(optimizer: ScarcityAwareOptimizer) -> set[str]:
+    """All activation keys referenced by ScOpt's scarcity maps."""
+    keys: set[str] = set()
+    for out_key, in_key in getattr(optimizer, "_matrix_scarcity_map", {}).values():
+        if out_key is not None:
+            keys.add(str(out_key))
+        if in_key is not None:
+            keys.add(str(in_key))
+    for key in getattr(optimizer, "_recurrence_scarcity_map", {}).values():
+        keys.add(str(key))
+    return keys
+
+
+def _base_module_names(keys: set[str]) -> set[str]:
+    """Strip ``.__in__`` / ``.__out__`` suffixes to module qualnames."""
+    bases: set[str] = set()
+    for key in keys:
+        if key.endswith(".__in__"):
+            bases.add(key[: -len(".__in__")])
+        elif key.endswith(".__out__"):
+            bases.add(key[: -len(".__out__")])
+        else:
+            bases.add(key)
+    return bases
+
+
+def _register_scopt_activation_hooks(
+    model: torch.nn.Module,
+    keys: set[str],
+) -> tuple[dict[str, torch.Tensor], list[Any]]:
+    """Register forward pre-hooks (inputs) and forward hooks (outputs).
+
+    Each base module named in ``keys`` gets both hooks; the ``__in__``
+    activation captures the first positional arg, and the ``__out__``
+    activation captures the module's return. Only tensors that require
+    grad are stored (so downstream autograd.grad can use them).
+    """
+    activations: dict[str, torch.Tensor] = {}
+    handles: list[Any] = []
+    modules = dict(model.named_modules())
+
+    def _make_pre_hook(capture_key: str):
+        def hook(_module, args):
+            if not args:
+                return
+            tensor = args[0]
+            if isinstance(tensor, torch.Tensor) and tensor.requires_grad:
+                activations[capture_key] = tensor
+
+        return hook
+
+    def _make_post_hook(capture_key: str):
+        def hook(_module, _args, output):
+            tensor = output[0] if isinstance(output, tuple) else output
+            if isinstance(tensor, torch.Tensor) and tensor.requires_grad:
+                activations[capture_key] = tensor
+
+        return hook
+
+    for base in sorted(_base_module_names(keys)):
+        module = modules.get(base)
+        if module is None:
+            continue
+        in_key = f"{base}.__in__"
+        out_key = f"{base}.__out__"
+        if in_key in keys:
+            handles.append(module.register_forward_pre_hook(_make_pre_hook(in_key)))
+        if out_key in keys or base in keys:
+            # Legacy callers that pass a bare module name get the output
+            # under that exact key (no suffix) for backward compatibility
+            # with tests that predate the in/out split.
+            legacy_key = base if base in keys else out_key
+            handles.append(module.register_forward_hook(_make_post_hook(legacy_key)))
+    return activations, handles
+
+
+class _ScOptPending:
+    """Rare-side outputs staged for post-clip commit.
+
+    Built inside ``_run_scopt_train_step`` on split steps and applied
+    after grad-clip so that clipped-batch rare gradients can be rejected
+    (spec line 186). Channel-pressure keys are stored sorted so ranks
+    all-reduce in matching order.
+    """
+
+    __slots__ = (
+        "rare_map",
+        "channel_pressure_items",
+        "row_pressure",
+        "pressure_stats",
+    )
+
+    def __init__(
+        self,
+        *,
+        rare_map: dict[str, torch.Tensor],
+        channel_pressure_items: list[tuple[str, torch.Tensor]],
+        row_pressure: torch.Tensor | None,
+        pressure_stats: dict[str, float],
+    ) -> None:
+        self.rare_map = rare_map
+        self.channel_pressure_items = channel_pressure_items
+        self.row_pressure = row_pressure
+        self.pressure_stats = pressure_stats
+
+
+def _pressure_summary(pressure: torch.Tensor) -> dict[str, float]:
+    with torch.no_grad():
+        flat = pressure.detach().float().reshape(-1)
+        total = int(flat.numel())
+        if total == 0:
+            return {}
+        positive = (flat > 0).sum().item()
+        return {
+            "min": float(flat.min()),
+            "median": float(flat.median()),
+            "p95": float(torch.quantile(flat, 0.95)),
+            "max": float(flat.max()),
+            "fraction_positive": float(positive) / float(total),
+        }
+
+
+def _apply_scopt_pending(
+    optimizer: ScarcityAwareOptimizer,
+    pending: _ScOptPending | None,
+    *,
+    skip: bool,
+) -> None:
+    """Commit deferred rare-side updates after grad-clip decision.
+
+    ``skip=True`` discards rare_grad_ema and channel_pressure for this
+    step (clipped gradients are noisy per spec line 186). Row pressure
+    is derived from CE rather than gradients and is applied either way.
+    Pressure distribution stats are always recorded for telemetry.
+    """
+    if pending is None:
+        return
+    optimizer.record_pressure_stats(pending.pressure_stats)
+    if pending.row_pressure is not None:
+        optimizer.set_row_pressure_ema(pending.row_pressure)
+    if skip:
+        return
+    optimizer.update_rare_grad_ema(pending.rare_map)
+    if pending.channel_pressure_items:
+        optimizer.set_channel_pressure(dict(pending.channel_pressure_items))
+
+
+def _run_scopt_train_step(
+    *,
+    model: torch.nn.Module,
+    optimizer: ScarcityAwareOptimizer,
+    inputs: torch.Tensor,
+    targets: torch.Tensor,
+    token_frequencies: torch.Tensor,
+    precision: str,
+    ddp_active: bool,
+    world_size: int,
+    step: int,
+    split_interval: int = 4,
+    baseline: FrequencyBucketBaseline | torch.Tensor | float | None = None,
+) -> tuple[torch.Tensor, _ScOptPending | None]:
+    """ScOpt training step with retained graph and rare-grad split.
+
+    Returns ``(loss, pending)`` where ``pending`` is ``None`` on
+    non-split steps. The caller must invoke ``_apply_scopt_pending``
+    after grad-clip so a clipped step can reject its rare contribution.
+    ``baseline`` may be a :class:`FrequencyBucketBaseline` (whose
+    per-bucket EMA is updated in-place from the current CE), a tensor,
+    a scalar, or ``None`` (bucket baseline is the expected default).
+    """
+    _reject_unsupported(model)
+    split_every = max(1, int(split_interval))
+    is_split_step = int(step) % split_every == 0
+    named_params = [
+        (name, param)
+        for name, param in model.named_parameters()
+        if param.requires_grad
+    ]
+    params = [param for _, param in named_params]
+    activations: dict[str, torch.Tensor] = {}
+    hook_handles: list[Any] = []
+    if is_split_step:
+        activations, hook_handles = _register_scopt_activation_hooks(
+            model,
+            _scopt_activation_keys(optimizer),
+        )
+    with autocast_context(precision, device_type=inputs.device.type):
+        try:
+            hidden = model.encode(inputs)
+        finally:
+            for handle in hook_handles:
+                handle.remove()
+        logits = model.lm_head(model.final_norm(hidden))
+        vocab = logits.size(-1)
+        ce = F.cross_entropy(
+            logits.reshape(-1, vocab).float(),
+            targets.reshape(-1),
+            reduction="none",
+        ).reshape_as(targets)
+        if isinstance(baseline, FrequencyBucketBaseline):
+            baseline_value: torch.Tensor | float | None = baseline.baseline(targets)
+            baseline.update(ce, targets)
+        elif baseline is None:
+            baseline_value = 0.0
+        else:
+            baseline_value = baseline
+        pressure = scarcity_pressure_from_ce(
+            ce,
+            targets,
+            token_frequencies=token_frequencies,
+            baseline=baseline_value,
+        )
+        total_loss = ce.mean()
+        rare_loss = (ce * pressure).sum() / pressure.sum().clamp_min(1.0)
+
+    common_grads = torch.autograd.grad(
+        total_loss,
+        params,
+        retain_graph=is_split_step,
+        allow_unused=True,
+    )
+    common_unused = {
+        name for (name, _), g in zip(named_params, common_grads) if g is None
+    }
+    for param, grad in zip(params, common_grads, strict=True):
+        param.grad = None if grad is None else grad.detach().clone()
+    if ddp_active and world_size > 1:
+        allreduce_grads(model, world_size)
+
+    if not is_split_step:
+        return total_loss.detach(), None
+
+    # Split step: compute rare gradients and per-layer activation grads
+    # with the graph still live. Retain across all sub-calls until the
+    # last consumer so future additions to the split step don't silently
+    # free the graph. The final autograd.grad in this block releases.
+    rare_grads = torch.autograd.grad(
+        rare_loss,
+        params,
+        retain_graph=True,
+        allow_unused=True,
+    )
+    rare_unused = {
+        name for (name, _), g in zip(named_params, rare_grads) if g is None
+    }
+    extra_rare_unused = rare_unused - common_unused
+    if extra_rare_unused:
+        raise RuntimeError(
+            "ScOpt: parameters have common-loss gradients but no rare-loss "
+            "gradients — possible graph disconnect. Offending params: "
+            f"{sorted(extra_rare_unused)}"
+        )
+    rare_map: dict[str, torch.Tensor] = {}
+    dense_rare: list[torch.Tensor] = []
+    for (name, _), grad in zip(named_params, rare_grads, strict=True):
+        if grad is None:
+            continue  # Genuinely unused in both rare and common.
+        cloned = grad.detach().clone()
+        rare_map[name] = cloned
+        dense_rare.append(cloned)
+    if ddp_active and world_size > 1 and dense_rare:
+        _average_dense_tensors(dense_rare, world_size=world_size)
+
+    # Iterate activations in sorted order so every rank issues
+    # all_reduce calls in identical sequence.
+    activation_items = sorted(activations.items())
+    channel_pressure_items: list[tuple[str, torch.Tensor]] = []
+    last_idx = len(activation_items) - 1
+    for idx, (key, activation) in enumerate(activation_items):
+        retain = idx < last_idx
+        dh = torch.autograd.grad(
+            rare_loss,
+            activation,
+            retain_graph=retain,
+            allow_unused=True,
+        )[0]
+        if dh is None:
+            continue
+        reduce_dims = tuple(range(max(0, dh.ndim - 1)))
+        pressure_vec = dh.detach().float().abs().mean(dim=reduce_dims)
+        channel_pressure_items.append((key, pressure_vec))
+    if ddp_active and world_size > 1 and channel_pressure_items:
+        _average_dense_tensors(
+            [vec for _, vec in channel_pressure_items],
+            world_size=world_size,
+        )
+
+    # Row pressure is derived from CE (not gradients), so it doesn't
+    # need grad-clip gating. EMA update runs locally; all-reduce keeps
+    # replicas consistent.
+    row_pressure = optimizer.update_row_pressure_ema(
+        targets,
+        pressure,
+        vocab_size=int(token_frequencies.numel()),
+    )
+    if row_pressure is not None and ddp_active and world_size > 1:
+        _average_dense_tensors([row_pressure], world_size=world_size)
+
+    pressure_stats = _pressure_summary(pressure)
+
+    pending = _ScOptPending(
+        rare_map=rare_map,
+        channel_pressure_items=channel_pressure_items,
+        row_pressure=row_pressure,
+        pressure_stats=pressure_stats,
+    )
+    return total_loss.detach(), pending
 
 
 def _run_train_step(
@@ -256,6 +685,8 @@ def _run_train_step(
     predictive_aux_projection: torch.nn.Module | None = None,
     dreamworld_entry: Any | None = None,
     dreamworld_weight: float = 0.0,
+    dreamworld_replay_batch_size: int = 0,
+    dreamworld_generator: torch.Generator | None = None,
 ) -> torch.Tensor:
     _reject_unsupported(model)
     with autocast_context(precision, device_type=inputs.device.type):
@@ -330,6 +761,10 @@ def _run_train_step(
             model,
             entry=dreamworld_entry,
             weight=dreamworld_weight,
+            lm_head_backward_mode=lm_head_backward_mode,
+            lm_head_tile_size=lm_head_tile_size,
+            replay_batch_size=dreamworld_replay_batch_size,
+            generator=dreamworld_generator,
         )
     if ddp_active and world_size > 1:
         mode = str(grad_allreduce_mode).strip().lower()
@@ -368,6 +803,7 @@ def _cuda_graph_rejection_reasons(
     activation_checkpoint: bool,
     compile_full_path: bool,
     lm_head_backward_mode: str,
+    optimizer: torch.optim.Optimizer | None = None,
 ) -> list[str]:
     reasons: list[str] = []
     if device.type != "cuda" or not torch.cuda.is_available():
@@ -386,6 +822,8 @@ def _cuda_graph_rejection_reasons(
         "fused_norm_streaming_v2",
     }:
         reasons.append("fused_lm_head_required")
+    if isinstance(optimizer, ScarcityAwareOptimizer):
+        reasons.append("scopt_autograd_grad_not_captured")
     return reasons
 
 
@@ -769,9 +1207,13 @@ def train_fast_for_budget(
     dreamworld_weight: float = 0.0,
     dreamworld_prefix_tokens: int = 128,
     dreamworld_replay_tokens: int = 64,
+    dreamworld_replay_batch_size: int = 0,
     dreamworld_buffer_size: int = 16,
     dreamworld_min_size: int = 2,
     dreamworld_max_age_steps: int = 256,
+    scopt_split_interval: int = 4,
+    scopt_baseline_buckets: int = 16,
+    scopt_baseline_decay: float = 0.99,
 ) -> dict[str, Any]:
     rank_ = int(rank)
     world_size_ = int(world_size)
@@ -783,6 +1225,19 @@ def train_fast_for_budget(
         raise ValueError(
             "grad_allreduce_mode must be 'bulk' or 'async_param', "
             f"got {grad_allreduce_mode!r}"
+        )
+    scopt_active = isinstance(optimizer, ScarcityAwareOptimizer)
+    if scopt_active and grad_allreduce_mode_ != "bulk":
+        raise ValueError("ScOpt currently requires grad_allreduce_mode='bulk'")
+    if scopt_active and (
+        spectral_reg_lambda_dead > 0.0
+        or spectral_reg_lambda_sticky > 0.0
+        or predictive_aux_weight > 0.0
+        or dreamworld_weight > 0.0
+    ):
+        raise ValueError(
+            "ScOpt training path currently supports CE-only training; "
+            "disable spectral, predictive_aux, and dreamworld mechanisms"
         )
     sampling_mode = str(train_sampling_mode).strip().lower()
     if sampling_mode not in {"random", "sequential_epoch", "shuffled_epoch"}:
@@ -823,6 +1278,7 @@ def train_fast_for_budget(
             activation_checkpoint=activation_checkpoint,
             compile_full_path=compile_full_path,
             lm_head_backward_mode=lm_head_backward_mode,
+            optimizer=optimizer,
         )
         if sampling_mode != "random":
             graph_rejections.append("train_sampling_mode_not_supported")
@@ -922,6 +1378,25 @@ def train_fast_for_budget(
 
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
+
+    scopt_token_frequencies = None
+    scopt_baseline: FrequencyBucketBaseline | None = None
+    if scopt_active:
+        token_counts = torch.bincount(
+            train_tokens[:train_num_tokens].detach().cpu().long(),
+            minlength=int(vocab_size),
+        ).clamp_min(1)
+        scopt_token_frequencies = token_counts.to(device=device, dtype=torch.float32)
+        # Frequency-bucket running-mean CE — the fallback baseline the
+        # design spec line 197 names. Attention-based baseline is a
+        # separate artifact; this keeps the optimizer runnable with a
+        # principled baseline until that artifact is trained.
+        scopt_baseline = FrequencyBucketBaseline(
+            scopt_token_frequencies,
+            num_buckets=int(scopt_baseline_buckets),
+            decay=float(scopt_baseline_decay),
+            device=device,
+        )
 
     prefetcher = None
     async_grad_reducer = (
@@ -1042,29 +1517,48 @@ def train_fast_for_budget(
                 predictive_aux_optimizer.zero_grad(set_to_none=True)
             if async_grad_reducer is not None:
                 async_grad_reducer.reset()
-            loss = _run_train_step(
-                model=model,
-                inputs=inputs,
-                targets=targets,
-                chunk_size=chunk_size,
-                precision=precision,
-                ddp_active=ddp_active,
-                world_size=world_size_,
-                compile_full_path=compile_full_path,
-                lm_head_backward_mode=lm_head_backward_mode,
-                lm_head_tile_size=lm_head_tile_size,
-                grad_allreduce_mode=grad_allreduce_mode_,
-                async_grad_reducer=async_grad_reducer,
-                spectral_reg_lambda_dead=spectral_reg_lambda_dead,
-                spectral_reg_lambda_sticky=spectral_reg_lambda_sticky,
-                spectral_reg_min_a=spectral_reg_min_a,
-                spectral_reg_max_a=spectral_reg_max_a,
-                predictive_aux_weight=predictive_aux_weight,
-                predictive_aux_horizon=predictive_aux_horizon,
-                predictive_aux_projection=predictive_aux_projection,
-                dreamworld_entry=dream_entry,
-                dreamworld_weight=dreamworld_weight,
-            )
+            scopt_pending: _ScOptPending | None = None
+            if scopt_active:
+                assert scopt_token_frequencies is not None
+                loss, scopt_pending = _run_scopt_train_step(
+                    model=model,
+                    optimizer=optimizer,
+                    inputs=inputs,
+                    targets=targets,
+                    token_frequencies=scopt_token_frequencies,
+                    precision=precision,
+                    ddp_active=ddp_active,
+                    world_size=world_size_,
+                    step=steps,
+                    split_interval=scopt_split_interval,
+                    baseline=scopt_baseline,
+                )
+            else:
+                loss = _run_train_step(
+                    model=model,
+                    inputs=inputs,
+                    targets=targets,
+                    chunk_size=chunk_size,
+                    precision=precision,
+                    ddp_active=ddp_active,
+                    world_size=world_size_,
+                    compile_full_path=compile_full_path,
+                    lm_head_backward_mode=lm_head_backward_mode,
+                    lm_head_tile_size=lm_head_tile_size,
+                    grad_allreduce_mode=grad_allreduce_mode_,
+                    async_grad_reducer=async_grad_reducer,
+                    spectral_reg_lambda_dead=spectral_reg_lambda_dead,
+                    spectral_reg_lambda_sticky=spectral_reg_lambda_sticky,
+                    spectral_reg_min_a=spectral_reg_min_a,
+                    spectral_reg_max_a=spectral_reg_max_a,
+                    predictive_aux_weight=predictive_aux_weight,
+                    predictive_aux_horizon=predictive_aux_horizon,
+                    predictive_aux_projection=predictive_aux_projection,
+                    dreamworld_entry=dream_entry,
+                    dreamworld_weight=dreamworld_weight,
+                    dreamworld_replay_batch_size=dreamworld_replay_batch_size,
+                    dreamworld_generator=rng,
+                )
             if ddp_active and predictive_aux_projection is not None:
                 allreduce_grads(predictive_aux_projection, world_size_)
             zero_embedding_grad_until(
@@ -1072,11 +1566,31 @@ def train_fast_for_budget(
                 step=steps,
                 freeze_steps=embed_freeze_steps,
             )
+            clipped_this_step = False
             if grad_clip_norm > 0.0:
                 if fused_grad_clip:
-                    clip_grad_norm_fused(model.parameters(), grad_clip_norm)
+                    total_norm = clip_grad_norm_fused(
+                        model.parameters(), grad_clip_norm
+                    )
                 else:
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
+                    total_norm = torch.nn.utils.clip_grad_norm_(
+                        model.parameters(), grad_clip_norm
+                    )
+                # One GPU->CPU sync per step on the ScOpt correctness path
+                # is acceptable given it already runs outside CUDA graphs
+                # and does several collectives; skip it when we don't need
+                # the decision.
+                if scopt_active:
+                    clipped_this_step = bool(
+                        float(total_norm) > float(grad_clip_norm)
+                    )
+            if scopt_active:
+                scopt_opt = optimizer
+                assert isinstance(scopt_opt, ScarcityAwareOptimizer)
+                scopt_opt.record_clip_event(triggered=clipped_this_step)
+                _apply_scopt_pending(
+                    scopt_opt, scopt_pending, skip=clipped_this_step
+                )
             optimizer.step()
             if predictive_aux_optimizer is not None:
                 predictive_aux_optimizer.step()
@@ -1160,6 +1674,7 @@ def train_fast_for_budget(
                 "dream_interval": int(dreamworld_interval),
                 "prefix_tokens": int(dreamworld_prefix_tokens),
                 "replay_tokens": int(dreamworld_replay_tokens),
+                "replay_batch_size": int(dreamworld_replay_batch_size),
                 "artifact_impact": "artifact_training_only",
                 "buffer": (
                     dream_buffer.diagnostics(current_step=steps)
@@ -1221,6 +1736,9 @@ def _warmup(
         lm_head_backward_mode=str(config.get("lm_head_backward_mode", "fused")),
         lm_head_tile_size=int(config.get("lm_head_tile_size", 1024)),
         cuda_graph_mode="none",
+        scopt_split_interval=int(config.get("scopt_split_interval", 4)),
+        scopt_baseline_buckets=int(config.get("scopt_baseline_buckets", 16)),
+        scopt_baseline_decay=float(config.get("scopt_baseline_decay", 0.99)),
     )
 
 
@@ -1373,9 +1891,15 @@ def run_condition(
         dreamworld_weight=float(config.get("dreamworld_weight", 0.0)),
         dreamworld_prefix_tokens=int(config.get("dreamworld_prefix_tokens", 128)),
         dreamworld_replay_tokens=int(config.get("dreamworld_replay_tokens", 64)),
+        dreamworld_replay_batch_size=int(
+            config.get("dreamworld_replay_batch_size", 0)
+        ),
         dreamworld_buffer_size=int(config.get("dreamworld_buffer_size", 16)),
         dreamworld_min_size=int(config.get("dreamworld_min_size", 2)),
         dreamworld_max_age_steps=int(config.get("dreamworld_max_age_steps", 256)),
+        scopt_split_interval=int(config.get("scopt_split_interval", 4)),
+        scopt_baseline_buckets=int(config.get("scopt_baseline_buckets", 16)),
+        scopt_baseline_decay=float(config.get("scopt_baseline_decay", 0.99)),
     )
 
     if ddp_active:

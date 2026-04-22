@@ -51,6 +51,26 @@ def _base_entry(
                 entry.get("predictive_aux_horizon", 0)
             ),
             "predictive_aux_dim": int(entry.get("predictive_aux_dim", 0)),
+            "dreamworld_enabled": bool(entry.get("dreamworld_enabled", False)),
+            "dreamworld_cache_interval": int(
+                entry.get("dreamworld_cache_interval", 0)
+            ),
+            "dreamworld_interval": int(entry.get("dreamworld_interval", 0)),
+            "dreamworld_weight": float(entry.get("dreamworld_weight", 0.0)),
+            "dreamworld_prefix_tokens": int(
+                entry.get("dreamworld_prefix_tokens", 128)
+            ),
+            "dreamworld_replay_tokens": int(
+                entry.get("dreamworld_replay_tokens", 64)
+            ),
+            "dreamworld_replay_batch_size": int(
+                entry.get("dreamworld_replay_batch_size", 0)
+            ),
+            "dreamworld_buffer_size": int(entry.get("dreamworld_buffer_size", 16)),
+            "dreamworld_min_size": int(entry.get("dreamworld_min_size", 2)),
+            "dreamworld_max_age_steps": int(
+                entry.get("dreamworld_max_age_steps", 256)
+            ),
             "embed_freeze_steps": int(entry.get("embed_freeze_steps", 0)),
             "semantic_layer_index": int(entry.get("semantic_layer_index", 0)),
             "semantic_momentum_min": float(
@@ -216,6 +236,25 @@ def build_first_wave_mechanism_matrix(
             "dreamworld_min_size": 2,
             "dreamworld_max_age_steps": 256,
         },
+        {
+            "name_arm": "fastslow_i32_a050_dreamworld_c8_i8_w025_sub128",
+            "exp24_mechanism": "fast_slow_dreamworld",
+            "artifact_impact": ARTIFACT_TRAINING_ONLY,
+            "fast_slow_enabled": True,
+            "fast_slow_interval": 32,
+            "fast_slow_alpha": 0.50,
+            "fast_slow_eval_copy": "slow",
+            "dreamworld_enabled": True,
+            "dreamworld_cache_interval": 8,
+            "dreamworld_interval": 8,
+            "dreamworld_weight": 0.25,
+            "dreamworld_prefix_tokens": 128,
+            "dreamworld_replay_tokens": 64,
+            "dreamworld_replay_batch_size": 128,
+            "dreamworld_buffer_size": 16,
+            "dreamworld_min_size": 2,
+            "dreamworld_max_age_steps": 256,
+        },
     ]
 
     entries: list[dict[str, Any]] = []
@@ -237,6 +276,53 @@ def build_first_wave_mechanism_matrix(
                     seed=int(seed),
                 )
             )
+    return entries
+
+
+def build_fastslow_dreamworld_matrix(
+    *,
+    speed_config: dict[str, Any],
+    world_size: int = 8,
+    budget_seconds: float = 600.0,
+    seed_values: Sequence[int] = DEFAULT_CONTROL_SEEDS,
+) -> list[dict[str, Any]]:
+    arm = {
+        "name_arm": "fastslow_i32_a050_dreamworld_c8_i8_w025_sub128",
+        "exp24_mechanism": "fast_slow_dreamworld",
+        "artifact_impact": ARTIFACT_TRAINING_ONLY,
+        "fast_slow_enabled": True,
+        "fast_slow_interval": 32,
+        "fast_slow_alpha": 0.50,
+        "fast_slow_eval_copy": "slow",
+        "dreamworld_enabled": True,
+        "dreamworld_cache_interval": 8,
+        "dreamworld_interval": 8,
+        "dreamworld_weight": 0.25,
+        "dreamworld_prefix_tokens": 128,
+        "dreamworld_replay_tokens": 64,
+        "dreamworld_replay_batch_size": 128,
+        "dreamworld_buffer_size": 16,
+        "dreamworld_min_size": 2,
+        "dreamworld_max_age_steps": 256,
+    }
+    entries: list[dict[str, Any]] = []
+    for seed in seed_values:
+        entry = _base_entry(
+            speed_config=speed_config,
+            world_size=world_size,
+            budget_seconds=budget_seconds,
+        )
+        entry.update(arm)
+        name_arm = str(entry.pop("name_arm"))
+        entries.append(
+            _named_entry(
+                base=entry,
+                phase=None,
+                mechanism=str(entry["exp24_mechanism"]),
+                arm=name_arm,
+                seed=int(seed),
+            )
+        )
     return entries
 
 

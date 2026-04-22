@@ -203,7 +203,9 @@ if [ -f "$REPO_ROOT/pyproject.toml" ] || [ -f "$REPO_ROOT/setup.py" ]; then
     # The editable install triggers setup.py build_ext for the bespoke
     # cuBLASLt extension, which shells out to nvcc. Prepend the cu13
     # nvcc bin dir to PATH and point CUDA_HOME at the cu13 umbrella so
-    # nvcc finds cccl headers and its own ptxas.
+    # nvcc finds cccl headers and its own ptxas. MAX_JOBS fans the 9 TUs
+    # out across ninja workers instead of compiling them serially.
+    MAX_JOBS=$(nproc) \
     PATH="$CU13_LIB/../bin:$PATH" \
     CUDA_HOME="$CU13_LIB/.." \
         pip install \
