@@ -38,6 +38,7 @@ SECTION_NAMES = (
     "predictive_aux",
     "dreamworld_replay",
     "event_sleep_gate",
+    "event_sleep_decision_resolve",
     "optimizer_step",
     "fast_slow_ema",
 )
@@ -195,9 +196,37 @@ def run_profile(args: argparse.Namespace) -> dict[str, Any]:
     event_sleep_trigger_count = 0
     event_sleep_replay_count = 0
     event_sleep_decision_count = 0
+    event_sleep_queued_decision = None
+    event_sleep_queued_step: int | None = None
     start = time.perf_counter()
 
+    def resolve_event_sleep_decision() -> None:
+        nonlocal event_sleep_pending
+        nonlocal event_sleep_trigger_count
+        nonlocal event_sleep_decision_count
+        nonlocal event_sleep_queued_decision
+        nonlocal event_sleep_queued_step
+
+        if event_sleep_queued_decision is None:
+            return
+        decision = event_sleep_queued_decision
+        decision_step = (
+            0 if event_sleep_queued_step is None else event_sleep_queued_step
+        )
+        event_sleep_queued_decision = None
+        event_sleep_queued_step = None
+
+        event_sleep_decision_count += 1
+        interval_ready = decision_step - event_sleep_last_replay_step >= 8
+        buffer_ready = len(dream_buffer) >= 2
+        if decision.triggered and interval_ready and buffer_ready:
+            event_sleep_trigger_count += 1
+            event_sleep_pending = True
+
     for step in range(args.steps):
+        if event_sleep_queued_decision is not None:
+            timer.time("event_sleep_decision_resolve", resolve_event_sleep_decision)
+
         if time.perf_counter() - start >= args.seconds:
             break
 
@@ -305,12 +334,8 @@ def run_profile(args: argparse.Namespace) -> dict[str, Any]:
             ),
         )
         if decision is not None:
-            event_sleep_decision_count += 1
-            interval_ready = step - event_sleep_last_replay_step >= 8
-            buffer_ready = len(dream_buffer) >= 2
-            if decision.triggered and interval_ready and buffer_ready:
-                event_sleep_trigger_count += 1
-                event_sleep_pending = True
+            event_sleep_queued_decision = decision
+            event_sleep_queued_step = step
 
         timer.time(
             "optimizer_step",
@@ -320,6 +345,9 @@ def run_profile(args: argparse.Namespace) -> dict[str, Any]:
             "fast_slow_ema",
             lambda: fast_slow.after_optimizer_step(model, step=step + 1),
         )
+
+    if event_sleep_queued_decision is not None:
+        timer.time("event_sleep_decision_resolve", resolve_event_sleep_decision)
 
     if device.type == "cuda":
         torch.cuda.synchronize(device)

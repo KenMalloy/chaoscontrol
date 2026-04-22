@@ -1,8 +1,8 @@
 {
   "arm": "fast_slow_dreamworld_event_sleep",
   "device": "cpu",
-  "elapsed_s": 0.3876336249522865,
-  "mean_inside_budget_ms_per_step": 5.839697732881177,
+  "elapsed_s": 0.42164487508125603,
+  "mean_inside_budget_ms_per_step": 6.289345845289063,
   "mechanisms": {
     "dream_buffer_size": 8,
     "event_sleep_decision_count": 32,
@@ -15,65 +15,74 @@
     {
       "count": 64,
       "mean_cuda_ms": null,
-      "mean_wall_ms": 3.4185038348368835,
+      "mean_wall_ms": 3.6340925071272068,
       "name": "backward",
-      "p50_wall_ms": 3.153312485665083,
-      "p95_wall_ms": 3.823718626517802,
-      "share_wall": 0.5853905443750201
+      "p50_wall_ms": 3.124520997516811,
+      "p95_wall_ms": 4.3454954167827955,
+      "share_wall": 0.5778172478540463
     },
     {
       "count": 64,
       "mean_cuda_ms": null,
-      "mean_wall_ms": 1.6571581618336495,
+      "mean_wall_ms": 1.7688613952486776,
       "name": "logits_and_loss",
-      "p50_wall_ms": 1.5847495524212718,
-      "p95_wall_ms": 1.9588786410167813,
-      "share_wall": 0.2837746468456415
+      "p50_wall_ms": 1.5566459624096751,
+      "p95_wall_ms": 2.224554528947919,
+      "share_wall": 0.28124727734182653
     },
     {
       "count": 64,
       "mean_cuda_ms": null,
-      "mean_wall_ms": 0.39989908327697776,
+      "mean_wall_ms": 0.3998366119049024,
       "name": "optimizer_step",
-      "p50_wall_ms": 0.3876249538734555,
-      "p95_wall_ms": 0.6882910616695881,
-      "share_wall": 0.06847941478636711
+      "p50_wall_ms": 0.36470801569521427,
+      "p95_wall_ms": 0.709708943031728,
+      "share_wall": 0.06357364052485583
     },
     {
       "count": 6,
       "mean_cuda_ms": null,
-      "mean_wall_ms": 1.5098473910863202,
+      "mean_wall_ms": 1.6674166933322947,
       "name": "dreamworld_replay",
-      "p50_wall_ms": 1.576271140947938,
-      "p95_wall_ms": 1.625270931981504,
-      "share_wall": 0.024238958827840867
+      "p50_wall_ms": 1.672312500886619,
+      "p95_wall_ms": 1.8330311286263168,
+      "share_wall": 0.024854781219733994
     },
     {
       "count": 64,
       "mean_cuda_ms": null,
-      "mean_wall_ms": 0.1395573272020556,
+      "mean_wall_ms": 0.14866932178847492,
       "name": "encode_forward",
-      "p50_wall_ms": 0.12870796490460634,
-      "p95_wall_ms": 0.1826437073759734,
-      "share_wall": 0.023898039519453195
+      "p50_wall_ms": 0.12587488163262606,
+      "p95_wall_ms": 0.31945885857567163,
+      "share_wall": 0.02363828058522706
     },
     {
       "count": 64,
       "mean_cuda_ms": null,
-      "mean_wall_ms": 0.0566399066883605,
+      "mean_wall_ms": 0.13931639477959834,
       "name": "event_sleep_gate",
-      "p50_wall_ms": 0.055353972129523754,
-      "p95_wall_ms": 0.07680797716602682,
-      "share_wall": 0.009699116166482752
+      "p50_wall_ms": 0.05806249100714922,
+      "p95_wall_ms": 0.08514806395396589,
+      "share_wall": 0.022151174097692707
     },
     {
       "count": 64,
       "mean_cuda_ms": null,
-      "mean_wall_ms": 0.026391226128907874,
+      "mean_wall_ms": 0.037278652598615736,
       "name": "fast_slow_ema",
-      "p50_wall_ms": 0.0013954704627394676,
-      "p95_wall_ms": 0.0021830317564308635,
-      "share_wall": 0.004519279479194385
+      "p50_wall_ms": 0.0013543758541345596,
+      "p95_wall_ms": 0.003201793879270544,
+      "share_wall": 0.005927270262381696
+    },
+    {
+      "count": 32,
+      "mean_cuda_ms": null,
+      "mean_wall_ms": 0.009941293683368713,
+      "name": "event_sleep_decision_resolve",
+      "p50_wall_ms": 0.008917064405977726,
+      "p95_wall_ms": 0.01449978444725275,
+      "share_wall": 0.0007903281142358458
     },
     {
       "count": 0,
@@ -96,5 +105,5 @@
   ],
   "steps": 64,
   "tokens_per_step": 4096,
-  "total_inside_budget_ms": 373.74065490439534
+  "total_inside_budget_ms": 402.5181340985
 }
