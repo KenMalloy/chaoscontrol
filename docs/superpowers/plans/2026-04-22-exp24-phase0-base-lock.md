@@ -2,11 +2,11 @@
 
 > **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
-**Goal:** Tune the `fast_slow + scheduled dreamworld` stack on a 3-rung ladder (DW sweep → FS sweep around DW winner → top-2 × 3-seed confirm) and commit the winning config as the Exp 24 base for all downstream arms.
+**Goal:** Tune the `fast_slow + scheduled dreamworld` stack on a 3-rung ladder (DW sweep → FS sweep around DW winner → top-2 × 3-seed confirm) and commit the winning config as the Exp 24 base for all downstream arms. After the base is locked, preregister one eval-only Phase 0b probe: entropy-gated `log_a` reread, which may improve the locked checkpoint but must not influence base selection.
 
-**Architecture:** Phase 0 runs as a data-collection plan, not a code plan. Each tuning rung is a new matrix builder in `experiments/24_training_time_bundle/exp24.py`, dispatched from `run_exp24.py`. Screening rungs (2 & 3) use seed=1337 single-seed; the confirm rung runs top-2 × 3 seeds with full-val. Winner is locked by mean BPB with run-to-run stability as tiebreaker.
+**Architecture:** Phase 0 runs as a data-collection plan, not a mechanism invention plan. Each tuning rung is a new matrix builder in `experiments/24_training_time_bundle/exp24.py`, dispatched from `run_exp24.py`. Screening rungs (2 & 3) use seed=1337 single-seed; the confirm rung runs top-2 × 3 seeds with full-val. Winner is locked by mean BPB with run-to-run stability as tiebreaker. Phase 0b is deliberately downstream: it uses the locked checkpoint/config, existing `DeltaModulator(log_a_shift=...)` semantics, and a causal gate based on model confidence. Its result can promote a future eval-time arm, but it cannot rewrite `exp24_base.yaml`.
 
-**Out of scope:** `event_sleep`, predictive aux, spectral, ScOpt. The rigor+speed plan for `fast_slow_dreamworld_event_sleep` (`2026-04-22-exp24-rigor-and-speed-implementation.md`) stays frozen until Phase 0 lands, because its test anchors and profile harness bake in FS+DW defaults that Phase 0 is about to choose.
+**Out of scope for base selection:** `event_sleep`, predictive aux, spectral, ScOpt, and any eval-time temporal-head/reread score. The rigor+speed plan for `fast_slow_dreamworld_event_sleep` (`2026-04-22-exp24-rigor-and-speed-implementation.md`) stays frozen until Phase 0 lands, because its test anchors and profile harness bake in FS+DW defaults that Phase 0 is about to choose. Entropy-gated reread is included only as a post-lock Phase 0b probe.
 
 **Tech Stack:** Python, existing `run_exp24.py` / `exp24.py` matrix dispatch, 8×H100 pod, 600s train budget, full-val eval (~82s on 8x per memory), FineWeb data already staged on the pod volume.
 
@@ -22,6 +22,40 @@ The anchor below is the starting guess the ladder tunes around. It is included a
 - `dreamworld_buffer_size=16`, `dreamworld_min_size=2`, `dreamworld_max_age_steps=256`
 
 All other knobs track the existing base config (`experiments/23_fast_path/configs/base_seq_epoch_lr0064_full_corpus.yaml`): 4-layer SSM, dim=256, bf16, LR=0.064, bs=1024 × 8 ranks, seq=512, Muon, sequential-epoch sampling.
+
+---
+
+## Phase 0b thesis addendum: entropy-gated `log_a` reread
+
+Phase 0's base claim is training-time: `fast_slow + scheduled dreamworld` produces the best weights/checkpoint. Phase 0b's separate claim is eval-time: an SSM can spend opt-in compute by rereading a recent suffix with a different hidden-state decay rate. This is the native SSM axis that Exp 22 and Exp 24 both point toward: `log_a` is a traversal knob, not a fixed constant.
+
+**Engagement with Exp 20 TTT null (2026-04-20).** The 128-doc TTT pilot showed no cell beat the reset floor at steps=1, and the cause was not compute-wall. That result shelved generic TTT for the current base. Phase 0b is not a rerun of Exp 20 with a new knob; its sharper hypothesis is that the gate must be SSM-native (hidden-state confusion drives hidden-state decay-rate change) rather than generic param-update TTT. If entropy-gated reread lands within noise of the score-only floor, that is consistent with Exp 20, not independent evidence, and Phase 0b shelves to join generic TTT on the "not for this base" pile until we have a new reason to revisit.
+
+The first Phase 0b version is intentionally small, but these four pieces are not optional:
+
+- **The model picks when to shift.** Trigger on the model's own predictive entropy at step `t`, measured from the softmax over the base-pass logits before token `t` is scored. A percentile threshold (e.g. fire on steps whose entropy is in the top 10% of a rolling window) defines "high entropy." No run-schedule component.
+- **The second reading blends into the pre-score state.** Replacement erases the base pass; concatenation changes the compute/artifact shape. **Primary path:** compute a soft mix `state_t = (1 - beta) * state_base + beta * state_reread` *before* scoring token `t`, so the reread influences the scored prediction. `beta` is fixed (pilot: 0.5) or severity-driven from the pre-score entropy signal. This is the promoted mechanism.
+- **Direction is target-free at the primary path.** Because the primary path blends before scoring, the direction signal cannot use target-`t` loss — the target is still unrevealed. Pick direction from a target-free candidate signal: reread-vs-base state divergence, predictive-entropy delta across candidate rereads, or agreement across `log_a_shift` sign candidates. A deferred-blend variant (score with base, use target-`t` loss to pick direction for `t+1` state) is allowed as a secondary arm, not the promoted mechanism — its mechanism and control set are called out below.
+- **The rewind is short.** The reread is "I am confused now; reread what I just saw differently." Start with a tight suffix (`K` in `{32, 64}`, with `128` as an explicit boundary diagnostic), not long windows that drag in unrelated context.
+
+**Matched-budget controls (procedural pin).** Run entropy-gated first, record its realized fire count `N_fire` and total reread token count over the full eval stream. Then configure each matched control so it sees the same per-stream reread-token budget:
+
+- **Score-only floor** — no reread, `600s` eval budget. This is the apples-to-apples base.
+- **Scheduled-reread control** — fire every `stream_length / N_fire` steps with the same `K`, same blend. Matched fire count.
+- **Entropy-gated same-horizon control** — same gate, `log_a_shift=0.0`. Isolates the effect of the decay-rate change from the effect of the reread pass itself.
+- **Entropy-gated bidirectional control** — candidates are `+log_a_shift` and `-log_a_shift`, direction chosen per-fire from the target-free signal.
+- **Fixed-direction shifted reread** — ablation only, not promoted.
+
+All controls use the same `600s` eval budget (per `feedback_train_eval_budget_separation`); reread compute is accounted against eval, never training.
+
+**Preregistered success criteria.** Written before the run, not after:
+
+- **Promote to eval-time arm if:** entropy-gated primary beats score-only floor by `>= 0.015 BPB` mean over 3 seeds AND beats scheduled-reread control by `>= 0.005 BPB` mean over 3 seeds AND seed-to-seed stddev `< 0.01 BPB`. Both thresholds must hold.
+- **Shelve and record consistent-with-Exp-20 if:** entropy-gated primary is within `0.005 BPB` of score-only floor (either direction), OR entropy-gated primary beats scheduled-reread by `< 0.002 BPB`. In either case, the mechanism is not doing native-SSM work beyond generic reread compute.
+- **Ambiguous / warrants follow-up if:** primary beats score-only floor by `0.005 to 0.015 BPB` but doesn't clear the scheduled-reread gap. Record, do not promote, design a sharper follow-up.
+- **Deferred-blend secondary** is evaluated on the same thresholds but against its own score-only floor at matched reread-token budget; it promotes only if primary also promotes (otherwise deferred-blend alone is not enough to claim an eval-time arm).
+
+This addendum is not a fourth base-lock rung. It runs only after `exp24_base.yaml` exists. Phase 0b tasks are out of scope for this plan; it becomes its own implementation plan once the base is locked, and it must cite this addendum as its thesis and preregistration.
 
 ---
 
@@ -454,7 +488,105 @@ git commit -m "exp24: lock phase0 base config"
 
 ---
 
-## Task 9: Unblock the event_sleep rigor+speed plan
+## Task 9: Preregister Phase 0b entropy-gated `log_a` reread
+
+**Files:**
+- Create: `experiments/24_training_time_bundle/PHASE0B_ENTROPY_REREAD.md`
+- Later implementation target, after prereg approval: `src/chaoscontrol/eval_stream/entropy_reread.py` or a thin runner around `src/chaoscontrol/eval_stream/temporal_heads.py`
+- Later tests: `tests/test_eval_stream_entropy_reread.py`
+
+**Step 1: Write the preregistration doc**
+
+The doc must begin with the locked base reference:
+
+- `PHASE0_BASE_LOCK.md`
+- `configs/exp24_base.yaml`
+- exact checkpoint path(s) used for Phase 0 confirm winner
+
+Then state the mechanism:
+
+```text
+At a chunk boundary, use only information available before the next chunk is
+scored. If the previous/base predictive entropy exceeds a frozen threshold,
+replay a short suffix with both a longer-memory and shorter-memory
+DeltaModulator(log_a_shift=s), choose or weight the direction causally, blend
+the selected reread boundary state into the base boundary state, and score the
+next chunk from that blended state.
+```
+
+Chunk-level gating is preferred for v0 because it makes leakage review simple. Token-level gating is allowed only if the entropy used for token `t` is computed before seeing the target token scored at `t`.
+
+**Step 2: Freeze the calibration protocol**
+
+Use a calibration stream that is not the primary full-val scoring stream. Record:
+
+- entropy statistic: raw mean entropy or z-scored entropy over the previous chunk
+- fire-rate thresholds: choose from target rates `{0.05, 0.10, 0.20}`; this sets the sensitivity, not a schedule
+- suffix length `K`: choose from `{32, 64}` tokens, with `128` only as a boundary diagnostic
+- shift pair: choose a symmetric or near-symmetric pair, e.g. `(-0.1, +0.1)` or `(-0.2, +0.2)`; do not choose a single primary direction
+- blend policy: freeze a soft mix rule, e.g. constant `beta` or `beta = clamp((entropy_z - tau) / width, 0, beta_max)`
+- direction policy: target-free candidate entropy/margin picker before scoring, or causal next-step-loss update after scoring that affects only subsequent state
+
+Do not tune thresholds or shifts on the primary full-val stream. If that happens, mark the run exploratory and rerun with frozen settings.
+
+**Step 3: Pre-register controls**
+
+Run the locked checkpoint under:
+
+1. `score_only`: no reread.
+2. `scheduled_reread_same_budget`: deterministic/scheduled rereads at the same observed fire rate.
+3. `entropy_reread_shift0`: entropy gate with `log_a_shift=0.0`, isolating extra scan/state-refresh compute from memory-horizon traversal.
+4. `entropy_reread_bidirectional_blend`: entropy gate, short rewind, both shift directions available, soft state blend.
+5. Diagnostic only: fixed longer-memory shift and fixed shorter-memory shift. These are not the promoted mechanism unless they expose that the direction picker is broken.
+6. Optional diagnostic only: always-on best single shift. This is not the promoted mechanism unless it beats gating at lower or equal wall time.
+
+**Step 4: Legality contract**
+
+The implementation must have a regression test that proves current-chunk targets cannot affect the decision for current-chunk scoring. In review terms:
+
+```python
+# Legal: target-free confidence controls the next chunk.
+gate_next = entropy(logits_for_previous_chunk) > threshold
+
+# Legal: both reread directions run on a triggered boundary, then a target-free
+# candidate signal chooses the state to blend before scoring the next target.
+direction = choose_by_entropy_or_margin(long_state, short_state)
+state_next = lerp(base_state, selected_reread_state, beta)
+
+# Legal if lagged: current target loss may choose the carried state for future
+# scoring only after the current score has already been recorded.
+winner_for_future = argmin(nll_long_current, nll_short_current)
+
+# Invalid for primary reporting: realized target loss controls the chunk
+# whose score includes that target.
+gate_current = nll(logits_current, targets_current) > threshold
+```
+
+Surprise/loss may be logged for analysis and may feed a lagged direction update, but it must not retroactively choose the score for the target that produced that loss.
+
+**Step 5: Success and kill criteria**
+
+Promote the mechanism only if `entropy_reread_bidirectional_blend`:
+
+- improves full-val BPB over `score_only` by at least `0.003` and preferably `0.005`,
+- beats `scheduled_reread_same_budget` on BPB per extra eval second,
+- beats `entropy_reread_shift0`, showing that the gain is horizon traversal rather than mere repeated compute,
+- beats both fixed-direction diagnostics or explains the fixed-direction winner as a stable regime worth splitting into a follow-up,
+- fires on no more than 20% of chunks unless the eval budget still has obvious slack,
+- stays within the 600s eval-time accounting rules used for the Param Golf path.
+
+Kill or park the mechanism if same-horizon reread matches it, if the best always-on single shift is faster and better, if soft blending collapses to replacement/zero-blend across most triggers, or if any leakage review finds target-dependent current-chunk gating.
+
+**Step 6: Commit**
+
+```bash
+git add experiments/24_training_time_bundle/PHASE0B_ENTROPY_REREAD.md
+git commit -m "exp24: preregister phase0b entropy-gated log-a reread"
+```
+
+---
+
+## Task 10: Unblock the event_sleep rigor+speed plan
 
 **Files:**
 - Modify: `docs/superpowers/plans/2026-04-22-exp24-rigor-and-speed-implementation.md`
@@ -484,6 +616,7 @@ git commit -m "plan: rebase exp24 event_sleep plan on phase0 base lock"
 
 - [ ] `exp24_base.yaml` exists and is reproducible via `run_exp24.py` with the matching matrix entry.
 - [ ] `PHASE0_BASE_LOCK.md` records the full decision trail.
+- [ ] `PHASE0B_ENTROPY_REREAD.md` exists after base lock and explicitly states that Phase 0b cannot alter `exp24_base.yaml`.
 - [ ] Event_sleep plan references the locked base, not the placeholder anchor.
 - [ ] All 3 matrices (`phase0_dreamworld_sweep`, `phase0_fastslow_sweep`, `phase0_confirm`) remain registered in `run_exp24.py` for reproducibility — do not delete them after locking the base.
 
@@ -493,8 +626,12 @@ git commit -m "plan: rebase exp24 event_sleep plan on phase0 base lock"
 
 **Total compute:** 9 + 6 + 6 = 21 runs × ~700s = ~4.1 hours of 8×H100 wall time, plus ~30 min of rsync/analysis between rungs. Plan on one full day end-to-end.
 
+**Phase 0b compute.** Entropy-gated reread is extra eval-only compute after base lock. It is not included in the 21-run base-lock budget because it reuses the locked checkpoint and does not train new weights.
+
 **Single-seed screening risk.** Rungs 1 and 2 run seed=1337 only. If the true seed noise is ~0.01 BPB (plausible from prior 8x runs), cells within that band are indistinguishable. Task 3 and Task 6 include explicit noise-band handling; if >3 configs tie, escalate for a seed=2674 mini-replication rather than guessing.
 
 **Sweep-boundary risk.** Both sweeps are 3-point grids at fixed endpoints. If a winner sits at a corner (e.g., interval=16 or weight=0.50 for DW), the true optimum may be outside the grid. Document as a Phase 0b candidate, don't expand Phase 0 mid-flight.
+
+**Phase 0b leakage risk.** Predictive entropy is legal only when computed before the targets it affects are revealed. Current-token or current-chunk realized loss is not legal as a trigger or direction choice for that same scoring window. If both directions are scored and the lower next-step loss is kept, that choice must be committed only after the current score is recorded, affecting future state rather than the score that generated the loss. Prefer previous-chunk gating for the first implementation because it is easy to audit.
 
 **Pod state.** Per project memory, `/workspace/venv` survives stop/start, pip-into-system-python doesn't. Always `source /workspace/venv/bin/activate` before launching. `runpodctl get pod --all` to see stopped pods. RunPod disk migrations copy tree only — if the pod migrates, `/workspace` shards may be gone and need re-staging.
