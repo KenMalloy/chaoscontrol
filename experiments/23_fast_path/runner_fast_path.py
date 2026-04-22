@@ -1323,6 +1323,11 @@ def run_condition(
         device=device,
         optimizer=optimizer,
         budget_seconds=budget_seconds,
+        max_steps=(
+            None
+            if config.get("max_steps") is None
+            else int(config["max_steps"])
+        ),
         chunk_size=int(config.get("chunk_size", 64)),
         grad_clip_norm=float(config.get("grad_clip_norm", 1.0)),
         fused_grad_clip=bool(config.get("fused_grad_clip", True)),

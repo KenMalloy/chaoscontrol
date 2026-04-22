@@ -1793,3 +1793,75 @@ def test_run_condition_result_preserves_exp24_artifact_metadata(monkeypatch):
     assert result["artifact"]["artifact_bytes_estimate"] > 0
     assert result["exp24"]["phase"] == "first_wave"
     assert result["exp24"]["mechanism"] == "predictive_aux"
+
+
+def test_run_condition_threads_max_steps_from_config(monkeypatch):
+    mod = _load_runner_module()
+    seen_kwargs = {}
+
+    monkeypatch.setattr(mod, "_init_distributed", lambda _world_size: (0, 1, 0))
+    monkeypatch.setattr(mod, "_pick_device", lambda _rank, _device: torch.device("cpu"))
+    monkeypatch.setattr(mod, "resolve_param_dtype", lambda _dtype, _device: torch.float32)
+    monkeypatch.setattr(mod, "verify_diag_recurrence", lambda _device: None)
+    monkeypatch.setattr(
+        mod,
+        "load_fineweb_tokens",
+        lambda _path: (
+            torch.arange(64, dtype=torch.int16),
+            torch.arange(64, dtype=torch.int16),
+        ),
+    )
+    monkeypatch.setattr(mod, "build_sentencepiece_luts", lambda *_args: (None, None, None))
+    monkeypatch.setattr(mod, "choose_lm_starts_lazy", lambda **_kwargs: [])
+    monkeypatch.setattr(mod, "build_model", lambda *_args: _TinyTokenTrainModel())
+    monkeypatch.setattr(mod, "_apply_embed_init", lambda *_args: None)
+    monkeypatch.setattr(mod, "_reject_unsupported", lambda _model: None)
+    monkeypatch.setattr(mod, "_warmup", lambda **_kwargs: None)
+    monkeypatch.setattr(
+        mod,
+        "_build_optimizer",
+        lambda _config, model: torch.optim.SGD(model.parameters(), lr=0.01),
+    )
+
+    def fake_train_fast_for_budget(*args, **kwargs):
+        seen_kwargs.update(kwargs)
+        return {
+            "steps": int(kwargs["max_steps"]),
+            "elapsed_s": 1.0,
+            "initial_loss": 1.0,
+            "final_loss": 0.5,
+            "aggregate_tokens_per_sec": 1.0,
+            "peak_vram_mb": 0.0,
+        }
+
+    monkeypatch.setattr(mod, "train_fast_for_budget", fake_train_fast_for_budget)
+
+    class FakeSP:
+        def Load(self, _path):
+            return True
+
+    monkeypatch.setitem(
+        sys.modules,
+        "sentencepiece",
+        type("M", (), {"SentencePieceProcessor": FakeSP}),
+    )
+
+    result = mod.run_condition(
+        {
+            "name": "matched_step_smoke",
+            "vocab_size": 6,
+            "seq_len": 3,
+            "stride": 1,
+            "batch_size": 2,
+            "max_steps": 517,
+        },
+        data_path="unused",
+        sp_model_path="unused.model",
+        budget_seconds=999.0,
+        output_json=None,
+        output_ckpt=None,
+        world_size_override=1,
+    )
+
+    assert seen_kwargs["max_steps"] == 517
+    assert result["train"]["steps"] == 517
