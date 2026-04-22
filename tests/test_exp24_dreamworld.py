@@ -69,12 +69,14 @@ def test_dream_replay_buffer_detaches_evicts_and_ages_entries() -> None:
     states_a = [torch.ones(2, 4, requires_grad=True)]
     tokens_a = torch.tensor([[0, 1, 2]], dtype=torch.long)
     buffer.add(step=0, states=states_a, replay_tokens=tokens_a)
+    assert len(buffer) == 1
 
     buffer.add(
         step=1,
         states=[torch.full((2, 4), 2.0)],
         replay_tokens=torch.tensor([[3, 4, 5]], dtype=torch.long),
     )
+    assert len(buffer) == 2
 
     stored_a = buffer.sample(torch.Generator().manual_seed(0), current_step=1)
     assert stored_a is not None
@@ -89,6 +91,7 @@ def test_dream_replay_buffer_detaches_evicts_and_ages_entries() -> None:
         replay_tokens=torch.tensor([[6, 7, 8]], dtype=torch.long),
     )
     diag = buffer.diagnostics(current_step=2)
+    assert len(buffer) == 2
     assert diag["size"] == 2
     assert diag["drop_count"] == 1
     assert diag["add_count"] == 3
@@ -102,6 +105,7 @@ def test_dream_replay_buffer_detaches_evicts_and_ages_entries() -> None:
         replay_tokens=torch.tensor([[9, 10, 11]], dtype=torch.long),
     )
     diag = buffer.diagnostics(current_step=5)
+    assert len(buffer) == 1
     assert diag["size"] == 1
     assert diag["drop_count"] == 3
     assert diag["age_min"] == 0

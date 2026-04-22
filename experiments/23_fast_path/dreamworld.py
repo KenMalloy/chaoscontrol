@@ -38,6 +38,9 @@ class DreamReplayBuffer:
         self.sample_count = 0
         self.drop_count = 0
 
+    def __len__(self) -> int:
+        return len(self._entries)
+
     def _prune_stale(self, current_step: int) -> None:
         keep: list[DreamReplayEntry] = []
         for entry in self._entries:
