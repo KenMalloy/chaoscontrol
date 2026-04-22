@@ -260,6 +260,116 @@ def test_fastslow_dreamworld_matrix_is_stack_only():
     assert all(entry["dreamworld_enabled"] is True for entry in entries)
 
 
+def test_build_phase0_dreamworld_sweep_shape_and_knobs():
+    mod = _load_exp24()
+
+    entries = mod.build_phase0_dreamworld_sweep(
+        speed_config={"batch_size": 1024, "chunk_size": 64},
+        world_size=4,
+        budget_seconds=600.0,
+        seed_values=(1337,),
+    )
+
+    assert len(entries) == 9
+    expected = {
+        f"exp24_phase0_fs_i32a050_dw_c{i}i{i}_w{int(w * 100):03d}_s1337"
+        for i in (4, 8, 16)
+        for w in (0.10, 0.25, 0.50)
+    }
+    assert {entry["name"] for entry in entries} == expected
+    assert {entry["world_size"] for entry in entries} == {4}
+    assert {entry["budget_seconds"] for entry in entries} == {600.0}
+    for entry in entries:
+        assert entry["exp24_phase"] == "phase0"
+        assert entry["exp24_mechanism"] == "fast_slow_dreamworld"
+        assert entry["artifact_impact"] == "artifact_training_only"
+        assert entry["fast_slow_enabled"] is True
+        assert entry["fast_slow_interval"] == 32
+        assert entry["fast_slow_alpha"] == 0.50
+        assert entry["fast_slow_eval_copy"] == "slow"
+        assert entry["dreamworld_enabled"] is True
+        assert entry["dreamworld_cache_interval"] == entry["dreamworld_interval"]
+        assert entry["dreamworld_replay_batch_size"] == 128
+        assert entry["dreamworld_prefix_tokens"] == 128
+        assert entry["dreamworld_replay_tokens"] == 64
+        assert entry["dreamworld_buffer_size"] == 16
+        assert entry["dreamworld_min_size"] == 2
+        assert entry["dreamworld_max_age_steps"] == 256
+
+
+def test_build_phase0_fastslow_sweep_shape_and_knobs():
+    mod = _load_exp24()
+
+    entries = mod.build_phase0_fastslow_sweep(
+        speed_config={"batch_size": 1024, "chunk_size": 64},
+        world_size=4,
+        budget_seconds=600.0,
+        seed_values=(1337,),
+    )
+
+    assert len(entries) == 6
+    assert {entry["seed"] for entry in entries} == {1337}
+    assert {entry["world_size"] for entry in entries} == {4}
+    assert {
+        (entry["fast_slow_interval"], entry["fast_slow_alpha"])
+        for entry in entries
+    } == {
+        (16, 0.25),
+        (16, 0.50),
+        (32, 0.25),
+        (32, 0.50),
+        (64, 0.25),
+        (64, 0.50),
+    }
+    dw_settings = {
+        (
+            entry["dreamworld_cache_interval"],
+            entry["dreamworld_interval"],
+            entry["dreamworld_weight"],
+        )
+        for entry in entries
+    }
+    assert len(dw_settings) == 1
+    for entry in entries:
+        assert entry["name"].startswith("exp24_phase0_fs_i")
+        assert entry["exp24_phase"] == "phase0"
+        assert entry["exp24_mechanism"] == "fast_slow_dreamworld"
+        assert entry["artifact_impact"] == "artifact_training_only"
+        assert entry["fast_slow_enabled"] is True
+        assert entry["fast_slow_eval_copy"] == "slow"
+        assert entry["dreamworld_enabled"] is True
+        assert entry["dreamworld_replay_batch_size"] == 128
+
+
+def test_build_phase0_confirm_shape_and_knobs():
+    mod = _load_exp24()
+
+    entries = mod.build_phase0_confirm(
+        speed_config={"batch_size": 1024, "chunk_size": 64},
+        world_size=4,
+        budget_seconds=600.0,
+    )
+
+    assert len(entries) == 6
+    assert {entry["seed"] for entry in entries} == {1337, 2674, 4011}
+    assert {entry["world_size"] for entry in entries} == {4}
+    assert {entry["budget_seconds"] for entry in entries} == {600.0}
+    confirm_labels = {
+        entry["name"].rsplit("_s", 1)[0]
+        for entry in entries
+    }
+    assert len(confirm_labels) == 2
+    for entry in entries:
+        assert entry["name"].startswith("exp24_phase0_confirm_")
+        assert entry["exp24_phase"] == "phase0"
+        assert entry["exp24_mechanism"] == "fast_slow_dreamworld"
+        assert entry["artifact_impact"] == "artifact_training_only"
+        assert entry["fast_slow_enabled"] is True
+        assert entry["fast_slow_eval_copy"] == "slow"
+        assert entry["dreamworld_enabled"] is True
+        assert entry["dreamworld_replay_batch_size"] == 128
+
+
 def test_run_exp24_cli_dry_run_prints_first_wave_plan(tmp_path):
     script = REPO / "experiments" / "24_training_time_bundle" / "run_exp24.py"
     output_dir = tmp_path / "exp24-dryrun"
