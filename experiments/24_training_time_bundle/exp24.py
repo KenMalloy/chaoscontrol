@@ -67,17 +67,21 @@ def _base_entry(
 def _named_entry(
     *,
     base: dict[str, Any],
-    phase: str,
+    phase: str | None,
     mechanism: str,
     arm: str,
     seed: int,
 ) -> dict[str, Any]:
     entry = copy.deepcopy(base)
+    if phase:
+        name = f"exp24_{phase}_{arm}_s{int(seed)}"
+    else:
+        name = f"exp24_{arm}_s{int(seed)}"
     entry.update(
         {
-            "name": f"exp24_{phase}_{arm}_s{int(seed)}",
+            "name": name,
             "seed": int(seed),
-            "exp24_phase": phase,
+            "exp24_phase": phase if phase is not None else "first_wave",
             "exp24_mechanism": mechanism,
         }
     )
@@ -165,6 +169,90 @@ def build_semantic_overhead_gate_matrix(
         )
 
     return entries
+
+
+def build_first_wave_mechanism_matrix(
+    *,
+    speed_config: dict[str, Any],
+    world_size: int = 8,
+    budget_seconds: float = 600.0,
+    seed_values: Sequence[int] = DEFAULT_CONTROL_SEEDS,
+) -> list[dict[str, Any]]:
+    arms = [
+        {
+            "name_arm": "fastslow_i32_a050",
+            "exp24_mechanism": "fast_slow",
+            "artifact_impact": ARTIFACT_TRAINING_ONLY,
+            "fast_slow_enabled": True,
+            "fast_slow_interval": 32,
+            "fast_slow_alpha": 0.50,
+            "fast_slow_eval_copy": "slow",
+        },
+        {
+            "name_arm": "spectral_dead1e-04_sticky1e-04",
+            "exp24_mechanism": "spectral",
+            "artifact_impact": ARTIFACT_CHANGES_WEIGHTS_ONLY,
+            "spectral_reg_lambda_dead": 1e-4,
+            "spectral_reg_lambda_sticky": 1e-4,
+        },
+        {
+            "name_arm": "predictive_h4_w010",
+            "exp24_mechanism": "predictive_aux",
+            "artifact_impact": ARTIFACT_TRAINING_ONLY,
+            "predictive_aux_weight": 0.10,
+            "predictive_aux_horizon": 4,
+        },
+        {
+            "name_arm": "dreamworld_c4_i4_w025",
+            "exp24_mechanism": "dreamworld",
+            "artifact_impact": ARTIFACT_TRAINING_ONLY,
+            "dreamworld_enabled": True,
+            "dreamworld_cache_interval": 4,
+            "dreamworld_interval": 4,
+            "dreamworld_weight": 0.25,
+            "dreamworld_prefix_tokens": 128,
+            "dreamworld_replay_tokens": 64,
+            "dreamworld_buffer_size": 16,
+            "dreamworld_min_size": 2,
+            "dreamworld_max_age_steps": 256,
+        },
+    ]
+
+    entries: list[dict[str, Any]] = []
+    for arm in arms:
+        for seed in seed_values:
+            entry = _base_entry(
+                speed_config=speed_config,
+                world_size=world_size,
+                budget_seconds=budget_seconds,
+            )
+            entry.update(arm)
+            name_arm = str(entry.pop("name_arm"))
+            entries.append(
+                _named_entry(
+                    base=entry,
+                    phase=None,
+                    mechanism=str(entry["exp24_mechanism"]),
+                    arm=name_arm,
+                    seed=int(seed),
+                )
+            )
+    return entries
+
+
+def build_first_wave_matrix(
+    *,
+    speed_config: dict[str, Any],
+    world_size: int = 8,
+    budget_seconds: float = 600.0,
+    seeds: Sequence[int] = DEFAULT_CONTROL_SEEDS,
+) -> list[dict[str, Any]]:
+    return build_first_wave_mechanism_matrix(
+        speed_config=speed_config,
+        world_size=world_size,
+        budget_seconds=budget_seconds,
+        seed_values=seeds,
+    )
 
 
 def summarize_control_noise(results: list[dict[str, Any]]) -> dict[str, Any]:

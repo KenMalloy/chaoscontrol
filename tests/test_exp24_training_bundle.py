@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import importlib.util
 import math
+import subprocess
+import sys
 from pathlib import Path
 
 
@@ -121,3 +123,94 @@ def test_build_semantic_overhead_gate_matrix_has_muon_and_semantic_rows():
         assert entry["exp24_phase"] == "smoke"
         assert entry["exp24_mechanism"] == "semantic_optimizer_gate"
         assert entry["artifact_impact"] == "artifact_changes_weights_only"
+
+
+def test_first_wave_mechanism_matrix_names_and_tags():
+    mod = _load_exp24()
+
+    entries = mod.build_first_wave_mechanism_matrix(
+        speed_config={"batch_size": 1024, "chunk_size": 64},
+        seed_values=[1337],
+        world_size=8,
+    )
+
+    names = [entry["name"] for entry in entries]
+    assert names == [
+        "exp24_fastslow_i32_a050_s1337",
+        "exp24_spectral_dead1e-04_sticky1e-04_s1337",
+        "exp24_predictive_h4_w010_s1337",
+        "exp24_dreamworld_c4_i4_w025_s1337",
+    ]
+
+    mechanisms = {entry["exp24_mechanism"] for entry in entries}
+    assert mechanisms == {
+        "fast_slow",
+        "spectral",
+        "predictive_aux",
+        "dreamworld",
+    }
+
+    fastslow = next(
+        entry for entry in entries if entry["name"] == "exp24_fastslow_i32_a050_s1337"
+    )
+    assert fastslow["fast_slow_enabled"] is True
+    assert fastslow["fast_slow_interval"] == 32
+    assert fastslow["fast_slow_alpha"] == 0.5
+    assert fastslow["fast_slow_eval_copy"] == "slow"
+    assert fastslow["artifact_impact"] == "artifact_training_only"
+
+    spectral = next(
+        entry
+        for entry in entries
+        if entry["name"] == "exp24_spectral_dead1e-04_sticky1e-04_s1337"
+    )
+    assert spectral["spectral_reg_lambda_dead"] == 0.0001
+    assert spectral["spectral_reg_lambda_sticky"] == 0.0001
+    assert spectral["artifact_impact"] == "artifact_changes_weights_only"
+
+    predictive = next(
+        entry for entry in entries if entry["name"] == "exp24_predictive_h4_w010_s1337"
+    )
+    assert predictive["predictive_aux_horizon"] == 4
+    assert predictive["predictive_aux_weight"] == 0.1
+    assert predictive["artifact_impact"] == "artifact_training_only"
+
+    dream = next(
+        entry for entry in entries if entry["name"] == "exp24_dreamworld_c4_i4_w025_s1337"
+    )
+    assert dream["dreamworld_enabled"] is True
+    assert dream["dreamworld_cache_interval"] == 4
+    assert dream["dreamworld_interval"] == 4
+    assert dream["dreamworld_weight"] == 0.25
+    assert dream["artifact_impact"] == "artifact_training_only"
+
+
+def test_run_exp24_cli_dry_run_prints_first_wave_plan(tmp_path):
+    script = REPO / "experiments" / "24_training_time_bundle" / "run_exp24.py"
+    output_dir = tmp_path / "exp24-dryrun"
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(script),
+            "--matrix",
+            "first_wave",
+            "--seeds",
+            "1337",
+            "--dry-run",
+            "--limit",
+            "2",
+            "--output-dir",
+            str(output_dir),
+        ],
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    stdout = result.stdout
+    assert "matrix=first_wave" in stdout
+    assert "exp24_fastslow_i32_a050_s1337" in stdout
+    assert "exp24_spectral_dead1e-04_sticky1e-04_s1337" in stdout
+    assert '"exp24_mechanism": "fast_slow"' in stdout
+    assert '"exp24_mechanism": "spectral"' in stdout
