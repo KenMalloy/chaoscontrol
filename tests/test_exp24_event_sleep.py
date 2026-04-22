@@ -389,3 +389,33 @@ def test_event_sleep_replay_lands_one_step_after_trigger(monkeypatch):
         f"replay did not land one step after trigger: {sampled_steps}"
     )
     assert sampled_steps == [6], f"replay fired on unexpected steps: {sampled_steps}"
+
+
+def test_gate_produces_exact_trigger_trajectory():
+    mod = _load_runner_module()
+
+    losses = []
+    base = 2.5
+    for step in range(40):
+        base = 0.995 * base
+        spike = 0.8 if step in (12, 24, 35) else 0.0
+        losses.append(base + spike)
+
+    gate = mod.LossTriggeredReplayEMA(decay=0.9, warmup_steps=5)
+
+    fired_steps: list[int] = []
+    for step, loss in enumerate(losses):
+        decision = gate.update(
+            torch.tensor(loss),
+            threshold=1.10,
+            pressure_threshold=0.02,
+            ddp_active=False,
+            world_size=1,
+            device=torch.device("cpu"),
+        )
+        if decision is not None and decision.triggered:
+            fired_steps.append(step)
+
+    assert fired_steps == [12, 24, 35], (
+        f"trigger trajectory drifted: got {fired_steps}, expected [12, 24, 35]"
+    )
