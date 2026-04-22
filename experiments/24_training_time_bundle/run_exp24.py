@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any
@@ -31,7 +32,7 @@ from exp24 import (  # noqa: E402
     build_semantic_overhead_gate_matrix,
 )
 from fast_path import read_speed_config, write_matrix  # noqa: E402
-from launch import run_matrix_entries  # noqa: E402
+from launch import pick_free_port, run_matrix_entries  # noqa: E402
 
 
 def _prebuild_cache(data_path: str) -> None:
@@ -49,6 +50,72 @@ def _print_entries(entries: list[dict[str, Any]]) -> None:
     for entry in entries:
         print(f"[exp24] {entry['name']}")
         print(json.dumps(entry, indent=2, sort_keys=True, default=str))
+
+
+def _score_full_val(
+    *,
+    entries: list[dict[str, Any]],
+    checkpoint_dir: Path,
+    results_dir: Path,
+    world_size: int,
+    cache_dir: Path,
+    budget_seconds: float,
+    dry_run: bool = False,
+) -> list[list[str]]:
+    full_val_dir = results_dir / "full_val"
+    full_val_dir.mkdir(parents=True, exist_ok=True)
+    logs_dir = results_dir / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    scorer = REPO / "scripts" / "run_exp20_fast_score.py"
+    commands: list[list[str]] = []
+    for entry in entries:
+        name = str(entry["name"])
+        ckpt = checkpoint_dir / f"{name}.pt"
+        if not dry_run and not ckpt.exists():
+            continue
+        summary_path = full_val_dir / f"{name}.summary.json"
+        if summary_path.exists():
+            continue
+        jsonl_path = full_val_dir / f"{name}.jsonl"
+        log_path = logs_dir / f"{name}.full_val.log"
+        rdzv_port = pick_free_port()
+        cmd = [
+            sys.executable,
+            "-m",
+            "torch.distributed.run",
+            f"--nproc_per_node={int(world_size)}",
+            f"--rdzv-endpoint=localhost:{rdzv_port}",
+            "--rdzv-backend=c10d",
+            f"--rdzv-id=score_{name}_{rdzv_port}",
+            str(scorer),
+            "--cache-dir",
+            str(cache_dir),
+            "--checkpoint-path",
+            str(ckpt),
+            "--output-path",
+            str(jsonl_path),
+            "--summary-path",
+            str(summary_path),
+            "--chunk-size",
+            "256",
+            "--budget-seconds",
+            str(float(budget_seconds)),
+            "--doc-batch-size",
+            "4096",
+            "--max-forward-tokens",
+            "auto",
+            "--score-boundary-targets",
+            "--doc-packing",
+            "chunk_count_tail",
+        ]
+        commands.append(cmd)
+        if dry_run:
+            continue
+        with log_path.open("w") as log:
+            log.write("+ " + " ".join(cmd) + "\n")
+            proc = subprocess.run(cmd, stdout=log, stderr=subprocess.STDOUT, text=True)
+            log.write(f"\n[returncode] {proc.returncode}\n")
+    return commands
 
 
 def _build_entries(
@@ -167,12 +234,39 @@ def main(argv: list[str] | None = None) -> int:
         default=DEFAULT_SP_MODEL_16384,
     )
     parser.add_argument("--skip-existing", action="store_true", default=True)
+    parser.add_argument(
+        "--checkpoint-dir",
+        type=Path,
+        default=None,
+        help="If set, save per-entry training checkpoints here via runner --output-ckpt.",
+    )
+    parser.add_argument(
+        "--full-val-score",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="After training each entry, run scripts/run_exp20_fast_score.py on the saved checkpoint.",
+    )
+    parser.add_argument(
+        "--val-cache-dir",
+        type=Path,
+        default=Path("/workspace/cache/exp23_val_16384"),
+        help="Tokenized val cache dir for the fast scorer.",
+    )
+    parser.add_argument(
+        "--val-budget-seconds",
+        type=float,
+        default=600.0,
+        help="Eval budget passed to run_exp20_fast_score.py.",
+    )
     args = parser.parse_args(argv)
 
     default_world_size = 1 if args.matrix == "semantic_overhead_gate" else 8
     default_budget = 90.0 if args.matrix == "semantic_overhead_gate" else 600.0
     world_size = int(args.world_size) if args.world_size is not None else default_world_size
     budget = float(args.budget) if args.budget is not None else default_budget
+    checkpoint_dir = args.checkpoint_dir
+    if args.full_val_score and checkpoint_dir is None:
+        checkpoint_dir = args.output_dir / "checkpoints"
 
     speed_config = read_speed_config(args.config)
     entries = _build_entries(
@@ -193,6 +287,13 @@ def main(argv: list[str] | None = None) -> int:
             f"world_size={world_size} dry_run={effective_dry_run}",
             flush=True,
         )
+        if args.full_val_score:
+            print(
+                "[exp24] full-val-score enabled "
+                f"checkpoint_dir={checkpoint_dir} val_cache_dir={args.val_cache_dir} "
+                f"val_budget_seconds={float(args.val_budget_seconds)}",
+                flush=True,
+            )
         _print_entries(selected)
 
     if not effective_dry_run:
@@ -208,7 +309,33 @@ def main(argv: list[str] | None = None) -> int:
         limit=args.limit,
         dry_run=effective_dry_run,
         skip_existing=args.skip_existing,
+        checkpoint_dir=checkpoint_dir,
     )
+    if args.full_val_score:
+        full_val_commands = _score_full_val(
+            entries=selected,
+            checkpoint_dir=checkpoint_dir,
+            results_dir=args.output_dir,
+            world_size=world_size,
+            cache_dir=args.val_cache_dir,
+            budget_seconds=float(args.val_budget_seconds),
+            dry_run=effective_dry_run,
+        )
+        if effective_dry_run:
+            summary["full_val_commands"] = full_val_commands
+        else:
+            summary = run_matrix_entries(
+                entries=entries,
+                runner_path=EXP23 / "runner_fast_path.py",
+                data_path=str(args.data_path),
+                sp_model_paths={16384: str(args.sp_model_path_16384)},
+                results_dir=args.output_dir,
+                world_size=world_size,
+                limit=args.limit,
+                dry_run=True,
+                skip_existing=True,
+                checkpoint_dir=checkpoint_dir,
+            )
     print(json.dumps(summary, indent=2, default=str))
     return 0
 

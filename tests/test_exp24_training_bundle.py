@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import math
 import subprocess
 import sys
@@ -10,10 +11,28 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
 EXP24_PATH = REPO / "experiments" / "24_training_time_bundle" / "exp24.py"
+RUN_EXP24_PATH = REPO / "experiments" / "24_training_time_bundle" / "run_exp24.py"
+LAUNCH_PATH = REPO / "experiments" / "23_fast_path" / "launch.py"
 
 
 def _load_exp24():
     spec = importlib.util.spec_from_file_location("exp24_training_bundle", EXP24_PATH)
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _load_run_exp24():
+    spec = importlib.util.spec_from_file_location("run_exp24_for_tests", RUN_EXP24_PATH)
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _load_launch():
+    spec = importlib.util.spec_from_file_location("exp23_launch_for_tests", LAUNCH_PATH)
     assert spec is not None and spec.loader is not None
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
@@ -351,3 +370,118 @@ def test_run_exp24_cli_fastslow_dreamworld_matrix_is_stack_only(tmp_path):
     assert "entries=1" in stdout
     assert "exp24_fastslow_i32_a050_dreamworld_c8_i8_w025_sub128_s1337" in stdout
     assert '"exp24_mechanism": "fast_slow_dreamworld"' in stdout
+
+
+def test_run_exp24_full_val_defaults_checkpoint_dir(tmp_path):
+    script = REPO / "experiments" / "24_training_time_bundle" / "run_exp24.py"
+    output_dir = tmp_path / "exp24-full-val-dryrun"
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(script),
+            "--matrix",
+            "fastslow_dreamworld",
+            "--seeds",
+            "1337",
+            "--dry-run",
+            "--full-val-score",
+            "--world-size",
+            "4",
+            "--output-dir",
+            str(output_dir),
+            "--val-cache-dir",
+            str(tmp_path / "val-cache"),
+        ],
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    stdout = result.stdout
+    assert "[exp24] full-val-score enabled" in stdout
+    assert str(output_dir / "checkpoints") in stdout
+    assert "run_exp20_fast_score.py" in stdout
+    assert "--nproc_per_node=4" in stdout
+
+
+def test_score_full_val_builds_expected_cmd(tmp_path):
+    mod = _load_run_exp24()
+    checkpoint_dir = tmp_path / "checkpoints"
+    checkpoint_dir.mkdir()
+    name = "exp24_fastslow_i32_a050_s1337"
+    (checkpoint_dir / f"{name}.pt").write_bytes(b"fake checkpoint")
+
+    commands = mod._score_full_val(
+        entries=[{"name": name}],
+        checkpoint_dir=checkpoint_dir,
+        results_dir=tmp_path,
+        world_size=4,
+        cache_dir=tmp_path / "val-cache",
+        budget_seconds=600.0,
+        dry_run=True,
+    )
+
+    assert len(commands) == 1
+    cmd = commands[0]
+    assert cmd[:3] == [sys.executable, "-m", "torch.distributed.run"]
+    assert "--nproc_per_node=4" in cmd
+    rdzv_endpoint = next(arg for arg in cmd if arg.startswith("--rdzv-endpoint="))
+    assert rdzv_endpoint.startswith("--rdzv-endpoint=localhost:")
+    assert "--rdzv-backend=c10d" in cmd
+    rdzv_id = next(arg for arg in cmd if arg.startswith("--rdzv-id="))
+    assert rdzv_id.startswith(f"--rdzv-id=score_{name}_")
+    assert str(REPO / "scripts" / "run_exp20_fast_score.py") in cmd
+    assert cmd[cmd.index("--cache-dir") + 1] == str(tmp_path / "val-cache")
+    assert cmd[cmd.index("--checkpoint-path") + 1] == str(checkpoint_dir / f"{name}.pt")
+    assert cmd[cmd.index("--output-path") + 1] == str(tmp_path / "full_val" / f"{name}.jsonl")
+    assert cmd[cmd.index("--summary-path") + 1] == str(
+        tmp_path / "full_val" / f"{name}.summary.json"
+    )
+    assert cmd[cmd.index("--chunk-size") + 1] == "256"
+    assert cmd[cmd.index("--budget-seconds") + 1] == "600.0"
+    assert cmd[cmd.index("--doc-batch-size") + 1] == "4096"
+    assert cmd[cmd.index("--max-forward-tokens") + 1] == "auto"
+    assert "--score-boundary-targets" in cmd
+    assert cmd[cmd.index("--doc-packing") + 1] == "chunk_count_tail"
+
+
+def test_summarize_result_dir_merges_val_bpb(tmp_path):
+    launch = _load_launch()
+    for name, tokens_per_sec, val_bpb in [
+        ("slow_best", 10.0, 1.10),
+        ("fast_worse", 100.0, 1.20),
+    ]:
+        (tmp_path / f"{name}.json").write_text(
+            json.dumps(
+                {
+                    "config": {"name": name},
+                    "train": {
+                        "aggregate_tokens_per_sec": tokens_per_sec,
+                        "per_gpu_tokens_per_sec": tokens_per_sec / 4,
+                        "steps": 7,
+                        "final_loss": 3.0,
+                        "peak_vram_mb": 123.0,
+                    },
+                    "artifact": {
+                        "artifact_impact": "artifact_training_only",
+                        "submit_valid": True,
+                    },
+                    "exp24": {
+                        "phase": "phase0",
+                        "mechanism": "fast_slow_dreamworld",
+                    },
+                }
+            )
+        )
+        full_val = tmp_path / "full_val"
+        full_val.mkdir(exist_ok=True)
+        (full_val / f"{name}.summary.json").write_text(
+            json.dumps({"aggregate_bpb": val_bpb, "docs_scored": 50000})
+        )
+
+    summary = launch.summarize_result_dir(tmp_path)
+
+    assert [row["name"] for row in summary["ranked"]] == ["slow_best", "fast_worse"]
+    assert [row["val_bpb"] for row in summary["ranked"]] == [1.10, 1.20]
+    assert [row["val_docs_scored"] for row in summary["ranked"]] == [50000, 50000]
