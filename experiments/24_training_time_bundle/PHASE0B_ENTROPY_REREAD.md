@@ -4,14 +4,15 @@ Frozen base references:
 
 - Base-lock decision: `experiments/24_training_time_bundle/PHASE0_BASE_LOCK.md`
 - Locked config: `experiments/24_training_time_bundle/configs/exp24_base.yaml`
-- Confirm winner checkpoints:
-  - `experiments/24_training_time_bundle/phase0_confirm_4x_20260423T044539Z/checkpoints/exp24_phase0_confirm_B_fs_i64a025_dw_c16i16_w010_s1337.pt`
-  - `experiments/24_training_time_bundle/phase0_confirm_4x_20260423T044539Z/checkpoints/exp24_phase0_confirm_B_fs_i64a025_dw_c16i16_w010_s2674.pt`
-  - `experiments/24_training_time_bundle/phase0_confirm_4x_20260423T044539Z/checkpoints/exp24_phase0_confirm_B_fs_i64a025_dw_c16i16_w010_s4011.pt`
+- Locked fast/slow-only checkpoints:
+  - `experiments/24_training_time_bundle/phase0_fastslow_only_control_4x_20260423T193800Z/checkpoints/exp24_phase0_control_fastslow_only_i64a025_s1337.pt`
+  - `experiments/24_training_time_bundle/phase0_fastslow_only_control_4x_20260423T193800Z/checkpoints/exp24_phase0_control_fastslow_only_i64a025_s2674.pt`
+  - `experiments/24_training_time_bundle/phase0_fastslow_only_control_4x_20260423T193800Z/checkpoints/exp24_phase0_control_fastslow_only_i64a025_s4011.pt`
 
 This document freezes the Phase 0b thesis and evaluation contract before any
 implementation. Phase 0b is not implemented or evaluated in the Phase 0
-base-lock plan.
+base-lock plan. It now sits explicitly in the adaptive / TTT lane on top of the
+fast/slow-only training base.
 
 ## Mechanism
 

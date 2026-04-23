@@ -4,6 +4,18 @@ Exp24 tests training-time mechanisms on top of the current Exp23 fastest SSM
 base. Evaluation remains the fixed post-training scorer; no eval-time TTT,
 temporal heads, or scoring-time state changes belong in this bundle.
 
+Current operational lock for optimizer work:
+
+- `experiments/24_training_time_bundle/configs/exp24_base.yaml`
+- `fast_slow_interval=64`
+- `fast_slow_alpha=0.25`
+- `fast_slow_eval_copy=slow`
+- `dreamworld_enabled=false`
+- `event_sleep_enabled=false`
+
+Dreamworld and sleep remain follow-up mechanism lanes, but they are not part of
+the locked static training base after the matched Phase 0 control.
+
 ## Run Order
 
 1. Ring 0 control: 2-3 seeds, 600s wall-clock, full validation after training.

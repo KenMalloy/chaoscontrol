@@ -8,11 +8,16 @@ import subprocess
 import sys
 from pathlib import Path
 
+import yaml
+
 
 REPO = Path(__file__).resolve().parents[1]
 EXP24_PATH = REPO / "experiments" / "24_training_time_bundle" / "exp24.py"
 RUN_EXP24_PATH = REPO / "experiments" / "24_training_time_bundle" / "run_exp24.py"
 LAUNCH_PATH = REPO / "experiments" / "23_fast_path" / "launch.py"
+EXP24_BASE_CONFIG_PATH = (
+    REPO / "experiments" / "24_training_time_bundle" / "configs" / "exp24_base.yaml"
+)
 
 
 def _load_exp24():
@@ -433,6 +438,27 @@ def test_build_phase0_fastslow_only_control_matches_locked_base_without_dreamwor
         assert entry["dreamworld_replay_batch_size"] == 0
 
 
+def test_exp24_base_config_matches_fastslow_only_lock():
+    cfg = yaml.safe_load(EXP24_BASE_CONFIG_PATH.read_text())
+
+    assert cfg["name"] == "exp24_base"
+    assert cfg["exp24_mechanism"] == "fast_slow"
+    assert cfg["artifact_impact"] == "artifact_training_only"
+    assert cfg["world_size"] == 4
+    assert cfg["budget_seconds"] == 600.0
+    assert cfg["fast_slow_enabled"] is True
+    assert cfg["fast_slow_interval"] == 64
+    assert cfg["fast_slow_alpha"] == 0.25
+    assert cfg["fast_slow_eval_copy"] == "slow"
+    assert cfg["dreamworld_enabled"] is False
+    assert cfg["dreamworld_cache_interval"] == 0
+    assert cfg["dreamworld_interval"] == 0
+    assert cfg["dreamworld_weight"] == 0.0
+    assert cfg["dreamworld_replay_batch_size"] == 0
+    assert cfg["event_sleep_enabled"] is False
+    assert cfg["event_sleep_weight"] == 0.0
+
+
 def test_run_exp24_cli_dry_run_prints_first_wave_plan(tmp_path):
     script = REPO / "experiments" / "24_training_time_bundle" / "run_exp24.py"
     output_dir = tmp_path / "exp24-dryrun"
@@ -488,6 +514,40 @@ def test_run_exp24_cli_ring0_defaults_to_control_seed_ladder(tmp_path):
     assert "exp24_ring0_control_s1337" in stdout
     assert "exp24_ring0_control_s2674" in stdout
     assert "exp24_ring0_control_s4011" in stdout
+
+
+def test_run_exp24_cli_phase0_fastslow_only_control_accepts_locked_base_config(tmp_path):
+    script = REPO / "experiments" / "24_training_time_bundle" / "run_exp24.py"
+    output_dir = tmp_path / "exp24-phase0-fastslow-only-dryrun"
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(script),
+            "--matrix",
+            "phase0_fastslow_only_control",
+            "--config",
+            str(EXP24_BASE_CONFIG_PATH),
+            "--dry-run",
+            "--limit",
+            "1",
+            "--output-dir",
+            str(output_dir),
+        ],
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    stdout = result.stdout
+    assert "matrix=phase0_fastslow_only_control" in stdout
+    assert "world_size=4" in stdout
+    assert "exp24_phase0_control_fastslow_only_i64a025_s1337" in stdout
+    assert '"exp24_mechanism": "fast_slow"' in stdout
+    assert '"fast_slow_interval": 64' in stdout
+    assert '"dreamworld_enabled": false' in stdout
+    assert '"event_sleep_enabled": false' in stdout
+    assert '"--nproc_per_node=4"' in stdout
 
 
 def test_run_exp24_cli_semantic_gate_defaults_to_cheap_smoke(tmp_path):

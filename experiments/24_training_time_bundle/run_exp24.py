@@ -237,6 +237,19 @@ def _build_entries(
     raise ValueError(f"unsupported matrix: {matrix}")
 
 
+def _default_world_size_for_matrix(matrix: str) -> int:
+    if matrix == "semantic_overhead_gate":
+        return 1
+    if matrix in {
+        "phase0_dreamworld_sweep",
+        "phase0_fastslow_sweep",
+        "phase0_confirm",
+        "phase0_fastslow_only_control",
+    }:
+        return 4
+    return 8
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -296,7 +309,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    default_world_size = 1 if args.matrix == "semantic_overhead_gate" else 8
+    default_world_size = _default_world_size_for_matrix(args.matrix)
     default_budget = 90.0 if args.matrix == "semantic_overhead_gate" else 600.0
     world_size = int(args.world_size) if args.world_size is not None else default_world_size
     budget = float(args.budget) if args.budget is not None else default_budget
