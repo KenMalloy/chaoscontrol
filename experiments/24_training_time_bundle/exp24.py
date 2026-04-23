@@ -544,6 +544,49 @@ def build_phase0_confirm(
     return entries
 
 
+def build_phase0_fastslow_only_control(
+    *,
+    speed_config: dict[str, Any],
+    world_size: int = 4,
+    budget_seconds: float = 600.0,
+    seed_values: Sequence[int] = DEFAULT_CONTROL_SEEDS,
+) -> list[dict[str, Any]]:
+    """Matched 4x fast/slow-only control for the locked Phase 0 stack."""
+    arm = {
+        "name_arm": "control_fastslow_only_i64a025",
+        "exp24_mechanism": "fast_slow",
+        "artifact_impact": ARTIFACT_TRAINING_ONLY,
+        "fast_slow_enabled": True,
+        "fast_slow_interval": 64,
+        "fast_slow_alpha": 0.25,
+        "fast_slow_eval_copy": "slow",
+        "dreamworld_enabled": False,
+        "dreamworld_cache_interval": 0,
+        "dreamworld_interval": 0,
+        "dreamworld_weight": 0.0,
+        "dreamworld_replay_batch_size": 0,
+    }
+    entries: list[dict[str, Any]] = []
+    for seed in seed_values:
+        entry = _base_entry(
+            speed_config=speed_config,
+            world_size=world_size,
+            budget_seconds=budget_seconds,
+        )
+        entry.update(arm)
+        name_arm = str(entry.pop("name_arm"))
+        entries.append(
+            _named_entry(
+                base=entry,
+                phase="phase0",
+                mechanism=str(entry["exp24_mechanism"]),
+                arm=name_arm,
+                seed=int(seed),
+            )
+        )
+    return entries
+
+
 def build_first_wave_matrix(
     *,
     speed_config: dict[str, Any],

@@ -400,6 +400,39 @@ def test_build_phase0_confirm_shape_and_knobs():
         assert entry["dreamworld_replay_batch_size"] == 128
 
 
+def test_build_phase0_fastslow_only_control_matches_locked_base_without_dreamworld():
+    mod = _load_exp24()
+
+    entries = mod.build_phase0_fastslow_only_control(
+        speed_config={"batch_size": 1024, "chunk_size": 64},
+        world_size=4,
+        budget_seconds=600.0,
+    )
+
+    assert len(entries) == 3
+    assert [entry["seed"] for entry in entries] == [1337, 2674, 4011]
+    assert [entry["name"] for entry in entries] == [
+        "exp24_phase0_control_fastslow_only_i64a025_s1337",
+        "exp24_phase0_control_fastslow_only_i64a025_s2674",
+        "exp24_phase0_control_fastslow_only_i64a025_s4011",
+    ]
+    assert {entry["world_size"] for entry in entries} == {4}
+    assert {entry["budget_seconds"] for entry in entries} == {600.0}
+    for entry in entries:
+        assert entry["exp24_phase"] == "phase0"
+        assert entry["exp24_mechanism"] == "fast_slow"
+        assert entry["artifact_impact"] == "artifact_training_only"
+        assert entry["fast_slow_enabled"] is True
+        assert entry["fast_slow_interval"] == 64
+        assert entry["fast_slow_alpha"] == 0.25
+        assert entry["fast_slow_eval_copy"] == "slow"
+        assert entry["dreamworld_enabled"] is False
+        assert entry["dreamworld_cache_interval"] == 0
+        assert entry["dreamworld_interval"] == 0
+        assert entry["dreamworld_weight"] == 0.0
+        assert entry["dreamworld_replay_batch_size"] == 0
+
+
 def test_run_exp24_cli_dry_run_prints_first_wave_plan(tmp_path):
     script = REPO / "experiments" / "24_training_time_bundle" / "run_exp24.py"
     output_dir = tmp_path / "exp24-dryrun"
