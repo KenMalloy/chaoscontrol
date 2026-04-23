@@ -1,8 +1,8 @@
 # Exp 24 - Rigor and Speed Session
 
 **Date:** 2026-04-22
-**Status:** Design - approved for implementation plan
-**Scope:** one session, 1 H100 primary, CPU-gloo for multi-rank tests
+**Status:** Implemented locally; H100 profile pending operator-provided GPU
+**Scope:** one session, CPU-gloo for multi-rank tests, CPU smoke profile locally
 
 ## Goal
 
@@ -80,6 +80,18 @@ Each candidate either lands with measured before/after step-time numbers, or is 
 ## Matrix change
 
 None. The `dreamworld + event_sleep` (no `fast_slow`) arm I had originally proposed for first-wave is dropped. Event_sleep's effect as part of the full stack is what Exp 24 is designed to measure.
+
+## Results
+
+Implementation landed on branch `exp24-rigor-speed`.
+
+- Event-sleep coverage moved into `tests/test_exp24_event_sleep.py`. The file now covers the real 4-rank gloo lockstep and equality boundary, one-step replay delay, seed-anchored trigger trajectory `[12, 24, 35]`, warmup-restore bit equality, bf16 loss handling, runner replay plumbing, and the tensor-backed EMA state contract.
+- Fast-slow slow-weight updates now use `torch._foreach_lerp_` for matching dtype/device tensors with the existing scalar fallback preserved for mismatches.
+- Event-sleep loss gating now keeps EMA/pressure math as tensors. The runner queues each decision and materializes it at the next step boundary, preserving the one-step replay contract while avoiding immediate loss `.item()` materialization on CUDA.
+- Profile harness and report landed at `experiments/24_training_time_bundle/profile_event_sleep_arm.py` and `docs/plans/2026-04-22-exp24-runner-profile.md`.
+- Spectral vectorization was deferred because the active `fast_slow_dreamworld_event_sleep` arm has `spectral_reg_lambda_* == 0.0`; graph-break audit is not applicable with `compile_full_path: false`; dreamworld replay backward was audited and left unchanged because it intentionally replays detached buffer samples via a fresh state-conditioned forward/backward.
+- Local verification: `pytest tests/test_exp23_fast_path.py tests/test_exp24_event_sleep.py tests/test_exp24_training_bundle.py tests/test_exp24_dreamworld.py tests/test_exp24_training_hooks.py -q` passed with `78 passed, 1 warning`; `git diff --check` passed.
+- H100 profile remains pending. This workstation has no CUDA device and `runpodctl pod list` showed no active pod; creating a paid pod was not done without explicit operator confirmation.
 
 ## Non-goals
 

@@ -528,36 +528,102 @@ def _apply_scopt_pending(
 
 class LossTriggeredReplayDecision:
     __slots__ = (
-        "local_loss",
-        "ema_loss",
-        "local_ratio",
-        "local_pressure",
-        "global_pressure",
-        "fire_count",
-        "local_fire",
-        "triggered",
+        "_local_loss",
+        "_ema_loss",
+        "_local_ratio",
+        "_local_pressure",
+        "_global_pressure",
+        "_fire_count",
+        "_local_fire",
+        "_triggered",
     )
 
     def __init__(
         self,
         *,
-        local_loss: float,
-        ema_loss: float,
-        local_ratio: float,
-        local_pressure: float,
-        global_pressure: float,
-        fire_count: int,
-        local_fire: bool,
-        triggered: bool,
+        local_loss: float | torch.Tensor,
+        ema_loss: float | torch.Tensor,
+        local_ratio: float | torch.Tensor,
+        local_pressure: float | torch.Tensor,
+        global_pressure: float | torch.Tensor,
+        fire_count: int | torch.Tensor,
+        local_fire: bool | torch.Tensor,
+        triggered: bool | torch.Tensor,
     ) -> None:
-        self.local_loss = local_loss
-        self.ema_loss = ema_loss
-        self.local_ratio = local_ratio
-        self.local_pressure = local_pressure
-        self.global_pressure = global_pressure
-        self.fire_count = fire_count
-        self.local_fire = local_fire
-        self.triggered = triggered
+        self._local_loss = local_loss
+        self._ema_loss = ema_loss
+        self._local_ratio = local_ratio
+        self._local_pressure = local_pressure
+        self._global_pressure = global_pressure
+        self._fire_count = fire_count
+        self._local_fire = local_fire
+        self._triggered = triggered
+
+    @staticmethod
+    def _materialize_float(value: float | torch.Tensor) -> float:
+        if isinstance(value, torch.Tensor):
+            return float(value.detach().float().item())
+        return float(value)
+
+    @staticmethod
+    def _materialize_int(value: int | torch.Tensor) -> int:
+        if isinstance(value, torch.Tensor):
+            return int(value.detach().item())
+        return int(value)
+
+    @staticmethod
+    def _materialize_bool(value: bool | torch.Tensor) -> bool:
+        if isinstance(value, torch.Tensor):
+            return bool(value.detach().item())
+        return bool(value)
+
+    @property
+    def local_loss(self) -> float:
+        value = self._materialize_float(self._local_loss)
+        self._local_loss = value
+        return value
+
+    @property
+    def ema_loss(self) -> float:
+        value = self._materialize_float(self._ema_loss)
+        self._ema_loss = value
+        return value
+
+    @property
+    def local_ratio(self) -> float:
+        value = self._materialize_float(self._local_ratio)
+        self._local_ratio = value
+        return value
+
+    @property
+    def local_pressure(self) -> float:
+        value = self._materialize_float(self._local_pressure)
+        self._local_pressure = value
+        return value
+
+    @property
+    def global_pressure(self) -> float:
+        value = self._materialize_float(self._global_pressure)
+        self._global_pressure = value
+        return value
+
+    @property
+    def fire_count(self) -> int:
+        value = self._materialize_int(self._fire_count)
+        self._fire_count = value
+        return value
+
+    @property
+    def local_fire(self) -> bool:
+        value = self._materialize_bool(self._local_fire)
+        self._local_fire = value
+        return value
+
+    @property
+    def triggered(self) -> bool:
+        value = self._materialize_bool(self._triggered)
+        self._triggered = value
+        return value
 
 
 class LossTriggeredReplayEMA:
@@ -583,7 +649,7 @@ class LossTriggeredReplayEMA:
         self.decay = float(decay)
         self.warmup_steps = int(warmup_steps)
         self.eps = float(eps)
-        self.value: float | None = None
+        self.value: torch.Tensor | None = None
         self.observations = 0
 
     def update(
@@ -596,34 +662,36 @@ class LossTriggeredReplayEMA:
         world_size: int = 1,
         device: torch.device | None = None,
     ) -> LossTriggeredReplayDecision | None:
-        loss_value = float(loss.detach().float().item())
+        loss_value = loss.detach().float().reshape(())
         if self.value is None:
-            self.value = loss_value
+            self.value = loss_value.clone()
             self.observations = 1
             return None
 
-        ema_before = float(self.value)
+        ema_before = self.value
         self.value = self.decay * self.value + (1.0 - self.decay) * loss_value
         self.observations += 1
         if self.observations <= self.warmup_steps:
             return None
 
-        ratio = loss_value / max(ema_before, self.eps)
-        local_pressure = max(0.0, ratio - float(threshold))
+        ratio = loss_value / ema_before.clamp_min(self.eps)
+        local_pressure = (ratio - float(threshold)).clamp_min(0.0)
         local_fire = local_pressure > 0.0
         if ddp_active and int(world_size) > 1:
             reduce_device = device if device is not None else loss.device
-            pressure_and_fire = torch.tensor(
-                [local_pressure, float(local_fire)],
-                dtype=torch.float32,
-                device=reduce_device,
+            pressure_and_fire = torch.stack(
+                (
+                    local_pressure.to(device=reduce_device, dtype=torch.float32),
+                    local_fire.to(device=reduce_device, dtype=torch.float32),
+                )
             )
             dist.all_reduce(pressure_and_fire, op=dist.ReduceOp.SUM)
-            global_pressure = float(pressure_and_fire[0].item()) / float(world_size)
-            fire_count = int(pressure_and_fire[1].item())
+            global_pressure = pressure_and_fire[0] / float(world_size)
+            fire_count = pressure_and_fire[1].round().to(torch.int64)
         else:
             global_pressure = local_pressure
-            fire_count = int(local_fire)
+            fire_count = local_fire.to(torch.int64)
+        triggered = global_pressure > float(pressure_threshold)
         return LossTriggeredReplayDecision(
             local_loss=loss_value,
             ema_loss=ema_before,
@@ -632,7 +700,7 @@ class LossTriggeredReplayEMA:
             global_pressure=global_pressure,
             fire_count=fire_count,
             local_fire=local_fire,
-            triggered=global_pressure > float(pressure_threshold),
+            triggered=triggered,
         )
 
 
@@ -1533,6 +1601,8 @@ def train_fast_for_budget(
     event_sleep_decision_count = 0
     event_sleep_pressure_sum = 0.0
     event_sleep_last_decision: dict[str, Any] | None = None
+    event_sleep_queued_decision: LossTriggeredReplayDecision | None = None
+    event_sleep_queued_step: int | None = None
     spectral_before = spectral_summary(model)
     losses: list[torch.Tensor] = []
     steps = 0
@@ -1589,6 +1659,42 @@ def train_fast_for_budget(
 
     try:
         while True:
+            # Resolve the previous loss decision at the step boundary so
+            # ``update`` can leave CUDA loss-pressure math unmaterialized.
+            if event_sleep_queued_decision is not None:
+                decision = event_sleep_queued_decision
+                decision_step = (
+                    steps
+                    if event_sleep_queued_step is None
+                    else event_sleep_queued_step
+                )
+                event_sleep_queued_decision = None
+                event_sleep_queued_step = None
+
+                event_sleep_decision_count += 1
+                event_sleep_pressure_sum += decision.global_pressure
+                event_sleep_last_decision = {
+                    "local_loss": decision.local_loss,
+                    "ema_loss": decision.ema_loss,
+                    "local_ratio": decision.local_ratio,
+                    "local_pressure": decision.local_pressure,
+                    "global_pressure": decision.global_pressure,
+                    "fire_count": decision.fire_count,
+                    "local_fire": decision.local_fire,
+                    "triggered": decision.triggered,
+                }
+                interval_ready = (
+                    decision_step - event_sleep_last_replay_step
+                    >= int(event_sleep_min_interval)
+                )
+                buffer_ready = (
+                    dream_buffer is not None
+                    and len(dream_buffer) >= int(dreamworld_min_size)
+                )
+                if decision.triggered and interval_ready and buffer_ready:
+                    event_sleep_trigger_count += 1
+                    event_sleep_pending = True
+
             check_interval = max(1, int(stop_check_interval))
             max_steps_reached = max_steps is not None and steps >= int(max_steps)
             if steps == 0 or steps % check_interval == 0 or max_steps_reached:
@@ -1746,29 +1852,8 @@ def train_fast_for_budget(
                     device=device,
                 )
                 if decision is not None:
-                    event_sleep_decision_count += 1
-                    event_sleep_pressure_sum += decision.global_pressure
-                    event_sleep_last_decision = {
-                        "local_loss": decision.local_loss,
-                        "ema_loss": decision.ema_loss,
-                        "local_ratio": decision.local_ratio,
-                        "local_pressure": decision.local_pressure,
-                        "global_pressure": decision.global_pressure,
-                        "fire_count": decision.fire_count,
-                        "local_fire": decision.local_fire,
-                        "triggered": decision.triggered,
-                    }
-                    interval_ready = (
-                        steps - event_sleep_last_replay_step
-                        >= int(event_sleep_min_interval)
-                    )
-                    buffer_ready = (
-                        dream_buffer is not None
-                        and len(dream_buffer) >= int(dreamworld_min_size)
-                    )
-                    if decision.triggered and interval_ready and buffer_ready:
-                        event_sleep_trigger_count += 1
-                        event_sleep_pending = True
+                    event_sleep_queued_decision = decision
+                    event_sleep_queued_step = steps
             if ddp_active and predictive_aux_projection is not None:
                 allreduce_grads(predictive_aux_projection, world_size_)
             zero_embedding_grad_until(
