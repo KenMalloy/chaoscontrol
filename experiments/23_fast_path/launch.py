@@ -69,6 +69,7 @@ def summarize_result_dir(results_dir: Path) -> dict[str, Any]:
     errors: list[dict[str, str]] = []
     if not results_dir.exists():
         return {"ranked": ranked, "errors": errors}
+    full_val_dir = results_dir / "full_val"
     for path in sorted(results_dir.glob("*.json")):
         if path.name in {"matrix.json", "summary.json"}:
             continue
@@ -83,7 +84,7 @@ def summarize_result_dir(results_dir: Path) -> dict[str, Any]:
         train = data.get("train") or {}
         artifact = data.get("artifact") or {}
         exp24 = data.get("exp24") or {}
-        ranked.append({
+        row = {
             "name": name,
             "tokens_per_sec": float(train.get("aggregate_tokens_per_sec", 0.0)),
             "per_gpu_tokens_per_sec": float(train.get("per_gpu_tokens_per_sec", 0.0)),
@@ -95,8 +96,19 @@ def summarize_result_dir(results_dir: Path) -> dict[str, Any]:
             "exp24_phase": exp24.get("phase"),
             "exp24_mechanism": exp24.get("mechanism"),
             "path": str(path),
-        })
-    ranked.sort(key=lambda row: row["tokens_per_sec"], reverse=True)
+        }
+        full_val_summary = full_val_dir / f"{name}.summary.json"
+        if full_val_summary.exists():
+            score = json.loads(full_val_summary.read_text())
+            if isinstance(score, dict) and "aggregate_bpb" in score:
+                row["val_bpb"] = float(score["aggregate_bpb"])
+                row["val_docs_scored"] = int(score.get("docs_scored", 0))
+                row["val_summary_path"] = str(full_val_summary)
+        ranked.append(row)
+    if ranked and all("val_bpb" in row for row in ranked):
+        ranked.sort(key=lambda row: row["val_bpb"])
+    else:
+        ranked.sort(key=lambda row: row["tokens_per_sec"], reverse=True)
     return {"ranked": ranked, "errors": errors}
 
 
