@@ -345,6 +345,32 @@ def _average_dense_tensors(
         tensor.div_(world_size)
 
 
+def _average_dense_tensors_coalesced(
+    tensors: list[torch.Tensor],
+    *,
+    world_size: int,
+) -> None:
+    """Flatten-reduce-unflatten for a list of same-dtype dense tensors.
+
+    Matches the ``allreduce_grads`` pattern in ``src/chaoscontrol/distributed.py``
+    and collapses N per-tensor NCCL launches (each paying ~100-500µs of
+    fixed overhead) into a single coalesced collective plus two cheap
+    host-side copies. Tensors must share a dtype; the caller is
+    responsible for grouping by dtype when that differs.
+
+    Mutates each input tensor in place so callers that kept references
+    see the averaged value.
+    """
+    if world_size <= 1 or not tensors:
+        return
+    contig = [t.contiguous() for t in tensors]
+    flat = torch._utils._flatten_dense_tensors(contig)
+    dist.all_reduce(flat, op=dist.ReduceOp.AVG)
+    synced = torch._utils._unflatten_dense_tensors(flat, contig)
+    for original, s in zip(tensors, synced, strict=True):
+        original.copy_(s)
+
+
 def _module_by_qualified_name(
     model: torch.nn.Module,
     name: str,
@@ -688,7 +714,7 @@ def _run_scopt_train_step(
         name for (name, _), g in zip(named_params, common_grads) if g is None
     }
     for param, grad in zip(params, common_grads, strict=True):
-        param.grad = None if grad is None else grad.detach().clone()
+        param.grad = None if grad is None else grad.detach().contiguous()
     if ddp_active and world_size > 1:
         allreduce_grads(model, world_size)
 
@@ -720,11 +746,11 @@ def _run_scopt_train_step(
     for (name, _), grad in zip(named_params, rare_grads, strict=True):
         if grad is None:
             continue  # Genuinely unused in both rare and common.
-        cloned = grad.detach().clone()
-        rare_map[name] = cloned
-        dense_rare.append(cloned)
+        dense = grad.detach().contiguous()
+        rare_map[name] = dense
+        dense_rare.append(dense)
     if ddp_active and world_size > 1 and dense_rare:
-        _average_dense_tensors(dense_rare, world_size=world_size)
+        _average_dense_tensors_coalesced(dense_rare, world_size=world_size)
 
     # Iterate activations in sorted order so every rank issues
     # all_reduce calls in identical sequence.
@@ -745,7 +771,7 @@ def _run_scopt_train_step(
         pressure_vec = dh.detach().float().abs().mean(dim=reduce_dims)
         channel_pressure_items.append((key, pressure_vec))
     if ddp_active and world_size > 1 and channel_pressure_items:
-        _average_dense_tensors(
+        _average_dense_tensors_coalesced(
             [vec for _, vec in channel_pressure_items],
             world_size=world_size,
         )
@@ -1331,6 +1357,7 @@ def train_fast_for_budget(
     scopt_split_interval: int = 4,
     scopt_baseline_buckets: int = 16,
     scopt_baseline_decay: float = 0.99,
+    scopt_trace_interval_steps: int = 0,
 ) -> dict[str, Any]:
     rank_ = int(rank)
     world_size_ = int(world_size)
@@ -1516,6 +1543,7 @@ def train_fast_for_budget(
 
     scopt_token_frequencies = None
     scopt_baseline: FrequencyBucketBaseline | None = None
+    scopt_trace_history: list[dict[str, Any]] = []
     if scopt_active:
         token_counts = torch.bincount(
             train_tokens[:train_num_tokens].detach().cpu().long(),
@@ -1779,6 +1807,13 @@ def train_fast_for_budget(
             fast_slow.after_optimizer_step(model, step=steps + 1)
             losses.append(loss.detach())
             steps += 1
+            if (
+                scopt_active
+                and scopt_trace_interval_steps > 0
+                and steps % int(scopt_trace_interval_steps) == 0
+            ):
+                assert isinstance(optimizer, ScarcityAwareOptimizer)
+                scopt_trace_history.append(optimizer.scarcity_trace())
     finally:
         if prefetcher is not None:
             prefetcher.close()
@@ -1815,6 +1850,7 @@ def train_fast_for_budget(
         ),
         "peak_vram_mb": peak_vram_mb,
         "optimizer": _optimizer_diagnostics(optimizer),
+        "scopt_trace_history": scopt_trace_history if scopt_active else None,
         "sampling_mode": sampling_mode,
         "total_start_count": total_starts,
         "rank_start_count": rank_start_count,
