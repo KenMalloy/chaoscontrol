@@ -1,6 +1,6 @@
 # Exp 24 Rigor-and-Speed Implementation Plan
 
-> **STATUS: BLOCKED on Phase 0 base-lock.** Do not start this plan until `docs/superpowers/plans/2026-04-22-exp24-phase0-base-lock.md` lands an `exp24_base.yaml`. Task 3's synthetic config, Task 4's seed-anchored trajectory, and Task 7's profile harness all bake in FS+DW defaults (`fast_slow_interval=32`, `fast_slow_alpha=0.50`, `dreamworld_cache_interval=8`, `dreamworld_interval=8`, `dreamworld_weight=0.25`) that Phase 0 is about to re-pick. Running this plan now produces tests anchored to placeholder values. After Phase 0: Task 9 (of the Phase 0 plan) rebases this plan; then execute normally.
+> **STATUS: UNBLOCKED by Phase 0 base-lock.** Use the locked base in `experiments/24_training_time_bundle/PHASE0_BASE_LOCK.md` and `experiments/24_training_time_bundle/configs/exp24_base.yaml`: `fast_slow_interval=64`, `fast_slow_alpha=0.25`, `dreamworld_cache_interval=16`, `dreamworld_interval=16`, `dreamworld_weight=0.10`. Task 3 keeps explicit synthetic overrides where needed to make the unit test fire (`dreamworld_cache_interval=1`, `dreamworld_min_size=1`), but all non-load-bearing FS/DW defaults and Task 7's profile harness must be anchored to `exp24_base.yaml`.
 
 > **For Claude:** REQUIRED SUB-SKILL: Use @superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking. Before starting the first code task, run @superpowers:receiving-code-review on the plan itself and fix anything it flags (per project memory: dry-run plan review before executing).
 
@@ -274,7 +274,8 @@ The test forces a trigger at step K and asserts the very next `dream_buffer.samp
 
 **Load-bearing details (do not soften):**
 
-- `dreamworld_cache_interval=1, dreamworld_min_size=1` is a real dependency, not boilerplate. `cache_interval=1` makes the first step's cache call fill the buffer; `min_size=1` means `sample` is eligible starting step 1. Together they guarantee the buffer is ready by the trigger step (5). Changing either value breaks the test.
+- `dreamworld_cache_interval=1, dreamworld_min_size=1` is a real dependency, not boilerplate. These intentionally override the locked base's `dreamworld_cache_interval=16` and `dreamworld_min_size=2` so the synthetic unit test can fill the buffer before the scripted trigger. `cache_interval=1` makes the first step's cache call fill the buffer; `min_size=1` means `sample` is eligible starting step 1. Together they guarantee the buffer is ready by the trigger step (5). Changing either value breaks the test.
+- Non-load-bearing DW knobs should mirror the locked base, especially `dreamworld_weight=0.10`.
 - The synthetic entry returned by the `capture_dream_entry` monkeypatch must match `dream_buffer.add(step=, states=, replay_tokens=)` at runner_fast_path.py:1654. The anonymous `type("E", (), {...})` builds an object with `.step`, `.states`, `.replay_tokens` — that is the production contract, not decoration. If the real entry type gains a field, the monkeypatch must add it too.
 
 ```python
@@ -372,7 +373,7 @@ def test_event_sleep_replay_lands_one_step_after_trigger(monkeypatch):
         dreamworld_enabled=True,
         dreamworld_cache_interval=1,
         dreamworld_interval=0,  # scheduled replay disabled
-        dreamworld_weight=0.25,
+        dreamworld_weight=0.10,
         dreamworld_prefix_tokens=3,
         dreamworld_replay_tokens=2,
         dreamworld_min_size=1,
@@ -415,6 +416,11 @@ git commit -m "tests: pin event_sleep one-step-delay invariant"
 
 **Files:**
 - Modify: `tests/test_exp24_event_sleep.py`
+
+**Phase 0 base-lock re-anchor note.** The first execution of this task after
+the Phase 0 lock must observe and record a fresh anchor. The previously
+discussed anchor trajectory belonged to placeholder FS/DW defaults; expect it
+to shift now that the plan is anchored to `exp24_base.yaml`.
 
 **Step 1: Add the test**
 
@@ -643,7 +649,9 @@ git commit -m "tests: pin event_sleep gate bf16 loss dtype path"
 
 **Step 1: Write the profile script**
 
-Create `experiments/24_training_time_bundle/profile_event_sleep_arm.py` with host-wall timings around the train step's major sections, plus CUDA-event timings for sections that launch GPU work. The script should: load a minimal model, construct a single-seed `fast_slow_dreamworld_event_sleep` config, run ~30 seconds (or 500 steps, whichever is first), emit a JSON with per-section host-wall milliseconds, optional CUDA milliseconds, and per-section share of the inside-budget host-wall total.
+Create `experiments/24_training_time_bundle/profile_event_sleep_arm.py` with host-wall timings around the train step's major sections, plus CUDA-event timings for sections that launch GPU work. The script should: load a minimal model, read `experiments/24_training_time_bundle/configs/exp24_base.yaml`, overlay the minimal `event_sleep` settings needed for the `fast_slow_dreamworld_event_sleep` arm, run ~30 seconds (or 500 steps, whichever is first), emit a JSON with per-section host-wall milliseconds, optional CUDA milliseconds, and per-section share of the inside-budget host-wall total.
+
+Do not hard-code the old placeholder FS/DW defaults. The profile harness must inherit the locked base: `fast_slow_interval=64`, `fast_slow_alpha=0.25`, `dreamworld_cache_interval=16`, `dreamworld_interval=16`, `dreamworld_weight=0.10`.
 
 **Measurement rule (load-bearing):** rank by synchronized host wall time, not CUDA-event time. CUDA events miss Python overhead and can hide synchronization waits from `.item()`, diagnostics, and control-flow branches. For any section that might synchronize (`event_sleep_gate`, `fast_slow_ema`, diagnostics, optimizer step), synchronize before and after timing on CUDA:
 
