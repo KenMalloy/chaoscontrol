@@ -307,7 +307,7 @@ def test_build_phase0_fastslow_sweep_shape_and_knobs():
         seed_values=(1337,),
     )
 
-    assert len(entries) == 6
+    assert len(entries) == 18
     assert {entry["seed"] for entry in entries} == {1337}
     assert {entry["world_size"] for entry in entries} == {4}
     assert {
@@ -329,7 +329,21 @@ def test_build_phase0_fastslow_sweep_shape_and_knobs():
         )
         for entry in entries
     }
-    assert len(dw_settings) == 1
+    assert dw_settings == {
+        (16, 16, 0.10),
+        (16, 16, 0.25),
+        (8, 8, 0.10),
+    }
+    expected_names = {
+        (
+            f"exp24_phase0_fs_i{fs_interval}a{int(fs_alpha * 100):03d}_"
+            f"dw_c{dw_cache}i{dw_interval}_w{int(dw_weight * 100):03d}_s1337"
+        )
+        for dw_cache, dw_interval, dw_weight in dw_settings
+        for fs_interval in (16, 32, 64)
+        for fs_alpha in (0.25, 0.50)
+    }
+    assert {entry["name"] for entry in entries} == expected_names
     for entry in entries:
         assert entry["name"].startswith("exp24_phase0_fs_i")
         assert entry["exp24_phase"] == "phase0"
