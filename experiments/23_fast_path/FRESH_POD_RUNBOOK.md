@@ -108,13 +108,12 @@ assert torch.cuda.device_count() >= 1
 PY
 ```
 
-Use `tools/runpod.py deploy <pod_id>` only for repo sync. The command now skips
-`tools/pod_bootstrap.sh` by default and excludes local `.git`, `.claude`, and
-`.venv` state from rsync. Pass `--bootstrap` only when you intentionally want
-the legacy broad bootstrap path, because it installs optional Mamba dependencies
-and can replace the working image torch if used carelessly. Direct manual use of
-`tools/pod_bootstrap.sh` is also guarded and requires
-`CHAOSCONTROL_ALLOW_BROAD_BOOTSTRAP=1`.
+Sync the repo on the pod itself with `git clone git@github.com:KenMalloy/chaoscontrol.git /workspace/chaoscontrol`
+on first setup, or `git pull` inside `/workspace/chaoscontrol` thereafter. Only
+committed code ever lands on a pod. Direct manual use of `tools/pod_bootstrap.sh`
+is guarded and requires `CHAOSCONTROL_ALLOW_BROAD_BOOTSTRAP=1`; it installs
+optional Mamba dependencies and can replace the working image torch, so prefer
+the narrow setup above.
 
 The exact failure signature from the bad bootstrap was a venv torch reporting
 CUDA unavailable on a CUDA-visible host. The system torch reported

@@ -129,8 +129,8 @@ if [ -d "$REPO" ]; then
     echo "Installing chaoscontrol in dev mode..."
     $PIP install -e "$REPO"
 else
-    echo "WARNING: $REPO not found. rsync the repo first."
-    echo "  python tools/runpod.py deploy <pod_id>"
+    echo "WARNING: $REPO not found. Clone it first, on the pod:"
+    echo "  git clone git@github.com:KenMalloy/chaoscontrol.git $REPO"
 fi
 
 # ---------------------------------------------------------------------------

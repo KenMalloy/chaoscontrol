@@ -34,7 +34,7 @@ python tools/runpod.py create \
   --gpu-count 1 \
   --name chaoscontrol-exp20-smoke \
   --lease-minutes 180
-python tools/runpod.py deploy <POD_ID>
+# then on the pod: git clone (first time) or git pull (subsequent) in /workspace/chaoscontrol
 ```
 
 Use a 1xH100 pod for the fp8/env smoke and floor pass if cost matters. Once
@@ -49,7 +49,7 @@ python tools/runpod.py create \
   --gpu-count 8 \
   --name chaoscontrol-exp20-first-wave \
   --lease-minutes 480
-python tools/runpod.py deploy <POD_ID>
+# then on the pod: git clone (first time) or git pull (subsequent) in /workspace/chaoscontrol
 ```
 
 After results are written under `experiments/20_ssm_native_ttt/`, harvest and
