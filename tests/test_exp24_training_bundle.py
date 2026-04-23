@@ -372,7 +372,23 @@ def test_build_phase0_confirm_shape_and_knobs():
         entry["name"].rsplit("_s", 1)[0]
         for entry in entries
     }
-    assert len(confirm_labels) == 2
+    assert confirm_labels == {
+        "exp24_phase0_confirm_A_fs_i32a025_dw_c16i16_w010",
+        "exp24_phase0_confirm_B_fs_i64a025_dw_c16i16_w010",
+    }
+    assert {
+        (
+            entry["fast_slow_interval"],
+            entry["fast_slow_alpha"],
+            entry["dreamworld_cache_interval"],
+            entry["dreamworld_interval"],
+            entry["dreamworld_weight"],
+        )
+        for entry in entries
+    } == {
+        (32, 0.25, 16, 16, 0.10),
+        (64, 0.25, 16, 16, 0.10),
+    }
     for entry in entries:
         assert entry["name"].startswith("exp24_phase0_confirm_")
         assert entry["exp24_phase"] == "phase0"

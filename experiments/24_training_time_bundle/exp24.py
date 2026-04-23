@@ -17,6 +17,10 @@ PHASE0_FASTSLOW_DW_CANDIDATES = (
     (16, 16, 0.25),
     (8, 8, 0.10),
 )
+PHASE0_CONFIRM_CONFIGS = (
+    ("A", 32, 0.25, 16, 16, 0.10),
+    ("B", 64, 0.25, 16, 16, 0.10),
+)
 
 
 def _base_entry(
@@ -483,6 +487,60 @@ def build_phase0_fastslow_sweep(
                             seed=int(seed),
                         )
                     )
+    return entries
+
+
+def build_phase0_confirm(
+    *,
+    speed_config: dict[str, Any],
+    world_size: int = 4,
+    budget_seconds: float = 600.0,
+    seed_values: Sequence[int] = DEFAULT_CONTROL_SEEDS,
+) -> list[dict[str, Any]]:
+    """Phase 0 rung 3: confirm top-2 configs x 3 seeds with full validation."""
+    entries: list[dict[str, Any]] = []
+    for label, fs_interval, fs_alpha, dw_cache_interval, dw_interval, dw_weight in (
+        PHASE0_CONFIRM_CONFIGS
+    ):
+        arm = {
+            "name_arm": (
+                f"confirm_{label}_fs_i{fs_interval}a{int(fs_alpha * 100):03d}_"
+                f"dw_c{dw_cache_interval}i{dw_interval}_w{int(dw_weight * 100):03d}"
+            ),
+            "exp24_mechanism": "fast_slow_dreamworld",
+            "artifact_impact": ARTIFACT_TRAINING_ONLY,
+            "fast_slow_enabled": True,
+            "fast_slow_interval": fs_interval,
+            "fast_slow_alpha": fs_alpha,
+            "fast_slow_eval_copy": "slow",
+            "dreamworld_enabled": True,
+            "dreamworld_cache_interval": dw_cache_interval,
+            "dreamworld_interval": dw_interval,
+            "dreamworld_weight": dw_weight,
+            "dreamworld_prefix_tokens": 128,
+            "dreamworld_replay_tokens": 64,
+            "dreamworld_replay_batch_size": 128,
+            "dreamworld_buffer_size": 16,
+            "dreamworld_min_size": 2,
+            "dreamworld_max_age_steps": 256,
+        }
+        for seed in seed_values:
+            entry = _base_entry(
+                speed_config=speed_config,
+                world_size=world_size,
+                budget_seconds=budget_seconds,
+            )
+            entry.update(arm)
+            name_arm = str(entry.pop("name_arm"))
+            entries.append(
+                _named_entry(
+                    base=entry,
+                    phase="phase0",
+                    mechanism=str(entry["exp24_mechanism"]),
+                    arm=name_arm,
+                    seed=int(seed),
+                )
+            )
     return entries
 
 
