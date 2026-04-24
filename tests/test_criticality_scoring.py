@@ -22,9 +22,44 @@ def test_event_mask_handles_all_equal_pressure():
 
 
 def test_event_mask_empty_at_zero_frac_and_full_at_one():
-    pressure = torch.randn(3, 4)
+    # Use strictly-positive pressure so event_frac=1.0 saturates the mask.
+    # (compute_event_mask now refuses to mark non-positive positions, so
+    # randn — which has negatives — would undercount here by design.)
+    pressure = torch.randn(3, 4).abs() + 1e-3
     assert compute_event_mask(pressure, event_frac=0.0).sum().item() == 0
     assert compute_event_mask(pressure, event_frac=1.0).sum().item() == pressure.numel()
+
+
+def test_compute_event_mask_returns_empty_for_uniform_zero_pressure():
+    pressure = torch.zeros(4, 8)
+    # Even at event_frac=1.0 (which would normally mark every position),
+    # uniform zero pressure must not fabricate events out of zero-valued channels.
+    for frac in (0.1, 0.5, 1.0):
+        mask = compute_event_mask(pressure, event_frac=frac)
+        assert mask.shape == pressure.shape
+        assert mask.dtype == torch.bool
+        assert mask.sum().item() == 0
+
+
+def test_compute_event_mask_selects_only_strictly_positive_positions():
+    # 20 positions total; only 3 are strictly positive. event_frac=0.5 would
+    # nominally pick k=10, but only 3 strictly-positive positions exist,
+    # so the mask must have exactly 3 True entries — those 3 positions —
+    # and never pad with zero-valued channels.
+    pressure = torch.zeros(4, 5)
+    pressure[0, 0] = 1.5
+    pressure[1, 2] = 0.25
+    pressure[3, 4] = 3.0
+    mask = compute_event_mask(pressure, event_frac=0.5)
+    assert mask.shape == pressure.shape
+    assert mask.dtype == torch.bool
+    assert mask.sum().item() == 3
+    # Every True position is strictly positive.
+    assert (pressure[mask] > 0).all()
+    # And specifically those three positions.
+    assert mask[0, 0].item() is True
+    assert mask[1, 2].item() is True
+    assert mask[3, 4].item() is True
 
 
 from chaoscontrol.optim.criticality import compute_future_energy

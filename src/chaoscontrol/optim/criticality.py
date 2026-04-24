@@ -316,13 +316,16 @@ def compute_event_mask(pressure: torch.Tensor, event_frac: float) -> torch.Tenso
     k = int(round(event_frac * total))
     if k == 0:
         return torch.zeros_like(pressure, dtype=torch.bool)
-    if k >= total:
-        return torch.ones_like(pressure, dtype=torch.bool)
+    positive = pressure > 0.0
+    n_positive = int(positive.sum().item())
+    if n_positive == 0:
+        return torch.zeros_like(pressure, dtype=torch.bool)
+    k = min(k, n_positive)
     flat = pressure.reshape(-1)
     _, idx = torch.topk(flat, k=k, largest=True)
     mask = torch.zeros(total, dtype=torch.bool, device=pressure.device)
     mask[idx] = True
-    return mask.reshape(pressure.shape)
+    return mask.reshape(pressure.shape) & positive
 
 
 def compute_future_energy(states: torch.Tensor, horizon_H: int) -> torch.Tensor:
