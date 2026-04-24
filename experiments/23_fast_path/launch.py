@@ -18,6 +18,13 @@ def pick_free_port() -> int:
         return int(sock.getsockname()[1])
 
 
+# Sentinel for dry-run rendering — torchrun accepts any integer, but a
+# real launch will pass a bound port. Chosen to be obviously-fake so a
+# dry-run command copy-pasted into a terminal fails loudly at rdzv init
+# instead of silently colliding with a real workload.
+DRY_RUN_RDZV_PORT: int = 0
+
+
 def build_torchrun_cmd(
     *,
     runner_path: Path,
@@ -29,9 +36,10 @@ def build_torchrun_cmd(
     rdzv_port: int | None = None,
     output_ckpt: Path | None = None,
     budget_seconds: float | None = None,
+    dry_run: bool = False,
 ) -> list[str]:
     if rdzv_port is None:
-        rdzv_port = pick_free_port()
+        rdzv_port = DRY_RUN_RDZV_PORT if dry_run else pick_free_port()
     cmd = [
         sys.executable,
         "-m",
@@ -152,6 +160,7 @@ def run_matrix_entries(
             output_ckpt=output_ckpt,
             world_size=world_size,
             budget_seconds=float(entry.get("budget_seconds", 90.0)),
+            dry_run=dry_run,
         )
         commands.append(cmd)
         if dry_run:

@@ -37,7 +37,7 @@ from exp24 import (  # noqa: E402
     build_semantic_overhead_gate_matrix,
 )
 from fast_path import read_speed_config, write_matrix  # noqa: E402
-from launch import pick_free_port, run_matrix_entries  # noqa: E402
+from launch import DRY_RUN_RDZV_PORT, pick_free_port, run_matrix_entries  # noqa: E402
 
 
 def _prebuild_cache(data_path: str) -> None:
@@ -83,7 +83,7 @@ def _score_full_val(
             continue
         jsonl_path = full_val_dir / f"{name}.jsonl"
         log_path = logs_dir / f"{name}.full_val.log"
-        rdzv_port = pick_free_port()
+        rdzv_port = DRY_RUN_RDZV_PORT if dry_run else pick_free_port()
         cmd = [
             sys.executable,
             "-m",

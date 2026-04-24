@@ -17,6 +17,23 @@ step is ``F.softplus(delta_proj(x))``, computed per-token from a plain
 Only A's parameterization (the seven suffixes below) gets the dynamics
 treatment here.
 
+Per-shape update path:
+
+  * 1D dynamics params (``log_a``, ``log_r``, ``theta``, ``skew_params``,
+    ``log_gamma``) → Muon/SemanticOptimizer/ScOpt's AdamW fallback at the
+    dynamics group's ``lr`` / ``wd``.
+  * 2D dynamics params (``U``, ``V`` in ``a_mode="full"``) → Muon's
+    Newton-Schulz matrix path at the dynamics group's ``lr`` / ``wd``.
+    This is deliberate: the SSM optimizer research flags low-rank
+    corrections as exactly the place where structure-aware curvature
+    (Shampoo/SOAP-style) outperforms diagonal adaptivity, and NS gives
+    that orthogonalized update with the right directional structure.
+    If a caller wants U/V through AdamW instead, pass
+    ``matrix_param_names`` to the optimizer with U/V excluded.
+
+Submission regime is ``a_mode="diag"``, so U/V don't exist in the current
+locked config. This policy is relevant only to future full-mode work.
+
 This module centralizes the classification so every optimizer in the
 subpackage uses the same rule. Classification is shape-first with
 name-based override for spectral parameters.

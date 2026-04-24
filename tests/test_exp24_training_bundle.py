@@ -784,6 +784,84 @@ def test_score_full_val_builds_expected_cmd(tmp_path):
     assert cmd[cmd.index("--doc-packing") + 1] == "chunk_count_tail"
 
 
+def test_score_full_val_dry_run_does_not_bind_port(tmp_path, monkeypatch):
+    """Sandboxed CI / offline dev machines can't bind localhost sockets.
+    Dry-run must render a command without calling pick_free_port, which
+    otherwise opens a socket to discover a free port.
+    """
+    mod = _load_run_exp24()
+    checkpoint_dir = tmp_path / "checkpoints"
+    checkpoint_dir.mkdir()
+    name = "exp24_dry_run_no_port_s1337"
+    (checkpoint_dir / f"{name}.pt").write_bytes(b"fake checkpoint")
+
+    def _raising_pick_free_port():
+        raise AssertionError(
+            "pick_free_port called during dry-run — would bind a socket"
+        )
+
+    monkeypatch.setattr(mod, "pick_free_port", _raising_pick_free_port)
+
+    commands = mod._score_full_val(
+        entries=[{"name": name}],
+        checkpoint_dir=checkpoint_dir,
+        results_dir=tmp_path,
+        world_size=4,
+        cache_dir=tmp_path / "val-cache",
+        budget_seconds=600.0,
+        dry_run=True,
+    )
+    assert len(commands) == 1
+    # Sentinel shows up in the rendered command, no real port bound.
+    rdzv_endpoint = next(
+        arg for arg in commands[0] if arg.startswith("--rdzv-endpoint=")
+    )
+    assert rdzv_endpoint == f"--rdzv-endpoint=localhost:{mod.DRY_RUN_RDZV_PORT}"
+
+
+def test_run_matrix_entries_dry_run_does_not_bind_port(tmp_path, monkeypatch):
+    """``launch.run_matrix_entries`` must not call ``pick_free_port``
+    under ``dry_run=True``. The function is called by run_exp24's main
+    dispatch for every training-matrix dry-run.
+    """
+    launch = _load_launch()
+
+    def _raising_pick_free_port():
+        raise AssertionError(
+            "pick_free_port called during dry-run — would bind a socket"
+        )
+
+    monkeypatch.setattr(launch, "pick_free_port", _raising_pick_free_port)
+
+    runner_path = REPO / "experiments" / "23_fast_path" / "runner_fast_path.py"
+    results_dir = tmp_path / "matrix_dry_run"
+    summary = launch.run_matrix_entries(
+        entries=[
+            {
+                "name": "exp24_dry_run_no_port_s1337",
+                "vocab_size": 16384,
+                "budget_seconds": 90.0,
+            }
+        ],
+        runner_path=runner_path,
+        data_path=str(tmp_path / "data"),
+        sp_model_paths={16384: str(tmp_path / "tokenizer.model")},
+        results_dir=results_dir,
+        world_size=1,
+        dry_run=True,
+        skip_existing=False,
+    )
+    commands = summary.get("commands") or []
+    assert commands, "dry-run should populate summary['commands']"
+    for cmd in commands:
+        rdzv_endpoint = next(
+            arg for arg in cmd if arg.startswith("--rdzv-endpoint=")
+        )
+        assert rdzv_endpoint == (
+            f"--rdzv-endpoint=localhost:{launch.DRY_RUN_RDZV_PORT}"
+        )
+
+
 def test_summarize_result_dir_merges_val_bpb(tmp_path):
     launch = _load_launch()
     for name, tokens_per_sec, val_bpb in [
