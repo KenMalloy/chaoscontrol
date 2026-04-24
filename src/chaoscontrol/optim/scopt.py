@@ -596,11 +596,22 @@ class ScarcityAwareOptimizer(torch.optim.Optimizer):
         row_factor: Tensor | None,
         col_factor: Tensor | None,
     ) -> None:
-        """Record post-NS scarce-vs-common row/col energy enrichment ratio.
+        """Record post-NS scarce-vs-common row/col energy enrichment and
+        log-space correlation between pre-NS scarcity factor and post-NS
+        row/col norm.
 
         Spec lines 278-281: NS normalizes away diagonal amplitude, so we
         must measure energy on the NS *output* to verify scarce
         rows/columns actually carry disproportionate update energy.
+
+        ``ns_row_factor_corr`` / ``ns_col_factor_corr`` answer a sharper
+        question that the median-split enrichment ratio leaves
+        underspecified: does the pre-NS multiplier *survive in
+        magnitude* through Newton-Schulz, or does NS whiten it toward
+        uniform? Correlation near 1 means pre-NS scaling is preserved
+        and a post-NS pressure-selected tail bypass has nothing to
+        recover. Correlation near 0 means NS flattens the signal and a
+        magnitude-preserving bypass mechanism has a real lever.
         """
         if update.ndim != 2:
             return
@@ -617,6 +628,11 @@ class ScarcityAwareOptimizer(torch.optim.Optimizer):
                     row_energy[scarce].mean() / row_energy[common].mean().clamp_min(self._eps)
                 )
                 self._telemetry_accum["ns_row_energy_enrichment"].append(float(ratio.item()))
+            self._record_factor_corr(
+                factor=factor,
+                energy=row_energy,
+                telemetry_key="ns_row_factor_corr",
+            )
         if col_factor is not None and col_factor.numel() == update.size(1):
             factor = col_factor.detach().to(device=update.device, dtype=torch.float32)
             col_energy = update_f.square().sum(dim=0) / frob_sq
@@ -628,6 +644,39 @@ class ScarcityAwareOptimizer(torch.optim.Optimizer):
                     col_energy[scarce].mean() / col_energy[common].mean().clamp_min(self._eps)
                 )
                 self._telemetry_accum["ns_col_energy_enrichment"].append(float(ratio.item()))
+            self._record_factor_corr(
+                factor=factor,
+                energy=col_energy,
+                telemetry_key="ns_col_factor_corr",
+            )
+
+    def _record_factor_corr(
+        self,
+        *,
+        factor: Tensor,
+        energy: Tensor,
+        telemetry_key: str,
+    ) -> None:
+        """Emit log-space Pearson correlation between pre-NS scarcity
+        factor and post-NS row/col norm (sqrt of normalized energy).
+
+        Uses log on both sides so the correlation reads as "what
+        fraction of a multiplicative pre-NS scaling survived NS". Skips
+        emission when either side has zero variance — correlation is
+        undefined and would noise the telemetry.
+        """
+        log_factor = factor.clamp_min(self._eps).log()
+        log_norm = energy.clamp_min(self._eps).log() * 0.5  # log(sqrt) = 0.5*log
+        lf_std = log_factor.std(unbiased=False)
+        ln_std = log_norm.std(unbiased=False)
+        if lf_std <= self._eps or ln_std <= self._eps:
+            return
+        lf_centered = log_factor - log_factor.mean()
+        ln_centered = log_norm - log_norm.mean()
+        corr = (lf_centered * ln_centered).mean() / (lf_std * ln_std).clamp_min(self._eps)
+        self._telemetry_accum[telemetry_key].append(
+            float(corr.clamp(-1.0, 1.0).item())
+        )
 
     def _apply_recurrence_scarcity(self, name: str | None, direction: Tensor) -> Tensor:
         if not self._scarcity_enabled() or name is None:

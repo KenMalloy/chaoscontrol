@@ -394,6 +394,50 @@ def test_energy_enrichment_ratio_greater_than_one_when_scarce_rows_dominate(monk
     assert ratio > 1.5, f"scarce rows should carry >1.5× common-row energy, got {ratio}"
 
 
+def test_ns_row_factor_corr_is_one_when_ns_preserves_pre_scaling(monkeypatch) -> None:
+    """Tail-bypass diagnostic: when NS is the identity (no whitening) and
+    pre-NS direction rows are equal, log(post-NS row norm) = log(row_factor)
+    + const, so the Pearson correlation is exactly 1.
+
+    Pins the measurement semantics on the lower end of possible NS
+    behavior (identity). The Tier 0 smoke on a real pod will observe
+    whatever real NS does; this test only guards that the telemetry is
+    wired up and interprets preserved scaling as a correlation of 1.
+    """
+    monkeypatch.setattr(
+        "chaoscontrol.optim.scopt.newton_schulz_orthogonalize",
+        lambda grad, **_: grad,
+    )
+    w = nn.Parameter(torch.zeros(4, 2))
+    opt = ScarcityAwareOptimizer(
+        [w],
+        lr=1.0,
+        momentum=0.0,
+        nesterov=False,
+        ns_steps=1,
+        weight_decay=0.0,
+        warmup_steps=0,
+        row_param_names={"embed.weight"},
+        row_scarcity_power=1.0,
+        tau_row_floor=1.0,
+        tau_std_scale=0.0,
+        compute_dtype=torch.float32,
+    )
+    opt.bind_param_names([("embed.weight", w)])
+    opt.set_row_pressure_ema(torch.tensor([0.0, 1.0, 2.0, 3.0]))
+
+    w.grad = torch.ones_like(w)
+    opt.step()
+    trace = opt.scarcity_trace()
+
+    assert "ns_row_factor_corr" in trace
+    corr_median = trace["ns_row_factor_corr"]["median"]
+    assert corr_median > 0.99, (
+        f"identity NS preserves pre-NS row scaling, so log-scale correlation "
+        f"should be ~1.0, got {corr_median}"
+    )
+
+
 def test_recurrence_scarcity_with_timescale_modulates_per_channel() -> None:
     """Design spec lines 148-161: long-half-life channels with high pressure
     get amplified updates; zero timescale disables the modulation channel-wise.
