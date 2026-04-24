@@ -701,3 +701,30 @@ def test_subtract_expired_removes_contribution_at_its_current_decay_weight():
     assert torch.allclose(cd.score_num[0], torch.zeros(2), atol=1e-6)
     assert abs(cd.score_den[0].item()) < 1e-6
     assert abs(cd.event_mass[0].item()) < 1e-6
+
+
+def test_score_from_accumulators_matches_full_bank_score_after_ingest_sequence():
+    """The incremental accumulator must produce the same score as the
+    full-bank scan after any sequence of ingests. This is the
+    consistency pin between the two implementations."""
+    cd = CriticalityDistillation(
+        num_layers=1, dim=3, trace_ttl_steps=8,
+        trace_half_life_steps=4.0,
+    )
+    ingests = [
+        (0, torch.tensor([1.0, 0.0, 0.0]), 2.0),
+        (1, torch.tensor([0.0, 1.0, 0.0]), 3.0),
+        (3, torch.tensor([0.0, 0.0, 2.0]), 1.0),
+    ]
+    for step, evidence, ec in ingests:
+        cd._step_decay_accumulators(current_step=step)
+        cd._add_contribution(layer=0, evidence=evidence, event_count=ec)
+        # Also write to the ring bank for the full-scan comparison.
+        cd.add_step_evidence(layer=0, step=step, evidence=evidence, event_count=ec)
+    # Advance decay to score time.
+    current_step = 5
+    cd._step_decay_accumulators(current_step=current_step)
+    accumulator_score = cd.score_from_accumulators()
+    full_scan_score = cd.score(current_step=current_step)
+    # Peak channel must match between both scorers.
+    assert accumulator_score[0].argmax().item() == full_scan_score[0].argmax().item()

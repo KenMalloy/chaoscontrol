@@ -153,21 +153,25 @@ class CriticalityDistillation(nn.Module):
         self.bank_event_count[layer, slot] = float(event_count)
 
     def score(self, current_step: int) -> torch.Tensor:
-        """Age-weighted average of evidence across the bank.
+        """Age-weighted, count-weighted average of evidence across the bank.
 
         Returns `[num_layers, dim]` fp32 score. Empty bank (no valid slots)
         produces zeros.
 
-        Age weight is `2 ** (-age / trace_half_life_steps)`, so `age ==
-        trace_half_life_steps` carries weight 0.5, and `age == 0` carries
-        weight 1.0.
+        Per-slot weight is `age_factor * event_count`, where
+        `age_factor = 2 ** (-age / trace_half_life_steps)` (so `age ==
+        trace_half_life_steps` carries age_factor 0.5, and `age == 0`
+        carries 1.0). Matches the running-accumulator scorer, which
+        adds each step's contribution as `evidence * event_count` and
+        then ages it uniformly.
         """
         valid = self.bank_step >= 0  # [L, T]
         age = (int(current_step) - self.bank_step).clamp_min(0).to(dtype=torch.float32)
-        weight = torch.exp2(-age / self.trace_half_life_steps)
-        weight = weight * valid.to(dtype=torch.float32)  # zero-out empty slots
-        weight_sum = weight.sum(dim=1, keepdim=True)  # [L, 1]
-        weighted_evidence = (weight.unsqueeze(-1) * self.bank_evidence).sum(dim=1)  # [L, D]
+        age_weight = torch.exp2(-age / self.trace_half_life_steps)
+        age_weight = age_weight * valid.to(dtype=torch.float32)  # zero-out empty slots
+        count_weight = age_weight * self.bank_event_count  # [L, T]
+        weight_sum = count_weight.sum(dim=1, keepdim=True)  # [L, 1]
+        weighted_evidence = (count_weight.unsqueeze(-1) * self.bank_evidence).sum(dim=1)  # [L, D]
         safe_denom = weight_sum.clamp_min(1e-12)
         score = weighted_evidence / safe_denom
         # Layers with zero total weight -> zeros (not NaN).
@@ -177,6 +181,18 @@ class CriticalityDistillation(nn.Module):
             torch.zeros_like(score),
         )
         return score
+
+    def score_from_accumulators(self) -> torch.Tensor:
+        """Age-weighted count-weighted mean of evidence, read from
+        running accumulators. Hot-path scorer.
+
+        Returns `[num_layers, dim]` fp32. Layers with zero event_mass
+        return zero (not NaN).
+        """
+        denom = self.score_den.clamp_min(1e-12).unsqueeze(-1)
+        raw = self.score_num / denom  # [L, D]
+        valid = self.event_mass > 0
+        return torch.where(valid.unsqueeze(-1), raw, torch.zeros_like(raw))
 
     @torch.no_grad()
     def update_baseline_ema(
