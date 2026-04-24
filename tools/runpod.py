@@ -1,5 +1,19 @@
 #!/usr/bin/env python3
-"""Lease-aware RunPod helpers for ChaosControl experiments.
+"""DEPRECATED — do not use for new work. Use ``runpodctl`` directly.
+
+Kept only so historical call sites (tools/poll_exp14.sh, the Exp 20 README)
+keep resolving. The lease/watchdog abstraction was convenient once but added
+a layer on top of ``runpodctl`` that the team has since decided to drop;
+agents reaching for a pod helper should go straight to the CLI:
+
+    runpodctl pod create --gpu-id "NVIDIA H100 80GB HBM3" --gpu-count 4 ...
+    runpodctl pod start <pod_id>
+    runpodctl pod stop  <pod_id>
+    runpodctl ssh info  <pod_id> -o json
+
+Harvesting results is ``rsync`` over the SSH info from ``runpodctl ssh info``.
+
+Lease-aware RunPod helpers for ChaosControl experiments.
 
 Adapted from parameter-golf/tools/run_deepfloor_runpod.py.
 Single GPU, auto-stop lease, rsync results back.
