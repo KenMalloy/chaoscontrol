@@ -13,6 +13,7 @@ for custom optimizer code.
 """
 from __future__ import annotations
 
+from chaoscontrol.optim.criticality import CriticalityDistillation
 from chaoscontrol.optim.lamb import LAMB
 from chaoscontrol.optim.muon import Muon
 from chaoscontrol.optim.param_groups import (
@@ -25,6 +26,7 @@ from chaoscontrol.optim.scopt import ScarcityAwareOptimizer
 from chaoscontrol.optim.semantic import SemanticOptimizer
 
 __all__ = [
+    "CriticalityDistillation",
     "LAMB",
     "Muon",
     "ScarcityAwareOptimizer",
