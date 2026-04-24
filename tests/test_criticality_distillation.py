@@ -129,3 +129,33 @@ def test_state_dict_round_trip_preserves_bank_and_baseline():
 
     # Score must match after round-trip.
     assert torch.allclose(cd2.score(current_step=2), cd1.score(current_step=2))
+
+
+def test_update_baseline_ema_only_reads_non_event_positions():
+    cd = CriticalityDistillation(
+        num_layers=1, dim=2, trace_ttl_steps=4,
+        baseline_ema_decay=0.5,
+    )
+    # future_energy shape [B=1, T=4, D=2]
+    future_energy = torch.tensor([[
+        [1.0, 10.0],  # t=0, event
+        [2.0, 20.0],  # t=1, non-event
+        [3.0, 30.0],  # t=2, non-event
+        [4.0, 40.0],  # t=3, event
+    ]])
+    event_mask = torch.tensor([[True, False, False, True]])
+    # Mean over non-event positions: channel 0 -> (2+3)/2 = 2.5
+    #                                channel 1 -> (20+30)/2 = 25.0
+    # Baseline starts at zero. One update with decay=0.5:
+    #   new = 0.5 * old + 0.5 * obs = 0.5 * 0 + 0.5 * [2.5, 25.0] = [1.25, 12.5]
+    cd.update_baseline_ema(layer=0, future_energy=future_energy, event_mask=event_mask)
+    assert torch.allclose(cd.baseline_future_energy[0], torch.tensor([1.25, 12.5]))
+
+
+def test_update_baseline_ema_no_nonevent_positions_is_noop():
+    cd = CriticalityDistillation(num_layers=1, dim=2, trace_ttl_steps=4, baseline_ema_decay=0.9)
+    cd.baseline_future_energy.fill_(7.0)
+    future_energy = torch.randn(1, 4, 2)
+    event_mask = torch.ones(1, 4, dtype=torch.bool)  # every position is an event
+    cd.update_baseline_ema(layer=0, future_energy=future_energy, event_mask=event_mask)
+    assert torch.equal(cd.baseline_future_energy[0], torch.full((2,), 7.0))

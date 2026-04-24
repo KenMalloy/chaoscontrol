@@ -148,6 +148,30 @@ class CriticalityDistillation(nn.Module):
         )
         return score
 
+    @torch.no_grad()
+    def update_baseline_ema(
+        self,
+        *,
+        layer: int,
+        future_energy: torch.Tensor,
+        event_mask: torch.Tensor,
+    ) -> None:
+        """Update per-channel baseline EMA using only non-event positions."""
+        if not 0 <= layer < self.num_layers:
+            raise IndexError(f"layer={layer}")
+        if future_energy.shape[-1] != self.dim:
+            raise ValueError(
+                f"future_energy last dim must be {self.dim}; got {tuple(future_energy.shape)}"
+            )
+        non_event = ~event_mask  # [B, T]
+        if not non_event.any():
+            return  # no new information; leave EMA alone
+        flat_fe = future_energy.reshape(-1, self.dim)  # [B*T, D]
+        flat_m = non_event.reshape(-1)  # [B*T]
+        obs = flat_fe[flat_m].mean(dim=0)  # [D]
+        decay = self.baseline_ema_decay
+        self.baseline_future_energy[layer].mul_(decay).add_(obs.to(self.baseline_future_energy.dtype), alpha=(1.0 - decay))
+
 
 def compute_event_mask(pressure: torch.Tensor, event_frac: float) -> torch.Tensor:
     """Top-`event_frac` positions of pressure become True.
