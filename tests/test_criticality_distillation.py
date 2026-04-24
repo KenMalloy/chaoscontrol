@@ -728,3 +728,31 @@ def test_score_from_accumulators_matches_full_bank_score_after_ingest_sequence()
     full_scan_score = cd.score(current_step=current_step)
     # Peak channel must match between both scorers.
     assert accumulator_score[0].argmax().item() == full_scan_score[0].argmax().item()
+
+
+def test_allocate_seats_from_accumulators_picks_topk_by_accumulator_score():
+    cd = CriticalityDistillation(
+        num_layers=1, dim=8, trace_ttl_steps=8,
+        trace_half_life_steps=100.0,
+        criticality_budget_frac=0.25,  # k=2
+        min_weighted_events_per_layer=0.5,
+    )
+    cd._step_decay_accumulators(current_step=0)
+    cd._add_contribution(layer=0, evidence=torch.tensor([0.1,0.2,5.0,0.0,0.0,9.0,0.0,0.0]), event_count=1.0)
+    cd.allocate_seats_from_accumulators(current_step=1)
+    assert cd.seat_mask[0].sum().item() == 2
+    assert cd.seat_mask[0, 5].item() is True  # peak 1
+    assert cd.seat_mask[0, 2].item() is True  # peak 2
+
+
+def test_allocate_seats_from_accumulators_respects_event_mass_gate():
+    cd = CriticalityDistillation(
+        num_layers=1, dim=8, trace_ttl_steps=8,
+        trace_half_life_steps=100.0,
+        criticality_budget_frac=0.25,
+        min_weighted_events_per_layer=100.0,  # unreachable
+    )
+    cd._step_decay_accumulators(current_step=0)
+    cd._add_contribution(layer=0, evidence=torch.ones(8), event_count=1.0)
+    cd.allocate_seats_from_accumulators(current_step=1)
+    assert not cd.seat_mask[0].any()

@@ -385,6 +385,29 @@ class CriticalityDistillation(nn.Module):
             mask[topk.indices] = True
             self.seat_mask[layer] = mask
 
+    @torch.no_grad()
+    def allocate_seats_from_accumulators(self, *, current_step: int) -> None:
+        """Hot-path seat allocator. Respects fixed_random_seats flag.
+        Gates on event_mass. Honors score_permute_before_topk for
+        falsifier cells."""
+        if self.fixed_random_seats:
+            return
+        self._step_decay_accumulators(current_step=current_step)
+        k = max(1, int(round(self.dim * self.criticality_budget_frac)))
+        scores = self.score_from_accumulators()
+        for layer in range(self.num_layers):
+            if float(self.event_mass[layer].item()) < float(self.min_weighted_events_per_layer):
+                self.seat_mask[layer].fill_(False)
+                continue
+            mask = torch.zeros(self.dim, dtype=torch.bool, device=self.seat_mask.device)
+            if self.score_permute_before_topk:
+                perm = torch.randperm(self.dim, device=self.seat_mask.device)
+                mask[perm[:k]] = True
+            else:
+                topk = torch.topk(scores[layer], k=k, largest=True)
+                mask[topk.indices] = True
+            self.seat_mask[layer] = mask
+
     def criticality_loss(self, log_a_per_layer: list) -> torch.Tensor:
         """Seat-masked MSE loss pulling `1 - sigmoid(log_a[seat])` toward
         `critical_value`.
