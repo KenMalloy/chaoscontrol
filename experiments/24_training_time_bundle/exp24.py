@@ -729,6 +729,75 @@ def build_phase0_fastslow_only_control(
     return entries
 
 
+def build_criticality_distillation_first_smoke_matrix() -> list[dict[str, Any]]:
+    """Eight cells on the locked ``control_fastslow_only_i64a025`` base.
+
+    Shape divergence: unlike the other exp24 builders (flat per-seed entries with
+    ``name`` inside each dict), this builder returns wrapped cells of the form
+    ``{"name": str, "config": dict}``. Stage F.2 is responsible for flattening
+    these into runnable matrix entries (seed expansion, speed_config/world_size
+    injection) before they can be consumed by ``run_matrix_entries``.
+
+    Pairs:
+      - treatment | telemetry | shuffled | budget_only  (falsifier set)
+      - hl_short | hl_long                              (half-life sensitivity)
+      - H_short  | H_long                               (horizon sensitivity)
+
+    Each cell is minimally-distinguishable; base knobs (fast/slow_enabled=True,
+    interval=64, alpha=0.25, eval_copy=slow, Dreamworld off) are held fixed so
+    any bpb delta across cells is attributable to CD rather than base noise.
+    """
+    # Mirrors the ``arm`` dict in ``build_phase0_fastslow_only_control`` so the
+    # CD smoke rides the locked control_fastslow_only_i64a025 configuration.
+    base_cfg: dict[str, Any] = {
+        "exp24_mechanism": "fast_slow",
+        "artifact_impact": ARTIFACT_TRAINING_ONLY,
+        "fast_slow_enabled": True,
+        "fast_slow_interval": 64,
+        "fast_slow_alpha": 0.25,
+        "fast_slow_eval_copy": "slow",
+        "dreamworld_enabled": False,
+        "dreamworld_cache_interval": 0,
+        "dreamworld_interval": 0,
+        "dreamworld_weight": 0.0,
+        "dreamworld_replay_batch_size": 0,
+    }
+
+    def cd_defaults() -> dict[str, Any]:
+        return {
+            "lm_head_backward_mode": "fused_streaming_cached",
+            "lm_head_emit_entropy": True,
+            "criticality_distill_enabled": True,
+            "criticality_distill_budget_frac": 0.15,
+            "criticality_distill_critical_value": 0.95,
+            "criticality_distill_trace_half_life_steps": 256.0,
+            "criticality_distill_trace_ttl_steps": 1024,
+            "criticality_distill_horizon_H": 16,
+            "criticality_distill_event_frac": 0.05,
+            "criticality_distill_seat_refresh_interval": 64,
+            "criticality_distill_min_weighted_events_per_layer": 256.0,
+            "criticality_distill_weight": 1e-3,
+            "criticality_distill_uniform_pressure": False,
+            "criticality_distill_score_permute_before_topk": False,
+            "criticality_distill_fixed_random_seats": False,
+        }
+
+    def make(name: str, **overrides: Any) -> dict[str, Any]:
+        cfg = {**base_cfg, **cd_defaults(), **overrides}
+        return {"name": name, "config": cfg}
+
+    return [
+        make("treatment"),
+        make("telemetry", criticality_distill_weight=0.0),
+        make("shuffled", criticality_distill_score_permute_before_topk=True),
+        make("budget_only", criticality_distill_fixed_random_seats=True),
+        make("hl_short", criticality_distill_trace_half_life_steps=128.0),
+        make("hl_long", criticality_distill_trace_half_life_steps=512.0),
+        make("H_short", criticality_distill_horizon_H=8),
+        make("H_long", criticality_distill_horizon_H=32),
+    ]
+
+
 def build_first_wave_matrix(
     *,
     speed_config: dict[str, Any],
