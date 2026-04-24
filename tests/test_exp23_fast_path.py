@@ -2926,3 +2926,59 @@ def test_topology_snapshot_absent_when_flag_off():
         # emit_topology_snapshot defaults to False.
     )
     assert "topology_snapshot" not in result
+
+
+def test_measure_cd_overhead_emits_cd_overhead_block():
+    mod = _load_runner_module()
+    # Distinct model instances for each of the two runs — otherwise
+    # state carries across.
+    def _make_model():
+        return _TinyCDTrainModel(dim=4, vocab_size=6, num_layers=2)
+
+    def _make_optimizer(model):
+        return torch.optim.SGD(model.parameters(), lr=0.01)
+
+    def train_fn(**kwargs):
+        model = _make_model()
+        optimizer = _make_optimizer(model)
+        kwargs.setdefault("model", model)
+        kwargs.setdefault("optimizer", optimizer)
+        return mod.train_fast_for_budget(**kwargs)
+
+    result = mod.measure_cd_overhead(
+        train_fn,
+        train_tokens=torch.arange(256, dtype=torch.int16) % 6,
+        train_num_tokens=256, stride=4, seq_len=6, batch_size=2,
+        device=torch.device("cpu"),
+        budget_seconds=300.0, chunk_size=2, grad_clip_norm=0.0,
+        fused_grad_clip=False,
+        rank=0, world_size=1, seed=123, precision="fp32",
+        stop_check_interval=1, stop_margin_seconds=0.0,
+        vocab_size=6, max_steps=4, prefetch_batches=False,
+        lm_head_backward_mode="fused_streaming_cached",
+        lm_head_emit_entropy=True,
+        criticality_distill_num_layers=2,
+        criticality_distill_dim=4,
+        criticality_distill_budget_frac=0.25,
+        criticality_distill_trace_ttl_steps=8,
+        criticality_distill_trace_half_life_steps=4.0,
+        criticality_distill_seat_refresh_interval=2,
+        criticality_distill_min_weighted_events_per_layer=0.1,
+        criticality_distill_horizon_H=2,
+        criticality_distill_event_frac=0.5,
+        criticality_distill_weight=1.0,
+    )
+    assert "tokens_per_sec_baseline" in result
+    assert "tokens_per_sec_treatment" in result
+    assert "overhead_fraction" in result
+    assert isinstance(result["tokens_per_sec_baseline"], float)
+    assert isinstance(result["tokens_per_sec_treatment"], float)
+    assert isinstance(result["overhead_fraction"], float)
+    # Treatment result dict has cd_overhead attached.
+    tr = result["treatment_result"]
+    assert "cd_overhead" in tr
+    assert set(tr["cd_overhead"].keys()) == {
+        "tokens_per_sec_baseline",
+        "tokens_per_sec_treatment",
+        "overhead_fraction",
+    }

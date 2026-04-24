@@ -2660,6 +2660,53 @@ def train_fast_for_budget(
     return result
 
 
+def measure_cd_overhead(train_fn, **kwargs) -> dict:
+    """Run ``train_fn`` twice — once with CD off, once on — using the
+    same seed and step budget, then report the overhead fraction.
+
+    Returns a dict with both result dicts plus a tokens/sec summary.
+    This is opt-in (report-only, not a hard gate) and doubles wall
+    time; use it only for smoke cells that care about the overhead
+    number. The treatment result dict has ``cd_overhead`` attached as
+    a convenience so downstream callers can keep the authoritative
+    run.
+    """
+    baseline_kwargs = dict(kwargs)
+    baseline_kwargs["criticality_distill_enabled"] = False
+    baseline_result = train_fn(**baseline_kwargs)
+
+    treatment_kwargs = dict(kwargs)
+    treatment_kwargs["criticality_distill_enabled"] = True
+    treatment_result = train_fn(**treatment_kwargs)
+
+    def _tok_per_sec(d: dict) -> float:
+        if "tokens_per_sec" in d:
+            return float(d["tokens_per_sec"])
+        if "aggregate_tokens_per_sec" in d:
+            return float(d["aggregate_tokens_per_sec"])
+        # Fall back to reconstruction.
+        step_count = int(d.get("final_step_count", d.get("steps", d.get("step_count", 0))))
+        wall = float(d.get("total_wall_time", d.get("elapsed_s", d.get("elapsed_seconds", 1.0))))
+        seq_len = int(kwargs["seq_len"])
+        batch_size = int(kwargs["batch_size"])
+        return (step_count * seq_len * batch_size) / max(wall, 1e-9)
+
+    baseline_tps = _tok_per_sec(baseline_result)
+    treatment_tps = _tok_per_sec(treatment_result)
+    overhead = 1.0 - (treatment_tps / max(baseline_tps, 1e-9))
+    summary = {
+        "tokens_per_sec_baseline": float(baseline_tps),
+        "tokens_per_sec_treatment": float(treatment_tps),
+        "overhead_fraction": float(overhead),
+    }
+    treatment_result["cd_overhead"] = summary
+    return {
+        **summary,
+        "baseline_result": baseline_result,
+        "treatment_result": treatment_result,
+    }
+
+
 def _warmup(
     *,
     model: torch.nn.Module,
