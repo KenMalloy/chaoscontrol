@@ -102,6 +102,11 @@ def test_rare_orthogonal_component_is_projected_against_common_direction(monkeyp
         weight_decay=0.0,
         warmup_steps=0,
         rare_orthogonal_weight=1.0,
+        # Disable the macro-Gerber cap: this test asserts the algebraic
+        # projection identity at rare_orthogonal_weight=1.0, which only
+        # holds without the post-fix cap. The cap's own behavior is
+        # covered by test_rare_macro_c_caps_orthogonal_when_larger_than_common.
+        rare_macro_c=0.0,
         compute_dtype=torch.float32,
     )
     opt.bind_param_names([("w", w)])
@@ -484,3 +489,142 @@ def test_recurrence_scarcity_with_timescale_modulates_per_channel() -> None:
     # Channels 2-3 see full scarcity amplification.
     assert adjusted[2].item() > 1.5
     assert adjusted[3].item() > 1.5
+
+
+def test_rare_macro_c_caps_orthogonal_when_larger_than_common(monkeypatch) -> None:
+    """Macro Gerber cap: rare-orthogonal contribution magnitude must be
+    bounded by ``rare_macro_c * common_norm``. This is the direction-scale
+    guard that the existing factor-scale Gerber doesn't provide, and its
+    absence caused the ScOpt runaway observed on 2026-04-24.
+
+    Setup: NS is the identity, rare EMA set to a direction orthogonal
+    to the common gradient with a much larger norm. The applied update
+    reads as ``-lr * (common + effective_weight * orthogonal)``. At
+    ``rare_macro_c=0.5`` the orthogonal portion must be capped at half
+    the common norm.
+    """
+    monkeypatch.setattr(
+        "chaoscontrol.optim.scopt.newton_schulz_orthogonalize",
+        lambda grad, **_: grad,
+    )
+    w = nn.Parameter(torch.zeros(2, 2))
+    opt = ScarcityAwareOptimizer(
+        [w],
+        lr=1.0,
+        momentum=0.0,
+        nesterov=False,
+        ns_steps=1,
+        weight_decay=0.0,
+        warmup_steps=0,
+        rare_macro_c=0.5,
+        rare_orthogonal_weight=1.0,
+        compute_dtype=torch.float32,
+    )
+    opt.bind_param_names([("w", w)])
+    # common gradient in direction e1, orth direction e2 with 100× norm.
+    opt.set_rare_grad_ema({"w": torch.tensor([[1.0, 100.0], [0.0, 0.0]])})
+    w.grad = torch.tensor([[1.0, 0.0], [0.0, 0.0]])
+    opt.step()
+    # -w.detach() is the applied update: common_f + ew * orth_f, scaled
+    # by Muon's rectangular rows/cols factor (rows==cols here → 1.0).
+    applied = -w.detach()
+    common = torch.tensor([[1.0, 0.0], [0.0, 0.0]])
+    orth_contribution = applied - common
+    orth_norm = float(orth_contribution.square().sum().sqrt())
+    common_norm = float(common.square().sum().sqrt())
+    cap = 0.5 * common_norm
+    assert orth_norm <= cap * (1.0 + 1e-5), (
+        f"orth contribution norm={orth_norm:.4f} exceeds cap={cap:.4f}"
+    )
+    trace = opt.scarcity_trace()
+    assert "rare_macro_cap_fired" in trace
+    # The cap should have fired: rare was 100× common, well above c=0.5.
+    assert trace["rare_macro_cap_fired"]["median"] > 0.5
+
+
+def test_rare_macro_c_zero_disables_cap(monkeypatch) -> None:
+    """``rare_macro_c=0.0`` preserves the pre-fix behavior (no cap), so
+    existing configs that predate the guard keep their bitwise updates."""
+    monkeypatch.setattr(
+        "chaoscontrol.optim.scopt.newton_schulz_orthogonalize",
+        lambda grad, **_: grad,
+    )
+    w = nn.Parameter(torch.zeros(2, 2))
+    opt = ScarcityAwareOptimizer(
+        [w],
+        lr=1.0,
+        momentum=0.0,
+        nesterov=False,
+        ns_steps=1,
+        weight_decay=0.0,
+        warmup_steps=0,
+        rare_macro_c=0.0,
+        rare_orthogonal_weight=1.0,
+        compute_dtype=torch.float32,
+    )
+    opt.bind_param_names([("w", w)])
+    opt.set_rare_grad_ema({"w": torch.tensor([[1.0, 100.0], [0.0, 0.0]])})
+    w.grad = torch.tensor([[1.0, 0.0], [0.0, 0.0]])
+    opt.step()
+    # Without cap, orth_contribution ≈ rare_orthogonal = [0, 100, 0, 0].
+    applied = -w.detach()
+    common = torch.tensor([[1.0, 0.0], [0.0, 0.0]])
+    orth = applied - common
+    # The orthogonal component should be the full [0, 100, 0, 0] (up to
+    # projection cleanup — rare was [1, 100, 0, 0] with parallel = [1,0,0,0]).
+    assert abs(float(orth[0, 1]) - 100.0) < 1e-4
+
+
+def test_scarcity_pressure_upper_clamp_gerber_catches_outliers() -> None:
+    """Gerber-style upper clamp on pressure: a handful of exploded-CE
+    tokens get clamped so they can't dominate the rare-gradient
+    accumulation. The clamp uses a winsorized-std scale so the
+    outliers themselves don't inflate the threshold they'd be caught by.
+    """
+    # 20 tokens: 19 well-calibrated (ce − baseline = 0.5), one exploded
+    # (ce − baseline = 100). The outlier must shrink; the normal-scale
+    # values must survive.
+    ce_values = [0.75] * 19 + [100.25]
+    ce = torch.tensor([ce_values], dtype=torch.float32)
+    targets = torch.arange(20).reshape(1, -1)
+    token_frequencies = torch.ones(20)
+    pressure_no_clamp = scarcity_pressure_from_ce(
+        ce,
+        targets,
+        token_frequencies=token_frequencies,
+        baseline=0.25,
+    )
+    assert float(pressure_no_clamp.max()) > 50.0
+    pressure_clamped = scarcity_pressure_from_ce(
+        ce,
+        targets,
+        token_frequencies=token_frequencies,
+        baseline=0.25,
+        upper_c=3.0,
+        upper_floor=1.0,
+    )
+    # Outlier should shrink to O(1), normal-scale tokens unchanged.
+    assert float(pressure_clamped.max()) < 10.0
+    # Normal tokens (value ≈ 0.72 after rarity scaling) are well under
+    # the clamp, so they pass through unchanged.
+    normal_max_no_clamp = float(pressure_no_clamp[0, :19].max())
+    normal_max_clamped = float(pressure_clamped[0, :19].max())
+    assert abs(normal_max_clamped - normal_max_no_clamp) < 1e-6
+
+
+def test_scarcity_pressure_upper_clamp_floor_is_respected_when_std_zero() -> None:
+    """When pressure has zero std (uniform), the Gerber clamp collapses
+    to the floor — guaranteeing a non-zero upper bound."""
+    ce = torch.tensor([[1.0, 1.0, 1.0]], dtype=torch.float32)
+    targets = torch.tensor([[0, 1, 2]])
+    token_frequencies = torch.ones(3)
+    pressure = scarcity_pressure_from_ce(
+        ce,
+        targets,
+        token_frequencies=token_frequencies,
+        baseline=0.0,
+        upper_c=3.0,
+        upper_floor=0.5,
+    )
+    # All pressures equal, so clamp is 3 * 0 = 0 unless floor kicks in.
+    assert float(pressure.max()) <= 0.5 + 1e-6

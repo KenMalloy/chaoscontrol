@@ -267,6 +267,16 @@ def build_scopt_overhead_gate_matrix(
             opt_base["scopt_trace_interval_steps"] = 64
             opt_base["scopt_rare_ema_decay"] = 0.9
             opt_base["scopt_rare_orthogonal_weight"] = 1.0
+            # Macro Gerber on rare-orthogonal contribution: caps
+            # orth_norm at c * common_norm per parameter, preventing the
+            # rare-gradient-dominates-common-gradient feedback loop that
+            # drove the 2026-04-24 long-smoke to final_loss 158.
+            opt_base["scopt_rare_macro_c"] = 0.5
+            # Gerber upper clamp on pressure: winsorized-std threshold
+            # to prevent exploded-CE tokens from poisoning the whole
+            # rare-gradient accumulation.
+            opt_base["scopt_pressure_upper_c"] = 3.0
+            opt_base["scopt_pressure_upper_floor"] = 1.0
             opt_base["scopt_row_scarcity_power"] = 0.5
             opt_base["scopt_tau_std_scale"] = 0.5
             opt_base["scopt_layer_index"] = 0

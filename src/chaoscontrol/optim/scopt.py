@@ -127,6 +127,8 @@ def scarcity_pressure_from_ce(
     token_frequencies: Tensor,
     baseline: Tensor | float | None = None,
     eps: float = 1e-8,
+    upper_c: float | None = None,
+    upper_floor: float = 1.0,
 ) -> Tensor:
     """Return detached rare-event pressure for unreduced CE.
 
@@ -134,6 +136,16 @@ def scarcity_pressure_from_ce(
     Pressure is a constant weight derived from ``ce.detach()`` so
     ``rare_loss = (ce * pressure).sum() / pressure.sum()`` backprops
     through CE only, not through the pressure heuristic itself.
+
+    ``upper_c`` (optional) enables a Gerber-style upper clamp on
+    pressure: ``pressure.clamp_max(max(upper_c * pressure_std, upper_floor))``.
+    This is the pressure-level counterpart to the per-factor Gerber
+    gates in the optimizer's ``_scarcity_factor``. Without it, a small
+    number of exploded-CE tokens can drive the per-batch pressure far
+    out of its typical range, destabilising the rare-gradient
+    accumulation (observed in the 2026-04-24 ScOpt smoke, with
+    ``pressure.max=172`` vs ``p95=21``). ``upper_c=None`` keeps the
+    historical no-clamp behavior.
     """
     if token_frequencies.ndim != 1:
         raise ValueError(
@@ -169,6 +181,23 @@ def scarcity_pressure_from_ce(
             baseline_tensor = torch.full_like(ce_detached, float(baseline))
         excess = (ce_detached - baseline_tensor).clamp_min(0.0)
         pressure = rarity.to(dtype=torch.float32) * excess
+        if upper_c is not None:
+            # Robust scale: use 95%-winsorized std so the outliers we want
+            # to clamp don't themselves inflate the threshold they'd be
+            # caught by. For tiny tensors (<10 elements) fall back to the
+            # plain std since quantile is ill-defined.
+            if pressure.numel() >= 10:
+                q95 = pressure.flatten().quantile(0.95)
+                pressure_scale = pressure.clamp_max(q95).std(unbiased=False)
+            elif pressure.numel() > 1:
+                pressure_scale = pressure.std(unbiased=False)
+            else:
+                pressure_scale = pressure.new_zeros(())
+            upper = torch.maximum(
+                pressure_scale * float(upper_c),
+                pressure.new_tensor(float(upper_floor)),
+            )
+            pressure = pressure.clamp_max(upper)
     return pressure.to(device=ce.device, dtype=torch.float32)
 
 
@@ -231,6 +260,7 @@ class ScarcityAwareOptimizer(torch.optim.Optimizer):
         compute_dtype: torch.dtype | None = None,
         rare_ema_decay: float = 0.9,
         rare_orthogonal_weight: float = 1.0,
+        rare_macro_c: float = 0.5,
         warmup_steps: int = 200,
         row_param_names: set[str] | None = None,
         row_scarcity_power: float = 0.5,
@@ -274,6 +304,11 @@ class ScarcityAwareOptimizer(torch.optim.Optimizer):
         self._compute_dtype = compute_dtype
         self._rare_ema_decay = float(rare_ema_decay)
         self._rare_orthogonal_weight = float(rare_orthogonal_weight)
+        self._rare_macro_c = float(rare_macro_c)
+        if self._rare_macro_c < 0.0:
+            raise ValueError(
+                f"rare_macro_c must be >= 0, got {self._rare_macro_c}"
+            )
         self._warmup_steps = int(warmup_steps)
         self._row_param_names = set(row_param_names or {"embed.weight", "lm_head.weight"})
         self._row_scarcity_power = float(row_scarcity_power)
@@ -516,7 +551,30 @@ class ScarcityAwareOptimizer(torch.optim.Optimizer):
             float((orth_norm / common_norm).item())
         )
 
-        direction = common_f + self._rare_orthogonal_weight * orthogonal
+        # Macro Gerber cap: bound the orthogonal contribution's norm to
+        # ``c_macro * common_norm`` so a rare-grad EMA that outgrows the
+        # common gradient can never dominate the update direction. The
+        # existing per-factor Gerber gates sit inside ``_scarcity_factor``
+        # and are irrelevant here — this path composes direction vectors,
+        # not per-channel amplifiers. The missing guard at this site is
+        # what drove the 2026-04-24 smoke to final_loss 158.
+        #
+        # ``rare_macro_c=0`` disables the cap (historical behavior).
+        desired_weight = float(self._rare_orthogonal_weight)
+        if self._rare_macro_c > 0.0 and desired_weight > 0.0:
+            cap = (self._rare_macro_c * common_norm) / orth_norm.clamp_min(self._eps)
+            effective_weight = torch.minimum(
+                cap,
+                cap.new_tensor(desired_weight),
+            )
+            ew_float = float(effective_weight.item())
+            self._telemetry_accum["rare_macro_effective_weight"].append(ew_float)
+            self._telemetry_accum["rare_macro_cap_fired"].append(
+                1.0 if ew_float < desired_weight - 1e-6 else 0.0
+            )
+            direction = common_f + effective_weight * orthogonal
+        else:
+            direction = common_f + desired_weight * orthogonal
         return direction.to(dtype=orig_dtype)
 
     def _apply_matrix_scarcity(

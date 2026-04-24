@@ -209,6 +209,7 @@ def _build_optimizer(
             rare_orthogonal_weight=float(
                 config.get("scopt_rare_orthogonal_weight", 1.0)
             ),
+            rare_macro_c=float(config.get("scopt_rare_macro_c", 0.5)),
             row_scarcity_power=float(config.get("scopt_row_scarcity_power", 0.5)),
             tau_std_scale=float(config.get("scopt_tau_std_scale", 0.5)),
             **scopt_cfg,
@@ -726,6 +727,8 @@ def _run_scopt_train_step(
     step: int,
     split_interval: int = 4,
     baseline: FrequencyBucketBaseline | torch.Tensor | float | None = None,
+    pressure_upper_c: float | None = None,
+    pressure_upper_floor: float = 1.0,
 ) -> tuple[torch.Tensor, _ScOptPending | None]:
     """ScOpt training step with retained graph and rare-grad split.
 
@@ -777,6 +780,8 @@ def _run_scopt_train_step(
             targets,
             token_frequencies=token_frequencies,
             baseline=baseline_value,
+            upper_c=pressure_upper_c,
+            upper_floor=pressure_upper_floor,
         )
         total_loss = ce.mean()
         rare_loss = (ce * pressure).sum() / pressure.sum().clamp_min(1.0)
@@ -1435,6 +1440,8 @@ def train_fast_for_budget(
     scopt_baseline_buckets: int = 16,
     scopt_baseline_decay: float = 0.99,
     scopt_trace_interval_steps: int = 0,
+    scopt_pressure_upper_c: float | None = None,
+    scopt_pressure_upper_floor: float = 1.0,
 ) -> dict[str, Any]:
     rank_ = int(rank)
     world_size_ = int(world_size)
@@ -1820,6 +1827,8 @@ def train_fast_for_budget(
                     step=steps,
                     split_interval=scopt_split_interval,
                     baseline=scopt_baseline,
+                    pressure_upper_c=scopt_pressure_upper_c,
+                    pressure_upper_floor=scopt_pressure_upper_floor,
                 )
             else:
                 loss = _run_train_step(
@@ -2075,6 +2084,15 @@ def _warmup(
         scopt_split_interval=int(config.get("scopt_split_interval", 4)),
         scopt_baseline_buckets=int(config.get("scopt_baseline_buckets", 16)),
         scopt_baseline_decay=float(config.get("scopt_baseline_decay", 0.99)),
+        scopt_trace_interval_steps=int(config.get("scopt_trace_interval_steps", 0)),
+        scopt_pressure_upper_c=(
+            float(config["scopt_pressure_upper_c"])
+            if config.get("scopt_pressure_upper_c") is not None
+            else None
+        ),
+        scopt_pressure_upper_floor=float(
+            config.get("scopt_pressure_upper_floor", 1.0)
+        ),
     )
 
 
@@ -2245,6 +2263,15 @@ def run_condition(
         scopt_split_interval=int(config.get("scopt_split_interval", 4)),
         scopt_baseline_buckets=int(config.get("scopt_baseline_buckets", 16)),
         scopt_baseline_decay=float(config.get("scopt_baseline_decay", 0.99)),
+        scopt_trace_interval_steps=int(config.get("scopt_trace_interval_steps", 0)),
+        scopt_pressure_upper_c=(
+            float(config["scopt_pressure_upper_c"])
+            if config.get("scopt_pressure_upper_c") is not None
+            else None
+        ),
+        scopt_pressure_upper_floor=float(
+            config.get("scopt_pressure_upper_floor", 1.0)
+        ),
     )
 
     if ddp_active:
