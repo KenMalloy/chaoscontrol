@@ -612,3 +612,21 @@ def test_fixed_random_seats_allocate_seats_is_noop():
         f"before={init_mask[0].nonzero(as_tuple=True)[0].tolist()}, "
         f"after={cd.seat_mask[0].nonzero(as_tuple=True)[0].tolist()}"
     )
+
+
+def test_accumulator_buffers_register_and_initialize_to_zero():
+    cd = CriticalityDistillation(num_layers=3, dim=8, trace_ttl_steps=16)
+    # score_num: running age-weighted sum of evidence contributions.
+    assert cd.score_num.shape == (3, 8)
+    assert torch.equal(cd.score_num, torch.zeros_like(cd.score_num))
+    # score_den: running age-weighted count.
+    assert cd.score_den.shape == (3,)
+    assert torch.equal(cd.score_den, torch.zeros_like(cd.score_den))
+    # event_mass: running age-weighted event count for the gate.
+    assert cd.event_mass.shape == (3,)
+    # last_decay_step: last step we applied decay to accumulators.
+    assert cd.last_decay_step.item() == -1
+    # All in state_dict (buffers registered).
+    sd = cd.state_dict()
+    for key in ("score_num", "score_den", "event_mass", "last_decay_step"):
+        assert key in sd

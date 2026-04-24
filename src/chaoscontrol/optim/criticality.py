@@ -89,6 +89,20 @@ class CriticalityDistillation(nn.Module):
             "seat_mask",
             torch.zeros(self.num_layers, self.dim, dtype=torch.bool),
         )
+        # Running decayed accumulators for O(L·D) per-step scoring; replace
+        # the full ring-bank rescan in the hot path.
+        self.register_buffer(
+            "score_num", torch.zeros(self.num_layers, self.dim, dtype=torch.float32)
+        )
+        self.register_buffer(
+            "score_den", torch.zeros(self.num_layers, dtype=torch.float32)
+        )
+        self.register_buffer(
+            "event_mass", torch.zeros(self.num_layers, dtype=torch.float32)
+        )
+        self.register_buffer(
+            "last_decay_step", torch.tensor(-1, dtype=torch.int64)
+        )
         if self.fixed_random_seats:
             # Falsifier: bind seats ONCE at construction using torch.randperm.
             # allocate_seats becomes a no-op; ingest still runs so cost and
