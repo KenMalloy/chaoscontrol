@@ -70,3 +70,30 @@ def test_capture_is_disabled_by_default_no_overhead_path():
     _ = core(x)
     assert core._captured_states is None
     assert core._capture_states_enabled is False
+
+
+def test_forward_output_is_identical_with_and_without_capture():
+    core = _make_core(dim=8)
+    x = torch.randn(2, 5, 8)
+    y_no_capture = core(x)
+    with core.capture_states() as _:
+        y_with_capture = core(x)
+    assert torch.equal(y_no_capture, y_with_capture), (
+        "capture must not change the forward output"
+    )
+
+
+def test_capture_states_raises_for_paired_mode():
+    torch.manual_seed(0)
+    core = ChaosSSMCore(dim=8, a_mode="paired")
+    with pytest.raises(NotImplementedError, match="capture_states"):
+        with core.capture_states():
+            pass
+
+
+def test_capture_states_raises_for_full_mode():
+    torch.manual_seed(0)
+    core = ChaosSSMCore(dim=8, a_mode="full")
+    with pytest.raises(NotImplementedError, match="capture_states"):
+        with core.capture_states():
+            pass
