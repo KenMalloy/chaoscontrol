@@ -4,6 +4,7 @@ from __future__ import annotations
 import math
 import os
 import warnings
+from contextlib import contextmanager
 from typing import Any
 
 import torch
@@ -335,6 +336,8 @@ class ChaosSSMCore(nn.Module):
         self.dim = dim
         self.a_mode = a_mode
         self.a_full_rank = a_full_rank
+        self._capture_states_enabled = False
+        self._captured_states: torch.Tensor | None = None
 
         # Shared projections across all modes
         self.in_proj = nn.Linear(dim, dim, bias=False)
@@ -408,16 +411,34 @@ class ChaosSSMCore(nn.Module):
         gate = torch.sigmoid(self.gate_proj(x))
         return decay, update, gate
 
-    def _forward_diag_scan(self, x: torch.Tensor) -> torch.Tensor:
-        """Compiled sequential diag recurrence.
+    @contextmanager
+    def capture_states(self):
+        """Enable recurrence-state capture for the enclosed forward(s).
 
-        Uses the same elementwise recurrence as the sequential loop
-        but processes decay/update/gate in a single batched projection
-        pass, then runs the state update loop on pre-computed terms.
-        torch.compile fuses the per-step kernels on CUDA.
+        Inside the context, `_forward_diag_scan` and the diag fast-path branch
+        in `forward()` write the per-step state trajectory into
+        `self._captured_states` as a detached `[B, T, D]` tensor. The buffer
+        is cleared on exit so we do not leak `[B, T, D]` tensors across
+        unrelated forwards.
         """
+        if self.a_mode != "diag":
+            raise NotImplementedError(
+                f"capture_states() is only implemented for a_mode='diag'; "
+                f"got a_mode={self.a_mode!r}."
+            )
+        self._capture_states_enabled = True
+        self._captured_states = None
+        try:
+            yield lambda: self._captured_states
+        finally:
+            self._capture_states_enabled = False
+            self._captured_states = None
+
+    def _forward_diag_scan(self, x: torch.Tensor) -> torch.Tensor:
         decay, update, gate = self._diag_terms(x)
         states = _diag_recurrence(decay, update)
+        if self._capture_states_enabled:
+            self._captured_states = states.detach()
         out = gate * states
         return self.out_proj(out)
 
