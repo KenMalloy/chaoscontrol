@@ -46,74 +46,116 @@ event_mask = pressure >= pressure.quantile(1 - event_frac) # top event_frac posi
 
 Default `event_frac = 0.05`. This directly kills the `fraction_positive ≈ 0.5` problem — pressure-as-ranking doesn't care about the dense tail shape.
 
-### Stage 2 — Rare Trace Bank
+### Stage 2 — Rare Trace Bank (per-step aggregate, not per-event)
 
-Per-layer rolling database of post-event recurrence traces. On event positions only, we snapshot the hidden state and its near future:
+**Storage granularity matters.** At submission batch sizes (bs=512, seq=512, event_frac=0.05) a per-event bank would absorb ~13k events per layer per step and overwrite a fixed ring within one step. We do not want per-event identity; codex's "repeated events reinforce channel seats through fresh evidence" observation tells us the bank only needs aggregate, time-stamped evidence vectors.
+
+**Bank entry = one `[D]` aggregate per (layer, step):**
 
 ```
-event = {
-    "step":    current_step,
-    "layer":   l,
-    "future_excess_energy": excess_l,   # [D], computed once per event
-    "pressure":             pressure[b, t],
-    "target_bucket":        freq_bucket[target[b, t]],  # reserved for v2 scoring
+bank_entry = {
+    "step":   current_step,
+    "layer":  l,
+    "evidence":   aggregated_excess_energy_l,  # [D] mean over this step's event positions
+    "event_count": n_events_this_step,          # for diagnostics and min-evidence gating
 }
 ```
 
-`excess_l` is the event contribution computed at capture time (see Stage 3), so the bank stores a small `[D]` vector per event, not `[H, D]`. Horizon `H` appears only inside the excess-energy computation and is released immediately.
+Aggregation inside Stage 3 is `mean_over_event_positions(future_excess_energy)`. If no events fire at layer `l` on step `t`, no entry is written (the step is invisible to the bank).
 
-**Storage rule:** fixed-size ring buffer per layer, capacity `trace_bank_capacity` events. TTL-based drop: any event older than `trace_ttl_steps` is evicted regardless of capacity. Combined with the age-weighted scoring below, the bank behaves as a rolling recency-weighted database.
+**Storage rule:** per-layer ring buffer keyed by step. Capacity = `trace_ttl_steps` (one slot per step, dropped on TTL). At `trace_ttl_steps = 1024` this is 1024 × D × fp32 per layer — a few MB per layer, not a few GB per step.
 
-### Stage 3 — Causal channel scoring
+If we later want per-family evidence, we split `evidence` into `[n_buckets, D]` indexed by target frequency bucket. That's a v2 feature; first pass is a single `[D]` per (layer, step).
 
-Channel score = excess future energy after an event, vs. a non-event baseline:
+### Stage 3 — Post-event trace scoring
+
+(Name note: not "causal" in the formal sense — `state_l[b, t+1:t+H]` includes contributions from *later input tokens* after the event, not only the event's own persistence. A matched-nearby or counterfactual control is required to claim causality. "Post-event trace scoring" is the honest label.)
+
+**Recurrence-state capture API — required prerequisite.** Current SSM forward (`src/chaoscontrol/core.py:411-422`) computes the `[B, T, D]` state trajectory internally via `_diag_recurrence` and returns only `gate * states` → `out_proj(out)`. The existing ScOpt hooks (`experiments/23_fast_path/runner_fast_path.py:421`) capture projection inputs/outputs, not the recurrence states themselves. Criticality Distillation requires a new capture point:
+
+- Modify `_forward_diag_scan` (and equivalents on other backends) to optionally return `states` — gated on a `capture_states: bool` param that defaults to False so production inference stays unchanged.
+- A lightweight capture context manager on the model enables state return per-forward, gathers `states` into a per-layer buffer, and hands them to the Rare Trace Bank at the end of the step.
+- Keep the capture buffer rank-local and short-lived; at end of step, Stage 3 consumes the `[B, T, D]` states, writes one `[D]` aggregate to the bank, and releases the raw states.
+
+**Event mask timing.** Pressure is computed from CE after `model.encode` returns, so event positions are not known *during* the forward pass. Two viable resolutions:
+
+- **(A) Two-pass within a step:** run the forward with state capture, compute CE + pressure, then accumulate excess energy over all positions and mask by event_mask *post-hoc*. This is cheap because excess-energy accumulation is O(B*T*D) per layer, well under the forward cost. The `states[B, T, D]` are already resident.
+- **(B) One-step-lagged event mask:** apply step `t-1`'s pressure quantile to step `t`'s states. Saves the post-hoc masking but introduces a one-step lag; rare structure is slow-moving so this is likely fine, and it cleanly decouples capture from pressure.
+
+Default to **(A)** for the first implementation because it keeps the event-state correspondence exact. Revisit (B) if the post-hoc pass turns out to be a measurable wall-clock hit.
+
+**Scoring math:**
 
 ```
-event_future_energy[c]    = mean( state_l[b, t+1:t+H][:, c] ** 2 )   # [D]
-baseline_future_energy[c] = running EMA of mean-square state per channel during non-events
-excess_l[c]               = relu(event_future_energy[c] - baseline_future_energy[c])
+# For each position (b, t) in each layer l, over the trailing window [t+1, t+H]:
+future_energy_l[b, t, c] = mean( states_l[b, t+1:t+H, c] ** 2 )   # [B, T, D]
+
+# Baseline: running EMA of future_energy per channel, updated over non-event positions only.
+baseline_future_energy_l[c] = ema_update( baseline, future_energy_l[~event_mask], decay=baseline_ema_decay )
+
+# Excess per position:
+excess_l[b, t, c] = relu(future_energy_l[b, t, c] - baseline_future_energy_l[c])
+
+# Aggregate into the bank entry for this (layer, step):
+bank_entry.evidence[c] = mean_over_event_positions( excess_l[event_mask, c] )   # [D]
 ```
 
-The baseline is a cheap per-channel EMA of non-event future-energy, updated every step at non-event positions. A matched-nearby control (paired non-event positions within the same sequence) is a v2 ablation; start with the EMA.
+The baseline is a cheap per-channel EMA of non-event future-energy. Matched-nearby control (paired non-event positions within the same sequence) is Ablation #3 — start with the EMA.
 
 Aggregate score uses age-weighted evidence over the whole bank:
 
 ```
-age_weight = exp( -(current_step - event.step) / trace_half_life_steps )
-score_l[c] = sum_events( age_weight * event.future_excess_energy[c] )
-             / sum_events( age_weight )
+age_weight = exp( -(current_step - entry.step) / trace_half_life_steps )
+score_l[c] = sum_entries( age_weight * entry.evidence[c] )
+             / sum_entries( age_weight )
 ```
 
-Events themselves age; seats do not age. See seat-relaxation section below.
+Evidence itself ages; seats do not age. See seat-relaxation section below.
 
-### Stage 4 — Budgeted seat allocation
+### Stage 4 — Budgeted seat allocation (with evidence gate)
 
-Every `seat_refresh_interval` steps, each layer recomputes its seat assignment from current score:
+Every `seat_refresh_interval` steps, each layer recomputes its seat assignment from current score, **iff the evidence gate is satisfied**:
 
 ```
-k = round(D * criticality_budget_frac)
-target_channels_l = topk(score_l, k)
-target_criticality_l = where(channel in target, critical_value, default_value)
+total_age_weighted_events_l = sum_entries( age_weight * entry.event_count )
+if total_age_weighted_events_l < min_weighted_events_per_layer:
+    # vacuous target — no gradient on log_a this refresh
+    target_criticality_l = None
+else:
+    k = round(D * criticality_budget_frac)
+    target_channels_l = topk(score_l, k)
+    seat_mask_l = one_hot(target_channels_l, num_classes=D)   # [D] bool
+    target_criticality_l = critical_value   # scalar applied only to seat channels
 ```
 
 Defaults:
 - `criticality_budget_frac = 0.15` (15% of channels critical per layer)
 - `critical_value = 0.95` (target `1 - sigmoid(log_a) = 0.95`, near-critical)
-- `default_value = 1 - sigmoid(log_a_init)` (leave non-seat channels alone at their current initialization-driven setpoint)
+- `min_weighted_events_per_layer = 256` (evidence floor before any seats bind)
 
 Top-k is the first-pass allocator because it matches the "seats" semantics exactly. A soft Lagrange-multiplier variant (fix the mean criticality instead of the count) is an ablation, not the default.
 
-### Stage 5 — Criticality actuator
+### Stage 5 — Criticality actuator (masked, seat-only gradient)
 
 A loss term, not an optimizer bias. This is the simplest and most composable choice: Muon just sees a gradient on `log_a`, and weight decay / fast-slow / param grouping all compose without special-casing.
 
+**Critical subtlety:** non-seat channels must not feel the loss. Applying MSE over the full `[D]` vector with any default target actively pulls non-seats back to that target on every step, freezing ~85% of the recurrence spectrum. Mask by the seat selection:
+
 ```
-criticality_l = 1.0 - sigmoid(log_a_l)                  # [D]
-loss_criticality_l = mse(criticality_l, target_criticality_l.detach())
+criticality_l = 1.0 - sigmoid(log_a_l)                        # [D]
+
+if target_criticality_l is None:
+    loss_criticality_l = 0.0       # evidence gate not yet passed
+else:
+    seat_err   = (criticality_l - critical_value) ** 2         # [D]
+    loss_criticality_l = (seat_err * seat_mask_l.float()).sum() / seat_mask_l.sum().clamp_min(1.0)
+
 total_loss = ce_loss + criticality_distill_weight * sum_l(loss_criticality_l)
 ```
 
-`target_criticality_l.detach()` ensures the actuator is a setpoint, not a differentiable signal that rare pressure can exploit. The `.detach()` is load-bearing.
+The mask means only the top-k seat channels receive criticality gradient; non-seats drift freely under whatever CE + Muon do to them. This matches the "no event owns a channel permanently" framing — a channel that loses its seat next refresh simply stops feeling the loss, it doesn't get yanked back to a default.
+
+`critical_value` is applied directly as a scalar; there is no `default_value` because non-seats have no target. The `.detach()` on `seat_mask_l` and `target` is implicit — neither is differentiable with respect to anything by construction (they're top-k outputs over detached scores).
 
 Default `criticality_distill_weight = 1e-3`. Sweep range 1e-4 to 1e-2 in ablations.
 
@@ -135,14 +177,15 @@ This avoids the "one rare event holds a channel hostage forever" failure mode wi
 
 ```
 event_frac                       = 0.05
-trace_bank_capacity              = 512      # events per layer
-trace_ttl_steps                  = 1024
+trace_ttl_steps                  = 1024     # one bank slot per step, per layer
 trace_half_life_steps            = 256
 seat_refresh_interval            = 64       # steps
 criticality_budget_frac          = 0.15
-critical_value                   = 0.95     # target 1 - sigmoid(log_a)
+critical_value                   = 0.95     # target 1 - sigmoid(log_a) for seats
 criticality_distill_weight       = 1e-3
-horizon_H                        = TBD — first ablation
+baseline_ema_decay               = 0.99     # non-event future-energy EMA
+min_weighted_events_per_layer    = 256      # evidence gate before seats bind
+horizon_H                        = required sweep; initial values 16 / 64 / 256
 ```
 
 ## Diagnostics
@@ -169,9 +212,16 @@ Aggregate `final_loss` is dominated by common tokens and is **not** a valid succ
 
 The `horizon_H` and `per-layer vs cross-layer` ablations are blockers for committing a default; the others are refinements.
 
-## Success metric (the only one)
+## Success metric and falsifier controls
 
-> Rare-bucket CE on Param-Golf val improves relative to a matched ScOpt-as-telemetry-only control (no criticality loss) and to the locked fast-slow baseline at matched wall-clock.
+**Primary metric (and only success signal):** rare-bucket CE on Param-Golf val improves relative to a matched ScOpt-as-telemetry-only control (criticality loss off, trace bank still collecting) AND relative to both falsifier controls below.
+
+**Falsifier controls — first-class cells, not optional ablations:**
+
+- **shuffled-teacher**: same trace bank, same budget, same scoring — but seat assignment uses a permuted `score_l` that destroys the channel identity. If rare-bucket CE improves in shuffled-teacher at the same rate as real teacher, the mechanism is "any budgeted criticality helps" and ScOpt-guided selection claims nothing.
+- **budget-only**: no ScOpt guidance, no scoring, no bank. Uniformly set target for a random-but-fixed top-k channels per layer at startup, hold through training. Controls for "does having SOME critical modes help regardless of which ones."
+
+Both are cheap variants (one config flag each) and devastating if they match treatment. They must ship in the first comparison matrix, not as v2.
 
 Aggregate BPB is secondary; it's the submission number but not the mechanism test. If rare-bucket CE moves and aggregate doesn't, we have a real mechanism that needs scale; if rare-bucket CE also doesn't move, the hypothesis is falsified regardless of aggregate noise.
 
@@ -181,14 +231,16 @@ First-pass estimate (be skeptical; I tend to overcount):
 
 | stage | effort | output |
 |---|---|---|
-| 1. Rare Trace Bank + event-mask plumbing | 1 day | per-layer ring buffer, event capture at hook level, unit tests |
-| 2. Causal channel scoring + age-weighted accumulator | 0.5 day | `score_l` trajectory, basic diagnostics |
-| 3. Budget allocator + criticality loss | 0.5 day | `loss_criticality`, target emission, integration with existing loss graph |
-| 4. Diagnostics + per-bucket CE readout | 0.5 day | `seat_churn`, `rare_bucket_ce` per bucket over time |
-| 5. Smoke + ablation 1 (horizon_H) | 1 day | 1 × H100 smoke per H value, results doc |
-| 6. Ablation 2 (per-layer vs cross-layer) + writeup | 0.5 day | decision on default |
+| 1a. Recurrence-state capture API | 0.5 day | `_forward_diag_scan(capture_states=True)` + equivalents on chunked/tri backends, capture context mgr |
+| 1b. Rare Trace Bank (per-step aggregate) + event-mask plumbing | 0.5 day | per-layer ring keyed by step, post-hoc event mask, unit tests |
+| 2. Post-event trace scoring + age-weighted accumulator + baseline EMA | 0.5 day | `score_l` trajectory, baseline EMA over non-events |
+| 3. Budget allocator (evidence-gated) + seat-masked criticality loss | 0.5 day | `loss_criticality`, target emission, integration with existing loss graph |
+| 4. Diagnostics + per-bucket CE readout + shuffled-teacher / budget-only flags | 0.5 day | `seat_churn`, `rare_bucket_ce` per bucket over time, two falsifier-control config flags |
+| 5. Smoke (treatment + telemetry-only + shuffled-teacher + budget-only, 4 cells) | 1 day | 1 × H100 smoke, mechanism read |
+| 6. Ablation 1 (horizon_H 16/64/256) + writeup | 1 day | decision on default |
+| 7. Ablation 2 (per-layer vs cross-layer) + writeup | 0.5 day | decision on default |
 
-Realistically 3-5 working days to a smoke result. Not 1 week; not 1 afternoon.
+Realistically **4-5 working days to first mechanism read** (stages 1-5), then another 1-2 days of ablation before a default lands.
 
 ## Integration with existing code
 
@@ -214,4 +266,6 @@ If treatment shows `rare_bucket_ce` movement against control, proceed to horizon
 
 ## Status
 
-Draft. Not wired. Next concrete action is approve-or-redline of this doc, then Stage 1 implementation.
+v2 draft. Not wired. Redline pass 2026-04-24 resolved: (1) per-step aggregate bank replaces per-event bank — at submission batch size per-event would overflow a fixed ring inside one step; (2) explicit recurrence-state capture API specified as a prerequisite — existing hooks do not expose `states`; (3) criticality loss is now seat-masked so non-seats drift freely; (4) evidence gate prevents allocation from junk; (5) shuffled-teacher and budget-only falsifier controls elevated to first-class cells; (6) Stage 3 renamed "post-event trace scoring" — matched-nearby control is required to claim causality; (7) `horizon_H` explicitly a required sweep parameter with initial values 16/64/256.
+
+Next concrete action is approve-or-redline of this v2, then Stage 1 (state capture API + trace bank skeleton).
