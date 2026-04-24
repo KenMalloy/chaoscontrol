@@ -264,7 +264,7 @@ def _build_entries(
 
 
 def _default_world_size_for_matrix(matrix: str) -> int:
-    if matrix in {"semantic_overhead_gate", "scopt_overhead_gate"}:
+    if matrix in {"semantic_overhead_gate", "scopt_overhead_gate", "scopt_calibration_sweep"}:
         return 1
     if matrix in {
         "phase0_dreamworld_sweep",
@@ -289,6 +289,8 @@ def _default_budget_for_matrix(matrix: str) -> float:
         return 90.0
     if matrix == "scopt_overhead_gate":
         return 180.0
+    if matrix == "scopt_calibration_sweep":
+        return 1200.0
     return 600.0
 
 
@@ -301,6 +303,7 @@ def main(argv: list[str] | None = None) -> int:
             "phase_a_sampling",
             "semantic_overhead_gate",
             "scopt_overhead_gate",
+            "scopt_calibration_sweep",
             "first_wave",
             "fastslow_dreamworld",
             "phase0_dreamworld_sweep",
