@@ -323,6 +323,67 @@ class CriticalityDistillation(nn.Module):
         self.bank_event_count[layer, slot] = float(event_count)
 
     @torch.no_grad()
+    def ingest_gpu(
+        self,
+        *,
+        pressure: torch.Tensor,
+        states_per_layer: list,
+        horizon_H: int,
+        event_frac: float,
+    ) -> dict:
+        """Phase 1 of two-phase ingest. Runs on the pressure/states
+        device. Returns only small aggregates + scalar counts — no
+        `[B, T]` masks in the payload, so the D2H copy stays tiny."""
+        if len(states_per_layer) != self.num_layers:
+            raise ValueError(
+                f"states_per_layer must have {self.num_layers} entries; got {len(states_per_layer)}"
+            )
+        event_mask = compute_event_mask(pressure, event_frac=event_frac)  # [B, T]
+        flat_mask = event_mask.reshape(-1)
+        flat_non_event = ~flat_mask
+        n_events = flat_mask.sum().to(torch.int64)
+        n_non_events = flat_non_event.sum().to(torch.int64)
+        aggregated_excess: list[torch.Tensor] = []
+        non_event_mean_future_energy: list[torch.Tensor] = []
+        event_count: list[torch.Tensor] = []
+        for layer, states in enumerate(states_per_layer):
+            if states.shape[-1] != self.dim:
+                raise ValueError(
+                    f"layer {layer}: states last dim {states.shape[-1]} != self.dim {self.dim}"
+                )
+            future_energy = compute_future_energy(states, horizon_H=horizon_H)
+            flat_fe = future_energy.reshape(-1, self.dim)
+            if flat_non_event.any():
+                nonevt_mean = flat_fe[flat_non_event].mean(dim=0)
+            else:
+                nonevt_mean = torch.zeros(
+                    self.dim, dtype=flat_fe.dtype, device=flat_fe.device
+                )
+            non_event_mean_future_energy.append(nonevt_mean)
+            baseline = self.baseline_future_energy[layer].to(flat_fe.device)
+            excess = (future_energy - baseline).clamp_min(0.0)
+            flat_excess = excess.reshape(-1, self.dim)
+            if flat_mask.any():
+                agg = flat_excess[flat_mask].mean(dim=0)
+                cnt = flat_mask.sum().to(torch.float32)
+            else:
+                agg = torch.zeros(
+                    self.dim, dtype=flat_excess.dtype, device=flat_excess.device
+                )
+                cnt = torch.zeros((), dtype=torch.float32, device=flat_excess.device)
+            aggregated_excess.append(agg)
+            event_count.append(cnt)
+        return {
+            "aggregated_excess_per_layer": torch.stack(aggregated_excess, dim=0),
+            "non_event_mean_future_energy_per_layer": torch.stack(
+                non_event_mean_future_energy, dim=0
+            ),
+            "event_count_per_layer": torch.stack(event_count, dim=0),
+            "n_events_scalar": n_events,
+            "n_non_events_scalar": n_non_events,
+        }
+
+    @torch.no_grad()
     def ingest_cpu_from_prepared(self, *, step: int, prepared: dict) -> None:
         """CPU-side ingest from a pre-aggregated payload. Drives the
         incremental accumulators and writes to the ring bank for
@@ -338,12 +399,7 @@ class CriticalityDistillation(nn.Module):
             device=self.bank_event_count.device,
             dtype=self.bank_event_count.dtype,
         )
-        # non-event gate: use event_mask to tell if any non-event positions
-        # contributed this step. When C.9 drops event_mask from the payload,
-        # this reads n_non_events_scalar instead — for now we still read the
-        # event_mask key.
-        event_mask = prepared["event_mask"]
-        had_non_events = bool((~event_mask).any().item())
+        had_non_events = int(prepared["n_non_events_scalar"].item()) > 0
         decay = self.baseline_ema_decay
         # Advance accumulator decay to this step.
         self._step_decay_accumulators(current_step=step)
@@ -385,6 +441,11 @@ class CriticalityDistillation(nn.Module):
     ) -> None:
         """Full per-step evidence ingestion.
 
+        Thin wrapper: runs `ingest_gpu` (GPU-side aggregation) then
+        `ingest_cpu_from_prepared` (CPU-side accumulator + ring-bank
+        update). Keeping a single math path guarantees parity between
+        the single-call and two-phase ingest routes.
+
         Args:
             step: current training step index.
             pressure: `[B, T]` pressure field (any real-valued tensor).
@@ -393,46 +454,13 @@ class CriticalityDistillation(nn.Module):
             horizon_H: trailing window for post-event energy.
             event_frac: fraction of positions to mark as events.
         """
-        if len(states_per_layer) != self.num_layers:
-            raise ValueError(
-                f"states_per_layer must have {self.num_layers} entries; got {len(states_per_layer)}"
-            )
-        event_mask = compute_event_mask(pressure, event_frac=event_frac)  # [B, T]
-        n_events = int(event_mask.sum().item())
-
-        # Validate layer shapes once up front.
-        for layer, states in enumerate(states_per_layer):
-            if states.shape[-1] != self.dim:
-                raise ValueError(
-                    f"layer {layer}: states last dim {states.shape[-1]} != self.dim {self.dim}"
-                )
-
-        # Baseline updates always run (a no-event step is the cleanest
-        # non-event observation; warm-up depends on this).
-        layer_future_energies: list[torch.Tensor] = []
-        for layer, states in enumerate(states_per_layer):
-            future_energy = compute_future_energy(states, horizon_H=horizon_H)  # [B, T, D]
-            self.update_baseline_ema(
-                layer=layer, future_energy=future_energy, event_mask=event_mask
-            )
-            layer_future_energies.append(future_energy)
-
-        if n_events == 0:
-            return
-
-        # Bank writes only on event-bearing steps.
-        flat_mask = event_mask.reshape(-1)
-        for layer, future_energy in enumerate(layer_future_energies):
-            baseline = self.baseline_future_energy[layer]  # [D]
-            excess = (future_energy - baseline).clamp_min(0.0)  # [B, T, D]
-            flat_excess = excess.reshape(-1, self.dim)
-            aggregate = flat_excess[flat_mask].mean(dim=0)
-            self.add_step_evidence(
-                layer=layer,
-                step=step,
-                evidence=aggregate,
-                event_count=float(flat_mask.sum().item()),
-            )
+        prepared = self.ingest_gpu(
+            pressure=pressure,
+            states_per_layer=states_per_layer,
+            horizon_H=horizon_H,
+            event_frac=event_frac,
+        )
+        self.ingest_cpu_from_prepared(step=step, prepared=prepared)
 
     @torch.no_grad()
     def allocate_seats(self, *, current_step: int) -> None:
@@ -560,6 +588,8 @@ def compute_event_mask(pressure: torch.Tensor, event_frac: float) -> torch.Tenso
 def compute_future_energy(states: torch.Tensor, horizon_H: int) -> torch.Tensor:
     """Per-position mean-square energy over the trailing window `[t+1, t+H]`.
 
+    Vectorized — no Python loop over T.
+
     Args:
         states: `[B, T, D]` recurrence states.
         horizon_H: window length (strictly positive).
@@ -571,11 +601,20 @@ def compute_future_energy(states: torch.Tensor, horizon_H: int) -> torch.Tensor:
         raise ValueError(f"horizon_H must be >= 1; got {horizon_H}")
     B, T, D = states.shape
     sq = states.pow(2)  # [B, T, D]
-    out = torch.zeros_like(sq)
-    for t in range(T):
-        start = t + 1
-        stop = min(t + 1 + horizon_H, T)
-        if start >= stop:
-            continue  # empty window -> zeros
-        out[:, t, :] = sq[:, start:stop, :].mean(dim=1)
-    return out
+    zero_pad = torch.zeros(B, 1, D, dtype=sq.dtype, device=sq.device)
+    csum = torch.cat([zero_pad, sq.cumsum(dim=1)], dim=1)  # [B, T+1, D]
+    t = torch.arange(T, device=sq.device)
+    t_start = t + 1
+    t_end_excl = torch.clamp(t + 1 + horizon_H, max=T)
+    valid = t_start < t_end_excl
+    safe_start = torch.where(valid, t_start, torch.zeros_like(t_start))
+    safe_end = torch.where(valid, t_end_excl, torch.zeros_like(t_end_excl))
+    sum_energy = csum[:, safe_end, :] - csum[:, safe_start, :]
+    count = torch.where(
+        valid,
+        (t_end_excl - t_start).to(torch.float32),
+        torch.zeros_like(t_start, dtype=torch.float32),
+    )
+    safe_count = count.clamp_min(1.0).view(1, T, 1)
+    out = sum_energy / safe_count.to(sum_energy.dtype)
+    return torch.where(valid.view(1, T, 1), out, torch.zeros_like(out))

@@ -84,3 +84,25 @@ def test_future_energy_matches_hand_computation_small_case():
     assert torch.allclose(out[0, 1], torch.tensor([12.5, 6.5]))
     assert torch.allclose(out[0, 2], torch.tensor([16.0, 9.0]))
     assert torch.allclose(out[0, 3], torch.tensor([0.0, 0.0]))
+
+
+def test_future_energy_vectorized_matches_reference_on_large_tensor():
+    """Vectorized form must match the slow reference on a shape that
+    actually matters."""
+    torch.manual_seed(0)
+    B, T, D, H = 4, 64, 32, 8
+    states = torch.randn(B, T, D)
+    # Reference (Python loop — the old slow one, re-written locally).
+    def _ref(states, H):
+        sq = states.pow(2)
+        out = torch.zeros_like(sq)
+        for t in range(T):
+            s, e = t + 1, min(t + 1 + H, T)
+            if s < e:
+                out[:, t, :] = sq[:, s:e, :].mean(dim=1)
+        return out
+    expected = _ref(states, H)
+    actual = compute_future_energy(states, horizon_H=H)
+    assert torch.allclose(actual, expected, atol=1e-5, rtol=1e-5), (
+        f"max abs diff {(actual - expected).abs().max().item()}"
+    )

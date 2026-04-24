@@ -207,15 +207,19 @@ def test_ingest_step_writes_one_entry_per_layer_with_events():
         horizon_H=2,
         event_frac=0.34,  # round(0.34 * 3) = 1 position
     )
-    # Layer 0: future at t=0 over [t+1:t+3] = rows 1 and 2 -> mean([[0,1,0],[0,0,1]]**2, dim=0) = [0, 0.5, 0.5]
-    # Baseline from non-event positions t=1..2: future at t=1 over [t+1:t+3] = [row 2] -> [0, 0, 1]
-    #                                            future at t=2 over [t+1:t+3] = [] -> [0, 0, 0]
-    # non-event future mean = ([0,0,1] + [0,0,0]) / 2 = [0, 0, 0.5]
-    # With decay=0 baseline = observation -> [0, 0, 0.5]
-    # excess = relu([0, 0.5, 0.5] - [0, 0, 0.5]) = [0, 0.5, 0]
-    # Aggregated over 1 event position = [0, 0.5, 0]
+    # Under the two-phase ingest (ingest_gpu -> ingest_cpu_from_prepared),
+    # baseline lags by one step: the excess at step 0 is computed against the
+    # zero-initialized baseline, THEN the non-event mean is written into
+    # baseline_future_energy for later steps to use. This is the intended
+    # canonical semantics — the production path runs ingest_gpu on GPU (where
+    # the baseline is already stale from prior steps' CPU writes) and
+    # ingest_cpu_from_prepared on CPU (where it updates baseline afterward).
+    # Layer 0: future at t=0 over [t+1:t+3] = rows 1 and 2 ->
+    #   mean([[0,1,0],[0,0,1]]**2, dim=0) = [0, 0.5, 0.5]
+    # excess = relu([0, 0.5, 0.5] - baseline[0, 0, 0]) = [0, 0.5, 0.5]
+    # Aggregated over 1 event position = [0, 0.5, 0.5]
     l0_slot = (cd.bank_step[0] == 0).nonzero(as_tuple=True)[0].item()
-    assert torch.allclose(cd.bank_evidence[0, l0_slot], torch.tensor([0.0, 0.5, 0.0]), atol=1e-6)
+    assert torch.allclose(cd.bank_evidence[0, l0_slot], torch.tensor([0.0, 0.5, 0.5]), atol=1e-6)
     assert cd.bank_event_count[0, l0_slot].item() == pytest.approx(1.0)
 
 
@@ -748,10 +752,14 @@ def test_allocate_seats_from_accumulators_picks_topk_by_accumulator_score():
 def test_ingest_cpu_from_prepared_advances_accumulators():
     cd = CriticalityDistillation(num_layers=1, dim=3, trace_ttl_steps=8, trace_half_life_steps=4.0)
     prepared = {
+        # event_mask retained as harmless extra key — documents intent;
+        # ingest_cpu_from_prepared now reads n_non_events_scalar instead.
         "event_mask": torch.tensor([[True, False, True]]),
         "aggregated_excess_per_layer": torch.tensor([[1.0, 2.0, 3.0]]),
         "non_event_mean_future_energy_per_layer": torch.tensor([[0.5, 0.5, 0.5]]),
         "event_count_per_layer": torch.tensor([2.0]),
+        "n_events_scalar": torch.tensor(2, dtype=torch.int64),
+        "n_non_events_scalar": torch.tensor(1, dtype=torch.int64),
     }
     cd.ingest_cpu_from_prepared(step=0, prepared=prepared)
     # Accumulators updated: score_num = evidence * count = [2, 4, 6];
@@ -762,6 +770,56 @@ def test_ingest_cpu_from_prepared_advances_accumulators():
     # Ring bank also written for TTL/checkpoint state.
     slot = (cd.bank_step[0] == 0).nonzero(as_tuple=True)[0].item()
     assert torch.allclose(cd.bank_evidence[0, slot], torch.tensor([1.0, 2.0, 3.0]))
+
+
+def test_ingest_gpu_returns_only_small_aggregates():
+    """ingest_gpu must NOT return [B, T] event_mask in the cross-PCIe
+    payload. Only layer-reduced tensors + scalar counts."""
+    cd = CriticalityDistillation(num_layers=2, dim=3, trace_ttl_steps=4)
+    states = [torch.randn(1, 6, 3), torch.randn(1, 6, 3)]
+    pressure = torch.randn(1, 6)
+    prepared = cd.ingest_gpu(
+        pressure=pressure, states_per_layer=states, horizon_H=2, event_frac=0.5,
+    )
+    assert set(prepared.keys()) == {
+        "aggregated_excess_per_layer",
+        "non_event_mean_future_energy_per_layer",
+        "event_count_per_layer",
+        "n_events_scalar",
+        "n_non_events_scalar",
+    }
+    assert prepared["aggregated_excess_per_layer"].shape == (2, 3)
+    assert prepared["non_event_mean_future_energy_per_layer"].shape == (2, 3)
+    assert prepared["event_count_per_layer"].shape == (2,)
+    assert prepared["n_events_scalar"].numel() == 1
+    assert prepared["n_non_events_scalar"].numel() == 1
+
+
+def test_ingest_gpu_parity_with_ingest_step():
+    """Two-phase (ingest_gpu -> ingest_cpu_from_prepared) must match
+    single-call ingest_step on accumulator state."""
+    cd_single = CriticalityDistillation(
+        num_layers=1, dim=3, trace_ttl_steps=8, baseline_ema_decay=0.0,
+    )
+    cd_split = CriticalityDistillation(
+        num_layers=1, dim=3, trace_ttl_steps=8, baseline_ema_decay=0.0,
+    )
+    torch.manual_seed(11)
+    states = [torch.randn(2, 8, 3)]
+    pressure = torch.randn(2, 8).abs()  # non-negative so events fire
+    cd_single.ingest_step(
+        step=0, pressure=pressure, states_per_layer=states,
+        horizon_H=3, event_frac=0.25,
+    )
+    prepared = cd_split.ingest_gpu(
+        pressure=pressure, states_per_layer=states,
+        horizon_H=3, event_frac=0.25,
+    )
+    cd_split.ingest_cpu_from_prepared(step=0, prepared=prepared)
+    assert torch.allclose(cd_single.score_num, cd_split.score_num, atol=1e-5)
+    assert torch.allclose(cd_single.score_den, cd_split.score_den, atol=1e-5)
+    assert torch.allclose(cd_single.event_mass, cd_split.event_mass, atol=1e-5)
+    assert torch.allclose(cd_single.baseline_future_energy, cd_split.baseline_future_energy, atol=1e-5)
 
 
 def test_allocate_seats_from_accumulators_respects_event_mass_gate():
