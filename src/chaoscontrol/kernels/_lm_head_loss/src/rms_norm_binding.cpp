@@ -325,6 +325,62 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> linear_ce_streaming_c
     return {loss, lse, loss_rows, logits_cache};
 }
 
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
+linear_ce_streaming_cached_forward_with_entropy(
+    const at::Tensor& x,
+    const at::Tensor& weight,
+    const at::Tensor& targets,
+    int64_t reduction,
+    int64_t tile_size) {
+    check_linear_ce_inputs(
+        x, weight, targets, reduction, tile_size,
+        "lm_head_loss linear_ce_streaming_cached_forward_with_entropy");
+
+    const auto rows = x.size(0);
+    const auto vocab = weight.size(0);
+    TORCH_CHECK(
+        vocab % tile_size == 0,
+        "lm_head_loss linear_ce_streaming_cached_forward_with_entropy: vocab "
+        "must be an exact multiple of tile_size for the cached logits layout");
+    const auto tiles = vocab / tile_size;
+    auto stats_options = x.options().dtype(at::kFloat);
+    auto row_max = at::full(
+        {rows},
+        -std::numeric_limits<float>::infinity(),
+        stats_options);
+    auto row_sum = at::zeros({rows}, stats_options);
+    auto row_exp_logit_sum = at::zeros({rows}, stats_options);
+    auto target_logits = at::full(
+        {rows},
+        -std::numeric_limits<float>::infinity(),
+        stats_options);
+    auto logits_cache = at::empty({tiles, rows, tile_size}, x.options());
+
+    for (int64_t tile_idx = 0; tile_idx < tiles; ++tile_idx) {
+        const int64_t start = tile_idx * tile_size;
+        auto weight_tile = weight.narrow(0, start, tile_size);
+        auto logits = logits_cache.select(0, tile_idx);
+        at::mm_out(logits, x, weight_tile.transpose(0, 1));
+        launch_linear_ce_update_online_with_exp_logit_sum(
+            logits,
+            targets,
+            row_max,
+            row_sum,
+            row_exp_logit_sum,
+            target_logits,
+            start);
+    }
+
+    auto lse = row_max + row_sum.log();
+    auto loss_rows = lse - target_logits;
+    auto loss = reduction == static_cast<int64_t>(Reduction::Mean)
+        ? loss_rows.mean()
+        : loss_rows.sum();
+    // entropy = lse - row_exp_logit_sum / row_sum  (fp32, shape [rows])
+    auto per_token_entropy = lse - row_exp_logit_sum / row_sum;
+    return {loss, lse, loss_rows, logits_cache, per_token_entropy};
+}
+
 std::tuple<at::Tensor, at::Tensor> linear_ce_backward(
     const at::Tensor& grad_loss,
     const at::Tensor& x,
@@ -706,6 +762,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "Workspace-backed tiled linear+cross-entropy backward for Exp23");
     m.def("linear_ce_streaming_cached_forward", &cc_lm_head_loss::linear_ce_streaming_cached_forward,
           "Cached-logits one-pass tiled linear+cross-entropy forward for Exp23");
+    m.def("linear_ce_streaming_cached_forward_with_entropy",
+          &cc_lm_head_loss::linear_ce_streaming_cached_forward_with_entropy,
+          "Cached-logits one-pass tiled linear+CE forward that also emits "
+          "per-token softmax entropy via an online-softmax accumulator");
     m.def("linear_ce_streaming_cached_backward", &cc_lm_head_loss::linear_ce_streaming_cached_backward,
           "Cached-logits tiled linear+cross-entropy backward for Exp23");
     m.def("linear_ce_weighted_backward", &cc_lm_head_loss::linear_ce_weighted_backward,
