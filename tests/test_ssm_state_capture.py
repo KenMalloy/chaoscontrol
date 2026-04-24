@@ -46,3 +46,25 @@ def test_capture_states_clears_when_block_raises():
     # finally must have run
     assert core._captured_states is None
     assert core._capture_states_enabled is False
+
+
+def test_capture_via_top_level_forward_diag_fast_path():
+    """Production model.encode() path routes through forward()'s inlined
+    diag fast-path, not _forward_diag_scan. Must capture there too."""
+    core = _make_core(dim=8)
+    x = torch.randn(2, 5, 8)
+    with core.capture_states() as get_states:
+        _ = core(x)  # forward, not _forward_diag_scan
+        captured = get_states()
+    assert captured is not None, "forward() diag fast-path must capture too"
+    assert captured.shape == (2, 5, 8)
+
+
+def test_capture_is_disabled_by_default_no_overhead_path():
+    """Capture is off by default; no attribute should be populated without
+    the context manager."""
+    core = _make_core(dim=8)
+    x = torch.randn(2, 5, 8)
+    _ = core(x)
+    assert core._captured_states is None
+    assert core._capture_states_enabled is False

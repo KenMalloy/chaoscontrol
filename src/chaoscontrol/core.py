@@ -601,6 +601,8 @@ class ChaosSSMCore(nn.Module):
             if rich_b is None and initial_state is None:
                 decay, update, gate = self._diag_terms(x)
                 states = _diag_recurrence(decay, update)
+                if self._capture_states_enabled:
+                    self._captured_states = states.detach()
                 out = gate * states
                 y = self.out_proj(out)
                 stats = (
