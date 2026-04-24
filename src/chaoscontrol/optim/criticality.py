@@ -147,3 +147,28 @@ class CriticalityDistillation(nn.Module):
             torch.zeros_like(score),
         )
         return score
+
+
+def compute_event_mask(pressure: torch.Tensor, event_frac: float) -> torch.Tensor:
+    """Top-`event_frac` positions of pressure become True.
+
+    Args:
+        pressure: any shape; absolute magnitude determines rank.
+        event_frac: fraction in [0, 1].
+
+    Returns:
+        Boolean tensor, same shape as `pressure`.
+    """
+    if not 0.0 <= event_frac <= 1.0:
+        raise ValueError(f"event_frac must be in [0, 1]; got {event_frac}")
+    total = pressure.numel()
+    k = int(round(event_frac * total))
+    if k == 0:
+        return torch.zeros_like(pressure, dtype=torch.bool)
+    if k >= total:
+        return torch.ones_like(pressure, dtype=torch.bool)
+    flat = pressure.reshape(-1)
+    _, idx = torch.topk(flat, k=k, largest=True)
+    mask = torch.zeros(total, dtype=torch.bool, device=pressure.device)
+    mask[idx] = True
+    return mask.reshape(pressure.shape)
