@@ -2644,3 +2644,176 @@ def test_criticality_distill_disabled_does_not_require_lm_head_emit_entropy():
     )
     # Whatever the result looks like — we only need that no exception fired.
     assert result is not None
+
+
+# ---------------------------------------------------------------------------
+# Criticality Distillation integration harness
+# ---------------------------------------------------------------------------
+
+
+from contextlib import contextmanager  # noqa: E402
+
+
+class _FakeSSMCore(nn.Module):
+    """Minimal stand-in for ChaosSSMCore.
+
+    Exposes the two contract surfaces the runner walks for CD:
+      * ``capture_states()`` — context manager yielding a getter for the
+        last captured ``[B, T, D]`` tensor.
+      * ``log_a`` parameter — the channel-wise decay log-odds CD pushes
+        toward the critical value via the seat-masked MSE loss.
+    """
+
+    def __init__(self, dim: int):
+        super().__init__()
+        self.dim = dim
+        # Mirror the real core: log_a is a Parameter on the SSM core.
+        self.log_a = nn.Parameter(torch.zeros(dim, dtype=torch.float32))
+        self._captured_states: torch.Tensor | None = None
+
+    @contextmanager
+    def capture_states(self):
+        self._captured_states = None
+        try:
+            yield lambda: self._captured_states
+        finally:
+            # Keep the captured tensor live so the runner can read it
+            # AFTER the stack exits in a test-friendly manner. The real
+            # core clears here; the runner contract is to read INSIDE the
+            # context, which this fake also supports.
+            pass
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        self._captured_states = x.detach()
+        return x
+
+
+class _TinyCDTrainModel(nn.Module):
+    """Tiny model with fake SSM cores the runner can discover via
+    ``capture_states`` and hook for CD wiring."""
+
+    def __init__(self, *, dim: int = 4, vocab_size: int = 6, num_layers: int = 2):
+        super().__init__()
+        self.embed = nn.Embedding(vocab_size, dim)
+        self.cores = nn.ModuleList([_FakeSSMCore(dim) for _ in range(num_layers)])
+        self.final_norm = nn.Identity()
+        self.lm_head = nn.Linear(dim, vocab_size, bias=False)
+
+    def encode(self, inputs: torch.Tensor) -> torch.Tensor:
+        x = self.embed(inputs)
+        for core in self.cores:
+            x = core(x)
+        return x
+
+
+def test_train_fast_for_budget_wires_criticality_distillation_4_steps():
+    """4-step integration: CD enabled, ingest fires every step, accumulator
+    advances, seat refresh fires at the configured cadence, criticality_loss
+    contributes gradient to log_a when seats exist."""
+    mod = _load_runner_module()
+    model = _TinyCDTrainModel(dim=4, vocab_size=6, num_layers=2)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+    result = mod.train_fast_for_budget(
+        model,
+        train_tokens=torch.arange(256, dtype=torch.int16) % 6,
+        train_num_tokens=256,
+        stride=4,
+        seq_len=6,
+        batch_size=2,
+        device=torch.device("cpu"),
+        optimizer=optimizer,
+        budget_seconds=300.0,
+        chunk_size=2,
+        grad_clip_norm=0.0,
+        fused_grad_clip=False,
+        rank=0,
+        world_size=1,
+        seed=123,
+        precision="fp32",
+        stop_check_interval=1,
+        stop_margin_seconds=0.0,
+        vocab_size=6,
+        max_steps=4,
+        prefetch_batches=False,
+        lm_head_backward_mode="fused_streaming_cached",
+        lm_head_emit_entropy=True,
+        criticality_distill_enabled=True,
+        criticality_distill_num_layers=2,
+        criticality_distill_dim=4,
+        criticality_distill_budget_frac=0.25,
+        criticality_distill_trace_ttl_steps=8,
+        criticality_distill_trace_half_life_steps=4.0,
+        criticality_distill_seat_refresh_interval=2,
+        criticality_distill_min_weighted_events_per_layer=0.1,
+        criticality_distill_horizon_H=2,
+        criticality_distill_event_frac=0.5,
+        criticality_distill_weight=1.0,
+        # Uniform-pressure forces every step to have events — we're
+        # testing orchestration, not pressure math (pressure is validated
+        # in test_runner_criticality_pressure.py).
+        criticality_distill_uniform_pressure=True,
+    )
+    cd = result["criticality_distillation_module"]
+    # Accumulator advanced per step; after steps 0..3 last_decay_step=3.
+    assert int(cd.last_decay_step.item()) == 3, (
+        f"expected last_decay_step=3, got {int(cd.last_decay_step.item())}"
+    )
+    debug = result["criticality_distill_debug"]
+    assert debug["ingest_calls"] == 4, debug
+    assert debug["seat_refresh_calls"] >= 1, debug
+    assert cd.seat_mask.any().item(), "seats never allocated"
+    # CD loss actually pushes gradient into log_a once seats exist.
+    grad = model.cores[0].log_a.grad
+    assert grad is not None, "cores[0].log_a has no grad"
+    assert grad.abs().sum().item() > 0.0, "cores[0].log_a.grad is all zero"
+    # is_pinned assertion is CUDA-gated; on CPU we can't pin, so skip.
+    if torch.cuda.is_available():
+        buffers = result.get("_criticality_distill_pinned_buffers")
+        if buffers is not None:
+            any_tensor = buffers["A"]["aggregated_excess_per_layer"]
+            assert any_tensor.is_pinned()
+
+
+def test_train_fast_for_budget_rejects_cd_with_missing_num_layers():
+    mod = _load_runner_module()
+    model = _TinyCDTrainModel(dim=4, vocab_size=6, num_layers=2)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+    with pytest.raises(ValueError, match="num_layers"):
+        mod.train_fast_for_budget(
+            model,
+            train_tokens=torch.arange(32, dtype=torch.int16) % 6,
+            train_num_tokens=32, stride=4, seq_len=3, batch_size=2,
+            device=torch.device("cpu"), optimizer=optimizer,
+            budget_seconds=1.0, chunk_size=2, grad_clip_norm=0.0,
+            fused_grad_clip=False,
+            rank=0, world_size=1, seed=123, precision="fp32",
+            stop_check_interval=1, stop_margin_seconds=0.0,
+            vocab_size=6, max_steps=1, prefetch_batches=False,
+            criticality_distill_enabled=True,
+            lm_head_emit_entropy=True,
+            criticality_distill_dim=4,
+            # num_layers omitted → should raise.
+        )
+
+
+def test_train_fast_for_budget_rejects_cd_with_mismatched_core_count():
+    mod = _load_runner_module()
+    # Model has 2 cores but CD is configured for 3 layers.
+    model = _TinyCDTrainModel(dim=4, vocab_size=6, num_layers=2)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+    with pytest.raises(ValueError, match="ssm_cores|capture_states|num_layers"):
+        mod.train_fast_for_budget(
+            model,
+            train_tokens=torch.arange(32, dtype=torch.int16) % 6,
+            train_num_tokens=32, stride=4, seq_len=3, batch_size=2,
+            device=torch.device("cpu"), optimizer=optimizer,
+            budget_seconds=1.0, chunk_size=2, grad_clip_norm=0.0,
+            fused_grad_clip=False,
+            rank=0, world_size=1, seed=123, precision="fp32",
+            stop_check_interval=1, stop_margin_seconds=0.0,
+            vocab_size=6, max_steps=1, prefetch_batches=False,
+            criticality_distill_enabled=True,
+            lm_head_emit_entropy=True,
+            criticality_distill_num_layers=3,
+            criticality_distill_dim=4,
+        )

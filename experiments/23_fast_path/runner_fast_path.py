@@ -9,6 +9,7 @@ fused Muon/grad-clip knobs, amortized stop checks, and compact timing JSON.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import math
 import os
@@ -26,6 +27,7 @@ import yaml
 
 REPO = Path(__file__).resolve().parents[2]
 EXPERIMENT = Path(__file__).resolve().parent
+sys.path.insert(0, str(REPO))
 sys.path.insert(0, str(REPO / "src"))
 sys.path.insert(0, str(REPO / "experiments" / "17_local_attn_sidecar"))
 sys.path.insert(0, str(REPO / "experiments" / "21_sgns_tokenizer"))
@@ -71,6 +73,7 @@ from chaoscontrol.optim.scopt import (  # noqa: E402
     ScarcityAwareOptimizer,
     scarcity_pressure_from_ce,
 )
+from chaoscontrol.optim.criticality import CriticalityDistillation  # noqa: E402
 from chaoscontrol.optim.semantic import SemanticOptimizer  # noqa: E402
 from chaoscontrol.precision import autocast_context  # noqa: E402
 from chaoscontrol.train_ssm import (  # noqa: E402
@@ -112,6 +115,10 @@ from dreamworld import (  # noqa: E402
     DreamReplayBuffer,
     capture_dream_entry,
     dreamworld_replay_backward,
+)
+from experiments._23_fast_path_runner_helpers import (  # noqa: E402
+    _alloc_pinned_evidence_buffers,
+    compute_ce_minus_entropy_pressure_from_fused,
 )
 from runner_exp17 import (  # noqa: E402
     build_sentencepiece_luts,
@@ -1580,6 +1587,19 @@ def train_fast_for_budget(
     scopt_pressure_upper_c: float | None = None,
     scopt_pressure_upper_floor: float = 1.0,
     criticality_distill_enabled: bool = False,
+    criticality_distill_num_layers: int | None = None,
+    criticality_distill_dim: int | None = None,
+    criticality_distill_budget_frac: float = 0.15,
+    criticality_distill_trace_ttl_steps: int = 1024,
+    criticality_distill_trace_half_life_steps: float = 256.0,
+    criticality_distill_seat_refresh_interval: int = 64,
+    criticality_distill_min_weighted_events_per_layer: float = 256.0,
+    criticality_distill_horizon_H: int = 16,
+    criticality_distill_event_frac: float = 0.05,
+    criticality_distill_weight: float = 1e-3,
+    criticality_distill_uniform_pressure: bool = False,
+    criticality_distill_score_permute_before_topk: bool = False,
+    criticality_distill_fixed_random_seats: bool = False,
 ) -> dict[str, Any]:
     rank_ = int(rank)
     world_size_ = int(world_size)
@@ -1615,6 +1635,56 @@ def train_fast_for_budget(
             "CD uses per-token entropy from the fused forward to build surprise pressure; "
             "pass lm_head_emit_entropy=True (the entrypoint select flag is orthogonal to "
             "lm_head_backward_mode, which stays at its default)."
+        )
+    cd: CriticalityDistillation | None = None
+    cd_ssm_cores: list[torch.nn.Module] = []
+    cd_pinned_buffers: dict[str, dict[str, torch.Tensor]] | None = None
+    if criticality_distill_enabled:
+        if criticality_distill_num_layers is None:
+            raise ValueError(
+                "criticality_distill_enabled=True requires "
+                "criticality_distill_num_layers (the CD module needs to know "
+                "how many SSM layers to score)."
+            )
+        if criticality_distill_dim is None:
+            raise ValueError(
+                "criticality_distill_enabled=True requires "
+                "criticality_distill_dim (per-layer recurrence-state dim)."
+            )
+        cd_ssm_cores = [
+            m for m in model.modules() if hasattr(m, "capture_states")
+        ]
+        if len(cd_ssm_cores) != int(criticality_distill_num_layers):
+            raise ValueError(
+                "criticality_distill_num_layers mismatch: configured "
+                f"{int(criticality_distill_num_layers)} but model exposes "
+                f"{len(cd_ssm_cores)} modules with capture_states(). "
+                "Every ssm_cores layer must have a capture_states context manager."
+            )
+        cd = CriticalityDistillation(
+            num_layers=int(criticality_distill_num_layers),
+            dim=int(criticality_distill_dim),
+            trace_ttl_steps=int(criticality_distill_trace_ttl_steps),
+            trace_half_life_steps=float(criticality_distill_trace_half_life_steps),
+            seat_refresh_interval=int(criticality_distill_seat_refresh_interval),
+            criticality_budget_frac=float(criticality_distill_budget_frac),
+            min_weighted_events_per_layer=float(
+                criticality_distill_min_weighted_events_per_layer
+            ),
+            criticality_distill_weight=float(criticality_distill_weight),
+            score_permute_before_topk=bool(
+                criticality_distill_score_permute_before_topk
+            ),
+            fixed_random_seats=bool(criticality_distill_fixed_random_seats),
+        )
+        cd.to(device=device)
+        # Simple call counters — the test asserts against these.
+        cd._ingest_call_count = 0
+        cd._seat_refresh_call_count = 0
+        cd_pinned_buffers = _alloc_pinned_evidence_buffers(
+            num_layers=int(criticality_distill_num_layers),
+            dim=int(criticality_distill_dim),
+            use_pinned=bool(torch.cuda.is_available()),
         )
     if scopt_active and (
         spectral_reg_lambda_dead > 0.0
@@ -1971,6 +2041,18 @@ def train_fast_for_budget(
                 predictive_aux_optimizer.zero_grad(set_to_none=True)
             if async_grad_reducer is not None:
                 async_grad_reducer.reset()
+            # Stage captured SSM states for CD. Must enter the
+            # capture_states() contexts BEFORE the encode call in
+            # _run_train_step so the cores write into _captured_states.
+            # We keep the stack open across the train-step call and
+            # read getters BEFORE exiting — the real ChaosSSMCore clears
+            # _captured_states in its context finally block.
+            cd_state_getters: list = []
+            cd_stack = contextlib.ExitStack()
+            if cd is not None:
+                for core in cd_ssm_cores:
+                    getter = cd_stack.enter_context(core.capture_states())
+                    cd_state_getters.append(getter)
             scopt_pending: _ScOptPending | None = None
             if scopt_active:
                 assert scopt_token_frequencies is not None
@@ -2042,6 +2124,132 @@ def train_fast_for_budget(
                     dreamworld_replay_batch_size=dreamworld_replay_batch_size,
                     dreamworld_generator=rng,
                 )
+            # ------------------------------------------------------------
+            # Criticality Distillation: ingest + seat refresh + loss add.
+            # The capture_states() stack is still open, so reading the
+            # getters is safe. After ingest we close the stack so the
+            # real ChaosSSMCore can clear its _captured_states per contract.
+            # ------------------------------------------------------------
+            if cd is not None:
+                cd_states_per_layer = [g() for g in cd_state_getters]
+                if any(s is None for s in cd_states_per_layer):
+                    cd_stack.close()
+                    raise RuntimeError(
+                        "Criticality Distillation: one or more SSM cores did "
+                        "not populate _captured_states during forward. Check "
+                        "that each core.a_mode='diag' and that the forward "
+                        "pass actually ran under capture_states()."
+                    )
+                target_device = cd_states_per_layer[0].device
+                # Compute per-token CE + per-token entropy for pressure.
+                # On CUDA we use the fused entropy-emitting kernel; on
+                # CPU (or when the kernel fails to import) fall back to a
+                # plain softmax. Kernel numerics are Stage D.4, not this task.
+                per_token_ce_bt: torch.Tensor | None = None
+                per_token_entropy_bt: torch.Tensor | None = None
+                use_fused_entropy = (
+                    target_device.type == "cuda" and torch.cuda.is_available()
+                )
+                if use_fused_entropy:
+                    try:
+                        from chaoscontrol.kernels._lm_head_loss import (
+                            fused_lm_head_forward_with_ce_entropy,
+                        )
+                    except Exception:
+                        use_fused_entropy = False
+                with torch.no_grad():
+                    hidden_cd = model.encode(inputs)
+                    normed_cd = model.final_norm(hidden_cd)
+                    B_cd, T_cd = inputs.shape[0], inputs.shape[1]
+                    if use_fused_entropy:
+                        (
+                            _loss_ignore,
+                            _lse_ignore,
+                            per_token_ce_flat,
+                            per_token_entropy_flat,
+                        ) = fused_lm_head_forward_with_ce_entropy(
+                            normed_cd,
+                            model.lm_head.weight,
+                            targets,
+                            tile_size=int(lm_head_tile_size),
+                        )
+                        per_token_ce_bt = per_token_ce_flat.reshape(B_cd, T_cd)
+                        per_token_entropy_bt = per_token_entropy_flat.reshape(B_cd, T_cd)
+                    else:
+                        logits_cd = normed_cd @ model.lm_head.weight.t()
+                        V_cd = logits_cd.shape[-1]
+                        per_token_ce_flat = F.cross_entropy(
+                            logits_cd.reshape(-1, V_cd),
+                            targets.reshape(-1),
+                            reduction="none",
+                        )
+                        probs_cd = F.softmax(logits_cd, dim=-1)
+                        per_token_entropy_flat = -(
+                            probs_cd * probs_cd.clamp_min(1e-12).log()
+                        ).sum(dim=-1)
+                        per_token_ce_bt = per_token_ce_flat.reshape(B_cd, T_cd)
+                        per_token_entropy_bt = per_token_entropy_flat.reshape(
+                            B_cd, T_cd
+                        )
+                    if criticality_distill_uniform_pressure:
+                        cd_pressure = torch.ones(
+                            B_cd, T_cd, device=target_device, dtype=torch.float32
+                        )
+                    else:
+                        cd_pressure = compute_ce_minus_entropy_pressure_from_fused(
+                            per_token_ce_bt, per_token_entropy_bt
+                        )
+                    cd_prepared_gpu = cd.ingest_gpu(
+                        pressure=cd_pressure,
+                        states_per_layer=cd_states_per_layer,
+                        horizon_H=int(criticality_distill_horizon_H),
+                        event_frac=float(criticality_distill_event_frac),
+                    )
+                # Close the capture_states stack now that we've read everything.
+                cd_stack.close()
+                # Async D2H copy into the pinned ping-pong slot.
+                host_slot = cd_pinned_buffers[
+                    "A" if steps % 2 == 0 else "B"
+                ]
+                for key, host_t in host_slot.items():
+                    src = cd_prepared_gpu[key]
+                    if src.device == host_t.device:
+                        host_t.copy_(src)
+                    else:
+                        host_t.copy_(src, non_blocking=True)
+                if target_device.type == "cuda" and torch.cuda.is_available():
+                    copy_done = torch.cuda.Event()
+                    copy_done.record()
+                    copy_done.synchronize()
+                cd.ingest_cpu_from_prepared(step=steps, prepared=host_slot)
+                cd._ingest_call_count += 1
+                # Seat refresh cadence: fire at step > 0 on the interval
+                # boundary. step=0 gets nothing (no accumulator state yet).
+                if (
+                    steps > 0
+                    and int(cd.seat_refresh_interval) > 0
+                    and steps % int(cd.seat_refresh_interval) == 0
+                ):
+                    cd.allocate_seats_from_accumulators(current_step=steps)
+                    cd._seat_refresh_call_count += 1
+                # Compose criticality_loss as a SEPARATE backward pass.
+                # log_a grads are disjoint from LM-head grads, so this
+                # does not conflict with the fused CE backward already done.
+                # criticality_loss() already multiplies by
+                # criticality_distill_weight internally — don't double-multiply.
+                if cd.seat_mask.any():
+                    log_a_per_layer: list[torch.Tensor] = []
+                    for core in cd_ssm_cores:
+                        la = getattr(core, "log_a", None)
+                        if la is not None:
+                            log_a_per_layer.append(la)
+                    if len(log_a_per_layer) == cd.num_layers:
+                        cd_loss = cd.criticality_loss(log_a_per_layer)
+                        if cd_loss.requires_grad:
+                            cd_loss.backward()
+            else:
+                # Nothing to close when CD is disabled; the stack is empty.
+                cd_stack.close()
             if event_sleep_gate is not None:
                 decision = event_sleep_gate.update(
                     loss,
@@ -2216,6 +2424,13 @@ def train_fast_for_budget(
     if graph_summary is not None:
         graph_summary["warmup_steps"] = int(cuda_graph_warmup_steps)
         result["cuda_graph"] = graph_summary
+    if cd is not None:
+        result["criticality_distillation_module"] = cd
+        result["criticality_distill_debug"] = {
+            "ingest_calls": int(cd._ingest_call_count),
+            "seat_refresh_calls": int(cd._seat_refresh_call_count),
+        }
+        result["_criticality_distill_pinned_buffers"] = cd_pinned_buffers
     return result
 
 
