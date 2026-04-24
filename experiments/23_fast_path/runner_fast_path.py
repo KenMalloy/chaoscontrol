@@ -2683,6 +2683,11 @@ def train_fast_for_budget(
             if rare_bucket_ce_eval_num_tokens is not None
             else int(train_num_tokens)
         )
+        # Cap eval batch size: training bs (1024) materializes a
+        # [bs, seq, vocab] fp32 logits tensor during non-fused eval
+        # forward (F.cross_entropy path), which at seq=512/vocab=16384
+        # is 32 GiB and OOMs. 128 keeps it at 4 GiB.
+        eval_batch_size = min(int(batch_size), 128)
         val_block = _compute_per_bucket_val_ce(
             model=model,
             device=device,
@@ -2690,7 +2695,7 @@ def train_fast_for_budget(
             num_tokens=bucket_eval_num_tokens,
             seq_len=int(seq_len),
             stride=int(stride),
-            batch_size=int(batch_size),
+            batch_size=eval_batch_size,
             vocab_size=int(vocab_size),
             token_frequencies=rare_bucket_ce_token_frequencies,
             num_buckets=int(rare_bucket_ce_num_buckets),
