@@ -172,6 +172,56 @@ class CriticalityDistillation(nn.Module):
         decay = self.baseline_ema_decay
         self.baseline_future_energy[layer].mul_(decay).add_(obs.to(self.baseline_future_energy.dtype), alpha=(1.0 - decay))
 
+    @torch.no_grad()
+    def ingest_step(
+        self,
+        *,
+        step: int,
+        pressure: torch.Tensor,
+        states_per_layer: list,
+        horizon_H: int,
+        event_frac: float,
+    ) -> None:
+        """Full per-step evidence ingestion.
+
+        Args:
+            step: current training step index.
+            pressure: `[B, T]` pressure field (any real-valued tensor).
+            states_per_layer: list of length `num_layers`, each entry a
+                `[B, T, D]` captured states tensor.
+            horizon_H: trailing window for post-event energy.
+            event_frac: fraction of positions to mark as events.
+        """
+        if len(states_per_layer) != self.num_layers:
+            raise ValueError(
+                f"states_per_layer must have {self.num_layers} entries; got {len(states_per_layer)}"
+            )
+        event_mask = compute_event_mask(pressure, event_frac=event_frac)  # [B, T]
+        n_events = int(event_mask.sum().item())
+        if n_events == 0:
+            return
+        for layer, states in enumerate(states_per_layer):
+            if states.shape[-1] != self.dim:
+                raise ValueError(
+                    f"layer {layer}: states last dim {states.shape[-1]} != self.dim {self.dim}"
+                )
+            future_energy = compute_future_energy(states, horizon_H=horizon_H)  # [B, T, D]
+            self.update_baseline_ema(
+                layer=layer, future_energy=future_energy, event_mask=event_mask
+            )
+            baseline = self.baseline_future_energy[layer]  # [D]
+            excess = (future_energy - baseline).clamp_min(0.0)  # [B, T, D]
+            # Aggregate: mean over event positions.
+            flat_excess = excess.reshape(-1, self.dim)  # [B*T, D]
+            flat_mask = event_mask.reshape(-1)  # [B*T]
+            aggregate = flat_excess[flat_mask].mean(dim=0)  # [D]
+            self.add_step_evidence(
+                layer=layer,
+                step=step,
+                evidence=aggregate,
+                event_count=float(flat_mask.sum().item()),
+            )
+
 
 def compute_event_mask(pressure: torch.Tensor, event_frac: float) -> torch.Tensor:
     """Top-`event_frac` positions of pressure become True.

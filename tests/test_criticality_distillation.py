@@ -159,3 +159,47 @@ def test_update_baseline_ema_no_nonevent_positions_is_noop():
     event_mask = torch.ones(1, 4, dtype=torch.bool)  # every position is an event
     cd.update_baseline_ema(layer=0, future_energy=future_energy, event_mask=event_mask)
     assert torch.equal(cd.baseline_future_energy[0], torch.full((2,), 7.0))
+
+
+def test_ingest_step_writes_one_entry_per_layer_with_events():
+    cd = CriticalityDistillation(
+        num_layers=2, dim=3, trace_ttl_steps=4,
+        baseline_ema_decay=0.0,  # baseline = observation (no smoothing) for easier math
+    )
+    states_l0 = torch.tensor([[
+        [1.0, 0.0, 0.0],  # t=0 event
+        [0.0, 1.0, 0.0],  # t=1 non-event
+        [0.0, 0.0, 1.0],  # t=2 non-event (future window for event at t=0 covers t=1..end)
+    ]])
+    states_l1 = torch.tensor([[
+        [2.0, 2.0, 2.0],
+        [0.0, 0.0, 0.0],
+        [0.0, 0.0, 0.0],
+    ]])
+    pressure = torch.tensor([[[10.0, 0.0, 0.0]]]).reshape(1, 3)  # top 1/3 at t=0
+    # event_frac chosen so only t=0 is an event; event_mask = [True, False, False]
+    cd.ingest_step(
+        step=0,
+        pressure=pressure,  # [B=1, T=3]
+        states_per_layer=[states_l0, states_l1],
+        horizon_H=2,
+        event_frac=0.34,  # round(0.34 * 3) = 1 position
+    )
+    # Layer 0: future at t=0 over [t+1:t+3] = rows 1 and 2 -> mean([[0,1,0],[0,0,1]]**2, dim=0) = [0, 0.5, 0.5]
+    # Baseline from non-event positions t=1..2: future at t=1 over [t+1:t+3] = [row 2] -> [0, 0, 1]
+    #                                            future at t=2 over [t+1:t+3] = [] -> [0, 0, 0]
+    # non-event future mean = ([0,0,1] + [0,0,0]) / 2 = [0, 0, 0.5]
+    # With decay=0 baseline = observation -> [0, 0, 0.5]
+    # excess = relu([0, 0.5, 0.5] - [0, 0, 0.5]) = [0, 0.5, 0]
+    # Aggregated over 1 event position = [0, 0.5, 0]
+    l0_slot = (cd.bank_step[0] == 0).nonzero(as_tuple=True)[0].item()
+    assert torch.allclose(cd.bank_evidence[0, l0_slot], torch.tensor([0.0, 0.5, 0.0]), atol=1e-6)
+    assert cd.bank_event_count[0, l0_slot].item() == pytest.approx(1.0)
+
+
+def test_ingest_step_no_events_writes_nothing():
+    cd = CriticalityDistillation(num_layers=1, dim=3, trace_ttl_steps=4)
+    states = [torch.randn(1, 3, 3)]
+    pressure = torch.zeros(1, 3)
+    cd.ingest_step(step=0, pressure=pressure, states_per_layer=states, horizon_H=2, event_frac=0.0)
+    assert (cd.bank_step == -1).all()
