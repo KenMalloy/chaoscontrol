@@ -5,6 +5,22 @@ import importlib.util
 from pathlib import Path
 
 
+SPEED_CONFIG = {
+    "model_size": "10M",
+    "seq_len": 512,
+    "batch_size_per_rank": 128,
+    "stride": 64,
+    "chunk_size": 16,
+    "precision": "bf16",
+    "grad_clip_norm": 1.0,
+    "fused_grad_clip": True,
+    "artifact_impact": "training_only",
+    "train_sampling_mode": "random",
+}
+
+SEEDS = [1337]
+
+
 def _load_exp24():
     path = Path(__file__).resolve().parent.parent / "experiments" / "24_training_time_bundle" / "exp24.py"
     spec = importlib.util.spec_from_file_location("exp24", path)
@@ -21,77 +37,97 @@ def _load_run_exp24():
     return mod
 
 
-def test_cd_first_smoke_matrix_has_eight_cells():
+def test_cd_first_smoke_matrix_has_eight_entries_per_seed():
     mod = _load_exp24()
-    cells = mod.build_criticality_distillation_first_smoke_matrix()
-    assert len(cells) == 8, f"expected 8 cells; got {len(cells)}"
+    entries = mod.build_criticality_distillation_first_smoke_matrix(
+        speed_config=SPEED_CONFIG, world_size=1, budget_seconds=600.0,
+        seed_values=SEEDS,
+    )
+    assert len(entries) == 8
 
 
-def test_cd_first_smoke_matrix_cells_have_required_names():
+def test_cd_first_smoke_cells_have_required_arm_names():
     mod = _load_exp24()
-    cells = mod.build_criticality_distillation_first_smoke_matrix()
-    names = {c["name"] for c in cells}
-    expected = {
-        "treatment", "telemetry", "shuffled", "budget_only",
-        "hl_short", "hl_long", "H_short", "H_long",
-    }
-    assert names == expected, f"got {names}"
+    entries = mod.build_criticality_distillation_first_smoke_matrix(
+        speed_config=SPEED_CONFIG, world_size=1, budget_seconds=600.0,
+        seed_values=SEEDS,
+    )
+    # Arm name is the middle token of the generated name:
+    # exp24_cd_first_smoke_{arm}_s{seed}
+    arms = set()
+    for entry in entries:
+        name = entry["name"]
+        arms.add(name.replace("exp24_cd_first_smoke_", "").rsplit("_s", 1)[0])
+    expected = {"treatment", "telemetry", "shuffled", "budget_only",
+                "hl_short", "hl_long", "H_short", "H_long"}
+    assert arms == expected, f"got {arms}"
 
 
 def test_cd_first_smoke_cells_all_ride_locked_fast_slow_base():
     mod = _load_exp24()
-    cells = mod.build_criticality_distillation_first_smoke_matrix()
-    for c in cells:
-        cfg = c["config"]
-        assert cfg.get("fast_slow_enabled") is True, f"{c['name']} missing fast_slow_enabled=True"
-        assert cfg.get("fast_slow_interval") == 64, f"{c['name']} fast_slow_interval != 64"
-        assert cfg.get("fast_slow_alpha") == 0.25, f"{c['name']} fast_slow_alpha != 0.25"
+    entries = mod.build_criticality_distillation_first_smoke_matrix(
+        speed_config=SPEED_CONFIG, world_size=1, budget_seconds=600.0,
+        seed_values=SEEDS,
+    )
+    for e in entries:
+        assert e.get("fast_slow_enabled") is True
+        assert e.get("fast_slow_interval") == 64
+        assert e.get("fast_slow_alpha") == 0.25
 
 
-def test_cd_first_smoke_cells_all_emit_entropy_fused_streaming_cached():
+def test_cd_first_smoke_cells_emit_entropy_fused_streaming_cached():
     mod = _load_exp24()
-    cells = mod.build_criticality_distillation_first_smoke_matrix()
-    for c in cells:
-        cfg = c["config"]
-        assert cfg.get("lm_head_backward_mode") == "fused_streaming_cached", (
-            f"{c['name']} wrong lm_head_backward_mode"
-        )
-        assert cfg.get("lm_head_emit_entropy") is True, f"{c['name']} missing lm_head_emit_entropy"
+    entries = mod.build_criticality_distillation_first_smoke_matrix(
+        speed_config=SPEED_CONFIG, world_size=1, budget_seconds=600.0,
+        seed_values=SEEDS,
+    )
+    for e in entries:
+        assert e.get("lm_head_backward_mode") == "fused_streaming_cached"
+        assert e.get("lm_head_emit_entropy") is True
 
 
 def test_cd_first_smoke_cells_all_have_cd_enabled():
     mod = _load_exp24()
-    cells = mod.build_criticality_distillation_first_smoke_matrix()
-    for c in cells:
-        cfg = c["config"]
-        assert cfg.get("criticality_distill_enabled") is True, (
-            f"{c['name']} missing criticality_distill_enabled=True"
-        )
+    entries = mod.build_criticality_distillation_first_smoke_matrix(
+        speed_config=SPEED_CONFIG, world_size=1, budget_seconds=600.0,
+        seed_values=SEEDS,
+    )
+    for e in entries:
+        assert e.get("criticality_distill_enabled") is True
 
 
 def test_cd_first_smoke_falsifier_cell_flags():
     mod = _load_exp24()
-    cells = {c["name"]: c for c in mod.build_criticality_distillation_first_smoke_matrix()}
-    tel = cells["telemetry"]["config"]
-    assert tel["criticality_distill_weight"] == 0.0, "telemetry must zero the loss weight"
-    sh = cells["shuffled"]["config"]
-    assert sh["criticality_distill_score_permute_before_topk"] is True, "shuffled flag"
-    bo = cells["budget_only"]["config"]
-    assert bo["criticality_distill_fixed_random_seats"] is True, "budget_only flag"
-    # Sensitivity cells leave falsifier flags False.
-    for sens_name in ("hl_short", "hl_long", "H_short", "H_long"):
-        cfg = cells[sens_name]["config"]
-        assert cfg["criticality_distill_score_permute_before_topk"] is False
-        assert cfg["criticality_distill_fixed_random_seats"] is False
+    entries = mod.build_criticality_distillation_first_smoke_matrix(
+        speed_config=SPEED_CONFIG, world_size=1, budget_seconds=600.0,
+        seed_values=SEEDS,
+    )
+    by_arm = {
+        e["name"].replace("exp24_cd_first_smoke_", "").rsplit("_s", 1)[0]: e
+        for e in entries
+    }
+    assert by_arm["telemetry"]["criticality_distill_weight"] == 0.0
+    assert by_arm["shuffled"]["criticality_distill_score_permute_before_topk"] is True
+    assert by_arm["budget_only"]["criticality_distill_fixed_random_seats"] is True
+    for sens in ("hl_short", "hl_long", "H_short", "H_long"):
+        assert by_arm[sens]["criticality_distill_score_permute_before_topk"] is False
+        assert by_arm[sens]["criticality_distill_fixed_random_seats"] is False
 
 
 def test_cd_first_smoke_sensitivity_cells_have_distinct_knob():
     mod = _load_exp24()
-    cells = {c["name"]: c for c in mod.build_criticality_distillation_first_smoke_matrix()}
-    assert cells["hl_short"]["config"]["criticality_distill_trace_half_life_steps"] == 128.0
-    assert cells["hl_long"]["config"]["criticality_distill_trace_half_life_steps"] == 512.0
-    assert cells["H_short"]["config"]["criticality_distill_horizon_H"] == 8
-    assert cells["H_long"]["config"]["criticality_distill_horizon_H"] == 32
+    entries = mod.build_criticality_distillation_first_smoke_matrix(
+        speed_config=SPEED_CONFIG, world_size=1, budget_seconds=600.0,
+        seed_values=SEEDS,
+    )
+    by_arm = {
+        e["name"].replace("exp24_cd_first_smoke_", "").rsplit("_s", 1)[0]: e
+        for e in entries
+    }
+    assert by_arm["hl_short"]["criticality_distill_trace_half_life_steps"] == 128.0
+    assert by_arm["hl_long"]["criticality_distill_trace_half_life_steps"] == 512.0
+    assert by_arm["H_short"]["criticality_distill_horizon_H"] == 8
+    assert by_arm["H_long"]["criticality_distill_horizon_H"] == 32
 
 
 def test_run_exp24_defaults_cd_first_smoke_to_world_size_1():

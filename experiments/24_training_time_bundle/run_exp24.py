@@ -226,10 +226,12 @@ def _build_entries(
             seed_values=seeds,
         )
     if matrix == "cd_first_smoke":
-        # Stage F.1 ships the config plumbing only. The builder returns wrapped
-        # cells ``{"name":..., "config":{...}}`` — Stage F.2 will flatten these
-        # into runnable entries before ``run_matrix_entries`` can consume them.
-        return build_criticality_distillation_first_smoke_matrix()
+        return build_criticality_distillation_first_smoke_matrix(
+            speed_config=speed_config,
+            world_size=world_size,
+            budget_seconds=budget_seconds,
+            seed_values=seeds,
+        )
     if matrix == "all":
         entries: list[dict[str, Any]] = []
         entries.extend(
