@@ -105,6 +105,12 @@ def _base_entry(
             "semantic_overhead_gate": float(
                 entry.get("semantic_overhead_gate", 0.08)
             ),
+            "optimizer_param_grouping": str(
+                entry.get("optimizer_param_grouping", "flat")
+            ),
+            "optimizer_dynamics_lr_mul": float(
+                entry.get("optimizer_dynamics_lr_mul", 0.1)
+            ),
         }
     )
     return entry
@@ -210,6 +216,68 @@ def build_semantic_overhead_gate_matrix(
                 phase="smoke",
                 mechanism="semantic_optimizer_gate",
                 arm=f"semantic_gate_{optimizer_name}",
+                seed=seed,
+            )
+        )
+
+    return entries
+
+
+def build_scopt_overhead_gate_matrix(
+    *,
+    speed_config: dict[str, Any],
+    seed: int = 1337,
+    world_size: int = 1,
+    budget_seconds: float = 180.0,
+    batch_size: int = 512,
+) -> list[dict[str, Any]]:
+    """1×H100 Muon-vs-ScOpt smoke at a VRAM-safe batch size.
+
+    ScOpt's split-step path uses unfused ``F.cross_entropy`` with
+    ``retain_graph=True`` and materializes the full fp32 ``(B, T, V)``
+    logits tensor. At submission bs=1024 / V=16384 that forward + the
+    subsequent ``logits.grad`` overflow H100 80 GB. bs=512 fits (~60 GiB
+    peak) and, at ~11 steps/s, runs well past ScOpt's default
+    ``warmup_steps=200`` inside ``budget_seconds=180``, so
+    ``scopt_probes.evaluate_tier0_gates`` has a non-warmup trace to read.
+
+    Both entries use ``optimizer_param_grouping='ssm_three_group'`` — the
+    comparison measures ScOpt's mechanism on top of an S4/S5/HOPE-aware
+    baseline rather than the legacy uniform-WD path that leaves ``log_a``
+    fighting ``wd=0.01`` while ScOpt's recurrence scarcity tries to move
+    it.
+    """
+    base = _base_entry(
+        speed_config=speed_config,
+        world_size=world_size,
+        budget_seconds=budget_seconds,
+    )
+    base["artifact_impact"] = ARTIFACT_CHANGES_WEIGHTS_ONLY
+    base["batch_size"] = int(batch_size)
+    base["optimizer_param_grouping"] = "ssm_three_group"
+    base["optimizer_dynamics_lr_mul"] = 0.1
+
+    entries: list[dict[str, Any]] = []
+    for optimizer_name in ("muon", "scopt"):
+        opt_base = copy.deepcopy(base)
+        opt_base["optimizer"] = optimizer_name
+        if optimizer_name == "scopt":
+            opt_base["scopt_warmup_steps"] = 200
+            opt_base["scopt_split_interval"] = 4
+            opt_base["scopt_trace_interval_steps"] = 64
+            opt_base["scopt_rare_ema_decay"] = 0.9
+            opt_base["scopt_rare_orthogonal_weight"] = 1.0
+            opt_base["scopt_row_scarcity_power"] = 0.5
+            opt_base["scopt_tau_std_scale"] = 0.5
+            opt_base["scopt_layer_index"] = 0
+            opt_base["scopt_baseline_buckets"] = 16
+            opt_base["scopt_baseline_decay"] = 0.99
+        entries.append(
+            _named_entry(
+                base=opt_base,
+                phase="smoke",
+                mechanism="scopt_overhead_gate",
+                arm=f"scopt_gate_{optimizer_name}",
                 seed=seed,
             )
         )

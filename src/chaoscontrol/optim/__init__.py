@@ -15,7 +15,22 @@ from __future__ import annotations
 
 from chaoscontrol.optim.lamb import LAMB
 from chaoscontrol.optim.muon import Muon
+from chaoscontrol.optim.param_groups import (
+    SPECTRAL_SUFFIXES,
+    build_optimizer_params,
+    classify_param,
+    ssm_three_group_params,
+)
 from chaoscontrol.optim.scopt import ScarcityAwareOptimizer
 from chaoscontrol.optim.semantic import SemanticOptimizer
 
-__all__ = ["LAMB", "Muon", "ScarcityAwareOptimizer", "SemanticOptimizer"]
+__all__ = [
+    "LAMB",
+    "Muon",
+    "ScarcityAwareOptimizer",
+    "SemanticOptimizer",
+    "SPECTRAL_SUFFIXES",
+    "build_optimizer_params",
+    "classify_param",
+    "ssm_three_group_params",
+]

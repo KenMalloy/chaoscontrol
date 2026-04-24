@@ -65,6 +65,7 @@ from chaoscontrol.distributed import (  # noqa: E402
 )
 from chaoscontrol.optim.lamb import LAMB  # noqa: E402
 from chaoscontrol.optim.muon import Muon  # noqa: E402
+from chaoscontrol.optim.param_groups import build_optimizer_params  # noqa: E402
 from chaoscontrol.optim.scopt import (  # noqa: E402
     FrequencyBucketBaseline,
     ScarcityAwareOptimizer,
@@ -152,7 +153,15 @@ def _build_optimizer(
     name = str(config.get("optimizer", "muon")).strip()
     base_lr = float(config.get("base_lr", 0.128))
     weight_decay = float(config.get("weight_decay", 0.01))
-    params = list(model.parameters())
+    grouping = str(config.get("optimizer_param_grouping", "flat")).strip()
+    dynamics_lr_mul = float(config.get("optimizer_dynamics_lr_mul", 0.1))
+    params = build_optimizer_params(
+        list(model.named_parameters()),
+        grouping=grouping,
+        base_lr=base_lr,
+        weight_decay=weight_decay,
+        dynamics_lr_mul=dynamics_lr_mul,
+    )
     if name == "adamw":
         return torch.optim.AdamW(params, lr=base_lr, weight_decay=weight_decay)
     if name == "lamb":

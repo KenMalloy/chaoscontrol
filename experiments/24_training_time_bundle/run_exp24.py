@@ -33,6 +33,7 @@ from exp24 import (  # noqa: E402
     build_phase0_fastslow_only_control,
     build_phase0_fastslow_sweep,
     build_ring0_control_matrix,
+    build_scopt_overhead_gate_matrix,
     build_semantic_overhead_gate_matrix,
 )
 from fast_path import read_speed_config, write_matrix  # noqa: E402
@@ -156,6 +157,18 @@ def _build_entries(
                 )
             )
         return entries
+    if matrix == "scopt_overhead_gate":
+        entries: list[dict[str, Any]] = []
+        for seed in seeds:
+            entries.extend(
+                build_scopt_overhead_gate_matrix(
+                    speed_config=speed_config,
+                    seed=seed,
+                    world_size=world_size,
+                    budget_seconds=budget_seconds,
+                )
+            )
+        return entries
     if matrix == "first_wave":
         return build_first_wave_mechanism_matrix(
             speed_config=speed_config,
@@ -238,7 +251,7 @@ def _build_entries(
 
 
 def _default_world_size_for_matrix(matrix: str) -> int:
-    if matrix == "semantic_overhead_gate":
+    if matrix in {"semantic_overhead_gate", "scopt_overhead_gate"}:
         return 1
     if matrix in {
         "phase0_dreamworld_sweep",
@@ -250,6 +263,22 @@ def _default_world_size_for_matrix(matrix: str) -> int:
     return 8
 
 
+def _default_budget_for_matrix(matrix: str) -> float:
+    """Smoke matrices need a budget that clears the optimizer's warmup.
+
+    - ``semantic_overhead_gate``: SemanticOptimizer has no warmup; 90s is
+      enough to read a β distribution post-saturation.
+    - ``scopt_overhead_gate``: ScOpt's default ``warmup_steps=200`` gates
+      pressure/rare-EMA writes; 180s at bs=512/~11 steps-per-second gives
+      ~1800 steps, ~1600 post-warmup, enough for Tier 0 probes.
+    """
+    if matrix == "semantic_overhead_gate":
+        return 90.0
+    if matrix == "scopt_overhead_gate":
+        return 180.0
+    return 600.0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -258,6 +287,7 @@ def main(argv: list[str] | None = None) -> int:
             "ring0_control",
             "phase_a_sampling",
             "semantic_overhead_gate",
+            "scopt_overhead_gate",
             "first_wave",
             "fastslow_dreamworld",
             "phase0_dreamworld_sweep",
@@ -310,7 +340,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     default_world_size = _default_world_size_for_matrix(args.matrix)
-    default_budget = 90.0 if args.matrix == "semantic_overhead_gate" else 600.0
+    default_budget = _default_budget_for_matrix(args.matrix)
     world_size = int(args.world_size) if args.world_size is not None else default_world_size
     budget = float(args.budget) if args.budget is not None else default_budget
     checkpoint_dir = args.checkpoint_dir

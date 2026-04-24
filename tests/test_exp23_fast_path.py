@@ -187,6 +187,90 @@ def test_build_optimizer_can_create_semantic_optimizer(monkeypatch):
     assert optimizer.bound_named_params is not None
 
 
+def test_build_optimizer_defaults_to_flat_grouping():
+    """Back-compat: no ``optimizer_param_grouping`` knob in config ⇒
+    every param lands in ``param_groups[0]`` with uniform lr/wd.
+
+    This pins the invariant that the Phase 0 locked config (which has
+    no grouping knob) continues to train exactly the same way after the
+    grouping code lands.
+    """
+    mod = _load_runner_module()
+    model = _TinySemanticModel()
+    optimizer = mod._build_optimizer(
+        {"optimizer": "muon", "base_lr": 0.05, "weight_decay": 0.02},
+        model,
+    )
+    # One flat group. lr/wd/adamw_lr/adamw_wd should all match the defaults.
+    assert len(optimizer.param_groups) == 1
+    group = optimizer.param_groups[0]
+    assert group["lr"] == pytest.approx(0.05)
+    assert group["adamw_lr"] == pytest.approx(0.05)
+    assert group["weight_decay"] == pytest.approx(0.02)
+    assert group["adamw_weight_decay"] == pytest.approx(0.02)
+
+
+def test_build_optimizer_ssm_three_group_splits_by_role():
+    """``optimizer_param_grouping='ssm_three_group'`` produces three
+    param groups (dynamics / no_decay / main) with distinct lr+wd
+    values. This is the SSM-aware stack rule from S4/S5/HOPE.
+
+    Uses _TinySemanticModel which has log_a (dynamics) + matrix weights
+    (main). No 1D non-spectral param, so ``no_decay`` is dropped — the
+    grouping helper prunes empty groups.
+    """
+    mod = _load_runner_module()
+    model = _TinySemanticModel()
+    optimizer = mod._build_optimizer(
+        {
+            "optimizer": "muon",
+            "base_lr": 0.064,
+            "weight_decay": 0.01,
+            "optimizer_param_grouping": "ssm_three_group",
+            "optimizer_dynamics_lr_mul": 0.1,
+        },
+        model,
+    )
+    group_names = [g.get("name") for g in optimizer.param_groups]
+    assert "dynamics" in group_names
+    assert "main" in group_names
+    dynamics = next(g for g in optimizer.param_groups if g.get("name") == "dynamics")
+    main = next(g for g in optimizer.param_groups if g.get("name") == "main")
+    # log_a is the only dynamics-class param in the tiny model.
+    assert dynamics["lr"] == pytest.approx(0.064 * 0.1)
+    assert dynamics["weight_decay"] == 0.0
+    assert dynamics["adamw_weight_decay"] == 0.0
+    assert main["lr"] == pytest.approx(0.064)
+    assert main["weight_decay"] == pytest.approx(0.01)
+    dynamics_ids = {id(p) for p in dynamics["params"]}
+    assert id(model.layers[0].core.log_a) in dynamics_ids
+
+
+def test_build_optimizer_ssm_three_group_propagates_to_scopt():
+    """The grouping is optimizer-agnostic — ScOpt should see three
+    groups with the same lr/wd split as Muon would.
+    """
+    mod = _load_runner_module()
+    model = _TinySemanticModel()
+    optimizer = mod._build_optimizer(
+        {
+            "optimizer": "scopt",
+            "base_lr": 0.064,
+            "weight_decay": 0.01,
+            "optimizer_param_grouping": "ssm_three_group",
+            "optimizer_dynamics_lr_mul": 0.1,
+            "scopt_layer_index": 0,
+            "scopt_warmup_steps": 5,
+        },
+        model,
+    )
+    group_names = [g.get("name") for g in optimizer.param_groups]
+    assert "dynamics" in group_names
+    dynamics = next(g for g in optimizer.param_groups if g.get("name") == "dynamics")
+    assert dynamics["lr"] == pytest.approx(0.064 * 0.1)
+    assert dynamics["weight_decay"] == 0.0
+
+
 def test_build_optimizer_can_create_scarcity_optimizer(monkeypatch):
     mod = _load_runner_module()
 

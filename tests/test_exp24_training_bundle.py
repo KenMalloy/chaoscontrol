@@ -149,6 +149,73 @@ def test_build_semantic_overhead_gate_matrix_has_muon_and_semantic_rows():
         assert entry["artifact_impact"] == "artifact_changes_weights_only"
 
 
+def test_build_scopt_overhead_gate_matrix_has_muon_and_scopt_rows():
+    mod = _load_exp24()
+
+    entries = mod.build_scopt_overhead_gate_matrix(
+        speed_config={"batch_size": 1024, "chunk_size": 64},
+        seed=1337,
+        world_size=1,
+        budget_seconds=180.0,
+    )
+
+    assert len(entries) == 2
+    assert [entry["name"] for entry in entries] == [
+        "exp24_smoke_scopt_gate_muon_s1337",
+        "exp24_smoke_scopt_gate_scopt_s1337",
+    ]
+    assert [entry["optimizer"] for entry in entries] == ["muon", "scopt"]
+    for entry in entries:
+        assert entry["world_size"] == 1
+        assert entry["budget_seconds"] == 180.0
+        assert entry["batch_size"] == 512, (
+            "ScOpt's unfused LM-head path OOMs at bs=1024 / V=16384; "
+            "smoke must use the VRAM-safe bs=512."
+        )
+        assert entry["exp24_phase"] == "smoke"
+        assert entry["exp24_mechanism"] == "scopt_overhead_gate"
+        assert entry["artifact_impact"] == "artifact_changes_weights_only"
+        assert entry["optimizer_param_grouping"] == "ssm_three_group", (
+            "ScOpt overhead gate must run against the SSM-aware baseline; "
+            "flat grouping leaves log_a fighting wd=0.01 while ScOpt's "
+            "recurrence scarcity tries to move it."
+        )
+        assert entry["optimizer_dynamics_lr_mul"] == 0.1
+
+    scopt_entry = entries[1]
+    assert scopt_entry["scopt_warmup_steps"] == 200
+    assert scopt_entry["scopt_split_interval"] == 4
+    assert scopt_entry["scopt_trace_interval_steps"] == 64
+    assert scopt_entry["scopt_layer_index"] == 0
+    # Muon entry must NOT carry ScOpt-only knobs.
+    muon_entry = entries[0]
+    assert "scopt_warmup_steps" not in muon_entry
+
+
+def test_build_scopt_overhead_gate_matrix_preserves_chunk_size():
+    """speed_config knobs (batch_size override, chunk_size) flow through
+    _base_entry. Only batch_size gets overridden by the gate; chunk_size
+    should stay whatever the user's Exp23 base config says.
+    """
+    mod = _load_exp24()
+
+    entries = mod.build_scopt_overhead_gate_matrix(
+        speed_config={
+            "batch_size": 1024,
+            "chunk_size": 128,
+            "seq_len": 512,
+            "model_dim": 256,
+            "num_layers": 4,
+            "vocab_size": 16384,
+        },
+        seed=1337,
+    )
+    for entry in entries:
+        assert entry["chunk_size"] == 128
+        assert entry["seq_len"] == 512
+        assert entry["vocab_size"] == 16384
+
+
 def test_first_wave_mechanism_matrix_names_and_tags():
     mod = _load_exp24()
 
@@ -575,6 +642,44 @@ def test_run_exp24_cli_semantic_gate_defaults_to_cheap_smoke(tmp_path):
     assert '"budget_seconds": 90.0' in stdout
     assert "--nproc_per_node=1" in stdout
     assert '"--budget",\n      "90.0"' in stdout
+
+
+def test_run_exp24_cli_scopt_gate_defaults_to_180s_bs512():
+    """``--matrix scopt_overhead_gate`` without explicit budget/batch
+    should pick 180s / bs=512 / world_size=1, enough steps to clear
+    ScOpt's warmup_steps=200 and read a Tier 0 probe trace.
+    """
+    import tempfile
+
+    script = REPO / "experiments" / "24_training_time_bundle" / "run_exp24.py"
+    with tempfile.TemporaryDirectory() as tmp:
+        output_dir = Path(tmp) / "exp24-scopt-gate-dryrun"
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(script),
+                "--matrix",
+                "scopt_overhead_gate",
+                "--dry-run",
+                "--output-dir",
+                str(output_dir),
+            ],
+            capture_output=True,
+            text=True,
+        )
+    assert result.returncode == 0, result.stderr
+    stdout = result.stdout
+    assert "matrix=scopt_overhead_gate" in stdout
+    assert "world_size=1" in stdout
+    assert '"budget_seconds": 180.0' in stdout
+    assert '"batch_size": 512' in stdout
+    assert '"optimizer_param_grouping": "ssm_three_group"' in stdout
+    # Guard: dynamics_lr_mul must propagate through _base_entry or the
+    # Muon/ScOpt constructors silently fall back to base_lr everywhere.
+    assert '"optimizer_dynamics_lr_mul": 0.1' in stdout
+    # Verify both optimizer rows present.
+    assert '"optimizer": "muon"' in stdout
+    assert '"optimizer": "scopt"' in stdout
 
 
 def test_run_exp24_cli_fastslow_dreamworld_matrix_is_stack_only(tmp_path):
