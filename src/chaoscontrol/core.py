@@ -336,6 +336,8 @@ class ChaosSSMCore(nn.Module):
         self.dim = dim
         self.a_mode = a_mode
         self.a_full_rank = a_full_rank
+        # Private. Flip only via capture_states(); non-diag modes have no
+        # write sites for _captured_states, so direct mutation silently no-ops.
         self._capture_states_enabled = False
         self._captured_states: torch.Tensor | None = None
 

@@ -52,12 +52,14 @@ def test_capture_via_top_level_forward_diag_fast_path():
     """Production model.encode() path routes through forward()'s inlined
     diag fast-path, not _forward_diag_scan. Must capture there too."""
     core = _make_core(dim=8)
-    x = torch.randn(2, 5, 8)
+    x = torch.randn(2, 5, 8, requires_grad=True)
     with core.capture_states() as get_states:
         _ = core(x)  # forward, not _forward_diag_scan
         captured = get_states()
     assert captured is not None, "forward() diag fast-path must capture too"
     assert captured.shape == (2, 5, 8)
+    assert captured.requires_grad is False, "captured states must be detached"
+    assert captured.grad_fn is None, "captured states must have no grad_fn"
 
 
 def test_capture_is_disabled_by_default_no_overhead_path():
