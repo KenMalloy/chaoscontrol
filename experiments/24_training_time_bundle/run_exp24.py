@@ -33,6 +33,7 @@ from exp24 import (  # noqa: E402
     build_phase0_fastslow_only_control,
     build_phase0_fastslow_sweep,
     build_ring0_control_matrix,
+    build_scopt_calibration_sweep_matrix,
     build_scopt_overhead_gate_matrix,
     build_semantic_overhead_gate_matrix,
 )
@@ -162,6 +163,18 @@ def _build_entries(
         for seed in seeds:
             entries.extend(
                 build_scopt_overhead_gate_matrix(
+                    speed_config=speed_config,
+                    seed=seed,
+                    world_size=world_size,
+                    budget_seconds=budget_seconds,
+                )
+            )
+        return entries
+    if matrix == "scopt_calibration_sweep":
+        entries: list[dict[str, Any]] = []
+        for seed in seeds:
+            entries.extend(
+                build_scopt_calibration_sweep_matrix(
                     speed_config=speed_config,
                     seed=seed,
                     world_size=world_size,

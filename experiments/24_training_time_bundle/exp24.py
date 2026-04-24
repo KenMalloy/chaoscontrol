@@ -295,6 +295,70 @@ def build_scopt_overhead_gate_matrix(
     return entries
 
 
+def build_scopt_calibration_sweep_matrix(
+    *,
+    speed_config: dict[str, Any],
+    seed: int = 1337,
+    world_size: int = 1,
+    budget_seconds: float = 1200.0,
+    batch_size: int = 512,
+) -> list[dict[str, Any]]:
+    """ScOpt calibration probe: three single-knob variants vs the step-1 base.
+
+    Step 1 (results_scopt_step1_20260424T0500Z) showed
+    rare_macro_cap_fired.median=1.0 and pressure_fraction_positive=0.51,
+    meaning the macro-Gerber cap was clipping every step and more than
+    half of all tokens still looked "rare" under the CE baseline. Each
+    cell here perturbs one knob relative to scopt_overhead_gate's ScOpt
+    entry so the diagnostic map is isolated per-lever.
+    """
+    base = _base_entry(
+        speed_config=speed_config,
+        world_size=world_size,
+        budget_seconds=budget_seconds,
+    )
+    base["artifact_impact"] = ARTIFACT_CHANGES_WEIGHTS_ONLY
+    base["batch_size"] = int(batch_size)
+    base["optimizer_param_grouping"] = "ssm_three_group"
+    base["optimizer_dynamics_lr_mul"] = 0.1
+    base["optimizer"] = "scopt"
+    base["scopt_warmup_steps"] = 200
+    base["scopt_split_interval"] = 4
+    base["scopt_trace_interval_steps"] = 64
+    base["scopt_rare_ema_decay"] = 0.9
+    base["scopt_rare_orthogonal_weight"] = 1.0
+    base["scopt_rare_macro_c"] = 0.5
+    base["scopt_pressure_upper_c"] = 3.0
+    base["scopt_pressure_upper_floor"] = 1.0
+    base["scopt_row_scarcity_power"] = 0.5
+    base["scopt_tau_std_scale"] = 0.5
+    base["scopt_layer_index"] = 0
+    base["scopt_baseline_buckets"] = 16
+    base["scopt_baseline_decay"] = 0.99
+
+    variants: list[tuple[str, dict[str, Any]]] = [
+        ("baseline_d95", {"scopt_baseline_decay": 0.95}),
+        ("pressure_c15", {"scopt_pressure_upper_c": 1.5}),
+        ("rare_ema_095", {"scopt_rare_ema_decay": 0.95}),
+    ]
+
+    entries: list[dict[str, Any]] = []
+    for arm_suffix, overrides in variants:
+        entry_base = copy.deepcopy(base)
+        entry_base.update(overrides)
+        entries.append(
+            _named_entry(
+                base=entry_base,
+                phase="smoke",
+                mechanism="scopt_calibration_sweep",
+                arm=f"scopt_cal_{arm_suffix}",
+                seed=seed,
+            )
+        )
+
+    return entries
+
+
 def build_first_wave_mechanism_matrix(
     *,
     speed_config: dict[str, Any],
