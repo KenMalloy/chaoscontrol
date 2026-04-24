@@ -126,6 +126,7 @@ def test_state_dict_round_trip_preserves_bank_and_baseline():
     assert torch.equal(cd2.bank_event_count, cd1.bank_event_count)
     assert torch.equal(cd2.baseline_future_energy, cd1.baseline_future_energy)
     assert torch.equal(cd2.seat_mask, cd1.seat_mask)
+    assert torch.equal(cd2.baseline_initialized, cd1.baseline_initialized)
 
     # Score must match after round-trip.
     assert torch.allclose(cd2.score(current_step=2), cd1.score(current_step=2))
@@ -146,10 +147,31 @@ def test_update_baseline_ema_only_reads_non_event_positions():
     event_mask = torch.tensor([[True, False, False, True]])
     # Mean over non-event positions: channel 0 -> (2+3)/2 = 2.5
     #                                channel 1 -> (20+30)/2 = 25.0
-    # Baseline starts at zero. One update with decay=0.5:
-    #   new = 0.5 * old + 0.5 * obs = 0.5 * 0 + 0.5 * [2.5, 25.0] = [1.25, 12.5]
+    # First observation replaces (baseline was uninitialized at zero) — so
+    # baseline -> [2.5, 25.0], not 0.5 * [2.5, 25.0]. The "only non-event
+    # positions contribute" invariant is preserved: event positions at t=0
+    # and t=3 are ignored, so their values (1, 10, 4, 40) never enter the
+    # mean.
     cd.update_baseline_ema(layer=0, future_energy=future_energy, event_mask=event_mask)
-    assert torch.allclose(cd.baseline_future_energy[0], torch.tensor([1.25, 12.5]))
+    assert torch.allclose(cd.baseline_future_energy[0], torch.tensor([2.5, 25.0]))
+
+    # Now that baseline is initialized, a second update should EMA with
+    # decay=0.5: new = 0.5 * [2.5, 25.0] + 0.5 * [2.5, 25.0] = [2.5, 25.0]
+    # (same observation, so unchanged). Use a different observation to
+    # actually exercise the EMA math: event_mask flips, so t=0 and t=3 are
+    # now non-events with values (1, 10) and (4, 40) -> mean [2.5, 25.0].
+    # Still identical! The whole point is to confirm event positions are
+    # excluded — same event pattern by design.
+    # Use a fresh future_energy + event_mask to make the EMA update visible:
+    future_energy2 = torch.tensor([[
+        [0.0, 0.0],
+        [10.0, 100.0],  # t=1, non-event
+    ]])
+    event_mask2 = torch.tensor([[True, False]])
+    # Non-event positions: t=1 only -> obs = [10.0, 100.0]
+    # EMA: 0.5 * [2.5, 25.0] + 0.5 * [10.0, 100.0] = [6.25, 62.5]
+    cd.update_baseline_ema(layer=0, future_energy=future_energy2, event_mask=event_mask2)
+    assert torch.allclose(cd.baseline_future_energy[0], torch.tensor([6.25, 62.5]))
 
 
 def test_update_baseline_ema_no_nonevent_positions_is_noop():
@@ -376,3 +398,91 @@ def test_full_mechanism_moves_seat_log_a_more_than_non_seat():
     assert log_a_delta[~seats].max().item() < 1e-6, (
         f"non-seat log_a moved: {log_a_delta[~seats]}"
     )
+
+
+def test_baseline_ema_first_observation_replaces_not_emas():
+    """First non-event observation replaces zero baseline rather than
+    being damped by (1 - decay). Otherwise decay=0.99 produces a
+    0.01 * obs baseline that makes the first allocation window
+    treat raw energy as excess."""
+    cd = CriticalityDistillation(
+        num_layers=1, dim=2, trace_ttl_steps=4,
+        baseline_ema_decay=0.99,  # aggressive smoothing
+    )
+    future_energy = torch.tensor([[[5.0, 10.0]]])  # [B=1, T=1, D=2]
+    event_mask = torch.tensor([[False]])  # single non-event position
+    cd.update_baseline_ema(layer=0, future_energy=future_energy, event_mask=event_mask)
+    # After first observation: baseline == obs (replacement, not EMA).
+    assert torch.allclose(cd.baseline_future_energy[0], torch.tensor([5.0, 10.0]))
+    assert cd.baseline_initialized[0].item() is True
+
+    # Second observation should EMA normally.
+    future_energy2 = torch.tensor([[[15.0, 20.0]]])
+    cd.update_baseline_ema(layer=0, future_energy=future_energy2, event_mask=event_mask)
+    # 0.99 * [5, 10] + 0.01 * [15, 20] = [5.1, 10.1]
+    assert torch.allclose(cd.baseline_future_energy[0], torch.tensor([5.1, 10.1]))
+
+
+def test_ingest_step_updates_baseline_even_when_no_events():
+    """event_frac=0 means no events -> no bank write, but baseline
+    should still observe the full step's non-event future-energy.
+    This matters for the budget-only falsifier control which runs at
+    event_frac=0, and for warmup before any events fire."""
+    cd = CriticalityDistillation(
+        num_layers=1, dim=2, trace_ttl_steps=4,
+        baseline_ema_decay=0.5,  # simple hand math
+    )
+    states = [torch.tensor([[
+        [1.0, 0.0],
+        [2.0, 1.0],
+        [3.0, 2.0],
+    ]])]
+    pressure = torch.zeros(1, 3)
+    cd.ingest_step(
+        step=0, pressure=pressure, states_per_layer=states,
+        horizon_H=2, event_frac=0.0,
+    )
+    # Bank entry: none written (all positions non-event).
+    assert (cd.bank_step == -1).all()
+    # Baseline: first observation replaces zero (finding 2 behavior).
+    # future_energy per position (H=2):
+    #   t=0: mean([[2,1],[3,2]]**2, dim=0) = [(4+9)/2, (1+4)/2] = [6.5, 2.5]
+    #   t=1: mean([[3,2]]**2) = [9, 4]
+    #   t=2: empty window -> [0, 0]
+    # Mean over all three non-event positions: [(6.5 + 9 + 0)/3, (2.5 + 4 + 0)/3]
+    #                                        = [15.5/3, 6.5/3]
+    #                                        ~ [5.1666..., 2.1666...]
+    expected = torch.tensor([15.5 / 3.0, 6.5 / 3.0])
+    assert torch.allclose(cd.baseline_future_energy[0], expected, atol=1e-6), (
+        cd.baseline_future_energy[0]
+    )
+    assert cd.baseline_initialized[0].item() is True
+
+
+def test_criticality_loss_applies_distill_weight_internally():
+    cd = CriticalityDistillation(
+        num_layers=1, dim=4, trace_ttl_steps=2,
+        critical_value=0.9,
+        criticality_distill_weight=0.25,  # non-default
+    )
+    cd.seat_mask[0] = torch.tensor([True, False, True, False])
+    log_a = torch.zeros(4, requires_grad=True)
+    # Unweighted MSE on 2 seats at log_a=0 (criticality=0.5 vs target 0.9):
+    #   mean([(0.5 - 0.9)^2, (0.5 - 0.9)^2]) = 0.16
+    # With weight 0.25: 0.16 * 0.25 = 0.04
+    loss = cd.criticality_loss([log_a])
+    assert torch.allclose(loss, torch.tensor(0.04), atol=1e-6), (
+        f"expected 0.04, got {loss.item()}"
+    )
+
+
+def test_criticality_loss_distill_weight_zero_gives_zero_loss():
+    cd = CriticalityDistillation(
+        num_layers=1, dim=4, trace_ttl_steps=2,
+        critical_value=0.9,
+        criticality_distill_weight=0.0,
+    )
+    cd.seat_mask[0] = torch.tensor([True, False, True, False])
+    log_a = torch.zeros(4, requires_grad=True)
+    loss = cd.criticality_loss([log_a])
+    assert loss.item() == 0.0

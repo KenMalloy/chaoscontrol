@@ -74,6 +74,12 @@ class CriticalityDistillation(nn.Module):
             "baseline_future_energy",
             torch.zeros(self.num_layers, self.dim, dtype=torch.float32),
         )
+        # Flag: has the baseline been seeded for this layer? First
+        # observation replaces the zero init rather than EMA-damping it.
+        self.register_buffer(
+            "baseline_initialized",
+            torch.zeros(self.num_layers, dtype=torch.bool),
+        )
         # Current seat assignment per layer (top-k channels that feel the loss).
         self.register_buffer(
             "seat_mask",
@@ -166,9 +172,13 @@ class CriticalityDistillation(nn.Module):
             return  # no new information; leave EMA alone
         flat_fe = future_energy.reshape(-1, self.dim)  # [B*T, D]
         flat_m = non_event.reshape(-1)  # [B*T]
-        obs = flat_fe[flat_m].mean(dim=0)  # [D]
-        decay = self.baseline_ema_decay
-        self.baseline_future_energy[layer].mul_(decay).add_(obs.to(self.baseline_future_energy.dtype), alpha=(1.0 - decay))
+        obs = flat_fe[flat_m].mean(dim=0).to(self.baseline_future_energy.dtype)  # [D]
+        if not bool(self.baseline_initialized[layer].item()):
+            self.baseline_future_energy[layer].copy_(obs)
+            self.baseline_initialized[layer] = True
+        else:
+            decay = self.baseline_ema_decay
+            self.baseline_future_energy[layer].mul_(decay).add_(obs, alpha=(1.0 - decay))
 
     @torch.no_grad()
     def ingest_step(
@@ -196,23 +206,34 @@ class CriticalityDistillation(nn.Module):
             )
         event_mask = compute_event_mask(pressure, event_frac=event_frac)  # [B, T]
         n_events = int(event_mask.sum().item())
-        if n_events == 0:
-            return
+
+        # Validate layer shapes once up front.
         for layer, states in enumerate(states_per_layer):
             if states.shape[-1] != self.dim:
                 raise ValueError(
                     f"layer {layer}: states last dim {states.shape[-1]} != self.dim {self.dim}"
                 )
+
+        # Baseline updates always run (a no-event step is the cleanest
+        # non-event observation; warm-up depends on this).
+        layer_future_energies: list[torch.Tensor] = []
+        for layer, states in enumerate(states_per_layer):
             future_energy = compute_future_energy(states, horizon_H=horizon_H)  # [B, T, D]
             self.update_baseline_ema(
                 layer=layer, future_energy=future_energy, event_mask=event_mask
             )
+            layer_future_energies.append(future_energy)
+
+        if n_events == 0:
+            return
+
+        # Bank writes only on event-bearing steps.
+        flat_mask = event_mask.reshape(-1)
+        for layer, future_energy in enumerate(layer_future_energies):
             baseline = self.baseline_future_energy[layer]  # [D]
             excess = (future_energy - baseline).clamp_min(0.0)  # [B, T, D]
-            # Aggregate: mean over event positions.
-            flat_excess = excess.reshape(-1, self.dim)  # [B*T, D]
-            flat_mask = event_mask.reshape(-1)  # [B*T]
-            aggregate = flat_excess[flat_mask].mean(dim=0)  # [D]
+            flat_excess = excess.reshape(-1, self.dim)
+            aggregate = flat_excess[flat_mask].mean(dim=0)
             self.add_step_evidence(
                 layer=layer,
                 step=step,
@@ -253,8 +274,9 @@ class CriticalityDistillation(nn.Module):
         exactly zero gradient to their log_a).
 
         Returns:
-            Scalar tensor. Weight of this term in the total loss is applied
-            externally (`criticality_distill_weight` is not multiplied here).
+            Scalar tensor, already multiplied by
+            `criticality_distill_weight` — the runner just adds it to the
+            CE loss (no external multiply).
         """
         if len(log_a_per_layer) != self.num_layers:
             raise ValueError(
@@ -275,7 +297,7 @@ class CriticalityDistillation(nn.Module):
             total = total + seat_err.mean()
         if not any_seats:
             return torch.zeros((), dtype=torch.float32, device=self.seat_mask.device)
-        return total
+        return total * self.criticality_distill_weight
 
 
 def compute_event_mask(pressure: torch.Tensor, event_frac: float) -> torch.Tensor:
