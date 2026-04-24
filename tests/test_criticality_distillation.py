@@ -677,3 +677,27 @@ def test_add_contribution_updates_numerator_denominator_and_event_mass():
     assert cd.event_mass[0].item() == 5.0
     # Layer 1 untouched.
     assert torch.equal(cd.score_num[1], torch.zeros(3))
+
+
+def test_subtract_expired_removes_contribution_at_its_current_decay_weight():
+    cd = CriticalityDistillation(
+        num_layers=1, dim=2, trace_ttl_steps=4,
+        trace_half_life_steps=2.0,
+    )
+    # Simulate: entry added at step=0 with evidence=[1, 2] and event_count=3.
+    # Current step=4. Entry's current age = 4 -> decay weight 2^(-4/2) = 0.25.
+    # Before subtraction:
+    cd.score_num[0] = torch.tensor([0.25 * 1 * 3, 0.25 * 2 * 3])  # [0.75, 1.5]
+    cd.score_den[0] = 0.25 * 3  # 0.75
+    cd.event_mass[0] = 0.25 * 3  # 0.75
+    # Subtract as if that slot is now being overwritten.
+    cd._subtract_expired_contribution(
+        layer=0,
+        evicted_step=0,
+        current_step=4,
+        evicted_evidence=torch.tensor([1.0, 2.0]),
+        evicted_event_count=3.0,
+    )
+    assert torch.allclose(cd.score_num[0], torch.zeros(2), atol=1e-6)
+    assert abs(cd.score_den[0].item()) < 1e-6
+    assert abs(cd.event_mass[0].item()) < 1e-6

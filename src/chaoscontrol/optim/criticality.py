@@ -248,6 +248,29 @@ class CriticalityDistillation(nn.Module):
         self.event_mass[layer].add_(ec)
 
     @torch.no_grad()
+    def _subtract_expired_contribution(
+        self,
+        *,
+        layer: int,
+        evicted_step: int,
+        current_step: int,
+        evicted_evidence: torch.Tensor,
+        evicted_event_count: float,
+    ) -> None:
+        """Remove an expired/evicted slot's remaining contribution at
+        its current decay weight. Call BEFORE writing a new entry into
+        an occupied slot."""
+        age = max(0, int(current_step) - int(evicted_step))
+        factor = 2.0 ** (-float(age) / self.trace_half_life_steps)
+        remaining_ec = float(evicted_event_count) * factor
+        ev = evicted_evidence.to(
+            dtype=self.score_num.dtype, device=self.score_num.device
+        )
+        self.score_num[layer].sub_(ev, alpha=remaining_ec)
+        self.score_den[layer].sub_(remaining_ec)
+        self.event_mass[layer].sub_(remaining_ec)
+
+    @torch.no_grad()
     def ingest_step(
         self,
         *,
