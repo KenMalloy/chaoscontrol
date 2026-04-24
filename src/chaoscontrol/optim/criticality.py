@@ -132,9 +132,7 @@ class CriticalityDistillation(nn.Module):
         """
         valid = self.bank_step >= 0  # [L, T]
         age = (int(current_step) - self.bank_step).clamp_min(0).to(dtype=torch.float32)
-        weight = torch.pow(
-            torch.tensor(2.0, dtype=torch.float32), -age / self.trace_half_life_steps
-        )
+        weight = torch.exp2(-age / self.trace_half_life_steps)
         weight = weight * valid.to(dtype=torch.float32)  # zero-out empty slots
         weight_sum = weight.sum(dim=1, keepdim=True)  # [L, 1]
         weighted_evidence = (weight.unsqueeze(-1) * self.bank_evidence).sum(dim=1)  # [L, D]
@@ -231,9 +229,7 @@ class CriticalityDistillation(nn.Module):
         """
         valid = self.bank_step >= 0
         age = (int(current_step) - self.bank_step).clamp_min(0).to(dtype=torch.float32)
-        weight = torch.pow(
-            torch.tensor(2.0, dtype=torch.float32), -age / self.trace_half_life_steps
-        )
+        weight = torch.exp2(-age / self.trace_half_life_steps)
         weight = weight * valid.to(dtype=torch.float32)  # [L, T]
         weighted_events_per_layer = (weight * self.bank_event_count).sum(dim=1)  # [L]
 
@@ -245,7 +241,7 @@ class CriticalityDistillation(nn.Module):
                 self.seat_mask[layer].fill_(False)
                 continue
             topk = torch.topk(scores[layer], k=k, largest=True)
-            mask = torch.zeros(self.dim, dtype=torch.bool)
+            mask = torch.zeros(self.dim, dtype=torch.bool, device=self.seat_mask.device)
             mask[topk.indices] = True
             self.seat_mask[layer] = mask
 
@@ -278,7 +274,7 @@ class CriticalityDistillation(nn.Module):
             seat_err = err[mask]
             total = total + seat_err.mean()
         if not any_seats:
-            return torch.zeros((), dtype=torch.float32)
+            return torch.zeros((), dtype=torch.float32, device=self.seat_mask.device)
         return total
 
 
