@@ -222,6 +222,33 @@ class CriticalityDistillation(nn.Module):
                 event_count=float(flat_mask.sum().item()),
             )
 
+    @torch.no_grad()
+    def allocate_seats(self, *, current_step: int) -> None:
+        """Recompute per-layer seat assignment from current age-weighted score.
+
+        Gate: a layer's total age-weighted event count must exceed
+        `min_weighted_events_per_layer`; otherwise its seats are cleared.
+        """
+        valid = self.bank_step >= 0
+        age = (int(current_step) - self.bank_step).clamp_min(0).to(dtype=torch.float32)
+        weight = torch.pow(
+            torch.tensor(2.0, dtype=torch.float32), -age / self.trace_half_life_steps
+        )
+        weight = weight * valid.to(dtype=torch.float32)  # [L, T]
+        weighted_events_per_layer = (weight * self.bank_event_count).sum(dim=1)  # [L]
+
+        k = max(1, int(round(self.dim * self.criticality_budget_frac)))
+        scores = self.score(current_step=current_step)  # [L, D]
+
+        for layer in range(self.num_layers):
+            if weighted_events_per_layer[layer].item() < self.min_weighted_events_per_layer:
+                self.seat_mask[layer].fill_(False)
+                continue
+            topk = torch.topk(scores[layer], k=k, largest=True)
+            mask = torch.zeros(self.dim, dtype=torch.bool)
+            mask[topk.indices] = True
+            self.seat_mask[layer] = mask
+
 
 def compute_event_mask(pressure: torch.Tensor, event_frac: float) -> torch.Tensor:
     """Top-`event_frac` positions of pressure become True.

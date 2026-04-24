@@ -203,3 +203,37 @@ def test_ingest_step_no_events_writes_nothing():
     pressure = torch.zeros(1, 3)
     cd.ingest_step(step=0, pressure=pressure, states_per_layer=states, horizon_H=2, event_frac=0.0)
     assert (cd.bank_step == -1).all()
+
+
+def test_allocate_seats_respects_evidence_gate():
+    cd = CriticalityDistillation(
+        num_layers=1, dim=10, trace_ttl_steps=4,
+        trace_half_life_steps=1.0,
+        criticality_budget_frac=0.3,
+        min_weighted_events_per_layer=100.0,  # unreachable with small input
+    )
+    cd.add_step_evidence(layer=0, step=0, evidence=torch.ones(10), event_count=1.0)
+    cd.allocate_seats(current_step=1)
+    assert not cd.seat_mask[0].any(), "evidence gate must suppress seat assignment"
+
+
+def test_allocate_seats_top_k_when_gate_passes():
+    cd = CriticalityDistillation(
+        num_layers=1, dim=10, trace_ttl_steps=4,
+        trace_half_life_steps=100.0,  # slow aging, so recent events count fully
+        criticality_budget_frac=0.3,  # 3 seats per layer
+        min_weighted_events_per_layer=1.0,
+    )
+    # Channels 2, 5, 7 have highest evidence.
+    evidence = torch.zeros(10)
+    evidence[2] = 3.0
+    evidence[5] = 5.0
+    evidence[7] = 1.0
+    evidence[0] = 0.5
+    cd.add_step_evidence(layer=0, step=0, evidence=evidence, event_count=10.0)
+    cd.allocate_seats(current_step=1)
+    assert cd.seat_mask[0].sum().item() == 3
+    # Top-3 by score: channels 5, 2, 7 (in order of magnitude)
+    assert cd.seat_mask[0, 5].item() is True
+    assert cd.seat_mask[0, 2].item() is True
+    assert cd.seat_mask[0, 7].item() is True
