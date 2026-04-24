@@ -776,6 +776,8 @@ def build_criticality_distillation_first_smoke_matrix(
         "criticality_distill_uniform_pressure": False,
         "criticality_distill_score_permute_before_topk": False,
         "criticality_distill_fixed_random_seats": False,
+        "rare_bucket_ce_enabled": True,
+        "rare_bucket_ce_num_buckets": 4,
     }
     cells = [
         ("treatment", {}),

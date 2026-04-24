@@ -96,6 +96,19 @@ def test_cd_first_smoke_cells_all_have_cd_enabled():
         assert e.get("criticality_distill_enabled") is True
 
 
+def test_cd_first_smoke_cells_emit_rare_bucket_val_ce():
+    """All cells must enable rare_bucket_ce so per-bucket val CE is
+    emitted — it is the primary falsifier axis for CD vs controls."""
+    mod = _load_exp24()
+    entries = mod.build_criticality_distillation_first_smoke_matrix(
+        speed_config=SPEED_CONFIG, world_size=1, budget_seconds=600.0,
+        seed_values=SEEDS,
+    )
+    for e in entries:
+        assert e.get("rare_bucket_ce_enabled") is True
+        assert int(e.get("rare_bucket_ce_num_buckets", 0)) == 4
+
+
 def test_cd_first_smoke_falsifier_cell_flags():
     mod = _load_exp24()
     entries = mod.build_criticality_distillation_first_smoke_matrix(
