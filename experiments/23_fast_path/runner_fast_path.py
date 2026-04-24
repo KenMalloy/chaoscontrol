@@ -324,6 +324,12 @@ def _compute_per_bucket_val_ce(
                 bucket_count.scatter_add_(0, flat_idx, flat_ones)
     finally:
         model.train()
+    # All-reduce across ranks before dividing — otherwise each rank reports
+    # its own shard's bucket means and rank-0's result is skewed by shard
+    # composition rather than the true val distribution.
+    if world_size > 1 and dist.is_available() and dist.is_initialized():
+        dist.all_reduce(bucket_sum, op=dist.ReduceOp.SUM)
+        dist.all_reduce(bucket_count, op=dist.ReduceOp.SUM)
     counts_f = bucket_count.to(torch.float64).clamp_min(1.0)
     per_bucket_val_ce = (bucket_sum / counts_f).detach().cpu().tolist()
     rare_k = max(1, int(num_buckets) // 4)
@@ -1789,6 +1795,15 @@ def train_fast_for_budget(
     rank_ = int(rank)
     world_size_ = int(world_size)
     ddp_active = world_size_ > 1
+    if criticality_distill_enabled and ddp_active:
+        raise ValueError(
+            "criticality_distill_enabled=True is single-rank only in this "
+            "runner. CD evidence, seat allocation, and the separate "
+            "cd_loss.backward() path are rank-local; running on "
+            f"world_size={world_size_} would produce divergent log_a updates "
+            "and non-comparable ranks. Add collectives for CD aggregates + "
+            "seat masks + criticality_loss before enabling on multi-rank."
+        )
     if ddp_active:
         broadcast_params(model)
     grad_allreduce_mode_ = str(grad_allreduce_mode).strip().lower()
@@ -2332,18 +2347,24 @@ def train_fast_for_budget(
                     )
                 target_device = cd_states_per_layer[0].device
                 # Compute per-token CE + per-token entropy for pressure.
-                # On CUDA we use the fused entropy-emitting kernel; on
-                # CPU (or when the kernel fails to import) fall back to a
-                # plain softmax. Kernel numerics are Stage D.4, not this task.
+                # On CUDA with a fully-built extension we use the fused
+                # entropy-emitting kernel; otherwise fall back to plain
+                # softmax. The fallback triggers on (a) CPU targets,
+                # (b) no CUDA runtime, (c) missing `_C` module, OR
+                # (d) the extension built without the entropy-emitting
+                # entrypoint (stale install) — case (d) raises at the
+                # call site, not at import, so we wrap BOTH. Stage D.4
+                # pins the kernel's numerical correctness.
                 per_token_ce_bt: torch.Tensor | None = None
                 per_token_entropy_bt: torch.Tensor | None = None
                 use_fused_entropy = (
                     target_device.type == "cuda" and torch.cuda.is_available()
                 )
+                fused_entropy_fn = None
                 if use_fused_entropy:
                     try:
                         from chaoscontrol.kernels._lm_head_loss import (
-                            fused_lm_head_forward_with_ce_entropy,
+                            fused_lm_head_forward_with_ce_entropy as fused_entropy_fn,
                         )
                     except Exception:
                         use_fused_entropy = False
@@ -2351,21 +2372,29 @@ def train_fast_for_budget(
                     hidden_cd = model.encode(inputs)
                     normed_cd = model.final_norm(hidden_cd)
                     B_cd, T_cd = inputs.shape[0], inputs.shape[1]
-                    if use_fused_entropy:
-                        (
-                            _loss_ignore,
-                            _lse_ignore,
-                            per_token_ce_flat,
-                            per_token_entropy_flat,
-                        ) = fused_lm_head_forward_with_ce_entropy(
-                            normed_cd,
-                            model.lm_head.weight,
-                            targets,
-                            tile_size=int(lm_head_tile_size),
-                        )
-                        per_token_ce_bt = per_token_ce_flat.reshape(B_cd, T_cd)
-                        per_token_entropy_bt = per_token_entropy_flat.reshape(B_cd, T_cd)
-                    else:
+                    if use_fused_entropy and fused_entropy_fn is not None:
+                        try:
+                            (
+                                _loss_ignore,
+                                _lse_ignore,
+                                per_token_ce_flat,
+                                per_token_entropy_flat,
+                            ) = fused_entropy_fn(
+                                normed_cd,
+                                model.lm_head.weight,
+                                targets,
+                                tile_size=int(lm_head_tile_size),
+                            )
+                            per_token_ce_bt = per_token_ce_flat.reshape(B_cd, T_cd)
+                            per_token_entropy_bt = per_token_entropy_flat.reshape(
+                                B_cd, T_cd
+                            )
+                        except (AttributeError, RuntimeError):
+                            # Stale extension missing the entropy entrypoint,
+                            # or kernel launch failure — fall through to the
+                            # softmax path. Same codepath as CPU.
+                            use_fused_entropy = False
+                    if not (use_fused_entropy and per_token_ce_bt is not None):
                         logits_cd = normed_cd @ model.lm_head.weight.t()
                         V_cd = logits_cd.shape[-1]
                         per_token_ce_flat = F.cross_entropy(
@@ -2945,6 +2974,72 @@ def run_condition(
         ),
         scopt_pressure_upper_floor=float(
             config.get("scopt_pressure_upper_floor", 1.0)
+        ),
+        lm_head_emit_entropy=bool(config.get("lm_head_emit_entropy", False)),
+        criticality_distill_enabled=bool(
+            config.get("criticality_distill_enabled", False)
+        ),
+        criticality_distill_num_layers=(
+            int(config["criticality_distill_num_layers"])
+            if "criticality_distill_num_layers" in config
+            else int(config["num_layers"])
+            if "num_layers" in config
+            else None
+        ),
+        criticality_distill_dim=(
+            int(config["criticality_distill_dim"])
+            if "criticality_distill_dim" in config
+            else int(config["model_dim"])
+            if "model_dim" in config
+            else None
+        ),
+        criticality_distill_budget_frac=float(
+            config.get("criticality_distill_budget_frac", 0.15)
+        ),
+        criticality_distill_critical_value=float(
+            config.get("criticality_distill_critical_value", 0.95)
+        ),
+        criticality_distill_trace_ttl_steps=int(
+            config.get("criticality_distill_trace_ttl_steps", 1024)
+        ),
+        criticality_distill_trace_half_life_steps=float(
+            config.get("criticality_distill_trace_half_life_steps", 256.0)
+        ),
+        criticality_distill_seat_refresh_interval=int(
+            config.get("criticality_distill_seat_refresh_interval", 64)
+        ),
+        criticality_distill_min_weighted_events_per_layer=float(
+            config.get(
+                "criticality_distill_min_weighted_events_per_layer", 256.0
+            )
+        ),
+        criticality_distill_horizon_H=int(
+            config.get("criticality_distill_horizon_H", 16)
+        ),
+        criticality_distill_event_frac=float(
+            config.get("criticality_distill_event_frac", 0.05)
+        ),
+        criticality_distill_weight=float(
+            config.get("criticality_distill_weight", 1e-3)
+        ),
+        criticality_distill_uniform_pressure=bool(
+            config.get("criticality_distill_uniform_pressure", False)
+        ),
+        criticality_distill_score_permute_before_topk=bool(
+            config.get("criticality_distill_score_permute_before_topk", False)
+        ),
+        criticality_distill_fixed_random_seats=bool(
+            config.get("criticality_distill_fixed_random_seats", False)
+        ),
+        rare_bucket_ce_enabled=bool(
+            config.get("rare_bucket_ce_enabled", False)
+        ),
+        rare_bucket_ce_num_buckets=int(
+            config.get("rare_bucket_ce_num_buckets", 4)
+        ),
+        rare_bucket_ce_token_frequencies=None,
+        emit_topology_snapshot=bool(
+            config.get("emit_topology_snapshot", False)
         ),
     )
 

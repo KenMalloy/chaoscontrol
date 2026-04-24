@@ -2774,6 +2774,32 @@ def test_train_fast_for_budget_wires_criticality_distillation_4_steps():
             assert any_tensor.is_pinned()
 
 
+def test_train_fast_for_budget_rejects_cd_on_multi_rank():
+    """CD is single-rank only in this runner — evidence/seat state is
+    rank-local and cd_loss.backward() is not all-reduced. Any world_size > 1
+    would produce divergent log_a updates. The runner must raise cleanly
+    rather than silently diverge."""
+    mod = _load_runner_module()
+    model = _TinyCDTrainModel(dim=4, vocab_size=6, num_layers=2)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+    with pytest.raises(ValueError, match=r"single-rank|world_size"):
+        mod.train_fast_for_budget(
+            model,
+            train_tokens=torch.arange(32, dtype=torch.int16) % 6,
+            train_num_tokens=32, stride=4, seq_len=3, batch_size=2,
+            device=torch.device("cpu"), optimizer=optimizer,
+            budget_seconds=1.0, chunk_size=2, grad_clip_norm=0.0,
+            fused_grad_clip=False,
+            rank=0, world_size=2, seed=123, precision="fp32",
+            stop_check_interval=1, stop_margin_seconds=0.0,
+            vocab_size=6, max_steps=1, prefetch_batches=False,
+            criticality_distill_enabled=True,
+            lm_head_emit_entropy=True,
+            criticality_distill_num_layers=2,
+            criticality_distill_dim=4,
+        )
+
+
 def test_train_fast_for_budget_rejects_cd_with_missing_num_layers():
     mod = _load_runner_module()
     model = _TinyCDTrainModel(dim=4, vocab_size=6, num_layers=2)

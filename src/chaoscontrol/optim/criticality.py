@@ -563,12 +563,19 @@ class CriticalityDistillation(nn.Module):
             la = log_a_per_layer[layer].detach().to(dtype=torch.float32)
             crit = 1.0 - torch.sigmoid(la)  # [D]
             cur_lmask = current_mask[layer]  # [D] bool
-            # Seat churn.
+            # Seat churn — fraction of SEATS that moved since last snapshot.
+            # Normalize by the current seat count (k), not D, so it reads as
+            # "of the k seats, what fraction are in new positions?" — every
+            # seat that moved counts as 1 change; a single move flips two bits
+            # in the mask (one seat leaving, one seat arriving), so we halve
+            # the bit-diff count to recover the seat-count denominator.
             if self._previous_seat_mask_snapshot is None:
                 churn = 0.0
             else:
                 prev = self._previous_seat_mask_snapshot[layer]
-                churn = float((prev != cur_lmask).float().mean().item())
+                k = max(1, int(cur_lmask.sum().item()))
+                bit_diffs = int((prev != cur_lmask).sum().item())
+                churn = float(bit_diffs) / (2.0 * float(k))
             seat_churn.append(churn)
             # Budget occupancy: fraction of seated channels with criticality >= 0.9 * critical_value.
             k = int(cur_lmask.sum().item())
