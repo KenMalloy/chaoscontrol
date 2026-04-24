@@ -125,6 +125,34 @@ __global__ void linear_ce_fill_grad_logits_kernel(
     store_from_float(grad_logits + idx, grad);
 }
 
+template <typename logits_t, typename grad_t>
+__global__ void linear_ce_fill_grad_logits_weighted_kernel(
+    const logits_t* __restrict__ logits,
+    const int64_t* __restrict__ targets,
+    const float* __restrict__ lse,
+    const float* __restrict__ grad_loss,
+    const float* __restrict__ row_weight,
+    const float* __restrict__ normalizer,
+    grad_t* __restrict__ grad_logits,
+    int64_t rows,
+    int tile_cols,
+    int64_t tile_start) {
+    const int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int64_t total = rows * static_cast<int64_t>(tile_cols);
+    if (idx >= total) {
+        return;
+    }
+
+    const int64_t row = idx / tile_cols;
+    const int col = static_cast<int>(idx - row * static_cast<int64_t>(tile_cols));
+    float grad = expf(load_as_float(logits + idx) - lse[row]);
+    if (targets[row] == tile_start + col) {
+        grad -= 1.0f;
+    }
+    grad *= load_as_float(grad_loss) * row_weight[row] / fmaxf(normalizer[0], 1.0f);
+    store_from_float(grad_logits + idx, grad);
+}
+
 template <typename scalar_t, int Block>
 __global__ void linear_ce_update_online_kernel(
     const scalar_t* __restrict__ logits,
@@ -290,6 +318,37 @@ void launch_fill_grad_logits_typed(
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
+template <typename logits_t, typename grad_t>
+void launch_fill_grad_logits_weighted_typed(
+    const at::Tensor& logits,
+    const at::Tensor& targets,
+    const at::Tensor& lse,
+    const at::Tensor& grad_loss,
+    const at::Tensor& row_weight,
+    const at::Tensor& normalizer,
+    at::Tensor& grad_logits,
+    int64_t tile_start) {
+    constexpr int Block = 256;
+    const auto rows = logits.size(0);
+    const auto tile_cols = static_cast<int>(logits.size(1));
+    const int64_t total = rows * static_cast<int64_t>(tile_cols);
+    const dim3 grid((total + Block - 1) / Block);
+    const dim3 block(Block);
+    auto stream = at::cuda::getCurrentCUDAStream();
+    linear_ce_fill_grad_logits_weighted_kernel<logits_t, grad_t><<<grid, block, 0, stream>>>(
+        logits.data_ptr<logits_t>(),
+        targets.data_ptr<int64_t>(),
+        lse.data_ptr<float>(),
+        grad_loss.data_ptr<float>(),
+        row_weight.data_ptr<float>(),
+        normalizer.data_ptr<float>(),
+        grad_logits.data_ptr<grad_t>(),
+        rows,
+        tile_cols,
+        tile_start);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
 }  // namespace
 
 void launch_linear_ce_update_max_and_target(
@@ -354,6 +413,37 @@ void launch_linear_ce_fill_grad_logits(
                 [&] {
                     launch_fill_grad_logits_typed<logits_t, scalar_t>(
                         logits, targets, lse, grad_loss, grad_logits, tile_start, divisor);
+                });
+        });
+}
+
+void launch_linear_ce_fill_grad_logits_weighted(
+    const at::Tensor& logits,
+    const at::Tensor& targets,
+    const at::Tensor& lse,
+    const at::Tensor& grad_loss,
+    const at::Tensor& row_weight,
+    const at::Tensor& normalizer,
+    at::Tensor& grad_logits,
+    int64_t tile_start) {
+    AT_DISPATCH_FLOATING_TYPES_AND2(
+        at::kHalf, at::kBFloat16, logits.scalar_type(),
+        "cc_lm_head_loss_linear_ce_fill_grad_logits_weighted_logits",
+        [&] {
+            using logits_t = scalar_t;
+            AT_DISPATCH_FLOATING_TYPES_AND2(
+                at::kHalf, at::kBFloat16, grad_logits.scalar_type(),
+                "cc_lm_head_loss_linear_ce_fill_grad_logits_weighted_grad",
+                [&] {
+                    launch_fill_grad_logits_weighted_typed<logits_t, scalar_t>(
+                        logits,
+                        targets,
+                        lse,
+                        grad_loss,
+                        row_weight,
+                        normalizer,
+                        grad_logits,
+                        tile_start);
                 });
         });
 }

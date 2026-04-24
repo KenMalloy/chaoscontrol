@@ -89,6 +89,53 @@ void check_linear_ce_inputs(
     TORCH_CHECK(weight.size(0) > 0, op_name, ": vocab dimension must be positive");
 }
 
+void check_linear_ce_weighted_backward_inputs(
+    const at::Tensor& grad_loss,
+    const at::Tensor& x,
+    const at::Tensor& weight,
+    const at::Tensor& targets,
+    const at::Tensor& lse,
+    const at::Tensor& row_weight,
+    const at::Tensor& normalizer,
+    int64_t tile_size,
+    const char* op_name) {
+    check_linear_ce_inputs(
+        x,
+        weight,
+        targets,
+        static_cast<int64_t>(Reduction::Sum),
+        tile_size,
+        op_name);
+    TORCH_CHECK(grad_loss.is_cuda(), op_name, ": grad_loss must be CUDA");
+    TORCH_CHECK(lse.is_cuda(), op_name, ": lse must be CUDA");
+    TORCH_CHECK(row_weight.is_cuda(), op_name, ": row_weight must be CUDA");
+    TORCH_CHECK(normalizer.is_cuda(), op_name, ": normalizer must be CUDA");
+    TORCH_CHECK(grad_loss.numel() == 1, op_name, ": grad_loss must be scalar");
+    TORCH_CHECK(lse.is_contiguous(), op_name, ": lse must be contiguous");
+    TORCH_CHECK(row_weight.is_contiguous(), op_name, ": row_weight must be contiguous");
+    TORCH_CHECK(normalizer.is_contiguous(), op_name, ": normalizer must be contiguous");
+    TORCH_CHECK(
+        lse.dim() == 1 && lse.size(0) == x.size(0),
+        op_name,
+        ": lse row mismatch");
+    TORCH_CHECK(
+        row_weight.dim() == 1 && row_weight.size(0) == x.size(0),
+        op_name,
+        ": row_weight row mismatch");
+    TORCH_CHECK(
+        row_weight.scalar_type() == at::kFloat,
+        op_name,
+        ": row_weight must be float32");
+    TORCH_CHECK(
+        normalizer.numel() == 1,
+        op_name,
+        ": normalizer must be scalar");
+    TORCH_CHECK(
+        normalizer.scalar_type() == at::kFloat,
+        op_name,
+        ": normalizer must be float32");
+}
+
 std::tuple<at::Tensor, at::Tensor, at::Tensor> linear_ce_forward(
     const at::Tensor& x,
     const at::Tensor& weight,
@@ -447,6 +494,197 @@ std::tuple<at::Tensor, at::Tensor> linear_ce_streaming_cached_backward(
     return {grad_x, grad_weight};
 }
 
+std::tuple<at::Tensor, at::Tensor> linear_ce_weighted_backward(
+    const at::Tensor& grad_loss,
+    const at::Tensor& x,
+    const at::Tensor& weight,
+    const at::Tensor& targets,
+    const at::Tensor& lse,
+    const at::Tensor& row_weight,
+    const at::Tensor& normalizer,
+    int64_t tile_size) {
+    check_linear_ce_weighted_backward_inputs(
+        grad_loss,
+        x,
+        weight,
+        targets,
+        lse,
+        row_weight,
+        normalizer,
+        tile_size,
+        "lm_head_loss linear_ce_weighted_backward");
+
+    const auto rows = x.size(0);
+    const auto vocab = weight.size(0);
+    auto grad_loss_f = grad_loss.to(at::kFloat).contiguous();
+    auto grad_x = at::zeros_like(x);
+    auto grad_weight = at::empty_like(weight);
+
+    for (int64_t start = 0; start < vocab; start += tile_size) {
+        const int64_t cols = std::min<int64_t>(tile_size, vocab - start);
+        auto weight_tile = weight.narrow(0, start, cols);
+        auto logits = at::matmul(x, weight_tile.transpose(0, 1)).contiguous();
+        auto grad_logits = at::empty({rows, cols}, x.options());
+        launch_linear_ce_fill_grad_logits_weighted(
+            logits,
+            targets,
+            lse,
+            grad_loss_f,
+            row_weight,
+            normalizer,
+            grad_logits,
+            start);
+
+        grad_x.add_(at::matmul(grad_logits, weight_tile));
+        grad_weight.narrow(0, start, cols).copy_(
+            at::matmul(grad_logits.transpose(0, 1), x));
+    }
+
+    return {grad_x, grad_weight};
+}
+
+std::tuple<at::Tensor, at::Tensor> linear_ce_streaming_weighted_backward(
+    const at::Tensor& grad_loss,
+    const at::Tensor& x,
+    const at::Tensor& weight,
+    const at::Tensor& targets,
+    const at::Tensor& lse,
+    const at::Tensor& row_weight,
+    const at::Tensor& normalizer,
+    int64_t tile_size) {
+    return linear_ce_weighted_backward(
+        grad_loss, x, weight, targets, lse, row_weight, normalizer, tile_size);
+}
+
+std::tuple<at::Tensor, at::Tensor> linear_ce_streaming_v2_weighted_backward(
+    const at::Tensor& grad_loss,
+    const at::Tensor& x,
+    const at::Tensor& weight,
+    const at::Tensor& targets,
+    const at::Tensor& lse,
+    const at::Tensor& row_weight,
+    const at::Tensor& normalizer,
+    int64_t tile_size) {
+    check_linear_ce_weighted_backward_inputs(
+        grad_loss,
+        x,
+        weight,
+        targets,
+        lse,
+        row_weight,
+        normalizer,
+        tile_size,
+        "lm_head_loss linear_ce_streaming_v2_weighted_backward");
+
+    const auto rows = x.size(0);
+    const auto vocab = weight.size(0);
+    auto grad_loss_f = grad_loss.to(at::kFloat).contiguous();
+    auto grad_x = at::zeros_like(x);
+    auto grad_weight = at::empty_like(weight);
+    auto logits_workspace = make_tile_workspace(x, rows, vocab, tile_size);
+    auto grad_logits_workspace = make_tile_workspace(x, rows, vocab, tile_size);
+
+    for (int64_t start = 0; start < vocab; start += tile_size) {
+        const int64_t cols = std::min<int64_t>(tile_size, vocab - start);
+        auto weight_tile = weight.narrow(0, start, cols);
+        auto logits = full_or_partial_tile(logits_workspace, x, rows, cols);
+        auto grad_logits = full_or_partial_tile(
+            grad_logits_workspace, x, rows, cols);
+        at::mm_out(logits, x, weight_tile.transpose(0, 1));
+        launch_linear_ce_fill_grad_logits_weighted(
+            logits,
+            targets,
+            lse,
+            grad_loss_f,
+            row_weight,
+            normalizer,
+            grad_logits,
+            start);
+
+        at::addmm_out(grad_x, grad_x, grad_logits, weight_tile, 1.0, 1.0);
+        auto grad_weight_tile = grad_weight.narrow(0, start, cols);
+        at::mm_out(grad_weight_tile, grad_logits.transpose(0, 1), x);
+    }
+
+    return {grad_x, grad_weight};
+}
+
+std::tuple<at::Tensor, at::Tensor> linear_ce_streaming_cached_weighted_backward(
+    const at::Tensor& grad_loss,
+    const at::Tensor& x,
+    const at::Tensor& weight,
+    const at::Tensor& targets,
+    const at::Tensor& lse,
+    const at::Tensor& logits_cache,
+    const at::Tensor& row_weight,
+    const at::Tensor& normalizer,
+    int64_t tile_size) {
+    check_linear_ce_weighted_backward_inputs(
+        grad_loss,
+        x,
+        weight,
+        targets,
+        lse,
+        row_weight,
+        normalizer,
+        tile_size,
+        "lm_head_loss linear_ce_streaming_cached_weighted_backward");
+    TORCH_CHECK(
+        logits_cache.is_cuda(),
+        "lm_head_loss linear_ce_streaming_cached_weighted_backward: "
+        "logits_cache must be CUDA");
+    TORCH_CHECK(
+        logits_cache.is_contiguous(),
+        "lm_head_loss linear_ce_streaming_cached_weighted_backward: "
+        "logits_cache must be contiguous");
+
+    const auto rows = x.size(0);
+    const auto vocab = weight.size(0);
+    TORCH_CHECK(
+        vocab % tile_size == 0,
+        "lm_head_loss linear_ce_streaming_cached_weighted_backward: vocab must "
+        "be an exact multiple of tile_size for the cached logits layout");
+    const auto tiles = vocab / tile_size;
+    TORCH_CHECK(
+        logits_cache.dim() == 3 &&
+            logits_cache.size(0) == tiles &&
+            logits_cache.size(1) == rows &&
+            logits_cache.size(2) == tile_size,
+        "lm_head_loss linear_ce_streaming_cached_weighted_backward: "
+        "logits_cache shape mismatch");
+    TORCH_CHECK(
+        logits_cache.scalar_type() == x.scalar_type(),
+        "lm_head_loss linear_ce_streaming_cached_weighted_backward: "
+        "logits_cache dtype mismatch");
+
+    auto grad_loss_f = grad_loss.to(at::kFloat).contiguous();
+    auto grad_x = at::zeros_like(x);
+    auto grad_weight = at::empty_like(weight);
+    auto grad_logits_workspace = make_tile_workspace(x, rows, vocab, tile_size);
+
+    for (int64_t tile_idx = 0; tile_idx < tiles; ++tile_idx) {
+        const int64_t start = tile_idx * tile_size;
+        auto weight_tile = weight.narrow(0, start, tile_size);
+        auto logits = logits_cache.select(0, tile_idx);
+        launch_linear_ce_fill_grad_logits_weighted(
+            logits,
+            targets,
+            lse,
+            grad_loss_f,
+            row_weight,
+            normalizer,
+            grad_logits_workspace,
+            start);
+
+        at::addmm_out(
+            grad_x, grad_x, grad_logits_workspace, weight_tile, 1.0, 1.0);
+        auto grad_weight_tile = grad_weight.narrow(0, start, tile_size);
+        at::mm_out(grad_weight_tile, grad_logits_workspace.transpose(0, 1), x);
+    }
+
+    return {grad_x, grad_weight};
+}
+
 }  // namespace cc_lm_head_loss
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -470,4 +708,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "Cached-logits one-pass tiled linear+cross-entropy forward for Exp23");
     m.def("linear_ce_streaming_cached_backward", &cc_lm_head_loss::linear_ce_streaming_cached_backward,
           "Cached-logits tiled linear+cross-entropy backward for Exp23");
+    m.def("linear_ce_weighted_backward", &cc_lm_head_loss::linear_ce_weighted_backward,
+          "Tiled weighted linear+cross-entropy backward for Exp23");
+    m.def("linear_ce_streaming_weighted_backward", &cc_lm_head_loss::linear_ce_streaming_weighted_backward,
+          "Tiled weighted linear+cross-entropy backward for one-pass Exp23");
+    m.def("linear_ce_streaming_v2_weighted_backward", &cc_lm_head_loss::linear_ce_streaming_v2_weighted_backward,
+          "Workspace-backed weighted linear+cross-entropy backward for Exp23");
+    m.def("linear_ce_streaming_cached_weighted_backward", &cc_lm_head_loss::linear_ce_streaming_cached_weighted_backward,
+          "Cached-logits weighted linear+cross-entropy backward for Exp23");
 }

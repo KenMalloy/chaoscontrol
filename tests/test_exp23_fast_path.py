@@ -533,6 +533,109 @@ def test_scopt_split_step_batches_rare_param_and_activation_grads(monkeypatch):
     assert len(calls) == 2  # common grads, then rare params + activations together.
 
 
+def test_scopt_split_step_uses_fused_weighted_lm_head(monkeypatch):
+    mod = _load_runner_module()
+    from chaoscontrol.core import RMSNorm
+    from chaoscontrol.optim.scopt import ScarcityAwareOptimizer
+
+    class _TinyNormTokenModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embed = nn.Embedding(6, 4)
+            self.final_norm = RMSNorm(4)
+            self.lm_head = nn.Linear(4, 6, bias=False)
+
+        def encode(self, inputs: torch.Tensor) -> torch.Tensor:
+            return self.embed(inputs)
+
+    model = _TinyNormTokenModel()
+    optimizer = ScarcityAwareOptimizer(
+        model.parameters(),
+        lr=0.01,
+        momentum=0.0,
+        nesterov=False,
+        ns_steps=1,
+        weight_decay=0.0,
+        warmup_steps=0,
+        compute_dtype=torch.float32,
+    )
+    optimizer.bind_param_names(list(model.named_parameters()))
+    common_calls = []
+    rare_calls = []
+
+    def fake_fused_lm_head_loss_with_ce(
+        *,
+        hidden,
+        final_norm,
+        lm_head,
+        targets,
+        backend,
+        tile_size,
+    ):
+        common_calls.append((backend, tile_size))
+        per_token_ce = torch.arange(
+            1,
+            targets.numel() + 1,
+            dtype=torch.float32,
+            device=targets.device,
+        )
+        return hidden.square().mean(), per_token_ce
+
+    def fake_fused_lm_head_weighted_loss_with_ce(
+        *,
+        hidden,
+        final_norm,
+        lm_head,
+        targets,
+        token_weight,
+        backend,
+        tile_size,
+    ):
+        rare_calls.append((backend, tile_size, token_weight.detach().clone()))
+        rare_scale = token_weight.detach().float().mean().clamp_min(1e-6)
+        return hidden.square().mean() * rare_scale, torch.zeros(
+            targets.numel(),
+            dtype=torch.float32,
+            device=targets.device,
+        )
+
+    monkeypatch.setattr(
+        mod,
+        "fused_lm_head_loss_with_ce",
+        fake_fused_lm_head_loss_with_ce,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        mod,
+        "fused_lm_head_weighted_loss_with_ce",
+        fake_fused_lm_head_weighted_loss_with_ce,
+        raising=False,
+    )
+
+    _, pending = mod._run_scopt_train_step(
+        model=model,
+        optimizer=optimizer,
+        inputs=torch.tensor([[0, 1, 2], [1, 2, 3]]),
+        targets=torch.tensor([[1, 2, 3], [2, 3, 4]]),
+        token_frequencies=torch.ones(6),
+        precision="fp32",
+        ddp_active=False,
+        world_size=1,
+        step=0,
+        split_interval=1,
+        lm_head_backward_mode="fused_norm_streaming_v2",
+        lm_head_tile_size=4096,
+    )
+
+    assert pending is not None
+    assert common_calls == [("norm_streaming_v2", 4096)]
+    assert len(rare_calls) == 1
+    backend, tile_size, token_weight = rare_calls[0]
+    assert (backend, tile_size) == ("norm_streaming_v2", 4096)
+    assert token_weight.shape == (2, 3)
+    assert token_weight.max() > 0
+
+
 def test_train_fast_for_budget_routes_scopt_warmup_to_common_fast_path(monkeypatch):
     mod = _load_runner_module()
     from chaoscontrol.optim.scopt import ScarcityAwareOptimizer

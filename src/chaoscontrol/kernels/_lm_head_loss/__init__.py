@@ -77,6 +77,60 @@ def _fallback_linear_cross_entropy(
     return loss, per_token_ce.detach()
 
 
+def _flat_token_weight(
+    token_weight: torch.Tensor,
+    *,
+    rows: int,
+    device: torch.device,
+    op_name: str,
+) -> torch.Tensor:
+    if token_weight.numel() != rows:
+        raise ValueError(
+            f"{op_name}: token_weight must contain one value per input row, "
+            f"got {token_weight.numel()} weights for {rows} rows"
+        )
+    if token_weight.device != device:
+        raise ValueError(
+            f"{op_name}: token_weight must be on the same device as x, got "
+            f"{token_weight.device} and {device}"
+        )
+    return token_weight.reshape(-1).detach().to(dtype=torch.float32).contiguous()
+
+
+def _weighted_loss_from_per_token_ce(
+    per_token_ce: torch.Tensor,
+    flat_token_weight: torch.Tensor,
+) -> torch.Tensor:
+    normalizer = flat_token_weight.sum().clamp_min(1.0)
+    return (per_token_ce * flat_token_weight).sum() / normalizer
+
+
+def _fallback_linear_cross_entropy_weighted(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    targets: torch.Tensor,
+    token_weight: torch.Tensor,
+    *,
+    op_name: str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    rows = x.numel() // x.size(-1)
+    flat_weight = _flat_token_weight(
+        token_weight,
+        rows=rows,
+        device=x.device,
+        op_name=op_name,
+    )
+    flat_x = x.reshape(-1, x.size(-1))
+    logits = flat_x @ weight.t()
+    per_token_ce = F.cross_entropy(
+        logits.float(),
+        targets.reshape(-1),
+        reduction="none",
+    )
+    loss = _weighted_loss_from_per_token_ce(per_token_ce, flat_weight)
+    return loss, per_token_ce.detach()
+
+
 def _fallback_rms_linear_cross_entropy(
     x: torch.Tensor,
     norm_weight: torch.Tensor,
@@ -92,6 +146,26 @@ def _fallback_rms_linear_cross_entropy(
         linear_weight,
         targets,
         reduction=reduction,
+    )
+
+
+def _fallback_rms_linear_cross_entropy_weighted(
+    x: torch.Tensor,
+    norm_weight: torch.Tensor,
+    linear_weight: torch.Tensor,
+    targets: torch.Tensor,
+    token_weight: torch.Tensor,
+    *,
+    eps: float,
+    op_name: str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    normed = _fallback_rms_norm(x, norm_weight, float(eps))
+    return _fallback_linear_cross_entropy_weighted(
+        normed,
+        linear_weight,
+        targets,
+        token_weight,
+        op_name=op_name,
     )
 
 
@@ -148,6 +222,37 @@ def _is_linear_ce_kernel_eligible(
     if not targets.is_cuda:
         return False
     if targets.dtype != torch.long:
+        return False
+    return True
+
+
+def _linear_ce_weighted_backward_name(backend: str) -> str:
+    if backend == "streaming":
+        return "linear_ce_streaming_weighted_backward"
+    if backend == "streaming_v2":
+        return "linear_ce_streaming_v2_weighted_backward"
+    if backend == "streaming_cached":
+        return "linear_ce_streaming_cached_weighted_backward"
+    return "linear_ce_weighted_backward"
+
+
+def _is_linear_ce_weighted_kernel_eligible(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    targets: torch.Tensor,
+    token_weight: torch.Tensor,
+    *,
+    backend: str,
+) -> bool:
+    if not _is_linear_ce_kernel_eligible(x, weight, targets, backend=backend):
+        return False
+    if token_weight.device != x.device:
+        return False
+    if token_weight.dtype != torch.float32:
+        return False
+    if not token_weight.is_contiguous():
+        return False
+    if not hasattr(_C, _linear_ce_weighted_backward_name(backend)):
         return False
     return True
 
@@ -393,6 +498,122 @@ class _StreamingCachedLinearCrossEntropyFn(torch.autograd.Function):
         return grad_x.reshape(ctx.x_shape), grad_weight, None, None, None
 
 
+class _WeightedLinearCrossEntropyFn(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        targets: torch.Tensor,
+        token_weight: torch.Tensor,
+        tile_size: int,
+        backend: str,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        flat_x = x.reshape(-1, x.size(-1)).contiguous()
+        flat_targets = targets.reshape(-1).contiguous()
+        flat_token_weight = token_weight.contiguous()
+        compute_weight = weight.contiguous()
+        if compute_weight.dtype != flat_x.dtype:
+            compute_weight = compute_weight.to(dtype=flat_x.dtype)
+        reduction_id = 1
+
+        if backend == "streaming_v2":
+            _, lse, per_token_ce = _C.linear_ce_streaming_v2_forward(
+                flat_x,
+                compute_weight,
+                flat_targets,
+                reduction_id,
+                int(tile_size),
+            )
+            saved = (flat_x, compute_weight, flat_targets, lse, flat_token_weight)
+        elif backend == "streaming":
+            _, lse, per_token_ce = _C.linear_ce_streaming_forward(
+                flat_x,
+                compute_weight,
+                flat_targets,
+                reduction_id,
+                int(tile_size),
+            )
+            saved = (flat_x, compute_weight, flat_targets, lse, flat_token_weight)
+        elif backend == "streaming_cached":
+            _, lse, per_token_ce, logits_cache = _C.linear_ce_streaming_cached_forward(
+                flat_x,
+                compute_weight,
+                flat_targets,
+                reduction_id,
+                int(tile_size),
+            )
+            saved = (
+                flat_x,
+                compute_weight,
+                flat_targets,
+                lse,
+                flat_token_weight,
+                logits_cache,
+            )
+        else:
+            _, lse, per_token_ce = _C.linear_ce_forward(
+                flat_x,
+                compute_weight,
+                flat_targets,
+                reduction_id,
+                int(tile_size),
+            )
+            saved = (flat_x, compute_weight, flat_targets, lse, flat_token_weight)
+
+        normalizer = flat_token_weight.sum().clamp_min(1.0).contiguous()
+        loss = (per_token_ce * flat_token_weight).sum() / normalizer
+        ctx.save_for_backward(*saved, normalizer)
+        ctx.x_shape = tuple(x.shape)
+        ctx.weight_dtype = weight.dtype
+        ctx.tile_size = int(tile_size)
+        ctx.backend = backend
+        ctx.has_logits_cache = backend == "streaming_cached"
+        ctx.mark_non_differentiable(per_token_ce)
+        return loss, per_token_ce
+
+    @staticmethod
+    def backward(ctx, grad_loss: torch.Tensor, grad_per_token_ce: torch.Tensor):  # type: ignore[override]
+        saved = ctx.saved_tensors
+        if ctx.has_logits_cache:
+            (
+                flat_x,
+                weight,
+                flat_targets,
+                lse,
+                flat_token_weight,
+                logits_cache,
+                normalizer,
+            ) = saved
+            grad_x, grad_weight = _C.linear_ce_streaming_cached_weighted_backward(
+                grad_loss.contiguous(),
+                flat_x,
+                weight,
+                flat_targets,
+                lse.contiguous(),
+                logits_cache,
+                flat_token_weight,
+                normalizer,
+                ctx.tile_size,
+            )
+        else:
+            flat_x, weight, flat_targets, lse, flat_token_weight, normalizer = saved
+            backward_name = _linear_ce_weighted_backward_name(ctx.backend)
+            grad_x, grad_weight = getattr(_C, backward_name)(
+                grad_loss.contiguous(),
+                flat_x,
+                weight,
+                flat_targets,
+                lse.contiguous(),
+                flat_token_weight,
+                normalizer,
+                ctx.tile_size,
+            )
+        if grad_weight.dtype != ctx.weight_dtype:
+            grad_weight = grad_weight.to(dtype=ctx.weight_dtype)
+        return grad_x.reshape(ctx.x_shape), grad_weight, None, None, None, None
+
+
 class _FusedRMSLinearCrossEntropyFn(torch.autograd.Function):
     @staticmethod
     def forward(
@@ -504,6 +725,193 @@ class _FusedRMSLinearCrossEntropyFn(torch.autograd.Function):
                 flat_targets,
                 lse.contiguous(),
                 ctx.reduction_id,
+                ctx.tile_size,
+            )
+
+        grad_hidden, grad_norm_weight = _C.rms_norm_backward(
+            grad_normed.reshape(ctx.x_shape).contiguous(),
+            x,
+            norm_weight,
+            inv_rms,
+        )
+        if grad_linear_weight.dtype != ctx.linear_weight_dtype:
+            grad_linear_weight = grad_linear_weight.to(
+                dtype=ctx.linear_weight_dtype
+            )
+        return (
+            grad_hidden,
+            grad_norm_weight,
+            grad_linear_weight,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+
+
+class _FusedRMSWeightedLinearCrossEntropyFn(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        x: torch.Tensor,
+        norm_weight: torch.Tensor,
+        linear_weight: torch.Tensor,
+        targets: torch.Tensor,
+        token_weight: torch.Tensor,
+        eps: float,
+        tile_size: int,
+        backend: str,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        x_contig = x.contiguous()
+        norm_weight_contig = norm_weight.contiguous()
+        flat_targets = targets.reshape(-1).contiguous()
+        flat_token_weight = token_weight.contiguous()
+
+        normed, inv_rms = _C.rms_norm_forward(
+            x_contig,
+            norm_weight_contig,
+            float(eps),
+        )
+        flat_normed = normed.reshape(-1, normed.size(-1)).contiguous()
+        compute_weight = linear_weight.contiguous()
+        if compute_weight.dtype != flat_normed.dtype:
+            compute_weight = compute_weight.to(dtype=flat_normed.dtype)
+
+        reduction_id = 1
+        if backend == "streaming_v2":
+            _, lse, per_token_ce = _C.linear_ce_streaming_v2_forward(
+                flat_normed,
+                compute_weight,
+                flat_targets,
+                reduction_id,
+                int(tile_size),
+            )
+            saved = (
+                x_contig,
+                norm_weight_contig,
+                inv_rms,
+                flat_normed,
+                compute_weight,
+                flat_targets,
+                lse,
+                flat_token_weight,
+            )
+        elif backend == "streaming":
+            _, lse, per_token_ce = _C.linear_ce_streaming_forward(
+                flat_normed,
+                compute_weight,
+                flat_targets,
+                reduction_id,
+                int(tile_size),
+            )
+            saved = (
+                x_contig,
+                norm_weight_contig,
+                inv_rms,
+                flat_normed,
+                compute_weight,
+                flat_targets,
+                lse,
+                flat_token_weight,
+            )
+        elif backend == "streaming_cached":
+            _, lse, per_token_ce, logits_cache = _C.linear_ce_streaming_cached_forward(
+                flat_normed,
+                compute_weight,
+                flat_targets,
+                reduction_id,
+                int(tile_size),
+            )
+            saved = (
+                x_contig,
+                norm_weight_contig,
+                inv_rms,
+                flat_normed,
+                compute_weight,
+                flat_targets,
+                lse,
+                flat_token_weight,
+                logits_cache,
+            )
+        else:
+            _, lse, per_token_ce = _C.linear_ce_forward(
+                flat_normed,
+                compute_weight,
+                flat_targets,
+                reduction_id,
+                int(tile_size),
+            )
+            saved = (
+                x_contig,
+                norm_weight_contig,
+                inv_rms,
+                flat_normed,
+                compute_weight,
+                flat_targets,
+                lse,
+                flat_token_weight,
+            )
+
+        normalizer = flat_token_weight.sum().clamp_min(1.0).contiguous()
+        loss = (per_token_ce * flat_token_weight).sum() / normalizer
+        ctx.save_for_backward(*saved, normalizer)
+        ctx.x_shape = tuple(x.shape)
+        ctx.linear_weight_dtype = linear_weight.dtype
+        ctx.tile_size = int(tile_size)
+        ctx.backend = backend
+        ctx.has_logits_cache = backend == "streaming_cached"
+        ctx.mark_non_differentiable(per_token_ce)
+        return loss, per_token_ce
+
+    @staticmethod
+    def backward(ctx, grad_loss: torch.Tensor, grad_per_token_ce: torch.Tensor):  # type: ignore[override]
+        saved = ctx.saved_tensors
+        if ctx.has_logits_cache:
+            (
+                x,
+                norm_weight,
+                inv_rms,
+                flat_normed,
+                linear_weight,
+                flat_targets,
+                lse,
+                flat_token_weight,
+                logits_cache,
+                normalizer,
+            ) = saved
+            grad_normed, grad_linear_weight = _C.linear_ce_streaming_cached_weighted_backward(
+                grad_loss.contiguous(),
+                flat_normed,
+                linear_weight,
+                flat_targets,
+                lse.contiguous(),
+                logits_cache,
+                flat_token_weight,
+                normalizer,
+                ctx.tile_size,
+            )
+        else:
+            (
+                x,
+                norm_weight,
+                inv_rms,
+                flat_normed,
+                linear_weight,
+                flat_targets,
+                lse,
+                flat_token_weight,
+                normalizer,
+            ) = saved
+            backward_name = _linear_ce_weighted_backward_name(ctx.backend)
+            grad_normed, grad_linear_weight = getattr(_C, backward_name)(
+                grad_loss.contiguous(),
+                flat_normed,
+                linear_weight,
+                flat_targets,
+                lse.contiguous(),
+                flat_token_weight,
+                normalizer,
                 ctx.tile_size,
             )
 
@@ -700,6 +1108,146 @@ def fused_linear_cross_entropy_with_ce(
     )
 
 
+def _fused_linear_cross_entropy_weighted_dispatch(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    targets: torch.Tensor,
+    token_weight: torch.Tensor,
+    *,
+    tile_size: int,
+    backend: str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    op_name = "fused_linear_cross_entropy_weighted"
+    backend_name = str(backend).strip().lower()
+    if backend_name == "auto":
+        backend_name = "v1"
+    if backend_name not in {"v1", "streaming", "streaming_v2", "streaming_cached"}:
+        raise ValueError(
+            f"{op_name}: backend must be 'auto', 'v1', 'streaming', "
+            f"'streaming_v2', or 'streaming_cached', got {backend!r}"
+        )
+    if x.size(-1) != weight.size(-1):
+        raise ValueError(
+            f"{op_name}: x last dimension must match weight input dimension, "
+            f"got {x.size(-1)} and {weight.size(-1)}"
+        )
+    rows = x.numel() // x.size(-1)
+    if targets.numel() != rows:
+        raise ValueError(
+            f"{op_name}: targets must contain one class index per input row, "
+            f"got {targets.numel()} targets for {rows} rows"
+        )
+    if int(tile_size) <= 0:
+        raise ValueError(f"{op_name}: tile_size must be positive, got {tile_size}")
+    flat_token_weight = _flat_token_weight(
+        token_weight,
+        rows=rows,
+        device=x.device,
+        op_name=op_name,
+    )
+    if backend_name == "streaming" and _is_linear_ce_weighted_kernel_eligible(
+        x, weight, targets, flat_token_weight, backend="streaming"
+    ):
+        return _WeightedLinearCrossEntropyFn.apply(
+            x,
+            weight,
+            targets,
+            flat_token_weight,
+            int(tile_size),
+            "streaming",
+        )
+    if backend_name == "streaming_v2" and _is_linear_ce_weighted_kernel_eligible(
+        x, weight, targets, flat_token_weight, backend="streaming_v2"
+    ):
+        return _WeightedLinearCrossEntropyFn.apply(
+            x,
+            weight,
+            targets,
+            flat_token_weight,
+            int(tile_size),
+            "streaming_v2",
+        )
+    if (
+        backend_name == "streaming_cached"
+        and weight.size(0) % int(tile_size) == 0
+        and _is_linear_ce_weighted_kernel_eligible(
+            x, weight, targets, flat_token_weight, backend="streaming_cached"
+        )
+    ):
+        return _WeightedLinearCrossEntropyFn.apply(
+            x,
+            weight,
+            targets,
+            flat_token_weight,
+            int(tile_size),
+            "streaming_cached",
+        )
+    if backend_name == "v1" and _is_linear_ce_weighted_kernel_eligible(
+        x, weight, targets, flat_token_weight, backend="v1"
+    ):
+        return _WeightedLinearCrossEntropyFn.apply(
+            x,
+            weight,
+            targets,
+            flat_token_weight,
+            int(tile_size),
+            "v1",
+        )
+    return _fallback_linear_cross_entropy_weighted(
+        x,
+        weight,
+        targets,
+        flat_token_weight,
+        op_name=op_name,
+    )
+
+
+def fused_linear_cross_entropy_weighted(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    targets: torch.Tensor,
+    *,
+    token_weight: torch.Tensor,
+    tile_size: int = 1024,
+    backend: str = "auto",
+) -> torch.Tensor:
+    """Linear projection plus weighted cross entropy.
+
+    ``token_weight`` is detached, flattened with ``targets``, and used only as
+    row geometry: ``sum(CE_i * w_i) / max(sum(w_i), 1)``. This is the ScOpt
+    rare-event actuator; the unweighted CE APIs remain unchanged.
+    """
+    loss, _ = _fused_linear_cross_entropy_weighted_dispatch(
+        x,
+        weight,
+        targets,
+        token_weight,
+        tile_size=int(tile_size),
+        backend=backend,
+    )
+    return loss
+
+
+def fused_linear_cross_entropy_weighted_with_ce(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    targets: torch.Tensor,
+    *,
+    token_weight: torch.Tensor,
+    tile_size: int = 1024,
+    backend: str = "auto",
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Weighted CE plus detached per-token CE, shape ``(rows,)``."""
+    return _fused_linear_cross_entropy_weighted_dispatch(
+        x,
+        weight,
+        targets,
+        token_weight,
+        tile_size=int(tile_size),
+        backend=backend,
+    )
+
+
 def _fused_rms_linear_cross_entropy_dispatch(
     x: torch.Tensor,
     norm_weight: torch.Tensor,
@@ -831,10 +1379,191 @@ def fused_rms_linear_cross_entropy_with_ce(
     )
 
 
+def _fused_rms_linear_cross_entropy_weighted_dispatch(
+    x: torch.Tensor,
+    norm_weight: torch.Tensor,
+    linear_weight: torch.Tensor,
+    targets: torch.Tensor,
+    token_weight: torch.Tensor,
+    *,
+    eps: float,
+    tile_size: int,
+    backend: str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    op_name = "fused_rms_linear_cross_entropy_weighted"
+    backend_name = str(backend).strip().lower()
+    if backend_name == "auto":
+        backend_name = "v1"
+    if backend_name not in {"v1", "streaming", "streaming_v2", "streaming_cached"}:
+        raise ValueError(
+            f"{op_name}: backend must be 'auto', 'v1', 'streaming', "
+            f"'streaming_v2', or 'streaming_cached', got {backend!r}"
+        )
+    if x.size(-1) != norm_weight.numel():
+        raise ValueError(
+            f"{op_name}: x last dimension must match norm_weight length, "
+            f"got {x.size(-1)} and {norm_weight.numel()}"
+        )
+    if x.size(-1) != linear_weight.size(-1):
+        raise ValueError(
+            f"{op_name}: x last dimension must match linear_weight input "
+            f"dimension, got {x.size(-1)} and {linear_weight.size(-1)}"
+        )
+    rows = x.numel() // x.size(-1)
+    if targets.numel() != rows:
+        raise ValueError(
+            f"{op_name}: targets must contain one class index per input row, "
+            f"got {targets.numel()} targets for {rows} rows"
+        )
+    if int(tile_size) <= 0:
+        raise ValueError(f"{op_name}: tile_size must be positive, got {tile_size}")
+    flat_token_weight = _flat_token_weight(
+        token_weight,
+        rows=rows,
+        device=x.device,
+        op_name=op_name,
+    )
+    if (
+        _is_kernel_eligible(x, norm_weight)
+        and backend_name == "streaming"
+        and _is_linear_ce_weighted_kernel_eligible(
+            x, linear_weight, targets, flat_token_weight, backend="streaming"
+        )
+    ):
+        return _FusedRMSWeightedLinearCrossEntropyFn.apply(
+            x,
+            norm_weight,
+            linear_weight,
+            targets,
+            flat_token_weight,
+            float(eps),
+            int(tile_size),
+            "streaming",
+        )
+    if (
+        _is_kernel_eligible(x, norm_weight)
+        and backend_name == "streaming_v2"
+        and _is_linear_ce_weighted_kernel_eligible(
+            x, linear_weight, targets, flat_token_weight, backend="streaming_v2"
+        )
+    ):
+        return _FusedRMSWeightedLinearCrossEntropyFn.apply(
+            x,
+            norm_weight,
+            linear_weight,
+            targets,
+            flat_token_weight,
+            float(eps),
+            int(tile_size),
+            "streaming_v2",
+        )
+    if (
+        _is_kernel_eligible(x, norm_weight)
+        and backend_name == "streaming_cached"
+        and linear_weight.size(0) % int(tile_size) == 0
+        and _is_linear_ce_weighted_kernel_eligible(
+            x,
+            linear_weight,
+            targets,
+            flat_token_weight,
+            backend="streaming_cached",
+        )
+    ):
+        return _FusedRMSWeightedLinearCrossEntropyFn.apply(
+            x,
+            norm_weight,
+            linear_weight,
+            targets,
+            flat_token_weight,
+            float(eps),
+            int(tile_size),
+            "streaming_cached",
+        )
+    if (
+        _is_kernel_eligible(x, norm_weight)
+        and backend_name == "v1"
+        and _is_linear_ce_weighted_kernel_eligible(
+            x, linear_weight, targets, flat_token_weight, backend="v1"
+        )
+    ):
+        return _FusedRMSWeightedLinearCrossEntropyFn.apply(
+            x,
+            norm_weight,
+            linear_weight,
+            targets,
+            flat_token_weight,
+            float(eps),
+            int(tile_size),
+            "v1",
+        )
+    return _fallback_rms_linear_cross_entropy_weighted(
+        x,
+        norm_weight,
+        linear_weight,
+        targets,
+        flat_token_weight,
+        eps=float(eps),
+        op_name=op_name,
+    )
+
+
+def fused_rms_linear_cross_entropy_weighted(
+    x: torch.Tensor,
+    norm_weight: torch.Tensor,
+    linear_weight: torch.Tensor,
+    targets: torch.Tensor,
+    *,
+    token_weight: torch.Tensor,
+    eps: float = 1e-6,
+    tile_size: int = 1024,
+    backend: str = "auto",
+) -> torch.Tensor:
+    """RMSNorm + linear projection + weighted CE as one public op."""
+    loss, _ = _fused_rms_linear_cross_entropy_weighted_dispatch(
+        x,
+        norm_weight,
+        linear_weight,
+        targets,
+        token_weight,
+        eps=float(eps),
+        tile_size=int(tile_size),
+        backend=backend,
+    )
+    return loss
+
+
+def fused_rms_linear_cross_entropy_weighted_with_ce(
+    x: torch.Tensor,
+    norm_weight: torch.Tensor,
+    linear_weight: torch.Tensor,
+    targets: torch.Tensor,
+    *,
+    token_weight: torch.Tensor,
+    eps: float = 1e-6,
+    tile_size: int = 1024,
+    backend: str = "auto",
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Weighted RMSNorm+linear CE plus detached per-token CE."""
+    return _fused_rms_linear_cross_entropy_weighted_dispatch(
+        x,
+        norm_weight,
+        linear_weight,
+        targets,
+        token_weight,
+        eps=float(eps),
+        tile_size=int(tile_size),
+        backend=backend,
+    )
+
+
 __all__ = [
     "fused_linear_cross_entropy",
     "fused_linear_cross_entropy_with_ce",
+    "fused_linear_cross_entropy_weighted",
+    "fused_linear_cross_entropy_weighted_with_ce",
     "fused_rms_linear_cross_entropy",
     "fused_rms_linear_cross_entropy_with_ce",
+    "fused_rms_linear_cross_entropy_weighted",
+    "fused_rms_linear_cross_entropy_weighted_with_ce",
     "fused_rms_norm",
 ]

@@ -33,4 +33,14 @@ void launch_linear_ce_fill_grad_logits(
     int64_t tile_start,
     double divisor);
 
+void launch_linear_ce_fill_grad_logits_weighted(
+    const at::Tensor& logits,
+    const at::Tensor& targets,
+    const at::Tensor& lse,
+    const at::Tensor& grad_loss,
+    const at::Tensor& row_weight,
+    const at::Tensor& normalizer,
+    at::Tensor& grad_logits,
+    int64_t tile_start);
+
 }  // namespace cc_lm_head_loss

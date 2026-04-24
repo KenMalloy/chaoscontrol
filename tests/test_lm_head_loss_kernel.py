@@ -12,8 +12,12 @@ import chaoscontrol.kernels._lm_head_loss as lm_head_loss
 from chaoscontrol.kernels._lm_head_loss import (
     fused_linear_cross_entropy,
     fused_linear_cross_entropy_with_ce,
+    fused_linear_cross_entropy_weighted,
+    fused_linear_cross_entropy_weighted_with_ce,
     fused_rms_linear_cross_entropy,
     fused_rms_linear_cross_entropy_with_ce,
+    fused_rms_linear_cross_entropy_weighted,
+    fused_rms_linear_cross_entropy_weighted_with_ce,
     fused_rms_norm,
 )
 
@@ -45,6 +49,23 @@ def _reference_linear_ce(
 ) -> torch.Tensor:
     logits = x.reshape(-1, x.size(-1)) @ weight.t()
     return F.cross_entropy(logits.float(), targets.reshape(-1), reduction="mean")
+
+
+def _reference_weighted_linear_ce(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    targets: torch.Tensor,
+    token_weight: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    logits = x.reshape(-1, x.size(-1)) @ weight.t()
+    per_token = F.cross_entropy(
+        logits.float(),
+        targets.reshape(-1),
+        reduction="none",
+    )
+    flat_weight = token_weight.reshape(-1).detach().float()
+    loss = (per_token * flat_weight).sum() / flat_weight.sum().clamp_min(1.0)
+    return loss, per_token
 
 
 def test_fused_rms_norm_cpu_fallback_matches_reference_forward_and_backward():
@@ -179,6 +200,69 @@ def test_fused_linear_cross_entropy_streaming_cached_cpu_fallback_matches_refere
     assert torch.allclose(w_ref.grad, w_new.grad, atol=0.0, rtol=0.0)
 
 
+@pytest.mark.parametrize("backend", ["auto", "streaming", "streaming_v2", "streaming_cached"])
+def test_fused_linear_cross_entropy_weighted_cpu_fallback_matches_reference_backward(
+    backend: str,
+):
+    torch.manual_seed(225)
+    x_ref = torch.randn(3, 5, 7, requires_grad=True)
+    w_ref = (torch.randn(12, 7) * 0.1).requires_grad_(True)
+    targets = torch.randint(0, 12, (3, 5), dtype=torch.long)
+    token_weight = torch.rand(3, 5).requires_grad_(True)
+    x_new = x_ref.detach().clone().requires_grad_(True)
+    w_new = w_ref.detach().clone().requires_grad_(True)
+
+    loss_ref, per_token_ref = _reference_weighted_linear_ce(
+        x_ref,
+        w_ref,
+        targets,
+        token_weight,
+    )
+    loss_new, per_token_ce = fused_linear_cross_entropy_weighted_with_ce(
+        x_new,
+        w_new,
+        targets,
+        token_weight=token_weight,
+        tile_size=4,
+        backend=backend,
+    )
+
+    assert torch.allclose(loss_ref, loss_new, atol=0.0, rtol=0.0)
+    assert torch.allclose(per_token_ce, per_token_ref.detach(), atol=0.0, rtol=0.0)
+    assert not per_token_ce.requires_grad
+    loss_ref.backward()
+    loss_new.backward()
+
+    assert torch.allclose(x_ref.grad, x_new.grad, atol=0.0, rtol=0.0)
+    assert torch.allclose(w_ref.grad, w_new.grad, atol=0.0, rtol=0.0)
+    assert token_weight.grad is None
+
+
+def test_fused_linear_cross_entropy_weighted_wrapper_matches_with_ce_loss():
+    torch.manual_seed(226)
+    x = torch.randn(2, 4, 6, requires_grad=True)
+    w = (torch.randn(9, 6) * 0.1).requires_grad_(True)
+    targets = torch.randint(0, 9, (2, 4), dtype=torch.long)
+    token_weight = torch.rand(2, 4)
+
+    loss_only = fused_linear_cross_entropy_weighted(
+        x,
+        w,
+        targets,
+        token_weight=token_weight,
+        tile_size=3,
+    )
+    loss_with_ce, _ = fused_linear_cross_entropy_weighted_with_ce(
+        x,
+        w,
+        targets,
+        token_weight=token_weight,
+        tile_size=3,
+    )
+
+    assert torch.allclose(loss_only, loss_with_ce, atol=0.0, rtol=0.0)
+
+
 def test_fused_rms_linear_cross_entropy_cpu_fallback_matches_reference_backward():
     torch.manual_seed(223)
     x_ref = torch.randn(3, 5, 7, requires_grad=True)
@@ -211,6 +295,56 @@ def test_fused_rms_linear_cross_entropy_cpu_fallback_matches_reference_backward(
     assert torch.allclose(w_ref.grad, w_new.grad, atol=0.0, rtol=0.0)
 
 
+def test_fused_rms_linear_cross_entropy_weighted_cpu_fallback_matches_reference_backward():
+    torch.manual_seed(227)
+    x_ref = torch.randn(3, 5, 7, requires_grad=True)
+    norm_ref = (torch.randn(7) * 0.1 + 1.0).requires_grad_(True)
+    w_ref = (torch.randn(11, 7) * 0.1).requires_grad_(True)
+    targets = torch.randint(0, 11, (3, 5), dtype=torch.long)
+    token_weight = torch.rand(3, 5)
+    x_new = x_ref.detach().clone().requires_grad_(True)
+    norm_new = norm_ref.detach().clone().requires_grad_(True)
+    w_new = w_ref.detach().clone().requires_grad_(True)
+
+    normed = _reference_rms_norm(x_ref, norm_ref, eps=1e-6)
+    loss_ref, per_token_ref = _reference_weighted_linear_ce(
+        normed,
+        w_ref,
+        targets,
+        token_weight,
+    )
+    loss_new, per_token_ce = fused_rms_linear_cross_entropy_weighted_with_ce(
+        x_new,
+        norm_new,
+        w_new,
+        targets,
+        token_weight=token_weight,
+        eps=1e-6,
+        tile_size=4,
+        backend="streaming_v2",
+    )
+
+    assert torch.allclose(loss_ref, loss_new, atol=0.0, rtol=0.0)
+    assert torch.allclose(per_token_ce, per_token_ref.detach(), atol=0.0, rtol=0.0)
+    loss_ref.backward()
+    loss_new.backward()
+
+    assert torch.allclose(x_ref.grad, x_new.grad, atol=0.0, rtol=0.0)
+    assert torch.allclose(norm_ref.grad, norm_new.grad, atol=0.0, rtol=0.0)
+    assert torch.allclose(w_ref.grad, w_new.grad, atol=0.0, rtol=0.0)
+
+    loss_only = fused_rms_linear_cross_entropy_weighted(
+        x_new.detach(),
+        norm_new.detach(),
+        w_new.detach(),
+        targets,
+        token_weight=token_weight,
+        eps=1e-6,
+        tile_size=4,
+    )
+    assert torch.allclose(loss_only, loss_new.detach(), atol=0.0, rtol=0.0)
+
+
 def test_fused_linear_cross_entropy_rejects_bad_reduction():
     x = torch.randn(2, 3, requires_grad=True)
     w = torch.randn(5, 3, requires_grad=True)
@@ -223,9 +357,28 @@ def test_fused_linear_cross_entropy_rejects_bad_reduction():
 def test_public_exports_include_norm_linear_ce_entry_point():
     assert "fused_linear_cross_entropy" in lm_head_loss.__all__
     assert "fused_linear_cross_entropy_with_ce" in lm_head_loss.__all__
+    assert "fused_linear_cross_entropy_weighted" in lm_head_loss.__all__
+    assert "fused_linear_cross_entropy_weighted_with_ce" in lm_head_loss.__all__
     assert "fused_rms_linear_cross_entropy" in lm_head_loss.__all__
     assert "fused_rms_linear_cross_entropy_with_ce" in lm_head_loss.__all__
+    assert "fused_rms_linear_cross_entropy_weighted" in lm_head_loss.__all__
+    assert "fused_rms_linear_cross_entropy_weighted_with_ce" in lm_head_loss.__all__
     assert "fused_rms_norm" in lm_head_loss.__all__
+
+
+def test_native_sources_expose_weighted_linear_ce_abi():
+    src_root = ROOT / "src" / "chaoscontrol" / "kernels" / "_lm_head_loss" / "src"
+
+    header = (src_root / "linear_ce.h").read_text()
+    cuda = (src_root / "linear_ce.cu").read_text()
+    binding = (src_root / "rms_norm_binding.cpp").read_text()
+
+    assert "launch_linear_ce_fill_grad_logits_weighted" in header
+    assert "linear_ce_fill_grad_logits_weighted_kernel" in cuda
+    assert "linear_ce_weighted_backward" in binding
+    assert "linear_ce_streaming_weighted_backward" in binding
+    assert "linear_ce_streaming_v2_weighted_backward" in binding
+    assert "linear_ce_streaming_cached_weighted_backward" in binding
 
 
 def test_fused_linear_cross_entropy_with_ce_cpu_fallback_matches_reference_none():
@@ -487,6 +640,60 @@ def test_fused_linear_cross_entropy_cuda_streaming_cached_matches_reference_if_a
     assert torch.allclose(w_ref.grad, w_new.grad, atol=2e-5, rtol=2e-5)
 
 
+@pytest.mark.parametrize(
+    ("backend", "backward_name"),
+    [
+        ("auto", "linear_ce_weighted_backward"),
+        ("streaming", "linear_ce_streaming_weighted_backward"),
+        ("streaming_v2", "linear_ce_streaming_v2_weighted_backward"),
+        ("streaming_cached", "linear_ce_streaming_cached_weighted_backward"),
+    ],
+)
+def test_fused_linear_cross_entropy_weighted_cuda_matches_reference_if_available(
+    backend: str,
+    backward_name: str,
+):
+    if not torch.cuda.is_available() or lm_head_loss._C is None:
+        pytest.skip(
+            "CUDA fused weighted linear+CE kernel is not available in this "
+            "environment; run fallback tests locally and this test on a CUDA pod."
+        )
+    assert hasattr(lm_head_loss._C, backward_name)
+
+    torch.manual_seed(336)
+    x_ref = torch.randn(
+        4, 6, 9, device="cuda", dtype=torch.float32, requires_grad=True,
+    )
+    w_ref = (torch.randn(20, 9, device="cuda") * 0.1).requires_grad_(True)
+    targets = torch.randint(0, 20, (4, 6), device="cuda", dtype=torch.long)
+    token_weight = torch.rand(4, 6, device="cuda")
+    x_new = x_ref.detach().clone().requires_grad_(True)
+    w_new = w_ref.detach().clone().requires_grad_(True)
+
+    loss_ref, per_token_ref = _reference_weighted_linear_ce(
+        x_ref,
+        w_ref,
+        targets,
+        token_weight,
+    )
+    loss_new, per_token_ce = fused_linear_cross_entropy_weighted_with_ce(
+        x_new,
+        w_new,
+        targets,
+        token_weight=token_weight,
+        tile_size=5,
+        backend=backend,
+    )
+
+    assert torch.allclose(loss_ref, loss_new, atol=2e-5, rtol=2e-5)
+    assert torch.allclose(per_token_ce, per_token_ref.detach(), atol=2e-5, rtol=2e-5)
+    loss_ref.backward()
+    loss_new.backward()
+
+    assert torch.allclose(x_ref.grad, x_new.grad, atol=2e-5, rtol=2e-5)
+    assert torch.allclose(w_ref.grad, w_new.grad, atol=2e-5, rtol=2e-5)
+
+
 def test_fused_rms_linear_cross_entropy_cuda_streaming_v2_matches_reference_if_available():
     if (
         not torch.cuda.is_available()
@@ -528,6 +735,59 @@ def test_fused_rms_linear_cross_entropy_cuda_streaming_v2_matches_reference_if_a
     )
 
     assert torch.allclose(loss_ref, loss_new, atol=2e-5, rtol=2e-5)
+    loss_ref.backward()
+    loss_new.backward()
+
+    assert torch.allclose(x_ref.grad, x_new.grad, atol=2e-5, rtol=2e-5)
+    assert torch.allclose(norm_ref.grad, norm_new.grad, atol=2e-5, rtol=2e-5)
+    assert torch.allclose(w_ref.grad, w_new.grad, atol=2e-5, rtol=2e-5)
+
+
+def test_fused_rms_linear_cross_entropy_weighted_cuda_streaming_v2_matches_reference_if_available():
+    if not torch.cuda.is_available() or lm_head_loss._C is None:
+        pytest.skip(
+            "CUDA fused weighted norm+linear+CE kernel is not available in "
+            "this environment; run fallback tests locally and this test on a pod."
+        )
+    assert hasattr(lm_head_loss._C, "rms_norm_forward")
+    assert hasattr(lm_head_loss._C, "rms_norm_backward")
+    assert hasattr(lm_head_loss._C, "linear_ce_streaming_v2_forward")
+    assert hasattr(lm_head_loss._C, "linear_ce_streaming_v2_weighted_backward")
+
+    torch.manual_seed(337)
+    x_ref = torch.randn(
+        4, 6, 9, device="cuda", dtype=torch.float32, requires_grad=True,
+    )
+    norm_ref = (
+        torch.randn(9, device="cuda", dtype=torch.float32) * 0.1 + 1.0
+    ).requires_grad_(True)
+    w_ref = (torch.randn(17, 9, device="cuda") * 0.1).requires_grad_(True)
+    targets = torch.randint(0, 17, (4, 6), device="cuda", dtype=torch.long)
+    token_weight = torch.rand(4, 6, device="cuda")
+    x_new = x_ref.detach().clone().requires_grad_(True)
+    norm_new = norm_ref.detach().clone().requires_grad_(True)
+    w_new = w_ref.detach().clone().requires_grad_(True)
+
+    normed = _reference_rms_norm(x_ref, norm_ref, eps=1e-6)
+    loss_ref, per_token_ref = _reference_weighted_linear_ce(
+        normed,
+        w_ref,
+        targets,
+        token_weight,
+    )
+    loss_new, per_token_ce = fused_rms_linear_cross_entropy_weighted_with_ce(
+        x_new,
+        norm_new,
+        w_new,
+        targets,
+        token_weight=token_weight,
+        eps=1e-6,
+        tile_size=5,
+        backend="streaming_v2",
+    )
+
+    assert torch.allclose(loss_ref, loss_new, atol=2e-5, rtol=2e-5)
+    assert torch.allclose(per_token_ce, per_token_ref.detach(), atol=2e-5, rtol=2e-5)
     loss_ref.backward()
     loss_new.backward()
 

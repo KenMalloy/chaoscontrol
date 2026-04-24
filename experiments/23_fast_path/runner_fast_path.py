@@ -80,6 +80,8 @@ from chaoscontrol.train_ssm import (  # noqa: E402
     fused_lm_head_backend_for_mode,
     fused_lm_head_backward,
     fused_lm_head_backward_with_ce,
+    fused_lm_head_loss_with_ce,
+    fused_lm_head_weighted_loss_with_ce,
     full_lm_head_backward,
 )
 from fast_path import (  # noqa: E402
@@ -820,6 +822,8 @@ def _run_scopt_train_step(
     baseline: FrequencyBucketBaseline | torch.Tensor | float | None = None,
     pressure_upper_c: float | None = None,
     pressure_upper_floor: float = 1.0,
+    lm_head_backward_mode: str = "fused",
+    lm_head_tile_size: int = 1024,
 ) -> tuple[torch.Tensor, _ScOptPending | None]:
     """ScOpt training step with retained graph and rare-grad split.
 
@@ -852,13 +856,27 @@ def _run_scopt_train_step(
         finally:
             for handle in hook_handles:
                 handle.remove()
-        logits = model.lm_head(model.final_norm(hidden))
-        vocab = logits.size(-1)
-        ce = F.cross_entropy(
-            logits.reshape(-1, vocab).float(),
-            targets.reshape(-1),
-            reduction="none",
-        ).reshape_as(targets)
+        mode = str(lm_head_backward_mode).strip().lower()
+        if mode in _FUSED_LM_HEAD_MODES:
+            backend_name = fused_lm_head_backend_for_mode(mode)
+            total_loss, per_token_ce = fused_lm_head_loss_with_ce(
+                hidden=hidden,
+                final_norm=model.final_norm,
+                lm_head=model.lm_head,
+                targets=targets,
+                backend=backend_name,
+                tile_size=int(lm_head_tile_size),
+            )
+            ce = per_token_ce.reshape_as(targets)
+        else:
+            logits = model.lm_head(model.final_norm(hidden))
+            vocab = logits.size(-1)
+            ce = F.cross_entropy(
+                logits.reshape(-1, vocab).float(),
+                targets.reshape(-1),
+                reduction="none",
+            ).reshape_as(targets)
+            total_loss = ce.mean()
         if isinstance(baseline, FrequencyBucketBaseline):
             baseline_value: torch.Tensor | float | None = baseline.baseline(targets)
             baseline.update(ce, targets)
@@ -874,8 +892,20 @@ def _run_scopt_train_step(
             upper_c=pressure_upper_c,
             upper_floor=pressure_upper_floor,
         )
-        total_loss = ce.mean()
-        rare_loss = (ce * pressure).sum() / pressure.sum().clamp_min(1.0)
+        rare_loss = None
+        if is_split_step:
+            if mode in _FUSED_LM_HEAD_MODES:
+                rare_loss, _ = fused_lm_head_weighted_loss_with_ce(
+                    hidden=hidden,
+                    final_norm=model.final_norm,
+                    lm_head=model.lm_head,
+                    targets=targets,
+                    token_weight=pressure,
+                    backend=backend_name,
+                    tile_size=int(lm_head_tile_size),
+                )
+            else:
+                rare_loss = (ce * pressure).sum() / pressure.sum().clamp_min(1.0)
 
     common_grads = torch.autograd.grad(
         total_loss,
@@ -893,6 +923,7 @@ def _run_scopt_train_step(
 
     if not is_split_step:
         return total_loss.detach(), None
+    assert rare_loss is not None
 
     # Split step: compute rare parameter gradients and activation
     # gradients in one autograd traversal. The older correctness path
@@ -1940,6 +1971,8 @@ def train_fast_for_budget(
                         baseline=scopt_baseline,
                         pressure_upper_c=scopt_pressure_upper_c,
                         pressure_upper_floor=scopt_pressure_upper_floor,
+                        lm_head_backward_mode=lm_head_backward_mode,
+                        lm_head_tile_size=lm_head_tile_size,
                     )
                 else:
                     loss = _run_scopt_common_train_step(
