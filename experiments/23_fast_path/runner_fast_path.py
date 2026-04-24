@@ -156,6 +156,138 @@ def _pick_device(local_rank: int, config_device: str) -> torch.device:
     return resolve_device(config_device)
 
 
+def _build_token_buckets(
+    token_frequencies: torch.Tensor, num_buckets: int,
+) -> torch.Tensor:
+    """Return a `[vocab_size]` int64 tensor assigning each token to a
+    log-frequency bucket.
+
+    Bucket 0 is rarest (lowest log-freq); bucket ``num_buckets - 1`` is
+    most frequent. Matches the binning math used by
+    ``FrequencyBucketBaseline`` (log1p with clamp_min(0.0), then a
+    span-anchored linspace) so bucket ids are directly comparable
+    between scopt and the val-time diagnostic.
+    """
+    if token_frequencies.ndim != 1:
+        raise ValueError("token_frequencies must be 1D")
+    if num_buckets < 1:
+        raise ValueError(f"num_buckets must be >= 1, got {num_buckets}")
+    log_freq = torch.log1p(
+        token_frequencies.to(dtype=torch.float32).clamp_min(0.0)
+    )
+    min_lf = float(log_freq.min().item())
+    max_lf = float(log_freq.max().item())
+    span = max(max_lf - min_lf, 1e-6)
+    edges = torch.linspace(
+        min_lf,
+        min_lf + span + 1e-6,
+        num_buckets + 1,
+        device=log_freq.device,
+        dtype=torch.float32,
+    )
+    bucket = torch.bucketize(log_freq, edges[1:-1])
+    bucket.clamp_(0, num_buckets - 1)
+    return bucket.to(dtype=torch.int64)
+
+
+def _compute_per_bucket_val_ce(
+    *,
+    model: torch.nn.Module,
+    device: torch.device,
+    tokens: torch.Tensor,
+    num_tokens: int,
+    seq_len: int,
+    stride: int,
+    batch_size: int,
+    vocab_size: int,
+    token_frequencies: torch.Tensor | None,
+    num_buckets: int,
+    rank: int,
+    world_size: int,
+    precision: str,
+) -> dict[str, Any]:
+    """Deterministic no_grad val pass: sum per-token CE into log-freq buckets.
+
+    Runs over sequential windows of ``tokens`` on this rank's shard
+    (rank/world_size stride), mean-reduces per bucket, and returns a
+    result-dict fragment with four keys:
+      * ``per_bucket_val_ce`` (list[float], length=num_buckets;
+        bucket 0 is rarest)
+      * ``rare_bucket_val_ce`` (float, mean of first
+        ``max(1, num_buckets // 4)`` buckets)
+      * ``val_bucket_num_buckets`` (int)
+      * ``val_bucket_token_counts`` (list[int])
+    """
+    if token_frequencies is None:
+        raise ValueError(
+            "rare_bucket_ce_enabled=True requires rare_bucket_ce_token_frequencies"
+        )
+    token_bucket = _build_token_buckets(token_frequencies, num_buckets).to(device)
+    bucket_sum = torch.zeros(num_buckets, dtype=torch.float64, device=device)
+    bucket_count = torch.zeros(num_buckets, dtype=torch.int64, device=device)
+    total = count_lm_starts(num_tokens, seq_len, stride)
+    sharded = count_sharded_lm_starts(
+        total_starts=total, rank=rank, world_size=world_size,
+    )
+    if sharded <= 0:
+        # This rank has no val work; emit zero-count buckets so the
+        # schema is populated.
+        return {
+            "per_bucket_val_ce": [0.0] * int(num_buckets),
+            "rare_bucket_val_ce": 0.0,
+            "val_bucket_num_buckets": int(num_buckets),
+            "val_bucket_token_counts": [0] * int(num_buckets),
+        }
+    n_steps = (sharded + batch_size - 1) // batch_size
+    model.eval()
+    try:
+        with torch.no_grad():
+            for step in range(n_steps):
+                batch_starts = sequential_sharded_lm_starts(
+                    num_tokens=num_tokens,
+                    seq_len=seq_len,
+                    stride=stride,
+                    batch_size=batch_size,
+                    rank=rank,
+                    world_size=world_size,
+                    step=step,
+                )
+                inputs, targets = batch_from_start_tensor(
+                    tokens=tokens,
+                    starts=batch_starts,
+                    seq_len=seq_len,
+                    device=device,
+                    vocab_size=vocab_size,
+                )
+                with autocast_context(precision, device_type=inputs.device.type):
+                    hidden = model.encode(inputs)
+                    logits = model.lm_head(model.final_norm(hidden))
+                vocab = logits.size(-1)
+                ce = F.cross_entropy(
+                    logits.reshape(-1, vocab).float(),
+                    targets.reshape(-1),
+                    reduction="none",
+                ).reshape_as(targets)
+                bucket_idx = token_bucket[targets]
+                flat_idx = bucket_idx.reshape(-1)
+                flat_ce = ce.reshape(-1).to(dtype=torch.float64)
+                flat_ones = torch.ones_like(flat_idx, dtype=torch.int64)
+                bucket_sum.scatter_add_(0, flat_idx, flat_ce)
+                bucket_count.scatter_add_(0, flat_idx, flat_ones)
+    finally:
+        model.train()
+    counts_f = bucket_count.to(torch.float64).clamp_min(1.0)
+    per_bucket_val_ce = (bucket_sum / counts_f).detach().cpu().tolist()
+    rare_k = max(1, int(num_buckets) // 4)
+    rare_bucket_val_ce = float(sum(per_bucket_val_ce[:rare_k]) / float(rare_k))
+    return {
+        "per_bucket_val_ce": [float(x) for x in per_bucket_val_ce],
+        "rare_bucket_val_ce": rare_bucket_val_ce,
+        "val_bucket_num_buckets": int(num_buckets),
+        "val_bucket_token_counts": [int(x) for x in bucket_count.detach().cpu().tolist()],
+    }
+
+
 def _build_optimizer(
     config: dict[str, Any],
     model: torch.nn.Module,
@@ -1600,6 +1732,9 @@ def train_fast_for_budget(
     criticality_distill_uniform_pressure: bool = False,
     criticality_distill_score_permute_before_topk: bool = False,
     criticality_distill_fixed_random_seats: bool = False,
+    rare_bucket_ce_enabled: bool = False,
+    rare_bucket_ce_num_buckets: int = 4,
+    rare_bucket_ce_token_frequencies: torch.Tensor | None = None,
 ) -> dict[str, Any]:
     rank_ = int(rank)
     world_size_ = int(world_size)
@@ -1639,6 +1774,7 @@ def train_fast_for_budget(
     cd: CriticalityDistillation | None = None
     cd_ssm_cores: list[torch.nn.Module] = []
     cd_pinned_buffers: dict[str, dict[str, torch.Tensor]] | None = None
+    criticality_distillation_diagnostics: list[dict] = []
     if criticality_distill_enabled:
         if criticality_distill_num_layers is None:
             raise ValueError(
@@ -2232,6 +2368,20 @@ def train_fast_for_budget(
                 ):
                     cd.allocate_seats_from_accumulators(current_step=steps)
                     cd._seat_refresh_call_count += 1
+                    # Emit one diagnostic snapshot per seat refresh. Walk
+                    # the ssm_cores for their log_a Parameters (same set
+                    # E.3 uses for the criticality loss below).
+                    cd_log_a_per_layer: list[torch.Tensor] = []
+                    for core in cd_ssm_cores:
+                        la = getattr(core, "log_a", None)
+                        if la is not None:
+                            cd_log_a_per_layer.append(la)
+                    if len(cd_log_a_per_layer) == cd.num_layers:
+                        snap = cd.diagnostics_snapshot(
+                            log_a_per_layer=cd_log_a_per_layer,
+                            current_step=steps,
+                        )
+                        criticality_distillation_diagnostics.append(snap)
                 # Compose criticality_loss as a SEPARATE backward pass.
                 # log_a grads are disjoint from LM-head grads, so this
                 # does not conflict with the fused CE backward already done.
@@ -2431,6 +2581,26 @@ def train_fast_for_budget(
             "seat_refresh_calls": int(cd._seat_refresh_call_count),
         }
         result["_criticality_distill_pinned_buffers"] = cd_pinned_buffers
+        result["criticality_distillation_diagnostics"] = (
+            criticality_distillation_diagnostics
+        )
+    if rare_bucket_ce_enabled:
+        val_block = _compute_per_bucket_val_ce(
+            model=model,
+            device=device,
+            tokens=train_tokens,
+            num_tokens=int(train_num_tokens),
+            seq_len=int(seq_len),
+            stride=int(stride),
+            batch_size=int(batch_size),
+            vocab_size=int(vocab_size),
+            token_frequencies=rare_bucket_ce_token_frequencies,
+            num_buckets=int(rare_bucket_ce_num_buckets),
+            rank=rank_,
+            world_size=world_size_,
+            precision=precision,
+        )
+        result.update(val_block)
     return result
 
 

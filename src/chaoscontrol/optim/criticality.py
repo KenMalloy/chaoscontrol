@@ -111,6 +111,11 @@ class CriticalityDistillation(nn.Module):
             for layer in range(self.num_layers):
                 perm = torch.randperm(self.dim)
                 self.seat_mask[layer, perm[:k]] = True
+        # Previous seat mask used by `diagnostics_snapshot` to compute
+        # per-layer churn. Not a registered buffer — diagnostics don't
+        # need to checkpoint, and it must not ride the state_dict load
+        # path.
+        self._previous_seat_mask_snapshot: torch.Tensor | None = None
 
     def add_step_evidence(
         self,
@@ -522,6 +527,86 @@ class CriticalityDistillation(nn.Module):
                 topk = torch.topk(scores[layer], k=k, largest=True)
                 mask[topk.indices] = True
             self.seat_mask[layer] = mask
+
+    @torch.no_grad()
+    def diagnostics_snapshot(
+        self, *, log_a_per_layer: list, current_step: int,
+    ) -> dict:
+        """Per-layer diagnostic snapshot of CD's current state.
+
+        Called by the runner at each seat refresh. Returns a dict with:
+          - step: int
+          - seat_churn_per_layer: fraction of seats changed since last snapshot
+          - budget_occupancy_per_layer: fraction of SEATED channels with
+            sigmoid-criticality >= 0.9 * critical_value
+          - score_criticality_corr_per_layer: Spearman rank correlation
+            of per-channel score vs criticality (0.0 if degenerate)
+          - event_rate_per_layer: event_mass / max(1, populated_slots)
+          - seat_mask_fraction_per_layer: fraction of D that is seated
+
+        Churn is 0.0 per layer on the first snapshot; subsequent
+        snapshots diff against the seat_mask cached from the previous
+        call.
+        """
+        if len(log_a_per_layer) != self.num_layers:
+            raise ValueError(
+                f"log_a_per_layer must have {self.num_layers} entries; got {len(log_a_per_layer)}"
+            )
+        seat_churn: list[float] = []
+        budget_occ: list[float] = []
+        score_corr: list[float] = []
+        event_rate: list[float] = []
+        seat_frac: list[float] = []
+        scores = self.score_from_accumulators()  # [L, D]
+        current_mask = self.seat_mask
+        for layer in range(self.num_layers):
+            la = log_a_per_layer[layer].detach().to(dtype=torch.float32)
+            crit = 1.0 - torch.sigmoid(la)  # [D]
+            cur_lmask = current_mask[layer]  # [D] bool
+            # Seat churn.
+            if self._previous_seat_mask_snapshot is None:
+                churn = 0.0
+            else:
+                prev = self._previous_seat_mask_snapshot[layer]
+                churn = float((prev != cur_lmask).float().mean().item())
+            seat_churn.append(churn)
+            # Budget occupancy: fraction of seated channels with criticality >= 0.9 * critical_value.
+            k = int(cur_lmask.sum().item())
+            if k == 0:
+                budget_occ.append(0.0)
+            else:
+                threshold = 0.9 * self.critical_value
+                seated_crit = crit[cur_lmask]
+                budget_occ.append(
+                    float((seated_crit >= threshold).float().mean().item())
+                )
+            # Rank correlation (Spearman) score vs criticality over all D.
+            s = scores[layer].detach().to(dtype=torch.float32)
+            if float(s.std().item()) < 1e-12 or float(crit.std().item()) < 1e-12:
+                score_corr.append(0.0)
+            else:
+                rs = torch.argsort(torch.argsort(s)).to(torch.float32)
+                rc = torch.argsort(torch.argsort(crit)).to(torch.float32)
+                rs = (rs - rs.mean()) / rs.std().clamp_min(1e-12)
+                rc = (rc - rc.mean()) / rc.std().clamp_min(1e-12)
+                score_corr.append(float((rs * rc).mean().item()))
+            # Event rate = event_mass / populated_slots.
+            populated = int((self.bank_step[layer] != -1).sum().item())
+            event_rate.append(
+                float(self.event_mass[layer].item()) / max(1, populated)
+            )
+            # Seat mask fraction.
+            seat_frac.append(float(cur_lmask.float().mean().item()))
+        # Cache the current mask for next snapshot's churn calc.
+        self._previous_seat_mask_snapshot = current_mask.clone()
+        return {
+            "step": int(current_step),
+            "seat_churn_per_layer": seat_churn,
+            "budget_occupancy_per_layer": budget_occ,
+            "score_criticality_corr_per_layer": score_corr,
+            "event_rate_per_layer": event_rate,
+            "seat_mask_fraction_per_layer": seat_frac,
+        }
 
     def criticality_loss(self, log_a_per_layer: list) -> torch.Tensor:
         """Seat-masked MSE loss pulling `1 - sigmoid(log_a[seat])` toward

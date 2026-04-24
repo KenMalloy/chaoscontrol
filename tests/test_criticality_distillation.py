@@ -862,3 +862,47 @@ def test_accumulator_score_equals_full_bank_score_within_fp32_tolerance():
     assert torch.allclose(acc, full, atol=1e-4, rtol=1e-4), (
         f"accumulator diverged from full scan: acc={acc} full={full}"
     )
+
+
+def test_diagnostics_snapshot_shape_and_types():
+    cd = CriticalityDistillation(num_layers=2, dim=4, trace_ttl_steps=8)
+    cd._step_decay_accumulators(current_step=0)
+    cd._add_contribution(layer=0, evidence=torch.tensor([0.0, 0.5, 2.0, 0.1]), event_count=3.0)
+    cd._add_contribution(layer=1, evidence=torch.tensor([1.0, 0.1, 0.0, 0.5]), event_count=5.0)
+    cd.allocate_seats_from_accumulators(current_step=1)
+    log_a = [torch.zeros(4), torch.zeros(4)]
+    snap = cd.diagnostics_snapshot(log_a_per_layer=log_a, current_step=1)
+    assert snap["step"] == 1
+    for key in (
+        "seat_churn_per_layer",
+        "budget_occupancy_per_layer",
+        "score_criticality_corr_per_layer",
+        "event_rate_per_layer",
+        "seat_mask_fraction_per_layer",
+    ):
+        assert key in snap
+        assert len(snap[key]) == cd.num_layers
+
+
+def test_diagnostics_snapshot_churn_is_zero_on_first_snapshot():
+    cd = CriticalityDistillation(num_layers=1, dim=4, trace_ttl_steps=8, min_weighted_events_per_layer=0.1)
+    cd._add_contribution(layer=0, evidence=torch.tensor([1.0, 0.0, 0.0, 0.0]), event_count=1.0)
+    cd.allocate_seats_from_accumulators(current_step=1)
+    snap = cd.diagnostics_snapshot(log_a_per_layer=[torch.zeros(4)], current_step=1)
+    assert snap["seat_churn_per_layer"][0] == 0.0
+
+
+def test_diagnostics_snapshot_churn_tracks_change_between_snapshots():
+    cd = CriticalityDistillation(
+        num_layers=1, dim=4, trace_ttl_steps=8, min_weighted_events_per_layer=0.1,
+        criticality_budget_frac=0.5,  # k=2
+    )
+    cd._add_contribution(layer=0, evidence=torch.tensor([2.0, 1.0, 0.0, 0.0]), event_count=1.0)
+    cd.allocate_seats_from_accumulators(current_step=1)
+    snap1 = cd.diagnostics_snapshot(log_a_per_layer=[torch.zeros(4)], current_step=1)
+    # Force a different seat set next refresh.
+    cd._add_contribution(layer=0, evidence=torch.tensor([0.0, 0.0, 5.0, 3.0]), event_count=10.0)
+    cd.allocate_seats_from_accumulators(current_step=2)
+    snap2 = cd.diagnostics_snapshot(log_a_per_layer=[torch.zeros(4)], current_step=2)
+    # At least one seat moved — churn > 0.
+    assert snap2["seat_churn_per_layer"][0] > 0.0

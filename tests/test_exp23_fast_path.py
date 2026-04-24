@@ -2817,3 +2817,67 @@ def test_train_fast_for_budget_rejects_cd_with_mismatched_core_count():
             criticality_distill_num_layers=3,
             criticality_distill_dim=4,
         )
+
+
+def test_train_result_contains_per_bucket_val_ce_when_rare_bucket_ce_enabled():
+    mod = _load_runner_module()
+    model = _TinyTokenTrainModel()
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+    token_frequencies = torch.tensor([100.0, 50.0, 20.0, 10.0, 5.0, 1.0])
+    result = mod.train_fast_for_budget(
+        model, train_tokens=torch.arange(128, dtype=torch.int16) % 6,
+        train_num_tokens=128, stride=4, seq_len=3, batch_size=2,
+        device=torch.device("cpu"), optimizer=optimizer,
+        budget_seconds=300.0, chunk_size=2, grad_clip_norm=0.0, fused_grad_clip=False,
+        rank=0, world_size=1, seed=123, precision="fp32",
+        stop_check_interval=1, stop_margin_seconds=0.0,
+        vocab_size=6, max_steps=4, prefetch_batches=False,
+        rare_bucket_ce_enabled=True,
+        rare_bucket_ce_token_frequencies=token_frequencies,
+        rare_bucket_ce_num_buckets=4,
+    )
+    assert "per_bucket_val_ce" in result
+    assert len(result["per_bucket_val_ce"]) == 4
+    assert "rare_bucket_val_ce" in result
+    assert isinstance(result["rare_bucket_val_ce"], float)
+    assert "val_bucket_num_buckets" in result
+    assert result["val_bucket_num_buckets"] == 4
+    assert "val_bucket_token_counts" in result
+    assert len(result["val_bucket_token_counts"]) == 4
+
+
+def test_cd_diagnostics_emitted_at_every_seat_refresh():
+    mod = _load_runner_module()
+    model = _TinyCDTrainModel(dim=4, vocab_size=6, num_layers=2)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+    result = mod.train_fast_for_budget(
+        model,
+        train_tokens=torch.arange(256, dtype=torch.int16) % 6,
+        train_num_tokens=256, stride=4, seq_len=6, batch_size=2,
+        device=torch.device("cpu"), optimizer=optimizer,
+        budget_seconds=300.0, chunk_size=2, grad_clip_norm=0.0, fused_grad_clip=False,
+        rank=0, world_size=1, seed=123, precision="fp32",
+        stop_check_interval=1, stop_margin_seconds=0.0,
+        vocab_size=6, max_steps=8, prefetch_batches=False,
+        lm_head_backward_mode="fused_streaming_cached",
+        lm_head_emit_entropy=True,
+        criticality_distill_enabled=True,
+        criticality_distill_num_layers=2,
+        criticality_distill_dim=4,
+        criticality_distill_budget_frac=0.25,
+        criticality_distill_trace_ttl_steps=8,
+        criticality_distill_trace_half_life_steps=4.0,
+        criticality_distill_seat_refresh_interval=2,
+        criticality_distill_min_weighted_events_per_layer=0.1,
+        criticality_distill_horizon_H=2,
+        criticality_distill_event_frac=0.5,
+        criticality_distill_weight=1.0,
+    )
+    diags = result["criticality_distillation_diagnostics"]
+    # 8 steps / refresh every 2 starting at step=2 = at least 3 snapshots (steps 2, 4, 6).
+    assert len(diags) >= 3
+    for snap in diags:
+        for key in ("step", "seat_churn_per_layer", "budget_occupancy_per_layer",
+                    "score_criticality_corr_per_layer", "event_rate_per_layer",
+                    "seat_mask_fraction_per_layer"):
+            assert key in snap, f"diagnostic snapshot missing {key}"
