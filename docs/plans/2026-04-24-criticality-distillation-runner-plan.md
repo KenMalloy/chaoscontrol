@@ -1,23 +1,24 @@
-# Criticality Distillation Runner Wiring — Implementation Plan
+# Criticality Distillation Runner Wiring — Implementation Plan (v3)
 
 > **For Claude:** REQUIRED SUB-SKILL: Use @superpowers:executing-plans to implement this plan task-by-task. Use @superpowers:test-driven-development for every task (red-fail → implement → green-pass → commit). Apply @superpowers:verification-before-completion before claiming any step is done.
 
-**Goal:** Wire the already-landed `CriticalityDistillation` module (Stages 1a/1b/2/3, terminal commit `c0318d8`) into `experiments/23_fast_path/runner_fast_path.py` and emit an 8-cell `cd_first_smoke` matrix. Every cell rides on the locked `control_fastslow_only_i64a025` operational stack (fast/slow interval 64, alpha 0.25, eval copy = slow, Dreamworld off) so the mechanism read isolates CD's effect on top of the actual submission base rather than a generic Muon base.
+**Goal:** Wire `CriticalityDistillation` (terminal commit `c0318d8`) into the training step with a speed-first design: fused LM-head entropy emission, GPU reduces to tiny tensors, CPU runs a low-latency incremental-accumulator controller, pinned double-buffered async D2H. Emit an 8-cell `cd_first_smoke` matrix riding the locked `control_fastslow_only_i64a025` fast/slow base. Measure CD overhead vs a CD-off baseline and report (not hard-fail).
 
-**Architecture:** CD pressure = `relu(CE - H[p])` computed independently of ScOpt. Bank + baseline EMA + allocator live on CPU; `seat_mask` lives on GPU. ExitStack at runner level for state capture. Two-phase ingest with synchronous D2H for first smoke (async side-stream deferred). Non-fused LM head path on CD cells so full logits exist for entropy.
+**Architecture (three tiers, each does one thing):**
+- **H100:** fused CE + entropy kernel, event-mask top-k, future-energy reduction, log_a loss compose.
+- **CPU:** decayed score accumulators (`score_num`, `score_den`, `event_mass`), non-event baseline EMA, falsifier policy, top-k seat allocation. Ring bank exists only for TTL correction + checkpoint debug.
+- **H100 (again):** consumes the latest seat_mask for `criticality_loss` on every backward.
 
-**Tech Stack:** PyTorch 2.9, pytest, chaoscontrol runner_fast_path, exp24 matrix builders.
+The "clever CPU" point: we do NOT rescan `[L, TTL, D]` every refresh. Each step applies one decay multiplier, one add. Top-k runs on the maintained accumulator. Ring bank is for TTL-exact correction (subtract evicted contribution at its current decay) and checkpoint serialization. Full-bank `score()` remains as a v2 diagnostic / consistency-check path.
+
+**Tech Stack:** PyTorch 2.9, pytest, chaoscontrol runner_fast_path, fused `_lm_head_loss` kernel.
 
 **Required reading before starting:**
-- Mechanism design: `docs/plans/2026-04-24-criticality-distillation.md` (v3, commit `4b7d77c`)
-- Runner-wiring design: `docs/plans/2026-04-24-criticality-distillation-runner-design.md` (commit `8293653`)
-- Locked fast/slow base: `build_phase0_fastslow_only_control` in `experiments/24_training_time_bundle/exp24.py` (the knobs CD rides on)
-- Implemented module: `src/chaoscontrol/optim/criticality.py`
-
-**Non-gating feedback files** (read these, they'll save time):
-- `feedback_regression_is_never_build_error.md` — tests must fail on the bug, not just collect
-- `feedback_risks_not_implementation_challenges.md` — no "risk" padding in reports
-- `feedback_estimate_calibration.md` — subtask-based effort estimates, no "multi-day" hand-waves
+- Mechanism design: `docs/plans/2026-04-24-criticality-distillation.md` (v3, `4b7d77c`)
+- Runner-wiring design: `docs/plans/2026-04-24-criticality-distillation-runner-design.md` (`8293653`)
+- Locked fast/slow base: `build_phase0_fastslow_only_control` in `experiments/24_training_time_bundle/exp24.py`
+- Fused LM head kernels: `src/chaoscontrol/kernels/_lm_head_loss/` (C++ bindings, CUDA sources)
+- Feedback memory: `feedback_regression_is_never_build_error.md`, `feedback_risks_not_implementation_challenges.md`, `feedback_estimate_calibration.md`.
 
 ---
 
@@ -25,70 +26,25 @@
 
 - Every task is TDD: red, implement, green, commit.
 - Commits: `component: imperative sentence`.
-- Test runner on macOS: `/opt/homebrew/bin/python3.11 -m pytest ...`
-- All tests run on CPU using contrived tensors. GPU-only behavior gated behind `torch.cuda.is_available()` skips.
+- macOS test runner: `/opt/homebrew/bin/python3.11 -m pytest ...`
+- CPU-only tests use contrived tensors. GPU-only behavior: `pytest.importorskip('torch.cuda')` or `pytest.mark.skipif(not torch.cuda.is_available())`.
 
 ---
 
-## Stage A — `compute_event_mask` conditional top-k
+## Stage A — `compute_event_mask` conditional top-k (unchanged from v2)
 
-### Task A.1 — Strictly-positive top-k, event mask returns empty on zero-pressure
+### Task A.1 — Strictly-positive top-k; zero pressure → zero events
 
-**Files:**
-- Modify: `src/chaoscontrol/optim/criticality.py` (the module-level `compute_event_mask`)
-- Modify: `tests/test_criticality_scoring.py`
+**Files:** `src/chaoscontrol/optim/criticality.py`, `tests/test_criticality_scoring.py`.
 
-**Step 1: Write the failing tests.**
+**Step 1:** Append two tests that verify uniform-zero → empty mask, and only strictly-positive positions are selected (exact test bodies in v2 are correct).
 
-Append to `tests/test_criticality_scoring.py`:
+**Step 2:** Run — expect FAIL.
 
-```python
-def test_event_mask_returns_empty_when_no_positive_pressure():
-    pressure = torch.zeros(2, 10)
-    mask = compute_event_mask(pressure, event_frac=0.5)
-    assert mask.sum().item() == 0, (
-        "uniform-zero pressure must produce no events (conditional top-k)"
-    )
-
-
-def test_event_mask_only_marks_strictly_positive_positions():
-    pressure = torch.tensor([[-1.0, 0.0, 0.5, 0.0, -2.0, 3.0, 0.0, 0.0, 1.5, 0.1]])
-    mask = compute_event_mask(pressure, event_frac=0.5)
-    # Strict positives: indices 2, 5, 8, 9. event_frac 0.5 → k=5 requested,
-    # only 4 positives exist, so 4 events returned at the positive indices.
-    assert mask.sum().item() == 4
-    for idx in [2, 5, 8, 9]:
-        assert mask[0, idx].item() is True
-    for idx in [0, 1, 3, 4, 6, 7]:
-        assert mask[0, idx].item() is False
-```
-
-**Step 2: Run — expect FAIL.**
-
-```
-/opt/homebrew/bin/python3.11 -m pytest tests/test_criticality_scoring.py::test_event_mask_returns_empty_when_no_positive_pressure tests/test_criticality_scoring.py::test_event_mask_only_marks_strictly_positive_positions -v
-```
-Current `compute_event_mask` returns k positions regardless of sign — both new tests fail.
-
-**Step 3: Fix `compute_event_mask`.**
-
-Replace the existing function body with:
+**Step 3:** Replace `compute_event_mask` body with:
 
 ```python
 def compute_event_mask(pressure: torch.Tensor, event_frac: float) -> torch.Tensor:
-    """Top-`event_frac` positions of STRICTLY-POSITIVE pressure become True.
-
-    Events only fire on positions where the model had something to be
-    surprised about (positive innovation). Uniform or all-negative
-    pressure produces zero events — the bank writes nothing that step.
-
-    Args:
-        pressure: any shape; values ranked in decreasing magnitude.
-        event_frac: fraction in [0, 1].
-
-    Returns:
-        Boolean tensor, same shape as `pressure`.
-    """
     if not 0.0 <= event_frac <= 1.0:
         raise ValueError(f"event_frac must be in [0, 1]; got {event_frac}")
     total = pressure.numel()
@@ -107,112 +63,414 @@ def compute_event_mask(pressure: torch.Tensor, event_frac: float) -> torch.Tenso
     return mask.reshape(pressure.shape) & positive
 ```
 
-**Step 4: Run the full scoring + distillation suites.**
+**Step 4:** Run full scoring + distillation suites. All pass.
 
-```
-/opt/homebrew/bin/python3.11 -m pytest tests/test_criticality_scoring.py tests/test_criticality_distillation.py -q
-```
-
-The existing `test_event_mask_handles_all_equal_pressure` still passes (uniform-ONES is all-positive, so k=10 events fire). Any distillation test that relied on zero/uniform pressure producing events must be audited and updated — none currently do, but spot-check.
-
-**Step 5: Commit.**
-
-```bash
-git add src/chaoscontrol/optim/criticality.py tests/test_criticality_scoring.py
-git commit -m "criticality: conditional top-k — event mask only marks strictly-positive pressure"
-```
+**Step 5:** `git commit -m "criticality: conditional top-k — event mask only marks strictly-positive pressure"`
 
 ---
 
-## Stage B — CD knobs for falsifier cells
+## Stage B — CD falsifier flags
 
-### Task B.1 — `score_permute_before_topk` (shuffled-teacher falsifier, genuinely random)
+### Task B.1 — `score_permute_before_topk` → random k-of-D (shuffled teacher)
 
-**Context.** The first draft of this plan had a bug: permuting scores and then mapping top-k indices back through the permutation recovers the original score peaks exactly — the permutation is silently undone. The correct shuffled-teacher semantics is "seat assignment is random w.r.t. the score." Simplest implementation: when the flag is on, bypass score-based top-k entirely and pick k random channels per layer.
+Exact as v2. In `allocate_seats`, when flag is True: `mask[torch.randperm(D, device=seat_mask.device)[:k]] = True`. Test pins `selected != peak_channels`.
 
-**Files:**
-- Modify: `src/chaoscontrol/optim/criticality.py`
-- Modify: `tests/test_criticality_distillation.py`
+Commit: `criticality: score_permute_before_topk flag — random k-of-D for shuffled-teacher falsifier`
 
-**Step 1: Write the failing tests.**
+### Task B.2 — `fixed_random_seats` flag (design-faithful budget-only)
 
-Append:
+Exact as v2. Constructor flag, seats bound once at init, `allocate_seats` is a no-op when True. Test pins init-bound + no-op on second call.
+
+Commit: `criticality: fixed_random_seats flag for design-faithful budget-only falsifier`
+
+---
+
+## Stage C — CPU-as-controller with incremental accumulators
+
+### Task C.1 — Register accumulator buffers
+
+**Files:** `src/chaoscontrol/optim/criticality.py`, `tests/test_criticality_distillation.py`.
+
+**Step 1:** Failing test.
 
 ```python
-def test_shuffled_teacher_does_not_select_score_peaks():
-    """With score_permute_before_topk=True, seat assignment is random —
-    NOT the top-k by score. The whole point of the falsifier is to break
-    the channel-identity correspondence between score peaks and seats.
-    """
-    torch.manual_seed(42)
-    cd = CriticalityDistillation(
-        num_layers=1, dim=10, trace_ttl_steps=4,
-        trace_half_life_steps=100.0,
-        criticality_budget_frac=0.3,  # k=3
-        min_weighted_events_per_layer=1.0,
-        score_permute_before_topk=True,
-    )
-    # Evidence concentrated on channels 0, 1, 2.
-    evidence = torch.zeros(10)
-    evidence[0] = 10.0
-    evidence[1] = 9.0
-    evidence[2] = 8.0
-    cd.add_step_evidence(layer=0, step=0, evidence=evidence, event_count=10.0)
-    cd.allocate_seats(current_step=1)
-    peak_channels = {0, 1, 2}
-    selected = set(cd.seat_mask[0].nonzero().flatten().tolist())
-    assert len(selected) == 3
-    # With seed 42 and random k-of-10 selection, the probability of
-    # exactly recovering {0,1,2} is 1 / C(10,3) = 1/120. The seed pins
-    # the non-match.
-    assert selected != peak_channels, (
-        f"shuffled-teacher must not track score peaks; got {selected}"
-    )
-
-
-def test_default_allocate_seats_still_picks_score_peaks():
-    """Regression pin against the fix — the non-shuffled path is
-    unchanged."""
-    cd = CriticalityDistillation(
-        num_layers=1, dim=10, trace_ttl_steps=4,
-        trace_half_life_steps=100.0,
-        criticality_budget_frac=0.3,
-        min_weighted_events_per_layer=1.0,
-    )
-    evidence = torch.zeros(10)
-    evidence[0] = 10.0
-    evidence[1] = 9.0
-    evidence[2] = 8.0
-    cd.add_step_evidence(layer=0, step=0, evidence=evidence, event_count=10.0)
-    cd.allocate_seats(current_step=1)
-    assert set(cd.seat_mask[0].nonzero().flatten().tolist()) == {0, 1, 2}
+def test_accumulator_buffers_register_and_initialize_to_zero():
+    cd = CriticalityDistillation(num_layers=3, dim=8, trace_ttl_steps=16)
+    # score_num: running age-weighted sum of evidence contributions.
+    assert cd.score_num.shape == (3, 8)
+    assert torch.equal(cd.score_num, torch.zeros_like(cd.score_num))
+    # score_den: running age-weighted count.
+    assert cd.score_den.shape == (3,)
+    assert torch.equal(cd.score_den, torch.zeros_like(cd.score_den))
+    # event_mass: running age-weighted event count for the gate.
+    assert cd.event_mass.shape == (3,)
+    # last_decay_step: last step we applied decay to accumulators.
+    assert cd.last_decay_step.item() == -1
+    # All in state_dict (buffers registered).
+    sd = cd.state_dict()
+    for key in ("score_num", "score_den", "event_mass", "last_decay_step"):
+        assert key in sd
 ```
 
-**Step 2: Run — expect FAIL.**
-
-The new tests fail: constructor doesn't accept `score_permute_before_topk`.
-
-**Step 3: Implement.**
-
-In `CriticalityDistillation.__init__`, add after the existing parameters:
+**Step 2-3:** Add these buffer registrations in `__init__` alongside existing ones:
 
 ```python
-        score_permute_before_topk: bool = False,
+        self.register_buffer(
+            "score_num", torch.zeros(self.num_layers, self.dim, dtype=torch.float32)
+        )
+        self.register_buffer(
+            "score_den", torch.zeros(self.num_layers, dtype=torch.float32)
+        )
+        self.register_buffer(
+            "event_mass", torch.zeros(self.num_layers, dtype=torch.float32)
+        )
+        self.register_buffer(
+            "last_decay_step", torch.tensor(-1, dtype=torch.int64)
+        )
 ```
 
-Store `self.score_permute_before_topk = bool(score_permute_before_topk)`.
+**Step 4-5:** Run tests, commit: `criticality: register accumulator buffers (score_num, score_den, event_mass, last_decay_step)`
 
-In `allocate_seats`, replace the top-k selection block:
+### Task C.2 — `_step_decay_accumulators` method
+
+**Files:** `src/chaoscontrol/optim/criticality.py`, `tests/test_criticality_distillation.py`.
+
+**Step 1:** Failing test.
 
 ```python
-            if weighted_events_per_layer[layer].item() < self.min_weighted_events_per_layer:
+def test_step_decay_applies_half_life_factor_to_all_accumulators():
+    cd = CriticalityDistillation(
+        num_layers=1, dim=4, trace_ttl_steps=8,
+        trace_half_life_steps=2.0,  # decay factor per step = 2^(-1/2) ≈ 0.7071
+    )
+    cd.score_num.fill_(1.0)
+    cd.score_den.fill_(4.0)
+    cd.event_mass.fill_(10.0)
+    cd.last_decay_step.fill_(0)
+    # Advance to step 2. Total decay = 2^(-2/2) = 0.5.
+    cd._step_decay_accumulators(current_step=2)
+    assert torch.allclose(cd.score_num, torch.full_like(cd.score_num, 0.5))
+    assert torch.allclose(cd.score_den, torch.tensor([2.0]))
+    assert torch.allclose(cd.event_mass, torch.tensor([5.0]))
+    assert cd.last_decay_step.item() == 2
+
+
+def test_step_decay_is_idempotent_when_called_with_same_step():
+    cd = CriticalityDistillation(num_layers=1, dim=2, trace_ttl_steps=4, trace_half_life_steps=2.0)
+    cd.score_num.fill_(1.0)
+    cd.last_decay_step.fill_(5)
+    cd._step_decay_accumulators(current_step=5)
+    assert torch.allclose(cd.score_num, torch.full_like(cd.score_num, 1.0))
+```
+
+**Step 2:** Run — FAIL on method not found.
+
+**Step 3:** Add method to `CriticalityDistillation`:
+
+```python
+    @torch.no_grad()
+    def _step_decay_accumulators(self, current_step: int) -> None:
+        """Apply age decay to running accumulators between
+        last_decay_step and current_step. Idempotent when called with
+        the same step."""
+        if int(current_step) <= int(self.last_decay_step.item()):
+            return
+        dt = int(current_step) - int(self.last_decay_step.item())
+        if int(self.last_decay_step.item()) < 0:
+            # First time — accumulators are all zero, no decay needed.
+            self.last_decay_step.fill_(int(current_step))
+            return
+        factor = 2.0 ** (-float(dt) / self.trace_half_life_steps)
+        self.score_num.mul_(factor)
+        self.score_den.mul_(factor)
+        self.event_mass.mul_(factor)
+        self.last_decay_step.fill_(int(current_step))
+```
+
+**Step 4-5:** Run, commit: `criticality: _step_decay_accumulators applies half-life decay between ingests`
+
+### Task C.3 — `_add_contribution` method
+
+**Files:** same as C.2.
+
+**Step 1:** Failing test.
+
+```python
+def test_add_contribution_updates_numerator_denominator_and_event_mass():
+    cd = CriticalityDistillation(
+        num_layers=2, dim=3, trace_ttl_steps=8,
+        trace_half_life_steps=4.0,
+    )
+    # Pre-step: call _step_decay (no-op on zero accumulators; just syncs last_decay_step).
+    cd._step_decay_accumulators(current_step=0)
+    cd._add_contribution(
+        layer=0,
+        evidence=torch.tensor([1.0, 2.0, 3.0]),
+        event_count=5.0,
+    )
+    # Numerator: evidence * event_count = [5, 10, 15]
+    assert torch.allclose(cd.score_num[0], torch.tensor([5.0, 10.0, 15.0]))
+    # Denominator: event_count = 5
+    assert cd.score_den[0].item() == 5.0
+    # Event mass: event_count
+    assert cd.event_mass[0].item() == 5.0
+    # Layer 1 untouched.
+    assert torch.equal(cd.score_num[1], torch.zeros(3))
+```
+
+**Step 2:** Run — FAIL.
+
+**Step 3:** Implement:
+
+```python
+    @torch.no_grad()
+    def _add_contribution(
+        self,
+        *,
+        layer: int,
+        evidence: torch.Tensor,
+        event_count: float,
+    ) -> None:
+        """Incremental additive update of accumulators. Weight for this
+        step's contribution is always 1.0 (the age is zero). Evidence
+        tensor must match `self.dim`."""
+        if not 0 <= layer < self.num_layers:
+            raise IndexError(f"layer={layer}")
+        if evidence.shape != (self.dim,):
+            raise ValueError(
+                f"evidence must have shape ({self.dim},); got {tuple(evidence.shape)}"
+            )
+        ec = float(event_count)
+        ev = evidence.to(dtype=self.score_num.dtype, device=self.score_num.device)
+        self.score_num[layer].add_(ev, alpha=ec)
+        self.score_den[layer].add_(ec)
+        self.event_mass[layer].add_(ec)
+```
+
+**Step 4-5:** Commit: `criticality: _add_contribution for incremental accumulator update`
+
+### Task C.4 — `_subtract_expired_contribution` method (TTL correction)
+
+**Files:** same.
+
+**Step 1:** Failing test.
+
+```python
+def test_subtract_expired_removes_contribution_at_its_current_decay_weight():
+    cd = CriticalityDistillation(
+        num_layers=1, dim=2, trace_ttl_steps=4,
+        trace_half_life_steps=2.0,
+    )
+    # Simulate: entry added at step=0 with evidence=[1, 2] and event_count=3.
+    # Current step=4. Entry's current age = 4 -> decay weight 2^(-4/2) = 0.25.
+    # Before subtraction:
+    cd.score_num[0] = torch.tensor([0.25 * 1 * 3, 0.25 * 2 * 3])  # [0.75, 1.5]
+    cd.score_den[0] = 0.25 * 3  # 0.75
+    cd.event_mass[0] = 0.25 * 3  # 0.75
+    # Subtract as if that slot is now being overwritten.
+    cd._subtract_expired_contribution(
+        layer=0,
+        evicted_step=0,
+        current_step=4,
+        evicted_evidence=torch.tensor([1.0, 2.0]),
+        evicted_event_count=3.0,
+    )
+    assert torch.allclose(cd.score_num[0], torch.zeros(2), atol=1e-6)
+    assert abs(cd.score_den[0].item()) < 1e-6
+    assert abs(cd.event_mass[0].item()) < 1e-6
+```
+
+**Step 2:** Run — FAIL.
+
+**Step 3:** Implement:
+
+```python
+    @torch.no_grad()
+    def _subtract_expired_contribution(
+        self,
+        *,
+        layer: int,
+        evicted_step: int,
+        current_step: int,
+        evicted_evidence: torch.Tensor,
+        evicted_event_count: float,
+    ) -> None:
+        """Remove an expired/evicted slot's contribution at its current
+        decay weight. Call this BEFORE writing the new entry into a
+        slot that was occupied."""
+        age = max(0, int(current_step) - int(evicted_step))
+        factor = 2.0 ** (-float(age) / self.trace_half_life_steps)
+        ec = float(evicted_event_count) * factor
+        ev = evicted_evidence.to(
+            dtype=self.score_num.dtype, device=self.score_num.device
+        )
+        self.score_num[layer].sub_(ev, alpha=ec)
+        self.score_den[layer].sub_(ec / factor if ec != 0 else 0.0)  # raw ec without factor... see note
+        # Correction: evicted slot's unweighted event_count was
+        # `evicted_event_count`. Its current contribution to score_den
+        # is `evicted_event_count * factor`. Remove that.
+        # (Refactor the above to be clearer.)
+```
+
+Actually, re-think the math. The contribution the slot ADDED at time `evicted_step` was:
+- score_num[layer] += evicted_evidence * evicted_event_count * (weight at time of add = 1.0)
+- score_den[layer] += evicted_event_count * 1.0
+- event_mass[layer] += evicted_event_count * 1.0
+
+Between then and `current_step`, all accumulators have been multiplied by `2^(-(current_step - evicted_step) / half_life) = factor`. So the slot's **remaining** contribution is:
+- score_num: `evicted_evidence * evicted_event_count * factor`
+- score_den: `evicted_event_count * factor`
+- event_mass: `evicted_event_count * factor`
+
+Subtract these. Cleaner implementation:
+
+```python
+    @torch.no_grad()
+    def _subtract_expired_contribution(
+        self,
+        *,
+        layer: int,
+        evicted_step: int,
+        current_step: int,
+        evicted_evidence: torch.Tensor,
+        evicted_event_count: float,
+    ) -> None:
+        age = max(0, int(current_step) - int(evicted_step))
+        factor = 2.0 ** (-float(age) / self.trace_half_life_steps)
+        remaining_ec = float(evicted_event_count) * factor
+        ev = evicted_evidence.to(
+            dtype=self.score_num.dtype, device=self.score_num.device
+        )
+        self.score_num[layer].sub_(ev, alpha=remaining_ec)
+        self.score_den[layer].sub_(remaining_ec)
+        self.event_mass[layer].sub_(remaining_ec)
+```
+
+**Step 4-5:** Run test, commit: `criticality: _subtract_expired_contribution for TTL-exact accumulator correction`
+
+### Task C.5 — `score_from_accumulators` replaces hot-path score
+
+**Files:** same.
+
+**Step 1:** Failing test.
+
+```python
+def test_score_from_accumulators_matches_full_bank_score_after_ingest_sequence():
+    """The incremental accumulator must produce the same score as the
+    full-bank scan after any sequence of ingests. This is the
+    consistency pin between the two implementations."""
+    cd = CriticalityDistillation(
+        num_layers=1, dim=3, trace_ttl_steps=8,
+        trace_half_life_steps=4.0,
+    )
+    ingests = [
+        (0, torch.tensor([1.0, 0.0, 0.0]), 2.0),
+        (1, torch.tensor([0.0, 1.0, 0.0]), 3.0),
+        (3, torch.tensor([0.0, 0.0, 2.0]), 1.0),
+    ]
+    for step, evidence, ec in ingests:
+        cd._step_decay_accumulators(current_step=step)
+        cd._add_contribution(layer=0, evidence=evidence, event_count=ec)
+        # Also write to the ring bank for the full-scan comparison.
+        cd.add_step_evidence(layer=0, step=step, evidence=evidence, event_count=ec)
+    # Advance decay to score time.
+    current_step = 5
+    cd._step_decay_accumulators(current_step=current_step)
+    accumulator_score = cd.score_from_accumulators()
+    full_scan_score = cd.score(current_step=current_step)
+    # Tolerance accounts for the fact that the accumulator's
+    # denominator treats `event_count` as weight while the full-scan
+    # score uses equal weight per entry. The two are semantically
+    # different if event_counts differ — so we compare the SIGN and
+    # NEARLY-EQUAL PER-CHANNEL RATIOS, not raw magnitudes.
+    # [Actually — align the two definitions so this matches. See note.]
+    # For now assert the peak channel matches.
+    assert accumulator_score[0].argmax().item() == full_scan_score[0].argmax().item()
+```
+
+**Implementation note for the subagent:** the full-scan `score()` uses `sum(age_weight * evidence) / sum(age_weight)` — equal weight per entry regardless of event_count. The accumulator weights entries by `event_count`. These are different semantics.
+
+**Decision:** align `score()` (the full-scan) with the accumulator semantics: weight each entry by its `event_count` when computing the age-weighted mean. Update both tests that depend on `score()` to the new convention.
+
+The math: `score_accumulator[c] = score_num[c] / score_den` where both have been age-decayed together. Equivalent to `(Σ_entries w_e · count_e · evidence_e[c]) / (Σ_entries w_e · count_e)`. This is a count-weighted mean, which is what we want — a step with 100 events contributes more than a step with 1 event.
+
+**Step 2:** Run — FAIL.
+
+**Step 3:** Implement two things:
+
+(a) Add to `CriticalityDistillation`:
+
+```python
+    def score_from_accumulators(self) -> torch.Tensor:
+        """Age-weighted count-weighted mean of evidence, read from
+        running accumulators. Hot-path scorer."""
+        denom = self.score_den.clamp_min(1e-12).unsqueeze(-1)
+        raw = self.score_num / denom  # [L, D]
+        # Layers with zero event_mass contribute zero (not NaN).
+        valid = self.event_mass > 0
+        return torch.where(valid.unsqueeze(-1), raw, torch.zeros_like(raw))
+```
+
+(b) Update `score()` (the full-scan) to weight by `bank_event_count` so it matches the accumulator semantics. Any existing tests that break under this change are testing the old unweighted semantics — update their expected values using the new weighted math.
+
+**Step 4:** Run. Expect some existing tests to break — audit each, update expected values or explain why they should be unchanged.
+
+**Step 5:** Commit: `criticality: score_from_accumulators as hot-path, align score() semantics`
+
+### Task C.6 — `allocate_seats_from_accumulators` + gate on `event_mass`
+
+**Files:** same.
+
+**Step 1:** Failing test.
+
+```python
+def test_allocate_seats_from_accumulators_picks_topk_by_accumulator_score():
+    cd = CriticalityDistillation(
+        num_layers=1, dim=8, trace_ttl_steps=8,
+        trace_half_life_steps=100.0,
+        criticality_budget_frac=0.25,  # k=2
+        min_weighted_events_per_layer=0.5,
+    )
+    cd._step_decay_accumulators(current_step=0)
+    cd._add_contribution(layer=0, evidence=torch.tensor([0.1,0.2,5.0,0.0,0.0,9.0,0.0,0.0]), event_count=1.0)
+    cd.allocate_seats_from_accumulators(current_step=1)
+    assert cd.seat_mask[0].sum().item() == 2
+    assert cd.seat_mask[0, 5].item() is True  # peak 1
+    assert cd.seat_mask[0, 2].item() is True  # peak 2
+
+
+def test_allocate_seats_from_accumulators_respects_event_mass_gate():
+    cd = CriticalityDistillation(
+        num_layers=1, dim=8, trace_ttl_steps=8,
+        trace_half_life_steps=100.0,
+        criticality_budget_frac=0.25,
+        min_weighted_events_per_layer=100.0,  # unreachable
+    )
+    cd._step_decay_accumulators(current_step=0)
+    cd._add_contribution(layer=0, evidence=torch.ones(8), event_count=1.0)
+    cd.allocate_seats_from_accumulators(current_step=1)
+    assert not cd.seat_mask[0].any()
+```
+
+**Step 2:** Run — FAIL.
+
+**Step 3:** Implement:
+
+```python
+    @torch.no_grad()
+    def allocate_seats_from_accumulators(self, *, current_step: int) -> None:
+        """Hot-path seat allocator. Respects fixed_random_seats flag."""
+        if self.fixed_random_seats:
+            return
+        self._step_decay_accumulators(current_step=current_step)
+        k = max(1, int(round(self.dim * self.criticality_budget_frac)))
+        scores = self.score_from_accumulators()
+        for layer in range(self.num_layers):
+            if self.event_mass[layer].item() < self.min_weighted_events_per_layer:
                 self.seat_mask[layer].fill_(False)
                 continue
             mask = torch.zeros(self.dim, dtype=torch.bool, device=self.seat_mask.device)
             if self.score_permute_before_topk:
-                # Random k-of-D channels — ignores score entirely. The
-                # evidence gate is still respected above, so layers
-                # without evidence get no seats even in this mode.
                 perm = torch.randperm(self.dim, device=self.seat_mask.device)
                 mask[perm[:k]] = True
             else:
@@ -221,257 +479,41 @@ In `allocate_seats`, replace the top-k selection block:
             self.seat_mask[layer] = mask
 ```
 
-**Step 4: Run.**
+**Step 4-5:** Run, commit: `criticality: allocate_seats_from_accumulators (hot-path, event_mass-gated)`
 
-```
-/opt/homebrew/bin/python3.11 -m pytest tests/test_criticality_distillation.py -q
-```
-All pass.
+### Task C.7 — Update `ingest_cpu_from_prepared` to drive accumulators
 
-**Step 5: Commit.**
+**Files:** same.
 
-```bash
-git add src/chaoscontrol/optim/criticality.py tests/test_criticality_distillation.py
-git commit -m "criticality: score_permute_before_topk flag — random k-of-D for shuffled-teacher falsifier"
-```
-
-### Task B.2 — `fixed_random_seats` flag (design-faithful budget-only falsifier)
-
-**Context.** The original design's `budget_only` cell is "no scoring, no bank, random fixed top-k seats held constant throughout training." This tests "does any fixed criticality budget help, regardless of channel selection?" Implementation: at init, pick random k channels per layer and never change them. Skip ingest and allocate entirely.
-
-**Files:**
-- Modify: `src/chaoscontrol/optim/criticality.py`
-- Modify: `tests/test_criticality_distillation.py`
-
-**Step 1: Write the failing tests.**
-
-Append:
+**Step 1:** Failing test.
 
 ```python
-def test_fixed_random_seats_binds_once_at_init_and_never_changes():
-    torch.manual_seed(7)
-    cd = CriticalityDistillation(
-        num_layers=2, dim=8, trace_ttl_steps=4,
-        criticality_budget_frac=0.25,  # k=2 per layer
-        fixed_random_seats=True,
-    )
-    # Seats bound at init.
-    assert cd.seat_mask[0].sum().item() == 2
-    assert cd.seat_mask[1].sum().item() == 2
-    initial_mask_0 = cd.seat_mask[0].clone()
-    initial_mask_1 = cd.seat_mask[1].clone()
-    # Per-layer masks differ (different random draws).
-    if initial_mask_0.shape == initial_mask_1.shape:
-        # Not strictly required but the test seed makes it likely.
-        pass
-    # allocate_seats is a no-op.
-    cd.add_step_evidence(layer=0, step=0, evidence=torch.tensor([5.0]*8), event_count=1.0)
-    cd.allocate_seats(current_step=1)
-    assert torch.equal(cd.seat_mask[0], initial_mask_0)
-    assert torch.equal(cd.seat_mask[1], initial_mask_1)
-
-
-def test_fixed_random_seats_with_default_false_does_not_prebind():
-    torch.manual_seed(7)
-    cd = CriticalityDistillation(
-        num_layers=1, dim=8, trace_ttl_steps=4,
-        criticality_budget_frac=0.25,
-    )
-    # Default False — no seats pre-bound.
-    assert cd.seat_mask.sum().item() == 0
-```
-
-**Step 2: Run — expect FAIL.**
-
-Constructor doesn't accept `fixed_random_seats`.
-
-**Step 3: Implement.**
-
-In `__init__`, add the flag:
-
-```python
-        fixed_random_seats: bool = False,
-```
-
-Store `self.fixed_random_seats = bool(fixed_random_seats)`.
-
-After the buffer registrations in `__init__`, add:
-
-```python
-        if self.fixed_random_seats:
-            k = max(1, int(round(self.dim * self.criticality_budget_frac)))
-            for layer in range(self.num_layers):
-                perm = torch.randperm(self.dim)
-                self.seat_mask[layer, perm[:k]] = True
-```
-
-In `allocate_seats`, add an early return at the top:
-
-```python
-    @torch.no_grad()
-    def allocate_seats(self, *, current_step: int) -> None:
-        """..."""
-        if self.fixed_random_seats:
-            # Seats bound once at init and never change — no-op.
-            return
-        # ... existing body unchanged ...
-```
-
-**Step 4: Run.**
-
-```
-/opt/homebrew/bin/python3.11 -m pytest tests/test_criticality_distillation.py -q
-```
-All pass.
-
-**Step 5: Commit.**
-
-```bash
-git add src/chaoscontrol/optim/criticality.py tests/test_criticality_distillation.py
-git commit -m "criticality: fixed_random_seats flag for design-faithful budget-only falsifier"
-```
-
----
-
-## Stage C — CPU/GPU split infrastructure
-
-### Task C.1 — `sync_seat_mask_to_device` helper
-
-**Files:**
-- Modify: `src/chaoscontrol/optim/criticality.py`
-- Modify: `tests/test_criticality_distillation.py`
-
-**Step 1: Write the failing test.**
-
-```python
-def test_seat_mask_can_live_on_different_device_than_bank():
-    cd = CriticalityDistillation(
-        num_layers=1, dim=4, trace_ttl_steps=2,
-        criticality_budget_frac=0.5,
-        min_weighted_events_per_layer=0.0,
-    )
-    cd.sync_seat_mask_to_device(torch.device('cpu'))
-    assert cd.seat_mask.device == torch.device('cpu')
-    cd.add_step_evidence(layer=0, step=0, evidence=torch.tensor([1.0, 2.0, 0.0, 0.0]), event_count=1.0)
-    cd.allocate_seats(current_step=1)
-    assert cd.seat_mask.device == torch.device('cpu')
-    log_a = torch.zeros(4, requires_grad=True)
-    loss = cd.criticality_loss([log_a])
-    assert loss.device == torch.device('cpu')
-```
-
-**Step 2-5:** Same pattern as before. Implement:
-
-```python
-    def sync_seat_mask_to_device(self, device: torch.device) -> None:
-        """Move (or keep) seat_mask on the specified device."""
-        self.seat_mask.data = self.seat_mask.data.to(device)
-```
-
-Commit: `criticality: sync_seat_mask_to_device for CPU-bank + GPU-seat_mask split`
-
-### Task C.2 — Two-phase ingest (`ingest_gpu` + `ingest_cpu_from_prepared`)
-
-**Files:**
-- Modify: `src/chaoscontrol/optim/criticality.py`
-- Modify: `tests/test_criticality_distillation.py`
-
-**Step 1: Failing test — split produces same bank state as single-call.**
-
-```python
-def test_ingest_two_phase_matches_single_phase_output():
-    cd_single = CriticalityDistillation(num_layers=1, dim=3, trace_ttl_steps=4, baseline_ema_decay=0.0)
-    cd_split = CriticalityDistillation(num_layers=1, dim=3, trace_ttl_steps=4, baseline_ema_decay=0.0)
-    states_l0 = torch.tensor([[
-        [1.0, 0.0, 0.0],
-        [0.0, 1.0, 0.0],
-        [0.0, 0.0, 1.0],
-    ]])
-    pressure = torch.tensor([[10.0, 0.0, 0.0]])
-    cd_single.ingest_step(step=0, pressure=pressure, states_per_layer=[states_l0], horizon_H=2, event_frac=0.34)
-    prepared = cd_split.ingest_gpu(pressure=pressure, states_per_layer=[states_l0], horizon_H=2, event_frac=0.34)
-    cd_split.ingest_cpu_from_prepared(step=0, prepared=prepared)
-    assert torch.allclose(cd_single.bank_evidence, cd_split.bank_evidence)
-    assert torch.equal(cd_single.bank_step, cd_split.bank_step)
-    assert torch.allclose(cd_single.bank_event_count, cd_split.bank_event_count)
-    assert torch.allclose(cd_single.baseline_future_energy, cd_split.baseline_future_energy)
-    assert torch.equal(cd_single.baseline_initialized, cd_split.baseline_initialized)
-
-
-def test_ingest_gpu_returns_expected_dict_keys():
-    cd = CriticalityDistillation(num_layers=2, dim=3, trace_ttl_steps=4)
-    prepared = cd.ingest_gpu(
-        pressure=torch.randn(1, 4),
-        states_per_layer=[torch.randn(1, 4, 3), torch.randn(1, 4, 3)],
-        horizon_H=2,
-        event_frac=0.5,
-    )
-    assert set(prepared.keys()) == {
-        "event_mask", "aggregated_excess_per_layer",
-        "non_event_mean_future_energy_per_layer",
-        "event_count_per_layer",
+def test_ingest_cpu_from_prepared_advances_accumulators():
+    cd = CriticalityDistillation(num_layers=1, dim=3, trace_ttl_steps=8, trace_half_life_steps=4.0)
+    prepared = {
+        "event_mask": torch.tensor([[True, False, True]]),
+        "aggregated_excess_per_layer": torch.tensor([[1.0, 2.0, 3.0]]),
+        "non_event_mean_future_energy_per_layer": torch.tensor([[0.5, 0.5, 0.5]]),
+        "event_count_per_layer": torch.tensor([2.0]),
     }
-    assert prepared["event_mask"].shape == (1, 4)
-    assert prepared["event_mask"].dtype == torch.bool
-    assert prepared["aggregated_excess_per_layer"].shape == (2, 3)
-    assert prepared["non_event_mean_future_energy_per_layer"].shape == (2, 3)
-    assert prepared["event_count_per_layer"].shape == (2,)
+    cd.ingest_cpu_from_prepared(step=0, prepared=prepared)
+    # Accumulators updated: score_num = evidence * count = [2, 4, 6];
+    # score_den = 2; event_mass = 2.
+    assert torch.allclose(cd.score_num[0], torch.tensor([2.0, 4.0, 6.0]))
+    assert cd.score_den[0].item() == 2.0
+    assert cd.event_mass[0].item() == 2.0
+    # Ring bank also written for TTL/checkpoint state.
+    slot = (cd.bank_step[0] == 0).nonzero(as_tuple=True)[0].item()
+    assert torch.allclose(cd.bank_evidence[0, slot], torch.tensor([1.0, 2.0, 3.0]))
 ```
 
-**Step 2: Run — expect FAIL (methods don't exist).**
+**Step 2:** Run — FAIL (existing method doesn't update accumulators).
 
-**Step 3: Implement.**
+**Step 3:** Update `ingest_cpu_from_prepared` to call `_step_decay_accumulators + _add_contribution` alongside the existing ring-bank write + baseline EMA update. When the ring evicts a slot, first call `_subtract_expired_contribution` with the evicted slot's data.
+
+Updated flow:
 
 ```python
-    @torch.no_grad()
-    def ingest_gpu(
-        self,
-        *,
-        pressure: torch.Tensor,
-        states_per_layer: list,
-        horizon_H: int,
-        event_frac: float,
-    ) -> dict:
-        if len(states_per_layer) != self.num_layers:
-            raise ValueError(
-                f"states_per_layer must have {self.num_layers} entries; got {len(states_per_layer)}"
-            )
-        event_mask = compute_event_mask(pressure, event_frac=event_frac)
-        flat_mask = event_mask.reshape(-1)
-        flat_non_event = ~flat_mask
-        aggregated_excess = []
-        non_event_mean_future_energy = []
-        event_count = []
-        for layer, states in enumerate(states_per_layer):
-            if states.shape[-1] != self.dim:
-                raise ValueError(
-                    f"layer {layer}: states last dim {states.shape[-1]} != self.dim {self.dim}"
-                )
-            future_energy = compute_future_energy(states, horizon_H=horizon_H)
-            flat_fe = future_energy.reshape(-1, self.dim)
-            if flat_non_event.any():
-                nonevt_mean = flat_fe[flat_non_event].mean(dim=0)
-            else:
-                nonevt_mean = torch.zeros(self.dim, dtype=flat_fe.dtype, device=flat_fe.device)
-            non_event_mean_future_energy.append(nonevt_mean)
-            baseline = self.baseline_future_energy[layer].to(flat_fe.device)
-            excess = (future_energy - baseline).clamp_min(0.0)
-            flat_excess = excess.reshape(-1, self.dim)
-            if flat_mask.any():
-                agg = flat_excess[flat_mask].mean(dim=0)
-                cnt = flat_mask.sum().to(torch.float32)
-            else:
-                agg = torch.zeros(self.dim, dtype=flat_excess.dtype, device=flat_excess.device)
-                cnt = torch.zeros((), dtype=torch.float32, device=flat_excess.device)
-            aggregated_excess.append(agg)
-            event_count.append(cnt)
-        return {
-            "event_mask": event_mask,
-            "aggregated_excess_per_layer": torch.stack(aggregated_excess, dim=0),
-            "non_event_mean_future_energy_per_layer": torch.stack(non_event_mean_future_energy, dim=0),
-            "event_count_per_layer": torch.stack(event_count, dim=0),
-        }
-
     @torch.no_grad()
     def ingest_cpu_from_prepared(self, *, step: int, prepared: dict) -> None:
         agg = prepared["aggregated_excess_per_layer"].to(
@@ -485,6 +527,8 @@ def test_ingest_gpu_returns_expected_dict_keys():
         )
         had_non_events = bool((~prepared["event_mask"]).any().item())
         decay = self.baseline_ema_decay
+        # Advance accumulator decay to this step.
+        self._step_decay_accumulators(current_step=step)
         for layer in range(self.num_layers):
             if had_non_events:
                 obs = nonevt[layer]
@@ -494,879 +538,404 @@ def test_ingest_gpu_returns_expected_dict_keys():
                 else:
                     self.baseline_future_energy[layer].mul_(decay).add_(obs, alpha=(1.0 - decay))
             cnt = float(counts[layer].item())
-            if cnt > 0:
-                self.add_step_evidence(
-                    layer=layer,
-                    step=step,
-                    evidence=agg[layer],
-                    event_count=cnt,
-                )
-```
-
-**Step 4: Run — all tests pass.**
-**Step 5: Commit:** `criticality: two-phase ingest (ingest_gpu + ingest_cpu_from_prepared)`
-
----
-
-## Stage D — Runner integration
-
-### Task D.1 — Pressure computation helper
-
-**Files:**
-- Create: `experiments/_23_fast_path_runner_helpers.py`
-- Modify: `experiments/23_fast_path/runner_fast_path.py`
-- Create: `tests/test_runner_criticality_pressure.py`
-
-**Step 1: Write failing tests.**
-
-`tests/test_runner_criticality_pressure.py`:
-
-```python
-import torch
-import pytest
-from experiments._23_fast_path_runner_helpers import compute_ce_minus_entropy_pressure
-
-
-def test_pressure_fires_on_confident_wrong():
-    logits = torch.tensor([[[5.0, 5.0, 0.0]]])
-    targets = torch.tensor([[2]])
-    pressure = compute_ce_minus_entropy_pressure(logits, targets)
-    assert pressure.shape == (1, 1)
-    assert pressure[0, 0].item() > 3.0
-
-
-def test_pressure_suppresses_confused_wrong():
-    logits = torch.zeros(1, 1, 10)
-    targets = torch.tensor([[3]])
-    pressure = compute_ce_minus_entropy_pressure(logits, targets)
-    assert abs(pressure[0, 0].item()) < 1e-5
-
-
-def test_pressure_nonnegative_always():
-    torch.manual_seed(0)
-    logits = torch.randn(2, 4, 8)
-    targets = torch.randint(0, 8, (2, 4))
-    pressure = compute_ce_minus_entropy_pressure(logits, targets)
-    assert (pressure >= 0.0).all()
-```
-
-**Step 2: Run — expect ImportError.**
-
-**Step 3: Implement.**
-
-`experiments/_23_fast_path_runner_helpers.py`:
-
-```python
-"""Runner-side helpers shared between runner_fast_path and tests."""
-from __future__ import annotations
-
-import torch
-import torch.nn.functional as F
-
-
-def compute_ce_minus_entropy_pressure(
-    logits: torch.Tensor,
-    targets: torch.Tensor,
-) -> torch.Tensor:
-    """Per-position `relu(CE - H[p])` pressure for Criticality Distillation.
-
-    Args:
-        logits: `[B, T, V]` unnormalized logits.
-        targets: `[B, T]` int64 target indices.
-
-    Returns:
-        `[B, T]` fp32 non-negative pressure.
-    """
-    log_probs = F.log_softmax(logits, dim=-1)
-    ce = -log_probs.gather(-1, targets.unsqueeze(-1)).squeeze(-1)
-    probs = log_probs.exp()
-    entropy = -(probs * log_probs).sum(dim=-1)
-    return (ce - entropy).clamp_min(0.0)
-```
-
-Add a re-export in `runner_fast_path.py`:
-
-```python
-from experiments._23_fast_path_runner_helpers import (  # noqa: E402
-    compute_ce_minus_entropy_pressure,
-)
-```
-
-**Step 4: Run — all pass.**
-**Step 5: Commit:** `runner: compute_ce_minus_entropy_pressure helper for criticality distillation`
-
-### Task D.2 — CD construction + train-step plumbing with lm_head_backward_mode validation
-
-**Files:**
-- Modify: `experiments/23_fast_path/runner_fast_path.py`
-- Modify: `tests/test_exp23_fast_path.py`
-
-**Step 1: Failing tests.**
-
-```python
-def test_train_fast_for_budget_raises_if_cd_enabled_with_fused_lm_head():
-    mod = _load_runner_module()
-    model = _TinyTokenTrainModel()
-    optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
-    with pytest.raises(ValueError, match="criticality_distill_enabled.*fused"):
-        mod.train_fast_for_budget(
-            model,
-            train_tokens=torch.arange(128, dtype=torch.int16) % 6,
-            train_num_tokens=128,
-            stride=4, seq_len=3, batch_size=2,
-            device=torch.device("cpu"),
-            optimizer=optimizer,
-            budget_seconds=300.0,
-            chunk_size=2, grad_clip_norm=0.0, fused_grad_clip=False,
-            rank=0, world_size=1, seed=123, precision="fp32",
-            stop_check_interval=1, stop_margin_seconds=0.0,
-            vocab_size=6, max_steps=1, prefetch_batches=False,
-            lm_head_backward_mode="fused_streaming_cached",
-            criticality_distill_enabled=True,
-        )
-
-
-def test_train_fast_for_budget_wires_criticality_distillation_when_configured(monkeypatch):
-    mod = _load_runner_module()
-    from chaoscontrol.optim.criticality import CriticalityDistillation
-
-    model = _TinyTokenTrainModel()
-    optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
-
-    ingest_gpu_calls = []
-    ingest_cpu_calls = []
-    sync_calls = []
-    allocate_calls = []
-
-    orig_ingest_gpu = CriticalityDistillation.ingest_gpu
-    orig_ingest_cpu = CriticalityDistillation.ingest_cpu_from_prepared
-    orig_sync = CriticalityDistillation.sync_seat_mask_to_device
-    orig_allocate = CriticalityDistillation.allocate_seats
-
-    def spy_ingest_gpu(self, **kwargs):
-        ingest_gpu_calls.append(kwargs)
-        return orig_ingest_gpu(self, **kwargs)
-
-    def spy_ingest_cpu(self, **kwargs):
-        ingest_cpu_calls.append(kwargs)
-        return orig_ingest_cpu(self, **kwargs)
-
-    def spy_sync(self, device):
-        sync_calls.append(device)
-        return orig_sync(self, device)
-
-    def spy_allocate(self, **kwargs):
-        allocate_calls.append(kwargs)
-        return orig_allocate(self, **kwargs)
-
-    monkeypatch.setattr(CriticalityDistillation, "ingest_gpu", spy_ingest_gpu)
-    monkeypatch.setattr(CriticalityDistillation, "ingest_cpu_from_prepared", spy_ingest_cpu)
-    monkeypatch.setattr(CriticalityDistillation, "sync_seat_mask_to_device", spy_sync)
-    monkeypatch.setattr(CriticalityDistillation, "allocate_seats", spy_allocate)
-
-    mod.train_fast_for_budget(
-        model,
-        train_tokens=torch.arange(128, dtype=torch.int16) % 6,
-        train_num_tokens=128,
-        stride=4, seq_len=3, batch_size=2,
-        device=torch.device("cpu"),
-        optimizer=optimizer,
-        budget_seconds=300.0,
-        chunk_size=2, grad_clip_norm=0.0, fused_grad_clip=False,
-        rank=0, world_size=1, seed=123, precision="fp32",
-        stop_check_interval=1, stop_margin_seconds=0.0,
-        vocab_size=6, max_steps=4, prefetch_batches=False,
-        lm_head_backward_mode="single",  # CD requires non-fused for entropy
-        criticality_distill_enabled=True,
-        criticality_distill_weight=1e-3,
-        criticality_distill_budget_frac=0.25,
-        criticality_distill_half_life_steps=100.0,
-        criticality_distill_ttl_steps=400,
-        criticality_distill_horizon_H=2,
-        criticality_distill_event_frac=0.25,
-        criticality_distill_seat_refresh_interval=2,
-        criticality_distill_min_weighted_events_per_layer=0.0,
-        criticality_distill_critical_value=0.95,
-        criticality_distill_uniform_pressure=False,
-        criticality_distill_score_permute_before_topk=False,
-        criticality_distill_fixed_random_seats=False,
-    )
-
-    assert len(ingest_gpu_calls) == 4
-    assert len(ingest_cpu_calls) == 4
-    assert len(allocate_calls) == 2  # seat_refresh_interval=2 over 4 steps
-    assert len(sync_calls) >= 2
-
-
-def test_train_fast_for_budget_cd_fixed_random_seats_skips_ingest_and_allocate(monkeypatch):
-    """Fixed-random-seats cell: no ingest, no allocate, seats bound at
-    init and held."""
-    mod = _load_runner_module()
-    from chaoscontrol.optim.criticality import CriticalityDistillation
-
-    model = _TinyTokenTrainModel()
-    optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
-    ingest_calls = []
-
-    monkeypatch.setattr(
-        CriticalityDistillation,
-        "ingest_gpu",
-        lambda self, **kw: (ingest_calls.append(kw) or {"event_mask": torch.zeros(1,1,dtype=torch.bool),
-                                                        "aggregated_excess_per_layer": torch.zeros(1,1),
-                                                        "non_event_mean_future_energy_per_layer": torch.zeros(1,1),
-                                                        "event_count_per_layer": torch.zeros(1)})
-    )
-
-    mod.train_fast_for_budget(
-        model,
-        train_tokens=torch.arange(128, dtype=torch.int16) % 6,
-        train_num_tokens=128,
-        stride=4, seq_len=3, batch_size=2,
-        device=torch.device("cpu"),
-        optimizer=optimizer,
-        budget_seconds=300.0,
-        chunk_size=2, grad_clip_norm=0.0, fused_grad_clip=False,
-        rank=0, world_size=1, seed=123, precision="fp32",
-        stop_check_interval=1, stop_margin_seconds=0.0,
-        vocab_size=6, max_steps=4, prefetch_batches=False,
-        lm_head_backward_mode="single",
-        criticality_distill_enabled=True,
-        criticality_distill_fixed_random_seats=True,
-        # Other CD knobs at defaults.
-    )
-    assert len(ingest_calls) == 0, (
-        "fixed_random_seats cell must skip ingest entirely"
-    )
-```
-
-**Step 2: Run — all fail.**
-
-**Step 3: Implement plumbing in `train_fast_for_budget`.**
-
-Add these kwargs (all default so existing runs unchanged):
-
-```python
-    # CD kwargs
-    criticality_distill_enabled: bool = False,
-    criticality_distill_weight: float = 1e-3,
-    criticality_distill_budget_frac: float = 0.15,
-    criticality_distill_critical_value: float = 0.95,
-    criticality_distill_half_life_steps: float = 2048.0,
-    criticality_distill_ttl_steps: int = 20480,
-    criticality_distill_horizon_H: int = 64,
-    criticality_distill_event_frac: float = 0.05,
-    criticality_distill_seat_refresh_interval: int = 64,
-    criticality_distill_min_weighted_events_per_layer: float = 256.0,
-    criticality_distill_baseline_ema_decay: float = 0.99,
-    criticality_distill_uniform_pressure: bool = False,
-    criticality_distill_score_permute_before_topk: bool = False,
-    criticality_distill_fixed_random_seats: bool = False,
-```
-
-After the existing config normalization, add validation:
-
-```python
-    if criticality_distill_enabled:
-        mode_lc = str(lm_head_backward_mode).strip().lower()
-        if mode_lc in _FUSED_LM_HEAD_MODES:
-            raise ValueError(
-                "criticality_distill_enabled=True requires a non-fused LM-head "
-                "backward mode so the full logits exist for per-position entropy "
-                f"computation. Got lm_head_backward_mode={lm_head_backward_mode!r}. "
-                "Use lm_head_backward_mode='single' or another non-fused variant."
+            if cnt <= 0:
+                continue
+            # Incremental accumulator update.
+            self._add_contribution(
+                layer=layer,
+                evidence=agg[layer],
+                event_count=cnt,
+            )
+            # Ring-bank write with TTL-exact correction.
+            self._write_ring_slot(
+                layer=layer,
+                step=step,
+                evidence=agg[layer],
+                event_count=cnt,
+                current_step=step,
             )
 ```
 
-Construct CD if enabled (after model construction, before training loop):
+Add helper `_write_ring_slot` that subtracts an evicted slot's contribution before overwriting:
 
 ```python
-    from contextlib import ExitStack
-    criticality = None
-    ssm_cores: list = []
-    if criticality_distill_enabled:
-        from chaoscontrol.optim.criticality import CriticalityDistillation
-        for layer in model.layers:
-            core = getattr(layer, "core", None)
-            if core is not None and getattr(core, "a_mode", None) == "diag":
-                ssm_cores.append(core)
-        if not ssm_cores:
-            raise ValueError(
-                "criticality_distill_enabled=True requires at least one diag-mode SSM core"
-            )
-        dim = ssm_cores[0].dim
-        for c in ssm_cores:
-            if c.dim != dim:
-                raise ValueError(
-                    f"CD requires all captured cores share dim; got {c.dim} vs {dim}"
-                )
-        criticality = CriticalityDistillation(
-            num_layers=len(ssm_cores),
-            dim=dim,
-            trace_ttl_steps=int(criticality_distill_ttl_steps),
-            trace_half_life_steps=float(criticality_distill_half_life_steps),
-            seat_refresh_interval=int(criticality_distill_seat_refresh_interval),
-            criticality_budget_frac=float(criticality_distill_budget_frac),
-            critical_value=float(criticality_distill_critical_value),
-            min_weighted_events_per_layer=float(criticality_distill_min_weighted_events_per_layer),
-            criticality_distill_weight=float(criticality_distill_weight),
-            baseline_ema_decay=float(criticality_distill_baseline_ema_decay),
-            score_permute_before_topk=bool(criticality_distill_score_permute_before_topk),
-            fixed_random_seats=bool(criticality_distill_fixed_random_seats),
-        )
-        criticality.sync_seat_mask_to_device(device)
-```
-
-In the inner training loop — pseudocode, adapt to the runner's actual variable names:
-
-```python
-        if criticality is not None and not criticality.fixed_random_seats:
-            with ExitStack() as stack:
-                _ = [stack.enter_context(c.capture_states()) for c in ssm_cores]
-                # Existing forward that produces logits + ce
-                hidden = model.encode(inputs)
-                logits = model.lm_head(model.final_norm(hidden))
-                ce = F.cross_entropy(logits.reshape(-1, V), targets.reshape(-1), reduction='none').view(B, T)
-                ce_loss = ce.mean()
-            states_per_layer = [c._captured_states for c in ssm_cores]
-            # Pressure
-            if bool(criticality_distill_uniform_pressure):
-                pressure = torch.ones_like(ce)
-            else:
-                pressure = compute_ce_minus_entropy_pressure(logits, targets)
-            # Ingest
-            prepared = criticality.ingest_gpu(
-                pressure=pressure,
-                states_per_layer=states_per_layer,
-                horizon_H=int(criticality_distill_horizon_H),
-                event_frac=float(criticality_distill_event_frac),
-            )
-            prepared_cpu = {
-                k: (v.to('cpu') if isinstance(v, torch.Tensor) else v)
-                for k, v in prepared.items()
-            }
-            criticality.ingest_cpu_from_prepared(step=steps, prepared=prepared_cpu)
-            # Seat refresh
-            if steps % criticality.seat_refresh_interval == 0:
-                criticality.allocate_seats(current_step=steps)
-                criticality.sync_seat_mask_to_device(device)
-        elif criticality is not None and criticality.fixed_random_seats:
-            # No ingest, no allocate — run plain forward + CE.
-            hidden = model.encode(inputs)
-            logits = model.lm_head(model.final_norm(hidden))
-            ce_loss = F.cross_entropy(logits.reshape(-1, V), targets.reshape(-1))
+    @torch.no_grad()
+    def _write_ring_slot(
+        self, *, layer: int, step: int, evidence: torch.Tensor,
+        event_count: float, current_step: int,
+    ) -> None:
+        slots = self.bank_step[layer]
+        empty = (slots == -1).nonzero(as_tuple=True)[0]
+        if empty.numel() > 0:
+            slot = int(empty[0].item())
         else:
-            # Existing non-CD forward path, unchanged.
-            ...
-
-        # Loss compose
-        if criticality is not None:
-            log_a_per_layer = [c.log_a for c in ssm_cores]
-            cd_loss = criticality.criticality_loss(log_a_per_layer)
-            total_loss = ce_loss + cd_loss
-        else:
-            total_loss = ce_loss
+            # Evicting oldest — first subtract its remaining contribution.
+            slot = int(slots.argmin().item())
+            evicted_step = int(slots[slot].item())
+            evicted_ev = self.bank_evidence[layer, slot].clone()
+            evicted_cnt = float(self.bank_event_count[layer, slot].item())
+            self._subtract_expired_contribution(
+                layer=layer,
+                evicted_step=evicted_step,
+                current_step=current_step,
+                evicted_evidence=evicted_ev,
+                evicted_event_count=evicted_cnt,
+            )
+        self.bank_evidence[layer, slot] = evidence.to(
+            dtype=self.bank_evidence.dtype, device=self.bank_evidence.device,
+        )
+        self.bank_step[layer, slot] = int(step)
+        self.bank_event_count[layer, slot] = float(event_count)
 ```
 
-**Implementation note:** the runner's existing structure uses `_run_train_step` to encapsulate the forward + loss. The cleanest integration is a new `_run_criticality_distillation_train_step` that replaces `_run_train_step` when CD is active, rather than adding branches inside the existing function. Match whichever pattern the rest of the file uses.
+**Step 4:** Run full suite. The existing `test_add_step_evidence_writes_into_correct_slot_and_ttl_wraps` still passes (ring behavior unchanged). Accumulator test passes.
 
-**Step 4: Run full file.**
+**Step 5:** Commit: `criticality: ingest drives incremental accumulators, ring handles TTL correction`
 
-```
-/opt/homebrew/bin/python3.11 -m pytest tests/test_exp23_fast_path.py -q
-```
+### Task C.8 — Equivalence test: accumulator score vs full-bank score
 
-All pass, including the three new CD tests.
+**Files:** `tests/test_criticality_distillation.py`.
 
-**Step 5: Commit:** `runner: criticality distillation wiring with non-fused LM head requirement`
-
-### Task D.3 — Val-time per-bucket CE in the submission scorer
-
-**Context.** Primary success metric is rare-bucket CE on Param-Golf val — NOT the training-time `FrequencyBucketBaseline._ema`. The training EMA is telemetry that we'll emit per-step (Task D.4 diagnostic), but the GATE is val-time per-bucket CE. This task extends the existing full-val scorer to emit per-bucket CE alongside the aggregate BPB it already produces.
-
-**Files:**
-- Modify: `experiments/23_fast_path/runner_fast_path.py` (locate the full-val scoring code)
-- Modify: `tests/test_exp23_fast_path.py`
-- Also: inspect where `FrequencyBucketBaseline` is persisted at eval time — the val scorer needs access to token frequencies.
-
-**Step 1: Failing test.**
+**Step 1:** A sharper equivalence test than C.5's shape-only check.
 
 ```python
-def test_full_val_scorer_emits_per_bucket_ce():
-    """The full-val scorer's result dict must include
-    per_bucket_val_ce: List[float], one entry per frequency bucket.
-    Rare-bucket CE is the first N entries (lowest log-freq buckets)."""
-    mod = _load_runner_module()
-    # Construct a minimal val scorer invocation with a stub model +
-    # known token frequencies, then verify the output shape + dtype.
-    # (Exact call shape depends on runner internals — adapt.)
-    #
-    # Minimal behavior:
-    result = mod.run_full_val_score(
-        model=_TinyTokenTrainModel(),
-        val_tokens=torch.arange(64, dtype=torch.int16) % 6,
-        token_frequencies=torch.tensor([100.0, 50.0, 20.0, 10.0, 5.0, 1.0]),
-        num_buckets=4,
-        device=torch.device("cpu"),
-    )
-    assert "per_bucket_val_ce" in result
-    assert len(result["per_bucket_val_ce"]) == 4
-    for v in result["per_bucket_val_ce"]:
-        assert isinstance(v, float)
-    assert "rare_bucket_val_ce" in result
-    assert isinstance(result["rare_bucket_val_ce"], float)  # aggregate of lowest bucket(s)
-```
-
-**Step 2: Run — expect FAIL (function or key missing).**
-
-**Step 3: Implement.**
-
-Locate the full-val scorer in `runner_fast_path.py` (search for `full_val`, `val_score`, or similar). Extend its per-token-CE accumulator to bucket by target token frequency:
-
-- Build a `FrequencyBucketBaseline`-style bucketizer from `token_frequencies + num_buckets`.
-- For each val batch, compute per-position CE, then scatter-add into `bucket_sum[num_buckets]` and `bucket_count[num_buckets]`.
-- At the end, `per_bucket_val_ce[b] = bucket_sum[b] / max(bucket_count[b], 1)`.
-- `rare_bucket_val_ce` is the mean of the lowest `max(1, num_buckets // 4)` buckets (quarter-most-rare).
-
-Emit both in the scorer's result dict. Propagate through `train_fast_for_budget`'s return so exp24 summaries can read it.
-
-**Step 4: Run full file — all pass.**
-**Step 5: Commit:** `runner: per-bucket val CE in full-val scorer (primary CD metric)`
-
-### Task D.4 — Diagnostics: seat_churn, budget_occupancy, score_criticality_corr, event_rate
-
-**Files:**
-- Modify: `src/chaoscontrol/optim/criticality.py`
-- Modify: `experiments/23_fast_path/runner_fast_path.py`
-- Modify: `tests/test_criticality_distillation.py`
-
-**Step 1: Failing tests.**
-
-```python
-def test_diagnostics_snapshot_shape():
+def test_accumulator_score_equals_full_bank_score_within_fp32_tolerance():
+    """Incremental accumulator and full-bank scan must agree exactly
+    (modulo fp32 rounding) after any ingest sequence and any step
+    advance."""
     cd = CriticalityDistillation(
-        num_layers=2, dim=8, trace_ttl_steps=4,
-        criticality_budget_frac=0.25,
+        num_layers=2, dim=5, trace_ttl_steps=10,
+        trace_half_life_steps=3.0,
     )
-    cd.seat_mask[0, :2] = True
-    cd.seat_mask[1, 2:4] = True
-    # Populate baseline and bank minimally.
-    cd.add_step_evidence(layer=0, step=0, evidence=torch.ones(8), event_count=3.0)
-    cd.add_step_evidence(layer=1, step=0, evidence=torch.ones(8), event_count=5.0)
-    cd.baseline_initialized.fill_(True)
-
-    log_a_per_layer = [torch.zeros(8), torch.zeros(8)]
-    snap = cd.diagnostics_snapshot(log_a_per_layer, current_step=1)
-    assert "seat_churn_per_layer" in snap  # fraction of seats changed since last snapshot
-    assert "budget_occupancy_per_layer" in snap  # fraction of seat channels above critical_value threshold
-    assert "score_criticality_corr_per_layer" in snap
-    assert "event_rate_per_layer" in snap
-    assert len(snap["seat_churn_per_layer"]) == 2
-    assert len(snap["budget_occupancy_per_layer"]) == 2
-    assert len(snap["score_criticality_corr_per_layer"]) == 2
-    assert len(snap["event_rate_per_layer"]) == 2
-
-
-def test_seat_churn_zero_when_seats_unchanged_between_snapshots():
-    cd = CriticalityDistillation(num_layers=1, dim=6, trace_ttl_steps=4, criticality_budget_frac=0.5)
-    cd.seat_mask[0, :3] = True
-    log_a = [torch.zeros(6)]
-    _ = cd.diagnostics_snapshot(log_a, current_step=0)
-    # Same seat_mask on next snapshot.
-    snap2 = cd.diagnostics_snapshot(log_a, current_step=1)
-    assert snap2["seat_churn_per_layer"][0] == 0.0
-
-
-def test_seat_churn_nonzero_when_seats_shift():
-    cd = CriticalityDistillation(num_layers=1, dim=6, trace_ttl_steps=4, criticality_budget_frac=0.5)
-    cd.seat_mask[0, :3] = True
-    log_a = [torch.zeros(6)]
-    _ = cd.diagnostics_snapshot(log_a, current_step=0)
-    cd.seat_mask[0].zero_()
-    cd.seat_mask[0, 3:] = True  # all seats moved
-    snap2 = cd.diagnostics_snapshot(log_a, current_step=1)
-    assert snap2["seat_churn_per_layer"][0] > 0.9
+    torch.manual_seed(7)
+    steps = [0, 1, 3, 5, 8, 13, 21]
+    for step in steps:
+        cd._step_decay_accumulators(current_step=step)
+        for layer in range(2):
+            evidence = torch.randn(5).abs() + 0.1
+            cnt = float(torch.randint(1, 10, (1,)).item())
+            cd._add_contribution(layer=layer, evidence=evidence, event_count=cnt)
+            cd._write_ring_slot(
+                layer=layer, step=step, evidence=evidence,
+                event_count=cnt, current_step=step,
+            )
+    current_step = 30
+    cd._step_decay_accumulators(current_step=current_step)
+    acc = cd.score_from_accumulators()
+    full = cd.score(current_step=current_step)
+    assert torch.allclose(acc, full, atol=1e-4, rtol=1e-4), (
+        f"accumulator diverged from full scan: acc={acc} full={full}"
+    )
 ```
 
-**Step 2-5: Implement + commit.**
+**Step 2-3:** Run — the test may initially fail due to subtle off-by-one in TTL handling OR because `score()` semantics aren't aligned. Fix whichever side is wrong until they match within fp32 tolerance. If they diverge, this is the regression pin that keeps the two impls in agreement.
 
-Add to `CriticalityDistillation`:
-
-```python
-    def diagnostics_snapshot(
-        self,
-        log_a_per_layer: list,
-        current_step: int,
-    ) -> dict:
-        """Emit a per-layer diagnostic snapshot.
-
-        Must be called with a stable cadence (e.g. at each seat refresh)
-        so seat_churn is interpretable.
-        """
-        if len(log_a_per_layer) != self.num_layers:
-            raise ValueError(f"need {self.num_layers} log_a tensors")
-        # seat_churn — needs a previous snapshot of seat_mask. Store
-        # lazily.
-        if not hasattr(self, "_last_seat_mask"):
-            self._last_seat_mask = torch.zeros_like(self.seat_mask)
-        churn = (self.seat_mask != self._last_seat_mask).float().mean(dim=-1)  # [L]
-        self._last_seat_mask = self.seat_mask.clone()
-        # budget_occupancy
-        occupancy = []
-        for layer, log_a in enumerate(log_a_per_layer):
-            mask = self.seat_mask[layer]
-            if not mask.any():
-                occupancy.append(0.0)
-                continue
-            criticality = 1.0 - torch.sigmoid(log_a.to(torch.float32))
-            above = criticality >= self.critical_value * 0.9  # 90% of target
-            occupancy.append(float((mask & above.to(mask.device)).float().sum().item() / mask.float().sum().item()))
-        # score_criticality_corr — Spearman-lite (rank correlation) per layer.
-        scores = self.score(current_step=current_step)  # [L, D]
-        corrs = []
-        for layer, log_a in enumerate(log_a_per_layer):
-            criticality = 1.0 - torch.sigmoid(log_a.detach().to(torch.float32)).cpu()
-            s = scores[layer].cpu()
-            # Pearson over rank — cheap proxy for Spearman.
-            rs = torch.argsort(torch.argsort(s)).float()
-            rc = torch.argsort(torch.argsort(criticality)).float()
-            rs = rs - rs.mean()
-            rc = rc - rc.mean()
-            denom = (rs.norm() * rc.norm()).clamp_min(1e-12)
-            corrs.append(float(((rs * rc).sum() / denom).item()))
-        # event_rate — average bank_event_count over populated slots.
-        event_rates = []
-        for layer in range(self.num_layers):
-            valid = self.bank_step[layer] >= 0
-            if not valid.any():
-                event_rates.append(0.0)
-                continue
-            event_rates.append(float(self.bank_event_count[layer][valid].mean().item()))
-        return {
-            "seat_churn_per_layer": churn.tolist(),
-            "budget_occupancy_per_layer": occupancy,
-            "score_criticality_corr_per_layer": corrs,
-            "event_rate_per_layer": event_rates,
-        }
-```
-
-In the runner, emit `diagnostics_snapshot` at every seat refresh into the result dict as `criticality_distillation_diagnostics: List[dict]` (one entry per refresh).
-
-Commit: `criticality: diagnostics_snapshot (seat_churn, budget_occupancy, score_criticality_corr, event_rate)`
-
-### Task D.5 — Config-threading test through the full matrix → runner path
-
-**Context.** `train_fast_for_budget` is called from the orchestrator via a config dict that must thread CD kwargs correctly. This class of bug has bitten us repeatedly — silent kwarg drops. Test directly.
-
-**Files:**
-- Create: `tests/test_cd_config_threading.py`
-
-**Step 1: Write the test (will fail if the dispatch is broken).**
-
-```python
-"""Config threading test for Criticality Distillation.
-
-Builds a matrix entry via the exp24 builder, then exercises the
-full dispatch path to confirm CD kwargs arrive at train_fast_for_budget
-unmodified.
-"""
-import sys
-sys.path.insert(0, "experiments/23_fast_path")
-sys.path.insert(0, "experiments/24_training_time_bundle")
-
-
-def test_matrix_entry_threads_all_cd_kwargs_to_runner(monkeypatch):
-    from exp24 import build_criticality_distillation_first_smoke_matrix
-
-    entries = build_criticality_distillation_first_smoke_matrix(
-        speed_config={}, seed=1337, budget_seconds=600.0,
-    )
-    assert len(entries) == 8
-    treatment = next(e for e in entries if "treatment" in e["name"])
-
-    # The orchestrator threads entries through run_condition -> runner
-    # kwargs. We monkeypatch train_fast_for_budget to capture the kwargs
-    # it actually receives.
-    import runner_fast_path  # type: ignore
-    captured = {}
-
-    def capture_kwargs(*args, **kwargs):
-        captured.update(kwargs)
-        # Return a minimal result dict so the orchestrator doesn't
-        # choke on downstream processing.
-        return {
-            "steps": 0, "final_loss": 0.0, "initial_loss": 0.0,
-            "aggregate_tokens_per_sec": 0.0, "peak_vram_mb": 0.0,
-            "tokens_per_step": 0, "elapsed_s": 0.0, "world_size": 1,
-            "loss_delta": 0.0, "loss_trajectory": [],
-        }
-
-    monkeypatch.setattr(runner_fast_path, "train_fast_for_budget", capture_kwargs)
-
-    # Now invoke the dispatch path the orchestrator uses. If the project
-    # has a helper like run_matrix_entries or run_condition, call that.
-    # Fall back to a direct config -> kwargs manual flatten if no such
-    # helper exists.
-    from launch import run_matrix_entries  # adapt to actual module
-    run_matrix_entries(
-        entries=[treatment],
-        output_dir="/tmp/test_cd_threading",
-        world_size=1,
-        dry_run=False,
-    )
-
-    required_cd_keys = {
-        "criticality_distill_enabled",
-        "criticality_distill_weight",
-        "criticality_distill_budget_frac",
-        "criticality_distill_critical_value",
-        "criticality_distill_half_life_steps",
-        "criticality_distill_ttl_steps",
-        "criticality_distill_horizon_H",
-        "criticality_distill_event_frac",
-        "criticality_distill_seat_refresh_interval",
-        "criticality_distill_min_weighted_events_per_layer",
-        "criticality_distill_uniform_pressure",
-        "criticality_distill_score_permute_before_topk",
-        "criticality_distill_fixed_random_seats",
-        "lm_head_backward_mode",
-        "rare_bucket_ce_num_buckets",
-    }
-    missing = required_cd_keys - set(captured.keys())
-    assert not missing, f"kwargs dropped in dispatch: {missing}"
-    # Spot-check a few critical values survive intact.
-    assert captured["criticality_distill_enabled"] is True
-    assert captured["criticality_distill_weight"] == 1e-3
-    assert captured["lm_head_backward_mode"] == "single"
-```
-
-**Step 2-5: Run — if the dispatch drops kwargs, this test catches it BEFORE first smoke burns pod time.** Fix the dispatch (usually in `launch.py` or wherever `run_condition`/`run_matrix_entries` flattens config dicts into kwargs) until the test passes. Commit: `runner: config-threading test confirms CD kwargs reach train_fast_for_budget`
+**Step 4-5:** Run, commit: `criticality: pin accumulator / full-scan equivalence to fp32 tolerance`
 
 ---
 
-## Stage E — Smoke matrix (on the locked fast/slow base)
+## Stage D — Fused LM head entropy emission (time-boxed, measured)
 
-### Task E.1 — `build_criticality_distillation_first_smoke_matrix` on fast_slow base
+**This is the one stage in this plan where the individual implementation step is genuinely >5 minutes.** Time it. Ken and I agreed ~30 min is the realistic estimate. Report actual elapsed in the commit message.
 
-**Files:**
-- Modify: `experiments/24_training_time_bundle/exp24.py`
-- Modify: `experiments/24_training_time_bundle/run_exp24.py`
-- Create: `tests/test_exp24_cd_smoke_matrix.py`
+**Outline:**
 
-**Step 1: Failing tests.**
+The existing fused forward emits `(loss, lse, per_token_ce)` (or `(loss, lse, per_token_ce, logits_cache)` in the cached variant). Add a fourth scalar accumulator per row in the streaming pass:
 
-```python
-import sys
-sys.path.insert(0, "experiments/23_fast_path")
-sys.path.insert(0, "experiments/24_training_time_bundle")
-from exp24 import build_criticality_distillation_first_smoke_matrix
-
-
-def test_matrix_emits_eight_cells_with_expected_names():
-    entries = build_criticality_distillation_first_smoke_matrix(
-        speed_config={}, seed=1337, budget_seconds=600.0,
-    )
-    assert len(entries) == 8
-    expected_suffixes = [
-        "treatment", "telemetry", "shuffled", "budget_only",
-        "hl_short", "hl_long", "H_short", "H_long",
-    ]
-    for suffix in expected_suffixes:
-        assert any(suffix in e["name"] for e in entries), (
-            f"missing cell for {suffix}"
-        )
-
-
-def test_every_cell_rides_on_locked_fast_slow_base():
-    """Every cell must inherit the control_fastslow_only_i64a025 lock
-    exactly. Otherwise matrix results conflate CD effect with base
-    differences."""
-    entries = build_criticality_distillation_first_smoke_matrix(
-        speed_config={}, seed=1337, budget_seconds=600.0,
-    )
-    for e in entries:
-        assert e.get("fast_slow_enabled") is True, e["name"]
-        assert e.get("fast_slow_interval") == 64, e["name"]
-        assert e.get("fast_slow_alpha") == 0.25, e["name"]
-        assert e.get("fast_slow_eval_copy") == "slow", e["name"]
-        assert e.get("dreamworld_enabled") is False, e["name"]
-        assert e.get("dreamworld_cache_interval") == 0, e["name"]
-        assert e.get("dreamworld_interval") == 0, e["name"]
-        assert e.get("dreamworld_weight") == 0.0, e["name"]
-        assert e.get("dreamworld_replay_batch_size") == 0, e["name"]
-
-
-def test_every_cell_uses_non_fused_lm_head_backward():
-    entries = build_criticality_distillation_first_smoke_matrix(
-        speed_config={}, seed=1337, budget_seconds=600.0,
-    )
-    for e in entries:
-        mode = str(e.get("lm_head_backward_mode", "")).strip().lower()
-        assert mode in {"single", "chunked"}, (
-            f"{e['name']} uses {mode!r}, must be non-fused for CD entropy"
-        )
-
-
-def test_cell_flags_match_design():
-    entries = build_criticality_distillation_first_smoke_matrix(
-        speed_config={}, seed=1337, budget_seconds=600.0,
-    )
-    by_suffix = {}
-    for e in entries:
-        # Strip _s<seed> and cd_ prefix to get the arm suffix.
-        name = e["name"]
-        arm = name.rsplit("_s", 1)[0].split("cd_")[-1]
-        by_suffix[arm] = e
-
-    # treatment: surprise pressure, weight 1e-3, real score, hl 2048, H 64
-    t = by_suffix["treatment"]
-    assert t["criticality_distill_enabled"] is True
-    assert t["criticality_distill_weight"] == 1e-3
-    assert t["criticality_distill_uniform_pressure"] is False
-    assert t["criticality_distill_score_permute_before_topk"] is False
-    assert t["criticality_distill_fixed_random_seats"] is False
-    assert t["criticality_distill_half_life_steps"] == 2048
-    assert t["criticality_distill_horizon_H"] == 64
-
-    # telemetry: weight 0
-    assert by_suffix["telemetry"]["criticality_distill_weight"] == 0.0
-
-    # shuffled: score_permute_before_topk True
-    assert by_suffix["shuffled"]["criticality_distill_score_permute_before_topk"] is True
-
-    # budget_only: fixed_random_seats True (design-faithful: no scoring, no bank)
-    assert by_suffix["budget_only"]["criticality_distill_fixed_random_seats"] is True
-
-    # Ablations
-    assert by_suffix["hl_short"]["criticality_distill_half_life_steps"] == 256
-    assert by_suffix["hl_long"]["criticality_distill_half_life_steps"] == 16384
-    assert by_suffix["H_short"]["criticality_distill_horizon_H"] == 16
-    assert by_suffix["H_long"]["criticality_distill_horizon_H"] == 256
+```
+sum_exp_logit[row] = Σ_v exp(logit_v - lse[row]) · logit_v
 ```
 
-**Step 2: Run — expect ImportError on builder.**
+Then `entropy[row] = lse[row] - sum_exp_logit[row]` (since probs sum to 1 by the lse normalization).
 
-**Step 3: Implement.**
+We extend **only one mode** to start (the current default: `fused_streaming_cached`). Other modes stay as-is and are unsupported for CD.
 
-In `experiments/24_training_time_bundle/exp24.py`:
+### Task D.1 — CUDA kernel: accumulate `sum_exp_logit` in the streaming pass
+
+**Files:** `src/chaoscontrol/kernels/_lm_head_loss/src/linear_ce.cu`
+
+**Start timer. Target: 30 min for D.1 through D.4.**
+
+**Step 1:** Find the streaming cached forward kernel (search for `linear_ce_streaming_cached_forward` or similar). Identify the row-level accumulation loop.
+
+**Step 2:** Add a new output buffer `per_token_entropy` emitted alongside `per_token_ce`. In the tile loop, after `max_logit` and `lse` are computed, add a second accumulation:
+
+```cpp
+// After lse is known for this row:
+float sum_exp_logit = 0.0f;
+for (int v = 0; v < vocab; ++v) {
+    float l = logits[row * vocab + v];
+    sum_exp_logit += expf(l - lse_row) * l;
+}
+per_token_entropy[row] = lse_row - sum_exp_logit;
+```
+
+In the actual streaming pass this is not a second pass — fold it into the existing tile loop that computes lse (or the loss-compute pass that reads logits again for CE).
+
+**Step 3:** Unit test at the C++/CUDA level (if the project has a way to call kernels from pytest) OR skip to D.4's Python-level test.
+
+**Step 4:** Build + load the extension:
+
+```bash
+MAX_JOBS=6 TORCH_CUDA_ARCH_LIST="9.0" /opt/homebrew/bin/python3.11 -m pip install -e . --no-build-isolation 2>&1 | tail -5
+```
+
+(Note: this builds CUDA code. On macOS without CUDA, the build will skip or error. **This task and D.2 / D.3 should be done by a subagent on the pod, not macOS.** The plan splits execution: write the code changes on macOS, verify against a Python reference in D.4, actual kernel execution + numerical test runs on the pod.)
+
+**Step 5:** Commit: `lm_head_loss: emit per_token_entropy in streaming_cached forward kernel`
+
+### Task D.2 — C++ binding: expose entropy output in pybind signature
+
+**Files:** `src/chaoscontrol/kernels/_lm_head_loss/src/rms_norm_binding.cpp`
+
+**Step 1-3:** Extend the return tuple of `linear_ce_streaming_cached_forward` (or define a new entrypoint `linear_ce_streaming_cached_forward_with_entropy`) to include `per_token_entropy` of shape `[B*T]` fp32.
+
+**Step 4-5:** Commit: `lm_head_loss: bind per_token_entropy in streaming_cached forward`
+
+### Task D.3 — Python autograd.Function returns entropy
+
+**Files:** `src/chaoscontrol/kernels/_lm_head_loss/__init__.py`
+
+**Step 1:** Add a new public API:
 
 ```python
-def build_criticality_distillation_first_smoke_matrix(
+def fused_lm_head_forward_with_ce_entropy(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    target: torch.Tensor,
     *,
-    speed_config: dict[str, Any],
-    seed: int = 1337,
-    world_size: int = 1,
-    budget_seconds: float = 600.0,
-    batch_size: int = 512,
-) -> list[dict[str, Any]]:
-    """First-read Criticality Distillation matrix — 8 cells, every cell
-    riding on the locked control_fastslow_only_i64a025 operational stack.
+    tile_size: int = 8192,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Returns (loss, lse, per_token_ce, per_token_entropy). Entropy is
+    detached (non-differentiable); the other three tensors behave as
+    before."""
+    ...
+```
 
-    Measures whether treatment improves rare-bucket val CE relative to
-    three falsifier controls (telemetry, shuffled-teacher, budget-only
-    random-fixed-seats) and maps sensitivity to half-life and horizon_H.
-    """
-    base = _base_entry(
-        speed_config=speed_config,
-        world_size=world_size,
-        budget_seconds=budget_seconds,
+This wraps the existing `fused_lm_head_forward` or the cached variant, with an additional per-token-entropy output.
+
+**Step 4-5:** Commit: `lm_head_loss: fused_lm_head_forward_with_ce_entropy API`
+
+### Task D.4 — Python test: kernel entropy matches softmax reference
+
+**Files:** `tests/test_lm_head_loss_kernel.py` (or new file `tests/test_lm_head_loss_entropy.py`).
+
+**This is a pod-only GPU test.** Mark skipped if no CUDA.
+
+**Step 1:** Failing test.
+
+```python
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_fused_entropy_matches_softmax_reference_within_fp32_tolerance():
+    from chaoscontrol.kernels._lm_head_loss import fused_lm_head_forward_with_ce_entropy
+    import torch.nn.functional as F
+    torch.manual_seed(0)
+    B, T, D, V = 2, 8, 32, 128
+    x = torch.randn(B, T, D, device='cuda', dtype=torch.float32)
+    weight = torch.randn(V, D, device='cuda', dtype=torch.float32)
+    target = torch.randint(0, V, (B, T), device='cuda', dtype=torch.int64)
+    loss, lse, per_token_ce, per_token_entropy = fused_lm_head_forward_with_ce_entropy(
+        x.reshape(-1, D), weight, target.reshape(-1),
+        tile_size=8192,
     )
-    base["artifact_impact"] = ARTIFACT_CHANGES_WEIGHTS_ONLY
-    base["batch_size"] = int(batch_size)
-    base["optimizer_param_grouping"] = "ssm_three_group"
-    base["optimizer_dynamics_lr_mul"] = 0.1
-    base["optimizer"] = "muon"
-
-    # LOCKED fast/slow-only base — every cell inherits this exactly.
-    base["fast_slow_enabled"] = True
-    base["fast_slow_interval"] = 64
-    base["fast_slow_alpha"] = 0.25
-    base["fast_slow_eval_copy"] = "slow"
-    base["dreamworld_enabled"] = False
-    base["dreamworld_cache_interval"] = 0
-    base["dreamworld_interval"] = 0
-    base["dreamworld_weight"] = 0.0
-    base["dreamworld_replay_batch_size"] = 0
-
-    # Non-fused LM head required for CD entropy.
-    base["lm_head_backward_mode"] = "single"
-
-    # CD defaults per design doc (CPU-resident bank, rescaled long windows).
-    base["criticality_distill_enabled"] = True
-    base["criticality_distill_weight"] = 1e-3
-    base["criticality_distill_budget_frac"] = 0.15
-    base["criticality_distill_critical_value"] = 0.95
-    base["criticality_distill_half_life_steps"] = 2048
-    base["criticality_distill_ttl_steps"] = 20480
-    base["criticality_distill_horizon_H"] = 64
-    base["criticality_distill_event_frac"] = 0.05
-    base["criticality_distill_seat_refresh_interval"] = 64
-    base["criticality_distill_min_weighted_events_per_layer"] = 256
-    base["criticality_distill_baseline_ema_decay"] = 0.99
-    base["criticality_distill_uniform_pressure"] = False
-    base["criticality_distill_score_permute_before_topk"] = False
-    base["criticality_distill_fixed_random_seats"] = False
-
-    # Val-time per-bucket CE readout.
-    base["rare_bucket_ce_num_buckets"] = 16
-
-    def _cell(arm_suffix: str, overrides: dict[str, Any]) -> dict[str, Any]:
-        cell = copy.deepcopy(base)
-        cell.update(overrides)
-        return _named_entry(
-            base=cell,
-            phase="smoke",
-            mechanism="cd_first_smoke",
-            arm=f"cd_{arm_suffix}",
-            seed=seed,
-        )
-
-    return [
-        _cell("treatment", {}),
-        _cell("telemetry", {"criticality_distill_weight": 0.0}),
-        _cell("shuffled", {"criticality_distill_score_permute_before_topk": True}),
-        _cell("budget_only", {"criticality_distill_fixed_random_seats": True}),
-        _cell("hl_short", {"criticality_distill_half_life_steps": 256,
-                            "criticality_distill_ttl_steps": 2560}),
-        _cell("hl_long", {"criticality_distill_half_life_steps": 16384,
-                           "criticality_distill_ttl_steps": 163840}),
-        _cell("H_short", {"criticality_distill_horizon_H": 16}),
-        _cell("H_long", {"criticality_distill_horizon_H": 256}),
-    ]
+    # Reference via softmax.
+    logits = x.reshape(-1, D) @ weight.T  # [B*T, V]
+    log_probs = F.log_softmax(logits, dim=-1)
+    probs = log_probs.exp()
+    ref_entropy = -(probs * log_probs).sum(dim=-1)
+    assert torch.allclose(per_token_entropy, ref_entropy, atol=1e-4, rtol=1e-4), (
+        f"max abs diff = {(per_token_entropy - ref_entropy).abs().max().item()}"
+    )
 ```
 
-In `run_exp24.py`:
-- Add `from exp24 import build_criticality_distillation_first_smoke_matrix` alongside other builder imports.
-- Add dispatch branch inside `run_matrix`:
-  ```python
-  if matrix == "cd_first_smoke":
-      entries: list[dict[str, Any]] = []
-      for seed in seeds:
-          entries.extend(
-              build_criticality_distillation_first_smoke_matrix(
-                  speed_config=speed_config, seed=seed,
-                  world_size=world_size, budget_seconds=budget_seconds,
-              )
-          )
-      return entries
-  ```
-- Add `"cd_first_smoke"` to argparse `choices`.
-- Add to `_default_world_size_for_matrix`: returns 1.
-- Add to `_default_budget_for_matrix`: returns 600.0.
+**Step 2-5:** Pod-only build + run. Commit: `lm_head_loss: test fused per-token entropy matches softmax reference`
 
-**Step 4: Run tests.**
+**Stop timer. Report elapsed in the final commit message of this stage** (e.g. `"actual elapsed: 37 min"` in `git notes` or the commit body).
 
-```
-/opt/homebrew/bin/python3.11 -m pytest tests/test_exp24_cd_smoke_matrix.py -q
-```
-All pass.
+---
 
-Dry-run check:
-```
-/opt/homebrew/bin/python3.11 experiments/24_training_time_bundle/run_exp24.py --matrix cd_first_smoke --seeds 1337 --dry-run
-```
-Prints 8 entries.
+## Stage E — Runner wiring with fused entropy + async D2H
 
-**Step 5: Commit:** `exp24: register cd_first_smoke on locked fast_slow-only base (8 cells)`
+### Task E.1 — Pressure helper consumes fused (ce, entropy) pair
+
+**Files:** `experiments/_23_fast_path_runner_helpers.py` (new), `experiments/23_fast_path/runner_fast_path.py`, `tests/test_runner_criticality_pressure.py`.
+
+**Step 1:** Failing test (same structure as v2 Task D.1 but consumes pre-computed per-token CE and entropy tensors, not logits):
+
+```python
+from experiments._23_fast_path_runner_helpers import compute_ce_minus_entropy_pressure_from_fused
+
+
+def test_pressure_from_fused_pair_nonnegative_and_ranks_by_innovation():
+    ce = torch.tensor([[3.0, 0.5, 2.0]])
+    entropy = torch.tensor([[0.1, 2.0, 2.5]])
+    # innovation = ce - entropy = [2.9, -1.5 -> 0, -0.5 -> 0]
+    pressure = compute_ce_minus_entropy_pressure_from_fused(ce, entropy)
+    assert (pressure >= 0).all()
+    assert pressure.argmax().item() == 0  # highest innovation at index 0
+```
+
+**Step 2-5:** Implement as a one-liner. Commit: `runner: compute_ce_minus_entropy_pressure_from_fused helper`
+
+### Task E.2 — CD construction + entropy-capable mode validation
+
+**Files:** `experiments/23_fast_path/runner_fast_path.py`, `tests/test_exp23_fast_path.py`.
+
+**Step 1:** Failing tests for:
+- `criticality_distill_enabled=True` with an entropy-capable mode (`fused_streaming_cached_with_entropy`) succeeds.
+- `criticality_distill_enabled=True` with a non-entropy-capable mode raises.
+- `criticality_distill_enabled=False` works with any mode (existing behavior).
+
+**Step 2-5:** Implement kwarg plumbing + validation. Define constant `_ENTROPY_CAPABLE_LM_HEAD_MODES = {"fused_streaming_cached_with_entropy"}` (initially only one mode). Commit: `runner: criticality distillation requires entropy-capable LM-head mode`
+
+### Task E.3 — Training-step wiring: capture, pressure, pinned async D2H, accumulator update
+
+**Files:** `experiments/23_fast_path/runner_fast_path.py`, `tests/test_exp23_fast_path.py`.
+
+**Step 1:** Failing integration-style test that runs 4 steps through the CD pipeline and verifies:
+- `ingest_gpu` called 4× (per-step ingest).
+- Pinned host buffers used for D2H (verify by asserting `tensor.is_pinned()` in a spy).
+- Accumulator state advances as steps go by.
+- Seat refresh fires every `seat_refresh_interval` steps.
+- `criticality_loss` is added to `total_loss` when CD has seats.
+
+**Step 2-5:** Implement the inner training step.
+
+Key structural change over v2's wiring: use pinned double-buffered host tensors and async D2H.
+
+```python
+# At CD construction time, allocate two pinned host buffers per prepared-key.
+def _alloc_pinned_evidence_buffers(num_layers: int, dim: int) -> dict:
+    return {
+        "A": {
+            "aggregated_excess_per_layer": torch.empty(num_layers, dim, pin_memory=True, dtype=torch.float32),
+            "non_event_mean_future_energy_per_layer": torch.empty(num_layers, dim, pin_memory=True, dtype=torch.float32),
+            "event_count_per_layer": torch.empty(num_layers, pin_memory=True, dtype=torch.float32),
+            "event_mask": torch.empty((1,), pin_memory=True, dtype=torch.bool),  # placeholder — resized per batch
+        },
+        "B": {...},  # mirror
+    }
+
+# Per-step, inside the training loop (with CD active):
+parity = step % 2  # ping-pong A/B
+host_slot = pinned_buffers["A" if parity == 0 else "B"]
+
+# Forward + CE + entropy via the fused entropy-capable kernel.
+with ExitStack() as stack:
+    _ = [stack.enter_context(c.capture_states()) for c in ssm_cores]
+    hidden = model.encode(inputs)
+    # Fused LM head with entropy:
+    loss, lse, per_token_ce, per_token_entropy = fused_lm_head_forward_with_ce_entropy(...)
+states_per_layer = [c._captured_states for c in ssm_cores]
+
+# Pressure.
+if criticality_distill_uniform_pressure:
+    pressure = torch.ones_like(per_token_ce).reshape(B, T)
+else:
+    pressure = compute_ce_minus_entropy_pressure_from_fused(
+        per_token_ce.reshape(B, T), per_token_entropy.reshape(B, T),
+    )
+
+# GPU reduction.
+prepared_gpu = criticality.ingest_gpu(
+    pressure=pressure,
+    states_per_layer=states_per_layer,
+    horizon_H=int(criticality_distill_horizon_H),
+    event_frac=float(criticality_distill_event_frac),
+)
+# Async D2H into pinned buffer.
+host_slot["aggregated_excess_per_layer"].copy_(prepared_gpu["aggregated_excess_per_layer"], non_blocking=True)
+host_slot["non_event_mean_future_energy_per_layer"].copy_(prepared_gpu["non_event_mean_future_energy_per_layer"], non_blocking=True)
+host_slot["event_count_per_layer"].copy_(prepared_gpu["event_count_per_layer"], non_blocking=True)
+# event_mask resized as needed.
+ev_mask_cpu = prepared_gpu["event_mask"].to("cpu", non_blocking=True)
+
+# Record event so the CPU consumer can wait.
+copy_done = torch.cuda.Event()
+copy_done.record()
+
+# ... training backward + optimizer step happens on main stream ...
+loss.backward()
+optimizer.step()
+
+# After the backward, CPU accumulator update (D2H will be done by then).
+copy_done.synchronize()
+prepared_cpu = {
+    "aggregated_excess_per_layer": host_slot["aggregated_excess_per_layer"],
+    "non_event_mean_future_energy_per_layer": host_slot["non_event_mean_future_energy_per_layer"],
+    "event_count_per_layer": host_slot["event_count_per_layer"],
+    "event_mask": ev_mask_cpu,
+}
+criticality.ingest_cpu_from_prepared(step=step, prepared=prepared_cpu)
+
+# Seat refresh every N steps.
+if step % criticality.seat_refresh_interval == 0 and step > 0:
+    criticality.allocate_seats_from_accumulators(current_step=step)
+    criticality.sync_seat_mask_to_device(device)
+```
+
+Commit: `runner: CD wiring with fused entropy, pinned async D2H, accumulator update`
+
+### Task E.4 — Diagnostics snapshot + val-time per-bucket CE
+
+**Files:** `src/chaoscontrol/optim/criticality.py`, `experiments/23_fast_path/runner_fast_path.py`, `tests/test_criticality_distillation.py`, `tests/test_exp23_fast_path.py`.
+
+Same as v2 Tasks D.3 + D.4. Commit: `runner: diagnostics_snapshot + per-bucket val CE`
+
+### Task E.5 — Config-threading test
+
+Same as v2 Task D.5, with the added required keys `lm_head_backward_mode` = entropy-capable mode name. Commit: `runner: config-threading test confirms CD kwargs reach train_fast_for_budget`
+
+---
+
+## Stage F — Smoke matrix on fast/slow base
+
+### Task F.1 — `build_criticality_distillation_first_smoke_matrix`
+
+Same as v2 Stage E with two differences:
+1. `base["lm_head_backward_mode"] = "fused_streaming_cached_with_entropy"` (entropy-capable fused mode, not `"single"`).
+2. Matrix test asserts every cell has this mode value.
+
+Commit: `exp24: register cd_first_smoke on locked fast_slow base with fused-entropy LM head`
+
+---
+
+## Stage G — Topology preflight + overhead measurement (measure-only, no hard fail)
+
+### Task G.1 — Topology snapshot emitted at training start
+
+**Files:** `experiments/23_fast_path/runner_fast_path.py` (one new helper), `tests/test_exp23_fast_path.py`.
+
+**Step 1:** Failing test — runner emits `topology_snapshot` in the result dict when enabled:
+
+```python
+def test_runner_emits_topology_snapshot_when_requested():
+    mod = _load_runner_module()
+    model = _TinyTokenTrainModel()
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+    result = mod.train_fast_for_budget(
+        model, ..., emit_topology_snapshot=True, max_steps=1,
+    )
+    snap = result.get("topology_snapshot")
+    assert snap is not None
+    assert "lscpu" in snap or "cpu_info" in snap
+    assert "nvidia_smi_topo" in snap or "gpu_topo" in snap or snap.get("gpu_topo_unavailable") is True
+    assert "numactl_h" in snap or "numa_unavailable" in snap
+```
+
+**Step 2-5:** Implement the helper as subprocess calls to `lscpu`, `nvidia-smi topo -m`, `numactl -H`, capturing stdout into the result dict. Each call wrapped in try/except to tolerate missing binaries.
+
+Commit: `runner: topology_snapshot for CPU flags, GPU interconnect, NUMA`
+
+### Task G.2 — CD overhead measurement
+
+**Files:** `experiments/23_fast_path/runner_fast_path.py`, `tests/test_exp23_fast_path.py`.
+
+**Step 1:** Failing test that runs the same config twice — once with `criticality_distill_enabled=False` and once with `True` (same steps, same seed) — and verifies the result dict contains an `cd_overhead` block with `tokens_per_sec_baseline`, `tokens_per_sec_treatment`, `overhead_fraction` fields.
+
+**Step 2-5:** Implement the measurement pattern. This is opt-in; only smoke cells that request it pay the double-run cost. For the first smoke, only `treatment` and `budget_only` need it (they're the "can CD ship" cells).
+
+Commit: `runner: CD overhead measurement (baseline vs CD-active tokens/sec, report only)`
 
 ---
 
@@ -1380,32 +949,35 @@ Prints 8 entries.
   tests/test_runner_criticality_pressure.py \
   tests/test_exp24_cd_smoke_matrix.py \
   tests/test_cd_config_threading.py \
-  tests/test_exp23_fast_path.py -q
+  tests/test_exp23_fast_path.py \
+  tests/test_lm_head_loss_entropy.py -q
 ```
 
-Expected: all passing, test count increased over current 34 by ~25 new tests.
-
-```
-git log --oneline 0c62203..HEAD | wc -l
-```
-
-Expected: 10-13 commits, one per task.
+Expected: all passing.
 
 ```
 /opt/homebrew/bin/python3.11 experiments/24_training_time_bundle/run_exp24.py --matrix cd_first_smoke --seeds 1337 --dry-run
 ```
 
-Expected: 8 entries printed; every entry has `fast_slow_enabled=True`, `fast_slow_interval=64`, `fast_slow_alpha=0.25`, `lm_head_backward_mode="single"`.
+Expected: 8 cells, each with `fast_slow_enabled=True`, `lm_head_backward_mode="fused_streaming_cached_with_entropy"`.
 
 ---
 
 ## Out of scope for this plan
 
-- **Fused-kernel entropy emission.** First smoke uses non-fused LM head. Follow-up plan: extend fused kernel to emit per-token entropy as a fourth output, at no algorithmic cost.
-- **Async side-stream D2H.** First smoke uses synchronous non_blocking=False. Side-stream with event-ordered sync is a throughput refinement.
-- **Multi-seed + 4×H100 confirmation** after first smoke shows treatment wins against all three falsifiers.
-- **Precision-weighted surprise** `(CE - H[p]) · H[p]` — active-inference panel's suggested v2.
-- **Matched-nearby baseline control** — current design uses EMA; matched-nearby is a v2 scoring ablation.
-- **Per-frequency-bucket evidence banks.**
-- **Paired / full SSM modes.** Currently `capture_states()` raises `NotImplementedError` for non-diag.
-- **Staggered CD seat-refresh vs fast/slow interval.** Both are 64 in the first smoke by design (legible control loop). If `seat_churn` diagnostics show chattering, v2 staggers CD to 32 or 128.
+- **Multi-seed + 4×H100 confirmation** after first smoke shows treatment wins.
+- **Precision-weighted surprise** `(CE - H[p]) · H[p]`.
+- **Matched-nearby baseline control** (v2 scoring ablation).
+- **Per-frequency-bucket evidence banks** (bucketed `bank_evidence`).
+- **Paired / full SSM modes.**
+- **Staggered CD seat-refresh vs fast/slow interval** (both at 64 in first smoke; follow-up if `seat_churn` chatters).
+- **Hard overhead-gate enforcement.** First smoke measures and reports; future runs may promote to a gate.
+- **CPU worker thread on a separate Python thread.** First smoke does CPU controller work on the main thread after `copy_done.synchronize()`. If profiling shows the sync is in the critical path, follow-up promotes to a dedicated thread with lock-free pinned ringbuffer.
+
+---
+
+## Execution notes
+
+- **macOS tasks:** Stages A, B, C, E.1, E.4 (partial), E.5, F.1, G.* — these have CPU-only tests, run on macOS first.
+- **Pod tasks:** Stage D (kernel), E.3's integration test on CUDA, Stage D.4 (pod-only). These require CUDA + kernel build; run after macOS tasks land on `main`.
+- **Time the kernel stage (D.1 through D.4).** Report actual elapsed vs the 30-minute estimate in the commit message body of D.4. This calibrates future kernel-change estimates.
