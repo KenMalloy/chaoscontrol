@@ -207,6 +207,24 @@ class CriticalityDistillation(nn.Module):
             self.baseline_future_energy[layer].mul_(decay).add_(obs, alpha=(1.0 - decay))
 
     @torch.no_grad()
+    def _step_decay_accumulators(self, current_step: int) -> None:
+        """Apply age decay to running accumulators between
+        last_decay_step and current_step. Idempotent when called with
+        the same step."""
+        if int(current_step) <= int(self.last_decay_step.item()):
+            return
+        dt = int(current_step) - int(self.last_decay_step.item())
+        if int(self.last_decay_step.item()) < 0:
+            # First time — accumulators are all zero, no decay needed.
+            self.last_decay_step.fill_(int(current_step))
+            return
+        factor = 2.0 ** (-float(dt) / self.trace_half_life_steps)
+        self.score_num.mul_(factor)
+        self.score_den.mul_(factor)
+        self.event_mass.mul_(factor)
+        self.last_decay_step.fill_(int(current_step))
+
+    @torch.no_grad()
     def ingest_step(
         self,
         *,

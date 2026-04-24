@@ -630,3 +630,28 @@ def test_accumulator_buffers_register_and_initialize_to_zero():
     sd = cd.state_dict()
     for key in ("score_num", "score_den", "event_mass", "last_decay_step"):
         assert key in sd
+
+
+def test_step_decay_applies_half_life_factor_to_all_accumulators():
+    cd = CriticalityDistillation(
+        num_layers=1, dim=4, trace_ttl_steps=8,
+        trace_half_life_steps=2.0,  # decay factor per step = 2^(-1/2) ≈ 0.7071
+    )
+    cd.score_num.fill_(1.0)
+    cd.score_den.fill_(4.0)
+    cd.event_mass.fill_(10.0)
+    cd.last_decay_step.fill_(0)
+    # Advance to step 2. Total decay = 2^(-2/2) = 0.5.
+    cd._step_decay_accumulators(current_step=2)
+    assert torch.allclose(cd.score_num, torch.full_like(cd.score_num, 0.5))
+    assert torch.allclose(cd.score_den, torch.tensor([2.0]))
+    assert torch.allclose(cd.event_mass, torch.tensor([5.0]))
+    assert cd.last_decay_step.item() == 2
+
+
+def test_step_decay_is_idempotent_when_called_with_same_step():
+    cd = CriticalityDistillation(num_layers=1, dim=2, trace_ttl_steps=4, trace_half_life_steps=2.0)
+    cd.score_num.fill_(1.0)
+    cd.last_decay_step.fill_(5)
+    cd._step_decay_accumulators(current_step=5)
+    assert torch.allclose(cd.score_num, torch.full_like(cd.score_num, 1.0))
