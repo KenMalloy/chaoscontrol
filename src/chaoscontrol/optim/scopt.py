@@ -325,10 +325,15 @@ class ScarcityAwareOptimizer(torch.optim.Optimizer):
         self._row_pressure_ema: Tensor | None = None
         self._channel_pressure: dict[str, Tensor] = {}
         self._step_count = 0
-        self._telemetry_accum: dict[str, list[float]] = defaultdict(list)
+        self._telemetry_accum: dict[str, list[float | Tensor]] = defaultdict(list)
         self._pressure_stats: dict[str, float] | None = None
         self._clip_events = 0
         self._clip_observations = 0
+
+    def _record_telemetry_scalar(self, key: str, value: Tensor | float) -> None:
+        self._telemetry_accum[key].append(
+            value.detach() if isinstance(value, Tensor) else float(value)
+        )
 
     def bind_param_names(self, named_params: Iterable[tuple[str, Tensor]]) -> None:
         """Attach names so role maps can target parameters."""
@@ -513,9 +518,9 @@ class ScarcityAwareOptimizer(torch.optim.Optimizer):
         )
         factor = torch.tanh(pressure_f / tau.clamp_min(self._eps)) + 1.0
         if telemetry_key is not None:
-            self._telemetry_accum[f"{telemetry_key}_min"].append(float(factor.min().item()))
-            self._telemetry_accum[f"{telemetry_key}_median"].append(float(factor.median().item()))
-            self._telemetry_accum[f"{telemetry_key}_max"].append(float(factor.max().item()))
+            self._record_telemetry_scalar(f"{telemetry_key}_min", factor.min())
+            self._record_telemetry_scalar(f"{telemetry_key}_median", factor.median())
+            self._record_telemetry_scalar(f"{telemetry_key}_max", factor.max())
         return factor.to(dtype=dtype)
 
     def _rare_adjusted_direction(
@@ -541,15 +546,12 @@ class ScarcityAwareOptimizer(torch.optim.Optimizer):
 
         # Record alignment diagnostics (fp32 domain) for null-result
         # interpretability — matches the design's diagnostics contract.
-        cos_rc = float(
+        cos_rc = (
             (rare_f.mul(common_f).sum() / (rare_norm * common_norm))
             .clamp(-1.0, 1.0)
-            .item()
         )
-        self._telemetry_accum["cos_rare_common"].append(cos_rc)
-        self._telemetry_accum["r_orth_over_common"].append(
-            float((orth_norm / common_norm).item())
-        )
+        self._record_telemetry_scalar("cos_rare_common", cos_rc)
+        self._record_telemetry_scalar("r_orth_over_common", orth_norm / common_norm)
 
         # Macro Gerber cap: bound the orthogonal contribution's norm to
         # ``c_macro * common_norm`` so a rare-grad EMA that outgrows the
@@ -567,10 +569,13 @@ class ScarcityAwareOptimizer(torch.optim.Optimizer):
                 cap,
                 cap.new_tensor(desired_weight),
             )
-            ew_float = float(effective_weight.item())
-            self._telemetry_accum["rare_macro_effective_weight"].append(ew_float)
-            self._telemetry_accum["rare_macro_cap_fired"].append(
-                1.0 if ew_float < desired_weight - 1e-6 else 0.0
+            self._record_telemetry_scalar(
+                "rare_macro_effective_weight",
+                effective_weight,
+            )
+            self._record_telemetry_scalar(
+                "rare_macro_cap_fired",
+                (effective_weight < desired_weight - 1e-6).to(dtype=torch.float32),
             )
             direction = common_f + effective_weight * orthogonal
         else:
@@ -681,11 +686,19 @@ class ScarcityAwareOptimizer(torch.optim.Optimizer):
             median = factor.median()
             scarce = factor >= median
             common = ~scarce
-            if scarce.any() and common.any():
-                ratio = (
-                    row_energy[scarce].mean() / row_energy[common].mean().clamp_min(self._eps)
-                )
-                self._telemetry_accum["ns_row_energy_enrichment"].append(float(ratio.item()))
+            scarce_f = scarce.to(dtype=torch.float32)
+            common_f = common.to(dtype=torch.float32)
+            scarce_count = scarce_f.sum()
+            common_count = common_f.sum()
+            scarce_mean = (row_energy * scarce_f).sum() / scarce_count.clamp_min(1.0)
+            common_mean = (row_energy * common_f).sum() / common_count.clamp_min(1.0)
+            ratio = scarce_mean / common_mean.clamp_min(self._eps)
+            ratio = torch.where(
+                (scarce_count > 0) & (common_count > 0),
+                ratio,
+                ratio.new_tensor(float("nan")),
+            )
+            self._record_telemetry_scalar("ns_row_energy_enrichment", ratio)
             self._record_factor_corr(
                 factor=factor,
                 energy=row_energy,
@@ -697,11 +710,19 @@ class ScarcityAwareOptimizer(torch.optim.Optimizer):
             median = factor.median()
             scarce = factor >= median
             common = ~scarce
-            if scarce.any() and common.any():
-                ratio = (
-                    col_energy[scarce].mean() / col_energy[common].mean().clamp_min(self._eps)
-                )
-                self._telemetry_accum["ns_col_energy_enrichment"].append(float(ratio.item()))
+            scarce_f = scarce.to(dtype=torch.float32)
+            common_f = common.to(dtype=torch.float32)
+            scarce_count = scarce_f.sum()
+            common_count = common_f.sum()
+            scarce_mean = (col_energy * scarce_f).sum() / scarce_count.clamp_min(1.0)
+            common_mean = (col_energy * common_f).sum() / common_count.clamp_min(1.0)
+            ratio = scarce_mean / common_mean.clamp_min(self._eps)
+            ratio = torch.where(
+                (scarce_count > 0) & (common_count > 0),
+                ratio,
+                ratio.new_tensor(float("nan")),
+            )
+            self._record_telemetry_scalar("ns_col_energy_enrichment", ratio)
             self._record_factor_corr(
                 factor=factor,
                 energy=col_energy,
@@ -727,14 +748,15 @@ class ScarcityAwareOptimizer(torch.optim.Optimizer):
         log_norm = energy.clamp_min(self._eps).log() * 0.5  # log(sqrt) = 0.5*log
         lf_std = log_factor.std(unbiased=False)
         ln_std = log_norm.std(unbiased=False)
-        if lf_std <= self._eps or ln_std <= self._eps:
-            return
         lf_centered = log_factor - log_factor.mean()
         ln_centered = log_norm - log_norm.mean()
         corr = (lf_centered * ln_centered).mean() / (lf_std * ln_std).clamp_min(self._eps)
-        self._telemetry_accum[telemetry_key].append(
-            float(corr.clamp(-1.0, 1.0).item())
+        corr = torch.where(
+            (lf_std > self._eps) & (ln_std > self._eps),
+            corr.clamp(-1.0, 1.0),
+            corr.new_tensor(float("nan")),
         )
+        self._record_telemetry_scalar(telemetry_key, corr)
 
     def _apply_recurrence_scarcity(self, name: str | None, direction: Tensor) -> Tensor:
         if not self._scarcity_enabled() or name is None:
@@ -808,10 +830,21 @@ class ScarcityAwareOptimizer(torch.optim.Optimizer):
         if self._pressure_stats is not None:
             trace["pressure_stats"] = dict(self._pressure_stats)
 
-        def _stats(values: list[float]) -> dict[str, float]:
+        def _stats(values: list[float | Tensor]) -> dict[str, float]:
             if not values:
                 return {}
-            t = torch.tensor(values, dtype=torch.float32)
+            scalar_values = [
+                (
+                    value.detach().to(device="cpu", dtype=torch.float32).reshape(())
+                    if isinstance(value, Tensor)
+                    else torch.tensor(float(value), dtype=torch.float32)
+                )
+                for value in values
+            ]
+            t = torch.stack(scalar_values)
+            t = t[torch.isfinite(t)]
+            if t.numel() == 0:
+                return {}
             return {
                 "min": float(t.min()),
                 "median": float(t.median()),
@@ -851,6 +884,10 @@ class ScarcityAwareOptimizer(torch.optim.Optimizer):
             adamw_eps = group["adamw_eps"]
             adamw_lr = group["adamw_lr"]
             adamw_wd = group["adamw_weight_decay"]
+            matrix_batches: dict[
+                tuple[int, int, torch.dtype, torch.device],
+                list[tuple[Tensor, Tensor, Tensor | None, Tensor | None, float]],
+            ] = defaultdict(list)
 
             for p in group["params"]:
                 if p.grad is None:
@@ -873,26 +910,24 @@ class ScarcityAwareOptimizer(torch.optim.Optimizer):
                         name, direction
                     )
                     direction, row_factor = self._apply_row_scarcity(name, direction)
-                    update = newton_schulz_orthogonalize(
-                        direction,
-                        steps=ns_steps,
-                        compute_dtype=self._compute_dtype,
-                    )
-                    # Scarce-row/col energy enrichment after NS — prefer
-                    # row_scarcity when both are present (both target the
-                    # same axis-0 row dimension).
                     effective_row = row_factor if row_factor is not None else out_factor
-                    if effective_row is not None or in_factor is not None:
-                        self._record_energy_enrichment(
-                            update,
-                            row_factor=effective_row,
-                            col_factor=in_factor,
-                        )
                     rows, cols = p.shape[-2], p.shape[-1]
                     scale = max(1.0, rows / cols) ** 0.5
-                    if wd > 0.0:
-                        p.data.mul_(1.0 - lr * wd)
-                    p.data.add_(update.to(dtype=p.dtype), alpha=-lr * scale)
+                    key = (
+                        int(rows),
+                        int(cols),
+                        direction.dtype,
+                        direction.device,
+                    )
+                    matrix_batches[key].append(
+                        (
+                            p,
+                            direction.contiguous(),
+                            effective_row,
+                            in_factor,
+                            float(scale),
+                        )
+                    )
                     continue
 
                 grad_for_adam = grad
@@ -926,5 +961,30 @@ class ScarcityAwareOptimizer(torch.optim.Optimizer):
                 if adamw_wd > 0.0:
                     p.data.mul_(1.0 - adamw_lr * adamw_wd)
                 p.data.addcdiv_(exp_avg, denom, value=-adamw_lr / bias1)
+
+            for (_rows, _cols, _dtype, _device), items in matrix_batches.items():
+                direction_stack = torch.stack(
+                    [direction for _, direction, _, _, _ in items],
+                    dim=0,
+                )
+                update_stack = newton_schulz_orthogonalize(
+                    direction_stack,
+                    steps=ns_steps,
+                    compute_dtype=self._compute_dtype,
+                )
+                for idx, (p, _direction, effective_row, in_factor, scale) in enumerate(items):
+                    update = update_stack[idx]
+                    # Scarce-row/col energy enrichment after NS — prefer
+                    # row_scarcity when both are present (both target the
+                    # same axis-0 row dimension).
+                    if effective_row is not None or in_factor is not None:
+                        self._record_energy_enrichment(
+                            update,
+                            row_factor=effective_row,
+                            col_factor=in_factor,
+                        )
+                    if wd > 0.0:
+                        p.data.mul_(1.0 - lr * wd)
+                    p.data.add_(update.to(dtype=p.dtype), alpha=-lr * scale)
 
         return loss

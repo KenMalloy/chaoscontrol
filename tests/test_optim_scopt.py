@@ -248,6 +248,40 @@ def test_reduces_to_muon_through_warmup() -> None:
     assert torch.allclose(layer_a.bias, layer_b.bias, atol=1e-6)
 
 
+def test_scopt_batches_same_shape_matrix_newton_schulz(monkeypatch) -> None:
+    calls: list[tuple[int, ...]] = []
+
+    def fake_ns(grad, **_kwargs):
+        calls.append(tuple(grad.shape))
+        return grad
+
+    monkeypatch.setattr(
+        "chaoscontrol.optim.scopt.newton_schulz_orthogonalize",
+        fake_ns,
+    )
+    w1 = nn.Parameter(torch.zeros(2, 2))
+    w2 = nn.Parameter(torch.zeros(2, 2))
+    opt = ScarcityAwareOptimizer(
+        [w1, w2],
+        lr=0.1,
+        momentum=0.0,
+        nesterov=False,
+        ns_steps=1,
+        weight_decay=0.0,
+        warmup_steps=0,
+        compute_dtype=torch.float32,
+    )
+    opt.bind_param_names([("w1", w1), ("w2", w2)])
+
+    w1.grad = torch.ones_like(w1)
+    w2.grad = torch.full_like(w2, 2.0)
+    opt.step()
+
+    assert calls == [(2, 2, 2)]
+    assert torch.allclose(w1.detach(), torch.full_like(w1, -0.1))
+    assert torch.allclose(w2.detach(), torch.full_like(w2, -0.2))
+
+
 def test_grad_clip_skip_blocks_rare_ema_update() -> None:
     """Design spec line 186: skipping a clipped step keeps rare EMA clean."""
     w = nn.Parameter(torch.zeros(2, 2))
@@ -314,6 +348,34 @@ def test_rare_adjusted_direction_records_alignment_telemetry() -> None:
     assert "cos_rare_common" in trace
     assert "r_orth_over_common" in trace
     assert trace["cos_rare_common"]["count"] >= 1
+
+
+def test_scopt_telemetry_stays_tensor_backed_until_trace(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "chaoscontrol.optim.scopt.newton_schulz_orthogonalize",
+        lambda grad, **_: grad,
+    )
+    w = nn.Parameter(torch.zeros(2, 2))
+    opt = ScarcityAwareOptimizer(
+        [w],
+        lr=0.1,
+        momentum=0.0,
+        nesterov=False,
+        ns_steps=1,
+        weight_decay=0.0,
+        warmup_steps=0,
+        rare_orthogonal_weight=1.0,
+        compute_dtype=torch.float32,
+    )
+    opt.bind_param_names([("w", w)])
+    opt.set_rare_grad_ema({"w": torch.tensor([[1.0, 1.0], [0.0, 0.0]])})
+
+    w.grad = torch.tensor([[1.0, 0.0], [0.0, 0.0]])
+    opt.step()
+
+    assert isinstance(opt._telemetry_accum["cos_rare_common"][0], torch.Tensor)
+    trace = opt.scarcity_trace()
+    assert trace["cos_rare_common"]["count"] == 1
 
 
 def test_two_sided_matrix_scarcity_applies_sqrt_factors_before_ns(monkeypatch) -> None:

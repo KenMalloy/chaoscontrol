@@ -79,6 +79,7 @@ from chaoscontrol.train_ssm import (  # noqa: E402
     chunked_lm_head_backward,
     fused_lm_head_backend_for_mode,
     fused_lm_head_backward,
+    fused_lm_head_backward_with_ce,
     full_lm_head_backward,
 )
 from fast_path import (  # noqa: E402
@@ -536,6 +537,96 @@ def _apply_scopt_pending(
         optimizer.set_channel_pressure(dict(pending.channel_pressure_items))
 
 
+_FUSED_LM_HEAD_MODES = {
+    "fused",
+    "fused_streaming",
+    "fused_streaming_v2",
+    "fused_streaming_cached",
+    "fused_norm_streaming_v2",
+}
+
+
+def _scopt_writes_enabled(optimizer: ScarcityAwareOptimizer) -> bool:
+    writes_enabled = getattr(optimizer, "_writes_enabled", None)
+    if callable(writes_enabled):
+        return bool(writes_enabled())
+    return True
+
+
+def _should_run_scopt_split_step(
+    optimizer: ScarcityAwareOptimizer,
+    *,
+    step: int,
+    split_interval: int,
+) -> bool:
+    if not _scopt_writes_enabled(optimizer):
+        return False
+    split_every = max(1, int(split_interval))
+    return int(step) % split_every == 0
+
+
+def _run_scopt_common_train_step(
+    *,
+    model: torch.nn.Module,
+    inputs: torch.Tensor,
+    targets: torch.Tensor,
+    precision: str,
+    ddp_active: bool,
+    world_size: int,
+    chunk_size: int = 1024,
+    compile_full_path: bool = False,
+    lm_head_backward_mode: str = "fused",
+    lm_head_tile_size: int = 1024,
+    grad_allreduce_mode: str = "bulk",
+    baseline: FrequencyBucketBaseline | torch.Tensor | float | None = None,
+) -> torch.Tensor:
+    """Fast ScOpt common step for warmup/non-split iterations.
+
+    ScOpt only needs unreduced CE on split steps for rare gradients, but
+    its bucket baseline should still see the ordinary CE stream. The
+    fused ``*_with_ce`` helper gives us that telemetry without leaving
+    the optimized LM-head path.
+    """
+    mode = str(lm_head_backward_mode).strip().lower()
+    if isinstance(baseline, FrequencyBucketBaseline) and mode in _FUSED_LM_HEAD_MODES:
+        _reject_unsupported(model)
+        with autocast_context(precision, device_type=inputs.device.type):
+            hidden = (
+                _compiled_step_fn()(model, inputs)
+                if compile_full_path
+                else model.encode(inputs)
+            )
+            backend_name = fused_lm_head_backend_for_mode(mode)
+            loss, per_token_ce = fused_lm_head_backward_with_ce(
+                hidden=hidden,
+                final_norm=model.final_norm,
+                lm_head=model.lm_head,
+                targets=targets,
+                backend=backend_name,
+                tile_size=int(lm_head_tile_size),
+            )
+        baseline.update(per_token_ce.reshape_as(targets), targets)
+        if ddp_active and world_size > 1:
+            if str(grad_allreduce_mode).strip().lower() != "bulk":
+                raise ValueError("ScOpt currently requires grad_allreduce_mode='bulk'")
+            allreduce_grads(model, world_size)
+        return loss
+
+    return _run_train_step(
+        model=model,
+        inputs=inputs,
+        targets=targets,
+        chunk_size=chunk_size,
+        precision=precision,
+        ddp_active=ddp_active,
+        world_size=world_size,
+        compile_full_path=compile_full_path,
+        lm_head_backward_mode=lm_head_backward_mode,
+        lm_head_tile_size=lm_head_tile_size,
+        grad_allreduce_mode=grad_allreduce_mode,
+    )
+
+
 class LossTriggeredReplayDecision:
     __slots__ = (
         "_local_loss",
@@ -803,16 +894,31 @@ def _run_scopt_train_step(
     if not is_split_step:
         return total_loss.detach(), None
 
-    # Split step: compute rare gradients and per-layer activation grads
-    # with the graph still live. Retain across all sub-calls until the
-    # last consumer so future additions to the split step don't silently
-    # free the graph. The final autograd.grad in this block releases.
-    rare_grads = torch.autograd.grad(
+    # Split step: compute rare parameter gradients and activation
+    # gradients in one autograd traversal. The older correctness path
+    # asked autograd once for params and then once per activation hook;
+    # this keeps the same tensors but removes N extra reverse walks.
+    activation_items = sorted(activations.items())
+    unique_activations: list[torch.Tensor] = []
+    activation_lookup: dict[int, int] = {}
+    activation_unique_indices: list[int] = []
+    for _, activation in activation_items:
+        activation_id = id(activation)
+        unique_idx = activation_lookup.get(activation_id)
+        if unique_idx is None:
+            unique_idx = len(unique_activations)
+            activation_lookup[activation_id] = unique_idx
+            unique_activations.append(activation)
+        activation_unique_indices.append(unique_idx)
+
+    rare_outputs = torch.autograd.grad(
         rare_loss,
-        params,
-        retain_graph=True,
+        [*params, *unique_activations],
+        retain_graph=False,
         allow_unused=True,
     )
+    rare_grads = rare_outputs[: len(params)]
+    activation_grads = rare_outputs[len(params) :]
     rare_unused = {
         name for (name, _), g in zip(named_params, rare_grads) if g is None
     }
@@ -834,19 +940,17 @@ def _run_scopt_train_step(
     if ddp_active and world_size > 1 and dense_rare:
         _average_dense_tensors_coalesced(dense_rare, world_size=world_size)
 
-    # Iterate activations in sorted order so every rank issues
-    # all_reduce calls in identical sequence.
-    activation_items = sorted(activations.items())
+    # Iterate activations in sorted order so every rank issues all_reduce
+    # calls in identical sequence. Duplicate activation tensors reuse the
+    # same gradient, matching the old one-call-per-hook behavior without
+    # asking autograd to recompute it.
     channel_pressure_items: list[tuple[str, torch.Tensor]] = []
-    last_idx = len(activation_items) - 1
-    for idx, (key, activation) in enumerate(activation_items):
-        retain = idx < last_idx
-        dh = torch.autograd.grad(
-            rare_loss,
-            activation,
-            retain_graph=retain,
-            allow_unused=True,
-        )[0]
+    for (key, _activation), unique_idx in zip(
+        activation_items,
+        activation_unique_indices,
+        strict=True,
+    ):
+        dh = activation_grads[unique_idx]
         if dh is None:
             continue
         reduce_dims = tuple(range(max(0, dh.ndim - 1)))
@@ -1365,6 +1469,7 @@ def _train_fast_for_budget_cuda_graph(
         "world_size": world_size_,
         "initial_loss": float(loss_cpu[0]) if loss_cpu.numel() else float("nan"),
         "final_loss": float(loss_cpu[-1]) if loss_cpu.numel() else float("nan"),
+        "loss_trajectory": [float(x) for x in loss_cpu.tolist()],
         "loss_delta": (
             float(loss_cpu[-1] - loss_cpu[0]) if loss_cpu.numel() >= 2 else float("nan")
         ),
@@ -1815,21 +1920,42 @@ def train_fast_for_budget(
             scopt_pending: _ScOptPending | None = None
             if scopt_active:
                 assert scopt_token_frequencies is not None
-                loss, scopt_pending = _run_scopt_train_step(
-                    model=model,
-                    optimizer=optimizer,
-                    inputs=inputs,
-                    targets=targets,
-                    token_frequencies=scopt_token_frequencies,
-                    precision=precision,
-                    ddp_active=ddp_active,
-                    world_size=world_size_,
+                assert isinstance(optimizer, ScarcityAwareOptimizer)
+                if _should_run_scopt_split_step(
+                    optimizer,
                     step=steps,
                     split_interval=scopt_split_interval,
-                    baseline=scopt_baseline,
-                    pressure_upper_c=scopt_pressure_upper_c,
-                    pressure_upper_floor=scopt_pressure_upper_floor,
-                )
+                ):
+                    loss, scopt_pending = _run_scopt_train_step(
+                        model=model,
+                        optimizer=optimizer,
+                        inputs=inputs,
+                        targets=targets,
+                        token_frequencies=scopt_token_frequencies,
+                        precision=precision,
+                        ddp_active=ddp_active,
+                        world_size=world_size_,
+                        step=steps,
+                        split_interval=scopt_split_interval,
+                        baseline=scopt_baseline,
+                        pressure_upper_c=scopt_pressure_upper_c,
+                        pressure_upper_floor=scopt_pressure_upper_floor,
+                    )
+                else:
+                    loss = _run_scopt_common_train_step(
+                        model=model,
+                        inputs=inputs,
+                        targets=targets,
+                        precision=precision,
+                        ddp_active=ddp_active,
+                        world_size=world_size_,
+                        chunk_size=chunk_size,
+                        compile_full_path=compile_full_path,
+                        lm_head_backward_mode=lm_head_backward_mode,
+                        lm_head_tile_size=lm_head_tile_size,
+                        grad_allreduce_mode=grad_allreduce_mode_,
+                        baseline=scopt_baseline,
+                    )
             else:
                 loss = _run_train_step(
                     model=model,
@@ -1948,6 +2074,7 @@ def train_fast_for_budget(
         "world_size": world_size_,
         "initial_loss": float(loss_cpu[0]) if loss_cpu.numel() else float("nan"),
         "final_loss": float(loss_cpu[-1]) if loss_cpu.numel() else float("nan"),
+        "loss_trajectory": [float(x) for x in loss_cpu.tolist()],
         "loss_delta": (
             float(loss_cpu[-1] - loss_cpu[0]) if loss_cpu.numel() >= 2 else float("nan")
         ),

@@ -418,6 +418,187 @@ def test_scopt_train_step_sets_channel_pressure_from_activation_gradients():
     assert "layers.0.core.__in__" in trace["channel_pressure_keys"]
 
 
+def test_scopt_common_step_uses_fused_ce_and_updates_bucket_baseline(monkeypatch):
+    mod = _load_runner_module()
+    from chaoscontrol.core import RMSNorm
+    from chaoscontrol.optim.scopt import FrequencyBucketBaseline
+
+    class _TinyNormTokenModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embed = nn.Embedding(6, 4)
+            self.final_norm = RMSNorm(4)
+            self.lm_head = nn.Linear(4, 6, bias=False)
+
+        def encode(self, inputs: torch.Tensor) -> torch.Tensor:
+            return self.embed(inputs)
+
+    model = _TinyNormTokenModel()
+    baseline = FrequencyBucketBaseline(torch.ones(6), decay=0.5)
+    calls = []
+
+    def fake_fused_lm_head_backward_with_ce(
+        hidden,
+        final_norm,
+        lm_head,
+        targets,
+        *,
+        backend,
+        tile_size,
+    ):
+        calls.append((backend, tile_size))
+        loss = hidden.square().mean()
+        loss.backward()
+        per_token_ce = torch.arange(
+            targets.numel(),
+            dtype=torch.float32,
+            device=targets.device,
+        )
+        return loss.detach(), per_token_ce
+
+    monkeypatch.setattr(
+        mod,
+        "fused_lm_head_backward_with_ce",
+        fake_fused_lm_head_backward_with_ce,
+    )
+
+    loss = mod._run_scopt_common_train_step(
+        model=model,
+        inputs=torch.tensor([[0, 1, 2], [1, 2, 3]]),
+        targets=torch.tensor([[1, 2, 3], [2, 3, 4]]),
+        precision="fp32",
+        ddp_active=False,
+        world_size=1,
+        compile_full_path=False,
+        lm_head_backward_mode="fused_streaming_cached",
+        lm_head_tile_size=8192,
+        grad_allreduce_mode="bulk",
+        baseline=baseline,
+    )
+
+    assert loss.ndim == 0
+    assert calls == [("streaming_cached", 8192)]
+    state = baseline.state_dict()
+    assert bool(state["initialized"].any())
+    assert float(state["ema"].max()) > 0.0
+
+
+def test_scopt_split_step_batches_rare_param_and_activation_grads(monkeypatch):
+    mod = _load_runner_module()
+    from chaoscontrol.optim.scopt import ScarcityAwareOptimizer
+
+    torch.manual_seed(3)
+    model = _TinyScOptLayerModel()
+    optimizer = ScarcityAwareOptimizer(
+        model.parameters(),
+        lr=0.01,
+        momentum=0.0,
+        nesterov=False,
+        ns_steps=1,
+        weight_decay=0.0,
+        warmup_steps=0,
+        matrix_scarcity_map={
+            "layers.0.core.weight": (
+                "layers.0.core.__out__",
+                "layers.0.core.__in__",
+            ),
+        },
+        compute_dtype=torch.float32,
+    )
+    optimizer.bind_param_names(list(model.named_parameters()))
+
+    original_grad = torch.autograd.grad
+    calls = []
+
+    def counting_grad(outputs, inputs, *args, **kwargs):
+        calls.append(inputs)
+        return original_grad(outputs, inputs, *args, **kwargs)
+
+    monkeypatch.setattr(torch.autograd, "grad", counting_grad)
+
+    _, pending = mod._run_scopt_train_step(
+        model=model,
+        optimizer=optimizer,
+        inputs=torch.tensor([[0, 1, 2]]),
+        targets=torch.tensor([[1, 2, 3]]),
+        token_frequencies=torch.ones(6),
+        precision="fp32",
+        ddp_active=False,
+        world_size=1,
+        step=0,
+        split_interval=1,
+    )
+
+    assert pending is not None
+    assert len(calls) == 2  # common grads, then rare params + activations together.
+
+
+def test_train_fast_for_budget_routes_scopt_warmup_to_common_fast_path(monkeypatch):
+    mod = _load_runner_module()
+    from chaoscontrol.optim.scopt import ScarcityAwareOptimizer
+
+    model = _TinyScOptLayerModel()
+    optimizer = ScarcityAwareOptimizer(
+        model.parameters(),
+        lr=0.01,
+        momentum=0.0,
+        nesterov=False,
+        ns_steps=1,
+        weight_decay=0.0,
+        warmup_steps=10,
+        matrix_scarcity_map={
+            "layers.0.core.weight": (
+                "layers.0.core.__out__",
+                "layers.0.core.__in__",
+            ),
+        },
+        compute_dtype=torch.float32,
+    )
+    optimizer.bind_param_names(list(model.named_parameters()))
+    common_calls = []
+
+    def fail_split(**_kwargs):
+        raise AssertionError("warmup/non-split ScOpt should not enter split path")
+
+    def fake_common(**kwargs):
+        common_calls.append(kwargs["lm_head_backward_mode"])
+        for param in kwargs["model"].parameters():
+            param.grad = torch.zeros_like(param)
+        return torch.tensor(1.0)
+
+    monkeypatch.setattr(mod, "_run_scopt_train_step", fail_split)
+    monkeypatch.setattr(mod, "_run_scopt_common_train_step", fake_common)
+
+    result = mod.train_fast_for_budget(
+        model,
+        train_tokens=torch.arange(128, dtype=torch.int16) % 6,
+        train_num_tokens=128,
+        stride=4,
+        seq_len=3,
+        batch_size=2,
+        device=torch.device("cpu"),
+        optimizer=optimizer,
+        budget_seconds=300.0,
+        chunk_size=2,
+        grad_clip_norm=0.0,
+        fused_grad_clip=False,
+        rank=0,
+        world_size=1,
+        seed=123,
+        precision="fp32",
+        stop_check_interval=1,
+        stop_margin_seconds=0.0,
+        vocab_size=6,
+        max_steps=2,
+        prefetch_batches=False,
+        lm_head_backward_mode="fused_streaming_cached",
+        scopt_split_interval=1,
+    )
+
+    assert result["steps"] == 2
+    assert common_calls == ["fused_streaming_cached", "fused_streaming_cached"]
+
+
 def test_scopt_optimizer_config_matches_real_chaos_ssm_core():
     """Smoke-test against a real ChaosSSMCore. The tiny test models
     above cover submodule naming convention but can't verify the map
@@ -1664,6 +1845,40 @@ def test_train_fast_for_budget_can_use_batch_prefetcher(monkeypatch):
     assert prefetcher.kwargs["seq_len"] == 3
     assert prefetcher.kwargs["batch_size"] == 2
     assert prefetcher.kwargs["vocab_size"] == 6
+
+
+def test_train_fast_for_budget_serializes_loss_trajectory():
+    mod = _load_runner_module()
+    model = _TinyTokenTrainModel()
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+
+    result = mod.train_fast_for_budget(
+        model,
+        train_tokens=torch.arange(128, dtype=torch.int16) % 6,
+        train_num_tokens=128,
+        stride=4,
+        seq_len=3,
+        batch_size=2,
+        device=torch.device("cpu"),
+        optimizer=optimizer,
+        budget_seconds=300.0,
+        chunk_size=2,
+        grad_clip_norm=0.0,
+        fused_grad_clip=False,
+        rank=0,
+        world_size=1,
+        seed=123,
+        precision="fp32",
+        stop_check_interval=1,
+        stop_margin_seconds=0.0,
+        vocab_size=6,
+        max_steps=3,
+        prefetch_batches=False,
+    )
+
+    assert len(result["loss_trajectory"]) == result["steps"] == 3
+    assert result["loss_trajectory"][0] == pytest.approx(result["initial_loss"])
+    assert result["loss_trajectory"][-1] == pytest.approx(result["final_loss"])
 
 
 def test_train_fast_for_budget_sequential_epoch_stops_after_epoch():
