@@ -306,3 +306,73 @@ def test_criticality_loss_has_no_grad_path_to_pressure_or_states():
     assert not cd.seat_mask.requires_grad
     # baseline_future_energy should not receive grads either.
     assert not cd.baseline_future_energy.requires_grad
+
+
+def test_full_mechanism_moves_seat_log_a_more_than_non_seat():
+    """After N training steps, seat-channel log_a values should move
+    meaningfully while non-seat log_a values stay pinned."""
+    from chaoscontrol.core import ChaosSSMCore
+
+    torch.manual_seed(0)
+    dim = 8
+    core = ChaosSSMCore(dim=dim, a_mode="diag")
+    cd = CriticalityDistillation(
+        num_layers=1,
+        dim=dim,
+        trace_ttl_steps=16,
+        trace_half_life_steps=4.0,
+        seat_refresh_interval=1,  # refresh every step for this test
+        criticality_budget_frac=0.25,  # 2 seats
+        critical_value=0.99,
+        min_weighted_events_per_layer=0.0,  # no gate for this integration test
+        criticality_distill_weight=1.0,
+    )
+
+    # Snapshot initial log_a.
+    log_a_init = core.log_a.detach().clone()
+
+    # Optimizer for log_a only (isolate the mechanism).
+    opt = torch.optim.SGD([core.log_a], lr=0.5)
+
+    # Force a specific seat pattern by biasing pressure to only channels
+    # 0 and 1 — we expect them to become seats.
+    for step in range(10):
+        x = torch.randn(2, 6, dim)
+        with core.capture_states() as get_states:
+            _ = core(x)
+            states = get_states()
+        # Pressure field biased to T=0, T=1 positions (so events concentrate there).
+        pressure = torch.zeros(2, 6)
+        pressure[:, 0] = 10.0
+        pressure[:, 1] = 8.0
+        # Construct states that light up channels 0 and 1 after events.
+        fake_states = torch.zeros_like(states)
+        fake_states[:, 1:, 0] = 1.0  # channel 0 persists after t=0 events
+        fake_states[:, 2:, 1] = 1.0  # channel 1 persists after t=0, 1 events
+
+        cd.ingest_step(
+            step=step,
+            pressure=pressure,
+            states_per_layer=[fake_states],
+            horizon_H=4,
+            event_frac=2.0 / 12.0,  # top ~2 positions per 12
+        )
+        cd.allocate_seats(current_step=step + 1)
+
+        opt.zero_grad()
+        loss = cd.criticality_loss([core.log_a])
+        if loss.requires_grad:
+            loss.backward()
+            opt.step()
+
+    # Seat channels (0 and 1) should have moved; non-seat channels stay put.
+    log_a_delta = (core.log_a.detach() - log_a_init).abs()
+    seats = cd.seat_mask[0]
+    # At least one of the seat channels moved
+    assert log_a_delta[seats].max().item() > 1e-3, (
+        f"seat log_a did not move: {log_a_delta[seats]}"
+    )
+    # No non-seat channel moved
+    assert log_a_delta[~seats].max().item() < 1e-6, (
+        f"non-seat log_a moved: {log_a_delta[~seats]}"
+    )
