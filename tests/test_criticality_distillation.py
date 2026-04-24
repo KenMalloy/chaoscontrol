@@ -486,3 +486,46 @@ def test_criticality_loss_distill_weight_zero_gives_zero_loss():
     log_a = torch.zeros(4, requires_grad=True)
     loss = cd.criticality_loss([log_a])
     assert loss.item() == 0.0
+
+
+def test_score_permute_before_topk_selects_random_k_of_D_not_peaks():
+    """Falsifier flag: when score_permute_before_topk=True, allocate_seats
+    must pick k channels uniformly at random, ignoring the score. Must NOT
+    be implemented as "permute score then top-k" (which un-shuffles through
+    the permutation and still selects the peaks).
+    """
+    D = 10
+    k_expected = 2  # budget_frac=0.2 -> round(0.2 * 10) = 2
+    cd = CriticalityDistillation(
+        num_layers=1, dim=D, trace_ttl_steps=4,
+        trace_half_life_steps=100.0,  # slow aging
+        criticality_budget_frac=0.2,  # 2 seats of 10
+        min_weighted_events_per_layer=1.0,
+        score_permute_before_topk=True,
+    )
+    # Peak-score channels are 5 and 2 (in that order of magnitude).
+    evidence = torch.zeros(D)
+    evidence[5] = 10.0
+    evidence[2] = 5.0
+    cd.add_step_evidence(layer=0, step=0, evidence=evidence, event_count=10.0)
+
+    peak_set = {5, 2}
+    observed_sets = []
+    for seed in (0, 1, 2, 3, 4):
+        torch.manual_seed(seed)
+        cd.allocate_seats(current_step=1)
+        # Exactly k seats each call.
+        assert cd.seat_mask[0].sum().item() == k_expected
+        selected = set(cd.seat_mask[0].nonzero(as_tuple=True)[0].tolist())
+        assert len(selected) == k_expected
+        observed_sets.append(selected)
+
+    # At least one seed must produce a seat set != peak set. If the bug
+    # was present (selection always == peaks), every set would equal
+    # {2, 5} and this would fail.
+    non_peak_draws = [s for s in observed_sets if s != peak_set]
+    assert len(non_peak_draws) >= 1, (
+        f"All {len(observed_sets)} seeds selected the peak-score set "
+        f"{peak_set}; score_permute_before_topk is not bypassing score. "
+        f"observed={observed_sets}"
+    )

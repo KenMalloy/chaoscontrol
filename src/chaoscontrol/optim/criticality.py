@@ -32,6 +32,7 @@ class CriticalityDistillation(nn.Module):
         min_weighted_events_per_layer: float = 256.0,
         criticality_distill_weight: float = 1e-3,
         baseline_ema_decay: float = 0.99,
+        score_permute_before_topk: bool = False,
     ) -> None:
         super().__init__()
         if not 0.0 < criticality_budget_frac < 1.0:
@@ -52,6 +53,7 @@ class CriticalityDistillation(nn.Module):
         self.min_weighted_events_per_layer = float(min_weighted_events_per_layer)
         self.criticality_distill_weight = float(criticality_distill_weight)
         self.baseline_ema_decay = float(baseline_ema_decay)
+        self.score_permute_before_topk = bool(score_permute_before_topk)
 
         # Per-layer ring buffer keyed by step index (one evidence vector per
         # (layer, step) that had at least one event).
@@ -260,6 +262,16 @@ class CriticalityDistillation(nn.Module):
         for layer in range(self.num_layers):
             if weighted_events_per_layer[layer].item() < self.min_weighted_events_per_layer:
                 self.seat_mask[layer].fill_(False)
+                continue
+            if self.score_permute_before_topk:
+                # Falsifier path: bypass score entirely and pick k channels
+                # uniformly at random. NOTE: implementing this as "permute
+                # score then top-k" would un-shuffle through the permutation
+                # and still return the peak-score indices — don't do that.
+                mask = torch.zeros(self.dim, dtype=torch.bool, device=self.seat_mask.device)
+                perm = torch.randperm(self.dim, device=mask.device)
+                mask[perm[:k]] = True
+                self.seat_mask[layer] = mask
                 continue
             topk = torch.topk(scores[layer], k=k, largest=True)
             mask = torch.zeros(self.dim, dtype=torch.bool, device=self.seat_mask.device)
