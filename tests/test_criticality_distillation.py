@@ -107,3 +107,25 @@ def test_score_returns_zeros_when_bank_empty():
     score = cd.score(current_step=0)
     assert score.shape == (2, 3)
     assert torch.equal(score, torch.zeros_like(score))
+
+
+def test_state_dict_round_trip_preserves_bank_and_baseline():
+    cd1 = CriticalityDistillation(num_layers=1, dim=4, trace_ttl_steps=3, trace_half_life_steps=2.0)
+    cd1.add_step_evidence(layer=0, step=0, evidence=torch.tensor([1.0, 0.0, 0.0, 0.0]), event_count=3.0)
+    cd1.add_step_evidence(layer=0, step=1, evidence=torch.tensor([0.0, 1.0, 0.0, 0.0]), event_count=5.0)
+    cd1.baseline_future_energy.fill_(0.42)
+    cd1.seat_mask[0, 0] = True
+
+    sd = cd1.state_dict()
+
+    cd2 = CriticalityDistillation(num_layers=1, dim=4, trace_ttl_steps=3, trace_half_life_steps=2.0)
+    cd2.load_state_dict(sd)
+
+    assert torch.equal(cd2.bank_evidence, cd1.bank_evidence)
+    assert torch.equal(cd2.bank_step, cd1.bank_step)
+    assert torch.equal(cd2.bank_event_count, cd1.bank_event_count)
+    assert torch.equal(cd2.baseline_future_energy, cd1.baseline_future_energy)
+    assert torch.equal(cd2.seat_mask, cd1.seat_mask)
+
+    # Score must match after round-trip.
+    assert torch.allclose(cd2.score(current_step=2), cd1.score(current_step=2))
