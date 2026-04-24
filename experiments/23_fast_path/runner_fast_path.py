@@ -1593,6 +1593,18 @@ def train_fast_for_budget(
     scopt_active = isinstance(optimizer, ScarcityAwareOptimizer)
     if scopt_active and grad_allreduce_mode_ != "bulk":
         raise ValueError("ScOpt currently requires grad_allreduce_mode='bulk'")
+    if (
+        scopt_active
+        and int(scopt_baseline_buckets) > 0
+        and str(lm_head_backward_mode).strip().lower() not in _FUSED_LM_HEAD_MODES
+    ):
+        allowed = ", ".join(sorted(_FUSED_LM_HEAD_MODES))
+        raise ValueError(
+            "ScOpt frequency baseline requires a fused LM-head backward mode "
+            "so the common path can update its CE EMA every step; got "
+            f"lm_head_backward_mode={lm_head_backward_mode!r}. "
+            f"Use one of: {allowed}"
+        )
     if scopt_active and (
         spectral_reg_lambda_dead > 0.0
         or spectral_reg_lambda_sticky > 0.0

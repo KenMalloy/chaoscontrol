@@ -702,6 +702,63 @@ def test_train_fast_for_budget_routes_scopt_warmup_to_common_fast_path(monkeypat
     assert common_calls == ["fused_streaming_cached", "fused_streaming_cached"]
 
 
+def test_train_fast_for_budget_rejects_scopt_non_fused_baseline(monkeypatch):
+    mod = _load_runner_module()
+    from chaoscontrol.optim.scopt import ScarcityAwareOptimizer
+
+    model = _TinyScOptLayerModel()
+    optimizer = ScarcityAwareOptimizer(
+        model.parameters(),
+        lr=0.01,
+        momentum=0.0,
+        nesterov=False,
+        ns_steps=1,
+        weight_decay=0.0,
+        warmup_steps=10,
+        matrix_scarcity_map={
+            "layers.0.core.weight": (
+                "layers.0.core.__out__",
+                "layers.0.core.__in__",
+            ),
+        },
+        compute_dtype=torch.float32,
+    )
+    optimizer.bind_param_names(list(model.named_parameters()))
+
+    def fail_common(**_kwargs):
+        raise AssertionError("ScOpt non-fused baseline should fail validation")
+
+    monkeypatch.setattr(mod, "_run_scopt_common_train_step", fail_common)
+
+    with pytest.raises(ValueError, match="ScOpt.*frequency baseline.*fused"):
+        mod.train_fast_for_budget(
+            model,
+            train_tokens=torch.arange(128, dtype=torch.int16) % 6,
+            train_num_tokens=128,
+            stride=4,
+            seq_len=3,
+            batch_size=2,
+            device=torch.device("cpu"),
+            optimizer=optimizer,
+            budget_seconds=300.0,
+            chunk_size=2,
+            grad_clip_norm=0.0,
+            fused_grad_clip=False,
+            rank=0,
+            world_size=1,
+            seed=123,
+            precision="fp32",
+            stop_check_interval=1,
+            stop_margin_seconds=0.0,
+            vocab_size=6,
+            max_steps=2,
+            prefetch_batches=False,
+            lm_head_backward_mode="chunked",
+            scopt_split_interval=1,
+            scopt_baseline_buckets=16,
+        )
+
+
 def test_scopt_optimizer_config_matches_real_chaos_ssm_core():
     """Smoke-test against a real ChaosSSMCore. The tiny test models
     above cover submodule naming convention but can't verify the map
