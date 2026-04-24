@@ -1722,6 +1722,7 @@ def train_fast_for_budget(
     criticality_distill_num_layers: int | None = None,
     criticality_distill_dim: int | None = None,
     criticality_distill_budget_frac: float = 0.15,
+    criticality_distill_critical_value: float = 0.95,
     criticality_distill_trace_ttl_steps: int = 1024,
     criticality_distill_trace_half_life_steps: float = 256.0,
     criticality_distill_seat_refresh_interval: int = 64,
@@ -1804,6 +1805,7 @@ def train_fast_for_budget(
             trace_half_life_steps=float(criticality_distill_trace_half_life_steps),
             seat_refresh_interval=int(criticality_distill_seat_refresh_interval),
             criticality_budget_frac=float(criticality_distill_budget_frac),
+            critical_value=float(criticality_distill_critical_value),
             min_weighted_events_per_layer=float(
                 criticality_distill_min_weighted_events_per_layer
             ),
