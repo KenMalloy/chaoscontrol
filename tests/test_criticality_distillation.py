@@ -745,6 +745,25 @@ def test_allocate_seats_from_accumulators_picks_topk_by_accumulator_score():
     assert cd.seat_mask[0, 2].item() is True  # peak 2
 
 
+def test_ingest_cpu_from_prepared_advances_accumulators():
+    cd = CriticalityDistillation(num_layers=1, dim=3, trace_ttl_steps=8, trace_half_life_steps=4.0)
+    prepared = {
+        "event_mask": torch.tensor([[True, False, True]]),
+        "aggregated_excess_per_layer": torch.tensor([[1.0, 2.0, 3.0]]),
+        "non_event_mean_future_energy_per_layer": torch.tensor([[0.5, 0.5, 0.5]]),
+        "event_count_per_layer": torch.tensor([2.0]),
+    }
+    cd.ingest_cpu_from_prepared(step=0, prepared=prepared)
+    # Accumulators updated: score_num = evidence * count = [2, 4, 6];
+    # score_den = 2; event_mass = 2.
+    assert torch.allclose(cd.score_num[0], torch.tensor([2.0, 4.0, 6.0]))
+    assert cd.score_den[0].item() == 2.0
+    assert cd.event_mass[0].item() == 2.0
+    # Ring bank also written for TTL/checkpoint state.
+    slot = (cd.bank_step[0] == 0).nonzero(as_tuple=True)[0].item()
+    assert torch.allclose(cd.bank_evidence[0, slot], torch.tensor([1.0, 2.0, 3.0]))
+
+
 def test_allocate_seats_from_accumulators_respects_event_mass_gate():
     cd = CriticalityDistillation(
         num_layers=1, dim=8, trace_ttl_steps=8,

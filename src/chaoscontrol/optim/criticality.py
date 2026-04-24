@@ -287,6 +287,93 @@ class CriticalityDistillation(nn.Module):
         self.event_mass[layer].sub_(remaining_ec)
 
     @torch.no_grad()
+    def _write_ring_slot(
+        self,
+        *,
+        layer: int,
+        step: int,
+        evidence: torch.Tensor,
+        event_count: float,
+        current_step: int,
+    ) -> None:
+        """Write one evidence slot into the ring bank. If the chosen
+        slot is non-empty, first subtract its remaining contribution
+        from the running accumulators."""
+        slots = self.bank_step[layer]
+        empty = (slots == -1).nonzero(as_tuple=True)[0]
+        if empty.numel() > 0:
+            slot = int(empty[0].item())
+        else:
+            # Evicting oldest — subtract its remaining contribution first.
+            slot = int(slots.argmin().item())
+            evicted_step = int(slots[slot].item())
+            evicted_ev = self.bank_evidence[layer, slot].clone()
+            evicted_cnt = float(self.bank_event_count[layer, slot].item())
+            self._subtract_expired_contribution(
+                layer=layer,
+                evicted_step=evicted_step,
+                current_step=current_step,
+                evicted_evidence=evicted_ev,
+                evicted_event_count=evicted_cnt,
+            )
+        self.bank_evidence[layer, slot] = evidence.to(
+            dtype=self.bank_evidence.dtype, device=self.bank_evidence.device,
+        )
+        self.bank_step[layer, slot] = int(step)
+        self.bank_event_count[layer, slot] = float(event_count)
+
+    @torch.no_grad()
+    def ingest_cpu_from_prepared(self, *, step: int, prepared: dict) -> None:
+        """CPU-side ingest from a pre-aggregated payload. Drives the
+        incremental accumulators and writes to the ring bank for
+        TTL/checkpoint state."""
+        agg = prepared["aggregated_excess_per_layer"].to(
+            device=self.bank_evidence.device, dtype=self.bank_evidence.dtype,
+        )
+        nonevt = prepared["non_event_mean_future_energy_per_layer"].to(
+            device=self.baseline_future_energy.device,
+            dtype=self.baseline_future_energy.dtype,
+        )
+        counts = prepared["event_count_per_layer"].to(
+            device=self.bank_event_count.device,
+            dtype=self.bank_event_count.dtype,
+        )
+        # non-event gate: use event_mask to tell if any non-event positions
+        # contributed this step. When C.9 drops event_mask from the payload,
+        # this reads n_non_events_scalar instead — for now we still read the
+        # event_mask key.
+        event_mask = prepared["event_mask"]
+        had_non_events = bool((~event_mask).any().item())
+        decay = self.baseline_ema_decay
+        # Advance accumulator decay to this step.
+        self._step_decay_accumulators(current_step=step)
+        for layer in range(self.num_layers):
+            if had_non_events:
+                obs = nonevt[layer]
+                if not bool(self.baseline_initialized[layer].item()):
+                    self.baseline_future_energy[layer].copy_(obs)
+                    self.baseline_initialized[layer] = True
+                else:
+                    self.baseline_future_energy[layer].mul_(decay).add_(obs, alpha=(1.0 - decay))
+            cnt = float(counts[layer].item())
+            if cnt <= 0:
+                continue
+            # Incremental accumulator update.
+            self._add_contribution(
+                layer=layer,
+                evidence=agg[layer],
+                event_count=cnt,
+            )
+            # Ring-bank write with TTL-exact correction.
+            self._write_ring_slot(
+                layer=layer,
+                step=step,
+                evidence=agg[layer],
+                event_count=cnt,
+                current_step=step,
+            )
+
+    @torch.no_grad()
     def ingest_step(
         self,
         *,
