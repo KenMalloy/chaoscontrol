@@ -138,6 +138,54 @@ def _env_int(name: str, default: int) -> int:
     return int(val)
 
 
+def _capture_topology_snapshot() -> dict:
+    """Best-effort snapshot of CPU, GPU-interconnect, and NUMA info.
+    Each subprocess call is wrapped in try/except so missing binaries
+    don't break training startup."""
+    import subprocess
+
+    def _run(cmd: list[str], timeout: float = 2.0) -> str | None:
+        try:
+            out = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=timeout, check=False,
+            )
+            if out.returncode != 0:
+                return None
+            return out.stdout
+        except (FileNotFoundError, PermissionError, subprocess.TimeoutExpired):
+            return None
+
+    snap: dict = {}
+
+    # CPU info.
+    lscpu = _run(["lscpu"])
+    if lscpu is not None:
+        snap["lscpu"] = lscpu
+    else:
+        # macOS fallback — sysctl.
+        sysctl = _run(["sysctl", "-a"])
+        if sysctl is not None:
+            snap["cpu_info"] = sysctl
+        else:
+            snap["cpu_unavailable"] = True
+
+    # GPU topology.
+    gpu = _run(["nvidia-smi", "topo", "-m"])
+    if gpu is not None:
+        snap["nvidia_smi_topo"] = gpu
+    else:
+        snap["gpu_topo_unavailable"] = True
+
+    # NUMA.
+    numa = _run(["numactl", "-H"])
+    if numa is not None:
+        snap["numactl_h"] = numa
+    else:
+        snap["numa_unavailable"] = True
+
+    return snap
+
+
 def _init_distributed(world_size_override: int | None) -> tuple[int, int, int]:
     env_world = _env_int("WORLD_SIZE", 1)
     target_world = world_size_override if world_size_override is not None else env_world
@@ -1736,6 +1784,7 @@ def train_fast_for_budget(
     rare_bucket_ce_enabled: bool = False,
     rare_bucket_ce_num_buckets: int = 4,
     rare_bucket_ce_token_frequencies: torch.Tensor | None = None,
+    emit_topology_snapshot: bool = False,
 ) -> dict[str, Any]:
     rank_ = int(rank)
     world_size_ = int(world_size)
@@ -1844,6 +1893,9 @@ def train_fast_for_budget(
             "or 'shuffled_epoch', "
             f"got {train_sampling_mode!r}"
         )
+    topology_snapshot: dict | None = None
+    if emit_topology_snapshot:
+        topology_snapshot = _capture_topology_snapshot()
     total_starts = count_lm_starts(train_num_tokens, seq_len, stride)
     rank_start_count = count_sharded_lm_starts(
         total_starts=total_starts,
@@ -2603,6 +2655,8 @@ def train_fast_for_budget(
             precision=precision,
         )
         result.update(val_block)
+    if topology_snapshot is not None:
+        result["topology_snapshot"] = topology_snapshot
     return result
 
 

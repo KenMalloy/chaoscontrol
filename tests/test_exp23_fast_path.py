@@ -2881,3 +2881,48 @@ def test_cd_diagnostics_emitted_at_every_seat_refresh():
                     "score_criticality_corr_per_layer", "event_rate_per_layer",
                     "seat_mask_fraction_per_layer"):
             assert key in snap, f"diagnostic snapshot missing {key}"
+
+
+def test_runner_emits_topology_snapshot_when_requested():
+    mod = _load_runner_module()
+    model = _TinyTokenTrainModel()
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+    result = mod.train_fast_for_budget(
+        model, train_tokens=torch.arange(32, dtype=torch.int16) % 6,
+        train_num_tokens=32, stride=4, seq_len=3, batch_size=2,
+        device=torch.device("cpu"), optimizer=optimizer,
+        budget_seconds=1.0, chunk_size=2, grad_clip_norm=0.0, fused_grad_clip=False,
+        rank=0, world_size=1, seed=123, precision="fp32",
+        stop_check_interval=1, stop_margin_seconds=0.0,
+        vocab_size=6, max_steps=1, prefetch_batches=False,
+        emit_topology_snapshot=True,
+    )
+    snap = result.get("topology_snapshot")
+    assert snap is not None
+    # CPU info must be present in some form.
+    assert "lscpu" in snap or "cpu_info" in snap or snap.get("cpu_unavailable") is True
+    # GPU topo may be absent on macOS — tolerate.
+    assert (
+        "nvidia_smi_topo" in snap
+        or "gpu_topo" in snap
+        or snap.get("gpu_topo_unavailable") is True
+    )
+    # NUMA likewise.
+    assert "numactl_h" in snap or "numa_unavailable" in snap
+
+
+def test_topology_snapshot_absent_when_flag_off():
+    mod = _load_runner_module()
+    model = _TinyTokenTrainModel()
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+    result = mod.train_fast_for_budget(
+        model, train_tokens=torch.arange(32, dtype=torch.int16) % 6,
+        train_num_tokens=32, stride=4, seq_len=3, batch_size=2,
+        device=torch.device("cpu"), optimizer=optimizer,
+        budget_seconds=1.0, chunk_size=2, grad_clip_norm=0.0, fused_grad_clip=False,
+        rank=0, world_size=1, seed=123, precision="fp32",
+        stop_check_interval=1, stop_margin_seconds=0.0,
+        vocab_size=6, max_steps=1, prefetch_batches=False,
+        # emit_topology_snapshot defaults to False.
+    )
+    assert "topology_snapshot" not in result
