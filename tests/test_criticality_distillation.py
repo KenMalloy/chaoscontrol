@@ -71,3 +71,39 @@ def test_add_step_evidence_rejects_wrong_layer_or_shape():
         cd.add_step_evidence(layer=5, step=0, evidence=torch.zeros(4), event_count=1.0)
     with pytest.raises((RuntimeError, ValueError)):
         cd.add_step_evidence(layer=0, step=0, evidence=torch.zeros(8), event_count=1.0)
+
+
+def test_score_age_weights_match_hand_computation():
+    cd = CriticalityDistillation(
+        num_layers=1,
+        dim=4,
+        trace_ttl_steps=3,
+        trace_half_life_steps=2.0,  # half-life = 2 steps for hand math
+    )
+    # One evidence vector at step=0, another at step=2.
+    cd.add_step_evidence(
+        layer=0, step=0,
+        evidence=torch.tensor([1.0, 0.0, 0.0, 0.0]),
+        event_count=1.0,
+    )
+    cd.add_step_evidence(
+        layer=0, step=2,
+        evidence=torch.tensor([0.0, 1.0, 0.0, 0.0]),
+        event_count=1.0,
+    )
+    # Score at current_step=4.
+    # age_weight uses half-life formulation: w = 2 ** (-age / half_life)
+    # age_0 = 4 (entry at step 0) -> w_0 = 2**(-4/2) = 0.25
+    # age_1 = 2 (entry at step 2) -> w_1 = 2**(-2/2) = 0.5
+    # expected: (0.25 * [1,0,0,0] + 0.5 * [0,1,0,0]) / (0.25 + 0.5)
+    #         = [1/3, 2/3, 0, 0]
+    score = cd.score(current_step=4)
+    expected = torch.tensor([[1.0 / 3.0, 2.0 / 3.0, 0.0, 0.0]])
+    assert torch.allclose(score, expected, atol=1e-6), f"{score} != {expected}"
+
+
+def test_score_returns_zeros_when_bank_empty():
+    cd = CriticalityDistillation(num_layers=2, dim=3, trace_ttl_steps=4)
+    score = cd.score(current_step=0)
+    assert score.shape == (2, 3)
+    assert torch.equal(score, torch.zeros_like(score))

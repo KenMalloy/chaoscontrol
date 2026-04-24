@@ -119,3 +119,31 @@ class CriticalityDistillation(nn.Module):
         )
         self.bank_step[layer, slot] = int(step)
         self.bank_event_count[layer, slot] = float(event_count)
+
+    def score(self, current_step: int) -> torch.Tensor:
+        """Age-weighted average of evidence across the bank.
+
+        Returns `[num_layers, dim]` fp32 score. Empty bank (no valid slots)
+        produces zeros.
+
+        Age weight is `2 ** (-age / trace_half_life_steps)`, so `age ==
+        trace_half_life_steps` carries weight 0.5, and `age == 0` carries
+        weight 1.0.
+        """
+        valid = self.bank_step >= 0  # [L, T]
+        age = (int(current_step) - self.bank_step).clamp_min(0).to(dtype=torch.float32)
+        weight = torch.pow(
+            torch.tensor(2.0, dtype=torch.float32), -age / self.trace_half_life_steps
+        )
+        weight = weight * valid.to(dtype=torch.float32)  # zero-out empty slots
+        weight_sum = weight.sum(dim=1, keepdim=True)  # [L, 1]
+        weighted_evidence = (weight.unsqueeze(-1) * self.bank_evidence).sum(dim=1)  # [L, D]
+        safe_denom = weight_sum.clamp_min(1e-12)
+        score = weighted_evidence / safe_denom
+        # Layers with zero total weight -> zeros (not NaN).
+        score = torch.where(
+            weight_sum > 0,
+            score,
+            torch.zeros_like(score),
+        )
+        return score
