@@ -225,6 +225,29 @@ class CriticalityDistillation(nn.Module):
         self.last_decay_step.fill_(int(current_step))
 
     @torch.no_grad()
+    def _add_contribution(
+        self,
+        *,
+        layer: int,
+        evidence: torch.Tensor,
+        event_count: float,
+    ) -> None:
+        """Incremental additive update of accumulators. Weight for this
+        step's contribution is always 1.0 (the age is zero). Evidence
+        tensor must match `self.dim`."""
+        if not 0 <= layer < self.num_layers:
+            raise IndexError(f"layer={layer}")
+        if evidence.shape != (self.dim,):
+            raise ValueError(
+                f"evidence must have shape ({self.dim},); got {tuple(evidence.shape)}"
+            )
+        ec = float(event_count)
+        ev = evidence.to(dtype=self.score_num.dtype, device=self.score_num.device)
+        self.score_num[layer].add_(ev, alpha=ec)
+        self.score_den[layer].add_(ec)
+        self.event_mass[layer].add_(ec)
+
+    @torch.no_grad()
     def ingest_step(
         self,
         *,

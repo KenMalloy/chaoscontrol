@@ -655,3 +655,25 @@ def test_step_decay_is_idempotent_when_called_with_same_step():
     cd.last_decay_step.fill_(5)
     cd._step_decay_accumulators(current_step=5)
     assert torch.allclose(cd.score_num, torch.full_like(cd.score_num, 1.0))
+
+
+def test_add_contribution_updates_numerator_denominator_and_event_mass():
+    cd = CriticalityDistillation(
+        num_layers=2, dim=3, trace_ttl_steps=8,
+        trace_half_life_steps=4.0,
+    )
+    # Pre-step: call _step_decay (no-op on zero accumulators; just syncs last_decay_step).
+    cd._step_decay_accumulators(current_step=0)
+    cd._add_contribution(
+        layer=0,
+        evidence=torch.tensor([1.0, 2.0, 3.0]),
+        event_count=5.0,
+    )
+    # Numerator: evidence * event_count = [5, 10, 15]
+    assert torch.allclose(cd.score_num[0], torch.tensor([5.0, 10.0, 15.0]))
+    # Denominator: event_count = 5
+    assert cd.score_den[0].item() == 5.0
+    # Event mass: event_count
+    assert cd.event_mass[0].item() == 5.0
+    # Layer 1 untouched.
+    assert torch.equal(cd.score_num[1], torch.zeros(3))
