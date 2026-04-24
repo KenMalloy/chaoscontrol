@@ -24,6 +24,15 @@ void launch_linear_ce_update_online(
     at::Tensor& target_logits,
     int64_t tile_start);
 
+void launch_linear_ce_update_online_with_exp_logit_sum(
+    const at::Tensor& logits,
+    const at::Tensor& targets,
+    at::Tensor& row_max,
+    at::Tensor& row_sum,
+    at::Tensor& row_exp_logit_sum,
+    at::Tensor& target_logits,
+    int64_t tile_start);
+
 void launch_linear_ce_fill_grad_logits(
     const at::Tensor& logits,
     const at::Tensor& targets,
