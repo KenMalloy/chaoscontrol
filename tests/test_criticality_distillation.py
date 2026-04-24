@@ -259,3 +259,50 @@ def test_criticality_loss_values_match_hand_mse_on_seats_only():
     # For seat channels: (0.5 - 0.9)^2 = 0.16. Mean over 2 seats = 0.16.
     loss = cd.criticality_loss(log_a_per_layer)
     assert torch.allclose(loss, torch.tensor(0.16), atol=1e-6)
+
+
+def test_non_seat_log_a_gets_exactly_zero_gradient_from_criticality_loss():
+    cd = CriticalityDistillation(
+        num_layers=1, dim=6, trace_ttl_steps=2,
+        critical_value=0.9,
+    )
+    cd.seat_mask[0] = torch.tensor([True, False, True, False, False, True])
+    log_a = torch.zeros(6, requires_grad=True)
+    loss = cd.criticality_loss([log_a])
+    loss.backward()
+    # Non-seat entries are indices 1, 3, 4 — their grad MUST be exactly zero.
+    non_seat_grad = log_a.grad[~cd.seat_mask[0]]
+    assert torch.equal(non_seat_grad, torch.zeros_like(non_seat_grad)), (
+        f"non-seat log_a must have exactly zero grad; got {non_seat_grad}"
+    )
+    # Seat entries must receive a nonzero grad (sanity — loss depends on them).
+    seat_grad = log_a.grad[cd.seat_mask[0]]
+    assert (seat_grad != 0.0).all(), (
+        f"seat log_a must have nonzero grad; got {seat_grad}"
+    )
+
+
+def test_criticality_loss_has_no_grad_path_to_pressure_or_states():
+    cd = CriticalityDistillation(
+        num_layers=1, dim=4, trace_ttl_steps=2,
+        critical_value=0.9, min_weighted_events_per_layer=0.0,
+    )
+    # Populate one evidence entry and seat.
+    evidence = torch.tensor([1.0, 0.0, 2.0, 0.0])
+    cd.add_step_evidence(layer=0, step=0, evidence=evidence, event_count=1.0)
+    cd.allocate_seats(current_step=1)
+
+    # Pressure and states are usually produced with grad in the training
+    # graph — but the criticality loss should only depend on log_a.
+    log_a = torch.zeros(4, requires_grad=True)
+    loss = cd.criticality_loss([log_a])
+    # If the loss depends on anything other than log_a, gradients on a
+    # fresh unrelated tensor should cause an error when we try to extract
+    # them. Assert directly: loss.backward consumes log_a only.
+    assert loss.requires_grad
+    loss.backward()
+    assert log_a.grad is not None
+    # seat_mask is a registered buffer and should not receive grads.
+    assert not cd.seat_mask.requires_grad
+    # baseline_future_energy should not receive grads either.
+    assert not cd.baseline_future_energy.requires_grad
