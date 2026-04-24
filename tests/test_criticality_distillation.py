@@ -775,3 +775,32 @@ def test_allocate_seats_from_accumulators_respects_event_mass_gate():
     cd._add_contribution(layer=0, evidence=torch.ones(8), event_count=1.0)
     cd.allocate_seats_from_accumulators(current_step=1)
     assert not cd.seat_mask[0].any()
+
+
+def test_accumulator_score_equals_full_bank_score_within_fp32_tolerance():
+    """Incremental accumulator and full-bank scan must agree exactly
+    (modulo fp32 rounding) after any ingest sequence and any step
+    advance."""
+    cd = CriticalityDistillation(
+        num_layers=2, dim=5, trace_ttl_steps=10,
+        trace_half_life_steps=3.0,
+    )
+    torch.manual_seed(7)
+    steps = [0, 1, 3, 5, 8, 13, 21]
+    for step in steps:
+        cd._step_decay_accumulators(current_step=step)
+        for layer in range(2):
+            evidence = torch.randn(5).abs() + 0.1
+            cnt = float(torch.randint(1, 10, (1,)).item())
+            cd._add_contribution(layer=layer, evidence=evidence, event_count=cnt)
+            cd._write_ring_slot(
+                layer=layer, step=step, evidence=evidence,
+                event_count=cnt, current_step=step,
+            )
+    current_step = 30
+    cd._step_decay_accumulators(current_step=current_step)
+    acc = cd.score_from_accumulators()
+    full = cd.score(current_step=current_step)
+    assert torch.allclose(acc, full, atol=1e-4, rtol=1e-4), (
+        f"accumulator diverged from full scan: acc={acc} full={full}"
+    )
