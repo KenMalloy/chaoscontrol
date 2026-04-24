@@ -1536,6 +1536,7 @@ def train_fast_for_budget(
     compile_full_path: bool = False,
     prefetch_batches: bool = False,
     lm_head_backward_mode: str = "fused",
+    lm_head_emit_entropy: bool = False,
     lm_head_tile_size: int = 1024,
     cuda_graph_mode: str = "none",
     cuda_graph_min_total_speedup: float = 0.05,
@@ -1578,6 +1579,7 @@ def train_fast_for_budget(
     scopt_trace_interval_steps: int = 0,
     scopt_pressure_upper_c: float | None = None,
     scopt_pressure_upper_floor: float = 1.0,
+    criticality_distill_enabled: bool = False,
 ) -> dict[str, Any]:
     rank_ = int(rank)
     world_size_ = int(world_size)
@@ -1604,6 +1606,15 @@ def train_fast_for_budget(
             "so the common path can update its CE EMA every step; got "
             f"lm_head_backward_mode={lm_head_backward_mode!r}. "
             f"Use one of: {allowed}"
+        )
+    # Criticality Distillation requires the entropy-emitting LM-head forward.
+    # See docs/plans/2026-04-24-criticality-distillation-runner-design.md.
+    if criticality_distill_enabled and not lm_head_emit_entropy:
+        raise ValueError(
+            "criticality_distill_enabled=True requires lm_head_emit_entropy=True. "
+            "CD uses per-token entropy from the fused forward to build surprise pressure; "
+            "pass lm_head_emit_entropy=True (the entrypoint select flag is orthogonal to "
+            "lm_head_backward_mode, which stays at its default)."
         )
     if scopt_active and (
         spectral_reg_lambda_dead > 0.0

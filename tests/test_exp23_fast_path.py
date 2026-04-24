@@ -2585,3 +2585,62 @@ def test_run_condition_threads_max_steps_from_config(monkeypatch):
 
     assert seen_kwargs["max_steps"] == 517
     assert result["train"]["steps"] == 517
+
+
+def test_train_fast_for_budget_accepts_lm_head_emit_entropy_flag():
+    """Orthogonal flag; no mode-name churn. Default False."""
+    mod = _load_runner_module()
+    # Use the same harness other tests use — construct a minimal model+optimizer.
+    import inspect
+    sig = inspect.signature(mod.train_fast_for_budget)
+    assert "lm_head_emit_entropy" in sig.parameters
+    assert sig.parameters["lm_head_emit_entropy"].default is False
+
+
+def test_train_fast_for_budget_accepts_criticality_distill_enabled_flag():
+    mod = _load_runner_module()
+    import inspect
+    sig = inspect.signature(mod.train_fast_for_budget)
+    assert "criticality_distill_enabled" in sig.parameters
+    assert sig.parameters["criticality_distill_enabled"].default is False
+
+
+def test_criticality_distill_enabled_requires_lm_head_emit_entropy():
+    """CD enabled without entropy emission -> clear ValueError."""
+    import pytest
+    mod = _load_runner_module()
+    model = _TinyTokenTrainModel()
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+    with pytest.raises(ValueError, match=r"lm_head_emit_entropy"):
+        mod.train_fast_for_budget(
+            model, train_tokens=torch.arange(32, dtype=torch.int16) % 6,
+            train_num_tokens=32, stride=4, seq_len=3, batch_size=2,
+            device=torch.device("cpu"), optimizer=optimizer,
+            budget_seconds=1.0, chunk_size=2, grad_clip_norm=0.0, fused_grad_clip=False,
+            rank=0, world_size=1, seed=123, precision="fp32",
+            stop_check_interval=1, stop_margin_seconds=0.0,
+            vocab_size=6, max_steps=1, prefetch_batches=False,
+            criticality_distill_enabled=True,
+            lm_head_emit_entropy=False,
+        )
+
+
+def test_criticality_distill_disabled_does_not_require_lm_head_emit_entropy():
+    """CD off -> entropy flag doesn't matter."""
+    mod = _load_runner_module()
+    model = _TinyTokenTrainModel()
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+    # Should not raise — CD off means entropy flag is don't-care.
+    result = mod.train_fast_for_budget(
+        model, train_tokens=torch.arange(32, dtype=torch.int16) % 6,
+        train_num_tokens=32, stride=4, seq_len=3, batch_size=2,
+        device=torch.device("cpu"), optimizer=optimizer,
+        budget_seconds=1.0, chunk_size=2, grad_clip_norm=0.0, fused_grad_clip=False,
+        rank=0, world_size=1, seed=123, precision="fp32",
+        stop_check_interval=1, stop_margin_seconds=0.0,
+        vocab_size=6, max_steps=1, prefetch_batches=False,
+        criticality_distill_enabled=False,
+        lm_head_emit_entropy=False,
+    )
+    # Whatever the result looks like — we only need that no exception fired.
+    assert result is not None
