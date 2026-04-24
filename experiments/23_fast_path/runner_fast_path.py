@@ -2397,10 +2397,13 @@ def train_fast_for_budget(
                     )
                 # Close the capture_states stack now that we've read everything.
                 cd_stack.close()
-                # Async D2H copy into the pinned ping-pong slot.
-                host_slot = cd_pinned_buffers[
-                    "A" if steps % 2 == 0 else "B"
-                ]
+                # Async D2H copy into the pinned ping-pong slot. Parity is
+                # keyed on the monotonically-advancing ingest counter — not
+                # the step index — so a skipped step (OOM retry, conditional
+                # early-exit) cannot desync "slot A's last copy completed"
+                # from "slot A is about to be reused."
+                parity_key = "A" if cd._ingest_call_count % 2 == 0 else "B"
+                host_slot = cd_pinned_buffers[parity_key]
                 for key, host_t in host_slot.items():
                     src = cd_prepared_gpu[key]
                     if src.device == host_t.device:
