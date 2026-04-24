@@ -42,6 +42,8 @@ REQUIRED_RARE_BUCKET_KEYS = {
     "rare_bucket_ce_enabled",
     "rare_bucket_ce_num_buckets",
     "rare_bucket_ce_token_frequencies",
+    "rare_bucket_ce_eval_tokens",
+    "rare_bucket_ce_eval_num_tokens",
 }
 
 

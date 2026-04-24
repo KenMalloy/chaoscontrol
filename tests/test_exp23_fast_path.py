@@ -2587,6 +2587,81 @@ def test_run_condition_threads_max_steps_from_config(monkeypatch):
     assert result["train"]["steps"] == 517
 
 
+def test_run_condition_derives_rare_bucket_frequencies_and_uses_val_tokens(monkeypatch):
+    """YAML cannot carry a tensor frequency table. The CLI path should derive
+    rarity buckets from train-token counts, while the CE readout itself should
+    run on val tokens rather than the training stream."""
+    mod = _load_runner_module()
+    seen_kwargs = {}
+    train_tokens = torch.tensor([0, 1, 1, 2, 2, 2, 5], dtype=torch.int16)
+    val_tokens = torch.tensor([5, 4, 4, 3, 3, 3], dtype=torch.int16)
+
+    monkeypatch.setattr(mod, "_init_distributed", lambda _world_size: (0, 1, 0))
+    monkeypatch.setattr(mod, "_pick_device", lambda _rank, _device: torch.device("cpu"))
+    monkeypatch.setattr(mod, "resolve_param_dtype", lambda _dtype, _device: torch.float32)
+    monkeypatch.setattr(mod, "verify_diag_recurrence", lambda _device: None)
+    monkeypatch.setattr(mod, "load_fineweb_tokens", lambda _path: (train_tokens, val_tokens))
+    monkeypatch.setattr(mod, "build_sentencepiece_luts", lambda *_args: (None, None, None))
+    monkeypatch.setattr(mod, "choose_lm_starts_lazy", lambda **_kwargs: [])
+    monkeypatch.setattr(mod, "build_model", lambda *_args: _TinyTokenTrainModel())
+    monkeypatch.setattr(mod, "_apply_embed_init", lambda *_args: None)
+    monkeypatch.setattr(mod, "_reject_unsupported", lambda _model: None)
+    monkeypatch.setattr(mod, "_warmup", lambda **_kwargs: None)
+    monkeypatch.setattr(
+        mod,
+        "_build_optimizer",
+        lambda _config, model: torch.optim.SGD(model.parameters(), lr=0.01),
+    )
+
+    def fake_train_fast_for_budget(*args, **kwargs):
+        seen_kwargs.update(kwargs)
+        return {
+            "steps": 1,
+            "elapsed_s": 1.0,
+            "initial_loss": 1.0,
+            "final_loss": 0.5,
+            "aggregate_tokens_per_sec": 1.0,
+            "peak_vram_mb": 0.0,
+        }
+
+    monkeypatch.setattr(mod, "train_fast_for_budget", fake_train_fast_for_budget)
+
+    class FakeSP:
+        def Load(self, _path):
+            return True
+
+    monkeypatch.setitem(
+        sys.modules,
+        "sentencepiece",
+        type("M", (), {"SentencePieceProcessor": FakeSP}),
+    )
+
+    mod.run_condition(
+        {
+            "name": "rare_bucket_cli_smoke",
+            "vocab_size": 6,
+            "seq_len": 3,
+            "stride": 1,
+            "batch_size": 2,
+            "max_steps": 1,
+            "rare_bucket_ce_enabled": True,
+            "rare_bucket_ce_num_buckets": 4,
+        },
+        data_path="unused",
+        sp_model_path="unused.model",
+        budget_seconds=1.0,
+        output_json=None,
+        output_ckpt=None,
+        world_size_override=1,
+    )
+
+    expected_freq = torch.tensor([1, 2, 3, 1, 1, 1], dtype=torch.float32)
+    assert seen_kwargs["rare_bucket_ce_enabled"] is True
+    assert torch.equal(seen_kwargs["rare_bucket_ce_token_frequencies"], expected_freq)
+    assert torch.equal(seen_kwargs["rare_bucket_ce_eval_tokens"], val_tokens)
+    assert seen_kwargs["rare_bucket_ce_eval_num_tokens"] == int(val_tokens.numel())
+
+
 def test_train_fast_for_budget_accepts_lm_head_emit_entropy_flag():
     """Orthogonal flag; no mode-name churn. Default False."""
     mod = _load_runner_module()

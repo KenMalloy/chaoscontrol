@@ -1790,6 +1790,8 @@ def train_fast_for_budget(
     rare_bucket_ce_enabled: bool = False,
     rare_bucket_ce_num_buckets: int = 4,
     rare_bucket_ce_token_frequencies: torch.Tensor | None = None,
+    rare_bucket_ce_eval_tokens: torch.Tensor | None = None,
+    rare_bucket_ce_eval_num_tokens: int | None = None,
     emit_topology_snapshot: bool = False,
 ) -> dict[str, Any]:
     rank_ = int(rank)
@@ -2671,11 +2673,21 @@ def train_fast_for_budget(
             criticality_distillation_diagnostics
         )
     if rare_bucket_ce_enabled:
+        bucket_eval_tokens = (
+            rare_bucket_ce_eval_tokens
+            if rare_bucket_ce_eval_tokens is not None
+            else train_tokens
+        )
+        bucket_eval_num_tokens = (
+            int(rare_bucket_ce_eval_num_tokens)
+            if rare_bucket_ce_eval_num_tokens is not None
+            else int(train_num_tokens)
+        )
         val_block = _compute_per_bucket_val_ce(
             model=model,
             device=device,
-            tokens=train_tokens,
-            num_tokens=int(train_num_tokens),
+            tokens=bucket_eval_tokens,
+            num_tokens=bucket_eval_num_tokens,
             seq_len=int(seq_len),
             stride=int(stride),
             batch_size=int(batch_size),
@@ -2888,6 +2900,18 @@ def run_condition(
         if ddp_active:
             dist.barrier()
 
+    rare_bucket_ce_enabled = bool(config.get("rare_bucket_ce_enabled", False))
+    rare_bucket_ce_token_frequencies = None
+    rare_bucket_ce_eval_tokens = None
+    rare_bucket_ce_eval_num_tokens = None
+    if rare_bucket_ce_enabled:
+        rare_bucket_ce_token_frequencies = torch.bincount(
+            train_tokens.detach().cpu().long(),
+            minlength=vocab_size,
+        ).clamp_min(1).to(device=device, dtype=torch.float32)
+        rare_bucket_ce_eval_tokens = val_tokens
+        rare_bucket_ce_eval_num_tokens = int(val_tokens.numel())
+
     train_result = train_fast_for_budget(
         model,
         train_tokens=train_tokens,
@@ -3032,12 +3056,14 @@ def run_condition(
             config.get("criticality_distill_fixed_random_seats", False)
         ),
         rare_bucket_ce_enabled=bool(
-            config.get("rare_bucket_ce_enabled", False)
+            rare_bucket_ce_enabled
         ),
         rare_bucket_ce_num_buckets=int(
             config.get("rare_bucket_ce_num_buckets", 4)
         ),
-        rare_bucket_ce_token_frequencies=None,
+        rare_bucket_ce_token_frequencies=rare_bucket_ce_token_frequencies,
+        rare_bucket_ce_eval_tokens=rare_bucket_ce_eval_tokens,
+        rare_bucket_ce_eval_num_tokens=rare_bucket_ce_eval_num_tokens,
         emit_topology_snapshot=bool(
             config.get("emit_topology_snapshot", False)
         ),
