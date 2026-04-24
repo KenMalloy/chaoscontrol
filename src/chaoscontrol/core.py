@@ -435,6 +435,13 @@ class ChaosSSMCore(nn.Module):
             self._captured_states = None
 
     def _forward_diag_scan(self, x: torch.Tensor) -> torch.Tensor:
+        """Compiled sequential diag recurrence.
+
+        Uses the same elementwise recurrence as the sequential loop
+        but processes decay/update/gate in a single batched projection
+        pass, then runs the state update loop on pre-computed terms.
+        torch.compile fuses the per-step kernels on CUDA.
+        """
         decay, update, gate = self._diag_terms(x)
         states = _diag_recurrence(decay, update)
         if self._capture_states_enabled:
