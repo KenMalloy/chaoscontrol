@@ -41,3 +41,33 @@ def test_buffers_register_for_state_dict():
     assert "bank_event_count" in sd
     assert "baseline_future_energy" in sd
     assert "seat_mask" in sd
+
+
+def test_add_step_evidence_writes_into_correct_slot_and_ttl_wraps():
+    cd = CriticalityDistillation(num_layers=1, dim=4, trace_ttl_steps=3)
+    e0 = torch.tensor([[1.0, 0.0, 0.0, 0.0]])
+    e1 = torch.tensor([[0.0, 1.0, 0.0, 0.0]])
+    e2 = torch.tensor([[0.0, 0.0, 1.0, 0.0]])
+    e3 = torch.tensor([[0.0, 0.0, 0.0, 1.0]])
+
+    cd.add_step_evidence(layer=0, step=0, evidence=e0[0], event_count=10.0)
+    cd.add_step_evidence(layer=0, step=1, evidence=e1[0], event_count=11.0)
+    cd.add_step_evidence(layer=0, step=2, evidence=e2[0], event_count=12.0)
+    # At this point all 3 slots occupied for layer 0.
+    assert set(cd.bank_step[0].tolist()) == {0, 1, 2}
+
+    # Wrap: step=3 must evict the oldest (step=0).
+    cd.add_step_evidence(layer=0, step=3, evidence=e3[0], event_count=13.0)
+    assert set(cd.bank_step[0].tolist()) == {1, 2, 3}
+    # Evidence for step=3 present
+    slot = (cd.bank_step[0] == 3).nonzero(as_tuple=True)[0].item()
+    assert torch.equal(cd.bank_evidence[0, slot], e3[0])
+    assert cd.bank_event_count[0, slot].item() == pytest.approx(13.0)
+
+
+def test_add_step_evidence_rejects_wrong_layer_or_shape():
+    cd = CriticalityDistillation(num_layers=2, dim=4, trace_ttl_steps=3)
+    with pytest.raises((IndexError, ValueError)):
+        cd.add_step_evidence(layer=5, step=0, evidence=torch.zeros(4), event_count=1.0)
+    with pytest.raises((RuntimeError, ValueError)):
+        cd.add_step_evidence(layer=0, step=0, evidence=torch.zeros(8), event_count=1.0)

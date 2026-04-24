@@ -79,3 +79,43 @@ class CriticalityDistillation(nn.Module):
             "seat_mask",
             torch.zeros(self.num_layers, self.dim, dtype=torch.bool),
         )
+
+    def add_step_evidence(
+        self,
+        *,
+        layer: int,
+        step: int,
+        evidence: torch.Tensor,
+        event_count: float,
+    ) -> None:
+        """Write one (layer, step) evidence vector into the bank.
+
+        Slot selection rule:
+          * If there is any empty slot (bank_step == -1), fill the smallest
+            empty index.
+          * Else evict the slot with the oldest bank_step value (lowest step).
+        This gives us a TTL-wrapped ring without tracking a separate write
+        pointer — the aging math naturally demotes the oldest evidence.
+        """
+        if not 0 <= layer < self.num_layers:
+            raise IndexError(
+                f"layer={layer} out of range for num_layers={self.num_layers}"
+            )
+        if evidence.shape != (self.dim,):
+            raise ValueError(
+                f"evidence must have shape ({self.dim},); got {tuple(evidence.shape)}"
+            )
+
+        slots = self.bank_step[layer]  # [trace_ttl_steps]
+        empty = (slots == -1).nonzero(as_tuple=True)[0]
+        if empty.numel() > 0:
+            slot = int(empty[0].item())
+        else:
+            # Evict oldest
+            slot = int(slots.argmin().item())
+
+        self.bank_evidence[layer, slot] = evidence.to(
+            dtype=self.bank_evidence.dtype, device=self.bank_evidence.device
+        )
+        self.bank_step[layer, slot] = int(step)
+        self.bank_event_count[layer, slot] = float(event_count)
