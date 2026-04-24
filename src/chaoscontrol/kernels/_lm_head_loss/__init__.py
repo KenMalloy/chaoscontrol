@@ -56,14 +56,25 @@ def _fallback_linear_cross_entropy(
     targets: torch.Tensor,
     *,
     reduction: str,
-) -> torch.Tensor:
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return ``(loss, per_token_ce)``.
+
+    The per-token CE is returned as a detached fp32 tensor of shape
+    ``(rows,)`` so the fallback path matches the CUDA kernels' contract.
+    The reduced scalar uses the same ``F.cross_entropy(..., reduction=...)``
+    call the old fallback used, so bitwise equality against the previous
+    API is preserved. Per-token CE is computed separately via a
+    ``reduction='none'`` call — this is an intentional second pass on the
+    CPU fallback because the two reduction modes can differ at the
+    last-ULP level and some tests pin exact equality.
+    """
     flat_x = x.reshape(-1, x.size(-1))
     logits = F.linear(flat_x, weight)
-    return F.cross_entropy(
-        logits.float(),
-        targets.reshape(-1),
-        reduction=reduction,
-    )
+    logits_f = logits.float()
+    flat_targets = targets.reshape(-1)
+    loss = F.cross_entropy(logits_f, flat_targets, reduction=reduction)
+    per_token_ce = F.cross_entropy(logits_f, flat_targets, reduction="none")
+    return loss, per_token_ce.detach()
 
 
 def _fallback_rms_linear_cross_entropy(
@@ -74,7 +85,7 @@ def _fallback_rms_linear_cross_entropy(
     *,
     eps: float,
     reduction: str,
-) -> torch.Tensor:
+) -> tuple[torch.Tensor, torch.Tensor]:
     normed = _fallback_rms_norm(x, norm_weight, float(eps))
     return _fallback_linear_cross_entropy(
         normed,
@@ -192,14 +203,14 @@ class _FusedLinearCrossEntropyFn(torch.autograd.Function):
         targets: torch.Tensor,
         reduction: str,
         tile_size: int,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         flat_x = x.reshape(-1, x.size(-1)).contiguous()
         flat_targets = targets.reshape(-1).contiguous()
         compute_weight = weight.contiguous()
         if compute_weight.dtype != flat_x.dtype:
             compute_weight = compute_weight.to(dtype=flat_x.dtype)
         reduction_id = 0 if reduction == "mean" else 1
-        loss, lse = _C.linear_ce_forward(
+        loss, lse, per_token_ce = _C.linear_ce_forward(
             flat_x,
             compute_weight,
             flat_targets,
@@ -211,10 +222,11 @@ class _FusedLinearCrossEntropyFn(torch.autograd.Function):
         ctx.weight_dtype = weight.dtype
         ctx.reduction_id = reduction_id
         ctx.tile_size = int(tile_size)
-        return loss
+        ctx.mark_non_differentiable(per_token_ce)
+        return loss, per_token_ce
 
     @staticmethod
-    def backward(ctx, grad_loss: torch.Tensor):  # type: ignore[override]
+    def backward(ctx, grad_loss: torch.Tensor, grad_per_token_ce: torch.Tensor):  # type: ignore[override]
         flat_x, weight, flat_targets, lse = ctx.saved_tensors
         grad_x, grad_weight = _C.linear_ce_backward(
             grad_loss.contiguous(),
@@ -239,14 +251,14 @@ class _StreamingLinearCrossEntropyFn(torch.autograd.Function):
         targets: torch.Tensor,
         reduction: str,
         tile_size: int,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         flat_x = x.reshape(-1, x.size(-1)).contiguous()
         flat_targets = targets.reshape(-1).contiguous()
         compute_weight = weight.contiguous()
         if compute_weight.dtype != flat_x.dtype:
             compute_weight = compute_weight.to(dtype=flat_x.dtype)
         reduction_id = 0 if reduction == "mean" else 1
-        loss, lse = _C.linear_ce_streaming_forward(
+        loss, lse, per_token_ce = _C.linear_ce_streaming_forward(
             flat_x,
             compute_weight,
             flat_targets,
@@ -258,10 +270,11 @@ class _StreamingLinearCrossEntropyFn(torch.autograd.Function):
         ctx.weight_dtype = weight.dtype
         ctx.reduction_id = reduction_id
         ctx.tile_size = int(tile_size)
-        return loss
+        ctx.mark_non_differentiable(per_token_ce)
+        return loss, per_token_ce
 
     @staticmethod
-    def backward(ctx, grad_loss: torch.Tensor):  # type: ignore[override]
+    def backward(ctx, grad_loss: torch.Tensor, grad_per_token_ce: torch.Tensor):  # type: ignore[override]
         flat_x, weight, flat_targets, lse = ctx.saved_tensors
         grad_x, grad_weight = _C.linear_ce_streaming_backward(
             grad_loss.contiguous(),
@@ -286,14 +299,14 @@ class _StreamingV2LinearCrossEntropyFn(torch.autograd.Function):
         targets: torch.Tensor,
         reduction: str,
         tile_size: int,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         flat_x = x.reshape(-1, x.size(-1)).contiguous()
         flat_targets = targets.reshape(-1).contiguous()
         compute_weight = weight.contiguous()
         if compute_weight.dtype != flat_x.dtype:
             compute_weight = compute_weight.to(dtype=flat_x.dtype)
         reduction_id = 0 if reduction == "mean" else 1
-        loss, lse = _C.linear_ce_streaming_v2_forward(
+        loss, lse, per_token_ce = _C.linear_ce_streaming_v2_forward(
             flat_x,
             compute_weight,
             flat_targets,
@@ -305,10 +318,11 @@ class _StreamingV2LinearCrossEntropyFn(torch.autograd.Function):
         ctx.weight_dtype = weight.dtype
         ctx.reduction_id = reduction_id
         ctx.tile_size = int(tile_size)
-        return loss
+        ctx.mark_non_differentiable(per_token_ce)
+        return loss, per_token_ce
 
     @staticmethod
-    def backward(ctx, grad_loss: torch.Tensor):  # type: ignore[override]
+    def backward(ctx, grad_loss: torch.Tensor, grad_per_token_ce: torch.Tensor):  # type: ignore[override]
         flat_x, weight, flat_targets, lse = ctx.saved_tensors
         grad_x, grad_weight = _C.linear_ce_streaming_v2_backward(
             grad_loss.contiguous(),
@@ -333,14 +347,14 @@ class _StreamingCachedLinearCrossEntropyFn(torch.autograd.Function):
         targets: torch.Tensor,
         reduction: str,
         tile_size: int,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         flat_x = x.reshape(-1, x.size(-1)).contiguous()
         flat_targets = targets.reshape(-1).contiguous()
         compute_weight = weight.contiguous()
         if compute_weight.dtype != flat_x.dtype:
             compute_weight = compute_weight.to(dtype=flat_x.dtype)
         reduction_id = 0 if reduction == "mean" else 1
-        loss, lse, logits_cache = _C.linear_ce_streaming_cached_forward(
+        loss, lse, per_token_ce, logits_cache = _C.linear_ce_streaming_cached_forward(
             flat_x,
             compute_weight,
             flat_targets,
@@ -358,10 +372,11 @@ class _StreamingCachedLinearCrossEntropyFn(torch.autograd.Function):
         ctx.weight_dtype = weight.dtype
         ctx.reduction_id = reduction_id
         ctx.tile_size = int(tile_size)
-        return loss
+        ctx.mark_non_differentiable(per_token_ce)
+        return loss, per_token_ce
 
     @staticmethod
-    def backward(ctx, grad_loss: torch.Tensor):  # type: ignore[override]
+    def backward(ctx, grad_loss: torch.Tensor, grad_per_token_ce: torch.Tensor):  # type: ignore[override]
         flat_x, weight, flat_targets, lse, logits_cache = ctx.saved_tensors
         grad_x, grad_weight = _C.linear_ce_streaming_cached_backward(
             grad_loss.contiguous(),
@@ -390,7 +405,7 @@ class _FusedRMSLinearCrossEntropyFn(torch.autograd.Function):
         reduction: str,
         tile_size: int,
         backend: str,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         x_contig = x.contiguous()
         norm_weight_contig = norm_weight.contiguous()
         flat_targets = targets.reshape(-1).contiguous()
@@ -407,7 +422,7 @@ class _FusedRMSLinearCrossEntropyFn(torch.autograd.Function):
             compute_weight = compute_weight.to(dtype=flat_normed.dtype)
 
         if backend == "streaming_v2":
-            loss, lse = _C.linear_ce_streaming_v2_forward(
+            loss, lse, per_token_ce = _C.linear_ce_streaming_v2_forward(
                 flat_normed,
                 compute_weight,
                 flat_targets,
@@ -415,7 +430,7 @@ class _FusedRMSLinearCrossEntropyFn(torch.autograd.Function):
                 int(tile_size),
             )
         elif backend == "streaming":
-            loss, lse = _C.linear_ce_streaming_forward(
+            loss, lse, per_token_ce = _C.linear_ce_streaming_forward(
                 flat_normed,
                 compute_weight,
                 flat_targets,
@@ -423,7 +438,7 @@ class _FusedRMSLinearCrossEntropyFn(torch.autograd.Function):
                 int(tile_size),
             )
         else:
-            loss, lse = _C.linear_ce_forward(
+            loss, lse, per_token_ce = _C.linear_ce_forward(
                 flat_normed,
                 compute_weight,
                 flat_targets,
@@ -445,10 +460,11 @@ class _FusedRMSLinearCrossEntropyFn(torch.autograd.Function):
         ctx.reduction_id = reduction_id
         ctx.tile_size = int(tile_size)
         ctx.backend = backend
-        return loss
+        ctx.mark_non_differentiable(per_token_ce)
+        return loss, per_token_ce
 
     @staticmethod
-    def backward(ctx, grad_loss: torch.Tensor):  # type: ignore[override]
+    def backward(ctx, grad_loss: torch.Tensor, grad_per_token_ce: torch.Tensor):  # type: ignore[override]
         (
             x,
             norm_weight,
@@ -534,20 +550,21 @@ def fused_rms_norm(
     return _fallback_rms_norm(x, weight, float(eps))
 
 
-def fused_linear_cross_entropy(
+def _fused_linear_cross_entropy_dispatch(
     x: torch.Tensor,
     weight: torch.Tensor,
     targets: torch.Tensor,
     *,
-    reduction: str = "mean",
-    tile_size: int = 1024,
-    backend: str = "auto",
-) -> torch.Tensor:
-    """Linear projection plus cross entropy without changing math.
+    reduction: str,
+    tile_size: int,
+    backend: str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Dispatch to the right backend and always return ``(loss, per_token_ce)``.
 
-    The fallback path is intentionally exact and may materialize full logits.
-    The native CUDA path, when available, owns the memory-safe tiled
-    implementation.
+    The CUDA autograd Functions return ``(loss, per_token_ce)`` directly with
+    ``per_token_ce`` marked non-differentiable inside ``forward``. The fallback
+    produces the same shape on CPU/unsupported configurations. Public wrappers
+    pick which outputs to expose.
     """
     if reduction not in {"mean", "sum"}:
         raise ValueError(
@@ -629,24 +646,71 @@ def fused_linear_cross_entropy(
     )
 
 
-def fused_rms_linear_cross_entropy(
+def fused_linear_cross_entropy(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    targets: torch.Tensor,
+    *,
+    reduction: str = "mean",
+    tile_size: int = 1024,
+    backend: str = "auto",
+) -> torch.Tensor:
+    """Linear projection plus cross entropy without changing math.
+
+    The fallback path is intentionally exact and may materialize full logits.
+    The native CUDA path, when available, owns the memory-safe tiled
+    implementation.
+    """
+    loss, _ = _fused_linear_cross_entropy_dispatch(
+        x,
+        weight,
+        targets,
+        reduction=reduction,
+        tile_size=int(tile_size),
+        backend=backend,
+    )
+    return loss
+
+
+def fused_linear_cross_entropy_with_ce(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    targets: torch.Tensor,
+    *,
+    reduction: str = "mean",
+    tile_size: int = 1024,
+    backend: str = "auto",
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Same as :func:`fused_linear_cross_entropy`, additionally returning the
+    per-token CE as a detached ``(rows,)`` fp32 tensor.
+
+    Per-token CE is always computed inside the kernel as ``lse -
+    target_logit`` on the way to the reduced scalar; returning it to the
+    caller is free. ScOpt's
+    :func:`chaoscontrol.optim.scopt.scarcity_pressure_from_ce` consumes it
+    shape-``(batch, seq)`` — reshape at the call site.
+    """
+    return _fused_linear_cross_entropy_dispatch(
+        x,
+        weight,
+        targets,
+        reduction=reduction,
+        tile_size=int(tile_size),
+        backend=backend,
+    )
+
+
+def _fused_rms_linear_cross_entropy_dispatch(
     x: torch.Tensor,
     norm_weight: torch.Tensor,
     linear_weight: torch.Tensor,
     targets: torch.Tensor,
     *,
-    eps: float = 1e-6,
-    reduction: str = "mean",
-    tile_size: int = 1024,
-    backend: str = "auto",
-) -> torch.Tensor:
-    """RMSNorm + linear projection + cross entropy as one exact op.
-
-    The CUDA fast path reuses the same native RMSNorm and tiled CE kernels as
-    the separate calls, but presents them as one autograd node. That trims the
-    Python/autograd orchestration around the Exp23 final head path and gives
-    the deeper CUDA fusion work a single stable public entry point.
-    """
+    eps: float,
+    reduction: str,
+    tile_size: int,
+    backend: str,
+) -> tuple[torch.Tensor, torch.Tensor]:
     if reduction not in {"mean", "sum"}:
         raise ValueError(
             "fused_rms_linear_cross_entropy: reduction must be 'mean' or 'sum', "
@@ -709,8 +773,68 @@ def fused_rms_linear_cross_entropy(
     )
 
 
+def fused_rms_linear_cross_entropy(
+    x: torch.Tensor,
+    norm_weight: torch.Tensor,
+    linear_weight: torch.Tensor,
+    targets: torch.Tensor,
+    *,
+    eps: float = 1e-6,
+    reduction: str = "mean",
+    tile_size: int = 1024,
+    backend: str = "auto",
+) -> torch.Tensor:
+    """RMSNorm + linear projection + cross entropy as one exact op.
+
+    The CUDA fast path reuses the same native RMSNorm and tiled CE kernels as
+    the separate calls, but presents them as one autograd node. That trims the
+    Python/autograd orchestration around the Exp23 final head path and gives
+    the deeper CUDA fusion work a single stable public entry point.
+    """
+    loss, _ = _fused_rms_linear_cross_entropy_dispatch(
+        x,
+        norm_weight,
+        linear_weight,
+        targets,
+        eps=float(eps),
+        reduction=reduction,
+        tile_size=int(tile_size),
+        backend=backend,
+    )
+    return loss
+
+
+def fused_rms_linear_cross_entropy_with_ce(
+    x: torch.Tensor,
+    norm_weight: torch.Tensor,
+    linear_weight: torch.Tensor,
+    targets: torch.Tensor,
+    *,
+    eps: float = 1e-6,
+    reduction: str = "mean",
+    tile_size: int = 1024,
+    backend: str = "auto",
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Same as :func:`fused_rms_linear_cross_entropy`, additionally returning
+    the per-token CE as a detached ``(rows,)`` fp32 tensor. See
+    :func:`fused_linear_cross_entropy_with_ce` for the contract.
+    """
+    return _fused_rms_linear_cross_entropy_dispatch(
+        x,
+        norm_weight,
+        linear_weight,
+        targets,
+        eps=float(eps),
+        reduction=reduction,
+        tile_size=int(tile_size),
+        backend=backend,
+    )
+
+
 __all__ = [
     "fused_linear_cross_entropy",
+    "fused_linear_cross_entropy_with_ce",
     "fused_rms_linear_cross_entropy",
+    "fused_rms_linear_cross_entropy_with_ce",
     "fused_rms_norm",
 ]

@@ -37,7 +37,9 @@ from chaoscontrol.distributed import (
 )
 from chaoscontrol.kernels._lm_head_loss import (
     fused_linear_cross_entropy,
+    fused_linear_cross_entropy_with_ce,
     fused_rms_linear_cross_entropy,
+    fused_rms_linear_cross_entropy_with_ce,
     fused_rms_norm,
 )
 from chaoscontrol.precision import autocast_context
@@ -202,6 +204,70 @@ def fused_lm_head_backward(
         )
     (loss * float(loss_weight)).backward()
     return loss.detach()
+
+
+def fused_lm_head_backward_with_ce(
+    hidden: torch.Tensor,
+    final_norm: nn.Module,
+    lm_head: nn.Linear,
+    targets: torch.Tensor,
+    *,
+    backend: str = "auto",
+    tile_size: int = 1024,
+    loss_weight: float = 1.0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Same as :func:`fused_lm_head_backward`, additionally returning the
+    detached per-token CE as a ``(rows,)`` fp32 tensor.
+
+    ScOpt consumes per-token CE as ``(batch, seq)``; the caller reshapes
+    at the use site. The fused kernel already computes the per-token
+    values on the way to the mean/sum; this helper just stops discarding
+    them.
+
+    Falls back to :func:`full_lm_head_backward` when ``final_norm.weight``
+    is missing, in which case we recompute per-token CE from logits via
+    ``F.cross_entropy(reduction='none')`` — the fallback path doesn't
+    expose logits, so the extra work is the unavoidable price of the
+    non-fused path.
+    """
+    weight = getattr(final_norm, "weight", None)
+    eps = float(getattr(final_norm, "eps", 1e-6))
+    if weight is None:
+        vocab = lm_head.out_features
+        logits = lm_head(final_norm(hidden))
+        logits_flat = logits.reshape(-1, vocab).float()
+        targets_flat = targets.reshape(-1)
+        per_token_ce = F.cross_entropy(
+            logits_flat, targets_flat, reduction="none"
+        )
+        loss = per_token_ce.mean()
+        (loss * float(loss_weight)).backward()
+        return loss.detach(), per_token_ce.detach()
+
+    backend_name = str(backend).strip().lower()
+    if backend_name == "norm_streaming_v2":
+        loss, per_token_ce = fused_rms_linear_cross_entropy_with_ce(
+            hidden,
+            weight,
+            lm_head.weight,
+            targets,
+            eps=eps,
+            reduction="mean",
+            backend="streaming_v2",
+            tile_size=int(tile_size),
+        )
+    else:
+        normed = fused_rms_norm(hidden, weight, eps=eps)
+        loss, per_token_ce = fused_linear_cross_entropy_with_ce(
+            normed,
+            lm_head.weight,
+            targets,
+            reduction="mean",
+            backend=backend,
+            tile_size=int(tile_size),
+        )
+    (loss * float(loss_weight)).backward()
+    return loss.detach(), per_token_ce
 
 
 _FUSED_LM_HEAD_BACKENDS: dict[str, str] = {

@@ -89,7 +89,7 @@ void check_linear_ce_inputs(
     TORCH_CHECK(weight.size(0) > 0, op_name, ": vocab dimension must be positive");
 }
 
-std::tuple<at::Tensor, at::Tensor> linear_ce_forward(
+std::tuple<at::Tensor, at::Tensor, at::Tensor> linear_ce_forward(
     const at::Tensor& x,
     const at::Tensor& weight,
     const at::Tensor& targets,
@@ -129,10 +129,10 @@ std::tuple<at::Tensor, at::Tensor> linear_ce_forward(
     auto loss = reduction == static_cast<int64_t>(Reduction::Mean)
         ? loss_rows.mean()
         : loss_rows.sum();
-    return {loss, lse};
+    return {loss, lse, loss_rows};
 }
 
-std::tuple<at::Tensor, at::Tensor> linear_ce_streaming_forward(
+std::tuple<at::Tensor, at::Tensor, at::Tensor> linear_ce_streaming_forward(
     const at::Tensor& x,
     const at::Tensor& weight,
     const at::Tensor& targets,
@@ -168,7 +168,7 @@ std::tuple<at::Tensor, at::Tensor> linear_ce_streaming_forward(
     auto loss = reduction == static_cast<int64_t>(Reduction::Mean)
         ? loss_rows.mean()
         : loss_rows.sum();
-    return {loss, lse};
+    return {loss, lse, loss_rows};
 }
 
 at::Tensor make_tile_workspace(
@@ -191,7 +191,7 @@ at::Tensor full_or_partial_tile(
     return at::empty({rows, cols}, x.options());
 }
 
-std::tuple<at::Tensor, at::Tensor> linear_ce_streaming_v2_forward(
+std::tuple<at::Tensor, at::Tensor, at::Tensor> linear_ce_streaming_v2_forward(
     const at::Tensor& x,
     const at::Tensor& weight,
     const at::Tensor& targets,
@@ -229,10 +229,10 @@ std::tuple<at::Tensor, at::Tensor> linear_ce_streaming_v2_forward(
     auto loss = reduction == static_cast<int64_t>(Reduction::Mean)
         ? loss_rows.mean()
         : loss_rows.sum();
-    return {loss, lse};
+    return {loss, lse, loss_rows};
 }
 
-std::tuple<at::Tensor, at::Tensor, at::Tensor> linear_ce_streaming_cached_forward(
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> linear_ce_streaming_cached_forward(
     const at::Tensor& x,
     const at::Tensor& weight,
     const at::Tensor& targets,
@@ -275,7 +275,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> linear_ce_streaming_cached_forwar
     auto loss = reduction == static_cast<int64_t>(Reduction::Mean)
         ? loss_rows.mean()
         : loss_rows.sum();
-    return {loss, lse, logits_cache};
+    return {loss, lse, loss_rows, logits_cache};
 }
 
 std::tuple<at::Tensor, at::Tensor> linear_ce_backward(

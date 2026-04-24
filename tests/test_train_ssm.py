@@ -26,6 +26,7 @@ from chaoscontrol.training import chunked_cross_entropy
 from chaoscontrol.train_ssm import (
     fused_lm_head_backend_for_mode,
     fused_lm_head_backward,
+    fused_lm_head_backward_with_ce,
     train_ssm_for_budget,
     train_ssm_step,
 )
@@ -495,6 +496,38 @@ class TestTrainSSMStepEquivalence:
                 4096,
             )
         ]
+
+    def test_fused_lm_head_backward_with_ce_returns_per_token_ce_matching_scalar(
+        self,
+    ) -> None:
+        """``fused_lm_head_backward_with_ce`` returns detached per-token CE of
+        shape ``(rows,)`` that reduces to the scalar loss.
+
+        ScOpt's ``scarcity_pressure_from_ce`` consumes this reshaped to
+        ``(batch, seq)`` and computes per-token rarity × excess; the
+        contract here is shape + mean equality, not ScOpt's downstream
+        semantics.
+        """
+        torch.manual_seed(11)
+        hidden = torch.randn(2, 3, 4, requires_grad=True)
+        final_norm = torch.nn.RMSNorm(4, eps=1e-6)
+        lm_head = torch.nn.Linear(4, 6, bias=False)
+        targets = torch.randint(0, 6, (2, 3), dtype=torch.long)
+
+        loss, per_token_ce = fused_lm_head_backward_with_ce(
+            hidden,
+            final_norm,
+            lm_head,
+            targets,
+            tile_size=4,
+        )
+
+        assert loss.ndim == 0
+        assert per_token_ce.shape == (2 * 3,)
+        assert not per_token_ce.requires_grad
+        assert torch.allclose(per_token_ce.mean(), loss, atol=1e-6, rtol=1e-6)
+        # Backward already ran inside the helper — hidden grad must exist.
+        assert hidden.grad is not None
 
     @pytest.mark.parametrize(
         ("mode", "backend"),

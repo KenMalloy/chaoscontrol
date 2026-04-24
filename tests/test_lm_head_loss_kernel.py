@@ -11,7 +11,9 @@ import torch.nn.functional as F
 import chaoscontrol.kernels._lm_head_loss as lm_head_loss
 from chaoscontrol.kernels._lm_head_loss import (
     fused_linear_cross_entropy,
+    fused_linear_cross_entropy_with_ce,
     fused_rms_linear_cross_entropy,
+    fused_rms_linear_cross_entropy_with_ce,
     fused_rms_norm,
 )
 
@@ -220,8 +222,115 @@ def test_fused_linear_cross_entropy_rejects_bad_reduction():
 
 def test_public_exports_include_norm_linear_ce_entry_point():
     assert "fused_linear_cross_entropy" in lm_head_loss.__all__
+    assert "fused_linear_cross_entropy_with_ce" in lm_head_loss.__all__
     assert "fused_rms_linear_cross_entropy" in lm_head_loss.__all__
+    assert "fused_rms_linear_cross_entropy_with_ce" in lm_head_loss.__all__
     assert "fused_rms_norm" in lm_head_loss.__all__
+
+
+def test_fused_linear_cross_entropy_with_ce_cpu_fallback_matches_reference_none():
+    """Per-token CE from the ``_with_ce`` API must match
+    ``F.cross_entropy(..., reduction='none')`` exactly on the CPU fallback,
+    and its mean must match the scalar loss. This is what ScOpt's pressure
+    computation relies on — shape ``(rows,)`` aligned with ``targets.reshape(-1)``.
+    """
+    torch.manual_seed(7)
+    x = torch.randn(3, 5, 7)
+    w = torch.randn(11, 7) * 0.1
+    targets = torch.randint(0, 11, (3, 5), dtype=torch.long)
+
+    logits_ref = x.reshape(-1, x.size(-1)) @ w.t()
+    per_token_ref = F.cross_entropy(
+        logits_ref.float(),
+        targets.reshape(-1),
+        reduction="none",
+    )
+
+    loss, per_token_ce = fused_linear_cross_entropy_with_ce(
+        x,
+        w,
+        targets,
+        reduction="mean",
+        tile_size=4,
+    )
+
+    assert per_token_ce.shape == (3 * 5,)
+    assert torch.allclose(per_token_ce, per_token_ref, atol=0.0, rtol=0.0)
+    assert torch.allclose(per_token_ce.mean(), loss, atol=1e-6, rtol=1e-6)
+
+
+def test_fused_linear_cross_entropy_with_ce_sum_reduction_matches_per_token_sum():
+    torch.manual_seed(8)
+    x = torch.randn(2, 4, 6)
+    w = torch.randn(9, 6) * 0.1
+    targets = torch.randint(0, 9, (2, 4), dtype=torch.long)
+
+    loss, per_token_ce = fused_linear_cross_entropy_with_ce(
+        x,
+        w,
+        targets,
+        reduction="sum",
+        tile_size=3,
+    )
+
+    assert torch.allclose(per_token_ce.sum(), loss, atol=1e-5, rtol=1e-5)
+
+
+def test_fused_linear_cross_entropy_with_ce_per_token_is_detached():
+    """Per-token CE is a non-differentiable forward output; leaking autograd
+    would quietly double-count gradients when a caller sums it. The
+    ``mark_non_differentiable`` + fallback ``.detach()`` contract makes
+    ``requires_grad=False`` either way."""
+    torch.manual_seed(9)
+    x = torch.randn(2, 3, 5, requires_grad=True)
+    w = (torch.randn(7, 5) * 0.1).requires_grad_(True)
+    targets = torch.randint(0, 7, (2, 3), dtype=torch.long)
+
+    loss, per_token_ce = fused_linear_cross_entropy_with_ce(
+        x,
+        w,
+        targets,
+        reduction="mean",
+        tile_size=2,
+    )
+
+    assert not per_token_ce.requires_grad
+    # The scalar loss must still be differentiable; sanity-check by
+    # running backward through it.
+    loss.backward()
+    assert x.grad is not None
+    assert w.grad is not None
+
+
+def test_fused_rms_linear_cross_entropy_with_ce_cpu_fallback_matches_reference():
+    torch.manual_seed(10)
+    x = torch.randn(2, 3, 7)
+    nw = (torch.randn(7) * 0.1 + 1.0)
+    lw = torch.randn(9, 7) * 0.1
+    targets = torch.randint(0, 9, (2, 3), dtype=torch.long)
+
+    # Reference: RMSNorm → linear → CE(reduction='none').
+    normed_ref = F.rms_norm(x.float(), (x.size(-1),), eps=1e-6).to(x.dtype) * nw
+    logits_ref = normed_ref.reshape(-1, x.size(-1)) @ lw.t()
+    per_token_ref = F.cross_entropy(
+        logits_ref.float(),
+        targets.reshape(-1),
+        reduction="none",
+    )
+
+    loss, per_token_ce = fused_rms_linear_cross_entropy_with_ce(
+        x,
+        nw,
+        lw,
+        targets,
+        eps=1e-6,
+        reduction="mean",
+        tile_size=3,
+    )
+
+    assert per_token_ce.shape == (2 * 3,)
+    assert torch.allclose(per_token_ce, per_token_ref, atol=0.0, rtol=0.0)
+    assert torch.allclose(per_token_ce.mean(), loss, atol=1e-6, rtol=1e-6)
 
 
 def test_fused_linear_cross_entropy_cuda_kernel_matches_reference_if_available():
