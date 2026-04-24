@@ -249,6 +249,38 @@ class CriticalityDistillation(nn.Module):
             mask[topk.indices] = True
             self.seat_mask[layer] = mask
 
+    def criticality_loss(self, log_a_per_layer: list) -> torch.Tensor:
+        """Seat-masked MSE loss pulling `1 - sigmoid(log_a[seat])` toward
+        `critical_value`.
+
+        Non-seat channels contribute exactly zero to the loss (and therefore
+        exactly zero gradient to their log_a).
+
+        Returns:
+            Scalar tensor. Weight of this term in the total loss is applied
+            externally (`criticality_distill_weight` is not multiplied here).
+        """
+        if len(log_a_per_layer) != self.num_layers:
+            raise ValueError(
+                f"log_a_per_layer must have {self.num_layers} entries"
+            )
+        total = torch.zeros((), dtype=torch.float32, device=self.seat_mask.device)
+        any_seats = False
+        for layer, log_a in enumerate(log_a_per_layer):
+            mask = self.seat_mask[layer]
+            if not mask.any():
+                continue
+            any_seats = True
+            criticality = 1.0 - torch.sigmoid(log_a.to(dtype=torch.float32))
+            err = (criticality - self.critical_value) ** 2
+            # Select seat entries explicitly so non-seats contribute no op that
+            # could produce grad through masking arithmetic.
+            seat_err = err[mask]
+            total = total + seat_err.mean()
+        if not any_seats:
+            return torch.zeros((), dtype=torch.float32)
+        return total
+
 
 def compute_event_mask(pressure: torch.Tensor, event_frac: float) -> torch.Tensor:
     """Top-`event_frac` positions of pressure become True.

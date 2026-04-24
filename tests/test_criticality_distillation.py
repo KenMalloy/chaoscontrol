@@ -237,3 +237,25 @@ def test_allocate_seats_top_k_when_gate_passes():
     assert cd.seat_mask[0, 5].item() is True
     assert cd.seat_mask[0, 2].item() is True
     assert cd.seat_mask[0, 7].item() is True
+
+
+def test_criticality_loss_is_zero_when_no_seats():
+    cd = CriticalityDistillation(num_layers=1, dim=4, trace_ttl_steps=2)
+    # seat_mask is all False by default.
+    log_a_per_layer = [torch.zeros(4, requires_grad=True)]
+    loss = cd.criticality_loss(log_a_per_layer)
+    assert loss.item() == 0.0
+
+
+def test_criticality_loss_values_match_hand_mse_on_seats_only():
+    cd = CriticalityDistillation(
+        num_layers=1, dim=4, trace_ttl_steps=2,
+        critical_value=0.9,
+        criticality_distill_weight=1.0,  # isolate per-layer mse
+    )
+    cd.seat_mask[0] = torch.tensor([True, False, True, False])
+    # 1 - sigmoid(log_a=0) = 0.5 on every channel.
+    log_a_per_layer = [torch.zeros(4, requires_grad=True)]
+    # For seat channels: (0.5 - 0.9)^2 = 0.16. Mean over 2 seats = 0.16.
+    loss = cd.criticality_loss(log_a_per_layer)
+    assert torch.allclose(loss, torch.tensor(0.16), atol=1e-6)
