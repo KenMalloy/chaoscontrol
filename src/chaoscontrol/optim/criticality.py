@@ -172,3 +172,27 @@ def compute_event_mask(pressure: torch.Tensor, event_frac: float) -> torch.Tenso
     mask = torch.zeros(total, dtype=torch.bool, device=pressure.device)
     mask[idx] = True
     return mask.reshape(pressure.shape)
+
+
+def compute_future_energy(states: torch.Tensor, horizon_H: int) -> torch.Tensor:
+    """Per-position mean-square energy over the trailing window `[t+1, t+H]`.
+
+    Args:
+        states: `[B, T, D]` recurrence states.
+        horizon_H: window length (strictly positive).
+
+    Returns:
+        `[B, T, D]` — empty windows (tail where `t+1 >= T`) produce zeros.
+    """
+    if horizon_H < 1:
+        raise ValueError(f"horizon_H must be >= 1; got {horizon_H}")
+    B, T, D = states.shape
+    sq = states.pow(2)  # [B, T, D]
+    out = torch.zeros_like(sq)
+    for t in range(T):
+        start = t + 1
+        stop = min(t + 1 + horizon_H, T)
+        if start >= stop:
+            continue  # empty window -> zeros
+        out[:, t, :] = sq[:, start:stop, :].mean(dim=1)
+    return out
