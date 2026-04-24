@@ -529,3 +529,86 @@ def test_score_permute_before_topk_selects_random_k_of_D_not_peaks():
         f"{peak_set}; score_permute_before_topk is not bypassing score. "
         f"observed={observed_sets}"
     )
+
+
+def test_fixed_random_seats_binds_seats_at_init():
+    """Falsifier flag: when fixed_random_seats=True, seats are bound ONCE at
+    construction (randomly, same k as the normal top-k). No ingest, no
+    allocate_seats call required — seat_mask must already have exactly k
+    True entries per layer. Different random seeds must yield different
+    seat sets (i.e. randomness is honored, not all-zero or all-first-k).
+    """
+    D = 16
+    num_layers = 2
+    budget_frac = 0.25
+    k_expected = max(1, int(round(D * budget_frac)))  # 4
+    assert k_expected < D
+
+    torch.manual_seed(0)
+    cd_a = CriticalityDistillation(
+        num_layers=num_layers, dim=D, trace_ttl_steps=4,
+        criticality_budget_frac=budget_frac,
+        fixed_random_seats=True,
+    )
+    # Immediately after construction: seat_mask populated, no ingest needed.
+    for layer in range(num_layers):
+        assert cd_a.seat_mask[layer].sum().item() == k_expected, (
+            f"layer {layer}: expected {k_expected} True entries, got "
+            f"{cd_a.seat_mask[layer].sum().item()}"
+        )
+
+    # Re-construct with a different seed -> different seat set (randomness
+    # is honored, not all-zero or all-first-k).
+    torch.manual_seed(12345)
+    cd_b = CriticalityDistillation(
+        num_layers=num_layers, dim=D, trace_ttl_steps=4,
+        criticality_budget_frac=budget_frac,
+        fixed_random_seats=True,
+    )
+    set_a = set(cd_a.seat_mask[0].nonzero(as_tuple=True)[0].tolist())
+    set_b = set(cd_b.seat_mask[0].nonzero(as_tuple=True)[0].tolist())
+    assert set_a != set_b, (
+        f"fixed_random_seats did not honor the RNG: set_a={set_a}, "
+        f"set_b={set_b} (both seeds produced the same seat set)"
+    )
+    # Sanity: not degenerate (not all-zero, not first-k deterministic).
+    first_k = set(range(k_expected))
+    assert not (set_a == first_k and set_b == first_k), (
+        "seats are hard-coded to first-k channels; RNG is not being used"
+    )
+
+
+def test_fixed_random_seats_allocate_seats_is_noop():
+    """Falsifier flag: when fixed_random_seats=True, allocate_seats must be
+    a no-op even when evidence would otherwise drive a score-based top-k
+    that differs from the init-bound seats.
+    """
+    D = 10
+    budget_frac = 0.2  # k = 2
+    torch.manual_seed(7)
+    cd = CriticalityDistillation(
+        num_layers=1, dim=D, trace_ttl_steps=4,
+        trace_half_life_steps=100.0,
+        criticality_budget_frac=budget_frac,
+        min_weighted_events_per_layer=1.0,
+        fixed_random_seats=True,
+    )
+    # Snapshot the init-bound seats.
+    init_mask = cd.seat_mask.clone()
+    assert init_mask[0].sum().item() == 2
+
+    # Feed evidence that would normally steer score-based allocate_seats
+    # toward channels [2, 5].
+    evidence = torch.zeros(D)
+    evidence[5] = 10.0
+    evidence[2] = 5.0
+    cd.add_step_evidence(layer=0, step=0, evidence=evidence, event_count=10.0)
+
+    cd.allocate_seats(current_step=1)
+
+    # allocate_seats must not have touched seat_mask.
+    assert torch.equal(cd.seat_mask, init_mask), (
+        f"allocate_seats overwrote fixed_random_seats: "
+        f"before={init_mask[0].nonzero(as_tuple=True)[0].tolist()}, "
+        f"after={cd.seat_mask[0].nonzero(as_tuple=True)[0].tolist()}"
+    )

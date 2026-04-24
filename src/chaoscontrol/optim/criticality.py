@@ -33,6 +33,7 @@ class CriticalityDistillation(nn.Module):
         criticality_distill_weight: float = 1e-3,
         baseline_ema_decay: float = 0.99,
         score_permute_before_topk: bool = False,
+        fixed_random_seats: bool = False,
     ) -> None:
         super().__init__()
         if not 0.0 < criticality_budget_frac < 1.0:
@@ -54,6 +55,7 @@ class CriticalityDistillation(nn.Module):
         self.criticality_distill_weight = float(criticality_distill_weight)
         self.baseline_ema_decay = float(baseline_ema_decay)
         self.score_permute_before_topk = bool(score_permute_before_topk)
+        self.fixed_random_seats = bool(fixed_random_seats)
 
         # Per-layer ring buffer keyed by step index (one evidence vector per
         # (layer, step) that had at least one event).
@@ -87,6 +89,14 @@ class CriticalityDistillation(nn.Module):
             "seat_mask",
             torch.zeros(self.num_layers, self.dim, dtype=torch.bool),
         )
+        if self.fixed_random_seats:
+            # Falsifier: bind seats ONCE at construction using torch.randperm.
+            # allocate_seats becomes a no-op; ingest still runs so cost and
+            # evidence-bank behavior match the treatment cell.
+            k = max(1, int(round(self.dim * self.criticality_budget_frac)))
+            for layer in range(self.num_layers):
+                perm = torch.randperm(self.dim)
+                self.seat_mask[layer, perm[:k]] = True
 
     def add_step_evidence(
         self,
@@ -250,6 +260,9 @@ class CriticalityDistillation(nn.Module):
         Gate: a layer's total age-weighted event count must exceed
         `min_weighted_events_per_layer`; otherwise its seats are cleared.
         """
+        if self.fixed_random_seats:
+            # Falsifier: seats were bound once at construction; never refresh.
+            return
         valid = self.bank_step >= 0
         age = (int(current_step) - self.bank_step).clamp_min(0).to(dtype=torch.float32)
         weight = torch.exp2(-age / self.trace_half_life_steps)
