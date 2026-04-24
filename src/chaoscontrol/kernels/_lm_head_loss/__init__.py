@@ -498,6 +498,82 @@ class _StreamingCachedLinearCrossEntropyFn(torch.autograd.Function):
         return grad_x.reshape(ctx.x_shape), grad_weight, None, None, None
 
 
+class _StreamingCachedLinearCrossEntropyWithEntropyFn(torch.autograd.Function):
+    """Streaming_cached forward that additionally emits per-token entropy.
+
+    Forward returns ``(loss, lse, per_token_ce, per_token_entropy)``.
+    ``per_token_entropy`` is fp32, shape ``[rows]``, and non-differentiable —
+    it is a diagnostic from the same online-softmax accumulator that builds
+    ``lse``. Backward wiring is identical to the plain streaming_cached
+    Function: only ``grad_loss`` propagates through to ``grad_x`` / ``grad_weight``.
+    """
+
+    @staticmethod
+    def forward(
+        ctx,
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        targets: torch.Tensor,
+        reduction: str,
+        tile_size: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        flat_x = x.reshape(-1, x.size(-1)).contiguous()
+        flat_targets = targets.reshape(-1).contiguous()
+        compute_weight = weight.contiguous()
+        if compute_weight.dtype != flat_x.dtype:
+            compute_weight = compute_weight.to(dtype=flat_x.dtype)
+        reduction_id = 0 if reduction == "mean" else 1
+        (
+            loss,
+            lse,
+            per_token_ce,
+            logits_cache,
+            per_token_entropy,
+        ) = _C.linear_ce_streaming_cached_forward_with_entropy(
+            flat_x,
+            compute_weight,
+            flat_targets,
+            reduction_id,
+            int(tile_size),
+        )
+        ctx.save_for_backward(
+            flat_x,
+            compute_weight,
+            flat_targets,
+            lse,
+            logits_cache,
+        )
+        ctx.x_shape = tuple(x.shape)
+        ctx.weight_dtype = weight.dtype
+        ctx.reduction_id = reduction_id
+        ctx.tile_size = int(tile_size)
+        ctx.mark_non_differentiable(lse, per_token_ce, per_token_entropy)
+        return loss, lse, per_token_ce, per_token_entropy
+
+    @staticmethod
+    def backward(  # type: ignore[override]
+        ctx,
+        grad_loss: torch.Tensor,
+        grad_lse: torch.Tensor,
+        grad_per_token_ce: torch.Tensor,
+        grad_per_token_entropy: torch.Tensor,
+    ):
+        flat_x, weight, flat_targets, lse, logits_cache = ctx.saved_tensors
+        grad_x, grad_weight = _C.linear_ce_streaming_cached_backward(
+            grad_loss.contiguous(),
+            flat_x,
+            weight,
+            flat_targets,
+            lse.contiguous(),
+            logits_cache,
+            ctx.reduction_id,
+            ctx.tile_size,
+        )
+        if grad_weight.dtype != ctx.weight_dtype:
+            grad_weight = grad_weight.to(dtype=ctx.weight_dtype)
+        return grad_x.reshape(ctx.x_shape), grad_weight, None, None, None
+
+
 class _WeightedLinearCrossEntropyFn(torch.autograd.Function):
     @staticmethod
     def forward(
@@ -1108,6 +1184,78 @@ def fused_linear_cross_entropy_with_ce(
     )
 
 
+def fused_lm_head_forward_with_ce_entropy(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    target: torch.Tensor,
+    *,
+    tile_size: int = 8192,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Fused LM-head forward emitting (loss, lse, per_token_ce, per_token_entropy).
+
+    ``per_token_entropy`` is a detached (non-differentiable) fp32 tensor of
+    shape ``[B*T]`` giving ``H[softmax(logits)]`` per token — computed in the
+    same tile loop as the cross-entropy with an online-softmax accumulator
+    trick, so emission is near-free.
+
+    The forward is functionally identical to
+    :func:`fused_linear_cross_entropy_with_ce` for
+    ``(loss, lse, per_token_ce)`` under ``backend="streaming_cached"`` and
+    ``reduction="mean"``; the backward path is unchanged —
+    ``per_token_entropy`` carries no gradient.
+
+    Args:
+        x: ``(B, T, D)`` or ``(rows, D)`` activation tensor on CUDA.
+        weight: ``(vocab, D)`` LM-head weight on CUDA; ``vocab`` must be a
+            multiple of ``tile_size``.
+        target: ``(B, T)`` or ``(rows,)`` int64 class indices on CUDA.
+        tile_size: vocab tile width. Default 8192 matches Exp23 submission.
+
+    Returns:
+        ``(loss, lse, per_token_ce, per_token_entropy)`` — loss is a scalar
+        mean-reduced CE; the remaining three are fp32 tensors of shape
+        ``[rows]``.
+    """
+    _require_ext()
+    if not hasattr(_C, "linear_ce_streaming_cached_forward_with_entropy"):
+        raise ImportError(
+            "chaoscontrol.kernels._lm_head_loss._C is built but missing the "
+            "`linear_ce_streaming_cached_forward_with_entropy` entrypoint. "
+            "Rebuild with `pip install -e . --no-build-isolation`."
+        )
+    if x.size(-1) != weight.size(-1):
+        raise ValueError(
+            "fused_lm_head_forward_with_ce_entropy: x last dimension must "
+            f"match weight input dimension, got {x.size(-1)} and "
+            f"{weight.size(-1)}"
+        )
+    rows = x.numel() // x.size(-1)
+    if target.numel() != rows:
+        raise ValueError(
+            "fused_lm_head_forward_with_ce_entropy: target must contain one "
+            f"class index per input row, got {target.numel()} targets for "
+            f"{rows} rows"
+        )
+    if int(tile_size) <= 0:
+        raise ValueError(
+            "fused_lm_head_forward_with_ce_entropy: tile_size must be "
+            f"positive, got {tile_size}"
+        )
+    if weight.size(0) % int(tile_size) != 0:
+        raise ValueError(
+            "fused_lm_head_forward_with_ce_entropy: vocab must be an exact "
+            f"multiple of tile_size; got vocab={weight.size(0)}, "
+            f"tile_size={tile_size}"
+        )
+    return _StreamingCachedLinearCrossEntropyWithEntropyFn.apply(
+        x,
+        weight,
+        target,
+        "mean",
+        int(tile_size),
+    )
+
+
 def _fused_linear_cross_entropy_weighted_dispatch(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -1561,6 +1709,7 @@ __all__ = [
     "fused_linear_cross_entropy_with_ce",
     "fused_linear_cross_entropy_weighted",
     "fused_linear_cross_entropy_weighted_with_ce",
+    "fused_lm_head_forward_with_ce_entropy",
     "fused_rms_linear_cross_entropy",
     "fused_rms_linear_cross_entropy_with_ce",
     "fused_rms_linear_cross_entropy_weighted",
