@@ -37,7 +37,14 @@ def broadcast_params(model: torch.nn.Module) -> None:
         dist.broadcast(p.data, src=0)
 
 
-def allreduce_grads(model: torch.nn.Module, world_size: int) -> None:
+def allreduce_grads(
+    model: torch.nn.Module,
+    world_size: int,
+    *,
+    group: "dist.ProcessGroup | None" = None,
+    op: "dist.ReduceOp" = dist.ReduceOp.AVG,
+    materialize_zeros: bool = False,
+) -> None:
     """Average all parameter gradients across DDP ranks.
 
     Replaces ``DistributedDataParallel``'s autograd-hook gradient sync
@@ -54,12 +61,37 @@ def allreduce_grads(model: torch.nn.Module, world_size: int) -> None:
     single coalesced call pays that cost once and reduces the whole
     flattened buffer in one collective. Uses the flatten/unflatten
     helpers torch's own ``DistributedDataParallel`` relies on.
+
+    Keyword-only knobs (default-preserving for the existing call sites):
+
+    - ``group``: pass a sub-process-group to restrict the collective.
+      ``None`` (default) routes through the WORLD group.
+    - ``op``: reduction op. Defaults to ``ReduceOp.AVG`` to match the
+      legacy behavior. Memory-aware/episodic call sites use
+      ``ReduceOp.SUM`` with caller-side pre-scaling so train and
+      replay grads can be combined in one collective.
+    - ``materialize_zeros``: when True, params whose ``grad is None``
+      get a zero-tensor materialized in place before the flatten
+      step. This guarantees identical flatten shapes across ranks
+      when only a subset of ranks ran a backward producing all
+      params' grads (e.g. the 3+1 episodic rank skipping main
+      backward). When False, those params are skipped — current
+      behavior. Note: ``materialize_zeros=True`` zero-fills frozen
+      params (``requires_grad=False``) along with trainable ones —
+      the post-step optimizer is responsible for ignoring frozen
+      params, as it always is. If a caller has frozen-param
+      gradients tracked elsewhere, the zero-fill is a no-op for the
+      collective and harmless for the optimizer.
     """
+    if materialize_zeros:
+        for p in model.parameters():
+            if p.grad is None:
+                p.grad = torch.zeros_like(p)
     grads = [p.grad for p in model.parameters() if p.grad is not None]
     if not grads:
         return
     flat = torch._utils._flatten_dense_tensors(grads)
-    dist.all_reduce(flat, op=dist.ReduceOp.AVG)
+    dist.all_reduce(flat, op=op, group=group)
     synced = torch._utils._unflatten_dense_tensors(flat, grads)
     for g, s in zip(grads, synced):
         g.copy_(s)
