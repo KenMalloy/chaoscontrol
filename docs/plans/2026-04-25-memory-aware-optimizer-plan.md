@@ -244,6 +244,8 @@ git commit -m "exp23: episodic rank drains write rings into cache"
 
 Live pod test. NCCL backend. 100-step training run with `episodic_enabled=True`. Cache fills monotonically on episodic rank; train val_bpb at end of 100 steps within float-noise of a **3-rank no-episodic baseline (NOT 4-rank)** at matched config — Codex round 3 flagged that the 4-rank baseline confounds "episodic-write effect" with "loss-of-a-train-rank effect." The right comparison: 3 train ranks with episodic disabled vs. 3 train ranks with episodic enabled and the 4th rank as the episodic worker. This isolates the write-only effect to ZERO behavioral change. No reads, no replay yet.
 
+**Pod lifecycle (per `feedback_no_subagent_runpod.md`):** subagent may invoke `runpodctl` IF it runs in the foreground with the main agent monitoring. For Task 1.6's ~30-min smoke that's appropriate. The subagent owns: bring up pod, sync code, run the 3-rank baseline + 3+1-episodic configs, capture results, and stop the pod. The main agent monitors completion and reads results. Do NOT dispatch this in `run_in_background` mode without a follow-up `/loop` watcher.
+
 Use `runpodcli` to bring up 4×H100. `/loop` for monitoring per `feedback_monitor_via_loop.md`.
 
 Smoke results JSON committed; runtime telemetry shows cache_len > 0 and write-ring `dropped_count` = 0.
@@ -419,6 +421,61 @@ git commit -m "exp24: record episodic_dw_curation_v1 results"
 
 ---
 
+## Phase 3.5 — DuckDB analytics layer (resequenced 2026-04-25 after spec review)
+
+**Why pulled forward from Phase 5:** the 8-GPU ablation matrix in Phase 4 is expensive and a null/mixed result is hard to interpret without queryable diagnostics. Without an analytics layer, the controller is still doing pressure-only candidate selection in Phase 4 — which means Phase 4 ablation can't distinguish "controller policy works" from "the headline curated-vs-uncurated effect." DuckDB lands BEFORE any 8-GPU run.
+
+Tasks (detailed):
+
+- **3.5.1 — DuckDB ingestion layer** for the Phase 3 NDJSON event log. Schema is already DuckDB-friendly per Decision 0.9. Build a small Python module (`src/chaoscontrol/episodic/analytics.py`) that wraps `duckdb.connect()` + `read_json_auto(...)` for the per-replay log, with helpers for the common queries.
+- **3.5.2 — Common query helpers:** cohort analysis (group entries by write-time channel mass), drift trajectory aggregation (avg key_rep displacement per entry per N steps), surprise frontier rollup (pressure × CE distribution over training), retrieval-utility correlation (does cosine retrieval predict replay grad cosine to rare-grad direction).
+- **3.5.3 — Controller-side query hooks:** wire the controller's per-cycle priority function to use DuckDB queries instead of pressure-only candidate selection. Replaces the Phase 2 default. This is what makes Phase 4 ablation testable beyond the headline experiment.
+
+**Phase 3.5 exit criterion:** controller demonstrably uses query-derived priority on a 4×H100 (3+1) smoke run; per-cycle wall budget for DuckDB queries stays under the controller's 50ms target. If queries are too slow at cache size 4096, profile and reduce; the analytics layer can NOT become a step-time bottleneck.
+
+**Drift snapshots (originally 5.2) are absorbed into Phase 3** — they're a cheap observability-only addition during the falsifier matrix run, NOT a separate task. Add a periodic `snapshot_key_reps_to_log()` call (every M=512 steps) that writes one NDJSON row per occupied cache slot to a parallel `episodic_drift_log_rank{R}.ndjson`. Rolled into Task 3.2's diagnostic-log work.
+
+---
+
+## Phase 3.6 — Drift correction implementation (4×H100 work)
+
+**Why pulled forward from Phase 5.3 (resequenced 2026-04-25):** Ken's framing — "I am really assuming it's going to be needed." Drift correction is the mechanism that determines whether `key_rep` stays anchored to its original event under continued backbone training. We bake the implementation in BEFORE 8-GPU work because (a) implementing it on cheap 4×H100 cycles before scaling is the right cost order, and (b) the 8-GPU ablation matrix in Phase 4 should test the system *with* drift correction active, not test "no drift correction" as a sneaky bonus arm.
+
+**Hard prerequisite:** Phase 3.5 outputs. The drift correction design picks among the three `key_rep` refresh options (full SSM state capture / prefix-token re-encode / a hybrid) based on what Phase 3.5's empirical drift trajectory data actually shows. Specifically, the DuckDB queries answer:
+- How fast does `key_rep` drift in practice (norm/step)?
+- Which cohorts drift fastest (early-layer vs late-layer residuals, high-pressure vs low-pressure writes)?
+- Does drift correlate with retrieval failure (cosine match producing replay grads that don't align with rare-grad direction)?
+
+Without those answers, we'd be guessing at refresh cadence, refresh trigger threshold, and refresh mechanism. With them, the design is data-driven.
+
+**Tasks (sequenced after Phase 3.5):**
+- **3.6.1 — Drift trajectory analysis report.** Run the DuckDB queries from 3.5 against the Phase 3 falsifier results' drift logs. Output a brief markdown report under `experiments/24_training_time_bundle/results/` summarizing measured drift, cohort splits, and retrieval-failure correlation. This is the spec for 3.6.2.
+- **3.6.2 — Refresh mechanism implementation.** Pick the option (or hybrid) the trajectory report supports. Wire it through the cache + worker. Add a per-entry `birth_embedding_version` increment on refresh (already in the cache schema).
+- **3.6.3 — Drift-correction unit tests.** Verify refresh produces the expected `key_rep` change for synthetic inputs; verify the eviction-to-refresh policy doesn't ping-pong; verify back-compat (drift correction OFF = Phase 1-3 behavior bit-identical).
+
+**Phase 3.6 exit criterion:** drift correction is opt-in via a new config flag (default OFF for back-compat with Phase 3 cells); unit tests green; the Phase 3 falsifier results stay reproducible bit-identically with the flag OFF.
+
+---
+
+## Phase 3.7 — Second 4×H100 falsifier with drift correction active
+
+**Goal:** validate that drift correction is the multiplier we expect on cheap compute before committing 8-GPU cycles.
+
+**Matrix `episodic_dw_curation_v2`:** 6 cells = 2 arms × 3 seeds.
+- **Arm B' — curated DW + drift correction ON:** same config as Phase 3 Arm B, plus the new drift-correction flag enabled.
+- **Arm B (reference) — curated DW + drift correction OFF:** REUSE the Phase 3 Arm B results (don't re-run; same seeds, same config). The ScOpt + episodic_enabled config combo (currently guarded; relies on Task 95) must be functional.
+
+Statistical comparison: B' vs B per-bucket val CE delta. Pre-committed escalation rule from Decision 0.5 (σ > 0.008 bpb on rare bucket → run 3 more seeds).
+
+**Phase 3.7 exit criterion:** decision gate.
+- **Pass:** B' improves rare-bucket val CE over B by ≥ 0.005 bpb. Drift correction works at scale-down. Phase 4 unlocks; the 8-GPU ablation matrix now tests the *full* system.
+- **Mixed/null:** drift correction didn't help on 4×H100. Either (a) drift wasn't the bottleneck (then Phase 4 is meaningful without 3.6's contribution), or (b) the refresh mechanism was wrong and a different option from 3.6.2 should be tried. Decision driven by the diagnostic logs from Phase 3.5.
+- **Regression:** B' worse than B. Disable, root-cause. Don't proceed to 8-GPU.
+
+**Hard prerequisite for proceeding to Phase 4:** either Phase 3.7 PASS, or an explicit decision (with documented reasoning) to scale up without drift correction.
+
+---
+
 ## Phase 4 — Scale to 8×H100 (6+2) + ablation matrix (outline only)
 
 Tasks (not detailed; sequence after Phase 3 pass):
@@ -432,17 +489,11 @@ Tasks (not detailed; sequence after Phase 3 pass):
 
 ---
 
-## Phase 5 — Controller analytics + drift handling + research extensions (outline only)
+## Phase 5 — Research extensions (outline only)
 
-Lumps several Tier-2-but-not-irrelevant features. Sequence after Phase 4.
+**Resequenced 2026-04-25:** former 5.1 (DuckDB analytics), 5.2 (drift model snapshots), and 5.3 (key_rep refresh) are pulled forward. They land as Phase 3 (drift snapshots), Phase 3.5 (DuckDB), and Phase 3.6 (refresh implementation) respectively, validated on a second 4×H100 falsifier (Phase 3.7) before any 8-GPU work. Phase 5 is now strictly post-Phase-4 research extensions.
 
-- **5.1: DuckDB time-series analytics.** Build the controller's query layer on top of the Phase 3 NDJSON logs. Implements cohort analysis (avenue 2), event-driven replay triggers (avenue 3), drift trajectory tracking (avenue 4), cross-entry correlation (avenue 5), surprise frontier (avenue 6), adaptive replay budget (avenue 7).
-- **5.2: Drift model — prerequisite for any refresh.** Define how key_rep is expected to drift under training. Empirical: snapshot key_rep per entry every M steps, compute trajectory norm. Expected vs. actual drift tells us when refresh would help vs. hurt.
-- **5.3: key_rep refresh with proper context capture.** ONLY after 5.2 is in place. Three options to evaluate:
-  - **(a) Full state capture:** store all L SSM recurrent states + residual at write. Replay continues from real state. ~16 MB extra cache memory.
-  - **(b) Prefix-token capture:** store the W input tokens preceding write position. Replay = encode(prefix ++ value), refresh from residual at last prefix position. ~256 KB extra. Replay re-pays prefix cost every time.
-  - **(c) No refresh:** keep Phase 1-3 behavior, accept drift via eviction.
-- **5.4: Predictor-vectors-per-entry research.** Per-entry stored `predictor_w[D]` updated by replay history. Retrieval score becomes `(key_rep · q)(predictor_w · q)·utility_ema`. Atomic at retrieval; learned per-entry. Triggered only if Phase 3 / Phase 4.4 ablation shows utility-weighted cosine retrieval is selecting wrong entries.
+- **5.4: Predictor-vectors-per-entry research.** Per-entry stored `predictor_w[D]` updated by replay history. Retrieval score becomes `(key_rep · q)(predictor_w · q)·utility_ema`. Atomic at retrieval; learned per-entry. Triggered only if Phase 4 ablation shows utility-weighted cosine retrieval is selecting wrong entries even with drift correction active.
 - **5.5: Cross-rank cache coherence (6+2).** Sharded cache across 2 episodic GPUs vs. replicated. Decide based on Phase 4 throughput.
 
 ---
@@ -452,7 +503,17 @@ Lumps several Tier-2-but-not-irrelevant features. Sequence after Phase 4.
 - Plan owner: Ken
 - Date scope: 2026-04-25 → estimated 2 sessions for Phase 1, 1 session for Phase 2, Phase 3 matrix is one ~8h pod run with offline analysis. Per `feedback_estimate_calibration.md` rule of dividing by 10×, real estimates may compress further.
 - Cache + writer modules untracked on `main`; commit as Task 1.0 first.
-- Phase 4-5 are deliberately outline-only. Detail after Phase 3 result lands.
+- Phase 3.5, 3.6, 3.7 detail will firm up after Phase 3's first 4×H100 result lands. Phase 4-5 stay outline-only.
+
+**Phase sequencing (locked 2026-04-25):**
+1. Phase 1 — 3+1 hardware bring-up (in flight)
+2. Phase 2 — controller + queries
+3. Phase 3 — first 4×H100 falsifier (drift snapshots logged inline)
+4. Phase 3.5 — DuckDB analytics layer (queryable diagnostics)
+5. Phase 3.6 — drift correction implementation (informed by 3.5 outputs)
+6. Phase 3.7 — second 4×H100 falsifier with drift correction
+7. Phase 4 — scale to 8×H100 + ablation matrix (only after 3.7 passes)
+8. Phase 5 — research extensions (predictor vectors, cross-rank coherence)
 
 ## Cross-cutting reminders
 
