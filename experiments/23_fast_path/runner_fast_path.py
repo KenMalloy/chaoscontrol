@@ -70,6 +70,7 @@ from chaoscontrol.episodic.payload_dtypes import (  # noqa: E402
     make_query_candidate_dtype,
     make_write_payload_dtype,
 )
+from chaoscontrol.optim.episodic_cache import EpisodicCache  # noqa: E402
 from chaoscontrol.optim.episodic_writer import select_writes  # noqa: E402
 from chaoscontrol.optim.lamb import LAMB  # noqa: E402
 from chaoscontrol.optim.muon import Muon  # noqa: E402
@@ -1540,6 +1541,112 @@ def _push_episodic_writes(
         handle.query_ring.try_write(qslot)
 
 
+class _EpisodicConsumerState:
+    """Episodic-rank consumer state: cache + attached write rings + heartbeat.
+
+    Constructed by ``_attach_episodic_consumer`` once per runner init. The
+    no-op shape (cache=None, write_rings=[], heartbeat=[0]) is what the
+    train ranks and ``episodic_enabled=False`` runs see so the
+    ``_run_train_step`` consumer branch is bit-identical to pre-Task-1.5
+    on those code paths.
+
+    The heartbeat is a single-element list so increments propagate back
+    to the caller (the runner's outer loop reads it for telemetry — Task
+    1.7's job).
+    """
+
+    __slots__ = ("cache", "write_rings", "heartbeat")
+
+    def __init__(
+        self,
+        cache: EpisodicCache | None,
+        write_rings: list[ShmRing],
+        heartbeat: list[int],
+    ) -> None:
+        self.cache = cache
+        self.write_rings = write_rings
+        self.heartbeat = heartbeat
+
+
+def _attach_episodic_consumer(
+    *,
+    episodic_enabled: bool,
+    is_episodic_rank: bool,
+    world_size: int,
+    config: dict[str, Any],
+    model_dim: int,
+    all_group: "dist.ProcessGroup | None",
+) -> _EpisodicConsumerState:
+    """Build the episodic-rank consumer (cache + ring attaches).
+
+    On non-episodic-rank or ``episodic_enabled=False`` this returns the
+    no-op state (``cache=None``, ``write_rings=[]``); the runner's outer
+    loop and ``_run_train_step``'s consumer branch both treat that as a
+    skip.
+
+    On the episodic rank, this:
+      1. Constructs an ``EpisodicCache`` from config-derived defaults
+         (Decision 0.4 of the design doc): capacity=4096, span_length=4,
+         key_rep_dim=model_dim, grace_steps=1000, utility_ema_decay=0.99.
+      2. ``ShmRing.attach``-es to ``episodic_write_ring_rank{R}`` for
+         R in 0..world_size-2 — the producer rings Task 1.4 creates on
+         every train rank at runner init.
+      3. Issues ``dist.barrier(group=all_group)`` AFTER the attaches.
+         The producer side (Task 1.4) issues the same barrier after its
+         create()s; this barrier is the rendezvous point that prevents
+         the consumer's attach from racing the producer's create.
+
+    Owns ``close()`` (NOT unlink) on each attached ring at runner
+    shutdown — the producer side owns the unlink of its own rings.
+    """
+    no_op = _EpisodicConsumerState(
+        cache=None, write_rings=[], heartbeat=[0],
+    )
+    if not episodic_enabled or not is_episodic_rank:
+        return no_op
+    if int(world_size) < 2:
+        # The runner's pre-collective guards reject this combination
+        # before we get here, but the helper stays defensive — building
+        # an empty consumer is the closest thing to a no-op for a misuse.
+        return no_op
+
+    span_length = int(config.get("episodic_span_length", 4))
+    key_rep_dim = int(config.get("episodic_key_rep_dim", model_dim))
+    cache = EpisodicCache(
+        capacity=int(config.get("episodic_capacity", 4096)),
+        span_length=span_length,
+        key_rep_dim=key_rep_dim,
+        grace_steps=int(config.get("episodic_grace_steps", 1000)),
+        utility_ema_decay=float(
+            config.get("episodic_utility_ema_decay", 0.99)
+        ),
+    )
+
+    write_payload_dtype = make_write_payload_dtype(
+        span_length=span_length, key_rep_dim=key_rep_dim,
+    )
+    capacity = int(config.get("episodic_write_ring_capacity", 256))
+    write_rings: list[ShmRing] = []
+    for r in range(int(world_size) - 1):
+        ring = ShmRing.attach(
+            name=f"episodic_write_ring_rank{r}",
+            slot_shape=(),
+            dtype=write_payload_dtype,
+            capacity=capacity,
+        )
+        write_rings.append(ring)
+
+    # Post-attach rendezvous with Task 1.4's producer-side barrier. Both
+    # sides converge on this single barrier; it's the contract's only
+    # init-time synchronization point.
+    if all_group is not None:
+        dist.barrier(group=all_group)
+
+    return _EpisodicConsumerState(
+        cache=cache, write_rings=write_rings, heartbeat=[0],
+    )
+
+
 def _run_train_step(
     *,
     model: torch.nn.Module,
@@ -1568,6 +1675,11 @@ def _run_train_step(
     is_episodic_rank: bool = False,
     all_group: "dist.ProcessGroup | None" = None,
     episodic_rings: EpisodicRingsHandle | None = None,
+    episodic_cache: EpisodicCache | None = None,
+    episodic_write_rings: list[ShmRing] | None = None,
+    episodic_heartbeat: list[int] | None = None,
+    current_step: int = 0,
+    embedding_version: int = 0,
 ) -> torch.Tensor:
     _reject_unsupported(model)
     # Episodic rank skip-main: this rank does not run the main forward
@@ -1581,6 +1693,42 @@ def _run_train_step(
     # it is NOT a stand-in for the train ranks' loss and event_sleep is
     # explicitly forbidden in this configuration (caller-side guard).
     if is_episodic_rank:
+        # Phase 1 Task 1.5 — episodic-rank drain. Pull every payload Task
+        # 1.4's producer pushed since the last drain into the cache. The
+        # drain runs BEFORE the SUM all-reduce so the cache state is up
+        # to date before the optimizer step; the all-reduce itself is a
+        # no-op for cache state and the order doesn't change behavior.
+        # ``episodic_cache`` and ``episodic_write_rings`` are None on
+        # the back-compat (non-episodic) path the train ranks take —
+        # nothing to do.
+        if (
+            episodic_cache is not None
+            and episodic_write_rings is not None
+        ):
+            for ring in episodic_write_rings:
+                while True:
+                    slot = ring.try_read()
+                    if slot is None:
+                        break
+                    # ``slot`` is a copy returned by try_read; the
+                    # ``.copy()`` on the per-field views below guards
+                    # against any future try_read implementation that
+                    # returns a view into shared memory (defensive: the
+                    # current implementation already returns a copy).
+                    episodic_cache.append(
+                        key_fp=int(slot["key_fp"]),
+                        key_rep=torch.from_numpy(
+                            np.asarray(slot["key_rep"]).copy(),
+                        ),
+                        value_tok_ids=torch.from_numpy(
+                            np.asarray(slot["value_tok_ids"]).copy(),
+                        ),
+                        value_anchor_id=int(slot["value_anchor_id"]),
+                        current_step=int(current_step),
+                        embedding_version=int(embedding_version),
+                    )
+        if episodic_heartbeat is not None:
+            episodic_heartbeat[0] += 1
         # Train ranks reach the all-reduce after backward; the episodic
         # rank skips backward, so we must enter the same collective with
         # all-None grads → ``materialize_zeros=True`` fills them.
@@ -2258,6 +2406,9 @@ def train_fast_for_budget(
     episodic_write_ring_capacity: int = 256,
     episodic_query_ring_capacity: int = 256,
     episodic_ring_name_suffix: str | None = None,
+    episodic_capacity: int = 4096,
+    episodic_grace_steps: int = 1000,
+    episodic_utility_ema_decay: float = 0.99,
 ) -> dict[str, Any]:
     rank_ = int(rank)
     world_size_ = int(world_size)
@@ -2386,6 +2537,38 @@ def train_fast_for_budget(
             "Phase-3 replay path will replace the placeholder; gate "
             "this combination on that work landing."
         )
+    # Phase 1 Task 1.5 — episodic-rank consumer init. Builds the cache
+    # and ``ShmRing.attach``-es to every train rank's write ring on the
+    # episodic rank only; on train ranks and ``episodic_enabled=False``
+    # the helper returns the no-op state and the runner's outer loop
+    # treats it as a skip. The post-attach barrier inside the helper
+    # rendezvouses with Task 1.4's producer-side barrier — both sides
+    # converge on the same call so the episodic rank's attach() doesn't
+    # race the train ranks' create().
+    _model_dim_for_episodic = (
+        int(getattr(model, "dim", 0))
+        or int(getattr(model.lm_head, "in_features", 0))
+    )
+    _episodic_consumer_config = {
+        "episodic_capacity": int(episodic_capacity),
+        "episodic_span_length": int(episodic_span_length),
+        "episodic_key_rep_dim": (
+            int(episodic_key_rep_dim)
+            if episodic_key_rep_dim is not None
+            else _model_dim_for_episodic
+        ),
+        "episodic_grace_steps": int(episodic_grace_steps),
+        "episodic_utility_ema_decay": float(episodic_utility_ema_decay),
+        "episodic_write_ring_capacity": int(episodic_write_ring_capacity),
+    }
+    episodic_consumer = _attach_episodic_consumer(
+        episodic_enabled=bool(episodic_enabled),
+        is_episodic_rank=bool(is_episodic_rank),
+        world_size=int(world_size_),
+        config=_episodic_consumer_config,
+        model_dim=_model_dim_for_episodic or 1,
+        all_group=all_group,
+    )
     if (
         scopt_active
         and int(scopt_baseline_buckets) > 0
@@ -2941,6 +3124,11 @@ def train_fast_for_budget(
                     is_episodic_rank=is_episodic_rank,
                     all_group=all_group,
                     episodic_rings=episodic_rings_handle,
+                    episodic_cache=episodic_consumer.cache,
+                    episodic_write_rings=episodic_consumer.write_rings,
+                    episodic_heartbeat=episodic_consumer.heartbeat,
+                    current_step=steps,
+                    embedding_version=0,
                     dreamworld_entry=dream_entry,
                     dreamworld_weight=(
                         float(event_sleep_weight)
@@ -3178,6 +3366,16 @@ def train_fast_for_budget(
         # so safe to call even if creation partially failed.
         if episodic_rings_handle is not None:
             _close_episodic_rings(episodic_rings_handle)
+        # Phase 1 Task 1.5 — consumer-side ring teardown. ``close()``
+        # only (NO unlink); the producer side (Task 1.4) owns the unlink
+        # of every ring it created. Idempotent on already-closed rings.
+        for _ring in episodic_consumer.write_rings:
+            try:
+                _ring.close()
+            except Exception:
+                # Defensive: a close() failure on shutdown should not
+                # mask the real exception that triggered the finally.
+                pass
 
     if ddp_active:
         dist.barrier()
@@ -3732,6 +3930,11 @@ def run_condition(
         # production YAML would silently desync producer + consumer.
         # Tests reach the kwarg via direct ``train_fast_for_budget``
         # invocation; production YAML cannot reach it.
+        episodic_capacity=int(config.get("episodic_capacity", 4096)),
+        episodic_grace_steps=int(config.get("episodic_grace_steps", 1000)),
+        episodic_utility_ema_decay=float(
+            config.get("episodic_utility_ema_decay", 0.99)
+        ),
     )
 
     if ddp_active:
