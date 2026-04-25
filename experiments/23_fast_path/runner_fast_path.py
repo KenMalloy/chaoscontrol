@@ -1252,8 +1252,40 @@ def _run_train_step(
     dreamworld_weight: float = 0.0,
     dreamworld_replay_batch_size: int = 0,
     dreamworld_generator: torch.Generator | None = None,
+    is_episodic_rank: bool = False,
+    all_group: "dist.ProcessGroup | None" = None,
 ) -> torch.Tensor:
     _reject_unsupported(model)
+    # Episodic rank skip-main: this rank does not run the main forward
+    # or backward. All its parameter grads stay None up to the all-reduce
+    # phase below, where ``materialize_zeros=True`` zero-fills them so
+    # the SUM collective produces ``(main_avg + 0) = main_avg`` on every
+    # rank for Phase 1. Phase 3 will land replay grads here instead of
+    # the no-op skip. The placeholder loss tensor below exists only so
+    # the caller's ``losses.append(loss.detach())`` and downstream
+    # bookkeeping see a real (zero-valued) tensor on the right device;
+    # it is NOT a stand-in for the train ranks' loss and event_sleep is
+    # explicitly forbidden in this configuration (caller-side guard).
+    if is_episodic_rank:
+        # Train ranks reach the all-reduce after backward; the episodic
+        # rank skips backward, so we must enter the same collective with
+        # all-None grads → ``materialize_zeros=True`` fills them.
+        if ddp_active and world_size > 1 and all_group is not None:
+            n_train = world_size - 1
+            if n_train < 1:
+                raise ValueError(
+                    "episodic rank topology requires world_size >= 2 "
+                    f"(1 train + 1 episodic), got world_size={world_size}"
+                )
+            allreduce_grads(
+                model,
+                world_size,
+                group=all_group,
+                op=dist.ReduceOp.SUM,
+                materialize_zeros=True,
+            )
+        device = inputs.device
+        return torch.zeros((), device=device, dtype=torch.float32)
     with autocast_context(precision, device_type=inputs.device.type):
         if compile_full_path:
             hidden = _compiled_step_fn()(model, inputs)
@@ -1334,7 +1366,37 @@ def _run_train_step(
     if ddp_active and world_size > 1:
         mode = str(grad_allreduce_mode).strip().lower()
         if mode == "bulk":
-            allreduce_grads(model, world_size)
+            if all_group is not None:
+                # 3+1 episodic topology — train ranks pre-scale their
+                # grads by 1/N_train so the SUM collective with the
+                # zero-materialized episodic rank reconstructs the
+                # train-rank average. The ``allreduce_grads`` interface
+                # owns the materialize_zeros zero-fill on the episodic
+                # rank above; this branch handles the train-rank pre-
+                # scale that pairs with it. Pre-scaling happens BEFORE
+                # the all-reduce, so post-collective grad clipping
+                # operates on the same train-rank-average value as the
+                # legacy AVG path produced — clipping decisions are
+                # unchanged in expectation.
+                n_train = world_size - 1
+                if n_train < 1:
+                    raise ValueError(
+                        "episodic rank topology requires world_size >= 2 "
+                        f"(1 train + 1 episodic), got world_size={world_size}"
+                    )
+                inv_n_train = 1.0 / float(n_train)
+                for p in model.parameters():
+                    if p.grad is not None:
+                        p.grad.mul_(inv_n_train)
+                allreduce_grads(
+                    model,
+                    world_size,
+                    group=all_group,
+                    op=dist.ReduceOp.SUM,
+                    materialize_zeros=True,
+                )
+            else:
+                allreduce_grads(model, world_size)
         elif mode == "async_param":
             if async_grad_reducer is None:
                 raise ValueError(
@@ -1812,6 +1874,7 @@ def train_fast_for_budget(
     rare_bucket_ce_eval_tokens: torch.Tensor | None = None,
     rare_bucket_ce_eval_num_tokens: int | None = None,
     emit_topology_snapshot: bool = False,
+    episodic_enabled: bool = False,
 ) -> dict[str, Any]:
     rank_ = int(rank)
     world_size_ = int(world_size)
@@ -1827,6 +1890,37 @@ def train_fast_for_budget(
         )
     if ddp_active:
         broadcast_params(model)
+    # 3+1 (train ranks + episodic) topology setup. ``episodic_enabled``
+    # selects the asymmetric replay topology where rank world_size-1
+    # skips the main forward+backward and (in Phase 3+) runs replay
+    # backward instead. Phase 1 introduces the structural plumbing —
+    # the episodic rank's grads are zero-filled in the SUM collective
+    # so ``(main_avg + 0) = main_avg``; Phase 3 replaces the zero-fill
+    # with a real replay grad so ``(main_avg + replay_full)`` flows in
+    # the same single collective with no API change at the call sites.
+    is_episodic_rank = False
+    all_group = None
+    if episodic_enabled:
+        if not ddp_active:
+            raise ValueError(
+                "episodic_enabled=True requires world_size > 1 (need at "
+                "least 1 train rank + 1 episodic rank); got "
+                f"world_size={world_size_}"
+            )
+        if world_size_ < 2:
+            raise ValueError(
+                "episodic_enabled=True requires world_size >= 2 "
+                f"(1 train + 1 episodic), got world_size={world_size_}"
+            )
+        is_episodic_rank = (rank_ == world_size_ - 1)
+        # ``all_group`` is the all-rank process group as an explicit
+        # handle. Phase 5 will introduce ``main_group`` (just train
+        # ranks) without changing any all_group call sites. Note:
+        # ``dist.new_group`` is itself a WORLD-collective on gloo/nccl
+        # — every rank in WORLD must call it, even ranks not in the
+        # subgroup. Here all_group is the world group, so all ranks
+        # participate.
+        all_group = dist.new_group(list(range(world_size_)))
     grad_allreduce_mode_ = str(grad_allreduce_mode).strip().lower()
     if grad_allreduce_mode_ not in {"bulk", "async_param"}:
         raise ValueError(
@@ -1836,6 +1930,40 @@ def train_fast_for_budget(
     scopt_active = isinstance(optimizer, ScarcityAwareOptimizer)
     if scopt_active and grad_allreduce_mode_ != "bulk":
         raise ValueError("ScOpt currently requires grad_allreduce_mode='bulk'")
+    if episodic_enabled and grad_allreduce_mode_ != "bulk":
+        raise ValueError(
+            "episodic_enabled=True requires grad_allreduce_mode='bulk'; "
+            "the 3+1 SUM all-reduce path is the only collective wired "
+            "for the asymmetric topology in Phase 1."
+        )
+    if episodic_enabled and scopt_active:
+        raise ValueError(
+            "episodic_enabled=True is incompatible with the ScOpt "
+            "optimizer in Phase 1: the ScOpt train step still uses the "
+            "AVG-over-WORLD collective at lines 826/1134, which the "
+            "episodic rank's None grads would deadlock or silently "
+            "average wrong. Migrate ScOpt to the SUM/all_group path "
+            "before combining the two."
+        )
+    if episodic_enabled and predictive_aux_weight > 0.0:
+        raise ValueError(
+            "episodic_enabled=True is incompatible with "
+            "predictive_aux_weight > 0.0 in Phase 1: the predictive "
+            "aux projection's grad all-reduce at the runner's outer "
+            "loop still uses AVG-over-WORLD, which would over-divide "
+            "by N when the episodic rank contributes None. Migrate "
+            "the predictive aux all-reduce to the SUM/all_group path "
+            "before combining the two."
+        )
+    if episodic_enabled and event_sleep_enabled:
+        raise ValueError(
+            "episodic_enabled=True is incompatible with "
+            "event_sleep_enabled=True in Phase 1: the EMA loss-pressure "
+            "gate would feed the episodic rank's zero placeholder loss "
+            "into its update, corrupting the cross-rank decision. The "
+            "Phase-3 replay path will replace the placeholder; gate "
+            "this combination on that work landing."
+        )
     if (
         scopt_active
         and int(scopt_baseline_buckets) > 0
@@ -2342,6 +2470,8 @@ def train_fast_for_budget(
                     predictive_aux_weight=predictive_aux_weight,
                     predictive_aux_horizon=predictive_aux_horizon,
                     predictive_aux_projection=predictive_aux_projection,
+                    is_episodic_rank=is_episodic_rank,
+                    all_group=all_group,
                     dreamworld_entry=dream_entry,
                     dreamworld_weight=(
                         float(event_sleep_weight)
@@ -3098,6 +3228,7 @@ def run_condition(
         emit_topology_snapshot=bool(
             config.get("emit_topology_snapshot", False)
         ),
+        episodic_enabled=bool(config.get("episodic_enabled", False)),
     )
 
     if ddp_active:
