@@ -1,5 +1,13 @@
 """SPSC ring buffer over POSIX shared memory (memory-aware optimizer, Task 1.1).
 
+DEPRECATED for the episodic IPC path as of Perf Pass C
+(``docs/plans/2026-04-25-perf-pass-c-gpu-resident-ipc.md``). The episodic
+write/query path now goes GPU-to-GPU via a single ``dist.gather``
+collective per training step (see ``chaoscontrol.episodic.gpu_slot``).
+This module is kept because the SPSC ring is general-purpose IPC and may
+serve a non-episodic use case; it has 11 tests pinning behavior. Slated
+for delete review after Phase 5.
+
 A bounded, single-producer-single-consumer ring with fixed-shape slots over
 POSIX shared memory. Producer writes are non-blocking — on full, drops the
 OLDEST slot (overwrites head) and bumps a `dropped_count` counter. Consumer

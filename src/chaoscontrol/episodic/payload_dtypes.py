@@ -1,5 +1,13 @@
 """Shared slot dtypes for the episodic-cache IPC rings.
 
+DEPRECATED for the episodic IPC path as of Perf Pass C
+(``docs/plans/2026-04-25-perf-pass-c-gpu-resident-ipc.md``). The episodic
+write/query payload now travels as a single contiguous fp32 tensor via
+``dist.gather`` (see ``chaoscontrol.episodic.gpu_slot``); these numpy
+struct dtypes are no longer in the production runner path. Kept because
+they're imported by the deprecated SPSC ring tests pinning the original
+contract; will be removed alongside the SPSC ring after Phase 5 review.
+
 Both Phase 1 Tasks 1.4 (producer, train-rank side) and 1.5 (consumer,
 episodic-rank side) target these dtypes. Defined here as a single source
 of truth so the parallel worktrees don't race on the file.
