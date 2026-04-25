@@ -1727,12 +1727,19 @@ def _train_fast_for_budget_cuda_graph(
     elapsed_s = time.perf_counter() - start_time
     loss_cpu = torch.stack(losses).cpu() if losses else torch.empty(0)
     peak_vram_mb = torch.cuda.max_memory_allocated(device) / (1024 * 1024)
+    # CUDA graph path is unreachable under ``episodic_enabled=True``
+    # because the asymmetric topology requires DDP (world_size >= 2)
+    # and ``_cuda_graph_rejection_reasons`` rejects ddp_active. Pass
+    # ``episodic_enabled=False`` explicitly so the kwarg is wired even
+    # though the value is constant here — keeps the call sites uniform
+    # if a future task lifts the DDP-CUDA-graph constraint.
     timing = summarize_train_timing(
         steps=steps,
         elapsed_s=elapsed_s,
         batch_size=batch_size,
         seq_len=seq_len,
         world_size=world_size_,
+        episodic_enabled=False,
     )
     graph_step_seconds = replay_seconds / max(steps, 1)
     # Steady-state eager baseline: median of warmup step times with the
@@ -1887,6 +1894,45 @@ def train_fast_for_budget(
             f"world_size={world_size_} would produce divergent log_a updates "
             "and non-comparable ranks. Add collectives for CD aggregates + "
             "seat masks + criticality_loss before enabling on multi-rank."
+        )
+    # Pre-collective episodic guards. These fire BEFORE
+    # ``broadcast_params`` so a misconfigured combination raises the real
+    # config error rather than a downstream "default process group has
+    # not been initialized" — and so they're directly testable via the
+    # same ``pytest.raises`` pattern as the CD guard above. The four
+    # episodic guards landed in Task 1.3 (lines ~1903-1973) intentionally
+    # stay where they are; they fire after ``broadcast_params`` and gate
+    # on optimizer / aux-objective state that's only known by then.
+    if episodic_enabled and str(train_sampling_mode).strip().lower() in {
+        "sequential_epoch",
+        "shuffled_epoch",
+    }:
+        raise ValueError(
+            "episodic_enabled=True is incompatible with "
+            f"train_sampling_mode={train_sampling_mode!r} in Phase 1: the "
+            "episodic rank receives a 1/N start-shard from "
+            "count_sharded_lm_starts but the skip-main flow makes it "
+            "silently drop that shard, so 1/N of the dataset goes unseen "
+            "each epoch and breaks the Phase 1.6 zero-behavior-change "
+            "comparison. Workaround: set train_sampling_mode='random' for "
+            "Phase 1 episodic runs; the proper fix (re-shard over N-1) is "
+            "tracked as a Phase 3 prerequisite."
+        )
+    if episodic_enabled and (
+        float(dreamworld_weight) > 0.0 or int(dreamworld_cache_interval) > 0
+    ):
+        raise ValueError(
+            "episodic_enabled=True is incompatible with "
+            f"dreamworld_weight={dreamworld_weight} / "
+            f"dreamworld_cache_interval={dreamworld_cache_interval} in "
+            "Phase 1. Defaults (both 0) are explicitly safe. Setting "
+            "either knob fires capture_dream_entry on every rank "
+            "including the episodic rank (wasteful) and would run "
+            "dreamworld_replay_backward on train ranks but not the "
+            "episodic rank (skip-main early-return), violating the "
+            "Phase 1 invariant that 'episodic submits zeros, train ranks "
+            "submit only main grads'. Proper Dreamworld integration with "
+            "the curated-replay cache is Phase 3 work (Task 3.1)."
         )
     if ddp_active:
         broadcast_params(model)
@@ -2721,6 +2767,7 @@ def train_fast_for_budget(
         batch_size=batch_size,
         seq_len=seq_len,
         world_size=world_size_,
+        episodic_enabled=episodic_enabled,
     )
     result = {
         "steps": steps,

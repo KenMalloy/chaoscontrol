@@ -1254,6 +1254,55 @@ def test_token_accounting_summary_uses_global_tokens():
     assert summary["per_gpu_tokens_per_sec"] == 160.0
 
 
+def test_token_accounting_summary_subtracts_episodic_rank_when_enabled():
+    """Under ``episodic_enabled=True`` the throughput math must divide by
+    ``world_size - 1`` (the train-rank count), not ``world_size``. Rank
+    ``world_size - 1`` skips the main forward+backward (Task 1.3 skip-main
+    flow); only the train ranks consume tokens.
+
+    With world_size=4, batch=4, seq=8: legacy math reports
+    ``4 * 8 * 4 = 128`` tokens/step (33% inflation). Episodic-aware math
+    reports ``4 * 8 * 3 = 96``. ``per_gpu_tokens_per_sec`` must use the
+    same train-rank denominator so per-rank throughput stays internally
+    consistent with aggregate.
+    """
+    mod = _load_module()
+    summary = mod.summarize_train_timing(
+        steps=10,
+        elapsed_s=2.0,
+        batch_size=4,
+        seq_len=8,
+        world_size=4,
+        episodic_enabled=True,
+    )
+
+    # 3 train ranks consume tokens: 4 * 8 * 3 = 96 per step.
+    assert summary["tokens_per_step"] == 96
+    # 96 tokens/step * 10 steps / 2.0 s = 480.0 tok/s aggregate.
+    assert summary["aggregate_tokens_per_sec"] == 480.0
+    # 480 / 3 train ranks = 160 tok/s per train rank.
+    assert summary["per_gpu_tokens_per_sec"] == 160.0
+
+
+def test_token_accounting_default_matches_pre_episodic_behavior():
+    """Back-compat invariant: omitting ``episodic_enabled`` (or passing
+    ``False``) must produce identical numbers to the pre-Task-1.3 math.
+    Every existing exp23/exp24 cell relies on this — they default to
+    ``episodic_enabled=False`` and would silently shift if the
+    keyword's default behavior changed.
+    """
+    mod = _load_module()
+    legacy = mod.summarize_train_timing(
+        steps=10, elapsed_s=2.0, batch_size=4, seq_len=8, world_size=3,
+    )
+    explicit_off = mod.summarize_train_timing(
+        steps=10, elapsed_s=2.0, batch_size=4, seq_len=8, world_size=3,
+        episodic_enabled=False,
+    )
+
+    assert legacy == explicit_off
+
+
 def test_cuda_graph_gate_counts_capture_against_budget():
     mod = _load_module()
 
@@ -2847,6 +2896,118 @@ def test_train_fast_for_budget_wires_criticality_distillation_4_steps():
         if buffers is not None:
             any_tensor = buffers["A"]["aggregated_excess_per_layer"]
             assert any_tensor.is_pinned()
+
+
+def test_train_fast_for_budget_rejects_episodic_with_epoch_sampling_sequential():
+    """``episodic_enabled=True`` is incompatible with epoch-mode sharded
+    sampling in Phase 1: the episodic rank receives a 1/N start-shard
+    from ``count_sharded_lm_starts`` but the skip-main flow makes it
+    silently drop that shard, so 25% (at N=4) of the dataset goes
+    unseen each epoch. Phase 1.6's "zero-behavior-change" comparison
+    against the legacy 4-rank cell would diverge for reasons unrelated
+    to the asymmetric topology. The proper fix — re-shard over N-1 —
+    is a Phase 3 prerequisite. For now, refuse the combo.
+
+    Tests both epoch modes (``sequential_epoch`` and ``shuffled_epoch``)
+    because they share the same shard-and-drop pathology; the random
+    sampler is fine in expectation and stays allowed.
+    """
+    mod = _load_runner_module()
+    model = _TinyTokenTrainModel()
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+    with pytest.raises(ValueError, match=r"sequential_epoch|shuffled_epoch|epoch sampling"):
+        mod.train_fast_for_budget(
+            model,
+            train_tokens=torch.arange(32, dtype=torch.int16) % 6,
+            train_num_tokens=32, stride=4, seq_len=3, batch_size=2,
+            device=torch.device("cpu"), optimizer=optimizer,
+            budget_seconds=1.0, chunk_size=2, grad_clip_norm=0.0,
+            fused_grad_clip=False,
+            rank=0, world_size=2, seed=123, precision="fp32",
+            stop_check_interval=1, stop_margin_seconds=0.0,
+            vocab_size=6, max_steps=1, prefetch_batches=False,
+            episodic_enabled=True,
+            train_sampling_mode="sequential_epoch",
+        )
+
+
+def test_train_fast_for_budget_rejects_episodic_with_epoch_sampling_shuffled():
+    """Mirror of the sequential_epoch test — the shuffled_epoch sampler
+    has the same shard-and-drop pathology under episodic skip-main.
+    """
+    mod = _load_runner_module()
+    model = _TinyTokenTrainModel()
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+    with pytest.raises(ValueError, match=r"sequential_epoch|shuffled_epoch|epoch sampling"):
+        mod.train_fast_for_budget(
+            model,
+            train_tokens=torch.arange(32, dtype=torch.int16) % 6,
+            train_num_tokens=32, stride=4, seq_len=3, batch_size=2,
+            device=torch.device("cpu"), optimizer=optimizer,
+            budget_seconds=1.0, chunk_size=2, grad_clip_norm=0.0,
+            fused_grad_clip=False,
+            rank=0, world_size=2, seed=123, precision="fp32",
+            stop_check_interval=1, stop_margin_seconds=0.0,
+            vocab_size=6, max_steps=1, prefetch_batches=False,
+            episodic_enabled=True,
+            train_sampling_mode="shuffled_epoch",
+        )
+
+
+def test_train_fast_for_budget_rejects_episodic_with_dreamworld_weight():
+    """``episodic_enabled=True`` with ``dreamworld_weight > 0`` would fire
+    ``dreamworld_replay_backward`` on train ranks but skip it on the
+    episodic rank (because of skip-main early-return), violating the
+    Phase 1 invariant that "episodic submits zeros, train ranks submit
+    only main grads". The proper fix is curated-replay integration in
+    Task 3.1; until then, refuse the combo.
+
+    Defaults (``dreamworld_weight=0.0``, ``dreamworld_cache_interval=0``)
+    are explicitly safe — runs with ``dreamworld_enabled=True`` but no
+    knobs wired must not regress.
+    """
+    mod = _load_runner_module()
+    model = _TinyTokenTrainModel()
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+    with pytest.raises(ValueError, match=r"dreamworld|Dreamworld|Task 3\.1"):
+        mod.train_fast_for_budget(
+            model,
+            train_tokens=torch.arange(32, dtype=torch.int16) % 6,
+            train_num_tokens=32, stride=4, seq_len=3, batch_size=2,
+            device=torch.device("cpu"), optimizer=optimizer,
+            budget_seconds=1.0, chunk_size=2, grad_clip_norm=0.0,
+            fused_grad_clip=False,
+            rank=0, world_size=2, seed=123, precision="fp32",
+            stop_check_interval=1, stop_margin_seconds=0.0,
+            vocab_size=6, max_steps=1, prefetch_batches=False,
+            episodic_enabled=True,
+            dreamworld_weight=0.5,
+        )
+
+
+def test_train_fast_for_budget_rejects_episodic_with_dreamworld_cache_interval():
+    """``dreamworld_cache_interval > 0`` triggers
+    ``capture_dream_entry`` on every rank including the episodic rank,
+    which is wasteful even before the replay backward asymmetry. Same
+    Task 3.1 fix path as the weight knob.
+    """
+    mod = _load_runner_module()
+    model = _TinyTokenTrainModel()
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+    with pytest.raises(ValueError, match=r"dreamworld|Dreamworld|Task 3\.1"):
+        mod.train_fast_for_budget(
+            model,
+            train_tokens=torch.arange(32, dtype=torch.int16) % 6,
+            train_num_tokens=32, stride=4, seq_len=3, batch_size=2,
+            device=torch.device("cpu"), optimizer=optimizer,
+            budget_seconds=1.0, chunk_size=2, grad_clip_norm=0.0,
+            fused_grad_clip=False,
+            rank=0, world_size=2, seed=123, precision="fp32",
+            stop_check_interval=1, stop_margin_seconds=0.0,
+            vocab_size=6, max_steps=1, prefetch_batches=False,
+            episodic_enabled=True,
+            dreamworld_cache_interval=4,
+        )
 
 
 def test_train_fast_for_budget_rejects_cd_on_multi_rank():

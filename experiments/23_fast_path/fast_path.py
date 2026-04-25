@@ -709,13 +709,29 @@ def summarize_train_timing(
     batch_size: int,
     seq_len: int,
     world_size: int,
+    episodic_enabled: bool = False,
 ) -> dict[str, float | int]:
-    tokens_per_step = int(batch_size) * int(seq_len) * int(world_size)
+    """Throughput summary for the train budget loop.
+
+    When ``episodic_enabled=True`` the asymmetric 3+1 topology dedicates
+    rank ``world_size - 1`` to (Phase 1: skip-main / Phase 3+: replay
+    backward), so it consumes no main-stream tokens. The token-throughput
+    math must therefore divide by ``world_size - 1``, not ``world_size``,
+    or every plot, scopt overhead matrix, and tok/s log silently inflates
+    aggregate by ``N / (N - 1)`` (33% at N=4). The same denominator drives
+    ``per_gpu_tokens_per_sec`` so per-train-rank throughput is internally
+    consistent — a stale ``world_size`` denominator there would
+    *under*-report per-rank speed by the inverse factor and disagree with
+    aggregate. Default is ``False`` so existing ``episodic_enabled=False``
+    cells (the default in every exp23/exp24 cell) are bit-identical.
+    """
+    n_consuming = max(int(world_size) - 1, 1) if episodic_enabled else int(world_size)
+    tokens_per_step = int(batch_size) * int(seq_len) * int(n_consuming)
     aggregate = (int(steps) * tokens_per_step) / max(float(elapsed_s), 1e-9)
     return {
         "tokens_per_step": tokens_per_step,
         "aggregate_tokens_per_sec": float(aggregate),
-        "per_gpu_tokens_per_sec": float(aggregate / max(int(world_size), 1)),
+        "per_gpu_tokens_per_sec": float(aggregate / max(int(n_consuming), 1)),
     }
 
 
