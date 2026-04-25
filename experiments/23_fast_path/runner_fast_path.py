@@ -65,6 +65,12 @@ from chaoscontrol.distributed import (  # noqa: E402
     clip_grad_norm_fused,
     should_stop_now,
 )
+from chaoscontrol.episodic.ipc import ShmRing  # noqa: E402
+from chaoscontrol.episodic.payload_dtypes import (  # noqa: E402
+    make_query_candidate_dtype,
+    make_write_payload_dtype,
+)
+from chaoscontrol.optim.episodic_writer import select_writes  # noqa: E402
 from chaoscontrol.optim.lamb import LAMB  # noqa: E402
 from chaoscontrol.optim.muon import Muon  # noqa: E402
 from chaoscontrol.optim.param_groups import build_optimizer_params  # noqa: E402
@@ -1227,6 +1233,313 @@ def _run_scopt_train_step(
     return total_loss.detach(), pending
 
 
+# ---------------------------------------------------------------------------
+# Episodic-cache producer side (Phase 1 Task 1.4)
+# ---------------------------------------------------------------------------
+#
+# A train rank with ``episodic_enabled=True`` creates two SPSC rings at
+# init, then on every training step pushes write payloads + query
+# candidates derived from the current batch's per-token signals. The
+# episodic rank (Task 1.5) attaches as a reader to these same rings.
+# The ring contract document
+# ``docs/plans/2026-04-25-ring-contract-tasks-1-4-and-1-5.md`` is the
+# canonical spec; the code here MUST not deviate from it without a
+# matching contract update on Task 1.5's side.
+
+
+class EpisodicRingsHandle:
+    """Producer-side handle the runner threads through to ``_run_train_step``.
+
+    Holds the two created rings plus their dtype + capacity metadata so
+    the in-step path doesn't re-derive them. The episodic rank does NOT
+    receive this handle (it ``attach``-es independently in Task 1.5);
+    only the train ranks own one.
+
+    Plain ``__slots__`` class (not a ``@dataclass``) because Python
+    3.14's ``dataclasses`` module looks up ``cls.__module__`` in
+    ``sys.modules`` while resolving string annotations, and the runner
+    is loaded via ``importlib.util.spec_from_file_location`` in tests
+    (see ``test_cd_config_threading._load_runner_module``) which doesn't
+    register the module in ``sys.modules`` — that combination raises
+    ``AttributeError: 'NoneType' object has no attribute '__dict__'``.
+    The mirrored ``_ScOptPending`` class above uses the same pattern for
+    the same reason.
+    """
+
+    __slots__ = (
+        "write_ring",
+        "query_ring",
+        "write_ring_name",
+        "query_ring_name",
+        "write_ring_capacity",
+        "query_ring_capacity",
+        "write_payload_dtype",
+        "query_candidate_dtype",
+        "span_length",
+        "key_rep_dim",
+        "fingerprint_window",
+        "top_p",
+    )
+
+    def __init__(
+        self,
+        *,
+        write_ring: ShmRing,
+        query_ring: ShmRing,
+        write_ring_name: str,
+        query_ring_name: str,
+        write_ring_capacity: int,
+        query_ring_capacity: int,
+        write_payload_dtype: np.dtype,
+        query_candidate_dtype: np.dtype,
+        span_length: int,
+        key_rep_dim: int,
+        fingerprint_window: int,
+        top_p: float,
+    ) -> None:
+        self.write_ring = write_ring
+        self.query_ring = query_ring
+        self.write_ring_name = write_ring_name
+        self.query_ring_name = query_ring_name
+        self.write_ring_capacity = write_ring_capacity
+        self.query_ring_capacity = query_ring_capacity
+        self.write_payload_dtype = write_payload_dtype
+        self.query_candidate_dtype = query_candidate_dtype
+        self.span_length = span_length
+        self.key_rep_dim = key_rep_dim
+        self.fingerprint_window = fingerprint_window
+        self.top_p = top_p
+
+
+def _episodic_ring_names(
+    *,
+    rank: int,
+    suffix: str | None,
+) -> tuple[str, str]:
+    """Build the two ring names for a train rank.
+
+    The contract pins the prefixes ``episodic_write_ring_rank{R}`` and
+    ``episodic_query_ring_rank{R}`` (Task 1.5 attaches by these exact
+    names). darwin's POSIX shm name cap is 31 chars including the
+    implicit leading ``/``, so the contract-pinned forms fit:
+
+      ``/episodic_write_ring_rank0``  → 26 chars
+      ``/episodic_write_ring_rank0_c`` → 28 chars (counter-shm sibling)
+
+    Leaving 3 chars of headroom for a test-only ``_{suffix}`` of up to
+    2 chars. ``suffix`` is a TEST-ONLY hook — production passes
+    ``None`` so the names match the documented contract patterns
+    exactly. The 2-char cap below means concurrent pytest sessions are
+    expected to clean up via ``_close_episodic_rings`` rather than rely
+    on globally-unique names.
+    """
+    base_write = f"episodic_write_ring_rank{rank}"
+    base_query = f"episodic_query_ring_rank{rank}"
+    if suffix is None or not str(suffix):
+        return base_write, base_query
+    # darwin PSHMNAMLEN is 31 chars including the leading ``/`` and the
+    # ``_c`` suffix the counter shm appends. The base name is 25 chars,
+    # so the budget for ``_{suffix}`` is 31 - 1 - 25 - 2 = 3 chars
+    # total — i.e. ``_{2 chars}``. Anything longer would overflow on
+    # darwin even though it succeeds on Linux pods.
+    short = str(suffix)[-2:]
+    return f"{base_write}_{short}", f"{base_query}_{short}"
+
+
+def _create_episodic_rings(
+    *,
+    rank: int,
+    world_size: int,
+    config: dict[str, Any],
+) -> EpisodicRingsHandle | None:
+    """Producer-side ring setup for one train rank.
+
+    Returns the handle on a TRAIN rank (``rank < world_size - 1``) when
+    ``episodic_enabled=True``. Returns ``None`` for the episodic rank,
+    for ``episodic_enabled=False``, or for a ``world_size == 1`` run
+    (no episodic rank exists). Caller must ``dist.barrier(group=all_group)``
+    AFTER this returns so Task 1.5's ``attach`` doesn't race the create.
+
+    The ring sizes / dtype dimensions are read from ``config`` with the
+    defaults documented in the ring contract:
+
+      - ``episodic_span_length``: default 4
+      - ``episodic_fingerprint_window``: default 8
+      - ``episodic_key_rep_dim``: default ``model_dim``
+      - ``episodic_write_ring_capacity``: default 256
+      - ``episodic_query_ring_capacity``: default 256
+      - ``episodic_top_p``: default ``1.0 / (B * T)`` (computed at the
+        in-step site since B/T aren't known until then)
+    """
+    if not bool(config.get("episodic_enabled", False)):
+        return None
+    if world_size <= 1:
+        return None
+    if rank >= world_size - 1:
+        # Episodic rank — Task 1.5 attaches; producer side is a no-op.
+        return None
+    span_length = int(config.get("episodic_span_length", 4))
+    key_rep_dim = int(config.get("episodic_key_rep_dim", config.get("model_dim", 0)))
+    if key_rep_dim <= 0:
+        raise ValueError(
+            "episodic_enabled=True requires episodic_key_rep_dim > 0 "
+            "(or a positive model_dim default); got "
+            f"episodic_key_rep_dim={config.get('episodic_key_rep_dim')!r}, "
+            f"model_dim={config.get('model_dim')!r}"
+        )
+    fingerprint_window = int(config.get("episodic_fingerprint_window", 8))
+    write_capacity = int(config.get("episodic_write_ring_capacity", 256))
+    query_capacity = int(config.get("episodic_query_ring_capacity", 256))
+    write_payload_dtype = make_write_payload_dtype(
+        span_length=span_length, key_rep_dim=key_rep_dim,
+    )
+    query_candidate_dtype = make_query_candidate_dtype(key_rep_dim=key_rep_dim)
+    write_name, query_name = _episodic_ring_names(
+        rank=rank,
+        suffix=str(config.get("episodic_ring_name_suffix", "") or ""),
+    )
+    write_ring = ShmRing.create(
+        name=write_name,
+        slot_shape=(),
+        dtype=write_payload_dtype,
+        capacity=write_capacity,
+    )
+    try:
+        query_ring = ShmRing.create(
+            name=query_name,
+            slot_shape=(),
+            dtype=query_candidate_dtype,
+            capacity=query_capacity,
+        )
+    except Exception:
+        # Roll back the write ring so a partially-created handle doesn't
+        # leak a shm segment if query-ring creation fails.
+        write_ring.close_and_unlink()
+        raise
+    # ``episodic_top_p`` is read lazily in-step because B*T isn't
+    # known here; default is ``1.0 / (B * T)`` per the contract. The
+    # value stored on the handle is whatever the config sets, or NaN
+    # to signal "use the per-step default".
+    top_p = float(config.get("episodic_top_p", float("nan")))
+    return EpisodicRingsHandle(
+        write_ring=write_ring,
+        query_ring=query_ring,
+        write_ring_name=write_name,
+        query_ring_name=query_name,
+        write_ring_capacity=write_capacity,
+        query_ring_capacity=query_capacity,
+        write_payload_dtype=write_payload_dtype,
+        query_candidate_dtype=query_candidate_dtype,
+        span_length=span_length,
+        key_rep_dim=key_rep_dim,
+        fingerprint_window=fingerprint_window,
+        top_p=top_p,
+    )
+
+
+def _close_episodic_rings(handle: EpisodicRingsHandle) -> None:
+    """Producer-side teardown: close handles AND unlink shm names.
+
+    Idempotent on each ring. Safe to call from a ``finally`` block. The
+    consumer side (Task 1.5) calls only ``close()`` — unlink is the
+    producer's responsibility per the contract.
+    """
+    try:
+        handle.write_ring.close_and_unlink()
+    finally:
+        handle.query_ring.close_and_unlink()
+
+
+def _right_pad_per_token_signal(signal: torch.Tensor, T: int) -> torch.Tensor:
+    """Right-pad a ``[B, T-1]`` per-token signal to ``[B, T]`` with zero.
+
+    Adapter for the case where ``per_token_ce`` arrives in the next-
+    token-CE convention (``[B, T-1]``, one CE per predicted target). The
+    exp23 batch builder shifts targets at construction time so the
+    typical signal is already ``[B, T]``; this helper is a no-op there.
+    Anything more than one short of ``T`` is a coding error and raises.
+    """
+    if signal.dim() != 2:
+        raise ValueError(
+            f"_right_pad_per_token_signal expects a 2-D tensor; got shape "
+            f"{tuple(signal.shape)}"
+        )
+    B, S = signal.shape
+    if S == T:
+        return signal
+    if S != T - 1:
+        raise ValueError(
+            f"_right_pad_per_token_signal: signal width {S} must equal "
+            f"T={T} (already padded) or T-1={T - 1} (transformer convention); "
+            "any other width is a coding error"
+        )
+    return torch.cat([signal, signal.new_zeros((B, 1))], dim=1)
+
+
+def _push_episodic_writes(
+    *,
+    handle: EpisodicRingsHandle,
+    inputs: torch.Tensor,
+    targets: torch.Tensor,
+    pressure: torch.Tensor,
+    per_token_ce: torch.Tensor,
+    hidden: torch.Tensor,
+) -> None:
+    """Per-step producer: select positions and push to BOTH rings.
+
+    The contract requires that the SAME positions drive both rings, so
+    we run ``select_writes`` once and reuse its boundary-filtered list
+    for both. Boundary-dropped positions appear in NEITHER ring.
+    """
+    T = int(inputs.size(1))
+    pressure_full = _right_pad_per_token_signal(pressure, T)
+    ce_full = _right_pad_per_token_signal(per_token_ce, T)
+    # Default top_p = ``1 / (B * T)`` — one position per batch step in
+    # expectation. ``handle.top_p`` is NaN when the config didn't pin a
+    # value; in that case we compute the default here where B/T are
+    # known. ``select_top_p_positions`` always returns at least 1 row,
+    # so this guarantees at least one selection attempt per step.
+    if not (handle.top_p == handle.top_p):  # NaN sentinel
+        numel = int(inputs.numel())
+        top_p = 1.0 / float(max(numel, 1))
+    else:
+        top_p = float(handle.top_p)
+    payloads = select_writes(
+        input_ids=inputs.to(dtype=torch.int64),
+        target_ids=targets.to(dtype=torch.int64),
+        pressure=pressure_full.detach(),
+        per_token_ce=ce_full.detach(),
+        key_rep_per_position=hidden.detach(),
+        top_p=top_p,
+        fingerprint_window=handle.fingerprint_window,
+        span_length=handle.span_length,
+    )
+    for p in payloads:
+        slot = np.zeros((), dtype=handle.write_payload_dtype)
+        slot["key_fp"] = int(p.key_fp)
+        slot["key_rep"] = (
+            p.key_rep.detach().to(dtype=torch.float32).cpu().numpy()
+        )
+        slot["value_tok_ids"] = (
+            p.value_tok_ids.detach().to(dtype=torch.int64).cpu().numpy()
+        )
+        slot["value_anchor_id"] = int(p.value_anchor_id)
+        handle.write_ring.try_write(slot)
+
+        qslot = np.zeros((), dtype=handle.query_candidate_dtype)
+        qslot["batch_index"] = int(p.batch_index)
+        qslot["position"] = int(p.position)
+        qslot["pressure"] = float(pressure_full[p.batch_index, p.position].item())
+        qslot["residual"] = (
+            hidden[p.batch_index, p.position]
+            .detach()
+            .to(dtype=torch.float32)
+            .cpu()
+            .numpy()
+        )
+        handle.query_ring.try_write(qslot)
+
+
 def _run_train_step(
     *,
     model: torch.nn.Module,
@@ -1254,6 +1567,7 @@ def _run_train_step(
     dreamworld_generator: torch.Generator | None = None,
     is_episodic_rank: bool = False,
     all_group: "dist.ProcessGroup | None" = None,
+    episodic_rings: EpisodicRingsHandle | None = None,
 ) -> torch.Tensor:
     _reject_unsupported(model)
     # Episodic rank skip-main: this rank does not run the main forward
@@ -1286,6 +1600,11 @@ def _run_train_step(
             )
         device = inputs.device
         return torch.zeros((), device=device, dtype=torch.float32)
+    # Per-token CE is captured only when the episodic producer is wired —
+    # the standard fast path stays on ``fused_lm_head_backward`` (which
+    # discards per-token CE) so the cost of the ``_with_ce`` variant is
+    # not paid by ``episodic_enabled=False`` runs.
+    per_token_ce_for_episodic: torch.Tensor | None = None
     with autocast_context(precision, device_type=inputs.device.type):
         if compile_full_path:
             hidden = _compiled_step_fn()(model, inputs)
@@ -1318,14 +1637,27 @@ def _run_train_step(
             "fused_norm_streaming_v2",
         }:
             backend_name = fused_lm_head_backend_for_mode(lm_head_backward_mode)
-            loss = fused_lm_head_backward(
-                hidden=hidden,
-                final_norm=model.final_norm,
-                lm_head=model.lm_head,
-                targets=targets,
-                tile_size=int(lm_head_tile_size),
-                backend=backend_name,
-            )
+            if episodic_rings is not None:
+                # Episodic-enabled fast path — the fused kernel computes
+                # per-token CE on the way to the loss anyway, so swap to
+                # the ``_with_ce`` sibling and stop discarding it.
+                loss, per_token_ce_for_episodic = fused_lm_head_backward_with_ce(
+                    hidden=hidden,
+                    final_norm=model.final_norm,
+                    lm_head=model.lm_head,
+                    targets=targets,
+                    tile_size=int(lm_head_tile_size),
+                    backend=backend_name,
+                )
+            else:
+                loss = fused_lm_head_backward(
+                    hidden=hidden,
+                    final_norm=model.final_norm,
+                    lm_head=model.lm_head,
+                    targets=targets,
+                    tile_size=int(lm_head_tile_size),
+                    backend=backend_name,
+                )
         elif lm_head_backward_mode == "chunked":
             hidden_for_ce = hidden.detach().requires_grad_(True)
             loss = chunked_lm_head_backward(
@@ -1362,6 +1694,43 @@ def _run_train_step(
             lm_head_tile_size=lm_head_tile_size,
             replay_batch_size=dreamworld_replay_batch_size,
             generator=dreamworld_generator,
+        )
+    # Episodic write+query producer (Phase 1 Task 1.4). Runs AFTER backward
+    # (so the gradient signal is captured for the next step's pressure
+    # computation) and BEFORE the train-rank pre-scale + all-reduce (so a
+    # ring write that fails or stalls cannot taint the collective). Only
+    # train ranks reach this branch; the episodic rank early-returned
+    # above. ``episodic_rings is None`` means episodic_enabled=False or
+    # this is the episodic rank — both no-op here.
+    if episodic_rings is not None:
+        if per_token_ce_for_episodic is None:
+            # Non-fused LM-head modes don't return per-token CE; recompute
+            # it under no_grad so the producer can score positions. This
+            # is off the documented submission fast path (which uses one
+            # of the fused modes), so the extra forward is acceptable.
+            with torch.no_grad():
+                logits_episodic = model.lm_head(model.final_norm(hidden.detach()))
+                vocab = logits_episodic.size(-1)
+                per_token_ce_for_episodic = F.cross_entropy(
+                    logits_episodic.reshape(-1, vocab).float(),
+                    targets.reshape(-1),
+                    reduction="none",
+                ).reshape_as(targets)
+        # Phase 1 uses uniform pressure (= 1.0 everywhere). With the
+        # default ``episodic_top_p = 1 / (B * T)`` selection rule this
+        # picks the highest-CE position per step, which matches the
+        # contract's intent (most-surprising target). Real ScOpt
+        # pressure is incompatible with episodic_enabled in Phase 1
+        # (caller-side guard), and a richer pressure source is Phase 2+.
+        per_token_ce_bt = per_token_ce_for_episodic.detach().reshape(targets.shape)
+        pressure_bt = torch.ones_like(per_token_ce_bt)
+        _push_episodic_writes(
+            handle=episodic_rings,
+            inputs=inputs,
+            targets=targets,
+            pressure=pressure_bt,
+            per_token_ce=per_token_ce_bt,
+            hidden=hidden,
         )
     if ddp_active and world_size > 1:
         mode = str(grad_allreduce_mode).strip().lower()
@@ -1882,6 +2251,13 @@ def train_fast_for_budget(
     rare_bucket_ce_eval_num_tokens: int | None = None,
     emit_topology_snapshot: bool = False,
     episodic_enabled: bool = False,
+    episodic_top_p: float | None = None,
+    episodic_fingerprint_window: int = 8,
+    episodic_span_length: int = 4,
+    episodic_key_rep_dim: int | None = None,
+    episodic_write_ring_capacity: int = 256,
+    episodic_query_ring_capacity: int = 256,
+    episodic_ring_name_suffix: str | None = None,
 ) -> dict[str, Any]:
     rank_ = int(rank)
     world_size_ = int(world_size)
@@ -2303,6 +2679,52 @@ def train_fast_for_budget(
             batch_sampler=batch_sampler,
         )
 
+    # Episodic-cache producer rings (Phase 1 Task 1.4). A train rank
+    # creates its per-rank write + query rings here; the episodic rank
+    # owns its own attach/teardown path (Task 1.5). The ``dist.barrier``
+    # below pairs with the matching barrier on the episodic rank — both
+    # sides converge on it so ``ShmRing.attach`` cannot race
+    # ``ShmRing.create``. Returns ``None`` for ``episodic_enabled=False``,
+    # for ``world_size == 1`` runs, and for the episodic rank itself.
+    episodic_rings_handle: EpisodicRingsHandle | None = None
+    if episodic_enabled:
+        # Default ``episodic_key_rep_dim`` to the model's hidden dim if
+        # the caller didn't pin it. ``model.dim`` is the canonical name
+        # on real models; the toy CPU smoke models expose ``dim`` via
+        # the embedding shape so probe both.
+        resolved_key_rep_dim = (
+            int(episodic_key_rep_dim)
+            if episodic_key_rep_dim is not None
+            else int(getattr(model, "dim", 0)) or int(model.lm_head.in_features)
+        )
+        ring_config = {
+            "episodic_enabled": True,
+            "episodic_top_p": (
+                float(episodic_top_p)
+                if episodic_top_p is not None
+                else float("nan")
+            ),
+            "episodic_fingerprint_window": int(episodic_fingerprint_window),
+            "episodic_span_length": int(episodic_span_length),
+            "episodic_key_rep_dim": resolved_key_rep_dim,
+            "episodic_write_ring_capacity": int(episodic_write_ring_capacity),
+            "episodic_query_ring_capacity": int(episodic_query_ring_capacity),
+            "episodic_ring_name_suffix": episodic_ring_name_suffix,
+            "model_dim": resolved_key_rep_dim,
+        }
+        episodic_rings_handle = _create_episodic_rings(
+            rank=rank_, world_size=world_size_, config=ring_config,
+        )
+        # All-rank barrier so Task 1.5's attach() observes the just-created
+        # shm. ``all_group`` exists exactly when ``episodic_enabled=True``
+        # (set up above); both sides of the producer/consumer split call
+        # this barrier and converge. Production NCCL backends don't lock
+        # in CPU-only mode, so this barrier is essentially free except for
+        # the rendezvous it forces. If you skip it, attach can hit
+        # FileNotFoundError intermittently on the episodic rank.
+        if all_group is not None:
+            dist.barrier(group=all_group)
+
     try:
         while True:
             # Resolve the previous loss decision at the step boundary so
@@ -2518,6 +2940,7 @@ def train_fast_for_budget(
                     predictive_aux_projection=predictive_aux_projection,
                     is_episodic_rank=is_episodic_rank,
                     all_group=all_group,
+                    episodic_rings=episodic_rings_handle,
                     dreamworld_entry=dream_entry,
                     dreamworld_weight=(
                         float(event_sleep_weight)
@@ -2749,6 +3172,12 @@ def train_fast_for_budget(
             prefetcher.close()
         if async_grad_reducer is not None:
             async_grad_reducer.close()
+        # Producer-side ring teardown: close + unlink. The episodic
+        # rank closes WITHOUT unlinking (Task 1.5); unlink is owned by
+        # the producer per the ring contract. Idempotent on each ring,
+        # so safe to call even if creation partially failed.
+        if episodic_rings_handle is not None:
+            _close_episodic_rings(episodic_rings_handle)
 
     if ddp_active:
         dist.barrier()
@@ -3276,6 +3705,33 @@ def run_condition(
             config.get("emit_topology_snapshot", False)
         ),
         episodic_enabled=bool(config.get("episodic_enabled", False)),
+        episodic_top_p=(
+            float(config["episodic_top_p"])
+            if config.get("episodic_top_p") is not None
+            else None
+        ),
+        episodic_fingerprint_window=int(
+            config.get("episodic_fingerprint_window", 8)
+        ),
+        episodic_span_length=int(config.get("episodic_span_length", 4)),
+        episodic_key_rep_dim=(
+            int(config["episodic_key_rep_dim"])
+            if config.get("episodic_key_rep_dim") is not None
+            else None
+        ),
+        episodic_write_ring_capacity=int(
+            config.get("episodic_write_ring_capacity", 256)
+        ),
+        episodic_query_ring_capacity=int(
+            config.get("episodic_query_ring_capacity", 256)
+        ),
+        # ``episodic_ring_name_suffix`` is intentionally NOT plumbed
+        # through here. It is a TEST-ONLY hook — the contract requires
+        # Task 1.5 to attach by the unsuffixed names
+        # ``episodic_{write,query}_ring_rank{R}``. Setting a suffix in
+        # production YAML would silently desync producer + consumer.
+        # Tests reach the kwarg via direct ``train_fast_for_budget``
+        # invocation; production YAML cannot reach it.
     )
 
     if ddp_active:
