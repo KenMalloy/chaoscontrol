@@ -247,3 +247,143 @@ def test_ring_close_and_unlink_is_idempotent(ring_name):
     ring.close_and_unlink()
     ring.close_and_unlink()
     ring.close_and_unlink()
+
+
+def test_attach_rejects_wrong_dtype(ring_name):
+    """Producer creates float32; consumer attach with float64 must raise."""
+    producer = ShmRing.create(
+        name=ring_name,
+        slot_shape=(4,),
+        dtype=np.dtype(np.float32),
+        capacity=8,
+    )
+    try:
+        with pytest.raises(ValueError, match="dtype"):
+            ShmRing.attach(
+                name=ring_name,
+                slot_shape=(4,),
+                dtype=np.dtype(np.float64),
+                capacity=8,
+            )
+    finally:
+        producer.close_and_unlink()
+
+
+def test_attach_rejects_wrong_shape(ring_name):
+    """Producer creates slot_shape=(8,); consumer attach (7,) must raise."""
+    producer = ShmRing.create(
+        name=ring_name,
+        slot_shape=(8,),
+        dtype=np.dtype(np.float32),
+        capacity=4,
+    )
+    try:
+        with pytest.raises(ValueError, match="shape"):
+            ShmRing.attach(
+                name=ring_name,
+                slot_shape=(7,),
+                dtype=np.dtype(np.float32),
+                capacity=4,
+            )
+    finally:
+        producer.close_and_unlink()
+
+
+def test_attach_rejects_wrong_capacity(ring_name):
+    """Producer creates capacity=4; consumer attach capacity=8 must raise."""
+    producer = ShmRing.create(
+        name=ring_name,
+        slot_shape=(4,),
+        dtype=np.dtype(np.float32),
+        capacity=4,
+    )
+    try:
+        with pytest.raises(ValueError, match="capacity"):
+            ShmRing.attach(
+                name=ring_name,
+                slot_shape=(4,),
+                dtype=np.dtype(np.float32),
+                capacity=8,
+            )
+    finally:
+        producer.close_and_unlink()
+
+
+def _matching_metadata_producer(name: str, ready_q, done_q):
+    """Producer subprocess for matching-metadata round-trip test."""
+    import numpy as np
+
+    from chaoscontrol.episodic.ipc import ShmRing
+
+    ring = ShmRing.create(
+        name=name,
+        slot_shape=(2, 3),
+        dtype=np.dtype(np.float32),
+        capacity=4,
+    )
+    try:
+        ready_q.put("ready")
+        for i in range(3):
+            ring.try_write(
+                np.full((2, 3), float(i), dtype=np.float32),
+            )
+        done_q.put("done")
+        ready_q.get()  # wait for "drained" sentinel
+    finally:
+        ring.close_and_unlink()
+
+
+def test_attach_succeeds_with_matching_metadata(ring_name):
+    """Sanity: matching metadata still round-trips across processes.
+
+    Proves the metadata-write path doesn't break the happy path. Uses 2-D
+    slot_shape to exercise multi-dim metadata storage end-to-end.
+    """
+    ctx = mp.get_context("spawn")
+    ready_q = ctx.Queue()
+    done_q = ctx.Queue()
+
+    proc = ctx.Process(
+        target=_matching_metadata_producer,
+        args=(ring_name, ready_q, done_q),
+    )
+    proc.start()
+    try:
+        assert ready_q.get(timeout=10.0) == "ready"
+
+        reader = ShmRing.attach(
+            name=ring_name,
+            slot_shape=(2, 3),
+            dtype=np.dtype(np.float32),
+            capacity=4,
+        )
+        try:
+            assert done_q.get(timeout=10.0) == "done"
+            for i in range(3):
+                got = reader.try_read()
+                assert got is not None
+                np.testing.assert_array_equal(
+                    got,
+                    np.full((2, 3), float(i), dtype=np.float32),
+                )
+            assert reader.try_read() is None
+        finally:
+            reader.close()
+            ready_q.put("drained")
+            proc.join(timeout=10.0)
+            assert proc.exitcode == 0, f"producer exited {proc.exitcode}"
+    finally:
+        if proc.is_alive():
+            proc.terminate()
+            proc.join(timeout=5.0)
+
+
+def test_create_rejects_oversized_ndim(ring_name):
+    """slot_shape with more than MAX_NDIM=8 dims must raise on create()."""
+    with pytest.raises(ValueError, match="MAX_NDIM"):
+        ShmRing.create(
+            name=ring_name,
+            slot_shape=(2,) * 9,
+            dtype=np.dtype(np.float32),
+            capacity=2,
+        )

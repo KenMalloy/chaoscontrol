@@ -32,14 +32,110 @@ import numpy as np
 
 
 _COUNTER_DTYPE = np.dtype(np.int64)
+# Live counters (the writer/reader hot path touches only these three cells).
 _COUNTER_HEAD = 0
 _COUNTER_TAIL = 1
 _COUNTER_DROPPED = 2
 _COUNTER_COUNT = 3
+# Metadata header (written once by create(), read once by attach() to validate
+# the caller's claimed shape/dtype/capacity against the underlying shm).
+_META_CAPACITY = 3
+_META_DTYPE_NUM = 4
+_META_NDIM = 5
+_META_SHAPE_BASE = 6
+MAX_NDIM = 8
+# Total int64 cells in the counter shm: 3 live counters + 3 scalar metadata
+# fields + MAX_NDIM shape cells. With MAX_NDIM=8 this is 14 cells = 112 bytes.
+_COUNTER_SHM_CELLS = _META_SHAPE_BASE + MAX_NDIM
 
 
 def _counter_shm_name(name: str) -> str:
     return f"{name}_c"
+
+
+def _write_metadata(
+    counter_shm: SharedMemory,
+    *,
+    slot_shape: tuple[int, ...],
+    dtype: np.dtype,
+    capacity: int,
+) -> None:
+    """Stash (capacity, dtype.num, ndim, shape...) into the counter shm header.
+
+    Caller must have zeroed the buffer first (the unused shape tail stays 0).
+    """
+    cells = np.ndarray(
+        (_COUNTER_SHM_CELLS,), dtype=_COUNTER_DTYPE, buffer=counter_shm.buf,
+    )
+    cells[_META_CAPACITY] = int(capacity)
+    cells[_META_DTYPE_NUM] = int(dtype.num)
+    cells[_META_NDIM] = len(slot_shape)
+    for i, dim in enumerate(slot_shape):
+        cells[_META_SHAPE_BASE + i] = int(dim)
+
+
+def _dtype_from_num(num: int) -> np.dtype | None:
+    """Best-effort reverse lookup of `numpy.dtype.num` for error-message text.
+
+    Returns None if no common scalar dtype matches; callers should fall back
+    to printing the numeric `num` in that case. Used only for human-readable
+    error messages — equality is established by comparing nums directly.
+    """
+    candidates = (
+        np.float16, np.float32, np.float64,
+        np.int8, np.int16, np.int32, np.int64,
+        np.uint8, np.uint16, np.uint32, np.uint64,
+        np.bool_, np.complex64, np.complex128,
+    )
+    for cand in candidates:
+        if np.dtype(cand).num == num:
+            return np.dtype(cand)
+    return None
+
+
+def _validate_metadata(
+    counter_shm: SharedMemory,
+    *,
+    claimed_slot_shape: tuple[int, ...],
+    claimed_dtype: np.dtype,
+    claimed_capacity: int,
+) -> None:
+    """Read metadata from counter shm and compare to caller's claim.
+
+    Raises ValueError naming both the expected (shm) and actual (claimed)
+    values for whichever field mismatches first.
+    """
+    cells = np.ndarray(
+        (_COUNTER_SHM_CELLS,), dtype=_COUNTER_DTYPE, buffer=counter_shm.buf,
+    )
+    actual_capacity = int(cells[_META_CAPACITY])
+    actual_dtype_num = int(cells[_META_DTYPE_NUM])
+    actual_ndim = int(cells[_META_NDIM])
+    actual_shape = tuple(
+        int(cells[_META_SHAPE_BASE + i]) for i in range(actual_ndim)
+    )
+
+    if actual_capacity != claimed_capacity:
+        raise ValueError(
+            f"capacity mismatch: shm has {actual_capacity}, "
+            f"attach claimed {claimed_capacity}",
+        )
+    if int(claimed_dtype.num) != actual_dtype_num:
+        actual_dtype = _dtype_from_num(actual_dtype_num)
+        actual_str = (
+            f"{actual_dtype} (num={actual_dtype_num})"
+            if actual_dtype is not None
+            else f"num={actual_dtype_num}"
+        )
+        raise ValueError(
+            f"dtype mismatch: shm has {actual_str}, "
+            f"attach claimed {claimed_dtype} (num={int(claimed_dtype.num)})",
+        )
+    if actual_shape != claimed_slot_shape:
+        raise ValueError(
+            f"shape mismatch: shm has {actual_shape}, "
+            f"attach claimed {claimed_slot_shape}",
+        )
 
 
 class ShmRing:
@@ -83,10 +179,24 @@ class ShmRing:
         dtype: np.dtype,
         capacity: int,
     ) -> "ShmRing":
-        """Producer side. Allocates new shm with `name` (fails if it exists)."""
+        """Producer side. Allocates new shm with `name` (fails if it exists).
+
+        Stashes (capacity, dtype.num, ndim, slot_shape) into a metadata header
+        in the counter shm so consumers can validate their `attach()` claim
+        against the underlying shm — without that, a typo at the call site
+        silently corrupts payloads (POSIX shm rounds up to a page boundary, so
+        small mismatched views fit and read garbage).
+
+        Raises ValueError if `len(slot_shape) > MAX_NDIM` (=8). Use cases are
+        1-D and 2-D slot shapes; 8 dims is room enough.
+        """
         if capacity <= 0:
             raise ValueError(f"capacity must be positive; got {capacity}")
         slot_shape = tuple(int(d) for d in slot_shape)
+        if len(slot_shape) > MAX_NDIM:
+            raise ValueError(
+                f"slot_shape has {len(slot_shape)} dims; MAX_NDIM={MAX_NDIM}",
+            )
         dtype = np.dtype(dtype)
 
         slot_nbytes = int(np.prod((capacity,) + slot_shape)) * dtype.itemsize
@@ -95,23 +205,31 @@ class ShmRing:
             counter_shm = SharedMemory(
                 name=_counter_shm_name(name),
                 create=True,
-                size=_COUNTER_COUNT * _COUNTER_DTYPE.itemsize,
+                size=_COUNTER_SHM_CELLS * _COUNTER_DTYPE.itemsize,
             )
         except Exception:
             slot_shm.close()
             slot_shm.unlink()
             raise
 
-        # Zero the slot buffer and the counters explicitly. SharedMemory does
-        # not guarantee zeroed contents on every platform.
+        # Zero the slot buffer and the full counter region (live counters +
+        # metadata). SharedMemory does not guarantee zeroed contents on every
+        # platform. Zero BEFORE writing metadata so the unused shape tail
+        # stays 0 and the freshly written metadata isn't clobbered.
         np.ndarray(
             (slot_nbytes,), dtype=np.uint8, buffer=slot_shm.buf,
         )[:] = 0
         np.ndarray(
-            (_COUNTER_COUNT,),
+            (_COUNTER_SHM_CELLS,),
             dtype=_COUNTER_DTYPE,
             buffer=counter_shm.buf,
         )[:] = 0
+        _write_metadata(
+            counter_shm,
+            slot_shape=slot_shape,
+            dtype=dtype,
+            capacity=capacity,
+        )
 
         return cls(
             slot_shape=slot_shape,
@@ -131,7 +249,14 @@ class ShmRing:
         dtype: np.dtype,
         capacity: int,
     ) -> "ShmRing":
-        """Consumer side. Attaches to an existing shm with `name`."""
+        """Consumer side. Attaches to an existing shm with `name`.
+
+        Validates the caller's claimed (slot_shape, dtype, capacity) against
+        metadata stashed by `create()`. Mismatches raise ValueError BEFORE any
+        numpy view is constructed — a mismatched view often silently fits
+        because POSIX shm rounds up to a page boundary, so we cannot rely on
+        ndarray construction to flag the bug.
+        """
         if capacity <= 0:
             raise ValueError(f"capacity must be positive; got {capacity}")
         slot_shape = tuple(int(d) for d in slot_shape)
@@ -143,6 +268,17 @@ class ShmRing:
                 name=_counter_shm_name(name), create=False,
             )
         except Exception:
+            slot_shm.close()
+            raise
+        try:
+            _validate_metadata(
+                counter_shm,
+                claimed_slot_shape=slot_shape,
+                claimed_dtype=dtype,
+                claimed_capacity=capacity,
+            )
+        except Exception:
+            counter_shm.close()
             slot_shm.close()
             raise
         return cls(
