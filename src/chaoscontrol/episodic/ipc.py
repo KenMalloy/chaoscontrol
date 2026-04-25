@@ -183,6 +183,10 @@ class ShmRing:
 
         idx = head % self._capacity
         self._slots[idx] = item
+        # Counter writes use Python-int + numpy assignment so an INT64_MAX
+        # overflow raises OverflowError loudly. Switching to numpy in-place
+        # arithmetic (`+= np.int64(1)`) would silently wraparound — load-
+        # bearing semantics; do not "optimize" the int() conversion away.
         self._counters[_COUNTER_HEAD] = head + 1
 
     # ---- consumer ------------------------------------------------------------
