@@ -617,7 +617,9 @@ class CriticalityDistillation(nn.Module):
             # Score percentiles over all D channels for this layer. Tracks
             # whether score signal-to-noise is sharpening over training.
             s_layer = scores[layer].detach().to(dtype=torch.float32)
-            q = torch.tensor([0.10, 0.50, 0.90], dtype=torch.float32)
+            q = torch.tensor(
+                [0.10, 0.50, 0.90], dtype=torch.float32, device=s_layer.device,
+            )
             p10, p50, p90 = torch.quantile(s_layer, q).tolist()
             score_p10.append(float(p10))
             score_p50.append(float(p50))
