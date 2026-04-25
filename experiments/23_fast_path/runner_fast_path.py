@@ -273,6 +273,11 @@ def _compute_per_bucket_val_ce(
     token_bucket = _build_token_buckets(token_frequencies, num_buckets).to(device)
     bucket_sum = torch.zeros(num_buckets, dtype=torch.float64, device=device)
     bucket_count = torch.zeros(num_buckets, dtype=torch.int64, device=device)
+    # Per-window (per inner-step) per-bucket sum/count for within-seed
+    # paired bootstrap. Rank-local — the aggregate keys above receive the
+    # cross-rank reduction; per-window arrays describe this rank's shard.
+    per_window_bucket_sum: list[list[float]] = []
+    per_window_bucket_count: list[list[int]] = []
     total = count_lm_starts(num_tokens, seq_len, stride)
     sharded = count_sharded_lm_starts(
         total_starts=total, rank=rank, world_size=world_size,
@@ -285,6 +290,8 @@ def _compute_per_bucket_val_ce(
             "rare_bucket_val_ce": 0.0,
             "val_bucket_num_buckets": int(num_buckets),
             "val_bucket_token_counts": [0] * int(num_buckets),
+            "per_window_bucket_ce_sum": [],
+            "per_window_bucket_count": [],
         }
     n_steps = (sharded + batch_size - 1) // batch_size
     model.eval()
@@ -320,8 +327,18 @@ def _compute_per_bucket_val_ce(
                 flat_idx = bucket_idx.reshape(-1)
                 flat_ce = ce.reshape(-1).to(dtype=torch.float64)
                 flat_ones = torch.ones_like(flat_idx, dtype=torch.int64)
-                bucket_sum.scatter_add_(0, flat_idx, flat_ce)
-                bucket_count.scatter_add_(0, flat_idx, flat_ones)
+                window_sum = torch.zeros_like(bucket_sum)
+                window_count = torch.zeros_like(bucket_count)
+                window_sum.scatter_add_(0, flat_idx, flat_ce)
+                window_count.scatter_add_(0, flat_idx, flat_ones)
+                bucket_sum.add_(window_sum)
+                bucket_count.add_(window_count)
+                per_window_bucket_sum.append(
+                    [float(x) for x in window_sum.detach().cpu().tolist()]
+                )
+                per_window_bucket_count.append(
+                    [int(x) for x in window_count.detach().cpu().tolist()]
+                )
     finally:
         model.train()
     # All-reduce across ranks before dividing — otherwise each rank reports
@@ -339,6 +356,8 @@ def _compute_per_bucket_val_ce(
         "rare_bucket_val_ce": rare_bucket_val_ce,
         "val_bucket_num_buckets": int(num_buckets),
         "val_bucket_token_counts": [int(x) for x in bucket_count.detach().cpu().tolist()],
+        "per_window_bucket_ce_sum": per_window_bucket_sum,
+        "per_window_bucket_count": per_window_bucket_count,
     }
 
 
@@ -1842,6 +1861,7 @@ def train_fast_for_budget(
     cd_ssm_cores: list[torch.nn.Module] = []
     cd_pinned_buffers: dict[str, dict[str, torch.Tensor]] | None = None
     criticality_distillation_diagnostics: list[dict] = []
+    criticality_distill_loss_trajectory: list[dict] = []
     if criticality_distill_enabled:
         if criticality_distill_num_layers is None:
             raise ValueError(
@@ -2483,6 +2503,9 @@ def train_fast_for_budget(
                             log_a_per_layer.append(la)
                     if len(log_a_per_layer) == cd.num_layers:
                         cd_loss = cd.criticality_loss(log_a_per_layer)
+                        criticality_distill_loss_trajectory.append(
+                            {"step": int(steps), "cd_loss": float(cd_loss.detach().item())}
+                        )
                         if cd_loss.requires_grad:
                             cd_loss.backward()
             else:
@@ -2671,6 +2694,9 @@ def train_fast_for_budget(
         result["_criticality_distill_pinned_buffers"] = cd_pinned_buffers
         result["criticality_distillation_diagnostics"] = (
             criticality_distillation_diagnostics
+        )
+        result["criticality_distill_loss_trajectory"] = (
+            criticality_distill_loss_trajectory
         )
     if rare_bucket_ce_enabled:
         bucket_eval_tokens = (

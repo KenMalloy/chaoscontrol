@@ -26,6 +26,7 @@ sys.path.insert(0, str(REPO / "src"))
 from exp24 import (  # noqa: E402
     DEFAULT_CONTROL_SEEDS,
     build_criticality_distillation_first_smoke_matrix,
+    build_criticality_distillation_multiseed_matrix,
     build_fastslow_dreamworld_matrix,
     build_first_wave_mechanism_matrix,
     build_phase_a_sampling_matrix,
@@ -232,6 +233,13 @@ def _build_entries(
             budget_seconds=budget_seconds,
             seed_values=seeds,
         )
+    if matrix == "cd_multiseed":
+        return build_criticality_distillation_multiseed_matrix(
+            speed_config=speed_config,
+            world_size=world_size,
+            budget_seconds=budget_seconds,
+            seed_values=seeds,
+        )
     if matrix == "all":
         entries: list[dict[str, Any]] = []
         entries.extend(
@@ -275,6 +283,8 @@ def _default_world_size_for_matrix(matrix: str) -> int:
     if matrix in {"semantic_overhead_gate", "scopt_overhead_gate", "scopt_calibration_sweep"}:
         return 1
     if matrix == "cd_first_smoke":
+        return 1
+    if matrix == "cd_multiseed":
         return 1
     if matrix in {
         "phase0_dreamworld_sweep",
@@ -321,6 +331,7 @@ def main(argv: list[str] | None = None) -> int:
             "phase0_confirm",
             "phase0_fastslow_only_control",
             "cd_first_smoke",
+            "cd_multiseed",
             "all",
         ],
         default="all",

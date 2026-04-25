@@ -892,6 +892,64 @@ def test_diagnostics_snapshot_churn_is_zero_on_first_snapshot():
     assert snap["seat_churn_per_layer"][0] == 0.0
 
 
+def test_diagnostics_snapshot_emits_seat_indices_per_layer():
+    """Snapshot must emit the actual seat indices (not just the fraction)
+    so post-hoc analysis can compute seat overlap across seeds/arms."""
+    cd = CriticalityDistillation(
+        num_layers=2, dim=8, trace_ttl_steps=8,
+        min_weighted_events_per_layer=0.1,
+        criticality_budget_frac=0.25,  # k=2
+    )
+    cd._add_contribution(layer=0, evidence=torch.tensor([2.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0]), event_count=1.0)
+    cd._add_contribution(layer=1, evidence=torch.tensor([0.0, 0.0, 0.0, 3.0, 0.0, 1.5, 0.0, 0.0]), event_count=1.0)
+    cd.allocate_seats_from_accumulators(current_step=1)
+    snap = cd.diagnostics_snapshot(
+        log_a_per_layer=[torch.zeros(8), torch.zeros(8)], current_step=1,
+    )
+    assert "seat_indices_per_layer" in snap
+    assert len(snap["seat_indices_per_layer"]) == cd.num_layers
+    # Per-layer entry is a list of int indices, sorted ascending.
+    for layer in range(cd.num_layers):
+        idx = snap["seat_indices_per_layer"][layer]
+        assert isinstance(idx, list)
+        assert all(isinstance(i, int) for i in idx)
+        assert idx == sorted(idx)
+        # Every index must agree with the live seat_mask.
+        from_mask = cd.seat_mask[layer].nonzero(as_tuple=True)[0].tolist()
+        assert idx == sorted(from_mask)
+
+
+def test_diagnostics_snapshot_emits_score_percentiles_per_layer():
+    """Snapshot must emit score distribution percentiles so we can track
+    whether score signal-to-noise is sharpening or flattening over training."""
+    cd = CriticalityDistillation(
+        num_layers=1, dim=16, trace_ttl_steps=8,
+        min_weighted_events_per_layer=0.1,
+    )
+    ev = torch.arange(16, dtype=torch.float32) * 0.1
+    cd._add_contribution(layer=0, evidence=ev, event_count=1.0)
+    cd.allocate_seats_from_accumulators(current_step=1)
+    snap = cd.diagnostics_snapshot(
+        log_a_per_layer=[torch.zeros(16)], current_step=1,
+    )
+    for key in (
+        "score_p10_per_layer",
+        "score_p50_per_layer",
+        "score_p90_per_layer",
+        "score_max_per_layer",
+    ):
+        assert key in snap, f"missing {key}"
+        assert len(snap[key]) == cd.num_layers
+        assert isinstance(snap[key][0], float)
+    # Percentiles must be ordered.
+    assert (
+        snap["score_p10_per_layer"][0]
+        <= snap["score_p50_per_layer"][0]
+        <= snap["score_p90_per_layer"][0]
+        <= snap["score_max_per_layer"][0]
+    )
+
+
 def test_diagnostics_snapshot_churn_tracks_change_between_snapshots():
     cd = CriticalityDistillation(
         num_layers=1, dim=4, trace_ttl_steps=8, min_weighted_events_per_layer=0.1,

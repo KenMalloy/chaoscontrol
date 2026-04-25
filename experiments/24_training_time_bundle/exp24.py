@@ -811,6 +811,83 @@ def build_criticality_distillation_first_smoke_matrix(
     return entries
 
 
+def build_criticality_distillation_multiseed_matrix(
+    *,
+    speed_config: dict[str, Any],
+    world_size: int = 1,
+    budget_seconds: float = 600.0,
+    seed_values: Sequence[int] = (1337, 17, 42, 1234, 2024),
+) -> list[dict[str, Any]]:
+    """Five arms x N seeds on the same locked base as cd_first_smoke.
+
+    Reduced arm set: keep treatment + 3 falsifiers + H_short (the one
+    sensitivity cell that survived the first smoke). Drop hl_short/hl_long/
+    H_long — first smoke showed them either collapsing the rare-bucket
+    win (hl) or converging on shuffled (H_long). Multi-seed gives paired
+    bootstrap CIs on b0/b1 so the -0.10 nat rare-CE gap is bounded by
+    real noise, not by a single-seed point estimate.
+    """
+    locked_base = {
+        "exp24_mechanism": "fast_slow",
+        "artifact_impact": ARTIFACT_TRAINING_ONLY,
+        "fast_slow_enabled": True,
+        "fast_slow_interval": 64,
+        "fast_slow_alpha": 0.25,
+        "fast_slow_eval_copy": "slow",
+        "dreamworld_enabled": False,
+        "dreamworld_cache_interval": 0,
+        "dreamworld_interval": 0,
+        "dreamworld_weight": 0.0,
+        "dreamworld_replay_batch_size": 0,
+    }
+    cd_defaults = {
+        "lm_head_backward_mode": "fused_streaming_cached",
+        "lm_head_emit_entropy": True,
+        "criticality_distill_enabled": True,
+        "criticality_distill_budget_frac": 0.15,
+        "criticality_distill_critical_value": 0.95,
+        "criticality_distill_trace_half_life_steps": 256.0,
+        "criticality_distill_trace_ttl_steps": 1024,
+        "criticality_distill_horizon_H": 16,
+        "criticality_distill_event_frac": 0.05,
+        "criticality_distill_seat_refresh_interval": 64,
+        "criticality_distill_min_weighted_events_per_layer": 256.0,
+        "criticality_distill_weight": 1e-3,
+        "criticality_distill_uniform_pressure": False,
+        "criticality_distill_score_permute_before_topk": False,
+        "criticality_distill_fixed_random_seats": False,
+        "rare_bucket_ce_enabled": True,
+        "rare_bucket_ce_num_buckets": 4,
+    }
+    cells = [
+        ("treatment", {}),
+        ("telemetry", {"criticality_distill_weight": 0.0}),
+        ("shuffled", {"criticality_distill_score_permute_before_topk": True}),
+        ("budget_only", {"criticality_distill_fixed_random_seats": True}),
+        ("H_short", {"criticality_distill_horizon_H": 8}),
+    ]
+    entries: list[dict[str, Any]] = []
+    for arm_name, overrides in cells:
+        arm = {**locked_base, **cd_defaults, **overrides}
+        for seed in seed_values:
+            entry = _base_entry(
+                speed_config=speed_config,
+                world_size=world_size,
+                budget_seconds=budget_seconds,
+            )
+            entry.update(arm)
+            entries.append(
+                _named_entry(
+                    base=entry,
+                    phase="cd_multiseed",
+                    mechanism="fast_slow",
+                    arm=arm_name,
+                    seed=int(seed),
+                )
+            )
+    return entries
+
+
 def build_first_wave_matrix(
     *,
     speed_config: dict[str, Any],

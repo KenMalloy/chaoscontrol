@@ -146,3 +146,104 @@ def test_cd_first_smoke_sensitivity_cells_have_distinct_knob():
 def test_run_exp24_defaults_cd_first_smoke_to_world_size_1():
     mod = _load_run_exp24()
     assert mod._default_world_size_for_matrix("cd_first_smoke") == 1
+
+
+CD_MULTISEED_SEEDS = [1337, 17, 42, 1234, 2024]
+CD_MULTISEED_ARMS = {"treatment", "telemetry", "shuffled", "budget_only", "H_short"}
+
+
+def test_cd_multiseed_matrix_has_25_entries():
+    mod = _load_exp24()
+    entries = mod.build_criticality_distillation_multiseed_matrix(
+        speed_config=SPEED_CONFIG, world_size=1, budget_seconds=600.0,
+        seed_values=CD_MULTISEED_SEEDS,
+    )
+    assert len(entries) == 25
+
+
+def test_cd_multiseed_matrix_covers_5_arms_and_5_seeds():
+    mod = _load_exp24()
+    entries = mod.build_criticality_distillation_multiseed_matrix(
+        speed_config=SPEED_CONFIG, world_size=1, budget_seconds=600.0,
+        seed_values=CD_MULTISEED_SEEDS,
+    )
+    seen: set[tuple[str, int]] = set()
+    for entry in entries:
+        name = entry["name"]
+        assert name.startswith("exp24_cd_multiseed_")
+        arm = name.replace("exp24_cd_multiseed_", "").rsplit("_s", 1)[0]
+        seed = int(name.rsplit("_s", 1)[1])
+        seen.add((arm, seed))
+    expected = {(arm, seed) for arm in CD_MULTISEED_ARMS for seed in CD_MULTISEED_SEEDS}
+    assert seen == expected, f"missing or extra cells: {seen ^ expected}"
+
+
+def test_cd_multiseed_cells_ride_locked_fast_slow_base():
+    mod = _load_exp24()
+    entries = mod.build_criticality_distillation_multiseed_matrix(
+        speed_config=SPEED_CONFIG, world_size=1, budget_seconds=600.0,
+        seed_values=CD_MULTISEED_SEEDS,
+    )
+    for e in entries:
+        assert e.get("fast_slow_enabled") is True
+        assert e.get("fast_slow_interval") == 64
+        assert e.get("fast_slow_alpha") == 0.25
+
+
+def test_cd_multiseed_cells_keep_winner_horizon_and_halflife():
+    """Treatment/telemetry/shuffled/budget_only must keep the winning
+    config (H=16, hl=256). H_short is the one cell that overrides H=8."""
+    mod = _load_exp24()
+    entries = mod.build_criticality_distillation_multiseed_matrix(
+        speed_config=SPEED_CONFIG, world_size=1, budget_seconds=600.0,
+        seed_values=CD_MULTISEED_SEEDS,
+    )
+    by_arm: dict[str, list[dict]] = {}
+    for e in entries:
+        arm = e["name"].replace("exp24_cd_multiseed_", "").rsplit("_s", 1)[0]
+        by_arm.setdefault(arm, []).append(e)
+    for arm in ("treatment", "telemetry", "shuffled", "budget_only"):
+        for e in by_arm[arm]:
+            assert e["criticality_distill_horizon_H"] == 16
+            assert e["criticality_distill_trace_half_life_steps"] == 256.0
+    for e in by_arm["H_short"]:
+        assert e["criticality_distill_horizon_H"] == 8
+        assert e["criticality_distill_trace_half_life_steps"] == 256.0
+
+
+def test_cd_multiseed_cells_emit_rare_bucket_val_ce():
+    mod = _load_exp24()
+    entries = mod.build_criticality_distillation_multiseed_matrix(
+        speed_config=SPEED_CONFIG, world_size=1, budget_seconds=600.0,
+        seed_values=CD_MULTISEED_SEEDS,
+    )
+    for e in entries:
+        assert e.get("rare_bucket_ce_enabled") is True
+        assert int(e.get("rare_bucket_ce_num_buckets", 0)) == 4
+
+
+def test_cd_multiseed_falsifier_flags_match_first_smoke():
+    mod = _load_exp24()
+    entries = mod.build_criticality_distillation_multiseed_matrix(
+        speed_config=SPEED_CONFIG, world_size=1, budget_seconds=600.0,
+        seed_values=CD_MULTISEED_SEEDS,
+    )
+    by_arm: dict[str, list[dict]] = {}
+    for e in entries:
+        arm = e["name"].replace("exp24_cd_multiseed_", "").rsplit("_s", 1)[0]
+        by_arm.setdefault(arm, []).append(e)
+    for e in by_arm["telemetry"]:
+        assert e["criticality_distill_weight"] == 0.0
+    for e in by_arm["shuffled"]:
+        assert e["criticality_distill_score_permute_before_topk"] is True
+    for e in by_arm["budget_only"]:
+        assert e["criticality_distill_fixed_random_seats"] is True
+    for arm in ("treatment", "H_short"):
+        for e in by_arm[arm]:
+            assert e["criticality_distill_score_permute_before_topk"] is False
+            assert e["criticality_distill_fixed_random_seats"] is False
+
+
+def test_run_exp24_defaults_cd_multiseed_to_world_size_1():
+    mod = _load_run_exp24()
+    assert mod._default_world_size_for_matrix("cd_multiseed") == 1

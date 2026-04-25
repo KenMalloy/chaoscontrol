@@ -2947,6 +2947,58 @@ def test_train_result_contains_per_bucket_val_ce_when_rare_bucket_ce_enabled():
     assert len(result["val_bucket_token_counts"]) == 4
 
 
+def test_train_result_contains_per_window_bucket_ce_when_rare_bucket_ce_enabled():
+    """Within-seed paired bootstrap on b0/b1 needs per-eval-window
+    bucket CE sums + counts, not just the aggregate. Aggregate must
+    still equal the sum of per-window data (sanity check)."""
+    mod = _load_runner_module()
+    model = _TinyTokenTrainModel()
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+    token_frequencies = torch.tensor([100.0, 50.0, 20.0, 10.0, 5.0, 1.0])
+    result = mod.train_fast_for_budget(
+        model, train_tokens=torch.arange(128, dtype=torch.int16) % 6,
+        train_num_tokens=128, stride=4, seq_len=3, batch_size=2,
+        device=torch.device("cpu"), optimizer=optimizer,
+        budget_seconds=300.0, chunk_size=2, grad_clip_norm=0.0, fused_grad_clip=False,
+        rank=0, world_size=1, seed=123, precision="fp32",
+        stop_check_interval=1, stop_margin_seconds=0.0,
+        vocab_size=6, max_steps=4, prefetch_batches=False,
+        rare_bucket_ce_enabled=True,
+        rare_bucket_ce_token_frequencies=token_frequencies,
+        rare_bucket_ce_num_buckets=4,
+    )
+    # Must emit per-window arrays alongside the aggregate.
+    assert "per_window_bucket_ce_sum" in result
+    assert "per_window_bucket_count" in result
+    sums = result["per_window_bucket_ce_sum"]
+    counts = result["per_window_bucket_count"]
+    # n_windows >= 1; each entry has length=num_buckets.
+    assert len(sums) >= 1
+    assert len(sums) == len(counts)
+    for w_sum, w_count in zip(sums, counts):
+        assert len(w_sum) == 4
+        assert len(w_count) == 4
+        assert all(isinstance(x, float) for x in w_sum)
+        assert all(isinstance(x, int) for x in w_count)
+    # Aggregate per_bucket_val_ce must equal sum(window_sum) / sum(window_count)
+    # (within float tolerance) for each bucket — with ws=1 there's no cross-rank
+    # reduction so per-window is the full picture.
+    import math
+    per_bucket = result["per_bucket_val_ce"]
+    counts_total = result["val_bucket_token_counts"]
+    for b in range(4):
+        win_sum = sum(w[b] for w in sums)
+        win_cnt = sum(w[b] for w in counts)
+        assert win_cnt == counts_total[b], (
+            f"bucket {b}: per-window count {win_cnt} != aggregate {counts_total[b]}"
+        )
+        if win_cnt > 0:
+            expected = win_sum / win_cnt
+            assert math.isclose(expected, per_bucket[b], rel_tol=1e-9, abs_tol=1e-9), (
+                f"bucket {b}: per-window mean {expected} != aggregate {per_bucket[b]}"
+            )
+
+
 def test_cd_diagnostics_emitted_at_every_seat_refresh():
     mod = _load_runner_module()
     model = _TinyCDTrainModel(dim=4, vocab_size=6, num_layers=2)
@@ -2982,6 +3034,48 @@ def test_cd_diagnostics_emitted_at_every_seat_refresh():
                     "score_criticality_corr_per_layer", "event_rate_per_layer",
                     "seat_mask_fraction_per_layer"):
             assert key in snap, f"diagnostic snapshot missing {key}"
+
+
+def test_cd_loss_trajectory_logged_per_step():
+    """cd_loss is computed each step CD ingests. Runner must record
+    (step, value) pairs so we can plot the CD-loss trajectory per arm."""
+    mod = _load_runner_module()
+    model = _TinyCDTrainModel(dim=4, vocab_size=6, num_layers=2)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+    result = mod.train_fast_for_budget(
+        model,
+        train_tokens=torch.arange(256, dtype=torch.int16) % 6,
+        train_num_tokens=256, stride=4, seq_len=6, batch_size=2,
+        device=torch.device("cpu"), optimizer=optimizer,
+        budget_seconds=300.0, chunk_size=2, grad_clip_norm=0.0, fused_grad_clip=False,
+        rank=0, world_size=1, seed=123, precision="fp32",
+        stop_check_interval=1, stop_margin_seconds=0.0,
+        vocab_size=6, max_steps=8, prefetch_batches=False,
+        lm_head_backward_mode="fused_streaming_cached",
+        lm_head_emit_entropy=True,
+        criticality_distill_enabled=True,
+        criticality_distill_num_layers=2,
+        criticality_distill_dim=4,
+        criticality_distill_budget_frac=0.25,
+        criticality_distill_trace_ttl_steps=8,
+        criticality_distill_trace_half_life_steps=4.0,
+        criticality_distill_seat_refresh_interval=2,
+        criticality_distill_min_weighted_events_per_layer=0.1,
+        criticality_distill_horizon_H=2,
+        criticality_distill_event_frac=0.5,
+        criticality_distill_weight=1.0,
+    )
+    traj = result.get("criticality_distill_loss_trajectory")
+    assert traj is not None, "missing criticality_distill_loss_trajectory"
+    # At least one entry once seats are allocated (step >= seat_refresh_interval).
+    assert len(traj) >= 1
+    for entry in traj:
+        assert "step" in entry and "cd_loss" in entry
+        assert isinstance(entry["step"], int)
+        assert isinstance(entry["cd_loss"], float)
+    # Steps must be monotonically nondecreasing.
+    steps = [e["step"] for e in traj]
+    assert steps == sorted(steps)
 
 
 def test_runner_emits_topology_snapshot_when_requested():

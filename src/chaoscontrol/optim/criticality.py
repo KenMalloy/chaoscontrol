@@ -557,6 +557,11 @@ class CriticalityDistillation(nn.Module):
         score_corr: list[float] = []
         event_rate: list[float] = []
         seat_frac: list[float] = []
+        seat_indices: list[list[int]] = []
+        score_p10: list[float] = []
+        score_p50: list[float] = []
+        score_p90: list[float] = []
+        score_max: list[float] = []
         scores = self.score_from_accumulators()  # [L, D]
         current_mask = self.seat_mask
         for layer in range(self.num_layers):
@@ -604,6 +609,20 @@ class CriticalityDistillation(nn.Module):
             )
             # Seat mask fraction.
             seat_frac.append(float(cur_lmask.float().mean().item()))
+            # Seat indices (sorted ascending) so post-hoc analysis can
+            # compute seat overlap across seeds/arms.
+            seat_indices.append(
+                sorted(int(i) for i in cur_lmask.nonzero(as_tuple=True)[0].tolist())
+            )
+            # Score percentiles over all D channels for this layer. Tracks
+            # whether score signal-to-noise is sharpening over training.
+            s_layer = scores[layer].detach().to(dtype=torch.float32)
+            q = torch.tensor([0.10, 0.50, 0.90], dtype=torch.float32)
+            p10, p50, p90 = torch.quantile(s_layer, q).tolist()
+            score_p10.append(float(p10))
+            score_p50.append(float(p50))
+            score_p90.append(float(p90))
+            score_max.append(float(s_layer.max().item()))
         # Cache the current mask for next snapshot's churn calc.
         self._previous_seat_mask_snapshot = current_mask.clone()
         return {
@@ -613,6 +632,11 @@ class CriticalityDistillation(nn.Module):
             "score_criticality_corr_per_layer": score_corr,
             "event_rate_per_layer": event_rate,
             "seat_mask_fraction_per_layer": seat_frac,
+            "seat_indices_per_layer": seat_indices,
+            "score_p10_per_layer": score_p10,
+            "score_p50_per_layer": score_p50,
+            "score_p90_per_layer": score_p90,
+            "score_max_per_layer": score_max,
         }
 
     def criticality_loss(self, log_a_per_layer: list) -> torch.Tensor:
