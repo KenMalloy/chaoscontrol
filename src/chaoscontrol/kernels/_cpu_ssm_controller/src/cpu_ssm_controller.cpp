@@ -17,6 +17,7 @@
 
 #include "action_history.h"
 #include "amx_matmul.h"
+#include "avx512_recurrence.h"
 #include "controller_main.h"
 #include "cpu_features.h"
 #include "credit.h"
@@ -953,6 +954,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("amx_bf16_matmul", &chaoscontrol::amx::amx_bf16_matmul,
         pybind11::arg("a"), pybind11::arg("b"),
         "Single-tile AMX BF16 matmul: bfloat16 CPU [M,K] x [K,N] -> float32 [M,N]");
+  m.def("avx512_recurrence_kernel_available",
+        &chaoscontrol::avx512::avx512_recurrence_kernel_available,
+        "Whether this extension build includes the opt-in AVX-512 recurrence kernel");
+  m.def("avx512_diagonal_recurrence",
+        &chaoscontrol::avx512::avx512_diagonal_recurrence,
+        pybind11::arg("decay"), pybind11::arg("x"), pybind11::arg("h"),
+        "In-place AVX-512 diagonal recurrence: h = decay * h + x");
   m.def("backend_name", &backend_name, "Compiled backend name");
   m.def("wire_event_sizes", &wire_event_sizes,
         "Byte sizes of WriteEvent / QueryEvent / ReplayOutcome wire structs");

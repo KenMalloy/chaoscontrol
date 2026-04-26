@@ -109,6 +109,14 @@ amx_bf16_matmul = (
     getattr(_C, "amx_bf16_matmul", _missing_extension)
     if _C is not None else _missing_extension
 )
+avx512_recurrence_kernel_available = (
+    getattr(_C, "avx512_recurrence_kernel_available", _missing_extension)
+    if _C is not None else _missing_extension
+)
+avx512_diagonal_recurrence = (
+    getattr(_C, "avx512_diagonal_recurrence", _missing_extension)
+    if _C is not None else _missing_extension
+)
 ActionHistoryEntry = (
     getattr(_C, "ActionHistoryEntry", _missing_extension)
     if _C is not None else _missing_extension
@@ -183,6 +191,8 @@ __all__ = [
     "has_amx_bf16",
     "amx_bf16_kernel_available",
     "amx_bf16_matmul",
+    "avx512_recurrence_kernel_available",
+    "avx512_diagonal_recurrence",
     "ActionHistoryEntry",
     "PerSlotActionHistory",
     "SpscRingU64x1024",
