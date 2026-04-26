@@ -1,0 +1,2 @@
+[rank 0/1] exp24_cd_multiseed_telemetry_s17 vocab=16384 batch=1024 chunk=64 ckpt=False params=10,751,232
+[rank 0/1] done steps=2468 tok/s=2162016 loss=3.8796 vram=54709.8MB
