@@ -171,6 +171,17 @@ def test_simplex_forward_softmax_stability():
 
 @pytest.mark.parametrize("seed", [0, 1, 2, 3, 4])
 def test_simplex_forward_matches_python_reference(seed: int):
+    # Tight tolerance is the at::matmul-path contract. On hosts where the
+    # AMX BF16 dispatch is live, the three forward GEMMs round-trip through
+    # bf16 and lose ~1e-2 of precision; the AMX-path parity test below
+    # carries the looser tolerance. To keep this test honest as the strict
+    # reference, skip it when the dispatch would route through AMX.
+    if _ext.amx_bf16_kernel_available() and _ext.has_amx_bf16():
+        pytest.skip(
+            "AMX BF16 dispatch is live; tight 1e-4 tolerance is covered by "
+            "the bf16-loose AMX-path parity test"
+        )
+
     weights = _make_weights(seed=seed)
     V, E, s = _make_inputs(seed=seed)
     cpp = _call_simplex_forward(weights, V, E, s)
@@ -187,6 +198,42 @@ def test_simplex_forward_matches_python_reference(seed: int):
     np.testing.assert_allclose(cpp_vertex_h, ref["vertex_h"], atol=1e-4, rtol=1e-4)
     np.testing.assert_allclose(cpp_mixed_h, ref["mixed_h"], atol=1e-4, rtol=1e-4)
     np.testing.assert_allclose(cpp_attn, ref["attn"], atol=1e-4, rtol=1e-4)
+
+
+@pytest.mark.parametrize("seed", [0, 1, 2, 3, 4])
+def test_simplex_forward_matches_python_reference_amx_bf16_path(seed: int):
+    """Hardware-gated parity for the AMX BF16 dispatch path.
+
+    The forward GEMMs (V@W_vp, vh@vh.T, mh@W_lh) bf16-cast inputs before
+    handing them to the tiled AMX kernel. The fp32 NumPy reference does
+    the same multiply at full precision, so the worst-case drift is the
+    bf16 round-trip plus the chained accumulation across 16- to 32-wide
+    K dimensions. atol/rtol of 1e-2 is the bf16 ULP-equivalent slack
+    that mirrors `tests/test_amx_matmul.py`'s tolerance for the same
+    kernel — both target Sapphire Rapids.
+
+    Skipped on arm64 / non-AMX builds where the dispatch falls through
+    to at::matmul; the strict 1e-4 test above covers that path.
+    """
+    if not (_ext.amx_bf16_kernel_available() and _ext.has_amx_bf16()):
+        pytest.skip("AMX BF16 hardware/OS state and compiled kernel are required")
+
+    weights = _make_weights(seed=seed)
+    V, E, s = _make_inputs(seed=seed)
+    cpp = _call_simplex_forward(weights, V, E, s)
+    ref = _python_simplex_forward(weights, V, E, s)
+
+    cpp_logits = np.asarray(cpp.logits, dtype=np.float32)
+    cpp_p = np.asarray(cpp.p, dtype=np.float32)
+    cpp_vertex_h = np.asarray(cpp.vertex_h, dtype=np.float32).reshape(weights.N, weights.H)
+    cpp_mixed_h = np.asarray(cpp.mixed_h, dtype=np.float32).reshape(weights.N, weights.H)
+    cpp_attn = np.asarray(cpp.attn, dtype=np.float32).reshape(weights.N, weights.N)
+
+    np.testing.assert_allclose(cpp_logits, ref["logits"], atol=1e-2, rtol=1e-2)
+    np.testing.assert_allclose(cpp_p, ref["p"], atol=1e-2, rtol=1e-2)
+    np.testing.assert_allclose(cpp_vertex_h, ref["vertex_h"], atol=1e-2, rtol=1e-2)
+    np.testing.assert_allclose(cpp_mixed_h, ref["mixed_h"], atol=1e-2, rtol=1e-2)
+    np.testing.assert_allclose(cpp_attn, ref["attn"], atol=1e-2, rtol=1e-2)
 
 
 def test_simplex_forward_alpha_zero_recovers_per_vertex_softmax():

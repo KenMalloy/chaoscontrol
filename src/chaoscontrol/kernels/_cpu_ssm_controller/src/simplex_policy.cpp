@@ -9,12 +9,18 @@
 #include <limits>
 #include <vector>
 
+#include "amx_matmul.h"
+#include "cpu_features.h"
+
 // Phase S1 — see simplex_policy.h for surface contract and the design doc
 // (docs/plans/2026-04-26-simplex-controller-design.md, "Forward architecture")
 // for the math. Three layers: vertex projection (Layer 1), edge-aware mixing
-// (Layer 2), logit head + simplex bias (Layer 3). All GEMMs route through
-// at::matmul; the AMX fast-path lands in a follow-up commit once correctness
-// is pinned on arm64.
+// (Layer 2), logit head + simplex bias (Layer 3). The three forward GEMMs
+// (V@W_vp, vh@vh.T, mh@W_lh) dispatch through the AMX BF16 tiled kernel
+// when the build includes it and the runtime has AMX state; otherwise they
+// fall through to at::matmul. The Layer-2 attention-mix GEMM (attn @ vh)
+// stays on at::matmul for now — its shape (16,16)@(16,32) is naturally
+// AMX-aligned and is a follow-up.
 
 namespace chaoscontrol::simplex {
 
@@ -72,20 +78,36 @@ at::Tensor view_2d(const std::vector<float>& v, int64_t rows, int64_t cols) {
       at::TensorOptions().dtype(at::kFloat).device(at::kCPU));
 }
 
-at::Tensor view_1d(const std::vector<float>& v, int64_t n) {
-  return at::from_blob(
-      const_cast<float*>(v.data()),
-      {n},
-      at::TensorOptions().dtype(at::kFloat).device(at::kCPU));
+// AMX-aware GEMM dispatch. Inputs are fp32 contiguous CPU tensors with the
+// inner dim matching (a: M x K, b: K x N). When the AMX BF16 kernel is built
+// in AND the runtime has AMX tile state AND the shapes are kernel-friendly
+// (positive dims, K even for bf16 dot pairs, both operands contiguous), we
+// bf16-cast and dispatch to the tiled kernel. Otherwise we fall through to
+// at::matmul. The CPUID + XCR0 read inside runtime_has_amx_bf16() is cheap
+// (tens of ns) but redundant per-call; caching at the call site is a follow-
+// up. Returns a fp32 contiguous tensor of shape (M, N) on either path so
+// downstream code can memcpy it without branching on which path served the
+// GEMM.
+at::Tensor matmul_dispatch(const at::Tensor& a, const at::Tensor& b) {
+  if (chaoscontrol::amx::amx_bf16_kernel_available() &&
+      chaoscontrol::cpu_features::runtime_has_amx_bf16() &&
+      a.dim() == 2 && b.dim() == 2 &&
+      a.is_contiguous() && b.is_contiguous() &&
+      a.size(0) > 0 && a.size(1) > 0 && b.size(1) > 0 &&
+      a.size(1) == b.size(0) &&
+      (a.size(1) % 2) == 0) {  // K must be even for BF16 dot pairs
+    return chaoscontrol::amx::amx_bf16_matmul(
+        a.to(at::kBFloat16), b.to(at::kBFloat16));
+  }
+  return at::matmul(a, b).contiguous();
 }
 
-// at::matmul into a contiguous fp32 result; copy out to a new vector. The
-// result is materialized into the output struct so SimplexForwardOutput is a
-// pure-C++ POD that doesn't pin a torch reference past return. Cost: one
-// extra copy per GEMM (tens to hundreds of bytes for these shapes — the
-// AMX-tile-natural N=16 case is dominated by the GEMM itself, not the copy).
+// matmul_dispatch wrapper that copies the result into a flat std::vector.
+// SimplexForwardOutput is a pure-C++ POD that doesn't pin a torch reference
+// past return; the copy cost (tens to hundreds of bytes for these shapes)
+// is dominated by the GEMM itself.
 std::vector<float> matmul_to_vec(const at::Tensor& a, const at::Tensor& b) {
-  at::Tensor out = at::matmul(a, b).contiguous();
+  at::Tensor out = matmul_dispatch(a, b);
   std::vector<float> result(static_cast<std::size_t>(out.numel()));
   std::memcpy(
       result.data(),
@@ -165,10 +187,12 @@ SimplexForwardOutput simplex_forward(
   // mixed_h[i]        = sum_j attn[i, j] * vertex_h[j]   then + vertex_h (residual)
   {
     at::Tensor vh_t = view_2d(out.vertex_h, N, H);
-    // vh_t @ vh_t.T -> [N, N] of dot products. at::matmul handles the
-    // transpose-then-multiply via the second operand's stride; .contiguous()
-    // ensures the materialized result is row-major before we read it.
-    at::Tensor dots_t = at::matmul(vh_t, vh_t.t()).contiguous();
+    // vh_t @ vh_t.T -> [N, N] of dot products. Materialize the transpose
+    // into a contiguous buffer so matmul_dispatch can route through the
+    // AMX kernel (which requires both operands contiguous). On arm64 /
+    // non-AMX hosts the dispatch falls through to at::matmul anyway.
+    at::Tensor vh_t_t = vh_t.t().contiguous();
+    at::Tensor dots_t = matmul_dispatch(vh_t, vh_t_t);
     const float* dots = dots_t.data_ptr<float>();
     const float scale = 1.0f / std::sqrt(static_cast<float>(H));
     const float alpha = weights.alpha;
@@ -201,9 +225,13 @@ SimplexForwardOutput simplex_forward(
   // p = softmax((logits + simplex_bias) / T)
   {
     at::Tensor mh_t = view_2d(out.mixed_h, N, H);
-    at::Tensor wlh_t = view_1d(weights.W_lh, H);
-    // matmul of (N, H) @ (H,) returns shape (N,).
-    at::Tensor logits_t = at::matmul(mh_t, wlh_t).contiguous();
+    // Shape W_lh as (H, 1) so matmul_dispatch can engage on AMX hosts;
+    // the dispatch helper requires 2D operands, and the result is (N, 1)
+    // contiguous fp32 — equivalent under flatten to the (N,) form.
+    // N=1 wastes the AMX N-axis (one tile column populated of 16) but
+    // the head GEMM is small and correctness is identical.
+    at::Tensor wlh_t = view_2d(weights.W_lh, H, 1);
+    at::Tensor logits_t = matmul_dispatch(mh_t, wlh_t);
     std::memcpy(
         out.logits.data(),
         logits_t.data_ptr<float>(),
