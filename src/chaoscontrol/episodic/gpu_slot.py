@@ -59,7 +59,23 @@ def slot_dim(*, span_length: int, key_rep_dim: int) -> int:
         raise ValueError(
             f"key_rep_dim must be positive; got {key_rep_dim}"
         )
-    return SLOT_DIM_BASE + 2 * int(span_length) + 2 * int(key_rep_dim)
+    width = SLOT_DIM_BASE + 2 * int(span_length) + 2 * int(key_rep_dim)
+    # ``slot_dim`` MUST stay even. Each row in a ``[K_max, slot_dim]``
+    # tensor starts at offset ``k * slot_dim * 4`` bytes; for the int64
+    # reinterpret (``slot[i:i+2].view(torch.int64)``) to land on an
+    # 8-byte boundary at every ``k``, ``slot_dim`` must be even.
+    # Adding a single fp32 field to the layout would silently misalign
+    # odd-numbered slots — depending on GPU arch and PyTorch version,
+    # this either reads garbage or hard-faults. If you ever extend the
+    # slot, either add fields in pairs or pad to keep ``slot_dim`` even.
+    if width % 2 != 0:
+        raise AssertionError(
+            f"slot_dim must be even (got {width}); int64 reinterpret "
+            "requires every row to start on an 8-byte boundary inside "
+            "the [K_max, slot_dim] tensor. Add fields in pairs or pad "
+            "to keep the total even."
+        )
+    return width
 
 
 def make_slot_tensor(

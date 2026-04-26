@@ -61,6 +61,29 @@ def test_slot_dim_rejects_non_positive() -> None:
         slot_dim(span_length=-1, key_rep_dim=4)
 
 
+def test_slot_dim_must_be_even_for_int64_alignment() -> None:
+    """Pin the alignment invariant: ``slot_dim`` MUST be even so that
+    every row in a ``[K_max, slot_dim]`` tensor starts on an 8-byte
+    boundary, which is what ``slot[i:i+2].view(torch.int64)`` requires
+    at every ``k``. The formula ``SLOT_DIM_BASE + 2*S + 2*D`` is
+    structurally even today (SLOT_DIM_BASE=6, plus 2*anything is even).
+    The guard in ``slot_dim`` is what prevents a future editor from
+    silently breaking int64 reinterpret on odd ``k`` by adding an
+    unpaired fp32 field.
+
+    This test sweeps a range of (S, D) pairs to confirm the formula
+    stays even, and pins SLOT_DIM_BASE itself as even.
+    """
+    assert SLOT_DIM_BASE % 2 == 0, (
+        "SLOT_DIM_BASE must be even; the int64 alignment guard relies "
+        "on the entire slot_dim staying even"
+    )
+    for s in (1, 2, 4, 8, 13, 16):
+        for d in (1, 2, 4, 16, 64, 128, 256, 257):
+            width = slot_dim(span_length=s, key_rep_dim=d)
+            assert width % 2 == 0, f"slot_dim(S={s}, D={d}) = {width} (odd)"
+
+
 # ---------------------------------------------------------------------------
 # Test 2: pack/unpack round trip
 # ---------------------------------------------------------------------------
