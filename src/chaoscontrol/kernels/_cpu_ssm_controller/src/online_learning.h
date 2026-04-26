@@ -97,6 +97,13 @@ class OnlineLearningController {
   uint32_t sgd_interval_;
   uint32_t actions_since_sgd_ = 0;
   bool weights_initialized_ = false;
+  // Cached at construction so the per-event hot path skips the CPUID/XCR0
+  // dance per replay. Resolves to true on Sapphire Rapids when the build
+  // included the AVX-512 matops kernel and the OS has AVX-512 state
+  // enabled; false on arm64 / non-AVX-512 hosts. Determines whether
+  // accumulate_backward routes through the AVX-512 raw kernels or the
+  // scalar reference.
+  bool use_avx512_matops_ = false;
   OnlineLearningWeights fast_weights_;
   OnlineLearningWeights slow_weights_;
   OnlineLearningWeights grad_weights_;

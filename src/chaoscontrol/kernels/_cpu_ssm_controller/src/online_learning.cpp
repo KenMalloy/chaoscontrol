@@ -6,6 +6,9 @@
 #include <string>
 #include <utility>
 
+#include "avx512_matops.h"
+#include "cpu_features.h"
+
 namespace {
 
 std::size_t checked_matrix_size(
@@ -75,6 +78,9 @@ OnlineLearningController::OnlineLearningController(
     throw std::invalid_argument(
         "OnlineLearningController sgd_interval must be > 0");
   }
+  use_avx512_matops_ =
+      chaoscontrol::avx512::avx512_matops_kernel_available() &&
+      chaoscontrol::cpu_features::runtime_has_avx512f();
 }
 
 void OnlineLearningController::on_write(const WriteEvent&) {
@@ -315,22 +321,46 @@ void OnlineLearningController::accumulate_backward(
   std::vector<float> out_global(gdim, 0.0f);
   std::vector<float> out_slot(sdim, 0.0f);
 
-  for (uint32_t i = 0; i < gdim; ++i) {
-    float out = fast_weights_.decay_global[i] * entry.global_state[i];
-    const std::size_t row = static_cast<std::size_t>(i) * fdim;
-    for (uint32_t j = 0; j < fdim; ++j) {
-      out += fast_weights_.w_global_in[row + j] * entry.features[j];
+  // Forward matvec with diagonal recurrence baked in:
+  //   out_global[i] = decay_global[i] * global_state[i] + sum_j(w_global_in[i, j] * features[j])
+  // AVX-512 path collapses 64 scalar ops per row into 4 _mm512_fmadd_ps +
+  // 1 horizontal reduce on Sapphire Rapids; on arm64 / non-AVX-512 hosts
+  // the scalar fallback is mathematically identical.
+  if (use_avx512_matops_) {
+    chaoscontrol::avx512::avx512_matvec_fma_with_decay_raw(
+        fast_weights_.w_global_in.data(),
+        fast_weights_.decay_global.data(),
+        entry.global_state.data(),
+        entry.features.data(),
+        out_global.data(),
+        gdim,
+        fdim);
+    chaoscontrol::avx512::avx512_matvec_fma_with_decay_raw(
+        fast_weights_.w_slot_in.data(),
+        fast_weights_.decay_slot.data(),
+        entry.slot_state.data(),
+        entry.features.data(),
+        out_slot.data(),
+        sdim,
+        fdim);
+  } else {
+    for (uint32_t i = 0; i < gdim; ++i) {
+      float out = fast_weights_.decay_global[i] * entry.global_state[i];
+      const std::size_t row = static_cast<std::size_t>(i) * fdim;
+      for (uint32_t j = 0; j < fdim; ++j) {
+        out += fast_weights_.w_global_in[row + j] * entry.features[j];
+      }
+      out_global[i] = out;
     }
-    out_global[i] = out;
-  }
 
-  for (uint32_t i = 0; i < sdim; ++i) {
-    float out = fast_weights_.decay_slot[i] * entry.slot_state[i];
-    const std::size_t row = static_cast<std::size_t>(i) * fdim;
-    for (uint32_t j = 0; j < fdim; ++j) {
-      out += fast_weights_.w_slot_in[row + j] * entry.features[j];
+    for (uint32_t i = 0; i < sdim; ++i) {
+      float out = fast_weights_.decay_slot[i] * entry.slot_state[i];
+      const std::size_t row = static_cast<std::size_t>(i) * fdim;
+      for (uint32_t j = 0; j < fdim; ++j) {
+        out += fast_weights_.w_slot_in[row + j] * entry.features[j];
+      }
+      out_slot[i] = out;
     }
-    out_slot[i] = out;
   }
 
   // Positive credit should increase the future selection logit; SGD minimizes,
@@ -338,13 +368,25 @@ void OnlineLearningController::accumulate_backward(
   const float upstream = -credit;
   grad_weights_.bias += upstream;
 
+  // Backward outer-product accumulation:
+  //   grad_w_in[i, j] += grad_out * features[j]
+  // Per row, that's a scaled axpy over the feature dim. AVX-512 axpy is
+  // 4 _mm512_fmadd_ps for fdim=64; scalar fallback is the same math.
   for (uint32_t i = 0; i < gdim; ++i) {
     const float grad_out = upstream * fast_weights_.w_global_out[i];
     grad_weights_.w_global_out[i] += upstream * out_global[i];
     grad_weights_.decay_global[i] += grad_out * entry.global_state[i];
     const std::size_t row = static_cast<std::size_t>(i) * fdim;
-    for (uint32_t j = 0; j < fdim; ++j) {
-      grad_weights_.w_global_in[row + j] += grad_out * entry.features[j];
+    if (use_avx512_matops_) {
+      chaoscontrol::avx512::avx512_axpy_fma_raw(
+          grad_out,
+          entry.features.data(),
+          grad_weights_.w_global_in.data() + row,
+          fdim);
+    } else {
+      for (uint32_t j = 0; j < fdim; ++j) {
+        grad_weights_.w_global_in[row + j] += grad_out * entry.features[j];
+      }
     }
   }
 
@@ -353,8 +395,16 @@ void OnlineLearningController::accumulate_backward(
     grad_weights_.w_slot_out[i] += upstream * out_slot[i];
     grad_weights_.decay_slot[i] += grad_out * entry.slot_state[i];
     const std::size_t row = static_cast<std::size_t>(i) * fdim;
-    for (uint32_t j = 0; j < fdim; ++j) {
-      grad_weights_.w_slot_in[row + j] += grad_out * entry.features[j];
+    if (use_avx512_matops_) {
+      chaoscontrol::avx512::avx512_axpy_fma_raw(
+          grad_out,
+          entry.features.data(),
+          grad_weights_.w_slot_in.data() + row,
+          fdim);
+    } else {
+      for (uint32_t j = 0; j < fdim; ++j) {
+        grad_weights_.w_slot_in[row + j] += grad_out * entry.features[j];
+      }
     }
   }
 }
