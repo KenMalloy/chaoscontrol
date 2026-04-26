@@ -143,6 +143,16 @@ class CpuSsmControllerStep:
     logit: torch.Tensor
 
 
+@dataclass(frozen=True)
+class CpuSsmControllerDecision:
+    """Decision-time inputs needed for delayed replay credit."""
+
+    features: torch.Tensor
+    global_state: torch.Tensor
+    slot_state: torch.Tensor
+    logit: torch.Tensor
+
+
 class CpuSsmControllerRuntime:
     """Mutable controller state for online scoring.
 
@@ -168,22 +178,36 @@ class CpuSsmControllerRuntime:
             int(capacity), weights.slot_dim, dtype=torch.float32,
         )
 
-    def score_slot(self, features: torch.Tensor, *, slot: int) -> torch.Tensor:
+    def score_slot_with_snapshot(
+        self,
+        features: torch.Tensor,
+        *,
+        slot: int,
+    ) -> CpuSsmControllerDecision:
         if not 0 <= int(slot) < int(self.slot_state.shape[0]):
             raise IndexError(f"slot {slot} out of range")
+        f = _cpu_f32(features, expected_shape=(self.weights.feature_dim,))
         state = CpuSsmControllerState(
-            global_state=self.global_state,
-            slot_state=self.slot_state[int(slot)],
+            global_state=self.global_state.clone(),
+            slot_state=self.slot_state[int(slot)].clone(),
         )
         out = forward_step(
-            features,
+            f,
             state,
             self.weights,
             prefer_cpp=self.prefer_cpp,
         )
         self.global_state.copy_(out.global_state)
         self.slot_state[int(slot)].copy_(out.slot_state)
-        return out.logit
+        return CpuSsmControllerDecision(
+            features=f.clone(),
+            global_state=state.global_state,
+            slot_state=state.slot_state,
+            logit=out.logit,
+        )
+
+    def score_slot(self, features: torch.Tensor, *, slot: int) -> torch.Tensor:
+        return self.score_slot_with_snapshot(features, slot=slot).logit
 
 
 def cpp_available() -> bool:

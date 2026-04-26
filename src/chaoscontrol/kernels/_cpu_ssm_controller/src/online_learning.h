@@ -14,6 +14,7 @@ struct OnlineLearningTelemetry {
   uint64_t history_appends = 0;
   uint64_t credited_actions = 0;
   uint64_t nonzero_credit_actions = 0;
+  uint64_t backward_ready_actions = 0;
   uint64_t backward_skipped_missing_state = 0;
   uint64_t invalid_slot_skips = 0;
   uint64_t sgd_steps = 0;
@@ -31,6 +32,15 @@ class OnlineLearningController {
   void on_write(const WriteEvent& ev);
   void on_query(const QueryEvent& ev);
   void on_replay_outcome(const ReplayOutcome& ev);
+  void record_replay_selection(
+      uint32_t slot_id,
+      uint64_t gpu_step,
+      uint32_t policy_version,
+      float output_logit,
+      uint8_t selected_rank,
+      std::vector<float> features,
+      std::vector<float> global_state,
+      std::vector<float> slot_state);
 
   const std::vector<ActionHistoryEntry>& history(uint32_t slot_id) const;
   const OnlineLearningTelemetry& telemetry() const;

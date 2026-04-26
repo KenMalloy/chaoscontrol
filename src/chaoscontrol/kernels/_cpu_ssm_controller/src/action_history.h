@@ -11,6 +11,7 @@ struct ActionHistoryEntry {
   float output_logit = 0.0f;
   uint8_t selected_rank = 0;
   uint32_t neighbor_slot = 0;
+  std::vector<float> features;
   std::vector<float> global_state;
   std::vector<float> slot_state;
 };

@@ -46,6 +46,7 @@ from __future__ import annotations
 import threading
 import time
 
+import pytest
 import torch
 
 from chaoscontrol.episodic.controller import (
@@ -342,6 +343,128 @@ def test_controller_main_uses_optional_runtime_for_controller_logit():
     assert len(runtime.calls) == 1
     assert tags[0]["teacher_score"] == tags[0]["score"]
     assert tags[0]["controller_logit"] == 100.0
+
+
+def test_controller_main_serializes_runtime_snapshots_without_tensors():
+    """Runtime-backed tags must carry delayed-learning snapshots as plain
+    Python lists, not tensors that can keep device memory alive.
+    """
+    from chaoscontrol.episodic.cpu_ssm_controller import (
+        CpuSsmControllerRuntime,
+        CpuSsmControllerWeights,
+    )
+
+    weights = CpuSsmControllerWeights(
+        w_global_in=torch.tensor(
+            [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0]],
+            dtype=torch.float32,
+        ),
+        w_slot_in=torch.tensor([[0.0, 0.0, 1.0, 0.0]], dtype=torch.float32),
+        decay_global=torch.tensor([0.5, 0.25], dtype=torch.float32),
+        decay_slot=torch.tensor([0.75], dtype=torch.float32),
+        w_global_out=torch.tensor([1.0, 2.0], dtype=torch.float32),
+        w_slot_out=torch.tensor([3.0], dtype=torch.float32),
+        bias=torch.tensor(0.0, dtype=torch.float32),
+    )
+    runtime = CpuSsmControllerRuntime(weights, capacity=2, prefer_cpp=False)
+    runtime.global_state.copy_(torch.tensor([4.0, 5.0], dtype=torch.float32))
+    runtime.slot_state[0].copy_(torch.tensor([6.0], dtype=torch.float32))
+
+    cache = _make_cache(capacity=2, key_rep_dim=4)
+    _populate_cache(
+        cache,
+        key_reps=[torch.tensor([1.0, 0.0, 0.0, 0.0])],
+        utilities=[0.5],
+    )
+    tags: list[dict] = []
+    run_controller_cycle(
+        controller_query_queue=[{
+            "step": 1,
+            "rank": 0,
+            "k": 0,
+            "pressure": 0.25,
+            "residual": torch.tensor([1.0, 0.0, 0.0, 0.0]),
+        }],
+        tagged_replay_queue=tags,
+        cache=cache,
+        k=1,
+        score_mode="cosine_utility_weighted",
+        controller_runtime=runtime,
+    )
+
+    assert len(tags) == 1
+    tag = tags[0]
+    assert tag["controller_features"] == pytest.approx([0.5, 0.25, 0.5, 0.0])
+    assert tag["controller_global_state"] == pytest.approx([4.0, 5.0])
+    assert tag["controller_slot_state"] == pytest.approx([6.0])
+    for value in tag.values():
+        assert not isinstance(value, torch.Tensor)
+
+
+def test_controller_main_records_snapshot_to_action_history_recorder():
+    from chaoscontrol.episodic.cpu_ssm_controller import (
+        CpuSsmControllerRuntime,
+        CpuSsmControllerWeights,
+    )
+
+    class RecorderStub:
+        def __init__(self) -> None:
+            self.calls: list[dict] = []
+
+        def record_replay_selection(self, **kwargs) -> None:
+            self.calls.append(kwargs)
+
+    weights = CpuSsmControllerWeights(
+        w_global_in=torch.eye(2, 4, dtype=torch.float32),
+        w_slot_in=torch.tensor([[0.0, 0.0, 1.0, 0.0]], dtype=torch.float32),
+        decay_global=torch.ones(2, dtype=torch.float32),
+        decay_slot=torch.ones(1, dtype=torch.float32),
+        w_global_out=torch.ones(2, dtype=torch.float32),
+        w_slot_out=torch.ones(1, dtype=torch.float32),
+        bias=torch.tensor(0.0, dtype=torch.float32),
+    )
+    runtime = CpuSsmControllerRuntime(weights, capacity=2, prefer_cpp=False)
+    runtime.global_state.copy_(torch.tensor([1.0, 2.0], dtype=torch.float32))
+    runtime.slot_state[0].copy_(torch.tensor([3.0], dtype=torch.float32))
+    recorder = RecorderStub()
+
+    cache = _make_cache(capacity=2, key_rep_dim=4)
+    _populate_cache(
+        cache,
+        key_reps=[torch.tensor([1.0, 0.0, 0.0, 0.0])],
+        utilities=[0.5],
+    )
+    tags: list[dict] = []
+    run_controller_cycle(
+        controller_query_queue=[{
+            "step": 1,
+            "rank": 0,
+            "k": 0,
+            "pressure": 0.25,
+            "residual": torch.tensor([1.0, 0.0, 0.0, 0.0]),
+        }],
+        tagged_replay_queue=tags,
+        cache=cache,
+        k=1,
+        score_mode="cosine_utility_weighted",
+        selected_at=77,
+        policy_version=9,
+        controller_runtime=runtime,
+        action_recorder=recorder,
+    )
+
+    assert len(recorder.calls) == 1
+    call = recorder.calls[0]
+    assert call["slot_id"] == tags[0]["slot"]
+    assert call["gpu_step"] == 77
+    assert call["policy_version"] == 9
+    assert call["output_logit"] == pytest.approx(tags[0]["controller_logit"])
+    assert call["selected_rank"] == 0
+    assert call["features"] == pytest.approx(tags[0]["controller_features"])
+    assert call["global_state"] == pytest.approx(
+        tags[0]["controller_global_state"]
+    )
+    assert call["slot_state"] == pytest.approx(tags[0]["controller_slot_state"])
 
 
 def test_controller_thread_starts_and_stops_cleanly():

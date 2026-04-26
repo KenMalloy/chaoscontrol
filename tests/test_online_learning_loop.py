@@ -1,10 +1,4 @@
-"""Online learning loop skeleton for CPU SSM controller C10.
-
-The current wire events do not carry saved controller hidden states, so C10
-must be honest: replay outcomes can append replay-selection history and
-compute credit for prior selections, but the backward pass is skipped until a
-future event schema supplies checkpoints.
-"""
+"""Online learning loop for CPU SSM controller C10."""
 from __future__ import annotations
 
 import math
@@ -115,3 +109,35 @@ def test_online_learning_skips_out_of_range_slot_without_throwing():
     assert telemetry["invalid_slot_skips"] == 1
     assert telemetry["history_appends"] == 0
     assert controller.history(0) == []
+
+
+def test_online_learning_records_stateful_selection_for_delayed_backward():
+    controller = _ext.OnlineLearningController(
+        num_slots=4,
+        max_entries_per_slot=8,
+        gamma=0.995,
+        gerber_c=0.5,
+    )
+
+    controller.record_replay_selection(
+        slot_id=1,
+        gpu_step=90,
+        policy_version=7,
+        output_logit=0.75,
+        selected_rank=0,
+        features=[0.5, 0.25, 0.5, 0.0],
+        global_state=[1.0, -1.0],
+        slot_state=[2.0],
+    )
+    controller.on_replay_outcome(_replay_outcome(2, gpu_step=120, selection_step=110))
+
+    history = controller.history(1)
+    assert [entry.gpu_step for entry in history] == [110, 90]
+    assert history[1].features == pytest.approx([0.5, 0.25, 0.5, 0.0])
+    assert history[1].global_state == pytest.approx([1.0, -1.0])
+    assert history[1].slot_state == pytest.approx([2.0])
+
+    telemetry = controller.telemetry()
+    assert telemetry["nonzero_credit_actions"] == 1
+    assert telemetry["backward_ready_actions"] == 1
+    assert telemetry["backward_skipped_missing_state"] == 0

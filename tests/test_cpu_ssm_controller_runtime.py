@@ -12,6 +12,7 @@ import pytest
 import torch
 
 from chaoscontrol.episodic.cpu_ssm_controller import (
+    CpuSsmControllerDecision,
     CpuSsmControllerRuntime,
     CpuSsmControllerState,
     CpuSsmControllerWeights,
@@ -120,6 +121,53 @@ def test_runtime_tracks_global_and_per_slot_state_independently():
     assert not torch.equal(runtime.global_state, torch.zeros_like(runtime.global_state))
     assert torch.equal(runtime.slot_state[0], slot0_after_first)
     assert not torch.equal(runtime.slot_state[1], slot1_initial)
+
+
+def test_runtime_score_slot_with_snapshot_returns_pre_update_state():
+    weights = _weights()
+    runtime = CpuSsmControllerRuntime(weights, capacity=2, prefer_cpp=False)
+    runtime.global_state.copy_(torch.tensor([1.0, -1.0], dtype=torch.float32))
+    runtime.slot_state[1].copy_(torch.tensor([2.0], dtype=torch.float32))
+    features = torch.tensor([2.0, 3.0, 4.0], dtype=torch.float32)
+
+    decision = runtime.score_slot_with_snapshot(features, slot=1)
+
+    assert isinstance(decision, CpuSsmControllerDecision)
+    torch.testing.assert_close(decision.features, features)
+    torch.testing.assert_close(
+        decision.global_state,
+        torch.tensor([1.0, -1.0], dtype=torch.float32),
+    )
+    torch.testing.assert_close(
+        decision.slot_state,
+        torch.tensor([2.0], dtype=torch.float32),
+    )
+
+    expected = forward_step(
+        features,
+        CpuSsmControllerState(
+            global_state=decision.global_state,
+            slot_state=decision.slot_state,
+        ),
+        weights,
+        prefer_cpp=False,
+    )
+    torch.testing.assert_close(decision.logit, expected.logit)
+    torch.testing.assert_close(runtime.global_state, expected.global_state)
+    torch.testing.assert_close(runtime.slot_state[1], expected.slot_state)
+
+    # The snapshot must be detached from the mutable runtime buffers; C10 uses
+    # it later for delayed replay credit after the runtime has advanced.
+    runtime.global_state.zero_()
+    runtime.slot_state[1].zero_()
+    torch.testing.assert_close(
+        decision.global_state,
+        torch.tensor([1.0, -1.0], dtype=torch.float32),
+    )
+    torch.testing.assert_close(
+        decision.slot_state,
+        torch.tensor([2.0], dtype=torch.float32),
+    )
 
 
 def test_runtime_raises_when_weights_path_missing_for_trained_mode():

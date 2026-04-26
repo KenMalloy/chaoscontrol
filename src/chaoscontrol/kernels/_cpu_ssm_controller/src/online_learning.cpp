@@ -1,6 +1,7 @@
 #include "online_learning.h"
 
 #include <cmath>
+#include <utility>
 
 OnlineLearningController::OnlineLearningController(
     uint32_t num_slots,
@@ -52,13 +53,15 @@ void OnlineLearningController::on_replay_outcome(const ReplayOutcome& ev) {
     }
     ++telemetry_.nonzero_credit_actions;
     last_credit_sum_ += action.credit;
-    if (action.entry.global_state.empty() || action.entry.slot_state.empty()) {
-      // Current wire events do not carry saved controller hidden states. C10
-      // records honest credit flow and skips the C7 backward pass until those
-      // checkpoints exist on the event stream.
+    if (action.entry.features.empty() || action.entry.global_state.empty() ||
+        action.entry.slot_state.empty()) {
+      // Backward needs the exact decision-time input and recurrent state.
+      // Legacy replay selections still arrive without those checkpoints, so
+      // keep the skip visible rather than pretending SGD happened.
       ++telemetry_.backward_skipped_missing_state;
       continue;
     }
+    ++telemetry_.backward_ready_actions;
   }
 
   append_replay_selection(ev);
@@ -80,6 +83,29 @@ const OnlineLearningTelemetry& OnlineLearningController::telemetry() const {
 
 float OnlineLearningController::last_credit_sum() const {
   return last_credit_sum_;
+}
+
+void OnlineLearningController::record_replay_selection(
+    uint32_t slot_id,
+    uint64_t gpu_step,
+    uint32_t policy_version,
+    float output_logit,
+    uint8_t selected_rank,
+    std::vector<float> features,
+    std::vector<float> global_state,
+    std::vector<float> slot_state) {
+  ActionHistoryEntry entry;
+  entry.action_type = 1;
+  entry.gpu_step = gpu_step;
+  entry.policy_version = policy_version;
+  entry.output_logit = output_logit;
+  entry.selected_rank = selected_rank;
+  entry.neighbor_slot = 0;
+  entry.features = std::move(features);
+  entry.global_state = std::move(global_state);
+  entry.slot_state = std::move(slot_state);
+  history_.append(slot_id, std::move(entry));
+  ++telemetry_.history_appends;
 }
 
 std::vector<float> OnlineLearningController::sigma_by_action_type() const {

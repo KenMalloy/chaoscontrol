@@ -998,6 +998,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def_readwrite("output_logit", &ActionHistoryEntry::output_logit)
       .def_readwrite("selected_rank", &ActionHistoryEntry::selected_rank)
       .def_readwrite("neighbor_slot", &ActionHistoryEntry::neighbor_slot)
+      .def_readwrite("features", &ActionHistoryEntry::features)
       .def_readwrite("global_state", &ActionHistoryEntry::global_state)
       .def_readwrite("slot_state", &ActionHistoryEntry::slot_state);
 
@@ -1034,6 +1035,17 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
            pybind11::arg("replay_outcome"),
            "Consume one ReplayOutcome dict, credit prior slot history, and "
            "append a replay-selection action with empty-state sentinels.")
+      .def("record_replay_selection",
+           &OnlineLearningController::record_replay_selection,
+           pybind11::arg("slot_id"),
+           pybind11::arg("gpu_step"),
+           pybind11::arg("policy_version"),
+           pybind11::arg("output_logit"),
+           pybind11::arg("selected_rank"),
+           pybind11::arg("features"),
+           pybind11::arg("global_state"),
+           pybind11::arg("slot_state"),
+           "Append a replay-selection action with decision-time snapshots.")
       .def("history", &OnlineLearningController::history,
            pybind11::arg("slot_id"),
            pybind11::return_value_policy::reference_internal)
@@ -1046,6 +1058,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
              d["credited_actions"] = pybind11::int_(t.credited_actions);
              d["nonzero_credit_actions"] =
                  pybind11::int_(t.nonzero_credit_actions);
+             d["backward_ready_actions"] =
+                 pybind11::int_(t.backward_ready_actions);
              d["backward_skipped_missing_state"] =
                  pybind11::int_(t.backward_skipped_missing_state);
              d["invalid_slot_skips"] = pybind11::int_(t.invalid_slot_skips);

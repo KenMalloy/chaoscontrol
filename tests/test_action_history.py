@@ -14,6 +14,7 @@ def _entry(step: int, *, action_type: int = 1) -> _ext.ActionHistoryEntry:
     entry.output_logit = step + 0.25
     entry.selected_rank = step % 4
     entry.neighbor_slot = 1000 + step
+    entry.features = [float(step) / 10.0, float(step) / 20.0]
     entry.global_state = [float(step), float(step + 1)]
     entry.slot_state = [float(-step)]
     return entry
@@ -54,6 +55,7 @@ def test_action_history_entry_round_trips_all_python_fields():
     entry.output_logit = -1.5
     entry.selected_rank = 2
     entry.neighbor_slot = 77
+    entry.features = [9.0, 10.0]
     entry.global_state = [0.125, 0.5, 1.25]
     entry.slot_state = [-3.0, 4.0]
 
@@ -66,6 +68,7 @@ def test_action_history_entry_round_trips_all_python_fields():
     assert stored.output_logit == pytest.approx(-1.5)
     assert stored.selected_rank == 2
     assert stored.neighbor_slot == 77
+    assert stored.features == pytest.approx([9.0, 10.0])
     assert stored.global_state == pytest.approx([0.125, 0.5, 1.25])
     assert stored.slot_state == pytest.approx([-3.0, 4.0])
 

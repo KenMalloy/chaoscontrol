@@ -62,6 +62,7 @@ def run_controller_cycle(
     selected_at: int | None = None,
     policy_version: int = 0,
     controller_runtime: Any | None = None,
+    action_recorder: Any | None = None,
 ) -> int:
     """Run a single controller cycle: drain queries, push tags.
 
@@ -88,6 +89,9 @@ def run_controller_cycle(
             means use ``time.monotonic_ns() // 1_000_000`` (millisecond
             granularity, monotonic across the cycle). Tests pass an
             explicit value for determinism.
+        action_recorder: optional C10 learning-loop bridge. When supplied and
+            the controller runtime exposes decision snapshots, each selected
+            replay action is appended with its decision-time input/state.
 
     Returns:
         Number of candidates drained from the query queue this cycle.
@@ -164,17 +168,19 @@ def run_controller_cycle(
             zip(slot_list, score_list, strict=True)
         ):
             controller_logit = float(score_i)
+            controller_snapshot: dict[str, Any] = {}
             if controller_runtime is not None:
-                controller_logit = float(
-                    controller_runtime.score_slot(
-                        _controller_feature_vector(
+                controller_logit, controller_snapshot = (
+                    _score_runtime_with_optional_snapshot(
+                        controller_runtime=controller_runtime,
+                        features=_controller_feature_vector(
                             heuristic_score=float(score_i),
                             pressure=float(cand.get("pressure", 0.0)),
                             utility=float(cache.utility_u[int(slot_i)].item()),
                             selected_rank=int(selected_rank),
                         ),
                         slot=int(slot_i),
-                    ).item()
+                    )
                 )
             # Clamp query_event_id to 56 bits before the 8-bit shift so the
             # packed replay_id fits in u64. The high 8 bits of query_event_id
@@ -187,7 +193,7 @@ def run_controller_cycle(
             replay_id = (
                 (int(query_event_id) & ((1 << 56) - 1)) << 8
             ) | (int(selected_rank) & 0xFF)
-            tagged_replay_queue.append({
+            tag = {
                 "step": producer_step,
                 "slot": int(slot_i),
                 "score": float(score_i),
@@ -205,7 +211,14 @@ def run_controller_cycle(
                 "selection_step": int(selected_at),
                 "policy_version": int(policy_version),
                 "outcome_status": "pending",
-            })
+            }
+            tag.update(controller_snapshot)
+            tagged_replay_queue.append(tag)
+            if action_recorder is not None and controller_snapshot:
+                _record_controller_action_snapshot(
+                    action_recorder=action_recorder,
+                    tag=tag,
+                )
         # Drop the residual reference explicitly. ``cand`` goes out of
         # scope at end of loop iteration, but explicit clearing makes
         # the slow-OOM invariant visible in the source.
@@ -276,6 +289,55 @@ def _controller_feature_vector(
     )
 
 
+def _score_runtime_with_optional_snapshot(
+    *,
+    controller_runtime: Any,
+    features: torch.Tensor,
+    slot: int,
+) -> tuple[float, dict[str, Any]]:
+    """Score a slot and, when supported, serialize C10 replay snapshots."""
+    scorer = getattr(controller_runtime, "score_slot_with_snapshot", None)
+    if scorer is None:
+        logit = controller_runtime.score_slot(features, slot=slot)
+        return float(logit.item()), {}
+
+    decision = scorer(features, slot=slot)
+    return (
+        float(decision.logit.item()),
+        {
+            "controller_features": _tensor_to_float_list(decision.features),
+            "controller_global_state": _tensor_to_float_list(
+                decision.global_state,
+            ),
+            "controller_slot_state": _tensor_to_float_list(decision.slot_state),
+        },
+    )
+
+
+def _tensor_to_float_list(value: torch.Tensor) -> list[float]:
+    return [
+        float(x)
+        for x in value.detach().to(device="cpu", dtype=torch.float32).tolist()
+    ]
+
+
+def _record_controller_action_snapshot(
+    *,
+    action_recorder: Any,
+    tag: dict[str, Any],
+) -> None:
+    action_recorder.record_replay_selection(
+        slot_id=int(tag["slot"]),
+        gpu_step=int(tag["selection_step"]),
+        policy_version=int(tag["policy_version"]),
+        output_logit=float(tag["controller_logit"]),
+        selected_rank=int(tag["selected_rank"]),
+        features=list(tag["controller_features"]),
+        global_state=list(tag["controller_global_state"]),
+        slot_state=list(tag["controller_slot_state"]),
+    )
+
+
 def controller_main(
     *,
     controller_query_queue: list[dict[str, Any]],
@@ -286,6 +348,7 @@ def controller_main(
     k: int = 16,
     score_mode: str = "cosine_utility_weighted",
     controller_runtime: Any | None = None,
+    action_recorder: Any | None = None,
     cycle_idle_sleep_s: float = 0.005,
     heartbeat: list[int] | None = None,
 ) -> None:
@@ -322,6 +385,7 @@ def controller_main(
             score_mode=score_mode,
             queue_lock=queue_lock,
             controller_runtime=controller_runtime,
+            action_recorder=action_recorder,
         )
         if heartbeat is not None:
             heartbeat[0] += 1
