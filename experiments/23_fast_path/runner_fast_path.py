@@ -1579,6 +1579,8 @@ class _EpisodicConsumerState:
         "rank_query_seq",
         "replay_outcome_log",
         "bucket_baseline_ema",
+        "compute_replay_ce_pair",
+        "pending_post_step_replays",
     )
 
     def __init__(
@@ -1589,6 +1591,7 @@ class _EpisodicConsumerState:
         controller_query_enabled: bool = False,
         tagged_replay_queue: list[dict[str, Any]] | None = None,
         episodic_event_log_enabled: bool = False,
+        compute_replay_ce_pair: bool = False,
     ) -> None:
         self.cache = cache
         self.heartbeat = heartbeat
@@ -1625,6 +1628,24 @@ class _EpisodicConsumerState:
         )
         self.bucket_baseline_ema: list[float] | None = (
             [0.0, 0.0, 0.0, 0.0] if episodic_event_log_enabled else None
+        )
+        # Phase B5: opt-in true pre/post replay CE pair. When enabled,
+        # the drain stages each successful replay (slot's value tokens +
+        # the just-emitted REPLAY_OUTCOME dict) into
+        # ``pending_post_step_replays``. After ``optimizer.step()`` the
+        # outer loop drains the staged list, runs a no-grad forward on
+        # the post-step weights, mutates the dict's
+        # ``ce_after_replay`` / ``ce_delta_raw`` / ``bucket_baseline`` /
+        # ``reward_shaped`` fields, and updates the bucket EMA.
+        # Disabling this flag keeps the B3 default: reward fields stay
+        # NaN and the EMA never updates. Allocating the list only when
+        # both gates are on avoids any per-step allocation cost on the
+        # default path.
+        self.compute_replay_ce_pair: bool = bool(
+            compute_replay_ce_pair and episodic_event_log_enabled
+        )
+        self.pending_post_step_replays: list[dict[str, Any]] | None = (
+            [] if self.compute_replay_ce_pair else None
         )
 
 
@@ -1692,6 +1713,9 @@ def _attach_episodic_consumer(
         ),
         episodic_event_log_enabled=bool(
             config.get("episodic_event_log_enabled", False)
+        ),
+        compute_replay_ce_pair=bool(
+            config.get("episodic_compute_replay_ce_pair", False)
         ),
     )
 
@@ -1806,14 +1830,24 @@ def _emit_replay_outcome(
     outcome_status: int,
     source_write_id: int,
     write_bucket: int,
+    ce_before_replay_override: float | None = None,
     ce_after_replay: float = float("nan"),
     grad_cos_rare: float = float("nan"),
     grad_cos_total: float = float("nan"),
+    defer_reward_shaping: bool = False,
 ) -> dict[str, Any] | None:
     """Append a REPLAY_OUTCOME dict to the Phase B3 placeholder log.
 
     The real controller fields are threaded through when present. Sentinel
     defaults are documented inline so Phase C can replace them deliberately.
+
+    Phase B5 adds the ``defer_reward_shaping`` knob: when True, the dict is
+    emitted with placeholder NaN reward fields and the bucket EMA is NOT
+    updated. The post-step CE pair pass owns the patch + EMA update once
+    ``optimizer.step()`` lands (see ``_run_post_step_replay_ce``). When the
+    flag is False (B3 default), the EMA still updates on the upstream-supplied
+    delta (NaN-skip in place) and the dict's reward fields are computed
+    inline against the supplied ``ce_after_replay``.
     """
     replay_outcome_log = getattr(consumer, "replay_outcome_log", None)
     bucket_baseline_ema = getattr(consumer, "bucket_baseline_ema", None)
@@ -1835,7 +1869,15 @@ def _emit_replay_outcome(
     # Until the trained controller is wired, controller_logit is a zero
     # sentinel rather than reusing the heuristic score.
     controller_logit = float(entry.get("controller_logit", 0.0))
-    ce_before_replay = float(entry.get("ce_before_replay", float("nan")))
+    if ce_before_replay_override is not None:
+        # Phase B5: the helper-computed pre-step ``replay_loss`` is the
+        # canonical ``ce_before_replay`` once the post-step pair runs.
+        # Override entry-supplied placeholder so the field carries the
+        # number that pairs with the post-step CE the deferred pass will
+        # write.
+        ce_before_replay = float(ce_before_replay_override)
+    else:
+        ce_before_replay = float(entry.get("ce_before_replay", float("nan")))
     ce_after = float(ce_after_replay)
     ce_delta_raw = ce_before_replay - ce_after
 
@@ -1845,7 +1887,8 @@ def _emit_replay_outcome(
         baseline = float(bucket_baseline_ema[bucket])
     reward_shaped = ce_delta_raw - baseline
     if (
-        0 <= bucket < len(bucket_baseline_ema)
+        not defer_reward_shaping
+        and 0 <= bucket < len(bucket_baseline_ema)
         and math.isfinite(ce_delta_raw)
     ):
         alpha = 0.05
@@ -1853,6 +1896,15 @@ def _emit_replay_outcome(
             (1.0 - alpha) * float(bucket_baseline_ema[bucket])
             + alpha * float(ce_delta_raw)
         )
+
+    if defer_reward_shaping:
+        # Post-step pass owns the final values; emit NaN placeholders so
+        # downstream readers that crash on partial values raise loudly
+        # if the deferred pass forgot to patch.
+        ce_after = float("nan")
+        ce_delta_raw = float("nan")
+        baseline = float("nan")
+        reward_shaped = float("nan")
 
     event = {
         "event_type": 3,
@@ -2312,7 +2364,19 @@ def _run_episodic_replay_from_tagged_queue(
             if math.isfinite(replay_loss)
             else _REPLAY_STATUS_NAN
         )
-        _emit_replay_outcome(
+        # Phase B5: when the pre/post CE pair gate is on, stash the
+        # value tokens + reference to the just-emitted dict so the
+        # post-optimizer-step pass can run a no-grad forward on the
+        # post-step weights and patch ``ce_after_replay`` /
+        # ``ce_delta_raw`` / ``bucket_baseline`` / ``reward_shaped``
+        # in place. The drain owns the EMA update gating: when deferred,
+        # the EMA stays untouched until the post-step pass lands on real
+        # finite deltas.
+        compute_pair = (
+            getattr(consumer, "compute_replay_ce_pair", False)
+            and replay_outcome_status == _REPLAY_STATUS_OK
+        )
+        emitted = _emit_replay_outcome(
             consumer=consumer,
             entry=entry,
             current_step=int(current_step),
@@ -2320,10 +2384,36 @@ def _run_episodic_replay_from_tagged_queue(
             outcome_status=int(replay_outcome_status),
             source_write_id=int(source_write_id),
             write_bucket=int(write_bucket),
-            ce_after_replay=float(replay_loss),
+            ce_before_replay_override=(
+                float(replay_loss) if compute_pair else None
+            ),
+            ce_after_replay=float("nan"),
             grad_cos_rare=float(result["replay_grad_cos_rare"]),
             grad_cos_total=float(result["replay_grad_cos_total"]),
+            defer_reward_shaping=bool(compute_pair),
         )
+        if (
+            compute_pair
+            and emitted is not None
+            and consumer.pending_post_step_replays is not None
+        ):
+            # Snapshot the value-token row off the cache so a slot
+            # eviction between drain and post-step pass can't corrupt
+            # the second forward. ``cache.value_tok_ids[slot]`` is an
+            # int64 row of shape ``[span_length]``; ``.detach().clone()``
+            # copies the data without moving it off-device.
+            value_row = (
+                cache.value_tok_ids[int(slot)].detach().clone()
+            )
+            consumer.pending_post_step_replays.append({
+                "event_dict": emitted,
+                "value_tok_ids": value_row,
+                "weight": float(weight),
+                "lm_head_backward_mode": str(lm_head_backward_mode),
+                "lm_head_tile_size": int(lm_head_tile_size),
+                "write_bucket": int(write_bucket),
+                "ce_before_replay": float(replay_loss),
+            })
 
         if logger is not None:
             logger.write_row({
@@ -2345,6 +2435,22 @@ def _run_episodic_replay_from_tagged_queue(
                 "controller_logit": float(
                     entry.get("controller_logit", query_cosine)
                 ),
+                # NOTE (Phase B5): the diagnostic NDJSON's
+                # ``ce_after_replay`` is intentionally the pre-step
+                # ``replay_loss`` here — this row is written BEFORE
+                # ``optimizer.step()`` runs, so the post-step CE is not
+                # available at this point. The wire-side
+                # ``replay_outcome_log`` dict carries the post-step CE
+                # (patched by ``_run_post_step_replay_ce``) when the
+                # ``compute_replay_ce_pair`` gate is on; the per-rank
+                # NDJSON keeps the pre-step value as a diagnostic
+                # column. Phase D4's BC pretrain corpus reads the wire
+                # column (via the schema rename map in
+                # ``tests/test_replay_outcome_log_schema.py``), not the
+                # diagnostic NDJSON, when it wants the true reward
+                # signal. A future task can deferred-write the NDJSON
+                # row from the post-step pass to make the two surfaces
+                # bit-identical; out of scope for B5.
                 "replay_loss": replay_loss,
                 "ce_before_replay": float("nan"),
                 "ce_after_replay": replay_loss,
@@ -2363,6 +2469,125 @@ def _run_episodic_replay_from_tagged_queue(
             })
         replayed += 1
     return replayed
+
+
+def _post_step_replay_ce(
+    *,
+    model: torch.nn.Module,
+    value_tok_ids: torch.Tensor,
+) -> float:
+    """Compute mean CE on the value-token row using current weights.
+
+    Mirrors ``dreamworld_replay_from_cache_entry``'s pre-step CE
+    computation EXCEPT it runs under ``torch.no_grad`` and skips both the
+    backward and the loss-weight scaling — the returned scalar is the
+    unscaled mean cross-entropy that ``replay_loss`` returns from
+    ``full_lm_head_backward`` / ``fused_lm_head_backward``. Keeping the
+    reduction and dtype path identical is what makes
+    ``ce_before_replay - ce_after_replay`` a meaningful delta.
+
+    **Precision parity caveat.** This helper always materializes the
+    full ``logits = lm_head(final_norm(hidden))`` tensor and casts to
+    fp32 before CE. The pre-step ``replay_loss`` from
+    ``fused_lm_head_backward`` / ``fused_rms_linear_cross_entropy`` may
+    take a kernel-fused path with its own intermediate dtype handling.
+    At fp32 the two surfaces match; at bf16 the small-span numerics can
+    differ by ~1e-3, which is well below the reward-signal magnitudes
+    the EMA tracks. If a future debugger sees a mystery delta of that
+    magnitude, the place to look is here, not the optimizer.
+
+    Returns the post-step CE as a Python float; NaN if the helper would
+    produce a degenerate row (length < 2 leaves no input/target split).
+    """
+    if value_tok_ids.dim() != 1:
+        raise ValueError(
+            "_post_step_replay_ce expects a 1-D value-token row; got shape "
+            f"{tuple(value_tok_ids.shape)}"
+        )
+    span_length = int(value_tok_ids.shape[0])
+    if span_length < 2:
+        return float("nan")
+    device = next(model.parameters()).device
+    value_row = value_tok_ids.to(device=device).reshape(1, span_length)
+    inputs = value_row[:, :-1].to(torch.int32)
+    targets = value_row[:, 1:].to(torch.long)
+    with torch.no_grad():
+        hidden = model.encode(inputs)
+        logits = model.lm_head(model.final_norm(hidden))
+        ce = F.cross_entropy(
+            logits.reshape(-1, logits.size(-1)).float(),
+            targets.reshape(-1),
+            reduction="mean",
+        )
+    return float(ce.detach().item())
+
+
+def _run_post_step_replay_ce(
+    *,
+    consumer: "_EpisodicConsumerState | None",
+    model: torch.nn.Module,
+) -> int:
+    """Drain the deferred post-step CE pass for B5 reward shaping.
+
+    For every replay that the in-step drain staged on
+    ``consumer.pending_post_step_replays``, run a no-grad forward on the
+    just-updated weights, compute mean CE on the same value tokens the
+    pre-step ``replay_loss`` was computed on, and patch the staged
+    REPLAY_OUTCOME dict in place. The bucket baseline EMA updates here
+    (deferred from the in-step path) so a real finite delta is the only
+    signal the EMA ever absorbs.
+
+    Returns the number of patched events (0 when the gate is off, when
+    no consumer is wired, or when the pending list is empty). Always
+    clears the pending list on exit so the next step starts clean.
+    """
+    if consumer is None:
+        return 0
+    pending = getattr(consumer, "pending_post_step_replays", None)
+    if pending is None or not pending:
+        return 0
+    bucket_baseline_ema = getattr(consumer, "bucket_baseline_ema", None)
+    patched = 0
+    for staged in pending:
+        event_dict = staged["event_dict"]
+        value_tok_ids = staged["value_tok_ids"]
+        ce_before = float(staged["ce_before_replay"])
+        bucket = int(staged["write_bucket"])
+        ce_after = _post_step_replay_ce(
+            model=model,
+            value_tok_ids=value_tok_ids,
+        )
+        baseline = 0.0
+        if (
+            bucket_baseline_ema is not None
+            and 0 <= bucket < len(bucket_baseline_ema)
+        ):
+            baseline = float(bucket_baseline_ema[bucket])
+        ce_delta_raw = ce_before - ce_after
+        reward_shaped = ce_delta_raw - baseline
+        # Patch the dict reference in-place — the same Python object is
+        # already on ``consumer.replay_outcome_log``, so downstream
+        # readers (Phase B4 shm-ring push, Phase D3 NDJSON sink, the BC
+        # pretrain corpus) see the finalized values without an extra
+        # bookkeeping pass.
+        event_dict["ce_before_replay"] = float(ce_before)
+        event_dict["ce_after_replay"] = float(ce_after)
+        event_dict["ce_delta_raw"] = float(ce_delta_raw)
+        event_dict["bucket_baseline"] = float(baseline)
+        event_dict["reward_shaped"] = float(reward_shaped)
+        if (
+            bucket_baseline_ema is not None
+            and 0 <= bucket < len(bucket_baseline_ema)
+            and math.isfinite(ce_delta_raw)
+        ):
+            alpha = 0.05
+            bucket_baseline_ema[bucket] = (
+                (1.0 - alpha) * float(bucket_baseline_ema[bucket])
+                + alpha * float(ce_delta_raw)
+            )
+        patched += 1
+    pending.clear()
+    return patched
 
 
 def _run_train_step(
@@ -3212,6 +3437,7 @@ def train_fast_for_budget(
     episodic_utility_ema_decay: float = 0.99,
     controller_query_enabled: bool = False,
     episodic_event_log_enabled: bool = False,
+    episodic_compute_replay_ce_pair: bool = False,
     episodic_controller_score_mode: str = "cosine_utility_weighted",
     episodic_controller_topk_k: int = 16,
     episodic_controller_idle_sleep_s: float = 0.005,
@@ -3372,6 +3598,9 @@ def train_fast_for_budget(
         "episodic_fingerprint_window": int(episodic_fingerprint_window),
         "controller_query_enabled": bool(controller_query_enabled),
         "episodic_event_log_enabled": bool(episodic_event_log_enabled),
+        "episodic_compute_replay_ce_pair": bool(
+            episodic_compute_replay_ce_pair
+        ),
     }
     episodic_consumer = _attach_episodic_consumer(
         episodic_enabled=bool(episodic_enabled),
@@ -4185,6 +4414,21 @@ def train_fast_for_budget(
             if predictive_aux_optimizer is not None:
                 predictive_aux_optimizer.step()
             fast_slow.after_optimizer_step(model, step=steps + 1)
+            # Phase B5: deferred post-step CE pair pass on the episodic
+            # rank. The in-step drain stages each successful replay and
+            # the just-emitted REPLAY_OUTCOME dict; this call runs a
+            # no-grad forward on the post-step weights, computes mean CE
+            # on the same value tokens, and patches
+            # ``ce_after_replay`` / ``ce_delta_raw`` /
+            # ``bucket_baseline`` / ``reward_shaped`` in place. Bucket
+            # EMA also updates here. Helper is a no-op (zero pending,
+            # gate off, or non-episodic rank where the pending list is
+            # always None) on every other code path.
+            if is_episodic_rank and episodic_consumer is not None:
+                _run_post_step_replay_ce(
+                    consumer=episodic_consumer,
+                    model=model,
+                )
             losses.append(loss.detach())
             steps += 1
             if (
@@ -4791,6 +5035,9 @@ def run_condition(
         ),
         episodic_event_log_enabled=bool(
             config.get("episodic_event_log_enabled", False)
+        ),
+        episodic_compute_replay_ce_pair=bool(
+            config.get("episodic_compute_replay_ce_pair", False)
         ),
         episodic_controller_score_mode=str(
             _controller_score_mode_from_config(config)
