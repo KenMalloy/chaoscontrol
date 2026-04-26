@@ -585,16 +585,21 @@ def test_episodic_dw_curation_v1_matrix_shape():
         # Arm A's replay reads the online buffer; controller_query_mode is
         # not load-bearing here. Omitted to keep the config surface honest.
         assert "controller_query_mode" not in entry
+        assert "controller_query_enabled" not in entry
 
     for entry in by_arm["arm_b_cosine_utility"]:
         assert entry["episodic_enabled"] is True
         assert entry["dreamworld_weight"] == 0.10
         assert entry["controller_query_mode"] == "cosine_utility_weighted"
+        # The controller-query gate must be on so the queue actually fills
+        # with retrieval candidates the future controller will drain.
+        assert entry["controller_query_enabled"] is True
 
     for entry in by_arm["arm_bp_pressure_only"]:
         assert entry["episodic_enabled"] is True
         assert entry["dreamworld_weight"] == 0.10
         assert entry["controller_query_mode"] == "pressure_only"
+        assert entry["controller_query_enabled"] is True
 
     for entry in by_arm["arm_c_no_dw"]:
         assert entry["episodic_enabled"] is True
@@ -605,24 +610,70 @@ def test_episodic_dw_curation_v1_matrix_shape():
         # Arm C's controller mode is irrelevant — replay grad is zeroed
         # before it lands in any param.grad. Omit to avoid a silent claim.
         assert "controller_query_mode" not in entry
+        assert "controller_query_enabled" not in entry
 
 
 def test_episodic_dw_curation_v1_matrix_supports_extra_seeds_for_sigma_escalation():
     """Decision 0.5: if sigma(rare-bucket delta) on Arm B > 0.008 bpb across
-    the 3 default seeds, add 3 more seeds. The matrix builder must accept a
-    custom seed list so the escalation is a one-line follow-up call.
+    the 3 default seeds, add 3 more seeds on Arms A/B/B' (NOT Arm C — the
+    topology baseline doesn't need extra seeds). The matrix builder must
+    accept both a custom seed list AND an arm filter so the escalation is a
+    one-line follow-up call.
     """
     mod = _load_exp24()
 
-    extra = mod.build_episodic_dw_curation_v1_matrix(
+    # Default behavior — all four arms, custom seed set.
+    extra_all = mod.build_episodic_dw_curation_v1_matrix(
         speed_config={"batch_size": 1024, "chunk_size": 64},
         world_size=4,
         budget_seconds=600.0,
         seed_values=[5012, 7331, 9183],
     )
+    assert len(extra_all) == 12
+    assert {entry["seed"] for entry in extra_all} == {5012, 7331, 9183}
 
-    assert len(extra) == 12
-    assert {entry["seed"] for entry in extra} == {5012, 7331, 9183}
+    # Decision 0.5 escalation shape: A/B/B' only, 3 seeds = 9 cells.
+    escalated = mod.build_episodic_dw_curation_v1_matrix(
+        speed_config={"batch_size": 1024, "chunk_size": 64},
+        world_size=4,
+        budget_seconds=600.0,
+        seed_values=mod.EPISODIC_DW_CURATION_V1_ESCALATION_SEEDS,
+        arms=mod.EPISODIC_DW_CURATION_V1_ESCALATION_ARMS,
+    )
+    assert len(escalated) == 9
+    arms_seen = {
+        next(
+            arm for arm in mod.EPISODIC_DW_CURATION_V1_ARMS if arm in entry["name"]
+        )
+        for entry in escalated
+    }
+    assert arms_seen == {
+        "arm_a_uncurated",
+        "arm_b_cosine_utility",
+        "arm_bp_pressure_only",
+    }
+    # No Arm C cells in the escalation matrix.
+    assert all("arm_c_no_dw" not in entry["name"] for entry in escalated)
+
+
+def test_episodic_dw_curation_v1_matrix_rejects_unknown_arm_name():
+    """Typo defense: passing an arm name that isn't in the canonical set
+    raises ValueError with the allowed names listed.
+    """
+    mod = _load_exp24()
+
+    try:
+        mod.build_episodic_dw_curation_v1_matrix(
+            speed_config={"batch_size": 1024, "chunk_size": 64},
+            world_size=4,
+            budget_seconds=600.0,
+            arms=("arm_b_cosine_utility", "arm_typo"),
+        )
+    except ValueError as exc:
+        assert "arm_typo" in str(exc)
+        assert "arm_a_uncurated" in str(exc)
+    else:
+        raise AssertionError("expected ValueError for unknown arm name")
 
 
 def test_run_exp24_cli_episodic_dw_curation_v1_dry_run(tmp_path):

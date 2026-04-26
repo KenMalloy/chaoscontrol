@@ -729,12 +729,30 @@ def build_phase0_fastslow_only_control(
     return entries
 
 
+EPISODIC_DW_CURATION_V1_ARMS: tuple[str, ...] = (
+    "arm_a_uncurated",
+    "arm_b_cosine_utility",
+    "arm_bp_pressure_only",
+    "arm_c_no_dw",
+)
+# Decision 0.5 specifies escalation runs A/B/B' only — Arm C is the
+# topology-baseline reference and doesn't need additional seeds when the
+# σ rule fires on the curated arms.
+EPISODIC_DW_CURATION_V1_ESCALATION_ARMS: tuple[str, ...] = (
+    "arm_a_uncurated",
+    "arm_b_cosine_utility",
+    "arm_bp_pressure_only",
+)
+EPISODIC_DW_CURATION_V1_ESCALATION_SEEDS: tuple[int, ...] = (5012, 7331, 9183)
+
+
 def build_episodic_dw_curation_v1_matrix(
     *,
     speed_config: dict[str, Any],
     world_size: int = 4,
     budget_seconds: float = 600.0,
     seed_values: Sequence[int] = DEFAULT_CONTROL_SEEDS,
+    arms: Sequence[str] | None = None,
 ) -> list[dict[str, Any]]:
     """Phase 3 falsifier matrix for ``episodic_dw_curation_v1``.
 
@@ -749,17 +767,27 @@ def build_episodic_dw_curation_v1_matrix(
 
     Per Decision 0.5 (memory-aware-optimizer-plan): if ``sigma`` of the
     Arm B rare-bucket delta across the default 3 seeds exceeds 0.008 bpb,
-    re-invoke this builder with ``seed_values=[5012, 7331, 9183]`` (or any
-    other 3-seed extension) to escalate; downstream analysis pools the two
-    runs.
+    re-invoke this builder with::
+
+        build_episodic_dw_curation_v1_matrix(
+            speed_config=...,
+            seed_values=EPISODIC_DW_CURATION_V1_ESCALATION_SEEDS,
+            arms=EPISODIC_DW_CURATION_V1_ESCALATION_ARMS,
+        )
+
+    to escalate. The ``arms`` filter restricts to A/B/B' (skipping C, the
+    topology-baseline reference) per the spec; downstream analysis pools
+    the two runs across the seed set.
 
     Arms:
       - ``arm_a_uncurated``: ``episodic_enabled=False``; replay reads the
         existing online buffer in ``dreamworld.py``. No cache writes,
         queries, or controller-driven selection.
-      - ``arm_b_cosine_utility``: ``episodic_enabled=True`` with
+      - ``arm_b_cosine_utility``: ``episodic_enabled=True`` +
+        ``controller_query_enabled=True`` with
         ``controller_query_mode="cosine_utility_weighted"`` (Decision 0.2).
-      - ``arm_bp_pressure_only``: ``episodic_enabled=True`` with
+      - ``arm_bp_pressure_only``: ``episodic_enabled=True`` +
+        ``controller_query_enabled=True`` with
         ``controller_query_mode="pressure_only"`` — the mechanism-
         specificity lesion. Cache fills the same way as Arm B; only the
         retrieval policy changes.
@@ -769,9 +797,11 @@ def build_episodic_dw_curation_v1_matrix(
 
     ``controller_query_mode`` is a forward-looking config knob the future
     Phase 2 controller will read; the runner ignores unknown config keys
-    today. Arms A and C omit the knob (Arm A doesn't query the cache;
-    Arm C's replay grads are zeroed before they land in any param.grad)
-    to avoid making config claims neither arm actually relies on.
+    today. ``controller_query_enabled`` is the gate the runner already
+    wires (Pass C, default False); B and B' set it True so the queue
+    populates with retrieval candidates that the controller drains. Arms
+    A and C omit both knobs (Arm A doesn't query the cache; Arm C's
+    replay grads are zeroed before they land in any param.grad).
     """
     # Locked Dreamworld replay knobs — match phase0_dw_sweep so the
     # uncurated control reuses a known, replayed-then-failed combo.
@@ -793,7 +823,7 @@ def build_episodic_dw_curation_v1_matrix(
         "fast_slow_alpha": 0.25,
         "fast_slow_eval_copy": "slow",
     }
-    arms: list[tuple[str, dict[str, Any]]] = [
+    arm_specs: list[tuple[str, dict[str, Any]]] = [
         (
             "arm_a_uncurated",
             {
@@ -805,6 +835,7 @@ def build_episodic_dw_curation_v1_matrix(
             "arm_b_cosine_utility",
             {
                 "episodic_enabled": True,
+                "controller_query_enabled": True,
                 "dreamworld_weight": 0.10,
                 "controller_query_mode": "cosine_utility_weighted",
             },
@@ -813,6 +844,7 @@ def build_episodic_dw_curation_v1_matrix(
             "arm_bp_pressure_only",
             {
                 "episodic_enabled": True,
+                "controller_query_enabled": True,
                 "dreamworld_weight": 0.10,
                 "controller_query_mode": "pressure_only",
             },
@@ -825,8 +857,17 @@ def build_episodic_dw_curation_v1_matrix(
             },
         ),
     ]
+    if arms is not None:
+        allowed = set(arms)
+        unknown = allowed - set(EPISODIC_DW_CURATION_V1_ARMS)
+        if unknown:
+            raise ValueError(
+                f"unknown arm(s) {sorted(unknown)}; "
+                f"allowed: {EPISODIC_DW_CURATION_V1_ARMS}"
+            )
+        arm_specs = [(n, o) for n, o in arm_specs if n in allowed]
     entries: list[dict[str, Any]] = []
-    for arm_name, arm_overrides in arms:
+    for arm_name, arm_overrides in arm_specs:
         arm = {
             "exp24_mechanism": "episodic_dw_curation_v1",
             "artifact_impact": ARTIFACT_TRAINING_ONLY,
