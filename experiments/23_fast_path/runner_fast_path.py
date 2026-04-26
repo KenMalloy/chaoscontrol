@@ -68,7 +68,6 @@ from chaoscontrol.distributed import (  # noqa: E402
 from chaoscontrol.episodic.gpu_slot import (  # noqa: E402
     make_slot_tensor,
     pack_payload,
-    slot_dim as gpu_slot_dim,
     unpack_payload,
 )
 from chaoscontrol.optim.episodic_cache import EpisodicCache  # noqa: E402
@@ -1465,6 +1464,10 @@ def _emit_episodic_payloads_gpu(
         # key_rep == residual in Phase 1 (same write-time hidden state);
         # the slot carries both so the controller queue can consume the
         # residual without the cache-writer blocking the controller path.
+        # NOTE: pack_payload upcasts these to fp32 internally, which is
+        # required for the int64-via-fp32-view reinterpret to be byte-
+        # exact across all GPUs. Do NOT "optimize" by passing bf16 —
+        # the slot dtype is fixed fp32 by the gpu_slot module contract.
         key_rep = hidden_detached[b, t]
         residual = hidden_detached[b, t]
         pack_payload(
@@ -1513,17 +1516,29 @@ class _EpisodicConsumerState:
     to the caller (the runner's outer loop reads it for telemetry).
     """
 
-    __slots__ = ("cache", "heartbeat", "controller_query_queue")
+    __slots__ = (
+        "cache",
+        "heartbeat",
+        "controller_query_queue",
+        "controller_query_enabled",
+    )
 
     def __init__(
         self,
         cache: EpisodicCache | None,
         heartbeat: list[int],
         controller_query_queue: list[dict[str, Any]],
+        controller_query_enabled: bool = False,
     ) -> None:
         self.cache = cache
         self.heartbeat = heartbeat
         self.controller_query_queue = controller_query_queue
+        # Default False: Phase 1 ships without a Phase 2 consumer wired,
+        # so the queue would grow unbounded and retain GPU residual
+        # tensors (~1.25 GB at world=8, 600s, D=256). Phase 2's
+        # controller-bring-up task flips this True at the same time it
+        # adds the consumer that drains the queue.
+        self.controller_query_enabled = bool(controller_query_enabled)
 
 
 def _attach_episodic_consumer(
@@ -1582,6 +1597,9 @@ def _attach_episodic_consumer(
         cache=cache,
         heartbeat=[0],
         controller_query_queue=[],
+        controller_query_enabled=bool(
+            config.get("controller_query_enabled", False)
+        ),
     )
 
 
@@ -1633,13 +1651,19 @@ def _drain_episodic_payloads_gpu(
                 current_step=int(current_step),
                 embedding_version=int(embedding_version),
             )
-            queue.append({
-                "step": int(current_step),
-                "rank": int(r),
-                "k": int(k),
-                "pressure": float(unpacked["pressure"]),
-                "residual": unpacked["residual"],
-            })
+            # Gate queue.append behind the consumer-enabled flag.
+            # Phase 1 ships with the flag default False; the queue stays
+            # empty (no GPU residual tensors retained, no slow OOM at
+            # 600s). Phase 2's controller bring-up flips the flag True at
+            # the same time it adds the consumer that drains the queue.
+            if consumer.controller_query_enabled:
+                queue.append({
+                    "step": int(current_step),
+                    "rank": int(r),
+                    "k": int(k),
+                    "pressure": float(unpacked["pressure"]),
+                    "residual": unpacked["residual"],
+                })
 
 
 def _run_train_step(

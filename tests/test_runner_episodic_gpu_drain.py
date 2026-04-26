@@ -157,8 +157,16 @@ class TestEpisodicConsumerHelper(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 
-def _build_consumer_state(mod, *, span_length: int, key_rep_dim: int):
-    """Helper: build an episodic-rank consumer state with a real cache."""
+def _build_consumer_state(
+    mod, *, span_length: int, key_rep_dim: int,
+    controller_query_enabled: bool = True,
+):
+    """Helper: build an episodic-rank consumer state with a real cache.
+
+    ``controller_query_enabled`` defaults to True for the existing
+    test 6 path that asserts queue grows. Phase 1 production default is
+    False (slow-OOM guard); see ``test_controller_query_queue_default_off``.
+    """
     return mod._attach_episodic_consumer(
         episodic_enabled=True,
         is_episodic_rank=True,
@@ -169,10 +177,52 @@ def _build_consumer_state(mod, *, span_length: int, key_rep_dim: int):
             "episodic_key_rep_dim": key_rep_dim,
             "episodic_grace_steps": 100,
             "episodic_utility_ema_decay": 0.99,
+            "controller_query_enabled": controller_query_enabled,
         },
         model_dim=key_rep_dim,
         all_group=None,
     )
+
+
+def test_controller_query_queue_default_off_no_growth() -> None:
+    """Phase 1 production default: controller_query_enabled is False, so
+    the drain still appends to ``EpisodicCache`` (write side) but does
+    NOT push to ``controller_query_queue``. Without this gate, the queue
+    retains GPU residual tensors unboundedly across a 600s run (~1.25 GB
+    at world=8, D=256). Phase 2 flips the flag True at the same time it
+    wires the consumer that drains the queue.
+    """
+    mod = _load_runner_module()
+    span_length = 2
+    key_rep_dim = 3
+    k_max = 2
+    consumer = _build_consumer_state(
+        mod, span_length=span_length, key_rep_dim=key_rep_dim,
+        controller_query_enabled=False,
+    )
+    # Hand-build a 1-rank gather_list with one valid row.
+    t = make_slot_tensor(
+        k_max=k_max, span_length=span_length, key_rep_dim=key_rep_dim,
+        device=torch.device("cpu"),
+    )
+    pack_payload(
+        t[0],
+        valid_mask=1.0, pressure=0.5, key_fp=99,
+        value_anchor_id=0,
+        value_tok_ids=torch.zeros(span_length, dtype=torch.int64),
+        key_rep=torch.zeros(key_rep_dim),
+        residual=torch.ones(key_rep_dim, dtype=torch.float32),
+        span_length=span_length, key_rep_dim=key_rep_dim,
+    )
+    mod._drain_episodic_payloads_gpu(
+        consumer=consumer, gather_list=[t],
+        span_length=span_length, key_rep_dim=key_rep_dim,
+        k_max=k_max, current_step=1, embedding_version=0,
+    )
+    # Cache append happened (write side is unconditional).
+    assert len(consumer.cache) == 1
+    # Queue stayed empty (gated by controller_query_enabled=False).
+    assert consumer.controller_query_queue == []
 
 
 def test_drain_filters_invalid_rows_and_appends_valid_ones() -> None:
@@ -394,6 +444,10 @@ def _gpu_drain_test_worker(
                 "episodic_key_rep_dim": key_rep_dim,
                 "episodic_grace_steps": 100,
                 "episodic_utility_ema_decay": 0.99,
+                # End-to-end test asserts queue grows to match cache_len,
+                # so the queue gate must be on. Phase 1 production default
+                # is False; see test_controller_query_queue_default_off.
+                "controller_query_enabled": True,
             },
             model_dim=key_rep_dim,
             all_group=all_group,
