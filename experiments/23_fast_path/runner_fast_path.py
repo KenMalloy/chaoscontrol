@@ -127,7 +127,9 @@ from dreamworld import (  # noqa: E402
     DreamReplayBuffer,
     capture_dream_entry,
     dreamworld_replay_backward,
+    dreamworld_replay_from_cache_entry,
 )
+from chaoscontrol.episodic.diagnostics import DiagnosticsLogger  # noqa: E402
 from experiments._23_fast_path_runner_helpers import (  # noqa: E402
     _alloc_pinned_evidence_buffers,
     compute_ce_minus_entropy_pressure_from_fused,
@@ -1819,6 +1821,154 @@ def _drain_episodic_payloads_gpu(
                 })
 
 
+def _get_tagged_replay_queue(
+    consumer: "_EpisodicConsumerState | None",
+) -> list[dict[str, Any]]:
+    """Return the consumer's ``tagged_replay_queue`` if X has wired it.
+
+    Phase 3.1 (this lane) is implemented in parallel with Phase 2's
+    controller bring-up (X's lane). Until X merges, the consumer state
+    may not carry a ``tagged_replay_queue`` attribute — ``getattr``
+    with a default-empty-list fallback keeps this lane shippable on
+    its own. After X merges this becomes a no-op assertion ("X
+    promised the field; let's read it directly"). The function is
+    intentionally tiny so the merge collapses cleanly into a single
+    attribute read.
+    """
+    if consumer is None:
+        return []
+    return getattr(consumer, "tagged_replay_queue", [])
+
+
+def _run_episodic_replay_from_tagged_queue(
+    *,
+    consumer: "_EpisodicConsumerState | None",
+    model: torch.nn.Module,
+    current_step: int,
+    weight: float,
+    lm_head_backward_mode: str,
+    lm_head_tile_size: int,
+    logger: DiagnosticsLogger | None,
+) -> int:
+    """Drain ``consumer.tagged_replay_queue`` and run replay per slot.
+
+    For each tagged entry the controller pushed onto the queue:
+
+    * Snapshot ``utility_pre`` for the diagnostic log row.
+    * Call ``dreamworld_replay_from_cache_entry`` — replay grads
+      accumulate into ``param.grad`` so the upcoming SUM all-reduce
+      sweeps them up alongside the train-rank main grads.
+    * Apply Decision 0.10's clamp via the dreamworld helper's
+      ``utility_signal_transformed`` and call
+      ``cache.update_utility`` so the EMA reflects the replay event.
+    * If a logger is wired, emit one NDJSON row carrying the 16
+      Decision-0.9 columns.
+
+    Returns the number of tagged entries replayed (0 when the queue
+    was empty / cache absent / consumer absent — the runner uses this
+    for telemetry).
+    """
+    if consumer is None or consumer.cache is None:
+        return 0
+    tagged = _get_tagged_replay_queue(consumer)
+    if not tagged:
+        return 0
+    cache = consumer.cache
+    replayed = 0
+    # Drain destructively. The controller is the producer; once we
+    # consume an entry, it's done — the controller will push fresh
+    # entries on the next cycle.
+    while tagged:
+        entry = tagged.pop(0)
+        slot = int(entry.get("slot", -1))
+        if not (0 <= slot < int(cache.capacity)):
+            continue
+        # Snapshot pre-replay utility so the log row pins the value
+        # the EMA started from. Read from the underlying tensor field
+        # rather than via ``query`` so we don't depend on the
+        # fingerprint hash being live.
+        if not bool(cache.occupied[slot].item()):
+            # Slot evicted between the controller's tag and our
+            # drain — race is documented in the design plan.
+            continue
+        utility_pre = float(cache.utility_u[slot].item())
+        write_step = int(cache.write_step[slot].item())
+        key_fp = int(cache.key_fp[slot].item())
+        # X's contract says the queue entry carries ``score`` (=
+        # cosine × utility). The diagnostic log wants ``query_cosine``
+        # (= raw cosine). Until the controller emits the raw cosine
+        # separately, log ``score`` and let Phase 3.5 backsolve cosine
+        # from ``score / utility_pre``. Default 0.0 if X's contract
+        # changes — the column is preserved either way.
+        query_cosine = float(entry.get("score", 0.0))
+
+        result = dreamworld_replay_from_cache_entry(
+            model=model,
+            cache=cache,
+            slot=slot,
+            current_step=int(current_step),
+            weight=float(weight),
+            lm_head_backward_mode=lm_head_backward_mode,
+            lm_head_tile_size=int(lm_head_tile_size),
+        )
+        if result is None:
+            # Race: slot evicted between our occupancy check and the
+            # replay forward. Skip without logging.
+            continue
+        # Decision 0.10: feed the clamped value to update_utility so
+        # the cache scoring rule (cosine × utility_u) keeps a
+        # well-defined ordering.
+        #
+        # Phase 1 NaN-skip: if utility_signal_raw is NaN (no live
+        # rare-grad direction in scope — the default until Phase 4
+        # wires the post-allreduce EMA snapshot), DON'T call
+        # update_utility. Otherwise every replay would feed 0.0 into
+        # the EMA, decaying utility_u by the EMA decay factor each
+        # time. Combined with the lowest-utility eviction policy and
+        # the cosine × utility_u retrieval rule, replayed entries
+        # would get evicted FASTER and down-weighted at retrieval —
+        # the cache would preferentially preserve UNUSED entries, and
+        # Arm B would collapse to "cosine × anti-frequency-of-replay."
+        # Skipping preserves utility_u=1.0 (init) for all entries until
+        # Phase 4 lands a real signal. Log row's utility_post then
+        # equals utility_pre, which Phase 3.5 readers can detect as
+        # "this replay didn't update utility."
+        raw = float(result["utility_signal_raw"])
+        if not math.isnan(raw):
+            cache.update_utility(
+                slot, ce_delta=float(result["utility_signal_transformed"]),
+            )
+        utility_post = float(cache.utility_u[slot].item())
+
+        if logger is not None:
+            logger.write_row({
+                "step": int(current_step),
+                "slot": int(slot),
+                "key_fp": key_fp,
+                "write_step": write_step,
+                # ``write_pressure`` and ``write_bucket`` are not on
+                # the cache schema (Decision 0.4 + Pass C). Phase 1
+                # logs NaN / -1 sentinel values; Phase 3.5's analytics
+                # layer joins these from the controller's drain log
+                # (where pressure IS captured in
+                # controller_query_queue) using (write_step, slot).
+                "write_pressure": float("nan"),
+                "write_bucket": -1,
+                "query_cosine": query_cosine,
+                "utility_pre": utility_pre,
+                "replay_loss": float(result["replay_loss"]),
+                "replay_grad_norm": float(result["replay_grad_norm"]),
+                "replay_grad_cos_common": float(result["replay_grad_cos_common"]),
+                "replay_grad_cos_rare": float(result["replay_grad_cos_rare"]),
+                "replay_grad_cos_total": float(result["replay_grad_cos_total"]),
+                "utility_signal_raw": float(result["utility_signal_raw"]),
+                "utility_signal_transformed": float(result["utility_signal_transformed"]),
+                "utility_post": utility_post,
+            })
+        replayed += 1
+    return replayed
+
+
 def _run_train_step(
     *,
     model: torch.nn.Module,
@@ -1849,6 +1999,7 @@ def _run_train_step(
     all_group: "dist.ProcessGroup | None" = None,
     episodic_emit: EpisodicGpuEmit | None = None,
     episodic_consumer: "_EpisodicConsumerState | None" = None,
+    episodic_replay_logger: DiagnosticsLogger | None = None,
     current_step: int = 0,
     embedding_version: int = 0,
 ) -> torch.Tensor:
@@ -1915,6 +2066,30 @@ def _run_train_step(
                 k_max=k_max,
                 current_step=int(current_step),
                 embedding_version=int(embedding_version),
+            )
+        # Phase 3.1: drain ``tagged_replay_queue`` (X's controller
+        # fills it during Phase 2). Each tagged slot triggers one
+        # replay backward; grads accumulate into ``param.grad`` so
+        # the SUM all-reduce below sweeps them up alongside the train
+        # ranks' main_avg contributions. The diagnostic logger emits
+        # one Decision-0.9 row per replay event.
+        #
+        # ``dreamworld_weight`` from the runner's outer loop carries
+        # the existing replay weight knob. Phase 3 falsifier matrix
+        # sets this per arm; Arm C runs the topology with weight=0 so
+        # replay backward fires but the loss-scaled CE contributes
+        # zero grad — establishes the 3+1 topology baseline without
+        # any DW signal. Single-process unit tests override the kwarg
+        # explicitly.
+        if episodic_consumer is not None and episodic_consumer.cache is not None:
+            _run_episodic_replay_from_tagged_queue(
+                consumer=episodic_consumer,
+                model=model,
+                current_step=int(current_step),
+                weight=float(dreamworld_weight),
+                lm_head_backward_mode=lm_head_backward_mode,
+                lm_head_tile_size=int(lm_head_tile_size),
+                logger=episodic_replay_logger,
             )
         if episodic_consumer is not None:
             episodic_consumer.heartbeat[0] += 1
