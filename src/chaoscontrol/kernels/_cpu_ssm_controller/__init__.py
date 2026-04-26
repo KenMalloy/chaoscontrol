@@ -57,6 +57,14 @@ gerber_weight = (
     getattr(_C, "gerber_weight", _missing_extension)
     if _C is not None else _missing_extension
 )
+CreditedAction = (
+    getattr(_C, "CreditedAction", _missing_extension)
+    if _C is not None else _missing_extension
+)
+attribute_credit = (
+    getattr(_C, "attribute_credit", _missing_extension)
+    if _C is not None else _missing_extension
+)
 RollingStddev = (
     getattr(_C, "RollingStddev", _missing_extension)
     if _C is not None else _missing_extension
@@ -126,6 +134,8 @@ __all__ = [
     "forward_pretrain_model",
     "recency_decay",
     "gerber_weight",
+    "CreditedAction",
+    "attribute_credit",
     "RollingStddev",
     "controller_main",
     "ActionHistoryEntry",

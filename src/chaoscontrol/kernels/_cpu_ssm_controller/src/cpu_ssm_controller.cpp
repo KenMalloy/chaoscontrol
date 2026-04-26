@@ -11,6 +11,7 @@
 #include <cstring>
 #include <fstream>
 #include <limits>
+#include <string>
 #include <tuple>
 #include <vector>
 
@@ -672,6 +673,15 @@ pybind11::dict replay_outcome_to_dict(const ReplayOutcome& ev) {
   return d;
 }
 
+template <typename T>
+T require_outcome_key(const pybind11::dict& outcome, const char* key) {
+  if (!outcome.contains(key)) {
+    throw pybind11::key_error(
+        std::string("outcome_dict missing required key '") + key + "'");
+  }
+  return outcome[pybind11::str(key)].cast<T>();
+}
+
 }  // namespace
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -691,6 +701,40 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         pybind11::arg("L_current"),
         pybind11::arg("H"),
         "Return 1 when both logits are active and agree in sign, else 0");
+  pybind11::class_<CreditedAction>(m, "CreditedAction")
+      .def_readonly("entry", &CreditedAction::entry)
+      .def_readonly("credit", &CreditedAction::credit);
+  m.def("attribute_credit",
+        [](uint32_t slot_id,
+           const pybind11::dict& outcome,
+           const PerSlotActionHistory& history,
+           const std::vector<float>& sigma_by_action_type,
+           float gamma,
+           float gerber_c) {
+          const uint64_t outcome_gpu_step =
+              require_outcome_key<uint64_t>(outcome, "gpu_step");
+          const float reward =
+              require_outcome_key<float>(outcome, "reward_shaped");
+          // C6 sentinel: use replay-outcome controller_logit as the current
+          // policy logit until C10 recomputes the policy for stored actions.
+          const float current_logit =
+              require_outcome_key<float>(outcome, "controller_logit");
+          return attribute_credit(
+              outcome_gpu_step,
+              reward,
+              current_logit,
+              history.history(slot_id),
+              sigma_by_action_type,
+              gamma,
+              gerber_c);
+        },
+        pybind11::arg("slot_id"),
+        pybind11::arg("outcome_dict"),
+        pybind11::arg("history"),
+        pybind11::arg("sigma_by_action_type"),
+        pybind11::arg("gamma") = 0.995f,
+        pybind11::arg("gerber_c") = 0.5f,
+        "Attribute replay-outcome credit to a slot's action history");
   pybind11::class_<RollingStddev>(m, "RollingStddev")
       .def(pybind11::init<float>(), pybind11::arg("decay") = 0.99f)
       .def("update", &RollingStddev::update, pybind11::arg("x"))
