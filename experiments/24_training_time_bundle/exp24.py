@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import copy
+import os
 import statistics
 from collections.abc import Sequence
 from typing import Any
@@ -920,6 +921,18 @@ EPISODIC_CONTROLLER_V1_ARMS: tuple[str, ...] = (
 EPISODIC_CONTROLLER_V1_WEIGHTS_PATH = (
     "TO_BE_FILLED/episodic_controller_v1_weights.pt"
 )
+EPISODIC_CONTROLLER_V1_WEIGHTS_PATH_ENV = "EPISODIC_CONTROLLER_V1_WEIGHTS_PATH"
+
+
+def _resolve_episodic_controller_v1_weights_path() -> str:
+    # Pod runbook substitutes the real artifact via the env var so this
+    # file stays canonical. Default placeholder is a sentinel; the runner's
+    # _build_controller_runtime_from_config rejects it via FileNotFoundError
+    # at attach time, before any cell starts training.
+    return os.environ.get(
+        EPISODIC_CONTROLLER_V1_WEIGHTS_PATH_ENV,
+        EPISODIC_CONTROLLER_V1_WEIGHTS_PATH,
+    )
 
 
 def build_episodic_controller_v1_matrix(
@@ -991,8 +1004,12 @@ def build_episodic_controller_v1_matrix(
     }
     trained_controller_frozen = {
         "episodic_controller_runtime": "cpu_ssm_reference",
-        "episodic_controller_weights_path": EPISODIC_CONTROLLER_V1_WEIGHTS_PATH,
+        "episodic_controller_weights_path": _resolve_episodic_controller_v1_weights_path(),
         "controller_train_online": False,
+        # Without the post-step CE pair the controller's reward signal is
+        # NaN (B5 gates the second forward on this flag). Always-on for
+        # trained arms; heuristic arms don't need it.
+        "episodic_compute_replay_ce_pair": True,
     }
     trained_controller_online = {
         **trained_controller_frozen,

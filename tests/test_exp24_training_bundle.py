@@ -1534,3 +1534,119 @@ def test_episodic_controller_v1_matrix_has_six_arms_three_seeds():
         assert entry["eval_episodic_cache_mode"] == "warm"
         assert entry["eval_episodic_cache_source"] == "checkpoint"
         assert entry["controller_train_online"] is True
+
+    for arm in trained_arms:
+        for entry in by_arm[arm]:
+            assert entry["episodic_compute_replay_ce_pair"] is True
+
+    for arm in ("arm_a_control", "arm_b_heuristic_cold", "arm_b_heuristic_warm"):
+        for entry in by_arm[arm]:
+            assert "episodic_compute_replay_ce_pair" not in entry
+
+
+def test_episodic_controller_v1_weights_path_honors_env_override(monkeypatch):
+    """Pod runbook substitutes the real weights via env var; matrix builder
+    must read the env at build time so the test default + pod override
+    can both work without editing this file.
+    """
+    mod = _load_exp24()
+    monkeypatch.setenv(
+        mod.EPISODIC_CONTROLLER_V1_WEIGHTS_PATH_ENV,
+        "/workspace/episodic_controller_v1_real.pt",
+    )
+    entries = mod.build_episodic_controller_v1_matrix(
+        speed_config={"batch_size": 1024, "chunk_size": 64},
+        world_size=4,
+        budget_seconds=600.0,
+    )
+    trained = [
+        entry for entry in entries
+        if entry["arm"] in {
+            "arm_c_trained_cold_frozen",
+            "arm_d_trained_cold_online",
+            "arm_e_trained_warm_online",
+        }
+    ]
+    assert trained
+    for entry in trained:
+        assert entry["episodic_controller_weights_path"] == (
+            "/workspace/episodic_controller_v1_real.pt"
+        )
+
+
+def test_episodic_eval_args_from_entry_cold_cache():
+    mod = _load_run_exp24()
+    args = mod._episodic_eval_args_from_entry(
+        {
+            "eval_episodic_cache_enabled": True,
+            "eval_episodic_cache_mode": "cold",
+            "eval_episodic_cache_capacity": 4096,
+            "eval_episodic_span_length": 4,
+            "eval_episodic_key_rep_dim": -1,
+            "eval_episodic_grace_steps": 1000,
+            "eval_episodic_fingerprint_window": 8,
+            "eval_episodic_cache_reset_per_doc": False,
+            "controller_train_online": False,
+        }
+    )
+    assert "--episodic-cache-enabled" in args
+    assert "--episodic-cache-source" in args
+    assert args[args.index("--episodic-cache-source") + 1] == "fresh"
+    assert "--no-episodic-cache-reset-per-doc" in args
+    assert "--controller-train-online" not in args
+
+
+def test_episodic_eval_args_from_entry_warm_online():
+    mod = _load_run_exp24()
+    args = mod._episodic_eval_args_from_entry(
+        {
+            "eval_episodic_cache_enabled": True,
+            "eval_episodic_cache_mode": "warm",
+            "eval_episodic_cache_source": "checkpoint",
+            "controller_train_online": True,
+        }
+    )
+    assert "--episodic-cache-enabled" in args
+    assert args[args.index("--episodic-cache-source") + 1] == "checkpoint"
+    assert "--controller-train-online" in args
+
+
+def test_episodic_eval_args_from_entry_disabled():
+    mod = _load_run_exp24()
+    args = mod._episodic_eval_args_from_entry(
+        {"eval_episodic_cache_enabled": False, "eval_episodic_cache_mode": "none"}
+    )
+    assert "--no-episodic-cache-enabled" in args
+    assert "--episodic-cache-source" not in args
+    assert "--controller-train-online" not in args
+
+
+def test_run_exp24_cli_episodic_controller_v1_dry_run(tmp_path):
+    script = REPO / "experiments" / "24_training_time_bundle" / "run_exp24.py"
+    output_dir = tmp_path / "exp24-controller-v1-dryrun"
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(script),
+            "--matrix",
+            "episodic_controller_v1",
+            "--dry-run",
+            "--limit",
+            "18",
+            "--output-dir",
+            str(output_dir),
+        ],
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    stdout = result.stdout
+    assert "matrix=episodic_controller_v1" in stdout
+    assert "world_size=4" in stdout
+    assert "entries=18" in stdout
+    assert "exp24_phase3_episodic_controller_v1_arm_a_control_s1337" in stdout
+    assert "exp24_phase3_episodic_controller_v1_arm_d_trained_cold_online_s1337" in stdout
+    assert "exp24_phase3_episodic_controller_v1_arm_e_trained_warm_online_s4011" in stdout
+    assert '"exp24_mechanism": "episodic_controller_v1"' in stdout

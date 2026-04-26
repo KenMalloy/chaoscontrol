@@ -27,6 +27,7 @@ from exp24 import (  # noqa: E402
     DEFAULT_CONTROL_SEEDS,
     build_criticality_distillation_first_smoke_matrix,
     build_criticality_distillation_multiseed_matrix,
+    build_episodic_controller_v1_matrix,
     build_episodic_dw_curation_v1_matrix,
     build_episodic_ttt_v1_matrix,
     build_fastslow_dreamworld_matrix,
@@ -60,6 +61,48 @@ def _print_entries(entries: list[dict[str, Any]]) -> None:
     for entry in entries:
         print(f"[exp24] {entry['name']}")
         print(json.dumps(entry, indent=2, sort_keys=True, default=str))
+
+
+def _episodic_eval_args_from_entry(entry: dict[str, Any]) -> list[str]:
+    # Per-entry eval-side episodic flags. F1 controller_v1 arms set these
+    # to differentiate cold/warm cache and frozen/online controller TTT;
+    # other matrices leave the keys absent and the scorer's defaults
+    # (cache off, source=auto) take over.
+    args: list[str] = []
+    cache_enabled = entry.get("eval_episodic_cache_enabled")
+    if cache_enabled is True:
+        args.append("--episodic-cache-enabled")
+    elif cache_enabled is False:
+        args.append("--no-episodic-cache-enabled")
+    mode = entry.get("eval_episodic_cache_mode")
+    if mode == "cold":
+        args.extend(["--episodic-cache-source", "fresh"])
+    elif mode == "warm":
+        args.extend(["--episodic-cache-source", "checkpoint"])
+    capacity = entry.get("eval_episodic_cache_capacity")
+    if capacity is not None:
+        args.extend(["--episodic-cache-capacity", str(int(capacity))])
+    span = entry.get("eval_episodic_span_length")
+    if span is not None:
+        args.extend(["--episodic-span-length", str(int(span))])
+    key_dim = entry.get("eval_episodic_key_rep_dim")
+    if key_dim is not None:
+        args.extend(["--episodic-key-rep-dim", str(int(key_dim))])
+    grace = entry.get("eval_episodic_grace_steps")
+    if grace is not None:
+        args.extend(["--episodic-grace-steps", str(int(grace))])
+    fp_window = entry.get("eval_episodic_fingerprint_window")
+    if fp_window is not None:
+        args.extend(["--episodic-fingerprint-window", str(int(fp_window))])
+    reset = entry.get("eval_episodic_cache_reset_per_doc")
+    if reset is True:
+        args.append("--episodic-cache-reset-per-doc")
+    elif reset is False:
+        args.append("--no-episodic-cache-reset-per-doc")
+    online = entry.get("controller_train_online")
+    if online is True:
+        args.append("--controller-train-online")
+    return args
 
 
 def _score_full_val(
@@ -118,6 +161,7 @@ def _score_full_val(
             "--doc-packing",
             "chunk_count_tail",
         ]
+        cmd.extend(_episodic_eval_args_from_entry(entry))
         commands.append(cmd)
         if dry_run:
             continue
@@ -256,6 +300,13 @@ def _build_entries(
             budget_seconds=budget_seconds,
             seed_values=seeds,
         )
+    if matrix == "episodic_controller_v1":
+        return build_episodic_controller_v1_matrix(
+            speed_config=speed_config,
+            world_size=world_size,
+            budget_seconds=budget_seconds,
+            seed_values=seeds,
+        )
     if matrix == "all":
         entries: list[dict[str, Any]] = []
         entries.extend(
@@ -309,6 +360,7 @@ def _default_world_size_for_matrix(matrix: str) -> int:
         "phase0_fastslow_only_control",
         "episodic_dw_curation_v1",
         "episodic_ttt_v1",
+        "episodic_controller_v1",
     }:
         return 4
     return 8
@@ -352,6 +404,7 @@ def main(argv: list[str] | None = None) -> int:
             "episodic_ttt_v1",
             "cd_first_smoke",
             "cd_multiseed",
+            "episodic_controller_v1",
             "all",
         ],
         default="all",

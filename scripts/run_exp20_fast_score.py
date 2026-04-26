@@ -332,14 +332,29 @@ def _build_legality_controller(
     """Mirror run_exp20_eval.py's eval-side episodic cache construction."""
     episodic_cache = None
     cache_source = "disabled"
+    requested_source = str(getattr(args, "episodic_cache_source", "auto"))
     if bool(args.episodic_cache_enabled):
         model_dim = int(ckpt_cfg["dim"])
-        episodic_cache = _load_episodic_cache_from_ckpt(ckpt_blob)
-        if episodic_cache is None:
+        if requested_source == "fresh":
             episodic_cache = _make_fresh_episodic_cache(args, model_dim)
-            cache_source = "fresh"
-        else:
+            cache_source = "fresh_forced"
+        elif requested_source == "checkpoint":
+            episodic_cache = _load_episodic_cache_from_ckpt(ckpt_blob)
+            if episodic_cache is None:
+                raise RuntimeError(
+                    "--episodic-cache-source=checkpoint requires "
+                    "ckpt['episodic_cache']; payload absent. The trainer "
+                    "must serialize the cache (F1 warm-cache arms depend "
+                    "on this contract)."
+                )
             cache_source = "loaded"
+        else:
+            episodic_cache = _load_episodic_cache_from_ckpt(ckpt_blob)
+            if episodic_cache is None:
+                episodic_cache = _make_fresh_episodic_cache(args, model_dim)
+                cache_source = "fresh"
+            else:
+                cache_source = "loaded"
 
     if episodic_cache is not None:
         controller_fp_window = int(episodic_cache.fingerprint_window)
@@ -950,10 +965,13 @@ def run(args: argparse.Namespace) -> dict:
             ckpt_blob=ckpt_blob,
         )
     )
-    if episodic_cache_source == "fresh":
+    if episodic_cache_source in {"fresh", "fresh_forced"}:
+        forced = " (forced via --episodic-cache-source=fresh)" if (
+            episodic_cache_source == "fresh_forced"
+        ) else ""
         print(
-            "[exp20_fast_score] episodic_cache: fresh empty cache "
-            f"(capacity={episodic_cache.capacity}, "
+            "[exp20_fast_score] episodic_cache: fresh empty cache"
+            f"{forced} (capacity={episodic_cache.capacity}, "
             f"span_length={episodic_cache.span_length}, "
             f"key_rep_dim={episodic_cache.key_rep_dim})",
             flush=True,
@@ -963,6 +981,14 @@ def run(args: argparse.Namespace) -> dict:
             "[exp20_fast_score] episodic_cache: loaded from checkpoint "
             f"(capacity={episodic_cache.capacity}, "
             f"occupied={int(episodic_cache.occupied.sum().item())})",
+            flush=True,
+        )
+    if bool(getattr(args, "controller_train_online", False)):
+        print(
+            "[exp20_fast_score] WARNING controller_train_online=True but "
+            "the CPU SSM controller's online learning loop is not yet "
+            "wired into the eval path; this run is equivalent to "
+            "trained-frozen until that lands.",
             flush=True,
         )
 
@@ -1292,6 +1318,28 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--episodic-key-rep-dim", type=int, default=-1)
     parser.add_argument("--episodic-grace-steps", type=int, default=1000)
     parser.add_argument("--episodic-fingerprint-window", type=int, default=8)
+    parser.add_argument(
+        "--episodic-cache-source",
+        choices=("auto", "fresh", "checkpoint"),
+        default="auto",
+        help=(
+            "auto = load from checkpoint if present else fresh (current "
+            "default); fresh = force-fresh regardless of checkpoint payload "
+            "(F1 cold-cache arms); checkpoint = require the payload, error "
+            "if absent (F1 warm-cache arms)."
+        ),
+    )
+    parser.add_argument(
+        "--controller-train-online",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "F1 controller-online arms set this. The eval scorer logs a "
+            "warning when set: the CPU SSM controller's online learning "
+            "loop is not yet wired into the eval path. Until that lands, "
+            "trained-online arms behave identically to trained-frozen."
+        ),
+    )
     parser.add_argument("--device", default="auto")
     return parser.parse_args()
 
