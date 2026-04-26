@@ -74,6 +74,8 @@ from chaoscontrol.episodic.gpu_slot import (  # noqa: E402
 )
 from chaoscontrol.optim.episodic_cache import EpisodicCache  # noqa: E402
 from chaoscontrol.optim.episodic_writer import (  # noqa: E402
+    _next_admission_trace_seq,
+    build_write_event_dict,
     fingerprint_tokens,
     select_top_p_positions,
 )
@@ -1286,6 +1288,7 @@ class EpisodicGpuEmit:
         "key_rep_dim",
         "fingerprint_window",
         "top_p",
+        "write_event_log",
     )
 
     def __init__(
@@ -1297,6 +1300,7 @@ class EpisodicGpuEmit:
         key_rep_dim: int,
         fingerprint_window: int,
         top_p: float,
+        write_event_log: list[dict[str, Any]] | None = None,
     ) -> None:
         self.slot_tensor = slot_tensor
         self.k_max = k_max
@@ -1304,6 +1308,10 @@ class EpisodicGpuEmit:
         self.key_rep_dim = key_rep_dim
         self.fingerprint_window = fingerprint_window
         self.top_p = top_p
+        # Phase B1 placeholder for per-train-rank WRITE_EVENT wire records.
+        # Disabled keeps this None so the hot path allocates no list and emits
+        # no records; Phase B4 will swap the append for shm-ring push.
+        self.write_event_log = write_event_log
 
 
 def _create_episodic_emit(
@@ -1357,6 +1365,14 @@ def _create_episodic_emit(
     # value stored on the handle is whatever the config sets, or NaN
     # to signal "use the per-step default".
     top_p = float(config.get("episodic_top_p", float("nan")))
+    event_log_enabled = bool(config.get("episodic_event_log_enabled", False))
+    # WRITE_EVENT producers live on train ranks. The episodic rank carries an
+    # all-zero gather tensor only, so allocating a list there would be a false
+    # signal and would violate the default "no list unless enabled producer"
+    # invariant.
+    write_event_log = (
+        [] if event_log_enabled and int(rank) != int(world_size) - 1 else None
+    )
     return EpisodicGpuEmit(
         slot_tensor=slot,
         k_max=k_max,
@@ -1364,6 +1380,7 @@ def _create_episodic_emit(
         key_rep_dim=key_rep_dim,
         fingerprint_window=fingerprint_window,
         top_p=top_p,
+        write_event_log=write_event_log,
     )
 
 
@@ -1404,6 +1421,8 @@ def _emit_episodic_payloads_gpu(
     rank: int,
     world_size: int,
     all_group: "dist.ProcessGroup | None",
+    current_step: int = 0,
+    write_bucket: int = 0,
 ) -> None:
     """Train-rank emit: pack the slot tensor and call ``dist.gather``.
 
@@ -1457,6 +1476,12 @@ def _emit_episodic_payloads_gpu(
     for k in range(K):
         b = int(positions[k, 0].item())
         t = int(positions[k, 1].item())
+        candidate_id: int | None = None
+        if emit.write_event_log is not None:
+            candidate_id = _rank_prefixed_event_id(
+                source_rank=int(rank),
+                rank_seq=_next_admission_trace_seq(),
+            )
         # Boundary skip mirrors ``build_write_payload``: need a full
         # fingerprint window to the left and a full span to the right.
         if t < W or t + S > T:
@@ -1486,6 +1511,22 @@ def _emit_episodic_payloads_gpu(
             span_length=S,
             key_rep_dim=D,
         )
+        if emit.write_event_log is not None:
+            assert candidate_id is not None
+            emit.write_event_log.append(
+                build_write_event_dict(
+                    candidate_id=int(candidate_id),
+                    gpu_step=int(current_step),
+                    source_rank=int(rank),
+                    key_fp=int(key_fp),
+                    key_rep=key_rep,
+                    value_tok_ids=value_tok_ids,
+                    value_anchor_id=int(anchor),
+                    pressure_at_write=float(pressure_full[b, t].item()),
+                    pre_write_ce=float(ce_full[b, t].item()),
+                    write_bucket=int(write_bucket),
+                )
+            )
     # Single GPU-to-GPU collective. Train ranks emit-only — they pass
     # ``gather_list=None`` to ``dist.gather`` and the episodic rank
     # holds the receive list. ``all_group is None`` is the single-rank
@@ -2465,6 +2506,7 @@ def _run_train_step(
                         rank=int(rank),
                         world_size=int(world_size),
                         all_group=all_group,
+                        current_step=int(current_step),
                     )
                 allreduce_grads(
                     model,
@@ -2516,6 +2558,7 @@ def _run_train_step(
             rank=int(rank),
             world_size=int(world_size),
             all_group=all_group,
+            current_step=int(current_step),
         )
     return loss
 
@@ -3509,6 +3552,7 @@ def train_fast_for_budget(
             "episodic_span_length": int(episodic_span_length),
             "episodic_key_rep_dim": resolved_key_rep_dim,
             "episodic_k_max": int(episodic_k_max),
+            "episodic_event_log_enabled": bool(episodic_event_log_enabled),
             "model_dim": resolved_key_rep_dim,
         }
         episodic_emit_handle = _create_episodic_emit(

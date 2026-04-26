@@ -78,6 +78,41 @@ class WritePayload:
     value_anchor_id: int
 
 
+def build_write_event_dict(
+    *,
+    candidate_id: int,
+    gpu_step: int,
+    source_rank: int,
+    key_fp: int,
+    key_rep: torch.Tensor,
+    value_tok_ids: torch.Tensor,
+    value_anchor_id: int,
+    pressure_at_write: float,
+    pre_write_ce: float,
+    write_bucket: int,
+) -> dict:
+    """Build the Phase B1 placeholder WRITE_EVENT dict in wire field order."""
+    return {
+        "event_type": 1,
+        "candidate_id": int(candidate_id),
+        "gpu_step": int(gpu_step),
+        "source_rank": int(source_rank),
+        "key_fp": int(key_fp),
+        "key_rep": (
+            key_rep.detach()
+            .cpu()
+            .to(torch.float16)
+            .numpy()
+            .tolist()
+        ),
+        "value_tok_ids": value_tok_ids.detach().cpu().tolist(),
+        "value_anchor_id": int(value_anchor_id),
+        "pressure_at_write": float(pressure_at_write),
+        "pre_write_ce": float(pre_write_ce),
+        "write_bucket": int(write_bucket),
+    }
+
+
 def fingerprint_tokens(tokens: torch.Tensor) -> int:
     """Stable polynomial rolling hash over a 1-D sequence of token IDs.
 
@@ -210,6 +245,7 @@ def select_writes(
     gpu_step: int = 0,
     write_bucket: int = 0,
     admission_trace_path: str | None = None,
+    write_event_log: list[dict] | None = None,
 ) -> list[WritePayload]:
     """Select and build write payloads for one training step.
 
@@ -272,9 +308,18 @@ def select_writes(
     positions = select_top_p_positions(write_signal, top_p=top_p)
     payloads: list[WritePayload] = []
     trace_rows: list[dict] = [] if admission_trace_path is not None else []
+    needs_candidate_id = (
+        admission_trace_path is not None or write_event_log is not None
+    )
     for i in range(positions.shape[0]):
         b = int(positions[i, 0].item())
         t = int(positions[i, 1].item())
+        candidate_id: int | None = None
+        if needs_candidate_id:
+            rank_seq = _next_admission_trace_seq()
+            candidate_id = (int(source_rank) << 56) | (
+                rank_seq & ((1 << 56) - 1)
+            )
         payload = build_write_payload(
             batch_index=b,
             position=t,
@@ -286,6 +331,22 @@ def select_writes(
         )
         if payload is not None:
             payloads.append(payload)
+            if write_event_log is not None:
+                assert candidate_id is not None
+                write_event_log.append(
+                    build_write_event_dict(
+                        candidate_id=candidate_id,
+                        gpu_step=int(gpu_step),
+                        source_rank=int(source_rank),
+                        key_fp=int(payload.key_fp),
+                        key_rep=payload.key_rep,
+                        value_tok_ids=payload.value_tok_ids,
+                        value_anchor_id=int(payload.value_anchor_id),
+                        pressure_at_write=float(pressure[b, t].item()),
+                        pre_write_ce=float(per_token_ce[b, t].item()),
+                        write_bucket=int(write_bucket),
+                    )
+                )
         if admission_trace_path is not None:
             # Reject path: ``payload is None`` means the candidate was
             # boundary-trimmed — no fingerprint window or no full target
@@ -303,10 +364,7 @@ def select_writes(
                 anchor_id = int(target_ids[b, t].item())
             key_rep_slice = key_rep_per_position[b, t]
             l2 = float(torch.linalg.vector_norm(key_rep_slice).item())
-            rank_seq = _next_admission_trace_seq()
-            candidate_id = (int(source_rank) << 56) | (
-                rank_seq & ((1 << 56) - 1)
-            )
+            assert candidate_id is not None
             trace_rows.append({
                 "candidate_id": candidate_id,
                 "decision": 1 if payload is not None else 0,
