@@ -281,3 +281,81 @@ def test_evict_invalid_slot_raises():
         cache.evict(5)
     with pytest.raises(IndexError):
         cache.evict(-1)
+
+
+def test_reset_returns_to_post_construction_state():
+    """reset() must put the cache in a state indistinguishable from a freshly
+    constructed one of the same shape — needed for per-doc cache resets at
+    eval time. Pin the same invariants that test_constructs_with_zeroed_storage
+    pins on a brand-new cache.
+    """
+    cache = EpisodicCache(capacity=4, span_length=4, key_rep_dim=8)
+    # Fill it with state.
+    cache.append(**_entry_kwargs(
+        key_fp=42, span_length=4, key_rep_dim=8, current_step=5,
+        embedding_version=7, value_anchor_id=99,
+    ))
+    cache.append(**_entry_kwargs(
+        key_fp=99, span_length=4, key_rep_dim=8, current_step=10,
+        embedding_version=7,
+    ))
+    e = cache.query(42)
+    assert e is not None
+    cache.mark_fired(e.slot, current_step=20)
+    cache.update_utility(e.slot, ce_delta=2.5)
+    assert len(cache) == 2
+
+    cache.reset()
+
+    # Mirror of test_constructs_with_zeroed_storage assertions:
+    assert len(cache) == 0
+    assert not cache.is_full
+    assert cache.occupied.dtype == torch.bool
+    assert not cache.occupied.any()
+    assert cache.key_fp.shape == (4,)
+    assert cache.value_tok_ids.shape == (4, 4)
+    assert cache.key_rep.shape == (4, 8)
+    # All field tensors zeroed (or -1 for the step trackers, matching __init__).
+    assert torch.all(cache.key_fp == 0)
+    assert torch.all(cache.key_rep == 0)
+    assert torch.all(cache.value_tok_ids == 0)
+    assert torch.all(cache.value_anchor_id == 0)
+    assert torch.all(cache.utility_u == 0)
+    assert torch.all(cache.last_fired_step == -1)
+    assert torch.all(cache.write_step == -1)
+    assert torch.all(cache.birth_embedding_version == 0)
+    # Hash index cleared so the same fingerprint can be reinserted from a
+    # blank slate.
+    assert cache._fp_index == {}
+    assert cache.query(42) is None
+    assert cache.query(99) is None
+
+    # Post-reset, the cache is fully usable again — re-append should land in
+    # slot 0 and be queryable.
+    slot = cache.append(**_entry_kwargs(
+        key_fp=42, span_length=4, key_rep_dim=8, current_step=0,
+    ))
+    assert slot == 0
+    e2 = cache.query(42)
+    assert e2 is not None
+    assert e2.slot == 0
+    assert e2.write_step == 0
+
+
+def test_reset_preserves_capacity_and_config():
+    """reset() must not change capacity, span_length, key_rep_dim, grace_steps,
+    or utility_ema_decay — those are construction-time choices, not state.
+    """
+    cache = EpisodicCache(
+        capacity=8, span_length=6, key_rep_dim=12,
+        grace_steps=128, utility_ema_decay=0.95,
+    )
+    cache.append(**_entry_kwargs(
+        key_fp=1, span_length=6, key_rep_dim=12, current_step=0,
+    ))
+    cache.reset()
+    assert cache.capacity == 8
+    assert cache.span_length == 6
+    assert cache.key_rep_dim == 12
+    assert cache.grace_steps == 128
+    assert cache.utility_ema_decay == pytest.approx(0.95)
