@@ -833,6 +833,22 @@ T require_outcome_key(const pybind11::dict& outcome, const char* key) {
   return outcome[pybind11::str(key)].cast<T>();
 }
 
+pybind11::dict online_learning_weights_to_dict(
+    const OnlineLearningWeights& weights) {
+  pybind11::dict d;
+  d["feature_dim"] = pybind11::int_(weights.feature_dim);
+  d["global_dim"] = pybind11::int_(weights.global_dim);
+  d["slot_dim"] = pybind11::int_(weights.slot_dim);
+  d["w_global_in"] = weights.w_global_in;
+  d["w_slot_in"] = weights.w_slot_in;
+  d["decay_global"] = weights.decay_global;
+  d["decay_slot"] = weights.decay_slot;
+  d["w_global_out"] = weights.w_global_out;
+  d["w_slot_out"] = weights.w_slot_out;
+  d["bias"] = pybind11::float_(weights.bias);
+  return d;
+}
+
 }  // namespace
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -1023,11 +1039,23 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
                              &PerSlotActionHistory::max_entries_per_slot);
 
   pybind11::class_<OnlineLearningController>(m, "OnlineLearningController")
-      .def(pybind11::init<uint32_t, uint32_t, float, float>(),
+      .def(pybind11::init<
+               uint32_t,
+               uint32_t,
+               float,
+               float,
+               float,
+               uint32_t,
+               float,
+               uint64_t>(),
            pybind11::arg("num_slots") = 4096,
            pybind11::arg("max_entries_per_slot") = 64,
            pybind11::arg("gamma") = 0.995f,
-           pybind11::arg("gerber_c") = 0.5f)
+           pybind11::arg("gerber_c") = 0.5f,
+           pybind11::arg("learning_rate") = 1.0e-3f,
+           pybind11::arg("sgd_interval") = 256,
+           pybind11::arg("ema_alpha") = 0.25f,
+           pybind11::arg("ema_interval") = 64)
       .def("on_replay_outcome",
            [](OnlineLearningController& self, const pybind11::dict& d) {
              self.on_replay_outcome(dict_to_replay_outcome(d));
@@ -1035,6 +1063,19 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
            pybind11::arg("replay_outcome"),
            "Consume one ReplayOutcome dict, credit prior slot history, and "
            "append a replay-selection action with empty-state sentinels.")
+      .def("initialize_weights",
+           &OnlineLearningController::initialize_weights,
+           pybind11::arg("feature_dim"),
+           pybind11::arg("global_dim"),
+           pybind11::arg("slot_dim"),
+           pybind11::arg("w_global_in"),
+           pybind11::arg("w_slot_in"),
+           pybind11::arg("decay_global"),
+           pybind11::arg("decay_slot"),
+           pybind11::arg("w_global_out"),
+           pybind11::arg("w_slot_out"),
+           pybind11::arg("bias"),
+           "Initialize fast/slow online-learning weights and zero gradients.")
       .def("record_replay_selection",
            &OnlineLearningController::record_replay_selection,
            pybind11::arg("slot_id"),
@@ -1062,11 +1103,26 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
                  pybind11::int_(t.backward_ready_actions);
              d["backward_skipped_missing_state"] =
                  pybind11::int_(t.backward_skipped_missing_state);
+             d["backward_skipped_missing_weights"] =
+                 pybind11::int_(t.backward_skipped_missing_weights);
+             d["backward_skipped_bad_shape"] =
+                 pybind11::int_(t.backward_skipped_bad_shape);
              d["invalid_slot_skips"] = pybind11::int_(t.invalid_slot_skips);
              d["sgd_steps"] = pybind11::int_(t.sgd_steps);
              d["ema_blends"] = pybind11::int_(t.ema_blends);
              return d;
            })
+      .def("fast_weights",
+           [](const OnlineLearningController& self) {
+             return online_learning_weights_to_dict(self.fast_weights());
+           })
+      .def("slow_weights",
+           [](const OnlineLearningController& self) {
+             return online_learning_weights_to_dict(self.slow_weights());
+           })
+      .def_property_readonly(
+          "weights_initialized",
+          &OnlineLearningController::weights_initialized)
       .def_property_readonly("last_credit_sum",
                              &OnlineLearningController::last_credit_sum);
 

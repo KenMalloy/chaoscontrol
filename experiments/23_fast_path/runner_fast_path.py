@@ -1709,6 +1709,7 @@ class _EpisodicConsumerState:
         "bucket_baseline_ema",
         "compute_replay_ce_pair",
         "pending_post_step_replays",
+        "online_learning_bridge",
     )
 
     def __init__(
@@ -1783,6 +1784,7 @@ class _EpisodicConsumerState:
         self.pending_post_step_replays: list[dict[str, Any]] | None = (
             [] if self.compute_replay_ce_pair else None
         )
+        self.online_learning_bridge = None
 
 
 def _attach_episodic_consumer(
@@ -2070,7 +2072,24 @@ def _emit_replay_outcome(
             drops_attr="replay_ring_drops",
             event=event,
         )
+        _notify_online_learning_bridge(consumer=consumer, event=event)
     return event
+
+
+def _notify_online_learning_bridge(
+    *,
+    consumer: _EpisodicConsumerState,
+    event: dict[str, Any],
+) -> None:
+    bridge = getattr(consumer, "online_learning_bridge", None)
+    if bridge is None:
+        return
+    if int(event.get("outcome_status", -1)) != _REPLAY_STATUS_OK:
+        return
+    reward = float(event.get("reward_shaped", float("nan")))
+    if not math.isfinite(reward):
+        return
+    bridge.on_replay_outcome(event)
 
 
 def _write_replay_ndjson_row(
@@ -2229,6 +2248,113 @@ def _build_controller_runtime_from_config(
     )
 
 
+class _OnlineLearningRuntimeBridge:
+    """Bridge C++ online updates back into the Python scoring runtime."""
+
+    __slots__ = ("runtime", "learner", "_lock", "_last_sgd_steps")
+
+    def __init__(
+        self,
+        *,
+        runtime: Any,
+        capacity: int,
+        config: dict[str, Any],
+    ) -> None:
+        self.runtime = runtime
+        self.learner = _ext.OnlineLearningController(
+            num_slots=int(capacity),
+            max_entries_per_slot=int(
+                config.get("episodic_controller_history_entries", 64)
+            ),
+            gamma=float(config.get("episodic_controller_credit_gamma", 0.995)),
+            gerber_c=float(config.get("episodic_controller_gerber_c", 0.5)),
+            learning_rate=float(
+                config.get("episodic_controller_learning_rate", 1.0e-3)
+            ),
+            sgd_interval=int(config.get("episodic_controller_sgd_interval", 256)),
+            ema_alpha=float(config.get("episodic_controller_ema_alpha", 0.25)),
+            ema_interval=int(config.get("episodic_controller_ema_interval", 64)),
+        )
+        self._lock = threading.Lock()
+        self._last_sgd_steps = 0
+        self._initialize_learner_from_runtime()
+
+    def score_slot_with_snapshot(
+        self,
+        features: torch.Tensor,
+        *,
+        slot: int,
+    ) -> Any:
+        with self._lock:
+            return self.runtime.score_slot_with_snapshot(features, slot=slot)
+
+    def score_slot(self, features: torch.Tensor, *, slot: int) -> torch.Tensor:
+        with self._lock:
+            return self.runtime.score_slot(features, slot=slot)
+
+    def record_replay_selection(self, **kwargs: Any) -> None:
+        with self._lock:
+            self.learner.record_replay_selection(**kwargs)
+
+    def on_replay_outcome(self, event: dict[str, Any]) -> None:
+        with self._lock:
+            self.learner.on_replay_outcome(event)
+            telemetry = self.learner.telemetry()
+            sgd_steps = int(telemetry.get("sgd_steps", 0))
+            if sgd_steps != self._last_sgd_steps:
+                self._last_sgd_steps = sgd_steps
+                self._sync_runtime_from_fast_weights()
+
+    def _initialize_learner_from_runtime(self) -> None:
+        weights = self.runtime.weights.to_dict()
+        self.learner.initialize_weights(
+            feature_dim=int(self.runtime.weights.feature_dim),
+            global_dim=int(self.runtime.weights.global_dim),
+            slot_dim=int(self.runtime.weights.slot_dim),
+            w_global_in=_flat_float_list(weights["w_global_in"]),
+            w_slot_in=_flat_float_list(weights["w_slot_in"]),
+            decay_global=_flat_float_list(weights["decay_global"]),
+            decay_slot=_flat_float_list(weights["decay_slot"]),
+            w_global_out=_flat_float_list(weights["w_global_out"]),
+            w_slot_out=_flat_float_list(weights["w_slot_out"]),
+            bias=float(weights["bias"].item()),
+        )
+
+    def _sync_runtime_from_fast_weights(self) -> None:
+        from chaoscontrol.episodic.cpu_ssm_controller import (
+            CpuSsmControllerWeights,
+        )
+
+        blob = self.learner.fast_weights()
+        feature_dim = int(blob["feature_dim"])
+        global_dim = int(blob["global_dim"])
+        slot_dim = int(blob["slot_dim"])
+        self.runtime.weights = CpuSsmControllerWeights(
+            w_global_in=torch.tensor(
+                blob["w_global_in"],
+                dtype=torch.float32,
+            ).reshape(global_dim, feature_dim),
+            w_slot_in=torch.tensor(
+                blob["w_slot_in"],
+                dtype=torch.float32,
+            ).reshape(slot_dim, feature_dim),
+            decay_global=torch.tensor(blob["decay_global"], dtype=torch.float32),
+            decay_slot=torch.tensor(blob["decay_slot"], dtype=torch.float32),
+            w_global_out=torch.tensor(blob["w_global_out"], dtype=torch.float32),
+            w_slot_out=torch.tensor(blob["w_slot_out"], dtype=torch.float32),
+            bias=torch.tensor(float(blob["bias"]), dtype=torch.float32),
+        )
+
+
+def _flat_float_list(value: torch.Tensor) -> list[float]:
+    return [
+        float(x)
+        for x in value.detach().to(device="cpu", dtype=torch.float32)
+        .reshape(-1)
+        .tolist()
+    ]
+
+
 def _spawn_episodic_controller(
     *,
     consumer: _EpisodicConsumerState,
@@ -2272,6 +2398,16 @@ def _spawn_episodic_controller(
         config,
         capacity=int(consumer.cache.capacity),
     )
+    action_recorder = None
+    controller_runtime_for_thread = controller_runtime
+    if controller_runtime is not None:
+        action_recorder = _OnlineLearningRuntimeBridge(
+            runtime=controller_runtime,
+            capacity=int(consumer.cache.capacity),
+            config=config,
+        )
+        controller_runtime_for_thread = action_recorder
+        consumer.online_learning_bridge = action_recorder
 
     stop_event = threading.Event()
     # The controller thread has its OWN heartbeat (exposed via
@@ -2302,7 +2438,8 @@ def _spawn_episodic_controller(
             "stop_event": stop_event,
             "k": k,
             "score_mode": score_mode,
-            "controller_runtime": controller_runtime,
+            "controller_runtime": controller_runtime_for_thread,
+            "action_recorder": action_recorder,
             "cycle_idle_sleep_s": idle_sleep_s,
             "heartbeat": controller_heartbeat,
         },
@@ -2819,6 +2956,7 @@ def _run_post_step_replay_ce(
             drops_attr="replay_ring_drops",
             event=event_dict,
         )
+        _notify_online_learning_bridge(consumer=consumer, event=event_dict)
         ndjson_logger = staged.get("ndjson_logger")
         ndjson_row = staged.get("ndjson_row")
         if ndjson_logger is not None and ndjson_row is not None:
@@ -3687,6 +3825,13 @@ def train_fast_for_budget(
     episodic_controller_weights_path: str | None = None,
     episodic_controller_global_dim: int = 8,
     episodic_controller_slot_dim: int = 4,
+    episodic_controller_learning_rate: float = 1.0e-3,
+    episodic_controller_sgd_interval: int = 256,
+    episodic_controller_ema_alpha: float = 0.25,
+    episodic_controller_ema_interval: int = 64,
+    episodic_controller_credit_gamma: float = 0.995,
+    episodic_controller_gerber_c: float = 0.5,
+    episodic_controller_history_entries: int = 64,
     episodic_replay_max_replays_per_step: int = 0,
 ) -> dict[str, Any]:
     rank_ = int(rank)
@@ -3868,6 +4013,21 @@ def train_fast_for_budget(
         "episodic_controller_weights_path": episodic_controller_weights_path,
         "episodic_controller_global_dim": int(episodic_controller_global_dim),
         "episodic_controller_slot_dim": int(episodic_controller_slot_dim),
+        "episodic_controller_learning_rate": float(
+            episodic_controller_learning_rate
+        ),
+        "episodic_controller_sgd_interval": int(
+            episodic_controller_sgd_interval
+        ),
+        "episodic_controller_ema_alpha": float(episodic_controller_ema_alpha),
+        "episodic_controller_ema_interval": int(episodic_controller_ema_interval),
+        "episodic_controller_credit_gamma": float(
+            episodic_controller_credit_gamma
+        ),
+        "episodic_controller_gerber_c": float(episodic_controller_gerber_c),
+        "episodic_controller_history_entries": int(
+            episodic_controller_history_entries
+        ),
     }
     if (
         scopt_active
@@ -5300,6 +5460,27 @@ def run_condition(
         ),
         episodic_controller_slot_dim=int(
             config.get("episodic_controller_slot_dim", 4)
+        ),
+        episodic_controller_learning_rate=float(
+            config.get("episodic_controller_learning_rate", 1.0e-3)
+        ),
+        episodic_controller_sgd_interval=int(
+            config.get("episodic_controller_sgd_interval", 256)
+        ),
+        episodic_controller_ema_alpha=float(
+            config.get("episodic_controller_ema_alpha", 0.25)
+        ),
+        episodic_controller_ema_interval=int(
+            config.get("episodic_controller_ema_interval", 64)
+        ),
+        episodic_controller_credit_gamma=float(
+            config.get("episodic_controller_credit_gamma", 0.995)
+        ),
+        episodic_controller_gerber_c=float(
+            config.get("episodic_controller_gerber_c", 0.5)
+        ),
+        episodic_controller_history_entries=int(
+            config.get("episodic_controller_history_entries", 64)
         ),
         episodic_replay_max_replays_per_step=int(
             config.get("episodic_replay_max_replays_per_step", 0)

@@ -36,6 +36,7 @@ Tests:
 from __future__ import annotations
 
 import importlib.util
+import math
 from pathlib import Path
 
 import pytest
@@ -156,6 +157,77 @@ def test_consumer_state_back_compat_with_disabled_episodic():
     assert consumer.heartbeat == [0]
     assert consumer.controller_query_queue == []
     assert consumer.tagged_replay_queue == []
+
+
+def test_online_learning_bridge_updates_scoring_runtime_after_sgd():
+    mod = _load_runner_module()
+    from chaoscontrol.episodic.cpu_ssm_controller import (
+        CpuSsmControllerRuntime,
+        CpuSsmControllerWeights,
+    )
+
+    runtime = CpuSsmControllerRuntime(
+        CpuSsmControllerWeights(
+            w_global_in=torch.tensor([[0.0]], dtype=torch.float32),
+            w_slot_in=torch.tensor([[0.0]], dtype=torch.float32),
+            decay_global=torch.tensor([1.0], dtype=torch.float32),
+            decay_slot=torch.tensor([1.0], dtype=torch.float32),
+            w_global_out=torch.tensor([1.0], dtype=torch.float32),
+            w_slot_out=torch.tensor([0.0], dtype=torch.float32),
+            bias=torch.tensor(0.0, dtype=torch.float32),
+        ),
+        capacity=2,
+        prefer_cpp=False,
+    )
+    bridge = mod._OnlineLearningRuntimeBridge(
+        runtime=runtime,
+        capacity=2,
+        config={
+            "episodic_controller_learning_rate": 0.1,
+            "episodic_controller_sgd_interval": 1,
+            "episodic_controller_ema_interval": 999,
+            "episodic_controller_credit_gamma": 1.0,
+            "episodic_controller_gerber_c": 0.0,
+        },
+    )
+    bridge.record_replay_selection(
+        slot_id=1,
+        gpu_step=90,
+        policy_version=7,
+        output_logit=1.0,
+        selected_rank=0,
+        features=[2.0],
+        global_state=[3.0],
+        slot_state=[0.0],
+    )
+
+    bridge.on_replay_outcome({
+        "event_type": 3,
+        "selected_rank": 0,
+        "outcome_status": 0,
+        "replay_id": 1,
+        "gpu_step": 120,
+        "query_event_id": 123,
+        "source_write_id": 456,
+        "slot_id": 1,
+        "policy_version": 7,
+        "selection_step": 110,
+        "teacher_score": 0.5,
+        "controller_logit": 1.0,
+        "ce_before_replay": 4.0,
+        "ce_after_replay": 3.0,
+        "ce_delta_raw": 1.0,
+        "bucket_baseline": 0.0,
+        "reward_shaped": 1.0,
+        "grad_cos_rare": math.nan,
+        "grad_cos_total": math.nan,
+        "flags": 0,
+    })
+
+    assert runtime.weights.w_global_in.reshape(-1).tolist() == pytest.approx([0.2])
+    assert runtime.weights.decay_global.tolist() == pytest.approx([1.3])
+    assert runtime.weights.w_global_out.tolist() == pytest.approx([1.3])
+    assert float(runtime.weights.bias.item()) == pytest.approx(0.1)
 
 
 def test_trainer_cache_checkpoint_preserves_configured_fingerprint_window(

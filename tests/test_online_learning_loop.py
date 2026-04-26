@@ -141,3 +141,68 @@ def test_online_learning_records_stateful_selection_for_delayed_backward():
     assert telemetry["nonzero_credit_actions"] == 1
     assert telemetry["backward_ready_actions"] == 1
     assert telemetry["backward_skipped_missing_state"] == 0
+
+
+def test_online_learning_applies_backward_sgd_and_slow_ema():
+    controller = _ext.OnlineLearningController(
+        num_slots=4,
+        max_entries_per_slot=8,
+        gamma=1.0,
+        gerber_c=0.0,
+        learning_rate=0.1,
+        sgd_interval=1,
+        ema_alpha=0.5,
+        ema_interval=1,
+    )
+    controller.initialize_weights(
+        feature_dim=1,
+        global_dim=1,
+        slot_dim=1,
+        w_global_in=[0.0],
+        w_slot_in=[0.0],
+        decay_global=[1.0],
+        decay_slot=[1.0],
+        w_global_out=[1.0],
+        w_slot_out=[0.0],
+        bias=0.0,
+    )
+    controller.record_replay_selection(
+        slot_id=1,
+        gpu_step=90,
+        policy_version=7,
+        output_logit=1.0,
+        selected_rank=0,
+        features=[2.0],
+        global_state=[3.0],
+        slot_state=[0.0],
+    )
+
+    controller.on_replay_outcome(
+        _replay_outcome(
+            2,
+            gpu_step=120,
+            selection_step=110,
+            controller_logit=1.0,
+            reward_shaped=1.0,
+        )
+    )
+
+    fast = controller.fast_weights()
+    assert fast["w_global_in"] == pytest.approx([0.2])
+    assert fast["decay_global"] == pytest.approx([1.3])
+    assert fast["w_global_out"] == pytest.approx([1.3])
+    assert fast["bias"] == pytest.approx(0.1)
+
+    # Slow starts equal to initial fast weights, then blends halfway toward the
+    # updated fast weights because ema_alpha=0.5 and ema_interval=1.
+    slow = controller.slow_weights()
+    assert slow["w_global_in"] == pytest.approx([0.1])
+    assert slow["decay_global"] == pytest.approx([1.15])
+    assert slow["w_global_out"] == pytest.approx([1.15])
+    assert slow["bias"] == pytest.approx(0.05)
+
+    telemetry = controller.telemetry()
+    assert telemetry["backward_ready_actions"] == 1
+    assert telemetry["backward_skipped_missing_state"] == 0
+    assert telemetry["sgd_steps"] == 1
+    assert telemetry["ema_blends"] == 1
