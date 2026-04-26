@@ -65,13 +65,17 @@ from chaoscontrol.distributed import (  # noqa: E402
     clip_grad_norm_fused,
     should_stop_now,
 )
-from chaoscontrol.episodic.ipc import ShmRing  # noqa: E402
-from chaoscontrol.episodic.payload_dtypes import (  # noqa: E402
-    make_query_candidate_dtype,
-    make_write_payload_dtype,
+from chaoscontrol.episodic.gpu_slot import (  # noqa: E402
+    make_slot_tensor,
+    pack_payload,
+    slot_dim as gpu_slot_dim,
+    unpack_payload,
 )
 from chaoscontrol.optim.episodic_cache import EpisodicCache  # noqa: E402
-from chaoscontrol.optim.episodic_writer import select_writes  # noqa: E402
+from chaoscontrol.optim.episodic_writer import (  # noqa: E402
+    fingerprint_tokens,
+    select_top_p_positions,
+)
 from chaoscontrol.optim.lamb import LAMB  # noqa: E402
 from chaoscontrol.optim.muon import Muon  # noqa: E402
 from chaoscontrol.optim.param_groups import build_optimizer_params  # noqa: E402
@@ -1235,47 +1239,46 @@ def _run_scopt_train_step(
 
 
 # ---------------------------------------------------------------------------
-# Episodic-cache producer side (Phase 1 Task 1.4)
+# Episodic-cache GPU-resident IPC (Perf Pass C)
 # ---------------------------------------------------------------------------
 #
-# A train rank with ``episodic_enabled=True`` creates two SPSC rings at
-# init, then on every training step pushes write payloads + query
-# candidates derived from the current batch's per-token signals. The
-# episodic rank (Task 1.5) attaches as a reader to these same rings.
-# The ring contract document
-# ``docs/plans/2026-04-25-ring-contract-tasks-1-4-and-1-5.md`` is the
-# canonical spec; the code here MUST not deviate from it without a
-# matching contract update on Task 1.5's side.
+# Replaces the POSIX shm SPSC ring path from Phase 1 Tasks 1.4 + 1.5. A
+# train rank with ``episodic_enabled=True`` now packs its selected write
+# + query payloads into a single contiguous fp32 tensor of shape
+# ``[K_max, slot_dim]`` and emits via ``dist.gather(dst=N-1)``. The
+# episodic rank receives, filters by ``valid_mask``, and routes each
+# valid slot to (a) ``cache.append`` for the write side and (b) a
+# Python list ``controller_query_queue`` for Phase 2 query handling.
+# Slot layout lives in ``chaoscontrol.episodic.gpu_slot``; design doc
+# is ``docs/plans/2026-04-25-perf-pass-c-gpu-resident-ipc.md``.
+
+# Default K_max for the per-rank emit tensor. At Phase 1 ``top_p ≈
+# 1/(B*T)`` the typical valid-row count is 1-2 per step; K_max=16 leaves
+# headroom for a 16x increase before we'd silently truncate.
+_DEFAULT_EPISODIC_K_MAX = 16
 
 
-class EpisodicRingsHandle:
-    """Producer-side handle the runner threads through to ``_run_train_step``.
+class EpisodicGpuEmit:
+    """Train-rank handle threaded into ``_run_train_step``.
 
-    Holds the two created rings plus their dtype + capacity metadata so
-    the in-step path doesn't re-derive them. The episodic rank does NOT
-    receive this handle (it ``attach``-es independently in Task 1.5);
-    only the train ranks own one.
+    Holds the pre-allocated ``[K_max, slot_dim]`` slot tensor (zeroed
+    each step before pack), the slot-format dimensions (S, D), the
+    fingerprint window, and the configured ``top_p`` (or NaN sentinel
+    for "use ``1/(B*T)`` default"). The episodic rank does NOT receive
+    this handle — it allocates its own ``gather_list`` of empty
+    ``[K_max, slot_dim]`` tensors via ``_drain_episodic_payloads_gpu``.
 
-    Plain ``__slots__`` class (not a ``@dataclass``) because Python
-    3.14's ``dataclasses`` module looks up ``cls.__module__`` in
-    ``sys.modules`` while resolving string annotations, and the runner
-    is loaded via ``importlib.util.spec_from_file_location`` in tests
-    (see ``test_cd_config_threading._load_runner_module``) which doesn't
-    register the module in ``sys.modules`` — that combination raises
-    ``AttributeError: 'NoneType' object has no attribute '__dict__'``.
-    The mirrored ``_ScOptPending`` class above uses the same pattern for
-    the same reason.
+    Plain ``__slots__`` class (not a ``@dataclass``) for the same
+    importlib-from-spec compatibility reason ``_ScOptPending`` and the
+    pre-Pass-C ``EpisodicRingsHandle`` used: Python 3.14's
+    ``dataclasses`` looks up ``cls.__module__`` in ``sys.modules`` while
+    resolving annotations, which fails when the runner is loaded via
+    ``importlib.util.spec_from_file_location``.
     """
 
     __slots__ = (
-        "write_ring",
-        "query_ring",
-        "write_ring_name",
-        "query_ring_name",
-        "write_ring_capacity",
-        "query_ring_capacity",
-        "write_payload_dtype",
-        "query_candidate_dtype",
+        "slot_tensor",
+        "k_max",
         "span_length",
         "key_rep_dim",
         "fingerprint_window",
@@ -1285,99 +1288,44 @@ class EpisodicRingsHandle:
     def __init__(
         self,
         *,
-        write_ring: ShmRing,
-        query_ring: ShmRing,
-        write_ring_name: str,
-        query_ring_name: str,
-        write_ring_capacity: int,
-        query_ring_capacity: int,
-        write_payload_dtype: np.dtype,
-        query_candidate_dtype: np.dtype,
+        slot_tensor: torch.Tensor,
+        k_max: int,
         span_length: int,
         key_rep_dim: int,
         fingerprint_window: int,
         top_p: float,
     ) -> None:
-        self.write_ring = write_ring
-        self.query_ring = query_ring
-        self.write_ring_name = write_ring_name
-        self.query_ring_name = query_ring_name
-        self.write_ring_capacity = write_ring_capacity
-        self.query_ring_capacity = query_ring_capacity
-        self.write_payload_dtype = write_payload_dtype
-        self.query_candidate_dtype = query_candidate_dtype
+        self.slot_tensor = slot_tensor
+        self.k_max = k_max
         self.span_length = span_length
         self.key_rep_dim = key_rep_dim
         self.fingerprint_window = fingerprint_window
         self.top_p = top_p
 
 
-def _episodic_ring_names(
-    *,
-    rank: int,
-    suffix: str | None,
-) -> tuple[str, str]:
-    """Build the two ring names for a train rank.
-
-    The contract pins the prefixes ``episodic_write_ring_rank{R}`` and
-    ``episodic_query_ring_rank{R}`` (Task 1.5 attaches by these exact
-    names). darwin's POSIX shm name cap is 31 chars including the
-    implicit leading ``/``, so the contract-pinned forms fit:
-
-      ``/episodic_write_ring_rank0``  → 26 chars
-      ``/episodic_write_ring_rank0_c`` → 28 chars (counter-shm sibling)
-
-    Leaving 3 chars of headroom for a test-only ``_{suffix}`` of up to
-    2 chars. ``suffix`` is a TEST-ONLY hook — production passes
-    ``None`` so the names match the documented contract patterns
-    exactly. The 2-char cap below means concurrent pytest sessions are
-    expected to clean up via ``_close_episodic_rings`` rather than rely
-    on globally-unique names.
-    """
-    base_write = f"episodic_write_ring_rank{rank}"
-    base_query = f"episodic_query_ring_rank{rank}"
-    if suffix is None or not str(suffix):
-        return base_write, base_query
-    # darwin PSHMNAMLEN is 31 chars including the leading ``/`` and the
-    # ``_c`` suffix the counter shm appends. The base name is 25 chars,
-    # so the budget for ``_{suffix}`` is 31 - 1 - 25 - 2 = 3 chars
-    # total — i.e. ``_{2 chars}``. Anything longer would overflow on
-    # darwin even though it succeeds on Linux pods.
-    short = str(suffix)[-2:]
-    return f"{base_write}_{short}", f"{base_query}_{short}"
-
-
-def _create_episodic_rings(
+def _create_episodic_emit(
     *,
     rank: int,
     world_size: int,
+    device: torch.device,
     config: dict[str, Any],
-) -> EpisodicRingsHandle | None:
-    """Producer-side ring setup for one train rank.
+) -> EpisodicGpuEmit | None:
+    """Build the per-rank emit-tensor handle.
 
-    Returns the handle on a TRAIN rank (``rank < world_size - 1``) when
-    ``episodic_enabled=True``. Returns ``None`` for the episodic rank,
-    for ``episodic_enabled=False``, or for a ``world_size == 1`` run
-    (no episodic rank exists). Caller must ``dist.barrier(group=all_group)``
-    AFTER this returns so Task 1.5's ``attach`` doesn't race the create.
+    Returns the handle on every rank when ``episodic_enabled=True`` and
+    ``world_size > 1``. Both train ranks and the episodic rank carry
+    their own emit tensor — the train ranks pack into theirs, the
+    episodic rank's stays all-zeros (its valid_mask=0 rows contribute
+    no cache writes, but the gather collective is symmetric and every
+    rank must contribute the same shape).
 
-    The ring sizes / dtype dimensions are read from ``config`` with the
-    defaults documented in the ring contract:
-
-      - ``episodic_span_length``: default 4
-      - ``episodic_fingerprint_window``: default 8
-      - ``episodic_key_rep_dim``: default ``model_dim``
-      - ``episodic_write_ring_capacity``: default 256
-      - ``episodic_query_ring_capacity``: default 256
-      - ``episodic_top_p``: default ``1.0 / (B * T)`` (computed at the
-        in-step site since B/T aren't known until then)
+    Returns ``None`` for ``episodic_enabled=False`` or ``world_size <=
+    1`` so the caller's ``handle is None`` check is the back-compat
+    skip.
     """
     if not bool(config.get("episodic_enabled", False)):
         return None
     if world_size <= 1:
-        return None
-    if rank >= world_size - 1:
-        # Episodic rank — Task 1.5 attaches; producer side is a no-op.
         return None
     span_length = int(config.get("episodic_span_length", 4))
     key_rep_dim = int(config.get("episodic_key_rep_dim", config.get("model_dim", 0)))
@@ -1389,66 +1337,31 @@ def _create_episodic_rings(
             f"model_dim={config.get('model_dim')!r}"
         )
     fingerprint_window = int(config.get("episodic_fingerprint_window", 8))
-    write_capacity = int(config.get("episodic_write_ring_capacity", 256))
-    query_capacity = int(config.get("episodic_query_ring_capacity", 256))
-    write_payload_dtype = make_write_payload_dtype(
-        span_length=span_length, key_rep_dim=key_rep_dim,
-    )
-    query_candidate_dtype = make_query_candidate_dtype(key_rep_dim=key_rep_dim)
-    write_name, query_name = _episodic_ring_names(
-        rank=rank,
-        suffix=str(config.get("episodic_ring_name_suffix", "") or ""),
-    )
-    write_ring = ShmRing.create(
-        name=write_name,
-        slot_shape=(),
-        dtype=write_payload_dtype,
-        capacity=write_capacity,
-    )
-    try:
-        query_ring = ShmRing.create(
-            name=query_name,
-            slot_shape=(),
-            dtype=query_candidate_dtype,
-            capacity=query_capacity,
+    k_max = int(config.get("episodic_k_max", _DEFAULT_EPISODIC_K_MAX))
+    if k_max <= 0:
+        raise ValueError(
+            f"episodic_k_max must be positive; got {k_max}"
         )
-    except Exception:
-        # Roll back the write ring so a partially-created handle doesn't
-        # leak a shm segment if query-ring creation fails.
-        write_ring.close_and_unlink()
-        raise
+    slot = make_slot_tensor(
+        k_max=k_max,
+        span_length=span_length,
+        key_rep_dim=key_rep_dim,
+        device=device,
+        dtype=torch.float32,
+    )
     # ``episodic_top_p`` is read lazily in-step because B*T isn't
-    # known here; default is ``1.0 / (B * T)`` per the contract. The
+    # known here; default is ``1.0 / (B * T)`` per the design. The
     # value stored on the handle is whatever the config sets, or NaN
     # to signal "use the per-step default".
     top_p = float(config.get("episodic_top_p", float("nan")))
-    return EpisodicRingsHandle(
-        write_ring=write_ring,
-        query_ring=query_ring,
-        write_ring_name=write_name,
-        query_ring_name=query_name,
-        write_ring_capacity=write_capacity,
-        query_ring_capacity=query_capacity,
-        write_payload_dtype=write_payload_dtype,
-        query_candidate_dtype=query_candidate_dtype,
+    return EpisodicGpuEmit(
+        slot_tensor=slot,
+        k_max=k_max,
         span_length=span_length,
         key_rep_dim=key_rep_dim,
         fingerprint_window=fingerprint_window,
         top_p=top_p,
     )
-
-
-def _close_episodic_rings(handle: EpisodicRingsHandle) -> None:
-    """Producer-side teardown: close handles AND unlink shm names.
-
-    Idempotent on each ring. Safe to call from a ``finally`` block. The
-    consumer side (Task 1.5) calls only ``close()`` — unlink is the
-    producer's responsibility per the contract.
-    """
-    try:
-        handle.write_ring.close_and_unlink()
-    finally:
-        handle.query_ring.close_and_unlink()
 
 
 def _right_pad_per_token_signal(signal: torch.Tensor, T: int) -> torch.Tensor:
@@ -1477,95 +1390,140 @@ def _right_pad_per_token_signal(signal: torch.Tensor, T: int) -> torch.Tensor:
     return torch.cat([signal, signal.new_zeros((B, 1))], dim=1)
 
 
-def _push_episodic_writes(
+def _emit_episodic_payloads_gpu(
     *,
-    handle: EpisodicRingsHandle,
+    emit: EpisodicGpuEmit,
     inputs: torch.Tensor,
     targets: torch.Tensor,
     pressure: torch.Tensor,
     per_token_ce: torch.Tensor,
     hidden: torch.Tensor,
+    rank: int,
+    world_size: int,
+    all_group: "dist.ProcessGroup | None",
 ) -> None:
-    """Per-step producer: select positions and push to BOTH rings.
+    """Train-rank emit: pack the slot tensor and call ``dist.gather``.
 
-    The contract requires that the SAME positions drive both rings, so
-    we run ``select_writes`` once and reuse its boundary-filtered list
-    for both. Boundary-dropped positions appear in NEITHER ring.
+    Only train ranks reach this function (the episodic rank's
+    ``is_episodic_rank`` branch in ``_run_train_step`` calls
+    ``dist.gather`` directly with its own ``gather_list``). Train ranks
+    pass ``gather_list=None`` to ``dist.gather`` so they emit-only.
+
+    The gather is a hard sync point across all ranks; train ranks block
+    here until the episodic rank also reaches its gather call. Packing
+    is a Python loop over ``select_top_p_positions``'s output (K is
+    small — default ``top_p ≈ 1/(B*T)`` produces 1-2 valid rows per
+    step). Boundary-dropped positions stay at ``valid_mask=0`` so the
+    drain's filter skips them.
     """
     T = int(inputs.size(1))
     pressure_full = _right_pad_per_token_signal(pressure, T)
     ce_full = _right_pad_per_token_signal(per_token_ce, T)
     # Default top_p = ``1 / (B * T)`` — one position per batch step in
-    # expectation. ``handle.top_p`` is NaN when the config didn't pin a
+    # expectation. ``emit.top_p`` is NaN when the config didn't pin a
     # value; in that case we compute the default here where B/T are
     # known. ``select_top_p_positions`` always returns at least 1 row,
     # so this guarantees at least one selection attempt per step.
-    if not (handle.top_p == handle.top_p):  # NaN sentinel
+    if not (emit.top_p == emit.top_p):  # NaN sentinel
         numel = int(inputs.numel())
         top_p = 1.0 / float(max(numel, 1))
     else:
-        top_p = float(handle.top_p)
-    payloads = select_writes(
-        input_ids=inputs.to(dtype=torch.int64),
-        target_ids=targets.to(dtype=torch.int64),
-        pressure=pressure_full.detach(),
-        per_token_ce=ce_full.detach(),
-        key_rep_per_position=hidden.detach(),
-        top_p=top_p,
-        fingerprint_window=handle.fingerprint_window,
-        span_length=handle.span_length,
+        top_p = float(emit.top_p)
+    write_signal = (
+        pressure_full.detach().to(dtype=torch.float32)
+        * ce_full.detach().to(dtype=torch.float32)
     )
-    for p in payloads:
-        slot = np.zeros((), dtype=handle.write_payload_dtype)
-        slot["key_fp"] = int(p.key_fp)
-        slot["key_rep"] = (
-            p.key_rep.detach().to(dtype=torch.float32).cpu().numpy()
+    positions = select_top_p_positions(write_signal, top_p=top_p)
+    K = int(positions.size(0))
+    if K > emit.k_max:
+        # Truncate silently — design doc says K > K_max is "config want
+        # bigger than the slot can hold"; assert covers an upstream bug
+        # where top_p would explode K beyond the configured cap.
+        positions = positions[: emit.k_max]
+        K = emit.k_max
+    # Zero out the slot tensor so untouched rows have valid_mask=0 (the
+    # drain's filter relies on this).
+    emit.slot_tensor.zero_()
+    W = int(emit.fingerprint_window)
+    S = int(emit.span_length)
+    D = int(emit.key_rep_dim)
+    B, _ = inputs.shape
+    inputs_i64 = inputs.detach().to(dtype=torch.int64)
+    targets_i64 = targets.detach().to(dtype=torch.int64)
+    hidden_detached = hidden.detach()
+    for k in range(K):
+        b = int(positions[k, 0].item())
+        t = int(positions[k, 1].item())
+        # Boundary skip mirrors ``build_write_payload``: need a full
+        # fingerprint window to the left and a full span to the right.
+        if t < W or t + S > T:
+            continue
+        fp_window = inputs_i64[b, t - W:t]
+        key_fp = fingerprint_tokens(fp_window)
+        anchor = int(targets_i64[b, t].item())
+        value_tok_ids = targets_i64[b, t:t + S]
+        # key_rep == residual in Phase 1 (same write-time hidden state);
+        # the slot carries both so the controller queue can consume the
+        # residual without the cache-writer blocking the controller path.
+        key_rep = hidden_detached[b, t]
+        residual = hidden_detached[b, t]
+        pack_payload(
+            emit.slot_tensor[k],
+            valid_mask=1.0,
+            pressure=float(pressure_full[b, t].item()),
+            key_fp=key_fp,
+            value_anchor_id=anchor,
+            value_tok_ids=value_tok_ids,
+            key_rep=key_rep,
+            residual=residual,
+            span_length=S,
+            key_rep_dim=D,
         )
-        slot["value_tok_ids"] = (
-            p.value_tok_ids.detach().to(dtype=torch.int64).cpu().numpy()
+    # Single GPU-to-GPU collective. Train ranks emit-only — they pass
+    # ``gather_list=None`` to ``dist.gather`` and the episodic rank
+    # holds the receive list. ``all_group is None`` is the single-rank
+    # test path: callers inspect ``emit.slot_tensor`` directly without
+    # a collective.
+    if all_group is not None:
+        dist.gather(
+            emit.slot_tensor,
+            gather_list=None,
+            dst=int(world_size) - 1,
+            group=all_group,
         )
-        slot["value_anchor_id"] = int(p.value_anchor_id)
-        handle.write_ring.try_write(slot)
-
-        qslot = np.zeros((), dtype=handle.query_candidate_dtype)
-        qslot["batch_index"] = int(p.batch_index)
-        qslot["position"] = int(p.position)
-        qslot["pressure"] = float(pressure_full[p.batch_index, p.position].item())
-        qslot["residual"] = (
-            hidden[p.batch_index, p.position]
-            .detach()
-            .to(dtype=torch.float32)
-            .cpu()
-            .numpy()
-        )
-        handle.query_ring.try_write(qslot)
 
 
 class _EpisodicConsumerState:
-    """Episodic-rank consumer state: cache + attached write rings + heartbeat.
+    """Episodic-rank consumer state: cache + heartbeat + controller queue.
 
     Constructed by ``_attach_episodic_consumer`` once per runner init. The
-    no-op shape (cache=None, write_rings=[], heartbeat=[0]) is what the
-    train ranks and ``episodic_enabled=False`` runs see so the
-    ``_run_train_step`` consumer branch is bit-identical to pre-Task-1.5
-    on those code paths.
+    no-op shape (``cache=None``, ``heartbeat=[0]``,
+    ``controller_query_queue=[]``) is what the train ranks and
+    ``episodic_enabled=False`` runs see so the ``_run_train_step``
+    consumer branch is bit-identical to pre-Pass-C on those code paths.
+
+    Pass C dropped the ``write_rings`` field — the new path uses
+    ``dist.gather`` instead of POSIX shm rings, so there are no rings to
+    track on the consumer side. The ``controller_query_queue`` is the
+    in-process Python list that Phase 2's CPU controller will read from;
+    Phase 1 just appends one entry per valid slot per step and exposes
+    the list to the runner for telemetry.
 
     The heartbeat is a single-element list so increments propagate back
-    to the caller (the runner's outer loop reads it for telemetry — Task
-    1.7's job).
+    to the caller (the runner's outer loop reads it for telemetry).
     """
 
-    __slots__ = ("cache", "write_rings", "heartbeat")
+    __slots__ = ("cache", "heartbeat", "controller_query_queue")
 
     def __init__(
         self,
         cache: EpisodicCache | None,
-        write_rings: list[ShmRing],
         heartbeat: list[int],
+        controller_query_queue: list[dict[str, Any]],
     ) -> None:
         self.cache = cache
-        self.write_rings = write_rings
         self.heartbeat = heartbeat
+        self.controller_query_queue = controller_query_queue
 
 
 def _attach_episodic_consumer(
@@ -1577,30 +1535,29 @@ def _attach_episodic_consumer(
     model_dim: int,
     all_group: "dist.ProcessGroup | None",
 ) -> _EpisodicConsumerState:
-    """Build the episodic-rank consumer (cache + ring attaches).
+    """Build the episodic-rank consumer (cache + controller queue).
 
     On non-episodic-rank or ``episodic_enabled=False`` this returns the
-    no-op state (``cache=None``, ``write_rings=[]``); the runner's outer
-    loop and ``_run_train_step``'s consumer branch both treat that as a
-    skip.
+    no-op state (``cache=None``, ``controller_query_queue=[]``); the
+    runner's outer loop and ``_run_train_step``'s consumer branch both
+    treat that as a skip.
 
-    On the episodic rank, this:
-      1. Constructs an ``EpisodicCache`` from config-derived defaults
-         (Decision 0.4 of the design doc): capacity=4096, span_length=4,
-         key_rep_dim=model_dim, grace_steps=1000, utility_ema_decay=0.99.
-      2. ``ShmRing.attach``-es to ``episodic_write_ring_rank{R}`` for
-         R in 0..world_size-2 — the producer rings Task 1.4 creates on
-         every train rank at runner init.
-      3. Issues ``dist.barrier(group=all_group)`` AFTER the attaches.
-         The producer side (Task 1.4) issues the same barrier after its
-         create()s; this barrier is the rendezvous point that prevents
-         the consumer's attach from racing the producer's create.
+    On the episodic rank, constructs an ``EpisodicCache`` from
+    config-derived defaults (Decision 0.4 of the design doc):
+    capacity=4096, span_length=4, key_rep_dim=model_dim,
+    grace_steps=1000, utility_ema_decay=0.99. The
+    ``controller_query_queue`` starts empty and grows one entry per
+    valid slot per gather drain.
 
-    Owns ``close()`` (NOT unlink) on each attached ring at runner
-    shutdown — the producer side owns the unlink of its own rings.
+    Pass C: the producer/consumer rendezvous from the POSIX shm path is
+    gone — the gather collective is its own implicit barrier, and there
+    are no shm segments to attach to. The ``all_group`` parameter is
+    accepted (for back-compat with the call site) but unused.
     """
     no_op = _EpisodicConsumerState(
-        cache=None, write_rings=[], heartbeat=[0],
+        cache=None,
+        heartbeat=[0],
+        controller_query_queue=[],
     )
     if not episodic_enabled or not is_episodic_rank:
         return no_op
@@ -1621,30 +1578,68 @@ def _attach_episodic_consumer(
             config.get("episodic_utility_ema_decay", 0.99)
         ),
     )
-
-    write_payload_dtype = make_write_payload_dtype(
-        span_length=span_length, key_rep_dim=key_rep_dim,
-    )
-    capacity = int(config.get("episodic_write_ring_capacity", 256))
-    write_rings: list[ShmRing] = []
-    for r in range(int(world_size) - 1):
-        ring = ShmRing.attach(
-            name=f"episodic_write_ring_rank{r}",
-            slot_shape=(),
-            dtype=write_payload_dtype,
-            capacity=capacity,
-        )
-        write_rings.append(ring)
-
-    # Post-attach rendezvous with Task 1.4's producer-side barrier. Both
-    # sides converge on this single barrier; it's the contract's only
-    # init-time synchronization point.
-    if all_group is not None:
-        dist.barrier(group=all_group)
-
     return _EpisodicConsumerState(
-        cache=cache, write_rings=write_rings, heartbeat=[0],
+        cache=cache,
+        heartbeat=[0],
+        controller_query_queue=[],
     )
+
+
+def _drain_episodic_payloads_gpu(
+    *,
+    consumer: _EpisodicConsumerState,
+    gather_list: list[torch.Tensor],
+    span_length: int,
+    key_rep_dim: int,
+    k_max: int,
+    current_step: int,
+    embedding_version: int,
+) -> None:
+    """Episodic-rank drain: filter gather_list by valid_mask, route to cache + queue.
+
+    ``gather_list[r]`` is a ``[K_max, slot_dim]`` fp32 tensor — rank r's
+    contribution. Iterate ``(rank, k)`` preserving the rank index so the
+    per-entry controller-queue row knows which train rank produced it,
+    skip rows with ``valid_mask <= 0.5``, and call ``cache.append`` /
+    queue-append for each surviving slot.
+
+    Tensor outputs from ``unpack_payload`` are already cloned so the
+    gather_list buffers are reusable next step. Scalar fields (``key_fp``,
+    ``value_anchor_id``, ``pressure``, ``valid_mask``) sync via
+    ``.item()`` — unavoidable since the cache schema and queue both want
+    Python scalars.
+    """
+    if consumer.cache is None:
+        return
+    cache = consumer.cache
+    queue = consumer.controller_query_queue
+    for r, gather_tensor in enumerate(gather_list):
+        for k in range(int(k_max)):
+            slot = gather_tensor[k]
+            # Cheap fp32 read on GPU — the .item() call is the real cost
+            # but it's per-row and gates the unpack work below.
+            if float(slot[0].item()) <= 0.5:
+                continue
+            unpacked = unpack_payload(
+                slot,
+                span_length=span_length,
+                key_rep_dim=key_rep_dim,
+            )
+            cache.append(
+                key_fp=int(unpacked["key_fp"]),
+                key_rep=unpacked["key_rep"],
+                value_tok_ids=unpacked["value_tok_ids"],
+                value_anchor_id=int(unpacked["value_anchor_id"]),
+                current_step=int(current_step),
+                embedding_version=int(embedding_version),
+            )
+            queue.append({
+                "step": int(current_step),
+                "rank": int(r),
+                "k": int(k),
+                "pressure": float(unpacked["pressure"]),
+                "residual": unpacked["residual"],
+            })
 
 
 def _run_train_step(
@@ -1656,6 +1651,7 @@ def _run_train_step(
     precision: str,
     ddp_active: bool,
     world_size: int,
+    rank: int = 0,
     compile_full_path: bool = False,
     lm_head_backward_mode: str = "fused",
     lm_head_tile_size: int = 1024,
@@ -1674,61 +1670,77 @@ def _run_train_step(
     dreamworld_generator: torch.Generator | None = None,
     is_episodic_rank: bool = False,
     all_group: "dist.ProcessGroup | None" = None,
-    episodic_rings: EpisodicRingsHandle | None = None,
-    episodic_cache: EpisodicCache | None = None,
-    episodic_write_rings: list[ShmRing] | None = None,
-    episodic_heartbeat: list[int] | None = None,
+    episodic_emit: EpisodicGpuEmit | None = None,
+    episodic_consumer: "_EpisodicConsumerState | None" = None,
     current_step: int = 0,
     embedding_version: int = 0,
 ) -> torch.Tensor:
     _reject_unsupported(model)
-    # Episodic rank skip-main: this rank does not run the main forward
-    # or backward. All its parameter grads stay None up to the all-reduce
-    # phase below, where ``materialize_zeros=True`` zero-fills them so
-    # the SUM collective produces ``(main_avg + 0) = main_avg`` on every
-    # rank for Phase 1. Phase 3 will land replay grads here instead of
-    # the no-op skip. The placeholder loss tensor below exists only so
-    # the caller's ``losses.append(loss.detach())`` and downstream
-    # bookkeeping see a real (zero-valued) tensor on the right device;
-    # it is NOT a stand-in for the train ranks' loss and event_sleep is
-    # explicitly forbidden in this configuration (caller-side guard).
+    # ------------------------------------------------------------------
+    # Episodic rank: skip main, prepare slot tensor (all-zeros valid_mask),
+    # gather (as dst), drain into cache + controller queue, all-reduce.
+    # ------------------------------------------------------------------
     if is_episodic_rank:
-        # Phase 1 Task 1.5 — episodic-rank drain. Pull every payload Task
-        # 1.4's producer pushed since the last drain into the cache. The
-        # drain runs BEFORE the SUM all-reduce so the cache state is up
-        # to date before the optimizer step; the all-reduce itself is a
-        # no-op for cache state and the order doesn't change behavior.
-        # ``episodic_cache`` and ``episodic_write_rings`` are None on
-        # the back-compat (non-episodic) path the train ranks take —
-        # nothing to do.
+        device = inputs.device
+        # The gather collective requires every rank to contribute a
+        # tensor of identical shape and dtype. The episodic rank's
+        # contribution is all zeros (valid_mask=0 for every k), so the
+        # train ranks' valid slots are the only ones that survive the
+        # drain's filter. Allocate from the emit handle when present
+        # (Pass C convention: the runner builds an emit handle on every
+        # rank including the episodic one); fall back to a zero tensor
+        # of the same shape if the caller forgot to thread an emit
+        # handle through.
+        if episodic_emit is not None:
+            episodic_emit.slot_tensor.zero_()
+            slot_self = episodic_emit.slot_tensor
+            k_max = int(episodic_emit.k_max)
+            span_length = int(episodic_emit.span_length)
+            key_rep_dim = int(episodic_emit.key_rep_dim)
+        else:
+            slot_self = None
+            k_max = 0
+            span_length = 0
+            key_rep_dim = 0
+        # Gather: episodic rank is the destination, allocates the
+        # gather_list. Train ranks pass gather_list=None.
+        gather_list: list[torch.Tensor] | None = None
         if (
-            episodic_cache is not None
-            and episodic_write_rings is not None
+            slot_self is not None
+            and ddp_active
+            and world_size > 1
+            and all_group is not None
         ):
-            for ring in episodic_write_rings:
-                while True:
-                    slot = ring.try_read()
-                    if slot is None:
-                        break
-                    # ``slot`` is a copy returned by try_read; the
-                    # ``.copy()`` on the per-field views below guards
-                    # against any future try_read implementation that
-                    # returns a view into shared memory (defensive: the
-                    # current implementation already returns a copy).
-                    episodic_cache.append(
-                        key_fp=int(slot["key_fp"]),
-                        key_rep=torch.from_numpy(
-                            np.asarray(slot["key_rep"]).copy(),
-                        ),
-                        value_tok_ids=torch.from_numpy(
-                            np.asarray(slot["value_tok_ids"]).copy(),
-                        ),
-                        value_anchor_id=int(slot["value_anchor_id"]),
-                        current_step=int(current_step),
-                        embedding_version=int(embedding_version),
-                    )
-        if episodic_heartbeat is not None:
-            episodic_heartbeat[0] += 1
+            gather_list = [
+                torch.zeros_like(slot_self) for _ in range(int(world_size))
+            ]
+            dist.gather(
+                slot_self,
+                gather_list=gather_list,
+                dst=int(world_size) - 1,
+                group=all_group,
+            )
+        # Drain: filter by valid_mask, route each surviving row to
+        # ``cache.append`` and the controller queue. Drain runs BEFORE
+        # the all-reduce so the cache state is up to date before the
+        # optimizer step (Phase 3+ replay backward will read the cache
+        # post-drain).
+        if (
+            episodic_consumer is not None
+            and episodic_consumer.cache is not None
+            and gather_list is not None
+        ):
+            _drain_episodic_payloads_gpu(
+                consumer=episodic_consumer,
+                gather_list=gather_list,
+                span_length=span_length,
+                key_rep_dim=key_rep_dim,
+                k_max=k_max,
+                current_step=int(current_step),
+                embedding_version=int(embedding_version),
+            )
+        if episodic_consumer is not None:
+            episodic_consumer.heartbeat[0] += 1
         # Train ranks reach the all-reduce after backward; the episodic
         # rank skips backward, so we must enter the same collective with
         # all-None grads → ``materialize_zeros=True`` fills them.
@@ -1746,8 +1758,10 @@ def _run_train_step(
                 op=dist.ReduceOp.SUM,
                 materialize_zeros=True,
             )
-        device = inputs.device
         return torch.zeros((), device=device, dtype=torch.float32)
+    # ------------------------------------------------------------------
+    # Train rank: forward + backward, pack slot tensor, gather, all-reduce.
+    # ------------------------------------------------------------------
     # Per-token CE is captured only when the episodic producer is wired —
     # the standard fast path stays on ``fused_lm_head_backward`` (which
     # discards per-token CE) so the cost of the ``_with_ce`` variant is
@@ -1785,7 +1799,7 @@ def _run_train_step(
             "fused_norm_streaming_v2",
         }:
             backend_name = fused_lm_head_backend_for_mode(lm_head_backward_mode)
-            if episodic_rings is not None:
+            if episodic_emit is not None:
                 # Episodic-enabled fast path — the fused kernel computes
                 # per-token CE on the way to the loss anyway, so swap to
                 # the ``_with_ce`` sibling and stop discarding it.
@@ -1843,43 +1857,6 @@ def _run_train_step(
             replay_batch_size=dreamworld_replay_batch_size,
             generator=dreamworld_generator,
         )
-    # Episodic write+query producer (Phase 1 Task 1.4). Runs AFTER backward
-    # (so the gradient signal is captured for the next step's pressure
-    # computation) and BEFORE the train-rank pre-scale + all-reduce (so a
-    # ring write that fails or stalls cannot taint the collective). Only
-    # train ranks reach this branch; the episodic rank early-returned
-    # above. ``episodic_rings is None`` means episodic_enabled=False or
-    # this is the episodic rank — both no-op here.
-    if episodic_rings is not None:
-        if per_token_ce_for_episodic is None:
-            # Non-fused LM-head modes don't return per-token CE; recompute
-            # it under no_grad so the producer can score positions. This
-            # is off the documented submission fast path (which uses one
-            # of the fused modes), so the extra forward is acceptable.
-            with torch.no_grad():
-                logits_episodic = model.lm_head(model.final_norm(hidden.detach()))
-                vocab = logits_episodic.size(-1)
-                per_token_ce_for_episodic = F.cross_entropy(
-                    logits_episodic.reshape(-1, vocab).float(),
-                    targets.reshape(-1),
-                    reduction="none",
-                ).reshape_as(targets)
-        # Phase 1 uses uniform pressure (= 1.0 everywhere). With the
-        # default ``episodic_top_p = 1 / (B * T)`` selection rule this
-        # picks the highest-CE position per step, which matches the
-        # contract's intent (most-surprising target). Real ScOpt
-        # pressure is incompatible with episodic_enabled in Phase 1
-        # (caller-side guard), and a richer pressure source is Phase 2+.
-        per_token_ce_bt = per_token_ce_for_episodic.detach().reshape(targets.shape)
-        pressure_bt = torch.ones_like(per_token_ce_bt)
-        _push_episodic_writes(
-            handle=episodic_rings,
-            inputs=inputs,
-            targets=targets,
-            pressure=pressure_bt,
-            per_token_ce=per_token_ce_bt,
-            hidden=hidden,
-        )
     if ddp_active and world_size > 1:
         mode = str(grad_allreduce_mode).strip().lower()
         if mode == "bulk":
@@ -1905,6 +1882,50 @@ def _run_train_step(
                 for p in model.parameters():
                     if p.grad is not None:
                         p.grad.mul_(inv_n_train)
+                # Pack slot tensor + gather BEFORE the SUM all-reduce
+                # per the design doc order. ``episodic_emit is None`` on
+                # ``episodic_enabled=False`` runs, in which case the
+                # gather is skipped entirely (back-compat).
+                if episodic_emit is not None:
+                    if per_token_ce_for_episodic is None:
+                        # Non-fused LM-head modes don't return per-token
+                        # CE; recompute it under no_grad so the producer
+                        # can score positions. This is off the documented
+                        # submission fast path (which uses one of the
+                        # fused modes), so the extra forward is acceptable.
+                        with torch.no_grad():
+                            logits_episodic = model.lm_head(
+                                model.final_norm(hidden.detach())
+                            )
+                            vocab = logits_episodic.size(-1)
+                            per_token_ce_for_episodic = F.cross_entropy(
+                                logits_episodic.reshape(-1, vocab).float(),
+                                targets.reshape(-1),
+                                reduction="none",
+                            ).reshape_as(targets)
+                    # Phase 1 uses uniform pressure (= 1.0 everywhere).
+                    # With the default ``episodic_top_p = 1 / (B * T)``
+                    # selection rule this picks the highest-CE position
+                    # per step, which matches the design intent
+                    # (most-surprising target). Real ScOpt pressure is
+                    # incompatible with episodic_enabled in Phase 1
+                    # (caller-side guard), and a richer pressure source
+                    # is Phase 2+.
+                    per_token_ce_bt = per_token_ce_for_episodic.detach().reshape(
+                        targets.shape
+                    )
+                    pressure_bt = torch.ones_like(per_token_ce_bt)
+                    _emit_episodic_payloads_gpu(
+                        emit=episodic_emit,
+                        inputs=inputs,
+                        targets=targets,
+                        pressure=pressure_bt,
+                        per_token_ce=per_token_ce_bt,
+                        hidden=hidden,
+                        rank=int(rank),
+                        world_size=int(world_size),
+                        all_group=all_group,
+                    )
                 allreduce_grads(
                     model,
                     world_size,
@@ -1926,6 +1947,36 @@ def _run_train_step(
                 "grad_allreduce_mode must be 'bulk' or 'async_param', "
                 f"got {grad_allreduce_mode!r}"
             )
+    elif episodic_emit is not None:
+        # Single-rank back-compat: the test path with ``ddp_active=False``
+        # exercises packing without a gather (``all_group is None``), so
+        # the runner can verify slot_tensor contents directly. This is
+        # how the unit tests pin the producer's pack semantics without
+        # standing up a process group.
+        if per_token_ce_for_episodic is None:
+            with torch.no_grad():
+                logits_episodic = model.lm_head(
+                    model.final_norm(hidden.detach())
+                )
+                vocab = logits_episodic.size(-1)
+                per_token_ce_for_episodic = F.cross_entropy(
+                    logits_episodic.reshape(-1, vocab).float(),
+                    targets.reshape(-1),
+                    reduction="none",
+                ).reshape_as(targets)
+        per_token_ce_bt = per_token_ce_for_episodic.detach().reshape(targets.shape)
+        pressure_bt = torch.ones_like(per_token_ce_bt)
+        _emit_episodic_payloads_gpu(
+            emit=episodic_emit,
+            inputs=inputs,
+            targets=targets,
+            pressure=pressure_bt,
+            per_token_ce=per_token_ce_bt,
+            hidden=hidden,
+            rank=int(rank),
+            world_size=int(world_size),
+            all_group=all_group,
+        )
     return loss
 
 
@@ -2403,9 +2454,7 @@ def train_fast_for_budget(
     episodic_fingerprint_window: int = 8,
     episodic_span_length: int = 4,
     episodic_key_rep_dim: int | None = None,
-    episodic_write_ring_capacity: int = 256,
-    episodic_query_ring_capacity: int = 256,
-    episodic_ring_name_suffix: str | None = None,
+    episodic_k_max: int = _DEFAULT_EPISODIC_K_MAX,
     episodic_capacity: int = 4096,
     episodic_grace_steps: int = 1000,
     episodic_utility_ema_decay: float = 0.99,
@@ -2537,14 +2586,13 @@ def train_fast_for_budget(
             "Phase-3 replay path will replace the placeholder; gate "
             "this combination on that work landing."
         )
-    # Phase 1 Task 1.5 — episodic-rank consumer init. Builds the cache
-    # and ``ShmRing.attach``-es to every train rank's write ring on the
-    # episodic rank only; on train ranks and ``episodic_enabled=False``
-    # the helper returns the no-op state and the runner's outer loop
-    # treats it as a skip. The post-attach barrier inside the helper
-    # rendezvouses with Task 1.4's producer-side barrier — both sides
-    # converge on the same call so the episodic rank's attach() doesn't
-    # race the train ranks' create().
+    # Pass C — episodic-rank consumer init. Builds the cache and the
+    # in-process controller_query_queue on the episodic rank only; on
+    # train ranks and ``episodic_enabled=False`` the helper returns the
+    # no-op state and the runner's outer loop treats it as a skip. No
+    # init-time barrier is needed under Pass C: the per-step
+    # ``dist.gather`` is itself the rendezvous, and there's no shm to
+    # coordinate.
     _model_dim_for_episodic = (
         int(getattr(model, "dim", 0))
         or int(getattr(model.lm_head, "in_features", 0))
@@ -2559,7 +2607,6 @@ def train_fast_for_budget(
         ),
         "episodic_grace_steps": int(episodic_grace_steps),
         "episodic_utility_ema_decay": float(episodic_utility_ema_decay),
-        "episodic_write_ring_capacity": int(episodic_write_ring_capacity),
     }
     episodic_consumer = _attach_episodic_consumer(
         episodic_enabled=bool(episodic_enabled),
@@ -2862,14 +2909,14 @@ def train_fast_for_budget(
             batch_sampler=batch_sampler,
         )
 
-    # Episodic-cache producer rings (Phase 1 Task 1.4). A train rank
-    # creates its per-rank write + query rings here; the episodic rank
-    # owns its own attach/teardown path (Task 1.5). The ``dist.barrier``
-    # below pairs with the matching barrier on the episodic rank — both
-    # sides converge on it so ``ShmRing.attach`` cannot race
-    # ``ShmRing.create``. Returns ``None`` for ``episodic_enabled=False``,
-    # for ``world_size == 1`` runs, and for the episodic rank itself.
-    episodic_rings_handle: EpisodicRingsHandle | None = None
+    # Episodic-cache GPU emit handle (Perf Pass C). Replaces the POSIX
+    # shm ring setup from Phase 1 Tasks 1.4 + 1.5. Every rank (train AND
+    # episodic) gets its own ``[K_max, slot_dim]`` slot tensor for the
+    # ``dist.gather`` collective; train ranks pack into theirs, the
+    # episodic rank's stays all-zeros (the gather symmetric-shape
+    # requirement). Returns ``None`` for ``episodic_enabled=False`` or
+    # ``world_size == 1`` runs.
+    episodic_emit_handle: EpisodicGpuEmit | None = None
     if episodic_enabled:
         # Default ``episodic_key_rep_dim`` to the model's hidden dim if
         # the caller didn't pin it. ``model.dim`` is the canonical name
@@ -2880,7 +2927,7 @@ def train_fast_for_budget(
             if episodic_key_rep_dim is not None
             else int(getattr(model, "dim", 0)) or int(model.lm_head.in_features)
         )
-        ring_config = {
+        emit_config = {
             "episodic_enabled": True,
             "episodic_top_p": (
                 float(episodic_top_p)
@@ -2890,23 +2937,15 @@ def train_fast_for_budget(
             "episodic_fingerprint_window": int(episodic_fingerprint_window),
             "episodic_span_length": int(episodic_span_length),
             "episodic_key_rep_dim": resolved_key_rep_dim,
-            "episodic_write_ring_capacity": int(episodic_write_ring_capacity),
-            "episodic_query_ring_capacity": int(episodic_query_ring_capacity),
-            "episodic_ring_name_suffix": episodic_ring_name_suffix,
+            "episodic_k_max": int(episodic_k_max),
             "model_dim": resolved_key_rep_dim,
         }
-        episodic_rings_handle = _create_episodic_rings(
-            rank=rank_, world_size=world_size_, config=ring_config,
+        episodic_emit_handle = _create_episodic_emit(
+            rank=rank_,
+            world_size=world_size_,
+            device=device,
+            config=emit_config,
         )
-        # All-rank barrier so Task 1.5's attach() observes the just-created
-        # shm. ``all_group`` exists exactly when ``episodic_enabled=True``
-        # (set up above); both sides of the producer/consumer split call
-        # this barrier and converge. Production NCCL backends don't lock
-        # in CPU-only mode, so this barrier is essentially free except for
-        # the rendezvous it forces. If you skip it, attach can hit
-        # FileNotFoundError intermittently on the episodic rank.
-        if all_group is not None:
-            dist.barrier(group=all_group)
 
     try:
         while True:
@@ -3109,6 +3148,7 @@ def train_fast_for_budget(
                     precision=precision,
                     ddp_active=ddp_active,
                     world_size=world_size_,
+                    rank=rank_,
                     compile_full_path=compile_full_path,
                     lm_head_backward_mode=lm_head_backward_mode,
                     lm_head_tile_size=lm_head_tile_size,
@@ -3123,10 +3163,8 @@ def train_fast_for_budget(
                     predictive_aux_projection=predictive_aux_projection,
                     is_episodic_rank=is_episodic_rank,
                     all_group=all_group,
-                    episodic_rings=episodic_rings_handle,
-                    episodic_cache=episodic_consumer.cache,
-                    episodic_write_rings=episodic_consumer.write_rings,
-                    episodic_heartbeat=episodic_consumer.heartbeat,
+                    episodic_emit=episodic_emit_handle,
+                    episodic_consumer=episodic_consumer,
                     current_step=steps,
                     embedding_version=0,
                     dreamworld_entry=dream_entry,
@@ -3360,22 +3398,12 @@ def train_fast_for_budget(
             prefetcher.close()
         if async_grad_reducer is not None:
             async_grad_reducer.close()
-        # Producer-side ring teardown: close + unlink. The episodic
-        # rank closes WITHOUT unlinking (Task 1.5); unlink is owned by
-        # the producer per the ring contract. Idempotent on each ring,
-        # so safe to call even if creation partially failed.
-        if episodic_rings_handle is not None:
-            _close_episodic_rings(episodic_rings_handle)
-        # Phase 1 Task 1.5 — consumer-side ring teardown. ``close()``
-        # only (NO unlink); the producer side (Task 1.4) owns the unlink
-        # of every ring it created. Idempotent on already-closed rings.
-        for _ring in episodic_consumer.write_rings:
-            try:
-                _ring.close()
-            except Exception:
-                # Defensive: a close() failure on shutdown should not
-                # mask the real exception that triggered the finally.
-                pass
+        # Pass C: no shm to clean up. The GPU slot tensors are plain
+        # ``torch.Tensor`` objects; their lifetime ends with the
+        # ``EpisodicGpuEmit`` handle going out of scope. The
+        # controller_query_queue is a Python list on the episodic rank
+        # consumer state; it stays alive for telemetry inspection until
+        # the consumer state itself is dropped.
 
     if ddp_active:
         dist.barrier()
@@ -3917,19 +3945,9 @@ def run_condition(
             if config.get("episodic_key_rep_dim") is not None
             else None
         ),
-        episodic_write_ring_capacity=int(
-            config.get("episodic_write_ring_capacity", 256)
+        episodic_k_max=int(
+            config.get("episodic_k_max", _DEFAULT_EPISODIC_K_MAX)
         ),
-        episodic_query_ring_capacity=int(
-            config.get("episodic_query_ring_capacity", 256)
-        ),
-        # ``episodic_ring_name_suffix`` is intentionally NOT plumbed
-        # through here. It is a TEST-ONLY hook — the contract requires
-        # Task 1.5 to attach by the unsuffixed names
-        # ``episodic_{write,query}_ring_rank{R}``. Setting a suffix in
-        # production YAML would silently desync producer + consumer.
-        # Tests reach the kwarg via direct ``train_fast_for_budget``
-        # invocation; production YAML cannot reach it.
         episodic_capacity=int(config.get("episodic_capacity", 4096)),
         episodic_grace_steps=int(config.get("episodic_grace_steps", 1000)),
         episodic_utility_ema_decay=float(
