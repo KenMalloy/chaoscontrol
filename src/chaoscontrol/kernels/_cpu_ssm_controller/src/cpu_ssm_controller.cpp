@@ -7,8 +7,10 @@
 #include <pybind11/stl.h>
 
 #include <cstdint>
+#include <cstring>
 #include <tuple>
 
+#include "posix_shm.h"
 #include "spsc_ring.h"
 #include "wire_events.h"
 
@@ -191,4 +193,47 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "capacity",
           [](pybind11::object) { return TestRing::capacity(); },
           "Compile-time capacity (1024)");
+
+  // Phase A3 binding — see tests/test_posix_shm.py. `write_bytes` /
+  // `read_bytes` exist for the test only; production callers will go
+  // through Phase A4's ShmRing rather than touching raw bytes. The
+  // bytes accessors validate (offset, length) against the region size
+  // here in C++ so a Python bug can't smash arbitrary memory.
+  pybind11::class_<PosixShm>(m, "PosixShm")
+      .def(pybind11::init<const std::string&, std::size_t, bool>(),
+           pybind11::arg("name"), pybind11::arg("size"), pybind11::arg("create"),
+           "Open or create a POSIX shm region. name must start with '/'; "
+           "size is bytes (ignored when create=False — the existing region's "
+           "size is recovered via fstat).")
+      .def("size", &PosixShm::size, "Region size in bytes")
+      .def("name", &PosixShm::name, "Region name (the '/'-prefixed POSIX name)")
+      .def_static("unlink", &PosixShm::unlink, pybind11::arg("name"),
+                  "Remove the name from the kernel namespace. ENOENT is a no-op "
+                  "so re-runs after clean teardown don't error.")
+      .def("write_bytes",
+           [](PosixShm& self, std::size_t offset, pybind11::bytes data) {
+             const std::string s = data;  // pybind11::bytes → std::string copy
+             if (offset + s.size() > self.size()) {
+               throw std::out_of_range(
+                   "PosixShm.write_bytes: offset(" + std::to_string(offset) +
+                   ") + len(" + std::to_string(s.size()) + ") > size(" +
+                   std::to_string(self.size()) + ")");
+             }
+             std::memcpy(static_cast<char*>(self.ptr()) + offset, s.data(), s.size());
+           },
+           pybind11::arg("offset"), pybind11::arg("data"),
+           "Test-only: copy bytes into the region at offset.")
+      .def("read_bytes",
+           [](const PosixShm& self, std::size_t offset, std::size_t length) {
+             if (offset + length > self.size()) {
+               throw std::out_of_range(
+                   "PosixShm.read_bytes: offset(" + std::to_string(offset) +
+                   ") + length(" + std::to_string(length) + ") > size(" +
+                   std::to_string(self.size()) + ")");
+             }
+             return pybind11::bytes(
+                 static_cast<const char*>(self.ptr()) + offset, length);
+           },
+           pybind11::arg("offset"), pybind11::arg("length"),
+           "Test-only: read `length` bytes from the region at offset.");
 }
