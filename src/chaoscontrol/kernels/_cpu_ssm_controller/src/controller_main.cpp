@@ -1,9 +1,13 @@
 #include "controller_main.h"
 
 #include <chrono>
+#include <cstdlib>
+#include <cstring>
 #include <optional>
+#include <stdexcept>
 #include <thread>
 
+#include "event_handlers.h"
 #include "posix_shm.h"
 
 namespace {
@@ -12,31 +16,25 @@ using WriteRing = ShmRing<WriteEvent, 16384>;
 using QueryRing = ShmRing<QueryEvent, 16384>;
 using ReplayRing = ShmRing<ReplayOutcome, 8192>;
 
-struct EventCounters {
-  uint64_t writes = 0;
-  uint64_t queries = 0;
-  uint64_t replay_outcomes = 0;
-
-  uint64_t total() const {
-    return writes + queries + replay_outcomes;
-  }
-};
-
-void handle_write(const WriteEvent&, EventCounters& counters) {
-  ++counters.writes;
-}
-
-void handle_query(const QueryEvent&, EventCounters& counters) {
-  ++counters.queries;
-}
-
-void handle_replay_outcome(const ReplayOutcome&, EventCounters& counters) {
-  ++counters.replay_outcomes;
-}
-
 bool exit_requested(const PosixShm& exit_flag) {
   const auto* byte = static_cast<const volatile uint8_t*>(exit_flag.ptr());
   return *byte != 0;
+}
+
+void publish_handler_counts(const EventHandlers& handlers, PosixShm* stats_shm) {
+  if (stats_shm == nullptr) {
+    return;
+  }
+  if (stats_shm->size() < 3 * sizeof(uint64_t)) {
+    throw std::runtime_error(
+        "controller_main stats shm must be at least 24 bytes");
+  }
+  const uint64_t counts[3] = {
+      handlers.write_count(),
+      handlers.query_count(),
+      handlers.replay_outcome_count(),
+  };
+  std::memcpy(stats_shm->ptr(), counts, sizeof(counts));
 }
 
 }  // namespace
@@ -55,28 +53,38 @@ uint64_t controller_main(
   QueryRing query_ring = QueryRing::attach(query_ring_name);
   ReplayRing replay_ring = ReplayRing::attach(replay_ring_name);
   PosixShm exit_flag(exit_flag_shm_name, 1, /*create=*/false);
+  std::optional<PosixShm> stats_shm;
+  const char* stats_shm_name =
+      std::getenv("CHAOSCONTROL_CONTROLLER_STATS_SHM");
+  if (stats_shm_name != nullptr && stats_shm_name[0] != '\0') {
+    stats_shm.emplace(stats_shm_name, 0, /*create=*/false);
+  }
 
-  EventCounters counters;
+  EventHandlers handlers;
+  publish_handler_counts(handlers, stats_shm ? &*stats_shm : nullptr);
   while (!exit_requested(exit_flag)) {
     bool processed = false;
 
     for (WriteRing& ring : write_rings) {
       std::optional<WriteEvent> ev = ring.pop();
       if (ev.has_value()) {
-        handle_write(*ev, counters);
+        handlers.handle_write(*ev);
+        publish_handler_counts(handlers, stats_shm ? &*stats_shm : nullptr);
         processed = true;
       }
     }
 
     std::optional<QueryEvent> query = query_ring.pop();
     if (query.has_value()) {
-      handle_query(*query, counters);
+      handlers.handle_query(*query);
+      publish_handler_counts(handlers, stats_shm ? &*stats_shm : nullptr);
       processed = true;
     }
 
     std::optional<ReplayOutcome> replay = replay_ring.pop();
     if (replay.has_value()) {
-      handle_replay_outcome(*replay, counters);
+      handlers.handle_replay_outcome(*replay);
+      publish_handler_counts(handlers, stats_shm ? &*stats_shm : nullptr);
       processed = true;
     }
 
@@ -85,5 +93,5 @@ uint64_t controller_main(
     }
   }
 
-  return counters.total();
+  return handlers.total_count();
 }

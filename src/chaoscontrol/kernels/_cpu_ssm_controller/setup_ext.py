@@ -16,10 +16,17 @@ def build_ext_modules() -> list:
     controller_main_rel = (
         this_dir.relative_to(repo_root) / "src" / "controller_main.cpp"
     )
+    event_handlers_rel = (
+        this_dir.relative_to(repo_root) / "src" / "event_handlers.cpp"
+    )
     return [
         CppExtension(
             name="chaoscontrol.kernels._cpu_ssm_controller._C",
-            sources=[str(cpp_rel), str(controller_main_rel)],
+            sources=[
+                str(cpp_rel),
+                str(controller_main_rel),
+                str(event_handlers_rel),
+            ],
             extra_compile_args={
                 "cxx": ["-O3", "-std=c++17"],
             },

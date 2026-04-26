@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import math
 import os
+import struct
 import time
 
 from chaoscontrol.kernels import _cpu_ssm_controller as _ext
@@ -67,6 +68,10 @@ def _sample_replay_outcome(replay_id: int) -> dict:
         "grad_cos_total": math.nan,
         "flags": 0xABCD,
     }
+
+
+def _read_counter_triplet(stats_shm: object) -> tuple[int, int, int]:
+    return struct.unpack("<QQQ", stats_shm.read_bytes(0, 24))
 
 
 def test_controller_main_polls_all_event_rings_until_exit_flag():
@@ -159,3 +164,95 @@ def test_controller_main_polls_all_event_rings_until_exit_flag():
         _force_unlink(_ext.ShmRingQueryEvent, query_name)
         _force_unlink(_ext.ShmRingReplayOutcome, replay_name)
         _force_unlink(_ext.PosixShm, exit_name)
+
+
+def test_controller_main_dispatches_each_event_type_to_its_handler_once():
+    """C2 dispatches each typed ring pop through the matching handler."""
+    pid_suffix = os.getpid()
+    write_names = [f"/cc_c2_w_{pid_suffix}"]
+    query_name = f"/cc_c2_q_{pid_suffix}"
+    replay_name = f"/cc_c2_r_{pid_suffix}"
+    exit_name = f"/cc_c2_x_{pid_suffix}"
+    stats_name = f"/cc_c2_s_{pid_suffix}"
+
+    for name in write_names:
+        _force_unlink(_ext.ShmRingWriteEvent, name)
+    _force_unlink(_ext.ShmRingQueryEvent, query_name)
+    _force_unlink(_ext.ShmRingReplayOutcome, replay_name)
+    _force_unlink(_ext.PosixShm, exit_name)
+    _force_unlink(_ext.PosixShm, stats_name)
+
+    write_rings = [_ext.ShmRingWriteEvent.create(name) for name in write_names]
+    query_ring = _ext.ShmRingQueryEvent.create(query_name)
+    replay_ring = _ext.ShmRingReplayOutcome.create(replay_name)
+    exit_flag = _ext.PosixShm(exit_name, 1, True)
+    stats_shm = _ext.PosixShm(stats_name, 24, True)
+    exit_flag.write_bytes(0, b"\x00")
+    stats_shm.write_bytes(0, b"\x00" * 24)
+
+    read_fd, write_fd = os.pipe()
+    child_pid = os.fork()
+    if child_pid == 0:
+        os.close(read_fd)
+        try:
+            os.environ["CHAOSCONTROL_CONTROLLER_STATS_SHM"] = stats_name
+            total = _ext.controller_main(
+                write_names,
+                query_name,
+                replay_name,
+                exit_name,
+                1_000,
+            )
+            os.write(write_fd, str(total).encode("ascii"))
+            os._exit(0)
+        except Exception as exc:
+            os.write(write_fd, f"ERR:{type(exc).__name__}:{exc}".encode("utf-8"))
+            os._exit(2)
+    os.close(write_fd)
+
+    try:
+        assert write_rings[0].push(_sample_write_event(1))
+        assert query_ring.push(_sample_query_event(1))
+        assert replay_ring.push(_sample_replay_outcome(1))
+
+        deadline = time.monotonic() + 5.0
+        early_status: int | None = None
+        while time.monotonic() < deadline:
+            exited_pid, status = os.waitpid(child_pid, os.WNOHANG)
+            if exited_pid == child_pid:
+                early_status = status
+                break
+            if _read_counter_triplet(stats_shm) == (1, 1, 1):
+                break
+            time.sleep(0.001)
+        if early_status is not None:
+            payload = os.read(read_fd, 256).decode("utf-8")
+            assert os.WIFEXITED(early_status), (
+                f"controller did not exit cleanly: {early_status}"
+            )
+            assert os.WEXITSTATUS(early_status) == 0, payload
+
+        assert _read_counter_triplet(stats_shm) == (1, 1, 1)
+        assert write_rings[0].size() == 0
+        assert query_ring.size() == 0
+        assert replay_ring.size() == 0
+
+        exit_flag.write_bytes(0, b"\x01")
+        _, status = os.waitpid(child_pid, 0)
+        payload = os.read(read_fd, 256).decode("utf-8")
+        assert os.WIFEXITED(status), f"controller did not exit cleanly: {status}"
+        assert os.WEXITSTATUS(status) == 0, payload
+        assert payload == "3"
+    finally:
+        try:
+            exit_flag.write_bytes(0, b"\x01")
+            _, _ = os.waitpid(child_pid, os.WNOHANG)
+        except ChildProcessError:
+            pass
+        os.close(read_fd)
+        for name in write_names:
+            _force_unlink(_ext.ShmRingWriteEvent, name)
+        _force_unlink(_ext.ShmRingQueryEvent, query_name)
+        _force_unlink(_ext.ShmRingReplayOutcome, replay_name)
+        _force_unlink(_ext.PosixShm, exit_name)
+        _force_unlink(_ext.PosixShm, stats_name)
