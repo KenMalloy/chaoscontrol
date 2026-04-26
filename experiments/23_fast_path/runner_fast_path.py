@@ -1534,6 +1534,8 @@ class _EpisodicConsumerState:
         "controller_query_queue",
         "controller_query_enabled",
         "tagged_replay_queue",
+        "query_event_log",
+        "rank_query_seq",
     )
 
     def __init__(
@@ -1543,6 +1545,7 @@ class _EpisodicConsumerState:
         controller_query_queue: list[dict[str, Any]],
         controller_query_enabled: bool = False,
         tagged_replay_queue: list[dict[str, Any]] | None = None,
+        episodic_event_log_enabled: bool = False,
     ) -> None:
         self.cache = cache
         self.heartbeat = heartbeat
@@ -1561,6 +1564,15 @@ class _EpisodicConsumerState:
         # state shares the same list instance.
         self.tagged_replay_queue = (
             [] if tagged_replay_queue is None else tagged_replay_queue
+        )
+        # Phase B2 placeholder for QUERY_EVENT wire records. When disabled,
+        # keep this as None so the default path allocates no list and appends
+        # no records; Phase B4 will swap the list append for shm-ring push.
+        self.query_event_log: list[dict[str, Any]] | None = (
+            [] if episodic_event_log_enabled else None
+        )
+        self.rank_query_seq: dict[int, int] | None = (
+            {} if episodic_event_log_enabled else None
         )
 
 
@@ -1626,6 +1638,9 @@ def _attach_episodic_consumer(
         controller_query_enabled=bool(
             config.get("controller_query_enabled", False)
         ),
+        episodic_event_log_enabled=bool(
+            config.get("episodic_event_log_enabled", False)
+        ),
     )
 
 
@@ -1663,6 +1678,46 @@ def _rank_prefixed_event_id(*, source_rank: int, rank_seq: int) -> int:
     if seq < 0:
         raise ValueError(f"rank_seq must be non-negative; got {rank_seq}")
     return (int(source_rank) << 56) | (seq & ((1 << 56) - 1))
+
+
+def _emit_query_event(
+    *,
+    consumer: _EpisodicConsumerState,
+    source_rank: int,
+    gpu_step: int,
+    query_residual: torch.Tensor,
+    pressure: float,
+    pre_query_ce: float,
+    bucket: int,
+) -> int | None:
+    """Append a QUERY_EVENT dict to the Phase B2 placeholder log.
+
+    Returns the query_id when an event is emitted; returns None when the event
+    log is disabled. The dict field order mirrors QueryEvent in wire_events.h.
+    """
+    if consumer.query_event_log is None or consumer.rank_query_seq is None:
+        return None
+    rank = int(source_rank)
+    seq = int(consumer.rank_query_seq.get(rank, 0))
+    consumer.rank_query_seq[rank] = seq + 1
+    query_id = _rank_prefixed_event_id(source_rank=rank, rank_seq=seq)
+    consumer.query_event_log.append({
+        "event_type": 2,
+        "query_id": int(query_id),
+        "gpu_step": int(gpu_step),
+        "source_rank": rank,
+        "query_rep": (
+            query_residual.detach()
+            .cpu()
+            .to(torch.float16)
+            .numpy()
+            .tolist()
+        ),
+        "pressure": float(pressure),
+        "pre_query_ce": float(pre_query_ce),
+        "bucket": int(bucket),
+    })
+    return int(query_id)
 
 
 def _controller_score_mode_from_config(config: dict[str, Any]) -> str:
@@ -1852,6 +1907,8 @@ def _drain_episodic_payloads_gpu(
     k_max: int,
     current_step: int,
     embedding_version: int,
+    pre_query_ce: float = float("nan"),
+    query_bucket: int = -1,
 ) -> None:
     """Episodic-rank drain: filter gather_list by valid_mask, route to cache + queue.
 
@@ -1887,6 +1944,15 @@ def _drain_episodic_payloads_gpu(
                 source_rank=int(r),
                 rank_seq=(int(current_step) << 16) | int(k),
             )
+            query_event_id = _emit_query_event(
+                consumer=consumer,
+                source_rank=int(r),
+                gpu_step=int(current_step),
+                query_residual=unpacked["residual"],
+                pressure=float(unpacked["pressure"]),
+                pre_query_ce=float(pre_query_ce),
+                bucket=int(query_bucket),
+            )
             appended_slot = cache.append(
                 key_fp=int(unpacked["key_fp"]),
                 key_rep=unpacked["key_rep"],
@@ -1904,16 +1970,15 @@ def _drain_episodic_payloads_gpu(
             # 600s). Phase 2's controller bring-up flips the flag True at
             # the same time it adds the consumer that drains the queue.
             if consumer.controller_query_enabled:
-                # Phase 1 bridge: query_event_id and source_write_id share the same
-                # packed value because the QUERY_EVENT producer hasn't landed yet.
-                # TODO(controller): split into independent IDs once the QUERY_EVENT
-                # wire path lands. Downstream joins must NOT treat equal values as
-                # evidence of the same admission until then.
                 queue.append({
                     "step": int(current_step),
                     "rank": int(r),
                     "k": int(k),
-                    "query_event_id": int(source_write_id),
+                    "query_event_id": int(
+                        query_event_id
+                        if query_event_id is not None
+                        else source_write_id
+                    ),
                     "source_write_id": int(source_write_id),
                     "slot": int(appended_slot),
                     "pressure": float(unpacked["pressure"]),
@@ -2934,6 +2999,7 @@ def train_fast_for_budget(
     episodic_grace_steps: int = 1000,
     episodic_utility_ema_decay: float = 0.99,
     controller_query_enabled: bool = False,
+    episodic_event_log_enabled: bool = False,
     episodic_controller_score_mode: str = "cosine_utility_weighted",
     episodic_controller_topk_k: int = 16,
     episodic_controller_idle_sleep_s: float = 0.005,
@@ -3093,6 +3159,7 @@ def train_fast_for_budget(
         "episodic_utility_ema_decay": float(episodic_utility_ema_decay),
         "episodic_fingerprint_window": int(episodic_fingerprint_window),
         "controller_query_enabled": bool(controller_query_enabled),
+        "episodic_event_log_enabled": bool(episodic_event_log_enabled),
     }
     episodic_consumer = _attach_episodic_consumer(
         episodic_enabled=bool(episodic_enabled),
@@ -4508,6 +4575,9 @@ def run_condition(
         ),
         controller_query_enabled=bool(
             config.get("controller_query_enabled", False)
+        ),
+        episodic_event_log_enabled=bool(
+            config.get("episodic_event_log_enabled", False)
         ),
         episodic_controller_score_mode=str(
             _controller_score_mode_from_config(config)
