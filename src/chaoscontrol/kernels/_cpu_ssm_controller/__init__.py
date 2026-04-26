@@ -49,6 +49,10 @@ forward_pretrain_model = (
     getattr(_C, "forward_pretrain_model", _missing_extension)
     if _C is not None else _missing_extension
 )
+backward_step = (
+    getattr(_C, "backward_step", _missing_extension)
+    if _C is not None else _missing_extension
+)
 recency_decay = (
     getattr(_C, "recency_decay", _missing_extension)
     if _C is not None else _missing_extension
@@ -132,6 +136,7 @@ __all__ = [
     "wire_event_constants",
     "load_weights_from_path",
     "forward_pretrain_model",
+    "backward_step",
     "recency_decay",
     "gerber_weight",
     "CreditedAction",

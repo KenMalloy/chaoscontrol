@@ -386,6 +386,119 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> forward_step(
   return std::make_tuple(out_global, out_slot, logit_tensor);
 }
 
+pybind11::dict backward_step(
+    const at::Tensor& features,
+    const at::Tensor& global_state,
+    const at::Tensor& slot_state,
+    const at::Tensor& w_global_in,
+    const at::Tensor& w_slot_in,
+    const at::Tensor& decay_global,
+    const at::Tensor& decay_slot,
+    const at::Tensor& w_global_out,
+    const at::Tensor& w_slot_out,
+    double bias,
+    double grad_logit = 1.0) {
+  (void)bias;
+  TORCH_CHECK(features.dim() == 1, "features must be 1-D");
+  TORCH_CHECK(global_state.dim() == 1, "global_state must be 1-D");
+  TORCH_CHECK(slot_state.dim() == 1, "slot_state must be 1-D");
+  const int64_t feature_dim = features.size(0);
+  const int64_t global_dim = global_state.size(0);
+  const int64_t slot_dim = slot_state.size(0);
+
+  check_vec(features, "features", feature_dim);
+  check_vec(global_state, "global_state", global_dim);
+  check_vec(slot_state, "slot_state", slot_dim);
+  check_mat(w_global_in, "w_global_in", global_dim, feature_dim);
+  check_mat(w_slot_in, "w_slot_in", slot_dim, feature_dim);
+  check_vec(decay_global, "decay_global", global_dim);
+  check_vec(decay_slot, "decay_slot", slot_dim);
+  check_vec(w_global_out, "w_global_out", global_dim);
+  check_vec(w_slot_out, "w_slot_out", slot_dim);
+
+  auto grad_features = at::zeros_like(features);
+  auto grad_global_state = at::empty_like(global_state);
+  auto grad_slot_state = at::empty_like(slot_state);
+  auto grad_w_global_in = at::empty_like(w_global_in);
+  auto grad_w_slot_in = at::empty_like(w_slot_in);
+  auto grad_decay_global = at::empty_like(decay_global);
+  auto grad_decay_slot = at::empty_like(decay_slot);
+  auto grad_w_global_out = at::empty_like(w_global_out);
+  auto grad_w_slot_out = at::empty_like(w_slot_out);
+  auto grad_bias = at::empty({}, features.options());
+
+  const float* f = features.data_ptr<float>();
+  const float* g = global_state.data_ptr<float>();
+  const float* s = slot_state.data_ptr<float>();
+  const float* wg = w_global_in.data_ptr<float>();
+  const float* ws = w_slot_in.data_ptr<float>();
+  const float* dg = decay_global.data_ptr<float>();
+  const float* ds = decay_slot.data_ptr<float>();
+  const float* wgo = w_global_out.data_ptr<float>();
+  const float* wso = w_slot_out.data_ptr<float>();
+
+  float* gf = grad_features.data_ptr<float>();
+  float* gg = grad_global_state.data_ptr<float>();
+  float* gs = grad_slot_state.data_ptr<float>();
+  float* gwg = grad_w_global_in.data_ptr<float>();
+  float* gws = grad_w_slot_in.data_ptr<float>();
+  float* gdg = grad_decay_global.data_ptr<float>();
+  float* gds = grad_decay_slot.data_ptr<float>();
+  float* gwgo = grad_w_global_out.data_ptr<float>();
+  float* gwso = grad_w_slot_out.data_ptr<float>();
+  const float upstream = static_cast<float>(grad_logit);
+  *grad_bias.data_ptr<float>() = upstream;
+
+  for (int64_t i = 0; i < global_dim; ++i) {
+    const float* row = wg + i * feature_dim;
+    float out_global = dg[i] * g[i];
+    for (int64_t j = 0; j < feature_dim; ++j) {
+      out_global += row[j] * f[j];
+    }
+
+    const float grad_out = upstream * wgo[i];
+    gwgo[i] = upstream * out_global;
+    gg[i] = grad_out * dg[i];
+    gdg[i] = grad_out * g[i];
+    float* grad_row = gwg + i * feature_dim;
+    for (int64_t j = 0; j < feature_dim; ++j) {
+      grad_row[j] = grad_out * f[j];
+      gf[j] += grad_out * row[j];
+    }
+  }
+
+  for (int64_t i = 0; i < slot_dim; ++i) {
+    const float* row = ws + i * feature_dim;
+    float out_slot = ds[i] * s[i];
+    for (int64_t j = 0; j < feature_dim; ++j) {
+      out_slot += row[j] * f[j];
+    }
+
+    const float grad_out = upstream * wso[i];
+    gwso[i] = upstream * out_slot;
+    gs[i] = grad_out * ds[i];
+    gds[i] = grad_out * s[i];
+    float* grad_row = gws + i * feature_dim;
+    for (int64_t j = 0; j < feature_dim; ++j) {
+      grad_row[j] = grad_out * f[j];
+      gf[j] += grad_out * row[j];
+    }
+  }
+
+  pybind11::dict out;
+  out["features"] = grad_features;
+  out["global_state"] = grad_global_state;
+  out["slot_state"] = grad_slot_state;
+  out["w_global_in"] = grad_w_global_in;
+  out["w_slot_in"] = grad_w_slot_in;
+  out["decay_global"] = grad_decay_global;
+  out["decay_slot"] = grad_decay_slot;
+  out["w_global_out"] = grad_w_global_out;
+  out["w_slot_out"] = grad_w_slot_out;
+  out["bias"] = grad_bias;
+  return out;
+}
+
 bool has_amx_bf16() {
 #if defined(__AMX_BF16__)
   return true;
@@ -686,6 +799,19 @@ T require_outcome_key(const pybind11::dict& outcome, const char* key) {
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("forward_step", &forward_step, "CPU SSM controller reference step");
+  m.def("backward_step", &backward_step,
+        pybind11::arg("features"),
+        pybind11::arg("global_state"),
+        pybind11::arg("slot_state"),
+        pybind11::arg("w_global_in"),
+        pybind11::arg("w_slot_in"),
+        pybind11::arg("decay_global"),
+        pybind11::arg("decay_slot"),
+        pybind11::arg("w_global_out"),
+        pybind11::arg("w_slot_out"),
+        pybind11::arg("bias"),
+        pybind11::arg("grad_logit") = 1.0,
+        "CPU SSM controller reference backward step");
   m.def("load_weights_from_path", &load_weights_from_path,
         "Load a CSWG controller pretrain weight dump");
   m.def("forward_pretrain_model", &forward_pretrain_model,
