@@ -53,6 +53,14 @@ recency_decay = (
     getattr(_C, "recency_decay", _missing_extension)
     if _C is not None else _missing_extension
 )
+gerber_weight = (
+    getattr(_C, "gerber_weight", _missing_extension)
+    if _C is not None else _missing_extension
+)
+RollingStddev = (
+    getattr(_C, "RollingStddev", _missing_extension)
+    if _C is not None else _missing_extension
+)
 controller_main = (
     getattr(_C, "controller_main", _missing_extension)
     if _C is not None else _missing_extension
@@ -117,6 +125,8 @@ __all__ = [
     "load_weights_from_path",
     "forward_pretrain_model",
     "recency_decay",
+    "gerber_weight",
+    "RollingStddev",
     "controller_main",
     "ActionHistoryEntry",
     "PerSlotActionHistory",

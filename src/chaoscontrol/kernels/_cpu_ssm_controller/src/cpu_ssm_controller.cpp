@@ -686,6 +686,16 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         pybind11::arg("P"),
         pybind11::arg("gamma") = 0.995f,
         "Apply gamma^(T-P) credit decay, preserving defensive T<P behavior");
+  m.def("gerber_weight", &gerber_weight,
+        pybind11::arg("L_v"),
+        pybind11::arg("L_current"),
+        pybind11::arg("H"),
+        "Return 1 when both logits are active and agree in sign, else 0");
+  pybind11::class_<RollingStddev>(m, "RollingStddev")
+      .def(pybind11::init<float>(), pybind11::arg("decay") = 0.99f)
+      .def("update", &RollingStddev::update, pybind11::arg("x"))
+      .def("stddev", &RollingStddev::stddev)
+      .def_property_readonly("count", &RollingStddev::count);
   m.def("has_amx_bf16", &has_amx_bf16, "Whether built with AMX BF16 support");
   m.def("backend_name", &backend_name, "Compiled backend name");
   m.def("wire_event_sizes", &wire_event_sizes,
