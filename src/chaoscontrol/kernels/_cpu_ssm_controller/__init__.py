@@ -142,6 +142,24 @@ PerSlotActionHistory = (
     if _C is not None else _missing_extension
 )
 
+# Phase S1 — simplex policy forward kernel. SimplexWeights / SimplexForwardOutput
+# are pure-data POD structs (no torch tensor dependency at the C++ layer), so
+# the same surface lands wherever the extension builds. simplex_forward runs
+# the three-layer per-query forward; S2's REINFORCE backward reads from
+# SimplexForwardOutput.{vertex_h, mixed_h, attn}.
+SimplexWeights = (
+    getattr(_C, "SimplexWeights", _missing_extension)
+    if _C is not None else _missing_extension
+)
+SimplexForwardOutput = (
+    getattr(_C, "SimplexForwardOutput", _missing_extension)
+    if _C is not None else _missing_extension
+)
+simplex_forward = (
+    getattr(_C, "simplex_forward", _missing_extension)
+    if _C is not None else _missing_extension
+)
+
 # SpscRing test fixture (Phase A2). Exposes the SpscRing<uint64_t, 1024>
 # instantiation bound in cpu_ssm_controller.cpp so tests/test_spsc_ring.py
 # can drive it without reaching into `_C`. The real wire-event ring
@@ -215,6 +233,9 @@ __all__ = [
     "avx512_axpy_fma",
     "ActionHistoryEntry",
     "PerSlotActionHistory",
+    "SimplexWeights",
+    "SimplexForwardOutput",
+    "simplex_forward",
     "SpscRingU64x1024",
     "PosixShm",
     "ShmRingU64x1024",
