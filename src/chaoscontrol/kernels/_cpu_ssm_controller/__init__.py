@@ -101,6 +101,14 @@ has_amx_bf16 = (
     getattr(_C, "has_amx_bf16", _missing_extension)
     if _C is not None else _missing_extension
 )
+amx_bf16_kernel_available = (
+    getattr(_C, "amx_bf16_kernel_available", _missing_extension)
+    if _C is not None else _missing_extension
+)
+amx_bf16_matmul = (
+    getattr(_C, "amx_bf16_matmul", _missing_extension)
+    if _C is not None else _missing_extension
+)
 ActionHistoryEntry = (
     getattr(_C, "ActionHistoryEntry", _missing_extension)
     if _C is not None else _missing_extension
@@ -173,6 +181,8 @@ __all__ = [
     "cpu_features",
     "has_avx512f",
     "has_amx_bf16",
+    "amx_bf16_kernel_available",
+    "amx_bf16_matmul",
     "ActionHistoryEntry",
     "PerSlotActionHistory",
     "SpscRingU64x1024",

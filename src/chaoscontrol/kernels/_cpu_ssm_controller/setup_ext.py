@@ -1,7 +1,21 @@
 """Build hook for the CPU SSM controller reference extension."""
 from __future__ import annotations
 
+import os
+import platform
 from pathlib import Path
+
+
+def _amx_compile_args() -> list[str]:
+    machine = platform.machine().lower()
+    requested = os.environ.get("CHAOSCONTROL_CPU_SSM_X86_ACCEL") == "1"
+    if not requested or machine not in {"x86_64", "amd64"}:
+        return []
+    return [
+        "-DCHAOSCONTROL_CPU_SSM_AMX_BF16_KERNEL=1",
+        "-mamx-tile",
+        "-mamx-bf16",
+    ]
 
 
 def build_ext_modules() -> list:
@@ -26,6 +40,7 @@ def build_ext_modules() -> list:
     cpu_features_rel = (
         this_dir.relative_to(repo_root) / "src" / "cpu_features.cpp"
     )
+    amx_matmul_rel = this_dir.relative_to(repo_root) / "src" / "amx_matmul.cpp"
     optimizer_rel = this_dir.relative_to(repo_root) / "src" / "optimizer.cpp"
     online_learning_rel = (
         this_dir.relative_to(repo_root) / "src" / "online_learning.cpp"
@@ -40,11 +55,12 @@ def build_ext_modules() -> list:
                 str(action_history_rel),
                 str(credit_rel),
                 str(cpu_features_rel),
+                str(amx_matmul_rel),
                 str(optimizer_rel),
                 str(online_learning_rel),
             ],
             extra_compile_args={
-                "cxx": ["-O3", "-std=c++17"],
+                "cxx": ["-O3", "-std=c++17", *_amx_compile_args()],
             },
         )
     ]
