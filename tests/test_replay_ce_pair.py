@@ -32,13 +32,16 @@ land on the test's printout for diagnostic visibility.
 from __future__ import annotations
 
 import importlib.util
+import json
 import math
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
 import pytest
 import torch
 import torch.nn as nn
 
+from chaoscontrol.episodic.diagnostics import DiagnosticsLogger
 from chaoscontrol.optim.episodic_cache import EpisodicCache
 
 REPO = Path(__file__).resolve().parents[1]
@@ -114,7 +117,14 @@ def _append_slot(
     )
 
 
-def _drain(mod, *, consumer, model, weight: float = 1.0) -> int:
+def _drain(
+    mod,
+    *,
+    consumer,
+    model,
+    weight: float = 1.0,
+    logger: DiagnosticsLogger | None = None,
+) -> int:
     return mod._run_episodic_replay_from_tagged_queue(
         consumer=consumer,
         model=model,
@@ -122,7 +132,7 @@ def _drain(mod, *, consumer, model, weight: float = 1.0) -> int:
         weight=weight,
         lm_head_backward_mode="single",
         lm_head_tile_size=1024,
-        logger=None,
+        logger=logger,
         max_replays_per_step=0,
     )
 
@@ -253,6 +263,66 @@ def test_compute_replay_ce_pair_on_finalizes_reward_fields_after_step():
     assert consumer.bucket_baseline_ema[2] == pytest.approx(
         0.05 * expected_delta
     )
+
+
+def test_ndjson_row_uses_post_step_replay_outcome_reward_fields():
+    """D4's NDJSON corpus must see the same finalized reward as wire."""
+    mod = _load_runner()
+    torch.manual_seed(7)
+    model = _TinyTokenModel()
+    cache = EpisodicCache(capacity=4, span_length=4, key_rep_dim=8)
+    slot = _append_slot(
+        cache, key_fp=42, write_bucket=2, source_write_id=1200,
+        span_tokens=[3, 5, 7, 9],
+    )
+    consumer = _consumer(
+        mod,
+        event_log_enabled=True,
+        cache=cache,
+        compute_replay_ce_pair=True,
+    )
+    consumer.tagged_replay_queue.append({
+        "slot": int(slot),
+        "replay_id": 700,
+        "query_event_id": 600,
+        "source_write_id": 1200,
+        "selection_step": 16,
+        "policy_version": 3,
+        "selected_rank": 0,
+        "teacher_score": 0.75,
+        "controller_logit": 0.25,
+        "ce_before_replay": 99.0,
+    })
+
+    optimizer = torch.optim.SGD(model.parameters(), lr=1e-1)
+    optimizer.zero_grad(set_to_none=True)
+    with TemporaryDirectory() as tmp:
+        log_path = Path(tmp) / "episodic_replay_log_rank0.ndjson"
+        with DiagnosticsLogger(log_path) as logger:
+            replayed = _drain(
+                mod, consumer=consumer, model=model, logger=logger,
+            )
+            assert replayed == 1
+            logger.flush()
+            assert log_path.read_text() == ""
+
+            patched = _step_optimizer_and_finalize(
+                mod, consumer=consumer, model=model, optimizer=optimizer,
+            )
+            assert patched == 1
+            logger.flush()
+
+        (line,) = log_path.read_text().splitlines()
+    row = json.loads(line)
+    event = consumer.replay_outcome_log[0]
+    for field in (
+        "ce_before_replay",
+        "ce_after_replay",
+        "ce_delta_raw",
+        "bucket_baseline",
+        "reward_shaped",
+    ):
+        assert row[field] == pytest.approx(float(event[field]))
 
 
 def test_post_step_pass_is_noop_with_empty_pending_list():

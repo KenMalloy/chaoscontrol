@@ -1969,6 +1969,93 @@ def _emit_replay_outcome(
     return event
 
 
+def _write_replay_ndjson_row(
+    logger: DiagnosticsLogger,
+    *,
+    event_dict: dict[str, Any] | None,
+    current_step: int,
+    slot: int,
+    key_fp: int,
+    write_step: int,
+    write_pressure: float,
+    write_bucket: int,
+    query_cosine: float,
+    utility_pre: float,
+    utility_post: float,
+    entry: dict[str, Any],
+    replay_loss: float,
+    replay_grad_norm: float,
+    replay_grad_cos_common: float,
+    replay_grad_cos_rare: float,
+    replay_grad_cos_total: float,
+    utility_signal_raw: float,
+    utility_signal_transformed: float,
+) -> None:
+    """Write one replay diagnostic row, sourcing wire fields from event_dict."""
+
+    def _event_value(field: str, fallback: Any) -> Any:
+        if event_dict is None:
+            return fallback
+        return event_dict.get(field, fallback)
+
+    logger.write_row({
+        "step": int(_event_value("gpu_step", int(current_step))),
+        "slot": int(_event_value("slot_id", int(slot))),
+        "key_fp": int(key_fp),
+        "write_step": int(write_step),
+        "write_pressure": float(write_pressure),
+        "write_bucket": int(write_bucket),
+        "query_cosine": float(query_cosine),
+        "utility_pre": float(utility_pre),
+        "replay_id": int(_event_value("replay_id", entry.get("replay_id", -1))),
+        "query_event_id": int(
+            _event_value("query_event_id", entry.get("query_event_id", -1))
+        ),
+        "source_write_id": int(
+            _event_value("source_write_id", entry.get("source_write_id", -1))
+        ),
+        "selection_step": int(
+            _event_value("selection_step", entry.get("selection_step", -1))
+        ),
+        "policy_version": int(
+            _event_value("policy_version", entry.get("policy_version", 0))
+        ),
+        "selected_rank": int(
+            _event_value("selected_rank", entry.get("selected_rank", -1))
+        ),
+        "teacher_score": float(
+            _event_value("teacher_score", entry.get("teacher_score", query_cosine))
+        ),
+        "controller_logit": float(
+            _event_value(
+                "controller_logit",
+                entry.get("controller_logit", query_cosine),
+            )
+        ),
+        "replay_loss": float(replay_loss),
+        "ce_before_replay": float(
+            _event_value("ce_before_replay", float("nan"))
+        ),
+        "ce_after_replay": float(_event_value("ce_after_replay", replay_loss)),
+        "ce_delta_raw": float(_event_value("ce_delta_raw", float("nan"))),
+        "bucket_baseline": float(_event_value("bucket_baseline", 0.0)),
+        "reward_shaped": float(_event_value("reward_shaped", float("nan"))),
+        "replay_grad_norm": float(replay_grad_norm),
+        "replay_grad_cos_common": float(replay_grad_cos_common),
+        "replay_grad_cos_rare": float(
+            _event_value("grad_cos_rare", replay_grad_cos_rare)
+        ),
+        "replay_grad_cos_total": float(
+            _event_value("grad_cos_total", replay_grad_cos_total)
+        ),
+        "utility_signal_raw": float(utility_signal_raw),
+        "utility_signal_transformed": float(utility_signal_transformed),
+        "utility_post": float(utility_post),
+        "outcome_status": "ok",
+        "flags": int(_event_value("flags", 0)),
+    })
+
+
 def _controller_score_mode_from_config(config: dict[str, Any]) -> str:
     """Read the controller score mode, accepting the Exp24 alias.
 
@@ -2442,7 +2529,7 @@ def _run_episodic_replay_from_tagged_queue(
             value_row = (
                 cache.value_tok_ids[int(slot)].detach().clone()
             )
-            consumer.pending_post_step_replays.append({
+            staged: dict[str, Any] = {
                 "event_dict": emitted,
                 "value_tok_ids": value_row,
                 "weight": float(weight),
@@ -2450,60 +2537,62 @@ def _run_episodic_replay_from_tagged_queue(
                 "lm_head_tile_size": int(lm_head_tile_size),
                 "write_bucket": int(write_bucket),
                 "ce_before_replay": float(replay_loss),
-            })
+            }
+            if logger is not None:
+                staged["ndjson_logger"] = logger
+                staged["ndjson_row"] = {
+                    "current_step": int(current_step),
+                    "slot": int(slot),
+                    "key_fp": int(key_fp),
+                    "write_step": int(write_step),
+                    "write_pressure": float(write_pressure),
+                    "write_bucket": int(write_bucket),
+                    "query_cosine": float(query_cosine),
+                    "utility_pre": float(utility_pre),
+                    "utility_post": float(utility_post),
+                    "entry": dict(entry),
+                    "replay_loss": float(replay_loss),
+                    "replay_grad_norm": float(result["replay_grad_norm"]),
+                    "replay_grad_cos_common": float(
+                        result["replay_grad_cos_common"]
+                    ),
+                    "replay_grad_cos_rare": float(
+                        result["replay_grad_cos_rare"]
+                    ),
+                    "replay_grad_cos_total": float(
+                        result["replay_grad_cos_total"]
+                    ),
+                    "utility_signal_raw": float(result["utility_signal_raw"]),
+                    "utility_signal_transformed": float(
+                        result["utility_signal_transformed"]
+                    ),
+                }
+            consumer.pending_post_step_replays.append(staged)
 
-        if logger is not None:
-            logger.write_row({
-                "step": int(current_step),
-                "slot": int(slot),
-                "key_fp": key_fp,
-                "write_step": write_step,
-                "write_pressure": write_pressure,
-                "write_bucket": write_bucket,
-                "query_cosine": query_cosine,
-                "utility_pre": utility_pre,
-                "replay_id": int(entry.get("replay_id", -1)),
-                "query_event_id": int(entry.get("query_event_id", -1)),
-                "source_write_id": int(source_write_id),
-                "selection_step": int(entry.get("selection_step", -1)),
-                "policy_version": int(entry.get("policy_version", 0)),
-                "selected_rank": int(entry.get("selected_rank", -1)),
-                "teacher_score": float(entry.get("teacher_score", query_cosine)),
-                "controller_logit": float(
-                    entry.get("controller_logit", query_cosine)
+        elif logger is not None:
+            _write_replay_ndjson_row(
+                logger,
+                event_dict=emitted,
+                current_step=int(current_step),
+                slot=int(slot),
+                key_fp=int(key_fp),
+                write_step=int(write_step),
+                write_pressure=float(write_pressure),
+                write_bucket=int(write_bucket),
+                query_cosine=float(query_cosine),
+                utility_pre=float(utility_pre),
+                utility_post=float(utility_post),
+                entry=entry,
+                replay_loss=float(replay_loss),
+                replay_grad_norm=float(result["replay_grad_norm"]),
+                replay_grad_cos_common=float(result["replay_grad_cos_common"]),
+                replay_grad_cos_rare=float(result["replay_grad_cos_rare"]),
+                replay_grad_cos_total=float(result["replay_grad_cos_total"]),
+                utility_signal_raw=float(result["utility_signal_raw"]),
+                utility_signal_transformed=float(
+                    result["utility_signal_transformed"]
                 ),
-                # NOTE (Phase B5): the diagnostic NDJSON's
-                # ``ce_after_replay`` is intentionally the pre-step
-                # ``replay_loss`` here — this row is written BEFORE
-                # ``optimizer.step()`` runs, so the post-step CE is not
-                # available at this point. The wire-side
-                # ``replay_outcome_log`` dict carries the post-step CE
-                # (patched by ``_run_post_step_replay_ce``) when the
-                # ``compute_replay_ce_pair`` gate is on; the per-rank
-                # NDJSON keeps the pre-step value as a diagnostic
-                # column. Phase D4's BC pretrain corpus reads the wire
-                # column (via the schema rename map in
-                # ``tests/test_replay_outcome_log_schema.py``), not the
-                # diagnostic NDJSON, when it wants the true reward
-                # signal. A future task can deferred-write the NDJSON
-                # row from the post-step pass to make the two surfaces
-                # bit-identical; out of scope for B5.
-                "replay_loss": replay_loss,
-                "ce_before_replay": float("nan"),
-                "ce_after_replay": replay_loss,
-                "ce_delta_raw": float("nan"),
-                "bucket_baseline": 0.0,
-                "reward_shaped": float("nan"),
-                "replay_grad_norm": float(result["replay_grad_norm"]),
-                "replay_grad_cos_common": float(result["replay_grad_cos_common"]),
-                "replay_grad_cos_rare": float(result["replay_grad_cos_rare"]),
-                "replay_grad_cos_total": float(result["replay_grad_cos_total"]),
-                "utility_signal_raw": float(result["utility_signal_raw"]),
-                "utility_signal_transformed": float(result["utility_signal_transformed"]),
-                "utility_post": utility_post,
-                "outcome_status": "ok",
-                "flags": 0,
-            })
+            )
         replayed += 1
     return replayed
 
@@ -2621,6 +2710,14 @@ def _run_post_step_replay_ce(
             bucket_baseline_ema[bucket] = (
                 (1.0 - alpha) * float(bucket_baseline_ema[bucket])
                 + alpha * float(ce_delta_raw)
+            )
+        ndjson_logger = staged.get("ndjson_logger")
+        ndjson_row = staged.get("ndjson_row")
+        if ndjson_logger is not None and ndjson_row is not None:
+            _write_replay_ndjson_row(
+                ndjson_logger,
+                event_dict=event_dict,
+                **ndjson_row,
             )
         patched += 1
     pending.clear()
