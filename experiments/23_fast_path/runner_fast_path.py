@@ -2795,11 +2795,13 @@ def train_fast_for_budget(
         model_dim=_model_dim_for_episodic or 1,
         all_group=all_group,
     )
-    # Phase 2: spawn the CPU controller thread on the episodic rank
-    # when controller_query_enabled=True. Returns None on every other
-    # code path (train ranks, episodic disabled, controller flag off).
-    # The handle is consumed by ``_shutdown_episodic_controller`` in
-    # the outer ``finally`` block.
+    # Initialize the controller handle to None up front so the outer
+    # ``finally`` block sees a defined name even if a pre-spawn raise
+    # exits the function. The actual spawn happens just before the
+    # ``try:`` block at the start of the train loop, AFTER all init
+    # guards have fired — that way a config-validation raise can't
+    # leak a running daemon thread.
+    episodic_controller_handle: _EpisodicControllerHandle | None = None
     _episodic_controller_config = {
         "episodic_controller_score_mode": str(
             episodic_controller_score_mode
@@ -2809,12 +2811,6 @@ def train_fast_for_budget(
             episodic_controller_idle_sleep_s
         ),
     }
-    episodic_controller_handle = _spawn_episodic_controller(
-        consumer=episodic_consumer,
-        is_episodic_rank=bool(is_episodic_rank),
-        episodic_enabled=bool(episodic_enabled),
-        config=_episodic_controller_config,
-    )
     if (
         scopt_active
         and int(scopt_baseline_buckets) > 0
@@ -3145,6 +3141,20 @@ def train_fast_for_budget(
             device=device,
             config=emit_config,
         )
+
+    # Phase 2: spawn the CPU controller thread on the episodic rank
+    # when controller_query_enabled=True. Returns None on every other
+    # code path (train ranks, episodic disabled, controller flag off).
+    # The spawn lands here — AFTER all init guards have fired — so a
+    # config-validation raise above can't leak a running daemon thread.
+    # The handle is consumed by ``_shutdown_episodic_controller`` in
+    # the outer ``finally`` block.
+    episodic_controller_handle = _spawn_episodic_controller(
+        consumer=episodic_consumer,
+        is_episodic_rank=bool(is_episodic_rank),
+        episodic_enabled=bool(episodic_enabled),
+        config=_episodic_controller_config,
+    )
 
     try:
         while True:
