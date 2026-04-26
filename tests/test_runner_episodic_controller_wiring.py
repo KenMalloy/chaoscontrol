@@ -370,3 +370,99 @@ def test_controller_score_mode_accepts_exp24_alias_and_rejects_conflict():
             "episodic_controller_score_mode": "cosine_utility_weighted",
             "controller_query_mode": "pressure_only",
         })
+
+
+def _make_trained_runtime():
+    """Build a minimal CpuSsmControllerRuntime that the bridge can
+    initialize from. The Python reference path (prefer_cpp=False) is
+    sufficient — _wire_online_learning_bridge doesn't dispatch on the
+    backend, just on whether the runtime is non-None and the config
+    flag.
+    """
+    from chaoscontrol.episodic.cpu_ssm_controller import (
+        CpuSsmControllerRuntime,
+        CpuSsmControllerWeights,
+    )
+    return CpuSsmControllerRuntime(
+        CpuSsmControllerWeights(
+            w_global_in=torch.tensor([[0.0]], dtype=torch.float32),
+            w_slot_in=torch.tensor([[0.0]], dtype=torch.float32),
+            decay_global=torch.tensor([1.0], dtype=torch.float32),
+            decay_slot=torch.tensor([1.0], dtype=torch.float32),
+            w_global_out=torch.tensor([1.0], dtype=torch.float32),
+            w_slot_out=torch.tensor([0.0], dtype=torch.float32),
+            bias=torch.tensor(0.0, dtype=torch.float32),
+        ),
+        capacity=2,
+        prefer_cpp=False,
+    )
+
+
+def test_wire_bridge_short_circuits_when_runtime_is_none():
+    """Heuristic mode: no trained runtime → no bridge to wrap. Returns
+    (None, None) and leaves consumer.online_learning_bridge unset."""
+    mod = _load_runner_module()
+    consumer = _make_disabled_consumer(mod)
+    consumer.online_learning_bridge = None
+    bridge, runtime_for_thread = mod._wire_online_learning_bridge(
+        consumer=consumer,
+        controller_runtime=None,
+        config={"controller_train_online": True},
+    )
+    assert bridge is None
+    assert runtime_for_thread is None
+    assert consumer.online_learning_bridge is None
+
+
+def test_wire_bridge_wraps_runtime_when_train_online_true():
+    """controller_train_online=True (default): the runtime is wrapped in
+    _OnlineLearningRuntimeBridge and the consumer points at it. Replay
+    outcomes will route through the C++ online-learning path."""
+    mod = _load_runner_module()
+    consumer = _make_disabled_consumer(mod)
+    consumer.online_learning_bridge = None
+    runtime = _make_trained_runtime()
+    bridge, runtime_for_thread = mod._wire_online_learning_bridge(
+        consumer=consumer,
+        controller_runtime=runtime,
+        config={"controller_train_online": True},
+    )
+    assert isinstance(bridge, mod._OnlineLearningRuntimeBridge)
+    assert runtime_for_thread is bridge
+    assert consumer.online_learning_bridge is bridge
+
+
+def test_wire_bridge_skips_wrap_when_train_online_false():
+    """controller_train_online=False (F1 arm_c): the runtime is used
+    raw, no bridge constructed, consumer.online_learning_bridge stays
+    unset so _notify_online_learning_bridge no-ops on every replay."""
+    mod = _load_runner_module()
+    consumer = _make_disabled_consumer(mod)
+    consumer.online_learning_bridge = None
+    runtime = _make_trained_runtime()
+    bridge, runtime_for_thread = mod._wire_online_learning_bridge(
+        consumer=consumer,
+        controller_runtime=runtime,
+        config={"controller_train_online": False},
+    )
+    assert bridge is None
+    assert runtime_for_thread is runtime
+    assert consumer.online_learning_bridge is None
+
+
+def test_wire_bridge_defaults_to_train_online_true_when_flag_absent():
+    """Backwards compat: existing configs that don't set
+    controller_train_online keep their pre-fix behavior (bridge wraps).
+    Only F1's frozen arm explicitly opts out."""
+    mod = _load_runner_module()
+    consumer = _make_disabled_consumer(mod)
+    consumer.online_learning_bridge = None
+    runtime = _make_trained_runtime()
+    bridge, runtime_for_thread = mod._wire_online_learning_bridge(
+        consumer=consumer,
+        controller_runtime=runtime,
+        config={},
+    )
+    assert isinstance(bridge, mod._OnlineLearningRuntimeBridge)
+    assert runtime_for_thread is bridge
+    assert consumer.online_learning_bridge is bridge

@@ -2358,6 +2358,56 @@ def _flat_float_list(value: torch.Tensor) -> list[float]:
     ]
 
 
+def _wire_online_learning_bridge(
+    *,
+    consumer: _EpisodicConsumerState,
+    controller_runtime: Any | None,
+    config: dict[str, Any],
+) -> tuple[Any | None, Any | None]:
+    """Decide whether to wrap the controller runtime with the C++ online-
+    learning bridge for the upcoming spawn.
+
+    Returns ``(action_recorder, controller_runtime_for_thread)``.
+
+    ``controller_train_online`` (default True for backwards compat) gates
+    the bridge. F1's ``arm_c_trained_cold_frozen`` sets it False so the
+    trained controller scores from loaded weights without recording
+    snapshots or running SGD; ``arm_d`` / ``arm_e`` set it True so the
+    bridge wraps the runtime and credit attribution + SGD + EMA all run
+    during the 600s training window.
+
+    When True: builds the bridge, sets ``consumer.online_learning_bridge``,
+    and returns the bridge as the runtime-for-thread.
+
+    When False: leaves ``consumer.online_learning_bridge`` unset so
+    ``_notify_online_learning_bridge`` no-ops on every replay outcome.
+    The raw runtime still handles ``score_slot_with_snapshot`` for the
+    query path (the bridge delegates identically when wrapped).
+
+    Heuristic-only / no-trained-runtime callers pass
+    ``controller_runtime=None`` and get ``(None, None)`` back regardless
+    of the flag — there's nothing to wrap.
+    """
+    if controller_runtime is None:
+        return None, None
+    train_online = bool(config.get("controller_train_online", True))
+    if not train_online:
+        print(
+            "[runner_fast_path] controller_train_online=False — wrapping "
+            "runtime without online-learning bridge; SGD + EMA + history "
+            "recording disabled for this run.",
+            flush=True,
+        )
+        return None, controller_runtime
+    bridge = _OnlineLearningRuntimeBridge(
+        runtime=controller_runtime,
+        capacity=int(consumer.cache.capacity),
+        config=config,
+    )
+    consumer.online_learning_bridge = bridge
+    return bridge, bridge
+
+
 def _spawn_episodic_controller(
     *,
     consumer: _EpisodicConsumerState,
@@ -2401,16 +2451,13 @@ def _spawn_episodic_controller(
         config,
         capacity=int(consumer.cache.capacity),
     )
-    action_recorder = None
-    controller_runtime_for_thread = controller_runtime
-    if controller_runtime is not None:
-        action_recorder = _OnlineLearningRuntimeBridge(
-            runtime=controller_runtime,
-            capacity=int(consumer.cache.capacity),
+    action_recorder, controller_runtime_for_thread = (
+        _wire_online_learning_bridge(
+            consumer=consumer,
+            controller_runtime=controller_runtime,
             config=config,
         )
-        controller_runtime_for_thread = action_recorder
-        consumer.online_learning_bridge = action_recorder
+    )
 
     stop_event = threading.Event()
     # The controller thread has its OWN heartbeat (exposed via

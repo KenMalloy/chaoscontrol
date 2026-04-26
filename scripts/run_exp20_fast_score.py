@@ -991,6 +991,23 @@ def run(args: argparse.Namespace) -> dict:
             "trained-frozen until that lands.",
             flush=True,
         )
+    if episodic_cache_source in {"fresh_forced", "loaded"}:
+        # Pre-existing fast-score limitation (not introduced by the F1
+        # eval-arg wiring): the optimized scoring loop calls _score_doc /
+        # _score_docs_reset_batch directly and bypasses the cache-aware
+        # LegalityController path. The episodic_cache is constructed,
+        # ckpt-loaded if requested, and ticked via mark_new_epoch /
+        # reset, but it does NOT affect CE numbers. Treat F1's cold/warm
+        # distinction as metadata-only here; cache-aware eval is the
+        # run_exp20_eval.py path, not this fast scorer.
+        print(
+            "[exp20_fast_score] WARNING --episodic-cache-source="
+            f"{getattr(args, 'episodic_cache_source', 'auto')!r} loaded "
+            "the cache, but this fast-score path's CE hot path bypasses "
+            "the cache-aware controller. cold/warm differs only in "
+            "summary metadata, not in scored CE.",
+            flush=True,
+        )
 
     rank_output_path = _rank_output_path(args.output_path, rank, world_size)
     rank_output_path.parent.mkdir(parents=True, exist_ok=True)

@@ -949,16 +949,35 @@ def build_episodic_controller_v1_matrix(
       - ``arm_b_heuristic_cold``: heuristic controller with a fresh cache.
       - ``arm_b_heuristic_warm``: heuristic controller with checkpoint cache.
       - ``arm_c_trained_cold_frozen``: trained controller, fresh cache,
-        eval-time online controller training disabled.
+        TRAIN-side online controller training disabled (frozen weights).
       - ``arm_d_trained_cold_online``: trained controller, fresh cache,
-        eval-time online controller training enabled.
+        TRAIN-side online controller training enabled (SGD + EMA).
       - ``arm_e_trained_warm_online``: trained controller, checkpoint cache,
-        eval-time online controller training enabled.
+        TRAIN-side online controller training enabled.
 
     ``episodic_controller_weights_path`` is intentionally a pinned
     to-be-filled placeholder for the trained arms. The runtime validator
     rejects trained modes without a path, but the real Phase F artifact is
     produced by the controller pretrain/export path, not this matrix builder.
+
+    KNOWN LIMITATIONS (visible at run time via runner / scorer warnings):
+
+    1. ``controller_train_online`` is honored on the train side: when False,
+       the runner skips wrapping the controller runtime in the C++
+       online-learning bridge so SGD + EMA + history recording are all
+       disabled for the 600s training window. arm_c vs arm_d isolates
+       this knob with everything else held constant.
+    2. ``eval_episodic_cache_mode`` (cold/warm) and ``eval_episodic_cache_source``
+       are loaded by run_exp20_fast_score.py but DO NOT affect the scored
+       CE — the optimized fast-score loop calls _score_doc /
+       _score_docs_reset_batch directly and bypasses the cache-aware
+       LegalityController path. Cold/warm pairs (arm_b_cold vs arm_b_warm,
+       arm_d vs arm_e) currently differ only in the train-side checkpoint
+       payload; downstream eval CE is the same. Cache-aware eval lives in
+       run_exp20_eval.py; wiring it into the fast scorer is a separate
+       follow-up. Until that lands, treat cold/warm pairs as a redundant
+       check on train-side cache stability rather than an eval-time TTT
+       contrast.
     """
     fast_slow_lock = {
         "fast_slow_enabled": True,
