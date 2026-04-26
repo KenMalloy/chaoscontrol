@@ -175,6 +175,20 @@ void check_sgd_tensor_pair(
       "weights and gradients must have the same shape");
 }
 
+void check_fast_slow_tensor_pair(
+    const at::Tensor& slow,
+    const at::Tensor& fast) {
+  TORCH_CHECK(!slow.is_cuda(), "slow must be a CPU tensor");
+  TORCH_CHECK(!fast.is_cuda(), "fast must be a CPU tensor");
+  TORCH_CHECK(slow.scalar_type() == at::kFloat, "slow must be float32");
+  TORCH_CHECK(fast.scalar_type() == at::kFloat, "fast must be float32");
+  TORCH_CHECK(slow.is_contiguous(), "slow must be contiguous");
+  TORCH_CHECK(fast.is_contiguous(), "fast must be contiguous");
+  TORCH_CHECK(
+      slow.sizes().equals(fast.sizes()),
+      "slow and fast must have the same shape");
+}
+
 at::Tensor exact_gelu(const at::Tensor& x) {
   return 0.5 * x * (1.0 + at::erf(x * kInvSqrt2));
 }
@@ -859,6 +873,28 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
            pybind11::arg("gradients"),
            "Apply one in-place plain SGD step: weights -= lr * gradients.")
       .def_property_readonly("lr", &SgdStep::lr);
+  pybind11::class_<FastSlowEma>(m, "FastSlowEma")
+      .def(pybind11::init<float, uint64_t>(),
+           pybind11::arg("alpha") = 0.25f,
+           pybind11::arg("interval") = 64)
+      .def("tick_event", &FastSlowEma::tick_event)
+      .def("should_blend", &FastSlowEma::should_blend)
+      .def("blend",
+           [](const FastSlowEma& self,
+              at::Tensor slow,
+              const at::Tensor& fast) {
+             check_fast_slow_tensor_pair(slow, fast);
+             self.blend(
+                 slow.data_ptr<float>(),
+                 fast.data_ptr<float>(),
+                 static_cast<std::size_t>(slow.numel()));
+           },
+           pybind11::arg("slow"),
+           pybind11::arg("fast"),
+           "Blend fast weights into slow weights in-place.")
+      .def_property_readonly("event_count", &FastSlowEma::event_count)
+      .def_property_readonly("alpha", &FastSlowEma::alpha)
+      .def_property_readonly("interval", &FastSlowEma::interval);
   pybind11::class_<CreditedAction>(m, "CreditedAction")
       .def_readonly("entry", &CreditedAction::entry)
       .def_readonly("credit", &CreditedAction::credit);
