@@ -970,6 +970,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("amx_bf16_matmul", &chaoscontrol::amx::amx_bf16_matmul,
         pybind11::arg("a"), pybind11::arg("b"),
         "Single-tile AMX BF16 matmul: bfloat16 CPU [M,K] x [K,N] -> float32 [M,N]");
+  m.def("amx_pack_b_vnni", &chaoscontrol::amx::pack_b_vnni,
+        pybind11::arg("b"),
+        "VNNI-rearrange B (K x N bf16) into (K/2 x 2N bf16) for TDPBF16PS. "
+        "Available on every platform so the packing logic can be tested "
+        "locally without AMX hardware.");
   m.def("avx512_recurrence_kernel_available",
         &chaoscontrol::avx512::avx512_recurrence_kernel_available,
         "Whether this extension build includes the opt-in AVX-512 recurrence kernel");

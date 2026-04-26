@@ -136,6 +136,39 @@ def test_vnni_packed_b_matches_at_matmul(M: int, N: int, K: int):
     [
         (16, 16, 32),
         (8, 12, 16),
+        (4, 8, 8),
+    ],
+)
+def test_cpp_pack_b_vnni_matches_python_reference(M: int, N: int, K: int):
+    # C++ side: amx_pack_b_vnni rearranges the same buffer the simulator
+    # rearranges in test_vnni_packed_b_matches_at_matmul. This pins the
+    # C++ implementation against the SDM-derived layout regardless of
+    # whether the host can run TDPBF16PS — local arm64 still validates
+    # the packing half of the kernel.
+    from chaoscontrol.kernels._cpu_ssm_controller import amx_pack_b_vnni
+
+    rng = np.random.default_rng(31415)
+    b_np = rng.standard_normal((K, N)).astype(np.float32)
+    b_torch_bf16 = torch.from_numpy(b_np).to(torch.bfloat16)
+
+    # Reference: same loop as the simulator, in fp32 just to compare bits.
+    b_bf16_fp32 = b_torch_bf16.to(torch.float32).numpy()
+    ref = np.empty((K // 2, 2 * N), dtype=np.float32)
+    for r in range(K // 2):
+        for n in range(N):
+            ref[r, 2 * n + 0] = b_bf16_fp32[2 * r + 0, n]
+            ref[r, 2 * n + 1] = b_bf16_fp32[2 * r + 1, n]
+
+    actual = amx_pack_b_vnni(b_torch_bf16).to(torch.float32).numpy()
+    assert actual.shape == (K // 2, 2 * N)
+    np.testing.assert_array_equal(actual, ref)
+
+
+@pytest.mark.parametrize(
+    "M, N, K",
+    [
+        (16, 16, 32),
+        (8, 12, 16),
     ],
 )
 def test_transposed_contiguous_b_diverges_from_at_matmul(
