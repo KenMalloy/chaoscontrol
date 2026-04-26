@@ -729,6 +729,130 @@ def build_phase0_fastslow_only_control(
     return entries
 
 
+def build_episodic_dw_curation_v1_matrix(
+    *,
+    speed_config: dict[str, Any],
+    world_size: int = 4,
+    budget_seconds: float = 600.0,
+    seed_values: Sequence[int] = DEFAULT_CONTROL_SEEDS,
+) -> list[dict[str, Any]]:
+    """Phase 3 falsifier matrix for ``episodic_dw_curation_v1``.
+
+    Four arms x N seeds. **All four arms are topologically identical**: 3+1
+    rank layout (``world_size=4``), episodic rank present, same all-reduce
+    path, same Dreamworld replay knobs (cache_interval, interval, replay
+    batch size, prefix/replay tokens, buffer/min/max-age), same fast/slow
+    recipe (anchored to ``phase0_fastslow_only_control``), same wall budget.
+    The ONLY differences allowed between arms are the replay-candidate-
+    selection mechanism (``episodic_enabled`` + ``controller_query_mode``)
+    and Arm C's ``dreamworld_weight=0.0`` zeroing of the replay signal.
+
+    Per Decision 0.5 (memory-aware-optimizer-plan): if ``sigma`` of the
+    Arm B rare-bucket delta across the default 3 seeds exceeds 0.008 bpb,
+    re-invoke this builder with ``seed_values=[5012, 7331, 9183]`` (or any
+    other 3-seed extension) to escalate; downstream analysis pools the two
+    runs.
+
+    Arms:
+      - ``arm_a_uncurated``: ``episodic_enabled=False``; replay reads the
+        existing online buffer in ``dreamworld.py``. No cache writes,
+        queries, or controller-driven selection.
+      - ``arm_b_cosine_utility``: ``episodic_enabled=True`` with
+        ``controller_query_mode="cosine_utility_weighted"`` (Decision 0.2).
+      - ``arm_bp_pressure_only``: ``episodic_enabled=True`` with
+        ``controller_query_mode="pressure_only"`` — the mechanism-
+        specificity lesion. Cache fills the same way as Arm B; only the
+        retrieval policy changes.
+      - ``arm_c_no_dw``: ``episodic_enabled=True`` with
+        ``dreamworld_weight=0.0``. Replay backward fires (so the rank
+        layout pays the same overhead) but contributes zero gradient.
+
+    ``controller_query_mode`` is a forward-looking config knob the future
+    Phase 2 controller will read; the runner ignores unknown config keys
+    today. Arms A and C omit the knob (Arm A doesn't query the cache;
+    Arm C's replay grads are zeroed before they land in any param.grad)
+    to avoid making config claims neither arm actually relies on.
+    """
+    # Locked Dreamworld replay knobs — match phase0_dw_sweep so the
+    # uncurated control reuses a known, replayed-then-failed combo.
+    dw_replay_lock = {
+        "dreamworld_enabled": True,
+        "dreamworld_cache_interval": 16,
+        "dreamworld_interval": 16,
+        "dreamworld_prefix_tokens": 128,
+        "dreamworld_replay_tokens": 64,
+        "dreamworld_replay_batch_size": 128,
+        "dreamworld_buffer_size": 16,
+        "dreamworld_min_size": 2,
+        "dreamworld_max_age_steps": 256,
+    }
+    # Locked fast/slow recipe — match phase0_fastslow_only_control.
+    fast_slow_lock = {
+        "fast_slow_enabled": True,
+        "fast_slow_interval": 64,
+        "fast_slow_alpha": 0.25,
+        "fast_slow_eval_copy": "slow",
+    }
+    arms: list[tuple[str, dict[str, Any]]] = [
+        (
+            "arm_a_uncurated",
+            {
+                "episodic_enabled": False,
+                "dreamworld_weight": 0.10,
+            },
+        ),
+        (
+            "arm_b_cosine_utility",
+            {
+                "episodic_enabled": True,
+                "dreamworld_weight": 0.10,
+                "controller_query_mode": "cosine_utility_weighted",
+            },
+        ),
+        (
+            "arm_bp_pressure_only",
+            {
+                "episodic_enabled": True,
+                "dreamworld_weight": 0.10,
+                "controller_query_mode": "pressure_only",
+            },
+        ),
+        (
+            "arm_c_no_dw",
+            {
+                "episodic_enabled": True,
+                "dreamworld_weight": 0.0,
+            },
+        ),
+    ]
+    entries: list[dict[str, Any]] = []
+    for arm_name, arm_overrides in arms:
+        arm = {
+            "exp24_mechanism": "episodic_dw_curation_v1",
+            "artifact_impact": ARTIFACT_TRAINING_ONLY,
+            **fast_slow_lock,
+            **dw_replay_lock,
+            **arm_overrides,
+        }
+        for seed in seed_values:
+            entry = _base_entry(
+                speed_config=speed_config,
+                world_size=world_size,
+                budget_seconds=budget_seconds,
+            )
+            entry.update(arm)
+            entries.append(
+                _named_entry(
+                    base=entry,
+                    phase="phase3",
+                    mechanism="episodic_dw_curation_v1",
+                    arm=f"episodic_dw_curation_v1_{arm_name}",
+                    seed=int(seed),
+                )
+            )
+    return entries
+
+
 def build_criticality_distillation_first_smoke_matrix(
     *,
     speed_config: dict[str, Any],

@@ -505,6 +505,156 @@ def test_build_phase0_fastslow_only_control_matches_locked_base_without_dreamwor
         assert entry["dreamworld_replay_batch_size"] == 0
 
 
+def test_episodic_dw_curation_v1_matrix_shape():
+    """Phase 3 falsifier matrix: 4 arms x 3 seeds, all topologically matched.
+
+    Per ``docs/plans/2026-04-25-memory-aware-optimizer-plan.md`` Task 3.3:
+    the only difference between arms is the replay-candidate-selection
+    mechanism. World size, budget, batch size, model dims, fast/slow
+    recipe, and the Dreamworld replay knobs (cache_interval, interval,
+    replay_batch_size, prefix/replay tokens, buffer/min/max-age) are
+    identical across all four arms.
+
+    Per-arm differences allowed:
+      - Arm A:   episodic_enabled=False (replay reads online buffer)
+      - Arm B:   episodic_enabled=True,  controller_query_mode="cosine_utility_weighted"
+      - Arm B':  episodic_enabled=True,  controller_query_mode="pressure_only"
+      - Arm C:   episodic_enabled=True,  dreamworld_weight=0.0 (topology-only)
+    """
+    mod = _load_exp24()
+
+    entries = mod.build_episodic_dw_curation_v1_matrix(
+        speed_config={"batch_size": 1024, "chunk_size": 64},
+        world_size=4,
+        budget_seconds=600.0,
+    )
+
+    assert len(entries) == 12
+    assert {entry["seed"] for entry in entries} == {1337, 2674, 4011}
+
+    expected_arms = (
+        "arm_a_uncurated",
+        "arm_b_cosine_utility",
+        "arm_bp_pressure_only",
+        "arm_c_no_dw",
+    )
+    expected_names = {
+        f"exp24_phase3_episodic_dw_curation_v1_{arm}_s{seed}"
+        for arm in expected_arms
+        for seed in (1337, 2674, 4011)
+    }
+    assert {entry["name"] for entry in entries} == expected_names
+
+    for entry in entries:
+        assert entry["exp24_phase"] == "phase3"
+        assert entry["exp24_mechanism"] == "episodic_dw_curation_v1"
+        assert entry["world_size"] == 4
+        assert entry["budget_seconds"] == 600.0
+        assert entry["artifact_impact"] == "artifact_training_only"
+        # Locked fast/slow recipe (shared with phase0_fastslow_only_control).
+        assert entry["fast_slow_enabled"] is True
+        assert entry["fast_slow_interval"] == 64
+        assert entry["fast_slow_alpha"] == 0.25
+        assert entry["fast_slow_eval_copy"] == "slow"
+        # Locked Dreamworld replay topology — identical knobs in all 4 arms
+        # so the only difference is candidate selection / replay weight.
+        assert entry["dreamworld_enabled"] is True, (
+            "Topology-equivalence: replay backward must fire in all arms; "
+            "Arm C zeroes dreamworld_weight instead of disabling DW."
+        )
+        assert entry["dreamworld_cache_interval"] == 16
+        assert entry["dreamworld_interval"] == 16
+        assert entry["dreamworld_replay_batch_size"] == 128
+        assert entry["dreamworld_prefix_tokens"] == 128
+        assert entry["dreamworld_replay_tokens"] == 64
+        assert entry["dreamworld_buffer_size"] == 16
+        assert entry["dreamworld_min_size"] == 2
+        assert entry["dreamworld_max_age_steps"] == 256
+
+    by_arm: dict[str, list[dict]] = {arm: [] for arm in expected_arms}
+    for entry in entries:
+        # Recover arm tag from the name suffix (between v1_ and _s<seed>).
+        suffix = entry["name"].split("episodic_dw_curation_v1_", 1)[1]
+        arm_tag = suffix.rsplit("_s", 1)[0]
+        by_arm[arm_tag].append(entry)
+    assert all(len(rows) == 3 for rows in by_arm.values())
+
+    for entry in by_arm["arm_a_uncurated"]:
+        assert entry["episodic_enabled"] is False
+        assert entry["dreamworld_weight"] == 0.10
+        # Arm A's replay reads the online buffer; controller_query_mode is
+        # not load-bearing here. Omitted to keep the config surface honest.
+        assert "controller_query_mode" not in entry
+
+    for entry in by_arm["arm_b_cosine_utility"]:
+        assert entry["episodic_enabled"] is True
+        assert entry["dreamworld_weight"] == 0.10
+        assert entry["controller_query_mode"] == "cosine_utility_weighted"
+
+    for entry in by_arm["arm_bp_pressure_only"]:
+        assert entry["episodic_enabled"] is True
+        assert entry["dreamworld_weight"] == 0.10
+        assert entry["controller_query_mode"] == "pressure_only"
+
+    for entry in by_arm["arm_c_no_dw"]:
+        assert entry["episodic_enabled"] is True
+        assert entry["dreamworld_weight"] == 0.0, (
+            "Arm C zeroes the replay weight to establish a 3+1-topology "
+            "baseline without any DW signal at all."
+        )
+        # Arm C's controller mode is irrelevant — replay grad is zeroed
+        # before it lands in any param.grad. Omit to avoid a silent claim.
+        assert "controller_query_mode" not in entry
+
+
+def test_episodic_dw_curation_v1_matrix_supports_extra_seeds_for_sigma_escalation():
+    """Decision 0.5: if sigma(rare-bucket delta) on Arm B > 0.008 bpb across
+    the 3 default seeds, add 3 more seeds. The matrix builder must accept a
+    custom seed list so the escalation is a one-line follow-up call.
+    """
+    mod = _load_exp24()
+
+    extra = mod.build_episodic_dw_curation_v1_matrix(
+        speed_config={"batch_size": 1024, "chunk_size": 64},
+        world_size=4,
+        budget_seconds=600.0,
+        seed_values=[5012, 7331, 9183],
+    )
+
+    assert len(extra) == 12
+    assert {entry["seed"] for entry in extra} == {5012, 7331, 9183}
+
+
+def test_run_exp24_cli_episodic_dw_curation_v1_dry_run(tmp_path):
+    script = REPO / "experiments" / "24_training_time_bundle" / "run_exp24.py"
+    output_dir = tmp_path / "exp24-episodic-dw-curation-v1-dryrun"
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(script),
+            "--matrix",
+            "episodic_dw_curation_v1",
+            "--dry-run",
+            "--limit",
+            "4",
+            "--output-dir",
+            str(output_dir),
+        ],
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    stdout = result.stdout
+    assert "matrix=episodic_dw_curation_v1" in stdout
+    assert "world_size=4" in stdout
+    assert "exp24_phase3_episodic_dw_curation_v1_arm_a_uncurated_s1337" in stdout
+    assert "exp24_phase3_episodic_dw_curation_v1_arm_b_cosine_utility_s1337" in stdout
+    assert '"exp24_mechanism": "episodic_dw_curation_v1"' in stdout
+    assert '"--nproc_per_node=4"' in stdout
+
+
 def test_exp24_base_config_matches_fastslow_only_lock():
     cfg = yaml.safe_load(EXP24_BASE_CONFIG_PATH.read_text())
 
