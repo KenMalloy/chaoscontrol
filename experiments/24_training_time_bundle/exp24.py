@@ -912,11 +912,10 @@ EPISODIC_TTT_V1_ARMS: tuple[str, ...] = (
 
 EPISODIC_CONTROLLER_V1_ARMS: tuple[str, ...] = (
     "arm_a_control",
-    "arm_b_heuristic_cold",
-    "arm_b_heuristic_warm",
-    "arm_c_trained_cold_frozen",
-    "arm_d_trained_cold_online",
-    "arm_e_trained_warm_online",
+    "arm_b_heuristic",
+    "arm_c_simplex_frozen",
+    "arm_d_simplex_online",
+    "arm_e_simplex_warm_online",
 )
 EPISODIC_CONTROLLER_V1_WEIGHTS_PATH = (
     "TO_BE_FILLED/episodic_controller_v1_weights.pt"
@@ -942,42 +941,68 @@ def build_episodic_controller_v1_matrix(
     budget_seconds: float = 600.0,
     seed_values: Sequence[int] = DEFAULT_CONTROL_SEEDS,
 ) -> list[dict[str, Any]]:
-    """Phase 3 CPU SSM controller V1 falsifier matrix.
+    """Phase 3 CPU SSM simplex controller V1 falsifier matrix.
 
-    Six arms x N seeds:
+    Five arms x N seeds:
       - ``arm_a_control``: no episodic cache, no controller.
-      - ``arm_b_heuristic_cold``: heuristic controller with a fresh cache.
-      - ``arm_b_heuristic_warm``: heuristic controller with checkpoint cache.
-      - ``arm_c_trained_cold_frozen``: trained controller, fresh cache,
-        TRAIN-side online controller training disabled (frozen weights).
-      - ``arm_d_trained_cold_online``: trained controller, fresh cache,
-        TRAIN-side online controller training enabled (SGD + EMA).
-      - ``arm_e_trained_warm_online``: trained controller, checkpoint cache,
-        TRAIN-side online controller training enabled.
+      - ``arm_b_heuristic``: heuristic controller (utility argmax over
+        cache-side top-K). The simplex baseline this falsifier needs to
+        beat — same candidate-generator semantics as the trained arms,
+        but no learned policy on top.
+      - ``arm_c_simplex_frozen``: trained simplex controller, fresh
+        cache, TRAIN-side online controller training disabled (weights
+        stay at the BC-pretrain init for the full 600s window).
+      - ``arm_d_simplex_online``: trained simplex controller, fresh
+        cache, TRAIN-side online REINFORCE enabled (SGD + EMA on the
+        simplex policy parameters W_vp, b_vp, W_lh, b_lh, W_sb, alpha).
+      - ``arm_e_simplex_warm_online``: trained simplex controller,
+        checkpoint-warm cache, TRAIN-side online REINFORCE enabled. The
+        warm cache means the candidate simplex starts richer — vertex
+        features (utility, age, cosine) carry more signal at step 0
+        than they would for a fresh-cache run.
 
-    ``episodic_controller_weights_path`` is intentionally a pinned
-    to-be-filled placeholder for the trained arms. The runtime validator
-    rejects trained modes without a path, but the real Phase F artifact is
-    produced by the controller pretrain/export path, not this matrix builder.
+    Three pairwise contrasts the matrix is designed to expose:
+      - heuristic vs trained: arm_b vs arm_c (frozen-trained vs
+        heuristic, same retrieval semantics, controller policy is
+        the only difference).
+      - frozen vs online: arm_c vs arm_d (trained controller, online
+        SGD is the only difference).
+      - cold vs warm cache: arm_d vs arm_e (online controller held
+        constant, cache init is the only difference).
 
-    KNOWN LIMITATIONS (visible at run time via runner / scorer warnings):
+    ``episodic_controller_weights_path`` is the path to the simplex
+    policy CSWG v2 file (S4's pretrain output). The default placeholder
+    ``TO_BE_FILLED/...`` is sentinel; the runner's
+    _build_controller_runtime_from_config rejects it via FileNotFoundError
+    at attach time. Pod runbook substitutes via the
+    ``EPISODIC_CONTROLLER_V1_WEIGHTS_PATH`` env var.
 
-    1. ``controller_train_online`` is honored on the train side: when False,
-       the runner skips wrapping the controller runtime in the C++
-       online-learning bridge so SGD + EMA + history recording are all
-       disabled for the 600s training window. arm_c vs arm_d isolates
-       this knob with everything else held constant.
-    2. ``eval_episodic_cache_mode`` (cold/warm) and ``eval_episodic_cache_source``
-       are loaded by run_exp20_fast_score.py but DO NOT affect the scored
-       CE — the optimized fast-score loop calls _score_doc /
-       _score_docs_reset_batch directly and bypasses the cache-aware
-       LegalityController path. Cold/warm pairs (arm_b_cold vs arm_b_warm,
-       arm_d vs arm_e) currently differ only in the train-side checkpoint
-       payload; downstream eval CE is the same. Cache-aware eval lives in
+    KNOWN GAPS (these will surface at run time via runner / scorer
+    warnings; the pod runbook should treat them as pre-flight checks):
+
+    1. ``episodic_controller_runtime: "simplex_v1"`` is matrix-side only
+       in this commit. The runner's _build_controller_runtime_from_config
+       still dispatches the per-slot V0 modes (``heuristic``,
+       ``cpu_ssm_reference``, ``cpp_reference``); a follow-up commit
+       will add ``simplex_v1`` dispatch that loads SimplexWeights from
+       CSWG v2, constructs a SimplexOnlineLearner, and threads the
+       candidate-set producer through to record_simplex_decision. Until
+       that lands, the trained arms (c, d, e) will hard-error at runner
+       startup with a clear "unsupported runtime" message. arm_a and
+       arm_b run as before.
+    2. ``controller_train_online`` is honored on the train side (V0): the
+       runner skips wrapping the controller runtime in the V0 bridge
+       when False. The V1 simplex bridge in the follow-up will honor the
+       same flag for arm_c (frozen) vs arm_d (online).
+    3. ``eval_episodic_cache_mode`` (cold/warm) is loaded by
+       run_exp20_fast_score.py but DOES NOT affect scored CE — the
+       optimized fast-score loop bypasses the cache-aware
+       LegalityController path. arm_d vs arm_e currently differs only
+       in the train-side checkpoint payload (warm = cache serialized in
+       ckpt); downstream eval CE is the same. Cache-aware eval lives in
        run_exp20_eval.py; wiring it into the fast scorer is a separate
-       follow-up. Until that lands, treat cold/warm pairs as a redundant
-       check on train-side cache stability rather than an eval-time TTT
-       contrast.
+       follow-up. Until that lands, treat the cold/warm contrast as a
+       train-side simplex-quality check, not eval-time TTT.
     """
     fast_slow_lock = {
         "fast_slow_enabled": True,
@@ -1021,17 +1046,17 @@ def build_episodic_controller_v1_matrix(
         "episodic_controller_runtime": "heuristic",
         "controller_train_online": False,
     }
-    trained_controller_frozen = {
-        "episodic_controller_runtime": "cpu_ssm_reference",
+    simplex_controller_frozen = {
+        "episodic_controller_runtime": "simplex_v1",
         "episodic_controller_weights_path": _resolve_episodic_controller_v1_weights_path(),
         "controller_train_online": False,
-        # Without the post-step CE pair the controller's reward signal is
-        # NaN (B5 gates the second forward on this flag). Always-on for
-        # trained arms; heuristic arms don't need it.
+        # Without the post-step CE pair the simplex policy's reward
+        # signal is NaN (B5 gates the second forward on this flag).
+        # Always-on for trained arms; the heuristic arm doesn't need it.
         "episodic_compute_replay_ce_pair": True,
     }
-    trained_controller_online = {
-        **trained_controller_frozen,
+    simplex_controller_online = {
+        **simplex_controller_frozen,
         "controller_train_online": True,
     }
     arm_specs: list[tuple[str, dict[str, Any]]] = [
@@ -1046,7 +1071,7 @@ def build_episodic_controller_v1_matrix(
             },
         ),
         (
-            "arm_b_heuristic_cold",
+            "arm_b_heuristic",
             {
                 "episodic_enabled": True,
                 "controller_query_enabled": True,
@@ -1057,43 +1082,32 @@ def build_episodic_controller_v1_matrix(
             },
         ),
         (
-            "arm_b_heuristic_warm",
-            {
-                "episodic_enabled": True,
-                "controller_query_enabled": True,
-                "episodic_event_log_enabled": False,
-                "episodic_controller_score_mode": "cosine_utility_weighted",
-                **heuristic_controller,
-                **warm_eval_cache,
-            },
-        ),
-        (
-            "arm_c_trained_cold_frozen",
+            "arm_c_simplex_frozen",
             {
                 "episodic_enabled": True,
                 "controller_query_enabled": True,
                 "episodic_event_log_enabled": True,
-                **trained_controller_frozen,
+                **simplex_controller_frozen,
                 **cold_eval_cache,
             },
         ),
         (
-            "arm_d_trained_cold_online",
+            "arm_d_simplex_online",
             {
                 "episodic_enabled": True,
                 "controller_query_enabled": True,
                 "episodic_event_log_enabled": True,
-                **trained_controller_online,
+                **simplex_controller_online,
                 **cold_eval_cache,
             },
         ),
         (
-            "arm_e_trained_warm_online",
+            "arm_e_simplex_warm_online",
             {
                 "episodic_enabled": True,
                 "controller_query_enabled": True,
                 "episodic_event_log_enabled": True,
-                **trained_controller_online,
+                **simplex_controller_online,
                 **warm_eval_cache,
             },
         ),

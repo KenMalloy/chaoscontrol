@@ -25,33 +25,32 @@ def _records():
     by_seed = {
         101: {
             "arm_a_control": 1.000,
-            "arm_b_heuristic_cold": 0.970,
-            "arm_b_heuristic_warm": 0.960,
-            "arm_c_trained_cold_frozen": 0.965,
-            "arm_d_trained_cold_online": 0.940,
-            "arm_e_trained_warm_online": 0.930,
+            "arm_b_heuristic": 0.970,
+            "arm_c_simplex_frozen": 0.965,
+            "arm_d_simplex_online": 0.940,
+            "arm_e_simplex_warm_online": 0.930,
         },
         202: {
             "arm_a_control": 1.100,
-            "arm_b_heuristic_cold": 1.040,
-            "arm_b_heuristic_warm": 1.035,
-            "arm_c_trained_cold_frozen": 1.025,
-            "arm_d_trained_cold_online": 1.000,
-            "arm_e_trained_warm_online": 0.980,
+            "arm_b_heuristic": 1.040,
+            "arm_c_simplex_frozen": 1.025,
+            "arm_d_simplex_online": 1.000,
+            "arm_e_simplex_warm_online": 0.980,
         },
         303: {
             "arm_a_control": 1.200,
-            "arm_b_heuristic_cold": 1.150,
-            "arm_b_heuristic_warm": 1.140,
-            "arm_c_trained_cold_frozen": 1.130,
-            "arm_d_trained_cold_online": 1.100,
-            "arm_e_trained_warm_online": 1.090,
+            "arm_b_heuristic": 1.150,
+            "arm_c_simplex_frozen": 1.130,
+            "arm_d_simplex_online": 1.100,
+            "arm_e_simplex_warm_online": 1.090,
         },
     }
     records = []
     for seed, arm_values in by_seed.items():
         for arm, bpb in arm_values.items():
-            if arm == "arm_e_trained_warm_online":
+            if arm == "arm_e_simplex_warm_online":
+                # Spot-check the nested-config record path: analyzer must
+                # accept arm under config["arm"], not just top-level.
                 records.append(
                     {
                         "seed": seed,
@@ -71,26 +70,26 @@ def test_controller_phase3_analysis_summarizes_arms_and_paired_comparisons():
 
     comparisons = result["pairwise_comparisons"]
     assert set(comparisons) == {
-        "trained_vs_heuristic",
+        "simplex_vs_heuristic",
         "warm_vs_cold",
         "online_vs_frozen",
     }
 
-    trained_vs_heuristic = comparisons["trained_vs_heuristic"]
-    assert trained_vs_heuristic["treatment_arm"] == "arm_d_trained_cold_online"
-    assert trained_vs_heuristic["control_arm"] == "arm_b_heuristic_cold"
-    assert trained_vs_heuristic["delta_bpb_by_seed"] == {
+    simplex_vs_heuristic = comparisons["simplex_vs_heuristic"]
+    assert simplex_vs_heuristic["treatment_arm"] == "arm_d_simplex_online"
+    assert simplex_vs_heuristic["control_arm"] == "arm_b_heuristic"
+    assert simplex_vs_heuristic["delta_bpb_by_seed"] == {
         101: pytest.approx(-0.030),
         202: pytest.approx(-0.040),
         303: pytest.approx(-0.050),
     }
-    assert trained_vs_heuristic["mean_delta_bpb"] == pytest.approx(-0.040)
-    assert trained_vs_heuristic["std_delta_bpb"] == pytest.approx(0.010)
-    assert trained_vs_heuristic["n"] == 3
-    assert trained_vs_heuristic["t_stat"] == pytest.approx(
+    assert simplex_vs_heuristic["mean_delta_bpb"] == pytest.approx(-0.040)
+    assert simplex_vs_heuristic["std_delta_bpb"] == pytest.approx(0.010)
+    assert simplex_vs_heuristic["n"] == 3
+    assert simplex_vs_heuristic["t_stat"] == pytest.approx(
         -0.040 / (0.010 / math.sqrt(3))
     )
-    assert "p_value" in trained_vs_heuristic
+    assert "p_value" in simplex_vs_heuristic
 
     assert comparisons["warm_vs_cold"]["delta_bpb_by_seed"] == {
         101: pytest.approx(-0.010),
@@ -118,13 +117,13 @@ def test_controller_phase3_analysis_summarizes_arms_and_paired_comparisons():
         "std_bpb": pytest.approx(0.100),
         "fraction_seeds_beating_arm_a_control": pytest.approx(0.0),
     }
-    assert summary_by_arm["arm_d_trained_cold_online"]["mean_bpb"] == pytest.approx(
+    assert summary_by_arm["arm_d_simplex_online"]["mean_bpb"] == pytest.approx(
         (0.940 + 1.000 + 1.100) / 3.0
     )
-    assert summary_by_arm["arm_d_trained_cold_online"][
+    assert summary_by_arm["arm_d_simplex_online"][
         "std_bpb"
     ] == pytest.approx(0.08082903768654767)
-    assert summary_by_arm["arm_d_trained_cold_online"][
+    assert summary_by_arm["arm_d_simplex_online"][
         "fraction_seeds_beating_arm_a_control"
     ] == pytest.approx(1.0)
 
@@ -137,9 +136,9 @@ def test_controller_phase3_analysis_rejects_missing_seed_pairing():
         if not (
             record["seed"] == 303
             and record.get("arm", record.get("config", {}).get("arm"))
-            == "arm_d_trained_cold_online"
+            == "arm_d_simplex_online"
         )
     ]
 
-    with pytest.raises(ValueError, match="missing paired seeds.*trained_vs_heuristic"):
+    with pytest.raises(ValueError, match="missing paired seeds.*simplex_vs_heuristic"):
         mod.analyze_controller_arms(records)

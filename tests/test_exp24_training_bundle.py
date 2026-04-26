@@ -1427,13 +1427,16 @@ def test_episodic_ttt_v1_matrix_pins_eval_cache_schema_on_all_arms():
     )
 
 
-def test_episodic_controller_v1_matrix_has_six_arms_three_seeds():
-    """Controller V1 falsifier matrix: 6 arms x 3 seeds.
+def test_episodic_controller_v1_matrix_has_five_arms_three_seeds():
+    """Simplex controller V1 falsifier matrix: 5 arms x 3 seeds.
 
-    F1 compares heuristic vs trained controller, cold vs warm cache, and
-    frozen vs eval-time-online controller learning. The arm label is part of
-    the config surface so downstream F2 analysis can group rows without
-    parsing names.
+    Three pairwise contrasts the matrix exposes:
+      - heuristic vs simplex: arm_b vs arm_c (frozen-trained policy is
+        the only difference; same retrieval semantics).
+      - frozen vs online: arm_c vs arm_d (online REINFORCE is the
+        only difference).
+      - cold vs warm cache: arm_d vs arm_e (online controller held
+        constant; cache init is the only difference).
     """
     mod = _load_exp24()
 
@@ -1443,17 +1446,16 @@ def test_episodic_controller_v1_matrix_has_six_arms_three_seeds():
         budget_seconds=600.0,
     )
 
-    assert len(entries) == 18
-    assert len({entry["name"] for entry in entries}) == 18
+    assert len(entries) == 15
+    assert len({entry["name"] for entry in entries}) == 15
     assert {entry["seed"] for entry in entries} == {1337, 2674, 4011}
 
     expected_arms = (
         "arm_a_control",
-        "arm_b_heuristic_cold",
-        "arm_b_heuristic_warm",
-        "arm_c_trained_cold_frozen",
-        "arm_d_trained_cold_online",
-        "arm_e_trained_warm_online",
+        "arm_b_heuristic",
+        "arm_c_simplex_frozen",
+        "arm_d_simplex_online",
+        "arm_e_simplex_warm_online",
     )
     assert {entry["arm"] for entry in entries} == set(expected_arms)
     assert {entry["exp24_mechanism"] for entry in entries} == {
@@ -1491,7 +1493,7 @@ def test_episodic_controller_v1_matrix_has_six_arms_three_seeds():
         assert entry["episodic_controller_runtime"] == "heuristic"
         assert entry["controller_train_online"] is False
 
-    for entry in by_arm["arm_b_heuristic_cold"]:
+    for entry in by_arm["arm_b_heuristic"]:
         assert entry["episodic_enabled"] is True
         assert entry["eval_episodic_cache_enabled"] is True
         assert entry["eval_episodic_cache_mode"] == "cold"
@@ -1499,47 +1501,39 @@ def test_episodic_controller_v1_matrix_has_six_arms_three_seeds():
         assert entry["controller_train_online"] is False
         assert "episodic_controller_weights_path" not in entry
 
-    for entry in by_arm["arm_b_heuristic_warm"]:
-        assert entry["episodic_enabled"] is True
-        assert entry["eval_episodic_cache_enabled"] is True
-        assert entry["eval_episodic_cache_mode"] == "warm"
-        assert entry["eval_episodic_cache_source"] == "checkpoint"
-        assert entry["episodic_controller_runtime"] == "heuristic"
-        assert entry["controller_train_online"] is False
-
-    trained_arms = (
-        "arm_c_trained_cold_frozen",
-        "arm_d_trained_cold_online",
-        "arm_e_trained_warm_online",
+    simplex_arms = (
+        "arm_c_simplex_frozen",
+        "arm_d_simplex_online",
+        "arm_e_simplex_warm_online",
     )
-    for arm in trained_arms:
+    for arm in simplex_arms:
         for entry in by_arm[arm]:
             assert entry["episodic_enabled"] is True
             assert entry["eval_episodic_cache_enabled"] is True
             assert entry["episodic_event_log_enabled"] is True
-            assert entry["episodic_controller_runtime"] == "cpu_ssm_reference"
+            assert entry["episodic_controller_runtime"] == "simplex_v1"
             assert entry["episodic_controller_weights_path"] == (
                 "TO_BE_FILLED/episodic_controller_v1_weights.pt"
             )
 
-    for entry in by_arm["arm_c_trained_cold_frozen"]:
+    for entry in by_arm["arm_c_simplex_frozen"]:
         assert entry["eval_episodic_cache_mode"] == "cold"
         assert entry["controller_train_online"] is False
 
-    for entry in by_arm["arm_d_trained_cold_online"]:
+    for entry in by_arm["arm_d_simplex_online"]:
         assert entry["eval_episodic_cache_mode"] == "cold"
         assert entry["controller_train_online"] is True
 
-    for entry in by_arm["arm_e_trained_warm_online"]:
+    for entry in by_arm["arm_e_simplex_warm_online"]:
         assert entry["eval_episodic_cache_mode"] == "warm"
         assert entry["eval_episodic_cache_source"] == "checkpoint"
         assert entry["controller_train_online"] is True
 
-    for arm in trained_arms:
+    for arm in simplex_arms:
         for entry in by_arm[arm]:
             assert entry["episodic_compute_replay_ce_pair"] is True
 
-    for arm in ("arm_a_control", "arm_b_heuristic_cold", "arm_b_heuristic_warm"):
+    for arm in ("arm_a_control", "arm_b_heuristic"):
         for entry in by_arm[arm]:
             assert "episodic_compute_replay_ce_pair" not in entry
 
@@ -1559,16 +1553,16 @@ def test_episodic_controller_v1_weights_path_honors_env_override(monkeypatch):
         world_size=4,
         budget_seconds=600.0,
     )
-    trained = [
+    simplex = [
         entry for entry in entries
         if entry["arm"] in {
-            "arm_c_trained_cold_frozen",
-            "arm_d_trained_cold_online",
-            "arm_e_trained_warm_online",
+            "arm_c_simplex_frozen",
+            "arm_d_simplex_online",
+            "arm_e_simplex_warm_online",
         }
     ]
-    assert trained
-    for entry in trained:
+    assert simplex
+    for entry in simplex:
         assert entry["episodic_controller_weights_path"] == (
             "/workspace/episodic_controller_v1_real.pt"
         )
@@ -1633,7 +1627,7 @@ def test_run_exp24_cli_episodic_controller_v1_dry_run(tmp_path):
             "episodic_controller_v1",
             "--dry-run",
             "--limit",
-            "18",
+            "15",
             "--output-dir",
             str(output_dir),
         ],
@@ -1645,8 +1639,8 @@ def test_run_exp24_cli_episodic_controller_v1_dry_run(tmp_path):
     stdout = result.stdout
     assert "matrix=episodic_controller_v1" in stdout
     assert "world_size=4" in stdout
-    assert "entries=18" in stdout
+    assert "entries=15" in stdout
     assert "exp24_phase3_episodic_controller_v1_arm_a_control_s1337" in stdout
-    assert "exp24_phase3_episodic_controller_v1_arm_d_trained_cold_online_s1337" in stdout
-    assert "exp24_phase3_episodic_controller_v1_arm_e_trained_warm_online_s4011" in stdout
+    assert "exp24_phase3_episodic_controller_v1_arm_d_simplex_online_s1337" in stdout
+    assert "exp24_phase3_episodic_controller_v1_arm_e_simplex_warm_online_s4011" in stdout
     assert '"exp24_mechanism": "episodic_controller_v1"' in stdout

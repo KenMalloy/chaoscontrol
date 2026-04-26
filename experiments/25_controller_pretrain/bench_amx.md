@@ -1,19 +1,19 @@
-# CPU SSM Controller — AMX / AVX-512 Benchmark
+# CPU SSM Simplex Controller — AMX / AVX-512 Benchmark
 
-Phase E4 deliverable. Two question this bench answers:
+Phase E4 + S5 deliverable. The benchmark answers two questions:
 
-1. **Per-event end-to-end speedup.** Does the on-pod controller hot path
-   (`OnlineLearningController::accumulate_backward` — forward matvec +
-   diagonal recurrence + backward outer-product axpy + credit attribution
-   + history append) run faster with AVX-512 wired vs the scalar
-   reference? This is the number that determines whether the controller
-   keeps up with the GPU training ranks within the 600s pod budget.
-2. **Kernel-level peak.** What is the per-call latency of the
-   `_tile_dpbf16ps` AMX kernel and the `_mm512_fmadd_ps`-based AVX-512
-   recurrence in isolation? This is the number the brief's "~10×" claim
-   is about. It bounds the speedup any caller can hope to realize when
-   call-site overhead (vector construction, Python boundary crossings,
-   tensor object cost) is amortized to zero.
+1. **Per-query simplex policy end-to-end.** Does the controller's per-event
+   hot path (`simplex_forward` → `record_simplex_decision` →
+   `on_replay_outcome` → REINFORCE backward → SGD apply) keep up with
+   the on-pod producer rate (~6.7K replay outcomes/sec inferred from
+   the 640 KB/s wire-event sizing in the design doc)? Per-event budget
+   is ~150 µs. Anything materially slower means batching becomes
+   structurally necessary.
+2. **Kernel-level peak.** What's the per-call latency of the
+   `_tile_dpbf16ps` AMX kernel and the AVX-512 recurrence in isolation?
+   The simplex `M=16` shape is the design target; the bench includes a
+   tiled `64x64x32` shape for follow-up coverage of the tiling logic on
+   real-controller pretrain dimensions.
 
 The bench captures both in one run.
 
@@ -21,33 +21,34 @@ The bench captures both in one run.
 
 **Isolated kernel timings** (per call, tile-aligned synthetic inputs):
 
-- `generic_fp32_recurrence`: scalar `h = decay * h + x` over 512 fp32
-  lanes. The reference path; runs on every CPU.
-- `avx512_recurrence`: same op, vectorized via `_mm512_fmadd_ps`. Gated
-  on `avx512_recurrence_kernel_available() && has_avx512f()`.
-- `amx_bf16_matmul_16x32x16`: single AMX tile `C[16, 16] = A[16, 32] @ B[32, 16]`
-  in BF16 with FP32 accumulation. The kernel-level perf claim's
-  reference shape — what `_tile_dpbf16ps` was designed to chew on.
-- `amx_bf16_matmul_64x64x32_tiled`: the tiled kernel doing the actual
-  output-tile + K-tile loops. `M=64` × `N=32` requires 4×2=8 dst tiles,
-  `K=64` requires 2 K-tiles per dst, so the kernel issues 16
-  `_tile_dpbf16ps`. Mirrors a 64-sample minibatch through controller
-  pretrain `in_proj` (`fdim=64 -> d_global=32`); validates the tiling
-  logic at a representative real-controller shape.
+- `generic_fp32_recurrence` — scalar `h = decay * h + x` over 512 fp32
+  lanes; reference path on every CPU.
+- `avx512_recurrence` — same op via `_mm512_fmadd_ps`; gated on
+  AVX-512 build + runtime.
+- `amx_bf16_matmul_16x32x16` — single AMX tile `C[16, 16] = A[16, 32]
+  @ B[32, 16]` in BF16 with FP32 accumulation. Kernel-level reference;
+  same shape as the simplex policy's Layer 1 GEMM (`(16, K_v) @ (K_v,
+  H)` with `K_v=16, H=32`).
+- `amx_bf16_matmul_64x64x32_tiled` — exercises the K-tile + dst-tile
+  loops on a controller-pretrain shape (64-sample minibatch through
+  `in_proj`).
 
-**Per-event end-to-end timings** (`OnlineLearningController.on_replay_outcome`):
+**Per-query simplex end-to-end timings** (`SimplexOnlineLearner`):
 
-- `controller_per_event.scalar`: `set_use_avx512_matops(False)` forces
-  the scalar dispatch even on AVX-512 hardware. Measures the reference
-  path's per-event latency.
-- `controller_per_event.avx512`: `set_use_avx512_matops(True)` forces
-  AVX-512. Only run when `avx512_matops_kernel_available() && has_avx512f()`.
+- `forward_only` — `simplex_forward(weights, V, E, simplex_features)`
+  alone. The read path: scoring the simplex for action selection.
+  Producer-side cost on every query.
+- `decision_record` — forward + `record_simplex_decision`. The write
+  path: action chosen, snapshot saved for credit assignment.
+- `full_replay_event` — forward + record + `on_replay_outcome` with
+  REINFORCE backward + SGD apply (sgd_interval=1 to capture worst-case
+  per-event cost; production cadence amortizes SGD across many
+  events). The total simplex-controller cost per replay outcome.
 
-The end-to-end timing includes a `record_replay_selection` call per
-iteration so the replay outcome has a stateful entry to credit. That
-matches the on-pod producer shape (one selection per replay event,
-backed by a write-side staging) and ensures `accumulate_backward`
-actually runs (not the missing-state skip path).
+The full-event timing is what matters for "does the controller keep up
+with the producer rate." `forward_only` is what matters for "does the
+read path stay fast enough that the simplex isn't the query-side
+bottleneck."
 
 ## Local Smoke (Darwin arm64)
 
@@ -59,25 +60,25 @@ actually runs (not the missing-state skip path).
 Expected on the Darwin arm64 / default build:
 
 - `cpu_features.is_x86 == false`
-- `kernel_available.avx512_matops == false` and friends
-- `controller_per_event.scalar.uses_avx512_matops == false`
-- `controller_per_event.avx512.available == false`
+- `kernel_available.{avx512_recurrence, avx512_matops, amx_bf16_matmul} == false`
+- `simplex_per_query.full_replay_event.mean_us` well under the 150 µs
+  per-event budget — the simplex hot path is `at::matmul`-bound on
+  arm64 and the matmul shapes are tiny (≤ 16x32x16 mostly).
 
-The arm64 numbers exercise the scalar code path end-to-end and confirm
-the bench harness itself is correct. Reference numbers from a
-representative arm64 run (Apple Silicon, Python 3.14, torch 2.11):
+Reference numbers from a representative arm64 run (Apple Silicon,
+Python 3.14, torch 2.11, 1000 iters):
 
 | metric | value |
 |---|---|
-| `isolated_kernel.generic_fp32_recurrence.mean_us` | ~1.37 |
-| `controller_per_event.scalar.mean_us` | ~26.1 |
+| `isolated_kernel.generic_fp32_recurrence.mean_us` | ~1.4 |
+| `simplex_per_query.forward_only.mean_us` | ~16 |
+| `simplex_per_query.decision_record.mean_us` | ~24 |
+| `simplex_per_query.full_replay_event.mean_us` | ~88 |
 
-The controller per-event number is dominated by Python boundary
-crossings and the vector-construction in `record_replay_selection`,
-not by the matops themselves. The on-pod AVX-512 speedup will move
-the matops portion 4-8x but won't speed up the Python boundary —
-realized end-to-end speedup is therefore expected to be smaller than
-the kernel-level ratio. That's the point of measuring both.
+Per-event budget is ~150 µs at the design-doc producer rate (6.7K
+events/sec). At ~88 µs on arm64 with no AVX-512 / AMX, the simplex
+controller has ~1.7× headroom even without any vectorization. Streaming
+works; the AMX dispatch is a perf upside, not a streaming requirement.
 
 ## Sapphire Rapids Run (F3 runbook step)
 
@@ -93,7 +94,9 @@ CHAOSCONTROL_CPU_SSM_X86_ACCEL=1 \
   tests/test_avx512_recurrence.py \
   tests/test_avx512_matops.py \
   tests/test_amx_matmul.py \
-  tests/test_amx_matmul_vnni_packing.py -q
+  tests/test_amx_matmul_vnni_packing.py \
+  tests/test_simplex_policy.py \
+  tests/test_simplex_learner.py -q
 
 .venv/bin/python experiments/25_controller_pretrain/bench_amx.py \
   --iterations 100000 --warmup 1000 \
@@ -117,39 +120,52 @@ F3 pod run.
 | `amx_bf16_matmul_16x32x16` | TBD | TBD | TBD |
 | `amx_bf16_matmul_64x64x32_tiled` | TBD | TBD | TBD |
 
-### Per-event end-to-end timings (Sapphire Rapids)
+### Per-query simplex end-to-end timings (Sapphire Rapids)
 
-| dispatch | mean (µs) | median (µs) | p99 (µs) |
+| mode | mean (µs) | median (µs) | p99 (µs) |
 |---|---|---|---|
-| `scalar` | TBD | TBD | TBD |
-| `avx512` | TBD | TBD | TBD |
+| `forward_only` | TBD | TBD | TBD |
+| `decision_record` | TBD | TBD | TBD |
+| `full_replay_event` | TBD | TBD | TBD |
 
 ### Speedup interpretation
 
-- **Kernel-level AMX vs generic** (the brief's "~10×" claim): compute
-  `generic_fp32_recurrence.mean_us / amx_bf16_matmul_16x32x16.mean_us`,
-  but note the comparison crosses ops (recurrence vs matmul) and
-  precisions (fp32 vs bf16) — the closer apples-to-apples ratio is
-  `at::matmul(fp32) / amx_bf16_matmul(bf16)` which the bench doesn't
-  currently measure.
-- **Per-event end-to-end** (the on-pod claim): compute
-  `controller_per_event.scalar.mean_us / controller_per_event.avx512.mean_us`.
-  This is the realized speedup the controller actually sees during
-  the 600s training window, with all Python and tensor-object
-  overheads still in the timer.
+- **Kernel-level AMX vs generic** (the brief's "~10×" claim):
+  `generic_fp32_recurrence.mean_us / amx_bf16_matmul_16x32x16.mean_us`.
+  Note this crosses ops (recurrence vs matmul) and precisions (fp32 vs
+  bf16); the more apples-to-apples ratio is `at::matmul(fp32) /
+  amx_bf16_matmul(bf16)` at the same `(16, 32, 16)` shape, which the
+  bench doesn't currently measure.
+- **Per-query end-to-end**: simplex_forward and full_replay_event on
+  SPR vs the arm64 reference numbers above. Expected: AMX dispatch in
+  `simplex_policy.cpp`'s three GEMMs (when wired — currently uses
+  `at::matmul`) yields a meaningful drop on the (16, K_v, H) shapes
+  that match the AMX tile exactly. The on-pod hot-path number is the
+  number that determines streaming margin.
 
-## Out of scope for this bench
+## What survives, what's pending
 
-- **AMX wired into the controller's per-event path.**
-  `accumulate_backward` runs `M=1` per replay event — single-tile AMX
-  wastes 15/16 of the tile no matter how cleanly wired. The kernel
-  itself (commit `dcda08b`, tiled, arbitrary `M, N, K`) ships and is
-  validated locally + ready for SPR parity, but the per-event call
-  site doesn't use it. The realistic AMX target is a controller-arch
-  change that batches replay events 16-at-a-time before issuing
-  `accumulate_backward`. That change is out of scope for E4.
-- **AMX wired into `forward_pretrain_model`.** That's the offline
-  pretrain pipeline (bootstraps controller weights from heuristic
-  traces); speedup there doesn't help the on-pod 600s budget. A
-  future commit could swap it once a benchmark proves AMX BF16
-  beats `at::matmul`'s MKL fp32 path at controller-pretrain shapes.
+**Survives** from the per-slot V0 phase:
+
+- Tiled AMX BF16 matmul (commit `dcda08b`). Per-query simplex forward
+  fits the tile naturally — `M=16` is exactly one A-tile.
+- AVX-512 matvec/axpy (commit `d208cdc`). Available for any future
+  per-vertex ops; not currently called from `simplex_policy.cpp`.
+- Wire-event ring infrastructure (Phases A + B). QueryEvent schema
+  bumped (commit `a1b6e72`) for the simplex candidate set.
+
+**Pending for full perf claim**:
+
+- AMX dispatch from inside `simplex_policy.cpp`. The forward currently
+  uses `at::matmul` (commit `369f200`); a follow-up will dispatch to
+  `amx_bf16_matmul` when the build includes the kernel and the runtime
+  has AMX state. This is the single change that turns "AMX is the
+  natural shape" into "AMX is the actual shape." Until it lands,
+  per-query timings reflect `at::matmul`'s MKL path.
+- Runner-side `simplex_v1` runtime mode in
+  `_build_controller_runtime_from_config`. Currently the matrix's
+  trained arms (c, d, e) carry `episodic_controller_runtime:
+  "simplex_v1"`; the runner will reject this until the dispatch lands.
+  Heuristic arms (a, b) run unaffected.
+
+Both are mechanical follow-ups, not architecture work.

@@ -1,8 +1,9 @@
 """Phase 3 analysis helpers for the `episodic_controller_v1` matrix.
 
-The controller matrix compares BPB across six arms. Lower BPB is better.
-Pairwise effects use ``delta_bpb = treatment_bpb - control_bpb`` so a
-negative delta means the treatment improved over its control for that seed.
+The controller matrix compares BPB across five simplex arms. Lower BPB is
+better. Pairwise effects use ``delta_bpb = treatment_bpb - control_bpb``
+so a negative delta means the treatment improved over its control for
+that seed.
 """
 from __future__ import annotations
 
@@ -16,24 +17,23 @@ from typing import Any, Iterable
 ARM_A_CONTROL = "arm_a_control"
 ARM_NAMES = (
     ARM_A_CONTROL,
-    "arm_b_heuristic_cold",
-    "arm_b_heuristic_warm",
-    "arm_c_trained_cold_frozen",
-    "arm_d_trained_cold_online",
-    "arm_e_trained_warm_online",
+    "arm_b_heuristic",
+    "arm_c_simplex_frozen",
+    "arm_d_simplex_online",
+    "arm_e_simplex_warm_online",
 )
 PAIRWISE_COMPARISONS = {
-    "trained_vs_heuristic": (
-        "arm_d_trained_cold_online",
-        "arm_b_heuristic_cold",
+    "simplex_vs_heuristic": (
+        "arm_d_simplex_online",
+        "arm_b_heuristic",
     ),
     "warm_vs_cold": (
-        "arm_e_trained_warm_online",
-        "arm_d_trained_cold_online",
+        "arm_e_simplex_warm_online",
+        "arm_d_simplex_online",
     ),
     "online_vs_frozen": (
-        "arm_d_trained_cold_online",
-        "arm_c_trained_cold_frozen",
+        "arm_d_simplex_online",
+        "arm_c_simplex_frozen",
     ),
 }
 
