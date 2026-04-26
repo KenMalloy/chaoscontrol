@@ -39,6 +39,7 @@ import importlib.util
 from pathlib import Path
 
 import pytest
+import torch
 
 
 def _load_runner_module():
@@ -155,6 +156,40 @@ def test_consumer_state_back_compat_with_disabled_episodic():
     assert consumer.heartbeat == [0]
     assert consumer.controller_query_queue == []
     assert consumer.tagged_replay_queue == []
+
+
+def test_trainer_cache_checkpoint_preserves_configured_fingerprint_window(
+    tmp_path,
+):
+    """The trainer-built cache must save the writer's configured W.
+
+    C1 flagged a silent-miss hazard where the writer could hash with a
+    non-default ``episodic_fingerprint_window`` while the saved cache carried
+    the constructor default W=8. Drive the trainer's current cache-construction
+    surface and round-trip the checkpoint payload so that mismatch fails here.
+    """
+    mod = _load_runner_module()
+    consumer = mod._attach_episodic_consumer(
+        episodic_enabled=True,
+        is_episodic_rank=True,
+        world_size=2,
+        config={
+            "episodic_capacity": 16,
+            "episodic_span_length": 4,
+            "episodic_key_rep_dim": 8,
+            "episodic_fingerprint_window": 16,
+        },
+        model_dim=8,
+        all_group=None,
+    )
+    assert consumer.cache is not None
+
+    ckpt_path = tmp_path / "trainer_cache.pt"
+    torch.save({"episodic_cache": consumer.cache.to_dict()}, ckpt_path)
+    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    loaded_cache = mod.EpisodicCache.from_dict(ckpt["episodic_cache"])
+
+    assert loaded_cache.fingerprint_window == 16
 
 
 def _make_disabled_consumer(mod, *, with_cache: bool = True):
