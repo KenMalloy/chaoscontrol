@@ -51,3 +51,14 @@ class RunConfig:
     checkpoint_path: str = ""
     output_path: str = ""
     summary_path: str = ""
+    # Episodic cache wiring (W-task / TTT shape). Both default False so
+    # existing configs deserialize unchanged — non-cache TTT runs and the
+    # phase 0/1/2 score-only/no-cache matrices are bit-identical to the
+    # pre-cache driver. Set ``episodic_cache_enabled=True`` to construct
+    # a CacheAwareLegalityController (loads ckpt['episodic_cache'] when
+    # present, falls back to a fresh empty cache for the Arm D /
+    # train-no-cache + eval-fresh-cache shape). Set
+    # ``episodic_cache_reset_per_doc=True`` to call cache.reset() at the
+    # per-doc boundary so retrieval state is structurally per-doc.
+    episodic_cache_enabled: bool = False
+    episodic_cache_reset_per_doc: bool = False
