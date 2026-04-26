@@ -351,13 +351,10 @@ class TestEpisodicReplayDrain(unittest.TestCase):
                 break
         self.assertTrue(any_nonzero)
 
-    def test_get_tagged_replay_queue_pre_x_merge_returns_empty_list(self):
-        """Until X's controller lane merges, the production
-        ``_EpisodicConsumerState`` doesn't carry a
-        ``tagged_replay_queue`` attribute. The helper returns an empty
-        list rather than raising AttributeError. After X merges this
-        becomes a no-op assertion."""
-        # Use the real consumer state — it lacks the field pre-merge.
+    def test_get_tagged_replay_queue_returns_empty_list_for_no_op_consumer(self):
+        """The no-op consumer (episodic disabled OR non-episodic rank)
+        carries an empty tagged_replay_queue post-X-merge; the helper
+        returns it as []. None consumer also returns []."""
         no_op_consumer = self.mod._attach_episodic_consumer(
             episodic_enabled=False,
             is_episodic_rank=False,
@@ -366,10 +363,8 @@ class TestEpisodicReplayDrain(unittest.TestCase):
             model_dim=4,
             all_group=None,
         )
-        self.assertFalse(hasattr(no_op_consumer, "tagged_replay_queue"))
         result = self.mod._get_tagged_replay_queue(no_op_consumer)
         self.assertEqual(result, [])
-        # None consumer → empty list (defensive call site cover).
         self.assertEqual(self.mod._get_tagged_replay_queue(None), [])
 
     def test_runner_skips_utility_update_when_signal_is_nan(self):
