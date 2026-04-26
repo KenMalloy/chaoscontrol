@@ -42,9 +42,18 @@ wire_event_constants = (
     _C.wire_event_constants if _C is not None else _missing_extension
 )
 
+# SpscRing test fixture (Phase A2). Exposes the SpscRing<uint64_t, 1024>
+# instantiation bound in cpu_ssm_controller.cpp so tests/test_spsc_ring.py
+# can drive it without reaching into `_C`. The real wire-event ring
+# instantiations land in Phase A4 (ShmRing).
+SpscRingU64x1024 = (
+    _C.SpscRingU64x1024 if _C is not None else _missing_extension
+)
+
 __all__ = [
     "_C",
     "wire_event_sizes",
     "wire_event_min_slot_alignment",
     "wire_event_constants",
+    "SpscRingU64x1024",
 ]

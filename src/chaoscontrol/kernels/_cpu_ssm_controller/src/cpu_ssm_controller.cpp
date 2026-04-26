@@ -1,7 +1,15 @@
 #include <torch/extension.h>
 
+// pybind11/stl.h pulls in the std::optional<T> caster used by
+// SpscRing::pop()'s binding (returns Python None when empty). Without
+// this include the binding compiles but pop() returns an opaque
+// std::optional object instead of None / int.
+#include <pybind11/stl.h>
+
+#include <cstdint>
 #include <tuple>
 
+#include "spsc_ring.h"
 #include "wire_events.h"
 
 namespace {
@@ -149,6 +157,16 @@ pybind11::dict wire_event_constants() {
   return d;
 }
 
+// Concrete SpscRing instantiation used only by the Phase A2 Python test
+// (tests/test_spsc_ring.py). The 1024-slot u64 ring is a stand-in — the
+// real wire-event rings (WriteEvent / QueryEvent / ReplayOutcome over
+// shared memory) are instantiated in Phase A4's ShmRing wrapper. u64
+// payload is wide enough to surface byte-tearing if memory ordering is
+// wrong but small enough that a 1024-slot ring is ~8KB (two
+// cacheline-padded indices + 8KB slot array) and stays well under any
+// pybind11 / heap pressure.
+using TestRing = SpscRing<uint64_t, 1024>;
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("forward_step", &forward_step, "CPU SSM controller reference step");
   m.def("has_amx_bf16", &has_amx_bf16, "Whether built with AMX BF16 support");
@@ -159,4 +177,18 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "Single int — minimum ShmRing slot alignment shared by all three wire events");
   m.def("wire_event_constants", &wire_event_constants,
         "Compile-time constants driving wire-event array dimensions");
+
+  // Phase A2 test fixture — see tests/test_spsc_ring.py. `capacity` is
+  // exposed as a static class property (not a method) because the
+  // template parameter is compile-time; `pop` returns Optional[int]
+  // via the std::optional caster from pybind11/stl.h.
+  pybind11::class_<TestRing>(m, "SpscRingU64x1024")
+      .def(pybind11::init<>())
+      .def("push", &TestRing::push, "Push u64; returns False if full")
+      .def("pop", &TestRing::pop, "Pop u64; returns None if empty")
+      .def("size", &TestRing::size, "Approximate occupied-slot count")
+      .def_property_readonly_static(
+          "capacity",
+          [](pybind11::object) { return TestRing::capacity(); },
+          "Compile-time capacity (1024)");
 }
