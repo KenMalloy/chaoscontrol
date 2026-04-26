@@ -4,6 +4,17 @@
 #include <cstdint>
 #include <vector>
 
+// Simplex policy snapshot stored at decision time so the replay-outcome
+// backward (REINFORCE) can recompute the forward and apply the policy
+// gradient on the same V/E/simplex_features the policy saw at the
+// moment of action.
+//
+// Legacy per-slot fields (features, global_state, slot_state, output_logit)
+// are kept on the struct for the V0 backward path the existing
+// OnlineLearningController bookkeeping still references; the V1 simplex
+// path uses chosen_idx / p_chosen_decision / V / E / simplex_features.
+// V0-only callers leave the V1 vectors empty; V1-only callers leave the
+// V0 vectors empty.
 struct ActionHistoryEntry {
   uint8_t action_type = 0;
   uint64_t gpu_step = 0;
@@ -11,9 +22,16 @@ struct ActionHistoryEntry {
   float output_logit = 0.0f;
   uint8_t selected_rank = 0;
   uint32_t neighbor_slot = 0;
+  // V0 per-slot snapshot (legacy):
   std::vector<float> features;
   std::vector<float> global_state;
   std::vector<float> slot_state;
+  // V1 simplex snapshot:
+  uint32_t chosen_idx = 0;
+  float p_chosen_decision = 0.0f;
+  std::vector<float> V;                 // (N * K_v)
+  std::vector<float> E;                 // (N * N)
+  std::vector<float> simplex_features;  // (K_s)
 };
 
 class PerSlotActionHistory {

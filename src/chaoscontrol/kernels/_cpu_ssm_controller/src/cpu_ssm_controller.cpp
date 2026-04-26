@@ -26,6 +26,7 @@
 #include "optimizer.h"
 #include "posix_shm.h"
 #include "shm_ring.h"
+#include "simplex_learner.h"
 #include "simplex_policy.h"
 #include "spsc_ring.h"
 #include "wire_events.h"
@@ -1169,7 +1170,15 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def_readwrite("neighbor_slot", &ActionHistoryEntry::neighbor_slot)
       .def_readwrite("features", &ActionHistoryEntry::features)
       .def_readwrite("global_state", &ActionHistoryEntry::global_state)
-      .def_readwrite("slot_state", &ActionHistoryEntry::slot_state);
+      .def_readwrite("slot_state", &ActionHistoryEntry::slot_state)
+      .def_readwrite("chosen_idx", &ActionHistoryEntry::chosen_idx)
+      .def_readwrite(
+          "p_chosen_decision",
+          &ActionHistoryEntry::p_chosen_decision)
+      .def_readwrite("V", &ActionHistoryEntry::V)
+      .def_readwrite("E", &ActionHistoryEntry::E)
+      .def_readwrite(
+          "simplex_features", &ActionHistoryEntry::simplex_features);
 
   pybind11::class_<PerSlotActionHistory>(m, "PerSlotActionHistory")
       .def(pybind11::init<uint32_t, uint32_t>(),
@@ -1518,6 +1527,88 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "vertices via three layers (vertex projection, edge-aware mixing, "
         "logit head) and saves the intermediate activations the S2 "
         "REINFORCE backward will read.");
+
+  pybind11::class_<chaoscontrol::simplex::SimplexLearnerTelemetry>(
+      m, "SimplexLearnerTelemetry")
+      .def_readonly("replay_outcomes",
+                    &chaoscontrol::simplex::SimplexLearnerTelemetry::replay_outcomes)
+      .def_readonly("history_appends",
+                    &chaoscontrol::simplex::SimplexLearnerTelemetry::history_appends)
+      .def_readonly("credited_actions",
+                    &chaoscontrol::simplex::SimplexLearnerTelemetry::credited_actions)
+      .def_readonly("backward_ready_actions",
+                    &chaoscontrol::simplex::SimplexLearnerTelemetry::backward_ready_actions)
+      .def_readonly(
+          "backward_skipped_missing_state",
+          &chaoscontrol::simplex::SimplexLearnerTelemetry::backward_skipped_missing_state)
+      .def_readonly(
+          "backward_skipped_missing_weights",
+          &chaoscontrol::simplex::SimplexLearnerTelemetry::backward_skipped_missing_weights)
+      .def_readonly("invalid_slot_skips",
+                    &chaoscontrol::simplex::SimplexLearnerTelemetry::invalid_slot_skips)
+      .def_readonly("sgd_steps",
+                    &chaoscontrol::simplex::SimplexLearnerTelemetry::sgd_steps)
+      .def_readonly("ema_blends",
+                    &chaoscontrol::simplex::SimplexLearnerTelemetry::ema_blends);
+
+  pybind11::class_<chaoscontrol::simplex::SimplexOnlineLearner>(
+      m, "SimplexOnlineLearner")
+      .def(pybind11::init<uint32_t, uint32_t, float, float, uint32_t, float,
+                          uint64_t>(),
+           pybind11::arg("num_slots") = 4096,
+           pybind11::arg("max_entries_per_slot") = 64,
+           pybind11::arg("gamma") = 0.995f,
+           pybind11::arg("learning_rate") = 1.0e-3f,
+           pybind11::arg("sgd_interval") = 256,
+           pybind11::arg("ema_alpha") = 0.25f,
+           pybind11::arg("ema_interval") = 64)
+      .def("initialize_simplex_weights",
+           &chaoscontrol::simplex::SimplexOnlineLearner::initialize_simplex_weights,
+           pybind11::arg("weights"),
+           "Set fast = slow = weights and zero the gradient buffer.")
+      .def("record_simplex_decision",
+           &chaoscontrol::simplex::SimplexOnlineLearner::record_simplex_decision,
+           pybind11::arg("chosen_slot_id"),
+           pybind11::arg("gpu_step"),
+           pybind11::arg("policy_version"),
+           pybind11::arg("chosen_idx"),
+           pybind11::arg("p_chosen_decision"),
+           pybind11::arg("V"),
+           pybind11::arg("E"),
+           pybind11::arg("simplex_features"),
+           "Record a simplex decision. Stores V, E, simplex_features, "
+           "chosen_idx, p_chosen_decision in the per-slot history under "
+           "chosen_slot_id so on_replay_outcome can match by gpu_step.")
+      .def("on_replay_outcome",
+           [](chaoscontrol::simplex::SimplexOnlineLearner& self,
+              const pybind11::dict& d) {
+             self.on_replay_outcome(dict_to_replay_outcome(d));
+           },
+           pybind11::arg("replay_outcome"),
+           "Match the outcome's slot_id + selection_step to a recorded "
+           "simplex decision; recompute the forward; backprop "
+           "advantage * (p - one_hot(chosen)) / T through the simplex "
+           "graph; accumulate gradients; on the SGD/EMA cadence apply "
+           "the update.")
+      .def("history",
+           &chaoscontrol::simplex::SimplexOnlineLearner::history,
+           pybind11::arg("slot_id"),
+           pybind11::return_value_policy::reference_internal)
+      .def("telemetry",
+           &chaoscontrol::simplex::SimplexOnlineLearner::telemetry,
+           pybind11::return_value_policy::reference_internal)
+      .def("fast_weights",
+           &chaoscontrol::simplex::SimplexOnlineLearner::fast_weights,
+           pybind11::return_value_policy::reference_internal)
+      .def("slow_weights",
+           &chaoscontrol::simplex::SimplexOnlineLearner::slow_weights,
+           pybind11::return_value_policy::reference_internal)
+      .def_property_readonly(
+          "weights_initialized",
+          &chaoscontrol::simplex::SimplexOnlineLearner::weights_initialized)
+      .def_property_readonly(
+          "last_advantage",
+          &chaoscontrol::simplex::SimplexOnlineLearner::last_advantage);
 
   pybind11::class_<ShmRingReplayOutcomeT>(m, "ShmRingReplayOutcome")
       .def_static("create", &ShmRingReplayOutcomeT::create, pybind11::arg("name"),

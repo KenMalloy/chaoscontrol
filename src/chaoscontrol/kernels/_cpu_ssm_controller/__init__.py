@@ -160,6 +160,20 @@ simplex_forward = (
     if _C is not None else _missing_extension
 )
 
+# Phase S2 — simplex online learner. REINFORCE policy gradient over the
+# 16-vertex simplex. Stores per-decision snapshots in PerSlotActionHistory
+# under chosen_slot_id; on_replay_outcome matches by (slot_id, gpu_step),
+# recomputes the forward, backprops -advantage * log p[chosen], applies
+# SGD on the cadence and EMA-blends slow := alpha * fast + (1-alpha) * slow.
+SimplexLearnerTelemetry = (
+    getattr(_C, "SimplexLearnerTelemetry", _missing_extension)
+    if _C is not None else _missing_extension
+)
+SimplexOnlineLearner = (
+    getattr(_C, "SimplexOnlineLearner", _missing_extension)
+    if _C is not None else _missing_extension
+)
+
 # SpscRing test fixture (Phase A2). Exposes the SpscRing<uint64_t, 1024>
 # instantiation bound in cpu_ssm_controller.cpp so tests/test_spsc_ring.py
 # can drive it without reaching into `_C`. The real wire-event ring
@@ -235,6 +249,8 @@ __all__ = [
     "PerSlotActionHistory",
     "SimplexWeights",
     "SimplexForwardOutput",
+    "SimplexLearnerTelemetry",
+    "SimplexOnlineLearner",
     "simplex_forward",
     "SpscRingU64x1024",
     "PosixShm",
