@@ -1597,16 +1597,19 @@ def _emit_episodic_payloads_gpu(
     for k in range(K):
         b = int(positions[k, 0].item())
         t = int(positions[k, 1].item())
+        # Boundary skip mirrors ``build_write_payload``: need a full
+        # fingerprint window to the left and a full span to the right.
+        # Skip BEFORE allocating a candidate_id so the rank_seq doesn't
+        # accumulate gaps for boundary-rejected positions — keeps offline
+        # trace joins (writer → controller → cache) seq-contiguous.
+        if t < W or t + S > T:
+            continue
         candidate_id: int | None = None
         if emit.write_ring is not None:
             candidate_id = _rank_prefixed_event_id(
                 source_rank=int(rank),
                 rank_seq=_next_admission_trace_seq(),
             )
-        # Boundary skip mirrors ``build_write_payload``: need a full
-        # fingerprint window to the left and a full span to the right.
-        if t < W or t + S > T:
-            continue
         fp_window = inputs_i64[b, t - W:t]
         key_fp = fingerprint_tokens(fp_window)
         anchor = int(targets_i64[b, t].item())
