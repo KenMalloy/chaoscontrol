@@ -53,6 +53,10 @@ class SpscRing {
     static_assert((Capacity & (Capacity - 1)) == 0,
                   "SpscRing Capacity must be a power of 2 (mask-based modulo)");
     static_assert(Capacity > 0, "SpscRing Capacity must be > 0");
+    static_assert(std::is_trivially_copyable_v<T>,
+                  "SpscRing T must be trivially copyable — slots_[idx] = item "
+                  "is the assignment used and shm-mapped consumers must be "
+                  "able to copy without invoking ctors/dtors");
 
 public:
     SpscRing() : write_idx_(0), read_idx_(0) {}
@@ -81,15 +85,19 @@ public:
         return item;
     }
 
-    // Approximate occupied-slot count. Race-free for the producer's
-    // own-view (w monotonic, r only grows so result is an under-estimate
-    // at worst) and for the consumer's own-view (r monotonic, w only
-    // grows so result is an over-estimate at worst). External observers
-    // see a snapshot that may be stale but never inconsistent: w >= r
-    // always holds because each role only advances its own index.
+    // Approximate occupied-slot count. Load r BEFORE w so that any
+    // observer (producer, consumer, or a third monitoring thread) sees
+    // r_loaded ≤ w_at_load(r) ≤ w_loaded — the subtraction is therefore
+    // bounded and never underflows. The reverse load order would let
+    // the producer push and the consumer pop between the two loads,
+    // sampling r > w_sampled and wrapping the unsigned result to ~2^64.
+    // The result is still an over-estimate (the real size at any
+    // instant in [load(r), load(w)] is ≤ this value) but never
+    // negative, which matters once Phase A4/A5 may add a status
+    // monitor on a third thread.
     std::size_t size() const {
-        const auto w = write_idx_.load(std::memory_order_acquire);
         const auto r = read_idx_.load(std::memory_order_acquire);
+        const auto w = write_idx_.load(std::memory_order_acquire);
         return static_cast<std::size_t>(w - r);
     }
 
