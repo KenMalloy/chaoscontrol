@@ -909,6 +909,187 @@ EPISODIC_TTT_V1_ARMS: tuple[str, ...] = (
 )
 
 
+EPISODIC_CONTROLLER_V1_ARMS: tuple[str, ...] = (
+    "arm_a_control",
+    "arm_b_heuristic_cold",
+    "arm_b_heuristic_warm",
+    "arm_c_trained_cold_frozen",
+    "arm_d_trained_cold_online",
+    "arm_e_trained_warm_online",
+)
+EPISODIC_CONTROLLER_V1_WEIGHTS_PATH = (
+    "TO_BE_FILLED/episodic_controller_v1_weights.pt"
+)
+
+
+def build_episodic_controller_v1_matrix(
+    *,
+    speed_config: dict[str, Any],
+    world_size: int = 4,
+    budget_seconds: float = 600.0,
+    seed_values: Sequence[int] = DEFAULT_CONTROL_SEEDS,
+) -> list[dict[str, Any]]:
+    """Phase 3 CPU SSM controller V1 falsifier matrix.
+
+    Six arms x N seeds:
+      - ``arm_a_control``: no episodic cache, no controller.
+      - ``arm_b_heuristic_cold``: heuristic controller with a fresh cache.
+      - ``arm_b_heuristic_warm``: heuristic controller with checkpoint cache.
+      - ``arm_c_trained_cold_frozen``: trained controller, fresh cache,
+        eval-time online controller training disabled.
+      - ``arm_d_trained_cold_online``: trained controller, fresh cache,
+        eval-time online controller training enabled.
+      - ``arm_e_trained_warm_online``: trained controller, checkpoint cache,
+        eval-time online controller training enabled.
+
+    ``episodic_controller_weights_path`` is intentionally a pinned
+    to-be-filled placeholder for the trained arms. The runtime validator
+    rejects trained modes without a path, but the real Phase F artifact is
+    produced by the controller pretrain/export path, not this matrix builder.
+    """
+    fast_slow_lock = {
+        "fast_slow_enabled": True,
+        "fast_slow_interval": 64,
+        "fast_slow_alpha": 0.25,
+        "fast_slow_eval_copy": "slow",
+        "dreamworld_enabled": False,
+        "dreamworld_cache_interval": 0,
+        "dreamworld_interval": 0,
+        "dreamworld_weight": 0.0,
+        "dreamworld_replay_batch_size": 0,
+    }
+    eval_cache_schema_lock = {
+        "eval_episodic_cache_capacity": 4096,
+        "eval_episodic_span_length": 4,
+        "eval_episodic_key_rep_dim": -1,
+        "eval_episodic_grace_steps": 1000,
+        "eval_episodic_fingerprint_window": 8,
+        "eval_episodic_cache_reset_per_doc": False,
+    }
+    no_eval_cache = {
+        **eval_cache_schema_lock,
+        "eval_episodic_cache_enabled": False,
+        "eval_steps_per_chunk": 0,
+        "eval_adapt_set": "none",
+        "eval_episodic_cache_mode": "none",
+    }
+    cold_eval_cache = {
+        **eval_cache_schema_lock,
+        "eval_episodic_cache_enabled": True,
+        "eval_steps_per_chunk": 0,
+        "eval_adapt_set": "none",
+        "eval_episodic_cache_mode": "cold",
+    }
+    warm_eval_cache = {
+        **cold_eval_cache,
+        "eval_episodic_cache_mode": "warm",
+        "eval_episodic_cache_source": "checkpoint",
+    }
+    heuristic_controller = {
+        "episodic_controller_runtime": "heuristic",
+        "controller_train_online": False,
+    }
+    trained_controller_frozen = {
+        "episodic_controller_runtime": "cpu_ssm_reference",
+        "episodic_controller_weights_path": EPISODIC_CONTROLLER_V1_WEIGHTS_PATH,
+        "controller_train_online": False,
+    }
+    trained_controller_online = {
+        **trained_controller_frozen,
+        "controller_train_online": True,
+    }
+    arm_specs: list[tuple[str, dict[str, Any]]] = [
+        (
+            "arm_a_control",
+            {
+                "episodic_enabled": False,
+                "controller_query_enabled": False,
+                "episodic_event_log_enabled": False,
+                **heuristic_controller,
+                **no_eval_cache,
+            },
+        ),
+        (
+            "arm_b_heuristic_cold",
+            {
+                "episodic_enabled": True,
+                "controller_query_enabled": True,
+                "episodic_event_log_enabled": False,
+                "episodic_controller_score_mode": "cosine_utility_weighted",
+                **heuristic_controller,
+                **cold_eval_cache,
+            },
+        ),
+        (
+            "arm_b_heuristic_warm",
+            {
+                "episodic_enabled": True,
+                "controller_query_enabled": True,
+                "episodic_event_log_enabled": False,
+                "episodic_controller_score_mode": "cosine_utility_weighted",
+                **heuristic_controller,
+                **warm_eval_cache,
+            },
+        ),
+        (
+            "arm_c_trained_cold_frozen",
+            {
+                "episodic_enabled": True,
+                "controller_query_enabled": True,
+                "episodic_event_log_enabled": True,
+                **trained_controller_frozen,
+                **cold_eval_cache,
+            },
+        ),
+        (
+            "arm_d_trained_cold_online",
+            {
+                "episodic_enabled": True,
+                "controller_query_enabled": True,
+                "episodic_event_log_enabled": True,
+                **trained_controller_online,
+                **cold_eval_cache,
+            },
+        ),
+        (
+            "arm_e_trained_warm_online",
+            {
+                "episodic_enabled": True,
+                "controller_query_enabled": True,
+                "episodic_event_log_enabled": True,
+                **trained_controller_online,
+                **warm_eval_cache,
+            },
+        ),
+    ]
+    entries: list[dict[str, Any]] = []
+    for arm_name, arm_overrides in arm_specs:
+        arm = {
+            "arm": arm_name,
+            "exp24_mechanism": "episodic_controller_v1",
+            "artifact_impact": ARTIFACT_TRAINING_ONLY,
+            **fast_slow_lock,
+            **arm_overrides,
+        }
+        for seed in seed_values:
+            entry = _base_entry(
+                speed_config=speed_config,
+                world_size=world_size,
+                budget_seconds=budget_seconds,
+            )
+            entry.update(arm)
+            entries.append(
+                _named_entry(
+                    base=entry,
+                    phase="phase3",
+                    mechanism="episodic_controller_v1",
+                    arm=f"episodic_controller_v1_{arm_name}",
+                    seed=int(seed),
+                )
+            )
+    return entries
+
+
 def build_episodic_ttt_v1_matrix(
     *,
     speed_config: dict[str, Any],

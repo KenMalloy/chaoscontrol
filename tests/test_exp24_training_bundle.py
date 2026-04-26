@@ -1425,3 +1425,112 @@ def test_episodic_ttt_v1_matrix_pins_eval_cache_schema_on_all_arms():
     assert len(shapes) == 1, (
         f"all arms must share an identical cache shape; got {shapes!r}"
     )
+
+
+def test_episodic_controller_v1_matrix_has_six_arms_three_seeds():
+    """Controller V1 falsifier matrix: 6 arms x 3 seeds.
+
+    F1 compares heuristic vs trained controller, cold vs warm cache, and
+    frozen vs eval-time-online controller learning. The arm label is part of
+    the config surface so downstream F2 analysis can group rows without
+    parsing names.
+    """
+    mod = _load_exp24()
+
+    entries = mod.build_episodic_controller_v1_matrix(
+        speed_config={"batch_size": 1024, "chunk_size": 64},
+        world_size=4,
+        budget_seconds=600.0,
+    )
+
+    assert len(entries) == 18
+    assert len({entry["name"] for entry in entries}) == 18
+    assert {entry["seed"] for entry in entries} == {1337, 2674, 4011}
+
+    expected_arms = (
+        "arm_a_control",
+        "arm_b_heuristic_cold",
+        "arm_b_heuristic_warm",
+        "arm_c_trained_cold_frozen",
+        "arm_d_trained_cold_online",
+        "arm_e_trained_warm_online",
+    )
+    assert {entry["arm"] for entry in entries} == set(expected_arms)
+    assert {entry["exp24_mechanism"] for entry in entries} == {
+        "episodic_controller_v1"
+    }
+    assert {entry["exp24_phase"] for entry in entries} == {"phase3"}
+    for arm in expected_arms:
+        assert {entry["seed"] for entry in entries if entry["arm"] == arm} == {
+            1337,
+            2674,
+            4011,
+        }
+
+    by_arm: dict[str, list[dict]] = {arm: [] for arm in expected_arms}
+    for entry in entries:
+        by_arm[entry["arm"]].append(entry)
+        assert entry["name"] == (
+            f"exp24_phase3_episodic_controller_v1_{entry['arm']}_"
+            f"s{entry['seed']}"
+        )
+        assert entry["world_size"] == 4
+        assert entry["budget_seconds"] == 600.0
+        assert entry["artifact_impact"] == "artifact_training_only"
+        assert entry["fast_slow_enabled"] is True
+        assert entry["fast_slow_interval"] == 64
+        assert entry["fast_slow_alpha"] == 0.25
+        assert entry["fast_slow_eval_copy"] == "slow"
+
+    assert all(len(rows) == 3 for rows in by_arm.values())
+
+    for entry in by_arm["arm_a_control"]:
+        assert entry["episodic_enabled"] is False
+        assert entry["eval_episodic_cache_enabled"] is False
+        assert entry["episodic_event_log_enabled"] is False
+        assert entry["episodic_controller_runtime"] == "heuristic"
+        assert entry["controller_train_online"] is False
+
+    for entry in by_arm["arm_b_heuristic_cold"]:
+        assert entry["episodic_enabled"] is True
+        assert entry["eval_episodic_cache_enabled"] is True
+        assert entry["eval_episodic_cache_mode"] == "cold"
+        assert entry["episodic_controller_runtime"] == "heuristic"
+        assert entry["controller_train_online"] is False
+        assert "episodic_controller_weights_path" not in entry
+
+    for entry in by_arm["arm_b_heuristic_warm"]:
+        assert entry["episodic_enabled"] is True
+        assert entry["eval_episodic_cache_enabled"] is True
+        assert entry["eval_episodic_cache_mode"] == "warm"
+        assert entry["eval_episodic_cache_source"] == "checkpoint"
+        assert entry["episodic_controller_runtime"] == "heuristic"
+        assert entry["controller_train_online"] is False
+
+    trained_arms = (
+        "arm_c_trained_cold_frozen",
+        "arm_d_trained_cold_online",
+        "arm_e_trained_warm_online",
+    )
+    for arm in trained_arms:
+        for entry in by_arm[arm]:
+            assert entry["episodic_enabled"] is True
+            assert entry["eval_episodic_cache_enabled"] is True
+            assert entry["episodic_event_log_enabled"] is True
+            assert entry["episodic_controller_runtime"] == "cpu_ssm_reference"
+            assert entry["episodic_controller_weights_path"] == (
+                "TO_BE_FILLED/episodic_controller_v1_weights.pt"
+            )
+
+    for entry in by_arm["arm_c_trained_cold_frozen"]:
+        assert entry["eval_episodic_cache_mode"] == "cold"
+        assert entry["controller_train_online"] is False
+
+    for entry in by_arm["arm_d_trained_cold_online"]:
+        assert entry["eval_episodic_cache_mode"] == "cold"
+        assert entry["controller_train_online"] is True
+
+    for entry in by_arm["arm_e_trained_warm_online"]:
+        assert entry["eval_episodic_cache_mode"] == "warm"
+        assert entry["eval_episodic_cache_source"] == "checkpoint"
+        assert entry["controller_train_online"] is True
