@@ -6,9 +6,13 @@
 // std::optional object instead of None / int.
 #include <pybind11/stl.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
+#include <fstream>
+#include <limits>
 #include <tuple>
+#include <vector>
 
 #include "posix_shm.h"
 #include "shm_ring.h"
@@ -16,6 +20,97 @@
 #include "wire_events.h"
 
 namespace {
+
+constexpr uint32_t kCswgVersion = 1;
+constexpr uint32_t kCswgDtypeFp16 = 1;
+constexpr std::size_t kCswgHeaderBytes = 28;
+constexpr double kInvSqrt2 = 0.70710678118654752440;
+
+struct CswgHeader {
+  uint32_t version;
+  uint32_t n_layers;
+  uint32_t d_global;
+  uint32_t d_slot;
+  uint32_t feature_dim;
+  uint32_t dtype;
+};
+
+uint32_t read_le_u32(const unsigned char* p) {
+  return static_cast<uint32_t>(p[0]) |
+      (static_cast<uint32_t>(p[1]) << 8) |
+      (static_cast<uint32_t>(p[2]) << 16) |
+      (static_cast<uint32_t>(p[3]) << 24);
+}
+
+CswgHeader parse_cswg_header(const std::vector<unsigned char>& bytes) {
+  TORCH_CHECK(bytes.size() == kCswgHeaderBytes, "CSWG internal header size bug");
+  TORCH_CHECK(std::memcmp(bytes.data(), "CSWG", 4) == 0, "CSWG bad magic");
+  return CswgHeader{
+      read_le_u32(bytes.data() + 4),
+      read_le_u32(bytes.data() + 8),
+      read_le_u32(bytes.data() + 12),
+      read_le_u32(bytes.data() + 16),
+      read_le_u32(bytes.data() + 20),
+      read_le_u32(bytes.data() + 24),
+  };
+}
+
+uint64_t checked_mul_u64(uint64_t a, uint64_t b, const char* name) {
+  TORCH_CHECK(
+      a == 0 || b <= std::numeric_limits<uint64_t>::max() / a,
+      "CSWG element count overflow while sizing ", name);
+  return a * b;
+}
+
+uint64_t checked_add_u64(uint64_t a, uint64_t b, const char* name) {
+  TORCH_CHECK(
+      b <= std::numeric_limits<uint64_t>::max() - a,
+      "CSWG element count overflow while adding ", name);
+  return a + b;
+}
+
+float half_bits_to_float(uint16_t bits) {
+  c10::Half value;
+  std::memcpy(&value, &bits, sizeof(bits));
+  return static_cast<float>(value);
+}
+
+at::Tensor read_fp16_tensor(
+    const std::vector<uint16_t>& payload,
+    std::size_t& offset,
+    const std::vector<int64_t>& shape,
+    const char* name) {
+  int64_t count_i64 = 1;
+  for (int64_t dim : shape) {
+    TORCH_CHECK(dim >= 0, name, " has negative dimension");
+    TORCH_CHECK(
+        count_i64 <= std::numeric_limits<int64_t>::max() / std::max<int64_t>(dim, 1),
+        name, " element count overflows int64");
+    count_i64 *= dim;
+  }
+  const std::size_t count = static_cast<std::size_t>(count_i64);
+  TORCH_CHECK(
+      offset <= payload.size() && count <= payload.size() - offset,
+      "CSWG payload ended while reading tensor ", name);
+  auto out = at::empty(
+      at::IntArrayRef(shape),
+      at::TensorOptions().dtype(at::kFloat).device(at::kCPU));
+  float* dst = out.data_ptr<float>();
+  for (std::size_t i = 0; i < count; ++i) {
+    dst[i] = half_bits_to_float(payload[offset + i]);
+  }
+  offset += count;
+  return out;
+}
+
+at::Tensor dict_tensor(const pybind11::dict& weights, const char* key) {
+  pybind11::str py_key(key);
+  TORCH_CHECK(weights.contains(py_key), "missing CSWG tensor ", key);
+  at::Tensor value = pybind11::cast<at::Tensor>(weights[py_key]);
+  TORCH_CHECK(!value.is_cuda(), key, " must be a CPU tensor");
+  TORCH_CHECK(value.scalar_type() == at::kFloat, key, " must be float32");
+  return value.contiguous();
+}
 
 void check_vec(const at::Tensor& t, const char* name, int64_t n) {
   TORCH_CHECK(!t.is_cuda(), name, " must be a CPU tensor");
@@ -37,7 +132,181 @@ void check_mat(
   TORCH_CHECK(t.is_contiguous(), name, " must be contiguous");
 }
 
+void check_batch(const at::Tensor& t, const char* name, int64_t cols) {
+  TORCH_CHECK(!t.is_cuda(), name, " must be a CPU tensor");
+  TORCH_CHECK(t.scalar_type() == at::kFloat, name, " must be float32");
+  TORCH_CHECK(t.dim() == 2 && t.size(1) == cols,
+              name, " must have shape [B, ", cols, "]");
+  TORCH_CHECK(t.is_contiguous(), name, " must be contiguous");
+}
+
+void check_tensor3(
+    const at::Tensor& t,
+    const char* name,
+    int64_t dim0,
+    int64_t dim1,
+    int64_t dim2) {
+  TORCH_CHECK(!t.is_cuda(), name, " must be a CPU tensor");
+  TORCH_CHECK(t.scalar_type() == at::kFloat, name, " must be float32");
+  TORCH_CHECK(
+      t.dim() == 3 && t.size(0) == dim0 && t.size(1) == dim1 &&
+          t.size(2) == dim2,
+      name, " must have shape [", dim0, ", ", dim1, ", ", dim2, "]");
+  TORCH_CHECK(t.is_contiguous(), name, " must be contiguous");
+}
+
+at::Tensor exact_gelu(const at::Tensor& x) {
+  return 0.5 * x * (1.0 + at::erf(x * kInvSqrt2));
+}
+
 }  // namespace
+
+pybind11::dict load_weights_from_path(const std::string& path) {
+  std::ifstream in(path, std::ios::binary);
+  TORCH_CHECK(in.good(), "failed to open CSWG weight file: ", path);
+
+  std::vector<unsigned char> header_bytes(kCswgHeaderBytes);
+  in.read(
+      reinterpret_cast<char*>(header_bytes.data()),
+      static_cast<std::streamsize>(header_bytes.size()));
+  TORCH_CHECK(in.gcount() == static_cast<std::streamsize>(header_bytes.size()),
+              "CSWG file is too short to contain a header: ", path);
+  const CswgHeader header = parse_cswg_header(header_bytes);
+  TORCH_CHECK(header.version == kCswgVersion,
+              "CSWG unsupported version ", header.version);
+  TORCH_CHECK(header.dtype == kCswgDtypeFp16,
+              "CSWG unsupported dtype enum ", header.dtype);
+  TORCH_CHECK(header.n_layers > 0, "CSWG n_layers must be positive");
+  TORCH_CHECK(header.d_global > 0, "CSWG d_global must be positive");
+  TORCH_CHECK(header.d_slot > 0, "CSWG d_slot must be positive");
+  TORCH_CHECK(header.feature_dim > 0, "CSWG feature_dim must be positive");
+
+  in.seekg(0, std::ios::end);
+  const std::streamoff file_size = in.tellg();
+  TORCH_CHECK(file_size >= static_cast<std::streamoff>(kCswgHeaderBytes),
+              "CSWG file size underflow: ", path);
+  const std::streamoff payload_bytes =
+      file_size - static_cast<std::streamoff>(kCswgHeaderBytes);
+  TORCH_CHECK(payload_bytes % 2 == 0,
+              "CSWG fp16 payload byte count must be even");
+  in.seekg(static_cast<std::streamoff>(kCswgHeaderBytes), std::ios::beg);
+
+  std::vector<uint16_t> payload(static_cast<std::size_t>(payload_bytes / 2));
+  in.read(
+      reinterpret_cast<char*>(payload.data()),
+      static_cast<std::streamsize>(payload_bytes));
+  TORCH_CHECK(in.gcount() == payload_bytes,
+              "failed to read full CSWG payload from ", path);
+
+  const uint64_t n_layers = header.n_layers;
+  const uint64_t d_global = header.d_global;
+  const uint64_t d_slot = header.d_slot;
+  const uint64_t feature_dim = header.feature_dim;
+  const uint64_t total = payload.size();
+  uint64_t expected = 0;
+  const uint64_t d_global_sq =
+      checked_mul_u64(d_global, d_global, "D_global squared");
+  auto add = [&](uint64_t term, const char* name) {
+    expected = checked_add_u64(expected, term, name);
+  };
+  add(checked_mul_u64(d_global, feature_dim, "trunk.in_proj.weight"),
+      "trunk.in_proj.weight");
+  add(d_global, "trunk.in_proj.bias");
+  add(checked_mul_u64(n_layers, d_global, "trunk.decay"), "trunk.decay");
+  add(checked_mul_u64(n_layers, d_global_sq, "trunk.w_in"), "trunk.w_in");
+  add(checked_mul_u64(n_layers, d_global_sq, "trunk.w_out"), "trunk.w_out");
+  add(checked_mul_u64(n_layers, d_global, "trunk.bias"), "trunk.bias");
+  add(checked_mul_u64(d_slot, d_global, "policy_head.weight"),
+      "policy_head.weight");
+  add(d_slot, "policy_head.bias");
+  add(d_global, "value_head.weight");
+  add(1, "value_head.bias");
+  TORCH_CHECK(
+      total == expected,
+      "CSWG payload element count mismatch: header expects ", expected,
+      " fp16 values but file has ", total);
+  TORCH_CHECK(
+      feature_dim <= static_cast<uint64_t>(std::numeric_limits<int64_t>::max()),
+      "CSWG feature_dim overflows int64");
+
+  const int64_t l = static_cast<int64_t>(n_layers);
+  const int64_t dg = static_cast<int64_t>(d_global);
+  const int64_t ds = static_cast<int64_t>(d_slot);
+  const int64_t f = static_cast<int64_t>(feature_dim);
+  std::size_t offset = 0;
+  pybind11::dict out;
+  out["trunk.in_proj.weight"] = read_fp16_tensor(
+      payload, offset, {dg, f}, "trunk.in_proj.weight");
+  out["trunk.in_proj.bias"] = read_fp16_tensor(
+      payload, offset, {dg}, "trunk.in_proj.bias");
+  out["trunk.decay"] = read_fp16_tensor(
+      payload, offset, {l, dg}, "trunk.decay");
+  out["trunk.w_in"] = read_fp16_tensor(
+      payload, offset, {l, dg, dg}, "trunk.w_in");
+  out["trunk.w_out"] = read_fp16_tensor(
+      payload, offset, {l, dg, dg}, "trunk.w_out");
+  out["trunk.bias"] = read_fp16_tensor(
+      payload, offset, {l, dg}, "trunk.bias");
+  out["policy_head.weight"] = read_fp16_tensor(
+      payload, offset, {ds, dg}, "policy_head.weight");
+  out["policy_head.bias"] = read_fp16_tensor(
+      payload, offset, {ds}, "policy_head.bias");
+  out["value_head.weight"] = read_fp16_tensor(
+      payload, offset, {1, dg}, "value_head.weight");
+  out["value_head.bias"] = read_fp16_tensor(
+      payload, offset, {1}, "value_head.bias");
+  TORCH_CHECK(offset == payload.size(),
+              "CSWG loader left unread payload elements");
+  return out;
+}
+
+std::tuple<at::Tensor, at::Tensor> forward_pretrain_model(
+    const at::Tensor& features,
+    const pybind11::dict& weights) {
+  at::Tensor in_proj_weight = dict_tensor(weights, "trunk.in_proj.weight");
+  at::Tensor in_proj_bias = dict_tensor(weights, "trunk.in_proj.bias");
+  at::Tensor decay = dict_tensor(weights, "trunk.decay");
+  at::Tensor w_in = dict_tensor(weights, "trunk.w_in");
+  at::Tensor w_out = dict_tensor(weights, "trunk.w_out");
+  at::Tensor trunk_bias = dict_tensor(weights, "trunk.bias");
+  at::Tensor policy_weight = dict_tensor(weights, "policy_head.weight");
+  at::Tensor policy_bias = dict_tensor(weights, "policy_head.bias");
+  at::Tensor value_weight = dict_tensor(weights, "value_head.weight");
+  at::Tensor value_bias = dict_tensor(weights, "value_head.bias");
+
+  TORCH_CHECK(in_proj_weight.dim() == 2,
+              "trunk.in_proj.weight must have shape [D_global, F]");
+  const int64_t d_global = in_proj_weight.size(0);
+  const int64_t feature_dim = in_proj_weight.size(1);
+  check_vec(in_proj_bias, "trunk.in_proj.bias", d_global);
+  TORCH_CHECK(decay.dim() == 2 && decay.size(1) == d_global,
+              "trunk.decay must have shape [n_layers, D_global]");
+  const int64_t n_layers = decay.size(0);
+  check_tensor3(w_in, "trunk.w_in", n_layers, d_global, d_global);
+  check_tensor3(w_out, "trunk.w_out", n_layers, d_global, d_global);
+  check_mat(trunk_bias, "trunk.bias", n_layers, d_global);
+  TORCH_CHECK(policy_weight.dim() == 2 && policy_weight.size(1) == d_global,
+              "policy_head.weight must have shape [D_slot, D_global]");
+  check_vec(policy_bias, "policy_head.bias", policy_weight.size(0));
+  check_mat(value_weight, "value_head.weight", 1, d_global);
+  check_vec(value_bias, "value_head.bias", 1);
+
+  at::Tensor x = features.contiguous();
+  check_batch(x, "features", feature_dim);
+
+  at::Tensor h = at::matmul(x, in_proj_weight.t()) + in_proj_bias;
+  for (int64_t layer = 0; layer < n_layers; ++layer) {
+    h = h * decay.select(0, layer) +
+        at::matmul(h, w_in.select(0, layer)) +
+        trunk_bias.select(0, layer);
+    h = exact_gelu(h);
+    h = at::matmul(h, w_out.select(0, layer));
+  }
+  at::Tensor logits = at::matmul(h, policy_weight.t()) + policy_bias;
+  at::Tensor value =
+      (at::matmul(h, value_weight.t()) + value_bias).squeeze(-1);
+  return std::make_tuple(logits.contiguous(), value.contiguous());
+}
 
 std::tuple<at::Tensor, at::Tensor, at::Tensor> forward_step(
     const at::Tensor& features,
@@ -404,6 +673,10 @@ pybind11::dict replay_outcome_to_dict(const ReplayOutcome& ev) {
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("forward_step", &forward_step, "CPU SSM controller reference step");
+  m.def("load_weights_from_path", &load_weights_from_path,
+        "Load a CSWG controller pretrain weight dump");
+  m.def("forward_pretrain_model", &forward_pretrain_model,
+        "Run the D4 controller pretrain model from a CSWG weight dict");
   m.def("has_amx_bf16", &has_amx_bf16, "Whether built with AMX BF16 support");
   m.def("backend_name", &backend_name, "Compiled backend name");
   m.def("wire_event_sizes", &wire_event_sizes,

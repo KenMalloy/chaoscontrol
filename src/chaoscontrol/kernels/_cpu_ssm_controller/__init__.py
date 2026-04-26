@@ -41,6 +41,14 @@ wire_event_min_slot_alignment = (
 wire_event_constants = (
     _C.wire_event_constants if _C is not None else _missing_extension
 )
+load_weights_from_path = (
+    getattr(_C, "load_weights_from_path", _missing_extension)
+    if _C is not None else _missing_extension
+)
+forward_pretrain_model = (
+    getattr(_C, "forward_pretrain_model", _missing_extension)
+    if _C is not None else _missing_extension
+)
 
 # SpscRing test fixture (Phase A2). Exposes the SpscRing<uint64_t, 1024>
 # instantiation bound in cpu_ssm_controller.cpp so tests/test_spsc_ring.py
@@ -90,6 +98,8 @@ __all__ = [
     "wire_event_sizes",
     "wire_event_min_slot_alignment",
     "wire_event_constants",
+    "load_weights_from_path",
+    "forward_pretrain_model",
     "SpscRingU64x1024",
     "PosixShm",
     "ShmRingU64x1024",
