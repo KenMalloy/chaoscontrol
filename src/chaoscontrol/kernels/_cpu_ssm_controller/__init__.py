@@ -61,12 +61,28 @@ PosixShm = (
 # ShmRing test fixture (Phase A4). Exposes the
 # ShmRing<uint64_t, 1024> instantiation bound in cpu_ssm_controller.cpp
 # so tests/test_shm_ring.py can drive it without reaching into `_C`.
-# The real wire-event ring instantiations
-# (ShmRing<WriteEvent, ...>, ShmRing<QueryEvent, ...>,
-# ShmRing<ReplayOutcome, ...>) land in B4 when the per-rank lifecycle
-# goes into the runner.
+# The real wire-event ring instantiations are below (Phase A5); the
+# per-rank lifecycle that allocates them lands in B4.
 ShmRingU64x1024 = (
     _C.ShmRingU64x1024 if _C is not None else _missing_extension
+)
+
+# Real wire-event ShmRing instantiations (Phase A5). Capacities chosen
+# per the design doc's per-rank throughput estimates:
+#   WriteEvent     × 16384 ≈ 9.5MB region per rank (5.7MB/s at 2M tok/s)
+#   QueryEvent     × 16384 ≈ 9MB
+#   ReplayOutcome  × 8192  ≈ 770KB (640KB/s replay traffic)
+# All powers of 2 to satisfy SpscRing's mask-based-modulo static_assert.
+# Each class accepts/returns Python dicts whose keys match the non-pad
+# fields of the corresponding wire-event struct in src/wire_events.h.
+ShmRingWriteEvent = (
+    _C.ShmRingWriteEvent if _C is not None else _missing_extension
+)
+ShmRingQueryEvent = (
+    _C.ShmRingQueryEvent if _C is not None else _missing_extension
+)
+ShmRingReplayOutcome = (
+    _C.ShmRingReplayOutcome if _C is not None else _missing_extension
 )
 
 __all__ = [
@@ -77,4 +93,7 @@ __all__ = [
     "SpscRingU64x1024",
     "PosixShm",
     "ShmRingU64x1024",
+    "ShmRingWriteEvent",
+    "ShmRingQueryEvent",
+    "ShmRingReplayOutcome",
 ]

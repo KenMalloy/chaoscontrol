@@ -174,10 +174,233 @@ using TestRing = SpscRing<uint64_t, 1024>;
 // (tests/test_shm_ring.py). Same TestRing payload/capacity as A2 but
 // with the SPSC state placed in POSIX shared memory so a fork()'d
 // child can attach by name. Real wire-event ring instantiations
-// (ShmRing<WriteEvent, ...>, ShmRing<QueryEvent, ...>,
-// ShmRing<ReplayOutcome, ...>) land in B4 when the per-rank lifecycle
-// goes into the runner.
+// (below, A5) ride per-rank rings allocated by the runner in B4.
 using TestShmRing = ShmRing<uint64_t, 1024>;
+
+// === Phase A5: real wire-event ShmRing instantiations ===
+//
+// Capacities are chosen per the design doc's per-rank throughput
+// estimates: 16384 slots gives ~9.5MB region for write_ring (5.7MB/s
+// traffic at 2M tok/s), 16384 for query_ring (~9MB), and 8192 for
+// replay_outcome_ring (~770KB at 640KB/s replay traffic). All powers
+// of 2 to satisfy SpscRing's mask-based-modulo static_assert.
+using ShmRingWriteEventT = ShmRing<WriteEvent, 16384>;
+using ShmRingQueryEventT = ShmRing<QueryEvent, 16384>;
+using ShmRingReplayOutcomeT = ShmRing<ReplayOutcome, 8192>;
+
+namespace {
+
+// Strict-key dict validator. Raises Python KeyError on extra or missing
+// keys — callers can't accidentally rely on a zero-initialized field
+// by omitting it, and a typo in a field name fails fast rather than
+// silently overwriting an unrelated field. Single helper for all three
+// event types (the key set is the only difference).
+void check_dict_keys(const pybind11::dict& d,
+                     const char* const* keys,
+                     std::size_t key_count,
+                     const char* event_name) {
+  // Missing key check.
+  for (std::size_t i = 0; i < key_count; ++i) {
+    if (!d.contains(keys[i])) {
+      throw pybind11::key_error(
+          std::string(event_name) + " dict missing required key '" +
+          keys[i] + "'");
+    }
+  }
+  // Extra key check — len(d) == key_count combined with the missing
+  // check above implies the key sets match exactly.
+  if (d.size() != key_count) {
+    // Find the offending key for a clear error message.
+    for (auto item : d) {
+      const std::string k = pybind11::str(item.first);
+      bool found = false;
+      for (std::size_t i = 0; i < key_count; ++i) {
+        if (k == keys[i]) { found = true; break; }
+      }
+      if (!found) {
+        throw pybind11::key_error(
+            std::string(event_name) + " dict has unexpected key '" +
+            k + "'");
+      }
+    }
+  }
+}
+
+// Copy a Python sequence of length `n` into a uint16_t array. Used by
+// WriteEvent.key_rep / value_tok_ids and QueryEvent.query_rep. Raises
+// ValueError on length mismatch (programmer error, not silent
+// truncation) and propagates pybind11's TypeError on non-integer items.
+void copy_u16_array(const pybind11::handle& seq,
+                    uint16_t* dst,
+                    std::size_t n,
+                    const char* field_name) {
+  auto pyseq = pybind11::reinterpret_borrow<pybind11::sequence>(seq);
+  if (static_cast<std::size_t>(pybind11::len(pyseq)) != n) {
+    throw pybind11::value_error(
+        std::string("field '") + field_name + "' must have length " +
+        std::to_string(n) + ", got " + std::to_string(pybind11::len(pyseq)));
+  }
+  for (std::size_t i = 0; i < n; ++i) {
+    dst[i] = pyseq[i].cast<uint16_t>();
+  }
+}
+
+// Reverse direction — uint16_t array → Python list of ints.
+pybind11::list u16_array_to_list(const uint16_t* src, std::size_t n) {
+  pybind11::list out(n);
+  for (std::size_t i = 0; i < n; ++i) {
+    out[i] = pybind11::int_(src[i]);
+  }
+  return out;
+}
+
+// --- WriteEvent dict <-> struct ---
+constexpr const char* kWriteEventKeys[] = {
+    "event_type", "source_rank", "write_bucket",
+    "candidate_id", "gpu_step", "key_fp",
+    "key_rep", "value_tok_ids", "value_anchor_id",
+    "pressure_at_write", "pre_write_ce",
+};
+constexpr std::size_t kWriteEventKeyCount =
+    sizeof(kWriteEventKeys) / sizeof(kWriteEventKeys[0]);
+
+WriteEvent dict_to_write_event(const pybind11::dict& d) {
+  check_dict_keys(d, kWriteEventKeys, kWriteEventKeyCount, "WriteEvent");
+  WriteEvent ev{};
+  ev.event_type        = d["event_type"].cast<uint8_t>();
+  ev.source_rank       = d["source_rank"].cast<uint8_t>();
+  ev.write_bucket      = d["write_bucket"].cast<uint8_t>();
+  ev.candidate_id      = d["candidate_id"].cast<uint64_t>();
+  ev.gpu_step          = d["gpu_step"].cast<uint64_t>();
+  ev.key_fp            = d["key_fp"].cast<uint64_t>();
+  copy_u16_array(d["key_rep"], ev.key_rep, KEY_REP_DIM_DEFAULT, "key_rep");
+  copy_u16_array(d["value_tok_ids"], ev.value_tok_ids,
+                 SPAN_LENGTH_DEFAULT, "value_tok_ids");
+  ev.value_anchor_id   = d["value_anchor_id"].cast<uint32_t>();
+  ev.pressure_at_write = d["pressure_at_write"].cast<float>();
+  ev.pre_write_ce      = d["pre_write_ce"].cast<float>();
+  return ev;
+}
+
+pybind11::dict write_event_to_dict(const WriteEvent& ev) {
+  pybind11::dict d;
+  d["event_type"]        = pybind11::int_(ev.event_type);
+  d["source_rank"]       = pybind11::int_(ev.source_rank);
+  d["write_bucket"]      = pybind11::int_(ev.write_bucket);
+  d["candidate_id"]      = pybind11::int_(ev.candidate_id);
+  d["gpu_step"]          = pybind11::int_(ev.gpu_step);
+  d["key_fp"]            = pybind11::int_(ev.key_fp);
+  d["key_rep"]           = u16_array_to_list(ev.key_rep, KEY_REP_DIM_DEFAULT);
+  d["value_tok_ids"]     = u16_array_to_list(ev.value_tok_ids, SPAN_LENGTH_DEFAULT);
+  d["value_anchor_id"]   = pybind11::int_(ev.value_anchor_id);
+  d["pressure_at_write"] = pybind11::float_(ev.pressure_at_write);
+  d["pre_write_ce"]      = pybind11::float_(ev.pre_write_ce);
+  return d;
+}
+
+// --- QueryEvent dict <-> struct ---
+constexpr const char* kQueryEventKeys[] = {
+    "event_type", "source_rank", "bucket",
+    "query_id", "gpu_step", "query_rep",
+    "pressure", "pre_query_ce",
+};
+constexpr std::size_t kQueryEventKeyCount =
+    sizeof(kQueryEventKeys) / sizeof(kQueryEventKeys[0]);
+
+QueryEvent dict_to_query_event(const pybind11::dict& d) {
+  check_dict_keys(d, kQueryEventKeys, kQueryEventKeyCount, "QueryEvent");
+  QueryEvent ev{};
+  ev.event_type   = d["event_type"].cast<uint8_t>();
+  ev.source_rank  = d["source_rank"].cast<uint8_t>();
+  ev.bucket       = d["bucket"].cast<uint8_t>();
+  ev.query_id     = d["query_id"].cast<uint64_t>();
+  ev.gpu_step     = d["gpu_step"].cast<uint64_t>();
+  copy_u16_array(d["query_rep"], ev.query_rep, KEY_REP_DIM_DEFAULT, "query_rep");
+  ev.pressure     = d["pressure"].cast<float>();
+  ev.pre_query_ce = d["pre_query_ce"].cast<float>();
+  return ev;
+}
+
+pybind11::dict query_event_to_dict(const QueryEvent& ev) {
+  pybind11::dict d;
+  d["event_type"]   = pybind11::int_(ev.event_type);
+  d["source_rank"]  = pybind11::int_(ev.source_rank);
+  d["bucket"]       = pybind11::int_(ev.bucket);
+  d["query_id"]     = pybind11::int_(ev.query_id);
+  d["gpu_step"]     = pybind11::int_(ev.gpu_step);
+  d["query_rep"]    = u16_array_to_list(ev.query_rep, KEY_REP_DIM_DEFAULT);
+  d["pressure"]     = pybind11::float_(ev.pressure);
+  d["pre_query_ce"] = pybind11::float_(ev.pre_query_ce);
+  return d;
+}
+
+// --- ReplayOutcome dict <-> struct ---
+constexpr const char* kReplayOutcomeKeys[] = {
+    "event_type", "selected_rank", "outcome_status",
+    "replay_id", "gpu_step", "query_event_id", "source_write_id",
+    "slot_id", "policy_version", "selection_step",
+    "teacher_score", "controller_logit",
+    "ce_before_replay", "ce_after_replay", "ce_delta_raw",
+    "bucket_baseline", "reward_shaped",
+    "grad_cos_rare", "grad_cos_total",
+    "flags",
+};
+constexpr std::size_t kReplayOutcomeKeyCount =
+    sizeof(kReplayOutcomeKeys) / sizeof(kReplayOutcomeKeys[0]);
+
+ReplayOutcome dict_to_replay_outcome(const pybind11::dict& d) {
+  check_dict_keys(d, kReplayOutcomeKeys, kReplayOutcomeKeyCount,
+                  "ReplayOutcome");
+  ReplayOutcome ev{};
+  ev.event_type       = d["event_type"].cast<uint8_t>();
+  ev.selected_rank    = d["selected_rank"].cast<uint8_t>();
+  ev.outcome_status   = d["outcome_status"].cast<uint8_t>();
+  ev.replay_id        = d["replay_id"].cast<uint64_t>();
+  ev.gpu_step         = d["gpu_step"].cast<uint64_t>();
+  ev.query_event_id   = d["query_event_id"].cast<uint64_t>();
+  ev.source_write_id  = d["source_write_id"].cast<uint64_t>();
+  ev.slot_id          = d["slot_id"].cast<uint32_t>();
+  ev.policy_version   = d["policy_version"].cast<uint32_t>();
+  ev.selection_step   = d["selection_step"].cast<uint64_t>();
+  ev.teacher_score    = d["teacher_score"].cast<float>();
+  ev.controller_logit = d["controller_logit"].cast<float>();
+  ev.ce_before_replay = d["ce_before_replay"].cast<float>();
+  ev.ce_after_replay  = d["ce_after_replay"].cast<float>();
+  ev.ce_delta_raw     = d["ce_delta_raw"].cast<float>();
+  ev.bucket_baseline  = d["bucket_baseline"].cast<float>();
+  ev.reward_shaped    = d["reward_shaped"].cast<float>();
+  ev.grad_cos_rare    = d["grad_cos_rare"].cast<float>();
+  ev.grad_cos_total   = d["grad_cos_total"].cast<float>();
+  ev.flags            = d["flags"].cast<uint16_t>();
+  return ev;
+}
+
+pybind11::dict replay_outcome_to_dict(const ReplayOutcome& ev) {
+  pybind11::dict d;
+  d["event_type"]       = pybind11::int_(ev.event_type);
+  d["selected_rank"]    = pybind11::int_(ev.selected_rank);
+  d["outcome_status"]   = pybind11::int_(ev.outcome_status);
+  d["replay_id"]        = pybind11::int_(ev.replay_id);
+  d["gpu_step"]         = pybind11::int_(ev.gpu_step);
+  d["query_event_id"]   = pybind11::int_(ev.query_event_id);
+  d["source_write_id"]  = pybind11::int_(ev.source_write_id);
+  d["slot_id"]          = pybind11::int_(ev.slot_id);
+  d["policy_version"]   = pybind11::int_(ev.policy_version);
+  d["selection_step"]   = pybind11::int_(ev.selection_step);
+  d["teacher_score"]    = pybind11::float_(ev.teacher_score);
+  d["controller_logit"] = pybind11::float_(ev.controller_logit);
+  d["ce_before_replay"] = pybind11::float_(ev.ce_before_replay);
+  d["ce_after_replay"]  = pybind11::float_(ev.ce_after_replay);
+  d["ce_delta_raw"]     = pybind11::float_(ev.ce_delta_raw);
+  d["bucket_baseline"]  = pybind11::float_(ev.bucket_baseline);
+  d["reward_shaped"]    = pybind11::float_(ev.reward_shaped);
+  d["grad_cos_rare"]    = pybind11::float_(ev.grad_cos_rare);
+  d["grad_cos_total"]   = pybind11::float_(ev.grad_cos_total);
+  d["flags"]            = pybind11::int_(ev.flags);
+  return d;
+}
+
+}  // namespace
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("forward_step", &forward_step, "CPU SSM controller reference step");
@@ -283,4 +506,127 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           [](pybind11::object) { return TestShmRing::REGION_BYTES; },
           "Static byte size of the underlying SpscRing<T, Capacity> — "
           "the shm region size required by `create` / `attach`.");
+
+  // === Phase A5 — real wire-event ShmRing instantiations ===
+  //
+  // Each binding mirrors the A4 ShmRingU64x1024 surface but accepts /
+  // returns Python dicts whose keys match the non-pad fields of the
+  // corresponding wire-event struct. dict_to_*_event / *_to_dict
+  // helpers above do the field-by-field copy and validate the key set
+  // so a typo or omission fails fast with KeyError.
+
+  pybind11::class_<ShmRingWriteEventT>(m, "ShmRingWriteEvent")
+      .def_static("create", &ShmRingWriteEventT::create, pybind11::arg("name"),
+                  "Creator-side factory — allocates an ~9.5MB shm region "
+                  "(REGION_BYTES) and placement-news the SpscRing<WriteEvent, "
+                  "16384> into it.")
+      .def_static("attach", &ShmRingWriteEventT::attach, pybind11::arg("name"),
+                  "Attacher-side factory — mmap an existing region created "
+                  "by ShmRingWriteEvent.create.")
+      .def("push",
+           [](ShmRingWriteEventT& self, const pybind11::dict& d) {
+             return self.push(dict_to_write_event(d));
+           },
+           pybind11::arg("event"),
+           "Push a WriteEvent dict; returns False if the ring is full. "
+           "Raises KeyError on missing/extra keys.")
+      .def("pop",
+           [](ShmRingWriteEventT& self) -> pybind11::object {
+             auto opt = self.pop();
+             if (!opt.has_value()) {
+               return pybind11::none();
+             }
+             return write_event_to_dict(*opt);
+           },
+           "Pop a WriteEvent; returns a dict, or None if the ring is empty.")
+      .def("size", &ShmRingWriteEventT::size,
+           "Approximate occupied-slot count.")
+      .def("name", &ShmRingWriteEventT::name,
+           "POSIX shm name (the '/'-prefixed region name).")
+      .def_static("unlink", &ShmRingWriteEventT::unlink, pybind11::arg("name"),
+                  "Remove the name from the kernel namespace.")
+      .def_property_readonly_static(
+          "capacity",
+          [](pybind11::object) { return ShmRingWriteEventT::capacity(); },
+          "Compile-time capacity (16384).")
+      .def_property_readonly_static(
+          "REGION_BYTES",
+          [](pybind11::object) { return ShmRingWriteEventT::REGION_BYTES; },
+          "Static byte size of SpscRing<WriteEvent, 16384>.");
+
+  pybind11::class_<ShmRingQueryEventT>(m, "ShmRingQueryEvent")
+      .def_static("create", &ShmRingQueryEventT::create, pybind11::arg("name"),
+                  "Creator-side factory — allocates an ~9MB shm region "
+                  "(REGION_BYTES) and placement-news the SpscRing<QueryEvent, "
+                  "16384> into it.")
+      .def_static("attach", &ShmRingQueryEventT::attach, pybind11::arg("name"),
+                  "Attacher-side factory — mmap an existing region.")
+      .def("push",
+           [](ShmRingQueryEventT& self, const pybind11::dict& d) {
+             return self.push(dict_to_query_event(d));
+           },
+           pybind11::arg("event"),
+           "Push a QueryEvent dict; returns False if full. "
+           "Raises KeyError on missing/extra keys.")
+      .def("pop",
+           [](ShmRingQueryEventT& self) -> pybind11::object {
+             auto opt = self.pop();
+             if (!opt.has_value()) {
+               return pybind11::none();
+             }
+             return query_event_to_dict(*opt);
+           },
+           "Pop a QueryEvent; returns a dict, or None if empty.")
+      .def("size", &ShmRingQueryEventT::size,
+           "Approximate occupied-slot count.")
+      .def("name", &ShmRingQueryEventT::name,
+           "POSIX shm name.")
+      .def_static("unlink", &ShmRingQueryEventT::unlink, pybind11::arg("name"),
+                  "Remove the name from the kernel namespace.")
+      .def_property_readonly_static(
+          "capacity",
+          [](pybind11::object) { return ShmRingQueryEventT::capacity(); },
+          "Compile-time capacity (16384).")
+      .def_property_readonly_static(
+          "REGION_BYTES",
+          [](pybind11::object) { return ShmRingQueryEventT::REGION_BYTES; },
+          "Static byte size of SpscRing<QueryEvent, 16384>.");
+
+  pybind11::class_<ShmRingReplayOutcomeT>(m, "ShmRingReplayOutcome")
+      .def_static("create", &ShmRingReplayOutcomeT::create, pybind11::arg("name"),
+                  "Creator-side factory — allocates a ~770KB shm region "
+                  "(REGION_BYTES) and placement-news the SpscRing<ReplayOutcome, "
+                  "8192> into it.")
+      .def_static("attach", &ShmRingReplayOutcomeT::attach, pybind11::arg("name"),
+                  "Attacher-side factory — mmap an existing region.")
+      .def("push",
+           [](ShmRingReplayOutcomeT& self, const pybind11::dict& d) {
+             return self.push(dict_to_replay_outcome(d));
+           },
+           pybind11::arg("event"),
+           "Push a ReplayOutcome dict; returns False if full. "
+           "Raises KeyError on missing/extra keys.")
+      .def("pop",
+           [](ShmRingReplayOutcomeT& self) -> pybind11::object {
+             auto opt = self.pop();
+             if (!opt.has_value()) {
+               return pybind11::none();
+             }
+             return replay_outcome_to_dict(*opt);
+           },
+           "Pop a ReplayOutcome; returns a dict, or None if empty.")
+      .def("size", &ShmRingReplayOutcomeT::size,
+           "Approximate occupied-slot count.")
+      .def("name", &ShmRingReplayOutcomeT::name,
+           "POSIX shm name.")
+      .def_static("unlink", &ShmRingReplayOutcomeT::unlink, pybind11::arg("name"),
+                  "Remove the name from the kernel namespace.")
+      .def_property_readonly_static(
+          "capacity",
+          [](pybind11::object) { return ShmRingReplayOutcomeT::capacity(); },
+          "Compile-time capacity (8192).")
+      .def_property_readonly_static(
+          "REGION_BYTES",
+          [](pybind11::object) { return ShmRingReplayOutcomeT::REGION_BYTES; },
+          "Static byte size of SpscRing<ReplayOutcome, 8192>.");
 }
