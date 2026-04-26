@@ -1102,3 +1102,279 @@ def test_summarize_result_dir_merges_val_bpb(tmp_path):
     assert [row["name"] for row in summary["ranked"]] == ["slow_best", "fast_worse"]
     assert [row["val_bpb"] for row in summary["ranked"]] == [1.10, 1.20]
     assert [row["val_docs_scored"] for row in summary["ranked"]] == [50000, 50000]
+
+
+def test_episodic_ttt_v1_matrix_shape():
+    """Phase 3 TTT-shaped falsifier matrix: 4 arms x 3 seeds.
+
+    Supersedes the training-only ``build_episodic_dw_curation_v1_matrix``
+    after the architecture pivot — the cache must be live at eval too,
+    not just during training. Per the W-task spec the four arms are::
+
+      Arm | Train side                | Eval side
+      ----|---------------------------|------------------------------
+      A   | Standard (no cache)       | No TTT, no cache (SOTA shape)
+      B   | Cache-curated DW          | TTT with loaded cache (the bet)
+      C   | Cache-curated DW          | No TTT (cache vs TTT control)
+      D   | Standard (no cache)       | TTT, fresh empty cache
+
+    Topology-locking: the train-side knobs (fast/slow, dreamworld replay
+    knobs, world_size, budget) are identical within each train-side
+    half (A=D, B=C). The eval-side knobs (eval_episodic_cache_enabled,
+    eval_steps_per_chunk, eval_adapt_set) similarly share the same
+    eval shape within each eval-side half (A=C, B=D).
+
+    NOTE: the eval-side fields are RECORDED ON THE MATRIX ENTRY but
+    cannot today be plumbed into ``run_exp20_fast_score.py`` (the path
+    used by run_exp24's ``--full-val-score``). Wiring them through is a
+    separate task; this matrix encodes the intent so downstream analysis
+    can attribute outcomes correctly.
+    """
+    mod = _load_exp24()
+
+    entries = mod.build_episodic_ttt_v1_matrix(
+        speed_config={"batch_size": 1024, "chunk_size": 64},
+        world_size=4,
+        budget_seconds=600.0,
+    )
+
+    assert len(entries) == 12
+    assert {entry["seed"] for entry in entries} == {1337, 2674, 4011}
+
+    expected_arms = (
+        "arm_a_no_cache_no_ttt",
+        "arm_b_cache_train_ttt_with_cache",
+        "arm_c_cache_train_no_ttt",
+        "arm_d_no_cache_train_ttt_only",
+    )
+    expected_names = {
+        f"exp24_phase3_episodic_ttt_v1_{arm}_s{seed}"
+        for arm in expected_arms
+        for seed in (1337, 2674, 4011)
+    }
+    assert {entry["name"] for entry in entries} == expected_names
+
+    by_arm: dict[str, list[dict]] = {arm: [] for arm in expected_arms}
+    for entry in entries:
+        suffix = entry["name"].split("episodic_ttt_v1_", 1)[1]
+        arm_tag = suffix.rsplit("_s", 1)[0]
+        by_arm[arm_tag].append(entry)
+    assert all(len(rows) == 3 for rows in by_arm.values())
+
+    # ---- shared topology across ALL arms ----
+    for entry in entries:
+        assert entry["exp24_phase"] == "phase3"
+        assert entry["exp24_mechanism"] == "episodic_ttt_v1"
+        assert entry["world_size"] == 4
+        assert entry["budget_seconds"] == 600.0
+        assert entry["artifact_impact"] == "artifact_training_only"
+        # Locked fast/slow recipe (shared with phase0_fastslow_only_control
+        # — Arm A is the SOTA control, must mirror this).
+        assert entry["fast_slow_enabled"] is True
+        assert entry["fast_slow_interval"] == 64
+        assert entry["fast_slow_alpha"] == 0.25
+        assert entry["fast_slow_eval_copy"] == "slow"
+
+    # ---- train-side topology halves: A==D (no cache), B==C (cache) ----
+    for entry in by_arm["arm_a_no_cache_no_ttt"]:
+        # Standard training: dreamworld OFF, episodic OFF. Mirrors
+        # phase0_fastslow_only_control exactly so Arm A is a true SOTA
+        # control vs Arm B's cache-train treatment.
+        assert entry["dreamworld_enabled"] is False
+        assert entry["dreamworld_weight"] == 0.0
+        assert entry.get("episodic_enabled", False) is False
+
+    for entry in by_arm["arm_d_no_cache_train_ttt_only"]:
+        # Same train-side as Arm A — only eval differs.
+        assert entry["dreamworld_enabled"] is False
+        assert entry["dreamworld_weight"] == 0.0
+        assert entry.get("episodic_enabled", False) is False
+
+    for entry in by_arm["arm_b_cache_train_ttt_with_cache"]:
+        # Cache-curated DW training (mirrors arm_b_cosine_utility from
+        # the deprecated v1 matrix).
+        assert entry["dreamworld_enabled"] is True
+        assert entry["episodic_enabled"] is True
+        assert entry["controller_query_enabled"] is True
+        assert entry["controller_query_mode"] == "cosine_utility_weighted"
+        assert entry["dreamworld_weight"] == 0.10
+        assert entry["dreamworld_cache_interval"] == 16
+        assert entry["dreamworld_interval"] == 16
+        assert entry["dreamworld_replay_batch_size"] == 128
+        assert entry["dreamworld_prefix_tokens"] == 128
+        assert entry["dreamworld_replay_tokens"] == 64
+        assert entry["dreamworld_buffer_size"] == 16
+        assert entry["dreamworld_min_size"] == 2
+        assert entry["dreamworld_max_age_steps"] == 256
+
+    for entry in by_arm["arm_c_cache_train_no_ttt"]:
+        # Same train-side as Arm B — only eval differs.
+        assert entry["dreamworld_enabled"] is True
+        assert entry["episodic_enabled"] is True
+        assert entry["controller_query_enabled"] is True
+        assert entry["controller_query_mode"] == "cosine_utility_weighted"
+        assert entry["dreamworld_weight"] == 0.10
+        assert entry["dreamworld_cache_interval"] == 16
+        assert entry["dreamworld_interval"] == 16
+        assert entry["dreamworld_replay_batch_size"] == 128
+        assert entry["dreamworld_prefix_tokens"] == 128
+        assert entry["dreamworld_replay_tokens"] == 64
+        assert entry["dreamworld_buffer_size"] == 16
+        assert entry["dreamworld_min_size"] == 2
+        assert entry["dreamworld_max_age_steps"] == 256
+
+    # ---- eval-side topology halves: A==C (no TTT), B==D (TTT) ----
+    for entry in by_arm["arm_a_no_cache_no_ttt"]:
+        # No TTT, no cache.
+        assert entry["eval_episodic_cache_enabled"] is False
+        assert entry["eval_steps_per_chunk"] == 0
+        assert entry["eval_adapt_set"] == "none"
+        assert entry["eval_episodic_cache_reset_per_doc"] is False
+
+    for entry in by_arm["arm_c_cache_train_no_ttt"]:
+        # Same eval shape as Arm A — score-only, no cache load at eval.
+        assert entry["eval_episodic_cache_enabled"] is False
+        assert entry["eval_steps_per_chunk"] == 0
+        assert entry["eval_adapt_set"] == "none"
+        assert entry["eval_episodic_cache_reset_per_doc"] is False
+
+    for entry in by_arm["arm_b_cache_train_ttt_with_cache"]:
+        # TTT with the trained cache loaded.
+        assert entry["eval_episodic_cache_enabled"] is True
+        assert entry["eval_steps_per_chunk"] == 1
+        assert entry["eval_adapt_set"] == "lm_head"
+        assert entry["eval_episodic_cache_reset_per_doc"] is False
+
+    for entry in by_arm["arm_d_no_cache_train_ttt_only"]:
+        # Same eval shape as Arm B (TTT enabled), but the checkpoint
+        # has no cache so the driver constructs a fresh empty one.
+        assert entry["eval_episodic_cache_enabled"] is True
+        assert entry["eval_steps_per_chunk"] == 1
+        assert entry["eval_adapt_set"] == "lm_head"
+        assert entry["eval_episodic_cache_reset_per_doc"] is False
+
+
+def test_episodic_ttt_v1_matrix_arm_a_matches_fastslow_only_control():
+    """Arm A is the SOTA control — train-side fields must reproduce
+    ``phase0_fastslow_only_control`` exactly so Arm A vs Arm B isolates the
+    cache mechanism from any other train-side change.
+    """
+    mod = _load_exp24()
+
+    ttt = mod.build_episodic_ttt_v1_matrix(
+        speed_config={"batch_size": 1024, "chunk_size": 64},
+        world_size=4,
+        budget_seconds=600.0,
+    )
+    fastslow = mod.build_phase0_fastslow_only_control(
+        speed_config={"batch_size": 1024, "chunk_size": 64},
+        world_size=4,
+        budget_seconds=600.0,
+    )
+    arm_a = [e for e in ttt if "arm_a_no_cache_no_ttt" in e["name"]]
+    # Must have all 3 seeds.
+    assert len(arm_a) == len(fastslow) == 3
+
+    # Pin the train-side topology fields one-by-one. Eval-side fields and
+    # naming differ — exclude those when matching against the control.
+    train_side_fields = (
+        "world_size", "budget_seconds", "artifact_impact",
+        "fast_slow_enabled", "fast_slow_interval", "fast_slow_alpha",
+        "fast_slow_eval_copy",
+        "dreamworld_enabled", "dreamworld_cache_interval",
+        "dreamworld_interval", "dreamworld_weight",
+        "dreamworld_replay_batch_size",
+        "dreamworld_prefix_tokens", "dreamworld_replay_tokens",
+        "dreamworld_buffer_size", "dreamworld_min_size",
+        "dreamworld_max_age_steps",
+    )
+    arm_a_by_seed = {entry["seed"]: entry for entry in arm_a}
+    fastslow_by_seed = {entry["seed"]: entry for entry in fastslow}
+    assert set(arm_a_by_seed.keys()) == set(fastslow_by_seed.keys())
+    for seed, entry in arm_a_by_seed.items():
+        ref = fastslow_by_seed[seed]
+        for field_name in train_side_fields:
+            assert entry[field_name] == ref[field_name], (
+                f"Arm A field {field_name!r} (seed={seed}) diverges from "
+                f"phase0_fastslow_only_control: {entry[field_name]!r} != "
+                f"{ref[field_name]!r}"
+            )
+
+
+def test_episodic_ttt_v1_matrix_supports_arms_filter_for_sigma_escalation():
+    """Decision 0.5 escalation pattern: re-invoke the builder with a custom
+    seed list and an arm filter to escalate signal-to-noise on the cache
+    treatment without paying for re-running the SOTA controls.
+    """
+    mod = _load_exp24()
+
+    extra_all = mod.build_episodic_ttt_v1_matrix(
+        speed_config={"batch_size": 1024, "chunk_size": 64},
+        world_size=4,
+        budget_seconds=600.0,
+        seed_values=[5012, 7331, 9183],
+    )
+    assert len(extra_all) == 12
+    assert {entry["seed"] for entry in extra_all} == {5012, 7331, 9183}
+
+    # Escalate the cache-vs-no-cache contrast: Arms A, B, D only.
+    escalated = mod.build_episodic_ttt_v1_matrix(
+        speed_config={"batch_size": 1024, "chunk_size": 64},
+        world_size=4,
+        budget_seconds=600.0,
+        seed_values=[5012, 7331, 9183],
+        arms=("arm_a_no_cache_no_ttt", "arm_b_cache_train_ttt_with_cache",
+              "arm_d_no_cache_train_ttt_only"),
+    )
+    assert len(escalated) == 9
+    assert all("arm_c_cache_train_no_ttt" not in e["name"] for e in escalated)
+
+
+def test_episodic_ttt_v1_matrix_rejects_unknown_arm_name():
+    """Typo defense: passing an arm name not in the canonical four raises
+    ValueError with the allowed names listed.
+    """
+    mod = _load_exp24()
+
+    try:
+        mod.build_episodic_ttt_v1_matrix(
+            speed_config={"batch_size": 1024, "chunk_size": 64},
+            world_size=4,
+            budget_seconds=600.0,
+            arms=("arm_b_cache_train_ttt_with_cache", "arm_typo"),
+        )
+    except ValueError as exc:
+        assert "arm_typo" in str(exc)
+        assert "arm_a_no_cache_no_ttt" in str(exc)
+    else:
+        raise AssertionError("expected ValueError for unknown arm name")
+
+
+def test_run_exp24_cli_episodic_ttt_v1_dry_run(tmp_path):
+    """The CLI must accept ``--matrix episodic_ttt_v1`` and dispatch to
+    the new builder with the right default world_size (4)."""
+    script = REPO / "experiments" / "24_training_time_bundle" / "run_exp24.py"
+    output_dir = tmp_path / "exp24-episodic-ttt-v1-dryrun"
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(script),
+            "--matrix",
+            "episodic_ttt_v1",
+            "--dry-run",
+            "--limit",
+            "4",
+            "--output-dir",
+            str(output_dir),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    stdout = result.stdout
+    assert "matrix=episodic_ttt_v1" in stdout
+    assert "world_size=4" in stdout
+    assert "exp24_phase3_episodic_ttt_v1_arm_a_no_cache_no_ttt_s1337" in stdout
+    assert "exp24_phase3_episodic_ttt_v1_arm_b_cache_train_ttt_with_cache_s1337" in stdout
+    assert '"exp24_mechanism": "episodic_ttt_v1"' in stdout

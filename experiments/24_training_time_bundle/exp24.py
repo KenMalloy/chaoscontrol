@@ -754,7 +754,14 @@ def build_episodic_dw_curation_v1_matrix(
     seed_values: Sequence[int] = DEFAULT_CONTROL_SEEDS,
     arms: Sequence[str] | None = None,
 ) -> list[dict[str, Any]]:
-    """Phase 3 falsifier matrix for ``episodic_dw_curation_v1``.
+    """[DEPRECATED] Training-only Phase 3 falsifier matrix.
+
+    Superseded by ``build_episodic_ttt_v1_matrix`` (the TTT-shaped successor
+    after the architecture pivot — the cache must be live at eval time, not
+    only during training). Kept available so deprecated runs remain
+    reproducible; new work should target the TTT matrix.
+
+    Phase 3 falsifier matrix for ``episodic_dw_curation_v1``.
 
     Four arms x N seeds. **All four arms are topologically identical**: 3+1
     rank layout (``world_size=4``), episodic rank present, same all-reduce
@@ -888,6 +895,177 @@ def build_episodic_dw_curation_v1_matrix(
                     phase="phase3",
                     mechanism="episodic_dw_curation_v1",
                     arm=f"episodic_dw_curation_v1_{arm_name}",
+                    seed=int(seed),
+                )
+            )
+    return entries
+
+
+EPISODIC_TTT_V1_ARMS: tuple[str, ...] = (
+    "arm_a_no_cache_no_ttt",
+    "arm_b_cache_train_ttt_with_cache",
+    "arm_c_cache_train_no_ttt",
+    "arm_d_no_cache_train_ttt_only",
+)
+
+
+def build_episodic_ttt_v1_matrix(
+    *,
+    speed_config: dict[str, Any],
+    world_size: int = 4,
+    budget_seconds: float = 600.0,
+    seed_values: Sequence[int] = DEFAULT_CONTROL_SEEDS,
+    arms: Sequence[str] | None = None,
+) -> list[dict[str, Any]]:
+    """Phase 3 TTT-shaped falsifier matrix for the memory-aware optimizer.
+
+    Supersedes ``build_episodic_dw_curation_v1_matrix`` after the
+    architecture pivot — the cache must be live at eval time too, not
+    only during training. Four-arm 2x2 over (train_uses_cache,
+    eval_uses_cache+TTT)::
+
+      Arm | Train side                | Eval side
+      ----|---------------------------|------------------------------
+      A   | Standard (no cache)       | No TTT, no cache (SOTA shape)
+      B   | Cache-curated DW          | TTT with loaded cache (the bet)
+      C   | Cache-curated DW          | No TTT (cache vs TTT control)
+      D   | Standard (no cache)       | TTT, fresh empty cache
+
+    Topology-locking discipline within each axis:
+      - Train-side: A and D share the SOTA control train shape (mirrors
+        ``phase0_fastslow_only_control``); B and C share the cache-curated
+        DW train shape with locked Dreamworld replay knobs.
+      - Eval-side: A and C share the score-only / no-TTT eval shape; B
+        and D share the cache-aware TTT eval shape (1 step per chunk on
+        the lm_head adapt set).
+      - Across all arms: same world_size, budget_seconds, fast/slow
+        recipe (interval=64, alpha=0.25, eval_copy=slow), seeds.
+
+    The eval-side fields are RECORDED on the matrix entry for downstream
+    analysis but are not yet plumbed into ``run_exp20_fast_score.py`` (the
+    path used by ``run_exp24 --full-val-score``). Wiring them through is
+    a separate task. ``run_exp20_eval.py`` already consumes them via
+    ``RunConfig.episodic_cache_enabled`` and friends.
+
+    NOTE: Arm B's ``loaded cache`` path requires the trainer to serialize
+    ``ckpt['episodic_cache']`` alongside the model weights — until that
+    save path lands, Arm B falls back to the fresh-cache path and reduces
+    to Arm D. That's a falsifier failure (or a downstream wiring task),
+    not a code bug in this builder. The matrix encodes the intended
+    contrast; the trainer pivot lands separately.
+
+    Per Decision 0.5 (memory-aware-optimizer-plan): if the σ rule fires
+    on the headline contrast, re-invoke this builder with::
+
+        build_episodic_ttt_v1_matrix(
+            speed_config=...,
+            seed_values=(5012, 7331, 9183),
+            arms=("arm_a_no_cache_no_ttt",
+                  "arm_b_cache_train_ttt_with_cache",
+                  "arm_d_no_cache_train_ttt_only"),
+        )
+
+    to escalate. (Arm C, the within-train-side cache-only baseline, is
+    omitted from escalation by convention — the topology-equivalence
+    reading doesn't tighten with extra seeds.)
+    """
+    # Train-side locks shared by Arms B and C — the cache-curated DW shape.
+    # Lifted from build_episodic_dw_curation_v1_matrix's arm_b_cosine_utility
+    # so the new TTT matrix replays the same train recipe; the eval split
+    # is the new axis the architecture pivot introduces.
+    cache_train_dw_lock = {
+        "dreamworld_enabled": True,
+        "dreamworld_cache_interval": 16,
+        "dreamworld_interval": 16,
+        "dreamworld_prefix_tokens": 128,
+        "dreamworld_replay_tokens": 64,
+        "dreamworld_replay_batch_size": 128,
+        "dreamworld_buffer_size": 16,
+        "dreamworld_min_size": 2,
+        "dreamworld_max_age_steps": 256,
+        "episodic_enabled": True,
+        "controller_query_enabled": True,
+        "controller_query_mode": "cosine_utility_weighted",
+        "dreamworld_weight": 0.10,
+    }
+    # Train-side locks shared by Arms A and D — the SOTA control shape.
+    # Mirrors phase0_fastslow_only_control's train-side knobs exactly so
+    # Arm A stands as a true control vs the cache-train treatment.
+    no_cache_train_lock = {
+        "dreamworld_enabled": False,
+        "dreamworld_cache_interval": 0,
+        "dreamworld_interval": 0,
+        "dreamworld_weight": 0.0,
+        "dreamworld_replay_batch_size": 0,
+    }
+    # Locked fast/slow recipe — match phase0_fastslow_only_control.
+    fast_slow_lock = {
+        "fast_slow_enabled": True,
+        "fast_slow_interval": 64,
+        "fast_slow_alpha": 0.25,
+        "fast_slow_eval_copy": "slow",
+    }
+    # Eval-side shapes — A == C share no-TTT, B == D share cache-aware TTT.
+    eval_no_ttt_lock = {
+        "eval_episodic_cache_enabled": False,
+        "eval_steps_per_chunk": 0,
+        "eval_adapt_set": "none",
+        "eval_episodic_cache_reset_per_doc": False,
+    }
+    eval_ttt_with_cache_lock = {
+        "eval_episodic_cache_enabled": True,
+        "eval_steps_per_chunk": 1,
+        "eval_adapt_set": "lm_head",
+        "eval_episodic_cache_reset_per_doc": False,
+    }
+    arm_specs: list[tuple[str, dict[str, Any]]] = [
+        (
+            "arm_a_no_cache_no_ttt",
+            {**no_cache_train_lock, **eval_no_ttt_lock},
+        ),
+        (
+            "arm_b_cache_train_ttt_with_cache",
+            {**cache_train_dw_lock, **eval_ttt_with_cache_lock},
+        ),
+        (
+            "arm_c_cache_train_no_ttt",
+            {**cache_train_dw_lock, **eval_no_ttt_lock},
+        ),
+        (
+            "arm_d_no_cache_train_ttt_only",
+            {**no_cache_train_lock, **eval_ttt_with_cache_lock},
+        ),
+    ]
+    if arms is not None:
+        allowed = set(arms)
+        unknown = allowed - set(EPISODIC_TTT_V1_ARMS)
+        if unknown:
+            raise ValueError(
+                f"unknown arm(s) {sorted(unknown)}; "
+                f"allowed: {EPISODIC_TTT_V1_ARMS}"
+            )
+        arm_specs = [(n, o) for n, o in arm_specs if n in allowed]
+    entries: list[dict[str, Any]] = []
+    for arm_name, arm_overrides in arm_specs:
+        arm = {
+            "exp24_mechanism": "episodic_ttt_v1",
+            "artifact_impact": ARTIFACT_TRAINING_ONLY,
+            **fast_slow_lock,
+            **arm_overrides,
+        }
+        for seed in seed_values:
+            entry = _base_entry(
+                speed_config=speed_config,
+                world_size=world_size,
+                budget_seconds=budget_seconds,
+            )
+            entry.update(arm)
+            entries.append(
+                _named_entry(
+                    base=entry,
+                    phase="phase3",
+                    mechanism="episodic_ttt_v1",
+                    arm=f"episodic_ttt_v1_{arm_name}",
                     seed=int(seed),
                 )
             )
