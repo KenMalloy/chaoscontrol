@@ -83,3 +83,16 @@ class RunConfig:
     # prefers the value carried on the loaded cache payload (the trainer's
     # exact W) and falls back to this cfg field for the fresh-cache path.
     episodic_fingerprint_window: int = 8
+    # Phase B5 reward-signal gate: when True AND
+    # ``episodic_event_log_enabled`` is True, the trainer (and any
+    # eval-time replay path that grows up to mirror it) runs a second
+    # forward on the post-step weights so REPLAY_OUTCOME's
+    # ``ce_before_replay`` / ``ce_after_replay`` /
+    # ``ce_delta_raw`` / ``reward_shaped`` carry finite values that
+    # train Phase C10's online learner. Default False so the cost (one
+    # extra replay-shaped forward per replay) stays opt-in and B3's
+    # bit-identical default holds. The trainer config knob with the same
+    # name in ``runner_fast_path.py`` is the canonical surface; this
+    # field exists so eval-side callers can read the same flag without
+    # rederiving it.
+    episodic_compute_replay_ce_pair: bool = False

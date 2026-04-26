@@ -120,7 +120,13 @@ def _run_replay_drain(mod, *, consumer, model) -> int:
 
 
 def test_replay_outcome_emitted_with_wire_schema_and_reward_fields():
-    """Two tagged replays produce two REPLAY_OUTCOME records in wire order."""
+    """Two tagged replays produce two REPLAY_OUTCOME records in wire order.
+
+    With ``compute_replay_ce_pair`` OFF (B3 default), the reward fields stay
+    NaN — the upstream-supplied ``entry["ce_before_replay"]`` is preserved
+    in the dict but ``ce_after_replay`` is NaN until the post-step pass owns
+    the pair (Phase B5, exercised in ``tests/test_replay_ce_pair.py``).
+    """
     mod = _load_runner()
     torch.manual_seed(7)
     model = _TinyTokenModel()
@@ -181,27 +187,29 @@ def test_replay_outcome_emitted_with_wire_schema_and_reward_fields():
     assert first["selected_rank"] == 0
     assert first["teacher_score"] == pytest.approx(0.75)
     assert first["controller_logit"] == pytest.approx(0.25)
+    # B3 default: entry's ``ce_before_replay`` survives, ``ce_after_replay``
+    # stays NaN until the B5 post-step pair pass lands a real value.
     assert first["ce_before_replay"] == pytest.approx(4.0)
-    assert math.isfinite(first["ce_after_replay"])
-    first_delta = first["ce_before_replay"] - first["ce_after_replay"]
-    assert first["ce_delta_raw"] == pytest.approx(first_delta)
-    assert first["bucket_baseline"] == pytest.approx(0.0)
-    assert first["reward_shaped"] == pytest.approx(first_delta)
+    assert math.isnan(first["ce_after_replay"])
+    assert math.isnan(first["ce_delta_raw"])
+    assert math.isnan(first["reward_shaped"])
     assert math.isnan(first["grad_cos_rare"])
     assert math.isnan(first["grad_cos_total"])
     assert first["outcome_status"] == 0
     assert first["flags"] == 0
 
-    second_delta = second["ce_before_replay"] - second["ce_after_replay"]
-    assert second["ce_delta_raw"] == pytest.approx(second_delta)
-    assert second["bucket_baseline"] == pytest.approx(0.05 * first_delta)
-    assert second["reward_shaped"] == pytest.approx(
-        second_delta - (0.05 * first_delta)
-    )
+    # NaN ``ce_delta_raw`` must not poison the EMA — the producer skips
+    # the EMA update on non-finite deltas, so the bucket baseline stays
+    # at its zero-init value across both replays.
+    assert math.isnan(second["ce_after_replay"])
+    assert math.isnan(second["ce_delta_raw"])
+    assert math.isnan(second["reward_shaped"])
+    assert second["bucket_baseline"] == pytest.approx(0.0)
     assert consumer.bucket_baseline_ema is not None
-    assert consumer.bucket_baseline_ema[2] == pytest.approx(
-        (0.95 * (0.05 * first_delta)) + (0.05 * second_delta)
-    )
+    assert consumer.bucket_baseline_ema[2] == pytest.approx(0.0)
+    # Flag off ⇒ no pending list allocated; the deferred pass is a no-op.
+    assert consumer.compute_replay_ce_pair is False
+    assert consumer.pending_post_step_replays is None
 
 
 def test_replay_id_derives_from_query_event_id_when_controller_field_missing():
