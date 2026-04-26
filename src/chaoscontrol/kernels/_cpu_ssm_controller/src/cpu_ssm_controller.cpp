@@ -2,6 +2,8 @@
 
 #include <tuple>
 
+#include "wire_events.h"
+
 namespace {
 
 void check_vec(const at::Tensor& t, const char* name, int64_t n) {
@@ -116,8 +118,46 @@ const char* backend_name() {
 #endif
 }
 
+// Wire-event introspection (Phase A1). Reports the byte sizes pinned by
+// `static_assert` in wire_events.h, the natural alignment of the largest
+// member (`alignof(uint64_t)` — note that `alignof(struct)` is 1 under
+// `#pragma pack(push, 1)` and is therefore not what callers want), and
+// the compile-time constants that drive the array fields.
+pybind11::dict wire_event_sizes() {
+  pybind11::dict d;
+  d["WriteEvent"] = static_cast<int64_t>(sizeof(WriteEvent));
+  d["QueryEvent"] = static_cast<int64_t>(sizeof(QueryEvent));
+  d["ReplayOutcome"] = static_cast<int64_t>(sizeof(ReplayOutcome));
+  return d;
+}
+
+pybind11::dict wire_event_alignments() {
+  // Largest member alignment, not `alignof(struct)` (= 1 under pack(1)).
+  // This is the alignment ShmRing slot stride must satisfy so a u64 load
+  // from any field lands on a natural boundary.
+  constexpr int64_t kSlotAlign = static_cast<int64_t>(alignof(uint64_t));
+  pybind11::dict d;
+  d["WriteEvent"] = kSlotAlign;
+  d["QueryEvent"] = kSlotAlign;
+  d["ReplayOutcome"] = kSlotAlign;
+  return d;
+}
+
+pybind11::dict wire_event_constants() {
+  pybind11::dict d;
+  d["KEY_REP_DIM_DEFAULT"] = static_cast<int64_t>(KEY_REP_DIM_DEFAULT);
+  d["SPAN_LENGTH_DEFAULT"] = static_cast<int64_t>(SPAN_LENGTH_DEFAULT);
+  return d;
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("forward_step", &forward_step, "CPU SSM controller reference step");
   m.def("has_amx_bf16", &has_amx_bf16, "Whether built with AMX BF16 support");
   m.def("backend_name", &backend_name, "Compiled backend name");
+  m.def("wire_event_sizes", &wire_event_sizes,
+        "Byte sizes of WriteEvent / QueryEvent / ReplayOutcome wire structs");
+  m.def("wire_event_alignments", &wire_event_alignments,
+        "Slot alignment for ShmRing placement (largest-member natural align)");
+  m.def("wire_event_constants", &wire_event_constants,
+        "Compile-time constants driving wire-event array dimensions");
 }
