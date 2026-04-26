@@ -91,6 +91,8 @@ def _populate_cache_slot(
     span_tokens: torch.Tensor,
     key_fp: int,
     write_step: int,
+    pressure_at_write: float = 0.0,
+    write_bucket: int = -1,
 ) -> int:
     return cache.append(
         key_fp=key_fp,
@@ -99,6 +101,8 @@ def _populate_cache_slot(
         value_anchor_id=slot_value_anchor,
         current_step=write_step,
         embedding_version=0,
+        pressure_at_write=pressure_at_write,
+        write_bucket=write_bucket,
     )
 
 
@@ -151,6 +155,8 @@ class TestEpisodicReplayDrain(unittest.TestCase):
             span_tokens=torch.tensor([3, 5, 7, 9], dtype=torch.int64),
             key_fp=42,
             write_step=10,
+            pressure_at_write=1.25,
+            write_bucket=2,
         )
         slot_b = _populate_cache_slot(
             cache,
@@ -158,6 +164,8 @@ class TestEpisodicReplayDrain(unittest.TestCase):
             span_tokens=torch.tensor([1, 2, 3, 4], dtype=torch.int64),
             key_fp=99,
             write_step=11,
+            pressure_at_write=2.50,
+            write_bucket=3,
         )
         utility_pre_a = float(cache.utility_u[slot_a].item())
         utility_pre_b = float(cache.utility_u[slot_b].item())
@@ -221,6 +229,12 @@ class TestEpisodicReplayDrain(unittest.TestCase):
                     self.assertIn(col, row)
                 self.assertEqual(row["step"], 11)
                 self.assertIn(row["slot"], (slot_a, slot_b))
+                if row["slot"] == slot_a:
+                    self.assertEqual(row["write_pressure"], 1.25)
+                    self.assertEqual(row["write_bucket"], 2)
+                else:
+                    self.assertEqual(row["write_pressure"], 2.5)
+                    self.assertEqual(row["write_bucket"], 3)
                 self.assertEqual(row["utility_pre"], 1.0)
                 # Phase 1 NaN policy: cosines + utility_signal_raw
                 # serialize as null.
@@ -483,6 +497,92 @@ class TestEpisodicReplayDrain(unittest.TestCase):
             # Queue drained but no log row written for the evicted slot.
             self.assertEqual(consumer.tagged_replay_queue, [])
             self.assertEqual(log_path.read_text(), "")
+
+    def test_runner_replay_drain_respects_per_step_budget(self):
+        """Replay fanout is part of the treatment dose.
+
+        A top-k controller can enqueue many tags per training step. The runner
+        must cap how many it replays in one step and leave the remainder queued
+        for later rather than turning one write burst into dozens of backwards.
+        """
+        model = _TinyTokenModel()
+        cache = EpisodicCache(capacity=4, span_length=4, key_rep_dim=8)
+        slots = [
+            _populate_cache_slot(
+                cache,
+                slot_value_anchor=2,
+                span_tokens=torch.tensor([3, 5, 7, 9], dtype=torch.int64),
+                key_fp=40 + i,
+                write_step=10 + i,
+            )
+            for i in range(3)
+        ]
+        consumer = _StubConsumerWithTaggedQueue(cache)
+        for slot in slots:
+            consumer.tagged_replay_queue.append({
+                "step": 11,
+                "slot": int(slot),
+                "score": 0.7,
+                "selected_at": 11,
+            })
+
+        replayed = self.mod._run_episodic_replay_from_tagged_queue(
+            consumer=consumer,
+            model=model,
+            current_step=11,
+            weight=1.0,
+            lm_head_backward_mode="single",
+            lm_head_tile_size=1024,
+            logger=None,
+            max_replays_per_step=1,
+        )
+
+        self.assertEqual(replayed, 1)
+        self.assertEqual(len(consumer.tagged_replay_queue), 2)
+        self.assertEqual(
+            [entry["slot"] for entry in consumer.tagged_replay_queue],
+            slots[1:],
+        )
+
+    def test_runner_replay_drain_unbounded_when_budget_is_zero(self):
+        """Pre-landing behavior was an unbounded `while tagged:` drain.
+        max_replays_per_step=0 must restore that — drain everything in
+        one call so a controller-driven config doesn't silently lose
+        treatment dose by inheriting a per-step cap."""
+        model = _TinyTokenModel()
+        cache = EpisodicCache(capacity=8, span_length=4, key_rep_dim=8)
+        slots = [
+            _populate_cache_slot(
+                cache,
+                slot_value_anchor=2,
+                span_tokens=torch.tensor([3, 5, 7, 9], dtype=torch.int64),
+                key_fp=40 + i,
+                write_step=10 + i,
+            )
+            for i in range(5)
+        ]
+        consumer = _StubConsumerWithTaggedQueue(cache)
+        for slot in slots:
+            consumer.tagged_replay_queue.append({
+                "step": 11,
+                "slot": int(slot),
+                "score": 0.7,
+                "selected_at": 11,
+            })
+
+        replayed = self.mod._run_episodic_replay_from_tagged_queue(
+            consumer=consumer,
+            model=model,
+            current_step=11,
+            weight=1.0,
+            lm_head_backward_mode="single",
+            lm_head_tile_size=1024,
+            logger=None,
+            max_replays_per_step=0,
+        )
+
+        self.assertEqual(replayed, 5)
+        self.assertEqual(consumer.tagged_replay_queue, [])
 
 
 if __name__ == "__main__":

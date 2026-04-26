@@ -2,7 +2,7 @@
 
 Per Decision 0.9 of ``docs/plans/2026-04-25-memory-aware-optimizer-plan.md``:
 the per-replay log lives at ``run_dir/episodic_replay_log_rank{R}.ndjson``;
-each row carries the 16 columns pinned in the schema. The writer is
+each row carries the columns pinned in the schema. The writer is
 append-only NDJSON so DuckDB's ``read_json_auto`` consumes it without
 transformation in Phase 3.5.
 
@@ -11,7 +11,7 @@ Tests:
 * ``test_diagnostics_log_writes_one_row_per_replay`` — calling the
   writer with synthetic event data appends one row per call; the
   serialized JSON round-trips back to the input keys/values.
-* ``test_diagnostics_log_schema_matches_decision_0_9`` — pin all 16
+* ``test_diagnostics_log_schema_matches_decision_0_9`` — pin all
   documented column names; rows missing a column or carrying extras
   surface immediately.
 * ``test_diagnostics_log_handles_nan_for_phase1_simplification`` —
@@ -45,7 +45,20 @@ def _synthetic_row(**overrides: object) -> dict[str, object]:
         "write_bucket": 1,
         "query_cosine": 0.61,
         "utility_pre": 0.55,
+        "replay_id": 700,
+        "query_event_id": 701,
+        "source_write_id": 702,
+        "selection_step": 6,
+        "policy_version": 2,
+        "selected_rank": 0,
+        "teacher_score": 0.61,
+        "controller_logit": 0.58,
         "replay_loss": 1.273,
+        "ce_before_replay": float("nan"),
+        "ce_after_replay": 1.273,
+        "ce_delta_raw": float("nan"),
+        "bucket_baseline": 0.0,
+        "reward_shaped": float("nan"),
         "replay_grad_norm": 2.4e-2,
         "replay_grad_cos_common": 0.11,
         "replay_grad_cos_rare": 0.22,
@@ -53,16 +66,18 @@ def _synthetic_row(**overrides: object) -> dict[str, object]:
         "utility_signal_raw": 0.22,
         "utility_signal_transformed": 0.22,
         "utility_post": 0.553,
+        "outcome_status": "ok",
+        "flags": 0,
     }
     row.update(overrides)
     return row
 
 
 class TestDiagnosticsSchema(unittest.TestCase):
-    """The 16 columns from Decision 0.9 are the contract."""
+    """The replay-outcome columns are the contract."""
 
     def test_diagnostics_log_schema_matches_decision_0_9(self):
-        """Pin all 16 documented column names against the canonical
+        """Pin all documented column names against the canonical
         list. Adding/removing a column without updating Decision 0.9 is
         a breaking change; this test forces the conversation."""
         expected = (
@@ -74,7 +89,20 @@ class TestDiagnosticsSchema(unittest.TestCase):
             "write_bucket",
             "query_cosine",
             "utility_pre",
+            "replay_id",
+            "query_event_id",
+            "source_write_id",
+            "selection_step",
+            "policy_version",
+            "selected_rank",
+            "teacher_score",
+            "controller_logit",
             "replay_loss",
+            "ce_before_replay",
+            "ce_after_replay",
+            "ce_delta_raw",
+            "bucket_baseline",
+            "reward_shaped",
             "replay_grad_norm",
             "replay_grad_cos_common",
             "replay_grad_cos_rare",
@@ -82,9 +110,11 @@ class TestDiagnosticsSchema(unittest.TestCase):
             "utility_signal_raw",
             "utility_signal_transformed",
             "utility_post",
+            "outcome_status",
+            "flags",
         )
         self.assertEqual(REPLAY_LOG_SCHEMA, expected)
-        self.assertEqual(len(REPLAY_LOG_SCHEMA), 16)
+        self.assertEqual(len(REPLAY_LOG_SCHEMA), 31)
 
 
 class TestDiagnosticsWriter(unittest.TestCase):

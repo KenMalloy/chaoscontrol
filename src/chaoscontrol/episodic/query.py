@@ -11,15 +11,10 @@ indices ranked by one of two scoring modes:
       ``score(i) = cosine_sim(query_residual, cache.key_rep[i]) * cache.utility_u[i]``
 
   ``"pressure_only"`` (Phase 3 Arm B' — the mechanism-specificity arm):
-      ``score(i) = cache.utility_u[i]``
-      The Phase 3 falsifier matrix uses this arm to distinguish "memory
-      persistence + similarity recall" from "any rare-grad-aligned
-      retrieval policy." ``EpisodicCache`` does not store a separate
-      ``pressure_at_write`` field, so ``utility_u`` is the proxy: the
-      utility EMA already encodes "did this entry produce gradients
-      aligned with the live rare-grad direction" per Decision 0.10. If
-      Phase 3 results suggest a true write-time pressure is needed, add
-      a ``pressure_at_write`` tensor to the cache schema first.
+      ``score(i) = cache.pressure_at_write[i]``
+      This is the mechanism-specificity arm: it ignores cosine and
+      replay-updated utility so the matrix can separate "write pressure
+      only" from "similarity recall × learned/useful utility."
 
 Both modes exclude unoccupied slots from the candidate set; the empty
 cache returns an empty int64 tensor without raising.
@@ -97,15 +92,7 @@ def query_topk(
         cosines = keys_n @ q  # [N_occ]
         scores = cosines * util  # [N_occ]
     else:  # pressure_only
-        # TODO(task #101): when EpisodicCache gains a pressure_at_write
-        # field (Phase 3 prereq), replace this proxy with
-        # ``cache.pressure_at_write[occupied_idx]``. Until then,
-        # ``utility_u`` is the closest available signal — but it's
-        # semantically wrong for the Arm B' mechanism-specificity test
-        # (spec wants Arm B' to ignore cosine AND utility entirely).
-        # Phase 3 falsifier loses some discriminative power until #101
-        # lands. Documented in the spec-review report.
-        scores = cache.utility_u.to(device)[occupied_idx]  # [N_occ]
+        scores = cache.pressure_at_write.to(device)[occupied_idx]  # [N_occ]
 
     k_eff = min(int(k), int(scores.numel()))
     if k_eff <= 0:

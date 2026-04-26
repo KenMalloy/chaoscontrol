@@ -1615,6 +1615,9 @@ def _attach_episodic_consumer(
         utility_ema_decay=float(
             config.get("episodic_utility_ema_decay", 0.99)
         ),
+        fingerprint_window=int(config.get("episodic_fingerprint_window", 8)),
+        slot_state_dim=int(config.get("episodic_slot_state_dim", 0)),
+        simplex_k_max=int(config.get("episodic_simplex_k_max", 0)),
     )
     return _EpisodicConsumerState(
         cache=cache,
@@ -1652,6 +1655,86 @@ class _EpisodicControllerHandle:
         self.heartbeat = heartbeat
 
 
+def _rank_prefixed_event_id(*, source_rank: int, rank_seq: int) -> int:
+    """Pack ``(rank, local_seq)`` into the CPU-controller wire id shape."""
+    if not 0 <= int(source_rank) < 256:
+        raise ValueError(f"source_rank must fit in u8; got {source_rank}")
+    seq = int(rank_seq)
+    if seq < 0:
+        raise ValueError(f"rank_seq must be non-negative; got {rank_seq}")
+    return (int(source_rank) << 56) | (seq & ((1 << 56) - 1))
+
+
+def _controller_score_mode_from_config(config: dict[str, Any]) -> str:
+    """Read the controller score mode, accepting the Exp24 alias.
+
+    Exp24 matrix builders historically emitted ``controller_query_mode`` while
+    the runner consumed ``episodic_controller_score_mode``. Supporting both
+    keeps older matrices runnable; a disagreement is rejected because silently
+    choosing one would poison the pressure-only control.
+    """
+    primary = config.get("episodic_controller_score_mode")
+    alias = config.get("controller_query_mode")
+    if primary is not None and alias is not None and str(primary) != str(alias):
+        raise ValueError(
+            "conflicting controller score mode keys: "
+            f"episodic_controller_score_mode={primary!r}, "
+            f"controller_query_mode={alias!r}"
+        )
+    return str(
+        primary if primary is not None else alias if alias is not None
+        else "cosine_utility_weighted"
+    ).strip()
+
+
+def _build_controller_runtime_from_config(
+    config: dict[str, Any],
+    *,
+    capacity: int,
+) -> Any | None:
+    mode = str(config.get("episodic_controller_runtime", "heuristic")).strip()
+    if mode in {"", "heuristic", "python_heuristic"}:
+        return None
+    prefer_cpp = mode in {"cpp", "cpu_ssm_cpp", "cpp_reference"}
+    prefer_reference = mode in {"reference", "cpu_ssm_reference", "python_reference"}
+    if not prefer_cpp and not prefer_reference:
+        raise ValueError(
+            "episodic_controller_runtime must be one of "
+            "'heuristic', 'cpp_reference', or 'cpu_ssm_reference'; "
+            f"got {mode!r}"
+        )
+    from chaoscontrol.episodic.cpu_ssm_controller import (
+        CpuSsmControllerRuntime,
+        CpuSsmControllerWeights,
+        require_cpp,
+    )
+
+    if prefer_cpp:
+        require_cpp()
+
+    weights_path = config.get("episodic_controller_weights_path")
+    if weights_path:
+        weights = CpuSsmControllerWeights.load(str(weights_path))
+    else:
+        feature_dim = 4
+        global_dim = int(config.get("episodic_controller_global_dim", 8))
+        slot_dim = int(config.get("episodic_controller_slot_dim", 4))
+        weights = CpuSsmControllerWeights(
+            w_global_in=torch.zeros(global_dim, feature_dim, dtype=torch.float32),
+            w_slot_in=torch.zeros(slot_dim, feature_dim, dtype=torch.float32),
+            decay_global=torch.zeros(global_dim, dtype=torch.float32),
+            decay_slot=torch.zeros(slot_dim, dtype=torch.float32),
+            w_global_out=torch.zeros(global_dim, dtype=torch.float32),
+            w_slot_out=torch.zeros(slot_dim, dtype=torch.float32),
+            bias=torch.zeros((), dtype=torch.float32),
+        )
+    return CpuSsmControllerRuntime(
+        weights,
+        capacity=int(capacity),
+        prefer_cpp=bool(prefer_cpp),
+    )
+
+
 def _spawn_episodic_controller(
     *,
     consumer: _EpisodicConsumerState,
@@ -1686,12 +1769,14 @@ def _spawn_episodic_controller(
     if not consumer.controller_query_enabled:
         return None
 
-    score_mode = str(
-        config.get("episodic_controller_score_mode", "cosine_utility_weighted")
-    ).strip()
+    score_mode = _controller_score_mode_from_config(config)
     k = int(config.get("episodic_controller_topk_k", 16))
     idle_sleep_s = float(
         config.get("episodic_controller_idle_sleep_s", 0.005)
+    )
+    controller_runtime = _build_controller_runtime_from_config(
+        config,
+        capacity=int(consumer.cache.capacity),
     )
 
     stop_event = threading.Event()
@@ -1723,6 +1808,7 @@ def _spawn_episodic_controller(
             "stop_event": stop_event,
             "k": k,
             "score_mode": score_mode,
+            "controller_runtime": controller_runtime,
             "cycle_idle_sleep_s": idle_sleep_s,
             "heartbeat": controller_heartbeat,
         },
@@ -1798,13 +1884,20 @@ def _drain_episodic_payloads_gpu(
                 span_length=span_length,
                 key_rep_dim=key_rep_dim,
             )
-            cache.append(
+            source_write_id = _rank_prefixed_event_id(
+                source_rank=int(r),
+                rank_seq=(int(current_step) << 16) | int(k),
+            )
+            appended_slot = cache.append(
                 key_fp=int(unpacked["key_fp"]),
                 key_rep=unpacked["key_rep"],
                 value_tok_ids=unpacked["value_tok_ids"],
                 value_anchor_id=int(unpacked["value_anchor_id"]),
                 current_step=int(current_step),
                 embedding_version=int(embedding_version),
+                pressure_at_write=float(unpacked["pressure"]),
+                source_write_id=int(source_write_id),
+                write_bucket=-1,
             )
             # Gate queue.append behind the consumer-enabled flag.
             # Phase 1 ships with the flag default False; the queue stays
@@ -1816,6 +1909,9 @@ def _drain_episodic_payloads_gpu(
                     "step": int(current_step),
                     "rank": int(r),
                     "k": int(k),
+                    "query_event_id": int(source_write_id),
+                    "source_write_id": int(source_write_id),
+                    "slot": int(appended_slot),
                     "pressure": float(unpacked["pressure"]),
                     "residual": unpacked["residual"],
                 })
@@ -1849,6 +1945,7 @@ def _run_episodic_replay_from_tagged_queue(
     lm_head_backward_mode: str,
     lm_head_tile_size: int,
     logger: DiagnosticsLogger | None,
+    max_replays_per_step: int = 0,
 ) -> int:
     """Drain ``consumer.tagged_replay_queue`` and run replay per slot.
 
@@ -1875,10 +1972,11 @@ def _run_episodic_replay_from_tagged_queue(
         return 0
     cache = consumer.cache
     replayed = 0
+    max_replays = int(max_replays_per_step)
     # Drain destructively. The controller is the producer; once we
     # consume an entry, it's done — the controller will push fresh
     # entries on the next cycle.
-    while tagged:
+    while tagged and (max_replays <= 0 or replayed < max_replays):
         entry = tagged.pop(0)
         slot = int(entry.get("slot", -1))
         if not (0 <= slot < int(cache.capacity)):
@@ -1894,6 +1992,8 @@ def _run_episodic_replay_from_tagged_queue(
         utility_pre = float(cache.utility_u[slot].item())
         write_step = int(cache.write_step[slot].item())
         key_fp = int(cache.key_fp[slot].item())
+        write_pressure = float(cache.pressure_at_write[slot].item())
+        write_bucket = int(cache.write_bucket[slot].item())
         # X's contract says the queue entry carries ``score`` (=
         # cosine × utility). The diagnostic log wants ``query_cosine``
         # (= raw cosine). Until the controller emits the raw cosine
@@ -1941,22 +2041,37 @@ def _run_episodic_replay_from_tagged_queue(
         utility_post = float(cache.utility_u[slot].item())
 
         if logger is not None:
+            replay_loss = float(result["replay_loss"])
             logger.write_row({
                 "step": int(current_step),
                 "slot": int(slot),
                 "key_fp": key_fp,
                 "write_step": write_step,
-                # ``write_pressure`` and ``write_bucket`` are not on
-                # the cache schema (Decision 0.4 + Pass C). Phase 1
-                # logs NaN / -1 sentinel values; Phase 3.5's analytics
-                # layer joins these from the controller's drain log
-                # (where pressure IS captured in
-                # controller_query_queue) using (write_step, slot).
-                "write_pressure": float("nan"),
-                "write_bucket": -1,
+                "write_pressure": write_pressure,
+                "write_bucket": write_bucket,
                 "query_cosine": query_cosine,
                 "utility_pre": utility_pre,
-                "replay_loss": float(result["replay_loss"]),
+                "replay_id": int(entry.get("replay_id", -1)),
+                "query_event_id": int(entry.get("query_event_id", -1)),
+                "source_write_id": int(
+                    entry.get(
+                        "source_write_id",
+                        int(cache.source_write_id[slot].item()),
+                    )
+                ),
+                "selection_step": int(entry.get("selection_step", -1)),
+                "policy_version": int(entry.get("policy_version", 0)),
+                "selected_rank": int(entry.get("selected_rank", -1)),
+                "teacher_score": float(entry.get("teacher_score", query_cosine)),
+                "controller_logit": float(
+                    entry.get("controller_logit", query_cosine)
+                ),
+                "replay_loss": replay_loss,
+                "ce_before_replay": float("nan"),
+                "ce_after_replay": replay_loss,
+                "ce_delta_raw": float("nan"),
+                "bucket_baseline": 0.0,
+                "reward_shaped": float("nan"),
                 "replay_grad_norm": float(result["replay_grad_norm"]),
                 "replay_grad_cos_common": float(result["replay_grad_cos_common"]),
                 "replay_grad_cos_rare": float(result["replay_grad_cos_rare"]),
@@ -1964,6 +2079,8 @@ def _run_episodic_replay_from_tagged_queue(
                 "utility_signal_raw": float(result["utility_signal_raw"]),
                 "utility_signal_transformed": float(result["utility_signal_transformed"]),
                 "utility_post": utility_post,
+                "outcome_status": "ok",
+                "flags": 0,
             })
         replayed += 1
     return replayed
@@ -2000,6 +2117,7 @@ def _run_train_step(
     episodic_emit: EpisodicGpuEmit | None = None,
     episodic_consumer: "_EpisodicConsumerState | None" = None,
     episodic_replay_logger: DiagnosticsLogger | None = None,
+    episodic_replay_max_replays_per_step: int = 0,
     current_step: int = 0,
     embedding_version: int = 0,
 ) -> torch.Tensor:
@@ -2090,6 +2208,7 @@ def _run_train_step(
                 lm_head_backward_mode=lm_head_backward_mode,
                 lm_head_tile_size=int(lm_head_tile_size),
                 logger=episodic_replay_logger,
+                max_replays_per_step=int(episodic_replay_max_replays_per_step),
             )
         if episodic_consumer is not None:
             episodic_consumer.heartbeat[0] += 1
@@ -2814,6 +2933,11 @@ def train_fast_for_budget(
     episodic_controller_score_mode: str = "cosine_utility_weighted",
     episodic_controller_topk_k: int = 16,
     episodic_controller_idle_sleep_s: float = 0.005,
+    episodic_controller_runtime: str = "heuristic",
+    episodic_controller_weights_path: str | None = None,
+    episodic_controller_global_dim: int = 8,
+    episodic_controller_slot_dim: int = 4,
+    episodic_replay_max_replays_per_step: int = 0,
 ) -> dict[str, Any]:
     rank_ = int(rank)
     world_size_ = int(world_size)
@@ -2963,6 +3087,7 @@ def train_fast_for_budget(
         ),
         "episodic_grace_steps": int(episodic_grace_steps),
         "episodic_utility_ema_decay": float(episodic_utility_ema_decay),
+        "episodic_fingerprint_window": int(episodic_fingerprint_window),
         "controller_query_enabled": bool(controller_query_enabled),
     }
     episodic_consumer = _attach_episodic_consumer(
@@ -2981,13 +3106,15 @@ def train_fast_for_budget(
     # leak a running daemon thread.
     episodic_controller_handle: _EpisodicControllerHandle | None = None
     _episodic_controller_config = {
-        "episodic_controller_score_mode": str(
-            episodic_controller_score_mode
-        ),
+        "episodic_controller_score_mode": str(episodic_controller_score_mode),
         "episodic_controller_topk_k": int(episodic_controller_topk_k),
         "episodic_controller_idle_sleep_s": float(
             episodic_controller_idle_sleep_s
         ),
+        "episodic_controller_runtime": str(episodic_controller_runtime),
+        "episodic_controller_weights_path": episodic_controller_weights_path,
+        "episodic_controller_global_dim": int(episodic_controller_global_dim),
+        "episodic_controller_slot_dim": int(episodic_controller_slot_dim),
     }
     if (
         scopt_active
@@ -3552,6 +3679,9 @@ def train_fast_for_budget(
                     all_group=all_group,
                     episodic_emit=episodic_emit_handle,
                     episodic_consumer=episodic_consumer,
+                    episodic_replay_max_replays_per_step=int(
+                        episodic_replay_max_replays_per_step
+                    ),
                     current_step=steps,
                     embedding_version=0,
                     dreamworld_entry=dream_entry,
@@ -3803,6 +3933,31 @@ def train_fast_for_budget(
     if fast_slow.enabled and str(fast_slow_eval_copy).strip().lower() == "slow":
         fast_slow.copy_slow_to_model(model)
 
+    episodic_cache_payload: dict[str, Any] | None = None
+    if episodic_enabled:
+        local_cache_payload = (
+            episodic_consumer.cache.to_dict()
+            if is_episodic_rank and episodic_consumer.cache is not None
+            else None
+        )
+        if ddp_active and dist.is_initialized():
+            gathered_payloads: list[dict[str, Any] | None] | None = (
+                [None for _ in range(world_size_)] if rank_ == 0 else None
+            )
+            dist.gather_object(
+                local_cache_payload,
+                object_gather_list=gathered_payloads,
+                dst=0,
+                group=all_group,
+            )
+            if rank_ == 0 and gathered_payloads is not None:
+                episodic_cache_payload = next(
+                    (p for p in gathered_payloads if p is not None),
+                    None,
+                )
+        else:
+            episodic_cache_payload = local_cache_payload
+
     elapsed_s = time.perf_counter() - start_time
     loss_cpu = torch.stack(losses).cpu() if losses else torch.empty(0)
     peak_vram_mb = 0.0
@@ -3956,6 +4111,8 @@ def train_fast_for_budget(
         result.update(val_block)
     if topology_snapshot is not None:
         result["topology_snapshot"] = topology_snapshot
+    if episodic_cache_payload is not None:
+        result["_episodic_cache_payload"] = episodic_cache_payload
     return result
 
 
@@ -4349,10 +4506,7 @@ def run_condition(
             config.get("controller_query_enabled", False)
         ),
         episodic_controller_score_mode=str(
-            config.get(
-                "episodic_controller_score_mode",
-                "cosine_utility_weighted",
-            )
+            _controller_score_mode_from_config(config)
         ),
         episodic_controller_topk_k=int(
             config.get("episodic_controller_topk_k", 16)
@@ -4360,7 +4514,25 @@ def run_condition(
         episodic_controller_idle_sleep_s=float(
             config.get("episodic_controller_idle_sleep_s", 0.005)
         ),
+        episodic_controller_runtime=str(
+            config.get("episodic_controller_runtime", "heuristic")
+        ),
+        episodic_controller_weights_path=(
+            str(config["episodic_controller_weights_path"])
+            if config.get("episodic_controller_weights_path") is not None
+            else None
+        ),
+        episodic_controller_global_dim=int(
+            config.get("episodic_controller_global_dim", 8)
+        ),
+        episodic_controller_slot_dim=int(
+            config.get("episodic_controller_slot_dim", 4)
+        ),
+        episodic_replay_max_replays_per_step=int(
+            config.get("episodic_replay_max_replays_per_step", 0)
+        ),
     )
+    episodic_cache_payload = train_result.pop("_episodic_cache_payload", None)
 
     if ddp_active:
         dist.barrier()
@@ -4425,7 +4597,12 @@ def run_condition(
             tmp.write_text(json.dumps(result, indent=2, default=str))
             tmp.rename(out)
         if output_ckpt:
-            _save_output_ckpt(output_ckpt, model, config)
+            _save_output_ckpt(
+                output_ckpt,
+                model,
+                config,
+                episodic_cache=episodic_cache_payload,
+            )
         print(
             f"[rank 0/{world_size}] done steps={train_result['steps']} "
             f"tok/s={train_result['aggregate_tokens_per_sec']:.0f} "

@@ -38,6 +38,8 @@ from __future__ import annotations
 import importlib.util
 from pathlib import Path
 
+import pytest
+
 
 def _load_runner_module():
     path = (
@@ -244,3 +246,20 @@ def test_spawn_returns_none_when_controller_query_disabled():
         config={},
     )
     assert handle is None
+
+
+def test_controller_score_mode_accepts_exp24_alias_and_rejects_conflict():
+    mod = _load_runner_module()
+
+    assert mod._controller_score_mode_from_config({
+        "controller_query_mode": "pressure_only",
+    }) == "pressure_only"
+    assert mod._controller_score_mode_from_config({
+        "episodic_controller_score_mode": "cosine_utility_weighted",
+        "controller_query_mode": "cosine_utility_weighted",
+    }) == "cosine_utility_weighted"
+    with pytest.raises(ValueError, match="conflicting controller score mode"):
+        mod._controller_score_mode_from_config({
+            "episodic_controller_score_mode": "cosine_utility_weighted",
+            "controller_query_mode": "pressure_only",
+        })

@@ -5,8 +5,8 @@ The episodic-rank step body emits one row per replay event. Rows land
 at ``run_dir/episodic_replay_log_rank{R}.ndjson`` so DuckDB's
 ``read_json_auto`` consumes them in Phase 3.5 without transformation.
 
-Schema (rows pinned to exactly these 16 columns; see Decision 0.9 of
-``docs/plans/2026-04-25-memory-aware-optimizer-plan.md``):
+Schema (rows pinned to exactly these columns; see the CPU SSM controller
+event-log design):
 
     step                       int64    -- training step at which replay fired
     slot                       int64    -- cache slot that was replayed
@@ -25,7 +25,20 @@ Schema (rows pinned to exactly these 16 columns; see Decision 0.9 of
                                         --   Decision 0.9 amendment; for now the
                                         --   semantic is documented inline.
     utility_pre                float64  -- utility_ema before this replay
+    replay_id                  int64    -- controller-issued action id
+    query_event_id             int64    -- triggering query id
+    source_write_id            int64    -- original admitted write id
+    selection_step             int64    -- controller step at selection time
+    policy_version             int64    -- controller policy version
+    selected_rank              int64    -- 0-based selected rank
+    teacher_score              float64  -- heuristic score used as BC teacher
+    controller_logit           float64  -- learned controller logit
     replay_loss                float64  -- CE on value tokens after replay forward
+    ce_before_replay           float64  -- reserved, null until before/after CE is wired
+    ce_after_replay            float64  -- replay CE after forward
+    ce_delta_raw               float64  -- before - after, null until wired
+    bucket_baseline            float64  -- EMA baseline for shaped reward
+    reward_shaped              float64  -- ce_delta_raw - bucket_baseline
     replay_grad_norm           float64  -- CUMULATIVE replay-only grad L2 across the
                                         --   step's replays so far. Per-replay
                                         --   contribution = consecutive-row delta.
@@ -38,6 +51,8 @@ Schema (rows pinned to exactly these 16 columns; see Decision 0.9 of
                                         --   == utility_pre if utility update was
                                         --   skipped this replay — see Phase 1 NaN
                                         --   policy in compute_utility_signal)
+    outcome_status             str      -- ok / slot_missing / stale / nan / skipped
+    flags                      int64    -- reserved bit flags
 
 NaN values serialize as ``null`` so DuckDB ingests them as missing
 values; Phase 1 logs NaN for the three replay-grad cosines and the
@@ -55,7 +70,7 @@ from pathlib import Path
 from typing import Any
 
 
-# Pin the 16 documented column names. Re-ordering is a breaking change
+# Pin the documented column names. Re-ordering is a breaking change
 # for the DuckDB analytics layer (Phase 3.5) and the Phase 4 ablation
 # matrix's downstream readers. Keep in lockstep with Decision 0.9.
 REPLAY_LOG_SCHEMA: tuple[str, ...] = (
@@ -67,7 +82,20 @@ REPLAY_LOG_SCHEMA: tuple[str, ...] = (
     "write_bucket",
     "query_cosine",
     "utility_pre",
+    "replay_id",
+    "query_event_id",
+    "source_write_id",
+    "selection_step",
+    "policy_version",
+    "selected_rank",
+    "teacher_score",
+    "controller_logit",
     "replay_loss",
+    "ce_before_replay",
+    "ce_after_replay",
+    "ce_delta_raw",
+    "bucket_baseline",
+    "reward_shaped",
     "replay_grad_norm",
     "replay_grad_cos_common",
     "replay_grad_cos_rare",
@@ -75,6 +103,8 @@ REPLAY_LOG_SCHEMA: tuple[str, ...] = (
     "utility_signal_raw",
     "utility_signal_transformed",
     "utility_post",
+    "outcome_status",
+    "flags",
 )
 _REPLAY_LOG_SCHEMA_SET: frozenset[str] = frozenset(REPLAY_LOG_SCHEMA)
 

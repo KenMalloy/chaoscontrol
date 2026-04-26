@@ -264,7 +264,9 @@ def test_snapshot_to_returns_tensor_dict_on_requested_device():
     expected_keys = {
         "key_fp", "key_rep", "value_tok_ids", "value_anchor_id",
         "utility_u", "last_fired_step", "write_step",
-        "birth_embedding_version", "occupied",
+        "birth_embedding_version", "occupied", "pressure_at_write",
+        "source_write_id", "write_bucket", "slot_state",
+        "simplex_edge_slot", "simplex_edge_weight",
     }
     assert set(snap.keys()) == expected_keys
     for name, t in snap.items():
@@ -459,3 +461,60 @@ def test_from_dict_raises_keyerror_on_missing_required_field():
         partial.pop(field_name)
         with pytest.raises(KeyError, match=field_name):
             EpisodicCache.from_dict(partial)
+
+
+def test_cpu_ssm_extended_fields_round_trip_with_cache_payload():
+    """CPU-controller V1 needs write pressure, durable source IDs, per-slot
+    SSM state, and simplex edges to live on the cache substrate.
+
+    These fields must round-trip through to_dict/from_dict because the
+    trainer-side cache checkpoint is the handoff to cache-aware eval.
+    """
+    cache = EpisodicCache(
+        capacity=3,
+        span_length=2,
+        key_rep_dim=4,
+        slot_state_dim=3,
+        simplex_k_max=2,
+    )
+    slot = cache.append(
+        key_fp=123,
+        key_rep=torch.ones(4),
+        value_tok_ids=torch.tensor([7, 8], dtype=torch.int64),
+        value_anchor_id=7,
+        current_step=5,
+        embedding_version=0,
+        pressure_at_write=4.25,
+        source_write_id=99,
+        write_bucket=2,
+    )
+    cache.slot_state[slot] = torch.tensor([0.5, 1.5, 2.5], dtype=torch.float16)
+    cache.simplex_edge_slot[slot] = torch.tensor([1, 2], dtype=torch.int64)
+    cache.simplex_edge_weight[slot] = torch.tensor([0.25, 0.75], dtype=torch.float16)
+
+    entry = cache.query(123)
+    assert entry is not None
+    assert entry.pressure_at_write == pytest.approx(4.25)
+    assert entry.source_write_id == 99
+    assert entry.write_bucket == 2
+
+    snap = cache.snapshot_to(torch.device("cpu"))
+    for name in (
+        "pressure_at_write",
+        "source_write_id",
+        "write_bucket",
+        "slot_state",
+        "simplex_edge_slot",
+        "simplex_edge_weight",
+    ):
+        assert name in snap
+
+    restored = EpisodicCache.from_dict(cache.to_dict())
+    assert restored.slot_state_dim == 3
+    assert restored.simplex_k_max == 2
+    torch.testing.assert_close(restored.pressure_at_write, cache.pressure_at_write)
+    assert torch.equal(restored.source_write_id, cache.source_write_id)
+    assert torch.equal(restored.write_bucket, cache.write_bucket)
+    torch.testing.assert_close(restored.slot_state, cache.slot_state)
+    assert torch.equal(restored.simplex_edge_slot, cache.simplex_edge_slot)
+    torch.testing.assert_close(restored.simplex_edge_weight, cache.simplex_edge_weight)

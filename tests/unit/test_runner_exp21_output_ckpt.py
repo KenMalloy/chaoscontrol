@@ -69,7 +69,7 @@ def _load_via_run_exp20_eval_pattern(ckpt_path: Path):
 
 
 def test_save_output_ckpt_writes_expected_keys(tmp_path):
-    """The saved blob has exactly {"model", "config"} top-level keys."""
+    """The default saved blob has exactly {"model", "config"} top-level keys."""
     config = _tiny_ssm_config()
     model = build_model(config, torch.device("cpu"), torch.float32)
     ckpt_path = tmp_path / "ckpt.pt"
@@ -81,6 +81,48 @@ def test_save_output_ckpt_writes_expected_keys(tmp_path):
         f"unexpected top-level keys: {set(blob.keys())} (consumer "
         "expects exactly model + config)"
     )
+
+
+def test_save_output_ckpt_can_include_episodic_cache_payload(tmp_path):
+    """Cache-aware TTT arms need ckpt['episodic_cache'] alongside weights."""
+    from chaoscontrol.optim.episodic_cache import EpisodicCache
+
+    config = _tiny_ssm_config()
+    model = build_model(config, torch.device("cpu"), torch.float32)
+    cache = EpisodicCache(
+        capacity=2,
+        span_length=2,
+        key_rep_dim=4,
+        fingerprint_window=6,
+        slot_state_dim=2,
+        simplex_k_max=1,
+    )
+    cache.append(
+        key_fp=42,
+        key_rep=torch.ones(4),
+        value_tok_ids=torch.tensor([1, 2], dtype=torch.int64),
+        value_anchor_id=1,
+        current_step=3,
+        embedding_version=0,
+        pressure_at_write=1.5,
+        source_write_id=123,
+        write_bucket=2,
+    )
+    ckpt_path = tmp_path / "ckpt.pt"
+
+    _save_output_ckpt(str(ckpt_path), model, config, episodic_cache=cache)
+
+    blob = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    assert set(blob.keys()) == {"model", "config", "episodic_cache"}
+    restored = EpisodicCache.from_dict(blob["episodic_cache"])
+    assert restored.fingerprint_window == 6
+    assert restored.slot_state_dim == 2
+    assert restored.simplex_k_max == 1
+    entry = restored.query(42)
+    assert entry is not None
+    assert entry.pressure_at_write == pytest.approx(1.5)
+    assert entry.source_write_id == 123
+    assert entry.write_bucket == 2
 
 
 def test_ssm_arm_round_trips_through_run_exp20_eval_loader(tmp_path):

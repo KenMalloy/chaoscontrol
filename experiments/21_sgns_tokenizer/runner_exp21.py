@@ -258,12 +258,14 @@ def _save_output_ckpt(
     output_ckpt: str,
     model: torch.nn.Module,
     config: dict[str, Any],
+    episodic_cache: Any | None = None,
 ) -> None:
     """Write a downstream-loadable checkpoint to ``output_ckpt``.
 
-    Format is ``{"model": state_dict, "config": <constructor_kwargs>}`` —
-    the exact contract consumed by ``scripts/run_exp20_eval.py::_build_model``
-    via ``ChaosStudentLM(**cfg).load_state_dict(blob['model'], strict=True)``.
+    Format is ``{"model": state_dict, "config": <constructor_kwargs>}`` by
+    default. Cache-aware runs may additionally carry ``"episodic_cache"`` as
+    an ``EpisodicCache.to_dict()`` payload consumed by
+    ``scripts/run_exp20_eval.py``.
 
     Both arms are saved with the right kwargs dict, but the consumer
     currently hardcodes ``ChaosStudentLM(**cfg)`` and will only successfully
@@ -280,10 +282,22 @@ def _save_output_ckpt(
     else:
         ctor_kwargs = _ssm_constructor_kwargs(config)
     cpu_state = {k: v.detach().to("cpu") for k, v in model.state_dict().items()}
+    blob: dict[str, Any] = {"model": cpu_state, "config": ctor_kwargs}
+    if episodic_cache is not None:
+        if isinstance(episodic_cache, dict):
+            blob["episodic_cache"] = episodic_cache
+        else:
+            to_dict = getattr(episodic_cache, "to_dict", None)
+            if not callable(to_dict):
+                raise TypeError(
+                    "episodic_cache must be a dict or expose to_dict() when "
+                    "passed to _save_output_ckpt"
+                )
+            blob["episodic_cache"] = to_dict()
     out_path = Path(output_ckpt)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = out_path.with_suffix(out_path.suffix + ".tmp")
-    torch.save({"model": cpu_state, "config": ctor_kwargs}, tmp_path)
+    torch.save(blob, tmp_path)
     tmp_path.rename(out_path)
 
 

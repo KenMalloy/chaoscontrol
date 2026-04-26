@@ -15,6 +15,8 @@ Extensions built here (concatenated in the order listed):
     ``src/chaoscontrol/kernels/_lm_head_loss/setup_ext.py``).
   * ``chaoscontrol.kernels._ssm_scan._C`` — diag SSM scan kernel
     (build hook at ``src/chaoscontrol/kernels/_ssm_scan/setup_ext.py``).
+  * ``chaoscontrol.kernels._cpu_ssm_controller._C`` — CPU reference runtime
+    for the learned episodic controller.
 
 If an extension's toolchain prerequisites aren't met (dev mac without
 CUDA, missing nvidia-cu13 headers, missing nvcc, etc.) its
@@ -59,17 +61,20 @@ def _load_build_hook(name: str):
 _cublaslt_hook = _load_build_hook("_cublaslt")
 _lm_head_loss_hook = _load_build_hook("_lm_head_loss")
 _ssm_scan_hook = _load_build_hook("_ssm_scan")
+_cpu_ssm_controller_hook = _load_build_hook("_cpu_ssm_controller")
 
 _ext_modules = (
     _cublaslt_hook.build_ext_modules()
     + _lm_head_loss_hook.build_ext_modules()
     + _ssm_scan_hook.build_ext_modules()
+    + _cpu_ssm_controller_hook.build_ext_modules()
 )
 # Both hooks return the same cmdclass (torch's BuildExtension); pick one.
 _cmdclass = (
     _cublaslt_hook.cmdclass_with_build_ext()
     or _lm_head_loss_hook.cmdclass_with_build_ext()
     or _ssm_scan_hook.cmdclass_with_build_ext()
+    or _cpu_ssm_controller_hook.cmdclass_with_build_ext()
 )
 
 setup(

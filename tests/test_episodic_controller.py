@@ -81,6 +81,8 @@ def _populate_cache(cache: EpisodicCache, *, key_reps: list[torch.Tensor],
             value_anchor_id=0,
             current_step=0,
             embedding_version=0,
+            pressure_at_write=float(i) / 10.0,
+            source_write_id=10_000 + i,
         )
         cache.utility_u[i] = float(utilities[i])
 
@@ -139,11 +141,29 @@ def test_controller_main_drains_queries_and_tags():
     assert len(tagged_replay_queue) == 6
     # Tag schema pin.
     for tag in tagged_replay_queue:
-        assert set(tag.keys()) >= {"step", "slot", "score", "selected_at"}
+        assert set(tag.keys()) >= {
+            "step",
+            "slot",
+            "score",
+            "selected_at",
+            "replay_id",
+            "query_event_id",
+            "source_write_id",
+            "selected_rank",
+            "teacher_score",
+            "controller_logit",
+            "selection_step",
+            "policy_version",
+            "outcome_status",
+        }
         assert isinstance(tag["slot"], int)
         assert isinstance(tag["score"], float)
         assert isinstance(tag["step"], int)
         assert isinstance(tag["selected_at"], int)
+        assert isinstance(tag["replay_id"], int)
+        assert isinstance(tag["query_event_id"], int)
+        assert isinstance(tag["source_write_id"], int)
+        assert tag["outcome_status"] == "pending"
     # First candidate aligned with key_rep[0] → top-1 slot is 0.
     first_tag = tagged_replay_queue[0]
     assert first_tag["slot"] == 0
@@ -197,16 +217,21 @@ def test_controller_main_respects_score_mode():
     """Same cache, same query, two different score modes — slot
     ordering follows ``score_mode``."""
     cache = _make_cache(key_rep_dim=4)
-    _populate_cache(
-        cache,
-        key_reps=[
-            torch.tensor([1.0, 0.0, 0.0, 0.0]),
-            torch.tensor([0.0, 1.0, 0.0, 0.0]),
-            torch.tensor([0.0, 0.0, 1.0, 0.0]),
-        ],
-        # Slot 0 has lowest utility; slot 1 has highest.
-        utilities=[0.1, 0.9, 0.5],
-    )
+    for i, (key_rep, utility, pressure) in enumerate([
+        (torch.tensor([1.0, 0.0, 0.0, 0.0]), 0.1, 0.2),
+        (torch.tensor([0.0, 1.0, 0.0, 0.0]), 0.9, 0.1),
+        (torch.tensor([0.0, 0.0, 1.0, 0.0]), 0.5, 0.8),
+    ]):
+        cache.append(
+            key_fp=1000 + i,
+            key_rep=key_rep,
+            value_tok_ids=torch.zeros(cache.span_length, dtype=torch.int64),
+            value_anchor_id=0,
+            current_step=0,
+            embedding_version=0,
+            pressure_at_write=pressure,
+        )
+        cache.utility_u[i] = utility
     # Query exactly aligned with slot 0's key_rep.
     candidate = {
         "step": 1,
@@ -229,7 +254,7 @@ def test_controller_main_respects_score_mode():
     )
     assert cuw_tags[0]["slot"] == 0
 
-    # Pressure-only: cosine ignored. Top-1 = highest utility slot 1.
+    # Pressure-only: cosine and utility ignored. Top-1 = highest pressure slot 2.
     po_q: list[dict] = [dict(candidate)]
     po_tags: list[dict] = []
     run_controller_cycle(
@@ -239,7 +264,79 @@ def test_controller_main_respects_score_mode():
         k=1,
         score_mode="pressure_only",
     )
-    assert po_tags[0]["slot"] == 1
+    assert po_tags[0]["slot"] == 2
+
+
+def test_controller_main_builds_rank_prefixed_ids_when_query_id_absent():
+    """Legacy in-process candidates do not carry QUERY_EVENT ids yet. The
+    controller must still emit durable rank-prefixed ids so replay outcomes
+    can be joined to selections.
+    """
+    cache = _make_cache(key_rep_dim=4)
+    _populate_cache(
+        cache,
+        key_reps=[torch.tensor([1.0, 0.0, 0.0, 0.0])],
+        utilities=[0.5],
+    )
+    q = [{
+        "step": 7,
+        "rank": 3,
+        "k": 5,
+        "pressure": 0.5,
+        "residual": torch.tensor([1.0, 0.0, 0.0, 0.0]),
+    }]
+    tags: list[dict] = []
+    run_controller_cycle(
+        controller_query_queue=q,
+        tagged_replay_queue=tags,
+        cache=cache,
+        k=1,
+        score_mode="cosine_utility_weighted",
+        selected_at=123,
+        policy_version=4,
+    )
+    assert len(tags) == 1
+    tag = tags[0]
+    assert tag["query_event_id"] == (3 << 56) | 5
+    assert tag["replay_id"] == ((3 << 56) | 5) << 8
+    assert tag["selection_step"] == 123
+    assert tag["policy_version"] == 4
+
+
+def test_controller_main_uses_optional_runtime_for_controller_logit():
+    class RuntimeStub:
+        def __init__(self) -> None:
+            self.calls: list[tuple[torch.Tensor, int]] = []
+
+        def score_slot(self, features: torch.Tensor, *, slot: int) -> torch.Tensor:
+            self.calls.append((features.clone(), int(slot)))
+            return torch.tensor(100.0 + float(slot), dtype=torch.float32)
+
+    cache = _make_cache(key_rep_dim=4)
+    _populate_cache(
+        cache,
+        key_reps=[torch.tensor([1.0, 0.0, 0.0, 0.0])],
+        utilities=[0.5],
+    )
+    runtime = RuntimeStub()
+    tags: list[dict] = []
+    run_controller_cycle(
+        controller_query_queue=[{
+            "step": 1,
+            "rank": 0,
+            "k": 0,
+            "pressure": 0.25,
+            "residual": torch.tensor([1.0, 0.0, 0.0, 0.0]),
+        }],
+        tagged_replay_queue=tags,
+        cache=cache,
+        k=1,
+        score_mode="cosine_utility_weighted",
+        controller_runtime=runtime,
+    )
+    assert len(runtime.calls) == 1
+    assert tags[0]["teacher_score"] == tags[0]["score"]
+    assert tags[0]["controller_logit"] == 100.0
 
 
 def test_controller_thread_starts_and_stops_cleanly():

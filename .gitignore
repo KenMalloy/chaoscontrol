@@ -3,6 +3,8 @@
 __pycache__/
 *.pyc
 *.egg-info/
+*.so
+build/
 /results/
 experiments/*/results/*
 !experiments/*/results/.gitkeep

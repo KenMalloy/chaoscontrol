@@ -60,6 +60,8 @@ def run_controller_cycle(
     score_mode: str = "cosine_utility_weighted",
     queue_lock: threading.Lock | None = None,
     selected_at: int | None = None,
+    policy_version: int = 0,
+    controller_runtime: Any | None = None,
 ) -> int:
     """Run a single controller cycle: drain queries, push tags.
 
@@ -70,7 +72,8 @@ def run_controller_cycle(
             an fp32 tensor of shape ``[D]``. The cycle drains the entire
             queue under the lock (snapshot-and-clear).
         tagged_replay_queue: consumer-side queue. Each appended tag is
-            a dict with keys ``step, slot, score, selected_at``.
+            a dict with replay/action identity plus ``step, slot, score,
+            selected_at``.
             Tensors MUST NOT be stored on the tag (slow-OOM hazard);
             this is a pinned invariant.
         cache: the episodic cache. Read-only from the controller's
@@ -156,12 +159,42 @@ def run_controller_cycle(
         slot_list = slots.tolist()
         score_list = scores.tolist()
         producer_step = int(cand.get("step", -1))
-        for slot_i, score_i in zip(slot_list, score_list, strict=True):
+        query_event_id = _query_event_id_for_candidate(cand)
+        for selected_rank, (slot_i, score_i) in enumerate(
+            zip(slot_list, score_list, strict=True)
+        ):
+            controller_logit = float(score_i)
+            if controller_runtime is not None:
+                controller_logit = float(
+                    controller_runtime.score_slot(
+                        _controller_feature_vector(
+                            heuristic_score=float(score_i),
+                            pressure=float(cand.get("pressure", 0.0)),
+                            utility=float(cache.utility_u[int(slot_i)].item()),
+                            selected_rank=int(selected_rank),
+                        ),
+                        slot=int(slot_i),
+                    ).item()
+                )
+            replay_id = (int(query_event_id) << 8) | int(selected_rank)
             tagged_replay_queue.append({
                 "step": producer_step,
                 "slot": int(slot_i),
                 "score": float(score_i),
                 "selected_at": int(selected_at),
+                "replay_id": replay_id,
+                "query_event_id": int(query_event_id),
+                "source_write_id": int(
+                    cache.source_write_id[int(slot_i)].item()
+                    if hasattr(cache, "source_write_id")
+                    else cand.get("source_write_id", -1)
+                ),
+                "selected_rank": int(selected_rank),
+                "teacher_score": float(score_i),
+                "controller_logit": float(controller_logit),
+                "selection_step": int(selected_at),
+                "policy_version": int(policy_version),
+                "outcome_status": "pending",
             })
         # Drop the residual reference explicitly. ``cand`` goes out of
         # scope at end of loop iteration, but explicit clearing makes
@@ -194,13 +227,43 @@ def _scores_for_slots(
         cosines = keys_n @ q
         return cosines * util
     if score_mode == "pressure_only":
-        # TODO(task #101): replace with cache.pressure_at_write[slots]
-        # once the EpisodicCache schema gains the field. utility_u is
-        # the closest available proxy today; semantically wrong for the
-        # Arm B' mechanism-specificity test (spec wants pressure-only
-        # to ignore utility entirely).
-        return cache.utility_u.to(device)[slots]
+        return cache.pressure_at_write.to(device)[slots]
     raise ValueError(f"unknown score_mode={score_mode!r}")
+
+
+def _query_event_id_for_candidate(cand: dict[str, Any]) -> int:
+    """Return a durable rank-prefixed id for a controller query event.
+
+    The CPU SSM design gives QUERY_EVENT a rank-prefixed monotonic id. The
+    current in-process Python queue predates that schema, so legacy rows only
+    carry ``rank`` + ``k``. Prefer explicit ids when present and synthesize the
+    old shape only as a compatibility bridge.
+    """
+    for key in ("query_event_id", "candidate_id", "event_id"):
+        if key in cand:
+            return int(cand[key])
+    source_rank = int(cand.get("source_rank", cand.get("rank", 0)))
+    rank_seq = int(cand.get("rank_seq", cand.get("k", 0)))
+    return (source_rank << 56) | rank_seq
+
+
+def _controller_feature_vector(
+    *,
+    heuristic_score: float,
+    pressure: float,
+    utility: float,
+    selected_rank: int,
+) -> torch.Tensor:
+    """Compact V1 bridge features for the learned controller runtime."""
+    return torch.tensor(
+        [
+            float(heuristic_score),
+            float(pressure),
+            float(utility),
+            float(selected_rank),
+        ],
+        dtype=torch.float32,
+    )
 
 
 def controller_main(
@@ -212,6 +275,7 @@ def controller_main(
     queue_lock: threading.Lock | None = None,
     k: int = 16,
     score_mode: str = "cosine_utility_weighted",
+    controller_runtime: Any | None = None,
     cycle_idle_sleep_s: float = 0.005,
     heartbeat: list[int] | None = None,
 ) -> None:
@@ -247,6 +311,7 @@ def controller_main(
             k=k,
             score_mode=score_mode,
             queue_lock=queue_lock,
+            controller_runtime=controller_runtime,
         )
         if heartbeat is not None:
             heartbeat[0] += 1

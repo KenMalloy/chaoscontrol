@@ -50,6 +50,9 @@ class CacheEntry:
     last_fired_step: int
     write_step: int
     birth_embedding_version: int
+    pressure_at_write: float = 0.0
+    source_write_id: int = -1
+    write_bucket: int = -1
 
 
 class EpisodicCache:
@@ -75,6 +78,8 @@ class EpisodicCache:
         grace_steps: int = 200,
         utility_ema_decay: float = 0.99,
         fingerprint_window: int = 8,
+        slot_state_dim: int = 0,
+        simplex_k_max: int = 0,
     ) -> None:
         if capacity <= 0:
             raise ValueError(f"capacity must be positive; got {capacity}")
@@ -90,6 +95,14 @@ class EpisodicCache:
             raise ValueError(
                 f"fingerprint_window must be positive; got {fingerprint_window}"
             )
+        if slot_state_dim < 0:
+            raise ValueError(
+                f"slot_state_dim must be non-negative; got {slot_state_dim}"
+            )
+        if simplex_k_max < 0:
+            raise ValueError(
+                f"simplex_k_max must be non-negative; got {simplex_k_max}"
+            )
 
         self.capacity = int(capacity)
         self.span_length = int(span_length)
@@ -102,6 +115,8 @@ class EpisodicCache:
         # fingerprints but the controller queries with W=4 and scores
         # zero hits.
         self.fingerprint_window = int(fingerprint_window)
+        self.slot_state_dim = int(slot_state_dim)
+        self.simplex_k_max = int(simplex_k_max)
 
         # Storage. Parallel tensors keyed by slot index.
         self.key_fp = torch.zeros(self.capacity, dtype=torch.int64)
@@ -121,6 +136,22 @@ class EpisodicCache:
             self.capacity, dtype=torch.int64,
         )
         self.occupied = torch.zeros(self.capacity, dtype=torch.bool)
+        self.pressure_at_write = torch.zeros(self.capacity, dtype=torch.float32)
+        self.source_write_id = torch.full(
+            (self.capacity,), -1, dtype=torch.int64,
+        )
+        self.write_bucket = torch.full(
+            (self.capacity,), -1, dtype=torch.int64,
+        )
+        self.slot_state = torch.zeros(
+            self.capacity, self.slot_state_dim, dtype=torch.float16,
+        )
+        self.simplex_edge_slot = torch.full(
+            (self.capacity, self.simplex_k_max), -1, dtype=torch.int64,
+        )
+        self.simplex_edge_weight = torch.zeros(
+            self.capacity, self.simplex_k_max, dtype=torch.float16,
+        )
 
         # Hash index for fast key_fp -> slot lookup. Rebuilt on every
         # mutation to keep this simple; if the rebuild cost shows up in
@@ -147,6 +178,9 @@ class EpisodicCache:
         value_anchor_id: int,
         current_step: int,
         embedding_version: int,
+        pressure_at_write: float = 0.0,
+        source_write_id: int = -1,
+        write_bucket: int = -1,
     ) -> int:
         """Insert one entry. If the cache is full, evict the lowest-utility
         entry past its grace period; if no entry is past grace, evict by
@@ -188,6 +222,14 @@ class EpisodicCache:
         self.write_step[slot] = int(current_step)
         self.birth_embedding_version[slot] = int(embedding_version)
         self.occupied[slot] = True
+        self.pressure_at_write[slot] = float(pressure_at_write)
+        self.source_write_id[slot] = int(source_write_id)
+        self.write_bucket[slot] = int(write_bucket)
+        if self.slot_state_dim > 0:
+            self.slot_state[slot].zero_()
+        if self.simplex_k_max > 0:
+            self.simplex_edge_slot[slot].fill_(-1)
+            self.simplex_edge_weight[slot].zero_()
 
         # Insert into hash index. If a duplicate fingerprint already exists
         # at a different slot, the new write wins (the older slot remains
@@ -222,6 +264,9 @@ class EpisodicCache:
             birth_embedding_version=int(
                 self.birth_embedding_version[slot].item()
             ),
+            pressure_at_write=float(self.pressure_at_write[slot].item()),
+            source_write_id=int(self.source_write_id[slot].item()),
+            write_bucket=int(self.write_bucket[slot].item()),
         )
 
     def mark_fired(self, slot: int, current_step: int) -> None:
@@ -256,6 +301,14 @@ class EpisodicCache:
         self.last_fired_step[slot] = -1
         self.write_step[slot] = -1
         self.utility_u[slot] = 0.0
+        self.pressure_at_write[slot] = 0.0
+        self.source_write_id[slot] = -1
+        self.write_bucket[slot] = -1
+        if self.slot_state_dim > 0:
+            self.slot_state[slot].zero_()
+        if self.simplex_k_max > 0:
+            self.simplex_edge_slot[slot].fill_(-1)
+            self.simplex_edge_weight[slot].zero_()
 
     def reset(self) -> None:
         """Return the cache to its post-construction state.
@@ -281,6 +334,12 @@ class EpisodicCache:
         self.write_step.fill_(-1)
         self.birth_embedding_version.zero_()
         self.occupied.zero_()
+        self.pressure_at_write.zero_()
+        self.source_write_id.fill_(-1)
+        self.write_bucket.fill_(-1)
+        self.slot_state.zero_()
+        self.simplex_edge_slot.fill_(-1)
+        self.simplex_edge_weight.zero_()
         self._fp_index.clear()
 
     # ---- snapshot -------------------------------------------------------------
@@ -308,6 +367,20 @@ class EpisodicCache:
                 device, non_blocking=True,
             ),
             "occupied": self.occupied.to(device, non_blocking=True),
+            "pressure_at_write": self.pressure_at_write.to(
+                device, non_blocking=True,
+            ),
+            "source_write_id": self.source_write_id.to(
+                device, non_blocking=True,
+            ),
+            "write_bucket": self.write_bucket.to(device, non_blocking=True),
+            "slot_state": self.slot_state.to(device, non_blocking=True),
+            "simplex_edge_slot": self.simplex_edge_slot.to(
+                device, non_blocking=True,
+            ),
+            "simplex_edge_weight": self.simplex_edge_weight.to(
+                device, non_blocking=True,
+            ),
         }
 
     # ---- save / load ----------------------------------------------------------
@@ -321,6 +394,8 @@ class EpisodicCache:
         "grace_steps",
         "utility_ema_decay",
         "fingerprint_window",
+        "slot_state_dim",
+        "simplex_k_max",
     )
     # Per-slot tensor fields that round-trip as torch.Tensor (kept native
     # so the trainer's saved payload can copy_() into the new cache without
@@ -336,6 +411,12 @@ class EpisodicCache:
         "write_step",
         "birth_embedding_version",
         "occupied",
+        "pressure_at_write",
+        "source_write_id",
+        "write_bucket",
+        "slot_state",
+        "simplex_edge_slot",
+        "simplex_edge_weight",
     )
 
     def to_dict(self) -> dict[str, Any]:

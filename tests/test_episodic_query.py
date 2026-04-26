@@ -7,11 +7,7 @@ episodic rank's GPU and returns slot indices ranked by:
         score(i) = cosine_sim(query_residual, cache.key_rep[i]) * cache.utility_u[i]
 
   - ``score_mode="pressure_only"`` (Phase 3 Arm B' mechanism-specificity arm):
-        score(i) = cache.utility_u[i]
-        (EpisodicCache has no separate ``pressure_at_write`` field, so
-        ``utility_u`` is the proxy. The Phase 3 falsifier matrix uses
-        this arm to distinguish "memory persistence + similarity recall"
-        from "any rare-grad-aligned retrieval policy.")
+        score(i) = cache.pressure_at_write[i]
 
 Tests pin both score modes against tiny hand-built caches with known
 key_reps + utilities, plus the empty-cache edge case.
@@ -36,7 +32,8 @@ def _build_cache_with_entries(
 
     Each entry dict has keys ``key_fp``, ``key_rep`` (tensor [D]),
     ``utility_u`` (float, written directly into ``cache.utility_u`` after
-    append since ``append`` always initializes utility to 1.0).
+    append since ``append`` always initializes utility to 1.0), and optional
+    ``pressure_at_write``.
     """
     cache = EpisodicCache(
         capacity=capacity,
@@ -53,6 +50,7 @@ def _build_cache_with_entries(
                 value_anchor_id=0,
                 current_step=int(e.get("current_step", 0)),
                 embedding_version=0,
+                pressure_at_write=float(e.get("pressure_at_write", 0.0)),
             )
             # Override utility_u directly (append initializes it to 1.0
             # per Decision 0.2's cold-start fix).
@@ -106,10 +104,10 @@ def test_query_topk_cosine_utility_weighted():
 
 
 def test_query_topk_pressure_only():
-    """Pin the pressure-only score: ranks by ``utility_u`` alone.
+    """Pin the pressure-only score: ranks by ``pressure_at_write`` alone.
 
     The cosine term is fully ignored. Even a query exactly aligned with
-    the lowest-utility entry's key_rep returns the highest-utility slot
+    the lowest-pressure entry's key_rep returns the highest-pressure slot
     first.
     """
     D = 4
@@ -120,13 +118,28 @@ def test_query_topk_pressure_only():
         capacity=8,
         key_rep_dim=D,
         entries=[
-            {"key_fp": 100, "key_rep": e0_key, "utility_u": 0.1},
-            {"key_fp": 200, "key_rep": e1_key, "utility_u": 0.9},
-            {"key_fp": 300, "key_rep": e2_key, "utility_u": 0.5},
+            {
+                "key_fp": 100,
+                "key_rep": e0_key,
+                "utility_u": 0.9,
+                "pressure_at_write": 0.1,
+            },
+            {
+                "key_fp": 200,
+                "key_rep": e1_key,
+                "utility_u": 0.1,
+                "pressure_at_write": 0.9,
+            },
+            {
+                "key_fp": 300,
+                "key_rep": e2_key,
+                "utility_u": 0.5,
+                "pressure_at_write": 0.5,
+            },
         ],
     )
-    # Query exactly aligned with e0 — but e0 has the lowest utility.
-    # pressure_only mode ignores cosine, so top-1 = slot 1 (utility 0.9).
+    # Query exactly aligned with e0 — but e0 has the lowest pressure.
+    # pressure_only mode ignores cosine and utility, so top-1 = slot 1.
     q = torch.tensor([1.0, 0.0, 0.0, 0.0])
     out = query_topk(q, cache, k=3, score_mode="pressure_only")
     assert int(out[0].item()) == 1
