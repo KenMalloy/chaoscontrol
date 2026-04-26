@@ -49,6 +49,10 @@ forward_pretrain_model = (
     getattr(_C, "forward_pretrain_model", _missing_extension)
     if _C is not None else _missing_extension
 )
+recency_decay = (
+    getattr(_C, "recency_decay", _missing_extension)
+    if _C is not None else _missing_extension
+)
 controller_main = (
     getattr(_C, "controller_main", _missing_extension)
     if _C is not None else _missing_extension
@@ -112,6 +116,7 @@ __all__ = [
     "wire_event_constants",
     "load_weights_from_path",
     "forward_pretrain_model",
+    "recency_decay",
     "controller_main",
     "ActionHistoryEntry",
     "PerSlotActionHistory",

@@ -16,6 +16,7 @@
 
 #include "action_history.h"
 #include "controller_main.h"
+#include "credit.h"
 #include "posix_shm.h"
 #include "shm_ring.h"
 #include "spsc_ring.h"
@@ -679,6 +680,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "Load a CSWG controller pretrain weight dump");
   m.def("forward_pretrain_model", &forward_pretrain_model,
         "Run the D4 controller pretrain model from a CSWG weight dict");
+  m.def("recency_decay", &recency_decay,
+        pybind11::arg("reward"),
+        pybind11::arg("T"),
+        pybind11::arg("P"),
+        pybind11::arg("gamma") = 0.995f,
+        "Apply gamma^(T-P) credit decay, preserving defensive T<P behavior");
   m.def("has_amx_bf16", &has_amx_bf16, "Whether built with AMX BF16 support");
   m.def("backend_name", &backend_name, "Compiled backend name");
   m.def("wire_event_sizes", &wire_event_sizes,

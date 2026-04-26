@@ -22,6 +22,7 @@ def build_ext_modules() -> list:
     action_history_rel = (
         this_dir.relative_to(repo_root) / "src" / "action_history.cpp"
     )
+    credit_rel = this_dir.relative_to(repo_root) / "src" / "credit.cpp"
     return [
         CppExtension(
             name="chaoscontrol.kernels._cpu_ssm_controller._C",
@@ -30,6 +31,7 @@ def build_ext_modules() -> list:
                 str(controller_main_rel),
                 str(event_handlers_rel),
                 str(action_history_rel),
+                str(credit_rel),
             ],
             extra_compile_args={
                 "cxx": ["-O3", "-std=c++17"],
