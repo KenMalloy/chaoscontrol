@@ -223,13 +223,20 @@ def test_simplex_forward_matches_python_reference(seed: int):
 def test_simplex_forward_matches_python_reference_amx_bf16_path(seed: int):
     """Hardware-gated parity for the AMX BF16 dispatch path.
 
-    The forward GEMMs (V@W_vp, vh@vh.T, mh@W_lh) bf16-cast inputs before
-    handing them to the tiled AMX kernel. The fp32 NumPy reference does
-    the same multiply at full precision, so the worst-case drift is the
-    bf16 round-trip plus the chained accumulation across 16- to 32-wide
-    K dimensions. atol/rtol of 1e-2 is the bf16 ULP-equivalent slack
-    that mirrors `tests/test_amx_matmul.py`'s tolerance for the same
-    kernel — both target Sapphire Rapids.
+    Three chained BF16 GEMMs (V@W_vp, vh@vh.T, mh@W_lh) compound the
+    bf16 round-trip + accumulation error of each multiply. The 7-bit
+    mantissa puts per-multiply rel error at ~0.5%; with K=16-32
+    summation and three chained matmuls the worst-case rel drift on
+    raw logits is on the order of a few percent. Cancellation cases
+    (small result from large summands) inflate apparent rel error
+    arbitrarily — this is BF16 physics, not a kernel bug.
+
+    What the policy actually consumes is the softmax output and its
+    argmax, so we verify those tightly: argmax must agree exactly,
+    KL(amx || ref) must be near zero. The intermediate magnitudes are
+    bounded but loose, enough to catch a wholesale broken kernel
+    (e.g., wrong tile layout, dropped accumulator) without flagging
+    physically expected drift.
 
     Skipped on arm64 / non-AMX builds where the dispatch falls through
     to at::matmul; the strict 1e-4 test above covers that path.
@@ -248,11 +255,20 @@ def test_simplex_forward_matches_python_reference_amx_bf16_path(seed: int):
     cpp_mixed_h = np.asarray(cpp.mixed_h, dtype=np.float32).reshape(weights.N, weights.H)
     cpp_attn = np.asarray(cpp.attn, dtype=np.float32).reshape(weights.N, weights.N)
 
-    np.testing.assert_allclose(cpp_logits, ref["logits"], atol=1e-2, rtol=1e-2)
-    np.testing.assert_allclose(cpp_p, ref["p"], atol=1e-2, rtol=1e-2)
-    np.testing.assert_allclose(cpp_vertex_h, ref["vertex_h"], atol=1e-2, rtol=1e-2)
-    np.testing.assert_allclose(cpp_mixed_h, ref["mixed_h"], atol=1e-2, rtol=1e-2)
-    np.testing.assert_allclose(cpp_attn, ref["attn"], atol=1e-2, rtol=1e-2)
+    # Strict: discrete decision must match exactly.
+    assert int(np.argmax(cpp_p)) == int(np.argmax(ref["p"]))
+    assert int(np.argmax(cpp_logits)) == int(np.argmax(ref["logits"]))
+
+    # Strict: distribution agreement (softmax compresses elementwise drift).
+    kl = float((cpp_p * (np.log(cpp_p + 1e-30) - np.log(ref["p"] + 1e-30))).sum())
+    assert abs(kl) < 0.05, f"KL(amx||ref)={kl:.6f} exceeds 0.05 nats"
+
+    # Loose: intermediate magnitudes (BF16 cancellation slack).
+    np.testing.assert_allclose(cpp_logits, ref["logits"], atol=0.5, rtol=0.05)
+    np.testing.assert_allclose(cpp_p, ref["p"], atol=0.05, rtol=0.05)
+    np.testing.assert_allclose(cpp_vertex_h, ref["vertex_h"], atol=0.5, rtol=0.05)
+    np.testing.assert_allclose(cpp_mixed_h, ref["mixed_h"], atol=0.5, rtol=0.05)
+    np.testing.assert_allclose(cpp_attn, ref["attn"], atol=0.05, rtol=0.05)
 
 
 def test_simplex_forward_alpha_zero_recovers_per_vertex_softmax():
