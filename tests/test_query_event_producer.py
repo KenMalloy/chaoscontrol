@@ -1,12 +1,4 @@
-"""QUERY_EVENT producer in runner_fast_path (Phase B2).
-
-When episodic_event_log_enabled=True, the runner records one
-QUERY_EVENT dict per query emission. When the flag is unset, no
-list is allocated and behavior is bit-identical to pre-B2.
-
-Phase B4 will replace the in-process list with shm-ring pushes
-once Phase A4 (ShmRing) lands.
-"""
+"""QUERY_EVENT producer in runner_fast_path (Phase B4)."""
 from __future__ import annotations
 
 import importlib.util
@@ -16,20 +8,25 @@ import pytest
 import torch
 
 from chaoscontrol.episodic.gpu_slot import make_slot_tensor, pack_payload
+from chaoscontrol.kernels import _cpu_ssm_controller as _ext
 
 REPO = Path(__file__).resolve().parents[1]
 RUNNER_PATH = REPO / "experiments" / "23_fast_path" / "runner_fast_path.py"
 
 QUERY_EVENT_KEYS = (
     "event_type",
+    "source_rank",
+    "bucket",
     "query_id",
     "gpu_step",
-    "source_rank",
     "query_rep",
     "pressure",
     "pre_query_ce",
-    "bucket",
 )
+
+
+def _fp16_bits(values: torch.Tensor) -> list[int]:
+    return values.detach().cpu().to(torch.float16).view(torch.uint16).tolist()
 
 
 def _load_runner():
@@ -105,47 +102,51 @@ def test_query_event_emitted_when_log_enabled():
     consumer = _consumer(mod, event_log_enabled=True)
     residual = torch.tensor([1.25, 2.5, 3.75, 5.0], dtype=torch.float32)
 
-    mod._drain_episodic_payloads_gpu(
-        consumer=consumer,
-        gather_list=_gather_list_with_valid_query(
-            source_rank=1,
-            query_residual=residual,
-            pressure=0.875,
-        ),
-        span_length=2,
-        key_rep_dim=4,
-        k_max=1,
-        current_step=11,
-        embedding_version=0,
-        pre_query_ce=1.5,
-        query_bucket=3,
-    )
+    try:
+        assert consumer.query_ring_name is not None
+        mod._drain_episodic_payloads_gpu(
+            consumer=consumer,
+            gather_list=_gather_list_with_valid_query(
+                source_rank=1,
+                query_residual=residual,
+                pressure=0.875,
+            ),
+            span_length=2,
+            key_rep_dim=4,
+            k_max=1,
+            current_step=11,
+            embedding_version=0,
+            pre_query_ce=1.5,
+            query_bucket=3,
+        )
 
-    assert consumer.query_event_log is not None
-    assert len(consumer.query_event_log) == 1
-    event = consumer.query_event_log[0]
-    assert tuple(event.keys()) == QUERY_EVENT_KEYS
-    assert event["event_type"] == 2
-    assert event["query_id"] == (1 << 56)
-    assert event["gpu_step"] == 11
-    assert event["source_rank"] == 1
-    assert event["pressure"] == pytest.approx(0.875)
-    assert event["pre_query_ce"] == pytest.approx(1.5)
-    assert event["bucket"] == 3
-    assert len(event["query_rep"]) == 4
-    torch.testing.assert_close(
-        torch.tensor(event["query_rep"], dtype=torch.float16),
-        residual.to(torch.float16),
-    )
+        ring = _ext.ShmRingQueryEvent.attach(consumer.query_ring_name)
+        event = ring.pop()
+        assert ring.pop() is None
+        assert consumer.query_ring_drops == 0
+        assert event is not None
+        assert tuple(event.keys()) == QUERY_EVENT_KEYS
+        assert event["event_type"] == 2
+        assert event["query_id"] == (1 << 56)
+        assert event["gpu_step"] == 11
+        assert event["source_rank"] == 1
+        assert event["pressure"] == pytest.approx(0.875)
+        assert event["pre_query_ce"] == pytest.approx(1.5)
+        assert event["bucket"] == 3
+        assert len(event["query_rep"]) == 256
+        assert event["query_rep"][:4] == _fp16_bits(residual)
+    finally:
+        mod._cleanup_episodic_event_rings(consumer)
 
 
-def test_no_query_event_log_when_disabled():
-    """With episodic_event_log_enabled=False (default), no list is
+def test_no_query_ring_when_disabled():
+    """With episodic_event_log_enabled=False (default), no ring is
     allocated on the consumer state."""
     mod = _load_runner()
     consumer = _consumer(mod, event_log_enabled=False)
 
-    assert getattr(consumer, "query_event_log", None) is None
+    assert getattr(consumer, "query_ring", None) is None
+    assert getattr(consumer, "query_ring_name", None) is None
     mod._drain_episodic_payloads_gpu(
         consumer=consumer,
         gather_list=_gather_list_with_valid_query(source_rank=0),
@@ -156,7 +157,8 @@ def test_no_query_event_log_when_disabled():
         embedding_version=0,
     )
 
-    assert getattr(consumer, "query_event_log", None) is None
+    assert getattr(consumer, "query_ring", None) is None
+    assert getattr(consumer, "query_ring_name", None) is None
     assert len(consumer.controller_query_queue) == 1
 
 
@@ -166,18 +168,23 @@ def test_query_id_is_rank_prefixed_monotonic():
     mod = _load_runner()
     consumer = _consumer(mod, event_log_enabled=True)
 
-    mod._drain_episodic_payloads_gpu(
-        consumer=consumer,
-        gather_list=_gather_list_with_valid_query(source_rank=2, k_max=3),
-        span_length=2,
-        key_rep_dim=4,
-        k_max=3,
-        current_step=9,
-        embedding_version=0,
-    )
+    try:
+        assert consumer.query_ring_name is not None
+        mod._drain_episodic_payloads_gpu(
+            consumer=consumer,
+            gather_list=_gather_list_with_valid_query(source_rank=2, k_max=3),
+            span_length=2,
+            key_rep_dim=4,
+            k_max=3,
+            current_step=9,
+            embedding_version=0,
+        )
 
-    assert consumer.query_event_log is not None
-    assert len(consumer.query_event_log) == 3
-    query_ids = [row["query_id"] for row in consumer.query_event_log]
-    assert [qid >> 56 for qid in query_ids] == [2, 2, 2]
-    assert [qid & ((1 << 56) - 1) for qid in query_ids] == [0, 1, 2]
+        ring = _ext.ShmRingQueryEvent.attach(consumer.query_ring_name)
+        rows = [ring.pop(), ring.pop(), ring.pop()]
+        assert ring.pop() is None
+        query_ids = [row["query_id"] for row in rows]
+        assert [qid >> 56 for qid in query_ids] == [2, 2, 2]
+        assert [qid & ((1 << 56) - 1) for qid in query_ids] == [0, 1, 2]
+    finally:
+        mod._cleanup_episodic_event_rings(consumer)

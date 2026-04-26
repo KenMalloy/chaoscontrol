@@ -31,7 +31,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from typing import Sequence
+from typing import Any, MutableSequence, Sequence
 
 import torch
 
@@ -41,6 +41,8 @@ import torch
 # at vocab sizes up to 32 bits.
 _FINGERPRINT_MODULUS = (1 << 61) - 1
 _FINGERPRINT_BASE = 1_000_003
+KEY_REP_WIRE_DIM = 256
+VALUE_TOK_WIRE_LEN = 4
 
 # Per-rank monotonically-increasing sequence used to mint candidate_id for the
 # admission trace (Phase D1 of the CPU SSM controller plan). The sequence is
@@ -64,6 +66,41 @@ def _next_admission_trace_seq() -> int:
     seq = _admission_trace_seq
     _admission_trace_seq += 1
     return seq
+
+
+def tensor_fp16_to_u16_wire(
+    values: torch.Tensor,
+    *,
+    width: int = KEY_REP_WIRE_DIM,
+) -> list[int]:
+    """Encode a float tensor as fixed-width fp16 bit patterns for the wire."""
+    flat = values.detach().flatten().cpu().to(torch.float16)
+    if int(flat.numel()) > int(width):
+        raise ValueError(
+            f"wire key_rep width is {width}, got {int(flat.numel())}"
+        )
+    bits = flat.view(torch.uint16).tolist()
+    return [int(x) for x in bits] + [0] * (int(width) - len(bits))
+
+
+def token_ids_to_u16_wire(
+    values: torch.Tensor,
+    *,
+    width: int = VALUE_TOK_WIRE_LEN,
+) -> list[int]:
+    """Encode token ids as the fixed-width uint16 value span on the wire."""
+    flat = values.detach().flatten().cpu().to(torch.int64)
+    if int(flat.numel()) > int(width):
+        raise ValueError(
+            f"wire value_tok_ids width is {width}, got {int(flat.numel())}"
+        )
+    toks = [int(x) for x in flat.tolist()]
+    return toks + [0] * (int(width) - len(toks))
+
+
+def _increment_drop_counter(counter: MutableSequence[int] | None) -> None:
+    if counter is not None:
+        counter[0] = int(counter[0]) + 1
 
 
 @dataclass(frozen=True)
@@ -91,25 +128,19 @@ def build_write_event_dict(
     pre_write_ce: float,
     write_bucket: int,
 ) -> dict:
-    """Build the Phase B1 placeholder WRITE_EVENT dict in wire field order."""
+    """Build a fixed-width WRITE_EVENT dict in wire field order."""
     return {
         "event_type": 1,
+        "source_rank": int(source_rank),
+        "write_bucket": int(write_bucket),
         "candidate_id": int(candidate_id),
         "gpu_step": int(gpu_step),
-        "source_rank": int(source_rank),
         "key_fp": int(key_fp),
-        "key_rep": (
-            key_rep.detach()
-            .cpu()
-            .to(torch.float16)
-            .numpy()
-            .tolist()
-        ),
-        "value_tok_ids": value_tok_ids.detach().cpu().tolist(),
+        "key_rep": tensor_fp16_to_u16_wire(key_rep),
+        "value_tok_ids": token_ids_to_u16_wire(value_tok_ids),
         "value_anchor_id": int(value_anchor_id),
         "pressure_at_write": float(pressure_at_write),
         "pre_write_ce": float(pre_write_ce),
-        "write_bucket": int(write_bucket),
     }
 
 
@@ -245,7 +276,8 @@ def select_writes(
     gpu_step: int = 0,
     write_bucket: int = 0,
     admission_trace_path: str | None = None,
-    write_event_log: list[dict] | None = None,
+    write_ring: Any | None = None,
+    write_ring_drops: MutableSequence[int] | None = None,
 ) -> list[WritePayload]:
     """Select and build write payloads for one training step.
 
@@ -309,7 +341,8 @@ def select_writes(
     payloads: list[WritePayload] = []
     trace_rows: list[dict] = [] if admission_trace_path is not None else []
     needs_candidate_id = (
-        admission_trace_path is not None or write_event_log is not None
+        admission_trace_path is not None
+        or write_ring is not None
     )
     for i in range(positions.shape[0]):
         b = int(positions[i, 0].item())
@@ -331,22 +364,22 @@ def select_writes(
         )
         if payload is not None:
             payloads.append(payload)
-            if write_event_log is not None:
+            if write_ring is not None:
                 assert candidate_id is not None
-                write_event_log.append(
-                    build_write_event_dict(
-                        candidate_id=candidate_id,
-                        gpu_step=int(gpu_step),
-                        source_rank=int(source_rank),
-                        key_fp=int(payload.key_fp),
-                        key_rep=payload.key_rep,
-                        value_tok_ids=payload.value_tok_ids,
-                        value_anchor_id=int(payload.value_anchor_id),
-                        pressure_at_write=float(pressure[b, t].item()),
-                        pre_write_ce=float(per_token_ce[b, t].item()),
-                        write_bucket=int(write_bucket),
-                    )
+                event = build_write_event_dict(
+                    candidate_id=candidate_id,
+                    gpu_step=int(gpu_step),
+                    source_rank=int(source_rank),
+                    key_fp=int(payload.key_fp),
+                    key_rep=payload.key_rep,
+                    value_tok_ids=payload.value_tok_ids,
+                    value_anchor_id=int(payload.value_anchor_id),
+                    pressure_at_write=float(pressure[b, t].item()),
+                    pre_write_ce=float(per_token_ce[b, t].item()),
+                    write_bucket=int(write_bucket),
                 )
+                if not bool(write_ring.push(event)):
+                    _increment_drop_counter(write_ring_drops)
         if admission_trace_path is not None:
             # Reject path: ``payload is None`` means the candidate was
             # boundary-trimmed — no fingerprint window or no full target

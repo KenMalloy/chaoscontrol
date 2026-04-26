@@ -1,12 +1,4 @@
-"""REPLAY_OUTCOME producer in runner_fast_path (Phase B3).
-
-When episodic_event_log_enabled=True, the episodic replay drain records one
-REPLAY_OUTCOME dict per replay outcome. When the flag is unset, no list or
-bucket-baseline EMA is allocated.
-
-Phase B4 will replace the in-process list with shm-ring pushes once Phase A4
-(ShmRing) lands.
-"""
+"""REPLAY_OUTCOME producer in runner_fast_path (Phase B4)."""
 from __future__ import annotations
 
 import importlib.util
@@ -17,6 +9,7 @@ import pytest
 import torch
 import torch.nn as nn
 
+from chaoscontrol.kernels import _cpu_ssm_controller as _ext
 from chaoscontrol.optim.episodic_cache import EpisodicCache
 
 REPO = Path(__file__).resolve().parents[1]
@@ -24,14 +17,15 @@ RUNNER_PATH = REPO / "experiments" / "23_fast_path" / "runner_fast_path.py"
 
 REPLAY_OUTCOME_KEYS = (
     "event_type",
+    "selected_rank",
+    "outcome_status",
     "replay_id",
     "gpu_step",
     "query_event_id",
     "source_write_id",
     "slot_id",
-    "selection_step",
     "policy_version",
-    "selected_rank",
+    "selection_step",
     "teacher_score",
     "controller_logit",
     "ce_before_replay",
@@ -41,7 +35,6 @@ REPLAY_OUTCOME_KEYS = (
     "reward_shaped",
     "grad_cos_rare",
     "grad_cos_total",
-    "outcome_status",
     "flags",
 )
 
@@ -169,10 +162,19 @@ def test_replay_outcome_emitted_with_wire_schema_and_reward_fields():
 
     replayed = _run_replay_drain(mod, consumer=consumer, model=model)
 
-    assert replayed == 2
-    assert consumer.replay_outcome_log is not None
-    assert len(consumer.replay_outcome_log) == 2
-    first, second = consumer.replay_outcome_log
+    try:
+        assert replayed == 2
+        assert consumer.replay_ring_name is not None
+        ring = _ext.ShmRingReplayOutcome.attach(consumer.replay_ring_name)
+        first = ring.pop()
+        second = ring.pop()
+        assert ring.pop() is None
+    finally:
+        mod._cleanup_episodic_event_rings(consumer)
+
+    assert first is not None
+    assert second is not None
+    assert consumer.replay_ring_drops == 0
     assert tuple(first.keys()) == REPLAY_OUTCOME_KEYS
     assert tuple(second.keys()) == REPLAY_OUTCOME_KEYS
 
@@ -229,8 +231,14 @@ def test_replay_id_derives_from_query_event_id_when_controller_field_missing():
 
     _run_replay_drain(mod, consumer=consumer, model=model)
 
-    assert consumer.replay_outcome_log is not None
-    event = consumer.replay_outcome_log[0]
+    try:
+        assert consumer.replay_ring_name is not None
+        ring = _ext.ShmRingReplayOutcome.attach(consumer.replay_ring_name)
+        event = ring.pop()
+        assert ring.pop() is None
+    finally:
+        mod._cleanup_episodic_event_rings(consumer)
+    assert event is not None
     expected = ((0x0200_0000_0000_0005 & ((1 << 56) - 1)) << 8) | 2
     assert event["replay_id"] == expected
     assert event["selection_step"] == 17
@@ -246,7 +254,8 @@ def test_no_replay_outcome_state_when_disabled():
     cache = EpisodicCache(capacity=2, span_length=4, key_rep_dim=8)
     slot = _append_slot(cache, key_fp=42, write_bucket=0, source_write_id=91)
     consumer = _consumer(mod, event_log_enabled=False, cache=cache)
-    assert consumer.replay_outcome_log is None
+    assert consumer.replay_ring is None
+    assert consumer.replay_ring_name is None
     assert consumer.bucket_baseline_ema is None
     consumer.tagged_replay_queue.append({
         "slot": int(slot),
@@ -258,7 +267,8 @@ def test_no_replay_outcome_state_when_disabled():
     replayed = _run_replay_drain(mod, consumer=consumer, model=model)
 
     assert replayed == 1
-    assert consumer.replay_outcome_log is None
+    assert consumer.replay_ring is None
+    assert consumer.replay_ring_name is None
     assert consumer.bucket_baseline_ema is None
 
 
@@ -277,10 +287,15 @@ def test_slot_missing_outcome_is_recorded_without_replay():
 
     replayed = _run_replay_drain(mod, consumer=consumer, model=model)
 
-    assert replayed == 0
-    assert consumer.replay_outcome_log is not None
-    assert len(consumer.replay_outcome_log) == 1
-    event = consumer.replay_outcome_log[0]
+    try:
+        assert replayed == 0
+        assert consumer.replay_ring_name is not None
+        ring = _ext.ShmRingReplayOutcome.attach(consumer.replay_ring_name)
+        event = ring.pop()
+        assert ring.pop() is None
+    finally:
+        mod._cleanup_episodic_event_rings(consumer)
+    assert event is not None
     assert tuple(event.keys()) == REPLAY_OUTCOME_KEYS
     assert event["outcome_status"] == 1
     assert event["slot_id"] == 1

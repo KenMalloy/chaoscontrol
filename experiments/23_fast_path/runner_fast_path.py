@@ -72,12 +72,14 @@ from chaoscontrol.episodic.gpu_slot import (  # noqa: E402
     pack_payload,
     unpack_payload,
 )
+from chaoscontrol.kernels import _cpu_ssm_controller as _ext  # noqa: E402
 from chaoscontrol.optim.episodic_cache import EpisodicCache  # noqa: E402
 from chaoscontrol.optim.episodic_writer import (  # noqa: E402
     _next_admission_trace_seq,
     build_write_event_dict,
     fingerprint_tokens,
     select_top_p_positions,
+    tensor_fp16_to_u16_wire,
 )
 from chaoscontrol.optim.lamb import LAMB  # noqa: E402
 from chaoscontrol.optim.muon import Muon  # noqa: E402
@@ -1300,6 +1302,80 @@ def _run_scopt_train_step(
 _DEFAULT_EPISODIC_K_MAX = 16
 
 
+def _event_ring_name(prefix: str, *, rank: int | None = None) -> str:
+    pid = int(os.getpid())
+    if rank is None:
+        return f"{prefix}_pid{pid}"
+    exact = f"{prefix}_rank{int(rank)}_pid{pid}"
+    if (
+        sys.platform == "darwin"
+        and prefix == "/cc_episodic_write"
+        and len(exact) > 31
+    ):
+        return f"{prefix}_r{int(rank)}_pid{pid}"
+    return exact
+
+
+def _create_event_ring(cls: Any, name: str) -> Any:
+    # POSIX shm names can outlive a crashed test process. B4 names are
+    # PID-scoped, so unlink-before-create is safe cleanup for stale regions.
+    try:
+        cls.unlink(name)
+    except Exception:
+        pass
+    return cls.create(name)
+
+
+def _push_event_ring(
+    owner: Any,
+    *,
+    ring_attr: str,
+    drops_attr: str,
+    event: dict[str, Any],
+) -> bool:
+    ring = getattr(owner, ring_attr, None)
+    if ring is None:
+        return False
+    pushed = bool(ring.push(event))
+    if not pushed:
+        setattr(owner, drops_attr, int(getattr(owner, drops_attr, 0)) + 1)
+    return pushed
+
+
+def _u8_wire(value: int, *, sentinel: int = 255) -> int:
+    v = int(value)
+    return v if 0 <= v <= 255 else int(sentinel)
+
+
+def _u64_wire(value: int, *, sentinel: int = (1 << 64) - 1) -> int:
+    v = int(value)
+    return v if v >= 0 else int(sentinel)
+
+
+def _cleanup_episodic_event_rings(owner: Any) -> None:
+    for name_attr, ring_attr, cls in (
+        ("write_ring_name", "write_ring", _ext.ShmRingWriteEvent),
+        ("query_ring_name", "query_ring", _ext.ShmRingQueryEvent),
+        ("replay_ring_name", "replay_ring", _ext.ShmRingReplayOutcome),
+    ):
+        name = getattr(owner, name_attr, None)
+        if name:
+            try:
+                cls.unlink(str(name))
+            except Exception:
+                pass
+        if hasattr(owner, ring_attr):
+            try:
+                setattr(owner, ring_attr, None)
+            except Exception:
+                pass
+        if hasattr(owner, name_attr):
+            try:
+                setattr(owner, name_attr, None)
+            except Exception:
+                pass
+
+
 class EpisodicGpuEmit:
     """Train-rank handle threaded into ``_run_train_step``.
 
@@ -1325,7 +1401,9 @@ class EpisodicGpuEmit:
         "key_rep_dim",
         "fingerprint_window",
         "top_p",
-        "write_event_log",
+        "write_ring",
+        "write_ring_name",
+        "write_ring_drops",
     )
 
     def __init__(
@@ -1337,7 +1415,8 @@ class EpisodicGpuEmit:
         key_rep_dim: int,
         fingerprint_window: int,
         top_p: float,
-        write_event_log: list[dict[str, Any]] | None = None,
+        write_ring: Any | None = None,
+        write_ring_name: str | None = None,
     ) -> None:
         self.slot_tensor = slot_tensor
         self.k_max = k_max
@@ -1345,10 +1424,9 @@ class EpisodicGpuEmit:
         self.key_rep_dim = key_rep_dim
         self.fingerprint_window = fingerprint_window
         self.top_p = top_p
-        # Phase B1 placeholder for per-train-rank WRITE_EVENT wire records.
-        # Disabled keeps this None so the hot path allocates no list and emits
-        # no records; Phase B4 will swap the append for shm-ring push.
-        self.write_event_log = write_event_log
+        self.write_ring = write_ring
+        self.write_ring_name = write_ring_name
+        self.write_ring_drops = 0
 
 
 def _create_episodic_emit(
@@ -1404,12 +1482,17 @@ def _create_episodic_emit(
     top_p = float(config.get("episodic_top_p", float("nan")))
     event_log_enabled = bool(config.get("episodic_event_log_enabled", False))
     # WRITE_EVENT producers live on train ranks. The episodic rank carries an
-    # all-zero gather tensor only, so allocating a list there would be a false
-    # signal and would violate the default "no list unless enabled producer"
+    # all-zero gather tensor only, so allocating a ring there would be a false
+    # signal and would violate the default "no producer unless enabled"
     # invariant.
-    write_event_log = (
-        [] if event_log_enabled and int(rank) != int(world_size) - 1 else None
-    )
+    write_ring = None
+    write_ring_name = None
+    if event_log_enabled and int(rank) != int(world_size) - 1:
+        write_ring_name = _event_ring_name(
+            "/cc_episodic_write",
+            rank=int(rank),
+        )
+        write_ring = _create_event_ring(_ext.ShmRingWriteEvent, write_ring_name)
     return EpisodicGpuEmit(
         slot_tensor=slot,
         k_max=k_max,
@@ -1417,7 +1500,8 @@ def _create_episodic_emit(
         key_rep_dim=key_rep_dim,
         fingerprint_window=fingerprint_window,
         top_p=top_p,
-        write_event_log=write_event_log,
+        write_ring=write_ring,
+        write_ring_name=write_ring_name,
     )
 
 
@@ -1514,7 +1598,7 @@ def _emit_episodic_payloads_gpu(
         b = int(positions[k, 0].item())
         t = int(positions[k, 1].item())
         candidate_id: int | None = None
-        if emit.write_event_log is not None:
+        if emit.write_ring is not None:
             candidate_id = _rank_prefixed_event_id(
                 source_rank=int(rank),
                 rank_seq=_next_admission_trace_seq(),
@@ -1548,10 +1632,13 @@ def _emit_episodic_payloads_gpu(
             span_length=S,
             key_rep_dim=D,
         )
-        if emit.write_event_log is not None:
+        if emit.write_ring is not None:
             assert candidate_id is not None
-            emit.write_event_log.append(
-                build_write_event_dict(
+            _push_event_ring(
+                emit,
+                ring_attr="write_ring",
+                drops_attr="write_ring_drops",
+                event=build_write_event_dict(
                     candidate_id=int(candidate_id),
                     gpu_step=int(current_step),
                     source_rank=int(rank),
@@ -1562,7 +1649,7 @@ def _emit_episodic_payloads_gpu(
                     pressure_at_write=float(pressure_full[b, t].item()),
                     pre_write_ce=float(ce_full[b, t].item()),
                     write_bucket=int(write_bucket),
-                )
+                ),
             )
     # Single GPU-to-GPU collective. Train ranks emit-only — they pass
     # ``gather_list=None`` to ``dist.gather`` and the episodic rank
@@ -1612,9 +1699,13 @@ class _EpisodicConsumerState:
         "controller_query_queue",
         "controller_query_enabled",
         "tagged_replay_queue",
-        "query_event_log",
+        "query_ring",
+        "query_ring_name",
+        "query_ring_drops",
         "rank_query_seq",
-        "replay_outcome_log",
+        "replay_ring",
+        "replay_ring_name",
+        "replay_ring_drops",
         "bucket_baseline_ema",
         "compute_replay_ce_pair",
         "pending_post_step_replays",
@@ -1648,21 +1739,29 @@ class _EpisodicConsumerState:
         self.tagged_replay_queue = (
             [] if tagged_replay_queue is None else tagged_replay_queue
         )
-        # Phase B2 placeholder for QUERY_EVENT wire records. When disabled,
-        # keep this as None so the default path allocates no list and appends
-        # no records; Phase B4 will swap the list append for shm-ring push.
-        self.query_event_log: list[dict[str, Any]] | None = (
-            [] if episodic_event_log_enabled else None
-        )
+        self.query_ring = None
+        self.query_ring_name: str | None = None
+        self.query_ring_drops = 0
+        if episodic_event_log_enabled:
+            self.query_ring_name = _event_ring_name("/cc_episodic_query")
+            self.query_ring = _create_event_ring(
+                _ext.ShmRingQueryEvent,
+                self.query_ring_name,
+            )
         self.rank_query_seq: dict[int, int] | None = (
             {} if episodic_event_log_enabled else None
         )
-        # Phase B3 placeholder for REPLAY_OUTCOME wire records and its
-        # per-bucket reward baseline. Disabled keeps both None: no list, no
-        # EMA state, no event emission on the default path.
-        self.replay_outcome_log: list[dict[str, Any]] | None = (
-            [] if episodic_event_log_enabled else None
-        )
+        self.replay_ring = None
+        self.replay_ring_name: str | None = None
+        self.replay_ring_drops = 0
+        if episodic_event_log_enabled:
+            self.replay_ring_name = _event_ring_name("/cc_episodic_replay")
+            self.replay_ring = _create_event_ring(
+                _ext.ShmRingReplayOutcome,
+                self.replay_ring_name,
+            )
+        # Per-bucket reward baseline. Disabled keeps None: no EMA state and
+        # no event emission on the default path.
         self.bucket_baseline_ema: list[float] | None = (
             [0.0, 0.0, 0.0, 0.0] if episodic_event_log_enabled else None
         )
@@ -1803,33 +1902,32 @@ def _emit_query_event(
     pre_query_ce: float,
     bucket: int,
 ) -> int | None:
-    """Append a QUERY_EVENT dict to the Phase B2 placeholder log.
+    """Push a QUERY_EVENT dict to the Phase B4 shm ring.
 
     Returns the query_id when an event is emitted; returns None when the event
-    log is disabled. The dict field order mirrors QueryEvent in wire_events.h.
+    ring is disabled. The dict field order mirrors QueryEvent in wire_events.h.
     """
-    if consumer.query_event_log is None or consumer.rank_query_seq is None:
+    if consumer.query_ring is None or consumer.rank_query_seq is None:
         return None
     rank = int(source_rank)
     seq = int(consumer.rank_query_seq.get(rank, 0))
     consumer.rank_query_seq[rank] = seq + 1
     query_id = _rank_prefixed_event_id(source_rank=rank, rank_seq=seq)
-    consumer.query_event_log.append({
-        "event_type": 2,
-        "query_id": int(query_id),
-        "gpu_step": int(gpu_step),
-        "source_rank": rank,
-        "query_rep": (
-            query_residual.detach()
-            .cpu()
-            .to(torch.float16)
-            .numpy()
-            .tolist()
-        ),
-        "pressure": float(pressure),
-        "pre_query_ce": float(pre_query_ce),
-        "bucket": int(bucket),
-    })
+    _push_event_ring(
+        consumer,
+        ring_attr="query_ring",
+        drops_attr="query_ring_drops",
+        event={
+            "event_type": 2,
+            "source_rank": rank,
+            "bucket": _u8_wire(int(bucket)),
+            "query_id": int(query_id),
+            "gpu_step": int(gpu_step),
+            "query_rep": tensor_fp16_to_u16_wire(query_residual),
+            "pressure": float(pressure),
+            "pre_query_ce": float(pre_query_ce),
+        },
+    )
     return int(query_id)
 
 
@@ -1873,7 +1971,7 @@ def _emit_replay_outcome(
     grad_cos_total: float = float("nan"),
     defer_reward_shaping: bool = False,
 ) -> dict[str, Any] | None:
-    """Append a REPLAY_OUTCOME dict to the Phase B3 placeholder log.
+    """Push a REPLAY_OUTCOME dict to the Phase B4 shm ring.
 
     The real controller fields are threaded through when present. Sentinel
     defaults are documented inline so Phase C can replace them deliberately.
@@ -1886,9 +1984,9 @@ def _emit_replay_outcome(
     delta (NaN-skip in place) and the dict's reward fields are computed
     inline against the supplied ``ce_after_replay``.
     """
-    replay_outcome_log = getattr(consumer, "replay_outcome_log", None)
+    replay_ring = getattr(consumer, "replay_ring", None)
     bucket_baseline_ema = getattr(consumer, "bucket_baseline_ema", None)
-    if replay_outcome_log is None or bucket_baseline_ema is None:
+    if replay_ring is None or bucket_baseline_ema is None:
         return None
 
     query_event_id = int(entry.get("query_event_id", -1))
@@ -1945,14 +2043,15 @@ def _emit_replay_outcome(
 
     event = {
         "event_type": 3,
-        "replay_id": int(replay_id),
+        "selected_rank": _u8_wire(int(selected_rank)),
+        "outcome_status": _u8_wire(int(outcome_status)),
+        "replay_id": _u64_wire(int(replay_id)),
         "gpu_step": int(current_step),
-        "query_event_id": int(query_event_id),
-        "source_write_id": int(source_write_id),
+        "query_event_id": _u64_wire(int(query_event_id)),
+        "source_write_id": _u64_wire(int(source_write_id)),
         "slot_id": int(slot),
-        "selection_step": int(selection_step),
         "policy_version": int(policy_version),
-        "selected_rank": int(selected_rank),
+        "selection_step": int(selection_step),
         "teacher_score": float(teacher_score),
         "controller_logit": float(controller_logit),
         "ce_before_replay": float(ce_before_replay),
@@ -1962,10 +2061,15 @@ def _emit_replay_outcome(
         "reward_shaped": float(reward_shaped),
         "grad_cos_rare": float(grad_cos_rare),
         "grad_cos_total": float(grad_cos_total),
-        "outcome_status": int(outcome_status),
         "flags": 0,
     }
-    replay_outcome_log.append(event)
+    if not defer_reward_shaping:
+        _push_event_ring(
+            consumer,
+            ring_attr="replay_ring",
+            drops_attr="replay_ring_drops",
+            event=event,
+        )
     return event
 
 
@@ -2691,11 +2795,9 @@ def _run_post_step_replay_ce(
             baseline = float(bucket_baseline_ema[bucket])
         ce_delta_raw = ce_before - ce_after
         reward_shaped = ce_delta_raw - baseline
-        # Patch the dict reference in-place — the same Python object is
-        # already on ``consumer.replay_outcome_log``, so downstream
-        # readers (Phase B4 shm-ring push, Phase D3 NDJSON sink, the BC
-        # pretrain corpus) see the finalized values without an extra
-        # bookkeeping pass.
+        # Patch before pushing to the B4 ring: shm ring push copies the dict
+        # into fixed wire storage, so the old placeholder-list in-place
+        # mutation trick would otherwise leave the ring with NaN rewards.
         event_dict["ce_before_replay"] = float(ce_before)
         event_dict["ce_after_replay"] = float(ce_after)
         event_dict["ce_delta_raw"] = float(ce_delta_raw)
@@ -2711,6 +2813,12 @@ def _run_post_step_replay_ce(
                 (1.0 - alpha) * float(bucket_baseline_ema[bucket])
                 + alpha * float(ce_delta_raw)
             )
+        _push_event_ring(
+            consumer,
+            ring_attr="replay_ring",
+            drops_attr="replay_ring_drops",
+            event=event_dict,
+        )
         ndjson_logger = staged.get("ndjson_logger")
         ndjson_row = staged.get("ndjson_row")
         if ndjson_logger is not None and ndjson_row is not None:
@@ -4583,12 +4691,8 @@ def train_fast_for_budget(
         # no-op. Bounded join so a stuck loop can't block the runner's
         # exit indefinitely.
         _shutdown_episodic_controller(episodic_controller_handle)
-        # Pass C: no shm to clean up. The GPU slot tensors are plain
-        # ``torch.Tensor`` objects; their lifetime ends with the
-        # ``EpisodicGpuEmit`` handle going out of scope. The
-        # controller_query_queue is a Python list on the episodic rank
-        # consumer state; it stays alive for telemetry inspection until
-        # the consumer state itself is dropped.
+        _cleanup_episodic_event_rings(episodic_emit_handle)
+        _cleanup_episodic_event_rings(episodic_consumer)
 
     if ddp_active:
         dist.barrier()

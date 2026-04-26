@@ -10,11 +10,12 @@ emitted.
 
 Two contracts pin here:
 
-1. **Flag ON** — drain emits NaN reward placeholders, post-step pass
-   patches finite values into ``ce_before_replay`` (override =
-   helper's ``replay_loss``), ``ce_after_replay`` (post-step CE on the
-   same value tokens), ``ce_delta_raw``, ``bucket_baseline``,
-   ``reward_shaped``, AND advances the per-bucket EMA on the real delta.
+1. **Flag ON** — drain stages NaN reward placeholders internally, then
+   the post-step pass patches finite values into ``ce_before_replay``
+   (override = helper's ``replay_loss``), ``ce_after_replay`` (post-step
+   CE on the same value tokens), ``ce_delta_raw``, ``bucket_baseline``,
+   ``reward_shaped``, pushes the finalized shm-ring event, AND advances
+   the per-bucket EMA on the real delta.
 2. **Flag OFF** (B3 default) — bit-identical to the producer test:
    ``ce_after_replay`` stays NaN, EMA never updates, no pending list is
    allocated. Tested in ``tests/test_replay_outcome_producer.py``; this
@@ -42,6 +43,7 @@ import torch
 import torch.nn as nn
 
 from chaoscontrol.episodic.diagnostics import DiagnosticsLogger
+from chaoscontrol.kernels import _cpu_ssm_controller as _ext
 from chaoscontrol.optim.episodic_cache import EpisodicCache
 
 REPO = Path(__file__).resolve().parents[1]
@@ -144,6 +146,11 @@ def _step_optimizer_and_finalize(mod, *, consumer, model, optimizer):
     return mod._run_post_step_replay_ce(consumer=consumer, model=model)
 
 
+def _replay_ring(consumer):
+    assert consumer.replay_ring_name is not None
+    return _ext.ShmRingReplayOutcome.attach(consumer.replay_ring_name)
+
+
 def test_compute_replay_ce_pair_off_keeps_b3_defaults():
     """Flag OFF: no pending list, no EMA update, reward fields NaN."""
     mod = _load_runner()
@@ -177,19 +184,22 @@ def test_compute_replay_ce_pair_off_keeps_b3_defaults():
     })
 
     replayed = _drain(mod, consumer=consumer, model=model)
-    assert replayed == 1
-    assert consumer.replay_outcome_log is not None
-    event = consumer.replay_outcome_log[0]
-    # B3 default: entry-supplied ce_before_replay survives, everything
-    # downstream of it stays NaN until B5 fills it.
-    assert event["ce_before_replay"] == pytest.approx(4.0)
-    assert math.isnan(event["ce_after_replay"])
-    assert math.isnan(event["ce_delta_raw"])
-    assert math.isnan(event["reward_shaped"])
-    # No pending list, no EMA mutation regardless of optimizer step.
-    patched = mod._run_post_step_replay_ce(consumer=consumer, model=model)
-    assert patched == 0
-    assert consumer.bucket_baseline_ema == [0.0, 0.0, 0.0, 0.0]
+    try:
+        assert replayed == 1
+        event = _replay_ring(consumer).pop()
+        assert event is not None
+        # B3 default: entry-supplied ce_before_replay survives, everything
+        # downstream of it stays NaN until B5 fills it.
+        assert event["ce_before_replay"] == pytest.approx(4.0)
+        assert math.isnan(event["ce_after_replay"])
+        assert math.isnan(event["ce_delta_raw"])
+        assert math.isnan(event["reward_shaped"])
+        # No pending list, no EMA mutation regardless of optimizer step.
+        patched = mod._run_post_step_replay_ce(consumer=consumer, model=model)
+        assert patched == 0
+        assert consumer.bucket_baseline_ema == [0.0, 0.0, 0.0, 0.0]
+    finally:
+        mod._cleanup_episodic_event_rings(consumer)
 
 
 def test_compute_replay_ce_pair_on_finalizes_reward_fields_after_step():
@@ -230,39 +240,39 @@ def test_compute_replay_ce_pair_on_finalizes_reward_fields_after_step():
     optimizer.zero_grad(set_to_none=True)
     replayed = _drain(mod, consumer=consumer, model=model)
     assert replayed == 1
-    # Drain emitted the dict already; reward fields are NaN until the
-    # post-step pass runs.
-    assert len(consumer.replay_outcome_log) == 1
-    event = consumer.replay_outcome_log[0]
-    assert math.isnan(event["ce_after_replay"])
-    assert math.isnan(event["ce_delta_raw"])
-    assert math.isnan(event["reward_shaped"])
-    # ce_before_replay was overridden to the helper's replay_loss
-    # (finite mean CE) — NOT the upstream 99.0 placeholder.
-    assert math.isfinite(event["ce_before_replay"])
-    assert event["ce_before_replay"] != pytest.approx(99.0)
+    # Deferred mode does not push a partial wire event; the shm ring sees
+    # only the finalized post-step reward fields.
+    ring = _replay_ring(consumer)
+    assert ring.pop() is None
     assert len(consumer.pending_post_step_replays) == 1
 
-    patched = _step_optimizer_and_finalize(
-        mod, consumer=consumer, model=model, optimizer=optimizer,
-    )
-    assert patched == 1
-    # Pending list is drained — next step starts clean.
-    assert consumer.pending_post_step_replays == []
-    # Reward fields are now finite and self-consistent.
-    assert math.isfinite(event["ce_before_replay"])
-    assert math.isfinite(event["ce_after_replay"])
-    expected_delta = (
-        float(event["ce_before_replay"]) - float(event["ce_after_replay"])
-    )
-    assert event["ce_delta_raw"] == pytest.approx(expected_delta)
-    assert event["bucket_baseline"] == pytest.approx(0.0)
-    assert event["reward_shaped"] == pytest.approx(expected_delta)
-    # EMA absorbed the finite delta on this bucket.
-    assert consumer.bucket_baseline_ema is not None
-    assert consumer.bucket_baseline_ema[2] == pytest.approx(
-        0.05 * expected_delta
-    )
+    try:
+        patched = _step_optimizer_and_finalize(
+            mod, consumer=consumer, model=model, optimizer=optimizer,
+        )
+        assert patched == 1
+        # Pending list is drained — next step starts clean.
+        assert consumer.pending_post_step_replays == []
+        event = ring.pop()
+        assert event is not None
+        assert ring.pop() is None
+        # Reward fields are now finite and self-consistent.
+        assert math.isfinite(event["ce_before_replay"])
+        assert event["ce_before_replay"] != pytest.approx(99.0)
+        assert math.isfinite(event["ce_after_replay"])
+        expected_delta = (
+            float(event["ce_before_replay"]) - float(event["ce_after_replay"])
+        )
+        assert event["ce_delta_raw"] == pytest.approx(expected_delta)
+        assert event["bucket_baseline"] == pytest.approx(0.0)
+        assert event["reward_shaped"] == pytest.approx(expected_delta)
+        # EMA absorbed the finite delta on this bucket.
+        assert consumer.bucket_baseline_ema is not None
+        assert consumer.bucket_baseline_ema[2] == pytest.approx(
+            0.05 * expected_delta
+        )
+    finally:
+        mod._cleanup_episodic_event_rings(consumer)
 
 
 def test_ndjson_row_uses_post_step_replay_outcome_reward_fields():
@@ -310,19 +320,23 @@ def test_ndjson_row_uses_post_step_replay_outcome_reward_fields():
                 mod, consumer=consumer, model=model, optimizer=optimizer,
             )
             assert patched == 1
+            event = _replay_ring(consumer).pop()
+            assert event is not None
             logger.flush()
 
         (line,) = log_path.read_text().splitlines()
-    row = json.loads(line)
-    event = consumer.replay_outcome_log[0]
-    for field in (
-        "ce_before_replay",
-        "ce_after_replay",
-        "ce_delta_raw",
-        "bucket_baseline",
-        "reward_shaped",
-    ):
-        assert row[field] == pytest.approx(float(event[field]))
+    try:
+        row = json.loads(line)
+        for field in (
+            "ce_before_replay",
+            "ce_after_replay",
+            "ce_delta_raw",
+            "bucket_baseline",
+            "reward_shaped",
+        ):
+            assert row[field] == pytest.approx(float(event[field]))
+    finally:
+        mod._cleanup_episodic_event_rings(consumer)
 
 
 def test_post_step_pass_is_noop_with_empty_pending_list():
@@ -338,8 +352,11 @@ def test_post_step_pass_is_noop_with_empty_pending_list():
     )
     assert consumer.pending_post_step_replays == []
     patched = mod._run_post_step_replay_ce(consumer=consumer, model=model)
-    assert patched == 0
-    assert consumer.bucket_baseline_ema == [0.0, 0.0, 0.0, 0.0]
+    try:
+        assert patched == 0
+        assert consumer.bucket_baseline_ema == [0.0, 0.0, 0.0, 0.0]
+    finally:
+        mod._cleanup_episodic_event_rings(consumer)
 
 
 def test_compute_replay_ce_pair_majority_positive_delta_sanity():
@@ -398,12 +415,16 @@ def test_compute_replay_ce_pair_majority_positive_delta_sanity():
             mod, consumer=consumer, model=model, optimizer=optimizer,
         )
         assert patched == 1
-        event = consumer.replay_outcome_log[0]
-        delta = float(event["ce_delta_raw"])
-        assert math.isfinite(delta), (
-            f"replay {replay_idx}: ce_delta_raw not finite: {delta!r}"
-        )
-        deltas.append(delta)
+        try:
+            event = _replay_ring(consumer).pop()
+            assert event is not None
+            delta = float(event["ce_delta_raw"])
+            assert math.isfinite(delta), (
+                f"replay {replay_idx}: ce_delta_raw not finite: {delta!r}"
+            )
+            deltas.append(delta)
+        finally:
+            mod._cleanup_episodic_event_rings(consumer)
 
     positive = sum(1 for d in deltas if d > 0.0)
     fraction_positive = positive / len(deltas)
