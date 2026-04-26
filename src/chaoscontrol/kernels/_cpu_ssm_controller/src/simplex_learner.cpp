@@ -6,10 +6,17 @@
 #include <ATen/ATen.h>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstring>
 #include <stdexcept>
 #include <string>
+
+#if defined(__x86_64__) && defined(__AVX512F__) && \
+    defined(CHAOSCONTROL_CPU_SSM_AVX512_KERNEL)
+#define CHAOSCONTROL_SIMPLEX_LEARNER_AVX512 1
+#include <immintrin.h>
+#endif
 
 namespace chaoscontrol::simplex {
 namespace {
@@ -49,6 +56,13 @@ at::Tensor view_1d(std::vector<float>& buf, int64_t n) {
 at::Tensor view_1d(const std::vector<float>& buf, int64_t n) {
   return at::from_blob(
       const_cast<float*>(buf.data()),
+      {n},
+      at::TensorOptions().dtype(at::kFloat).device(at::kCPU));
+}
+
+at::Tensor view_1d_ptr(float* data, int64_t n) {
+  return at::from_blob(
+      data,
       {n},
       at::TensorOptions().dtype(at::kFloat).device(at::kCPU));
 }
@@ -144,6 +158,64 @@ void copy_simplex_shape(const SimplexWeights& src, SimplexWeights& dst) {
   dst.W_e.assign(src.W_e.size(), 0.0f);
 }
 
+void build_logits_gradient(
+    const std::vector<float>& p,
+    uint32_t chosen,
+    float advantage,
+    float temperature,
+    float entropy_beta,
+    float* g_logits,
+    float* log_p,
+    int64_t n,
+    float& entropy) {
+  entropy = 0.0f;
+  for (int64_t i = 0; i < n; ++i) {
+    const std::size_t idx = static_cast<std::size_t>(i);
+    const float p_i = p[idx];
+    const float log_p_i = std::log(std::max(p_i, 1.0e-30f));
+    log_p[idx] = log_p_i;
+    entropy -= p_i * log_p_i;
+  }
+
+  const float adv_over_t = advantage / temperature;
+  const float beta_over_t = entropy_beta / temperature;
+
+#if defined(CHAOSCONTROL_SIMPLEX_LEARNER_AVX512)
+  // Production simplex N=16 is exactly one AVX-512 vector and one
+  // 64-byte L1 cache line. Keep the hot arithmetic in registers on SPR;
+  // logf is scalar because AVX-512F has no native log instruction.
+  if (n == 16 && chaoscontrol::cpu_features::runtime_has_avx512f()) {
+    const __m512 p_v = _mm512_loadu_ps(p.data());
+    const __m512 log_p_v = _mm512_loadu_ps(log_p);
+    __m512 g_v = _mm512_mul_ps(p_v, _mm512_set1_ps(adv_over_t));
+    if (entropy_beta != 0.0f) {
+      const __m512 bonus_shape = _mm512_mul_ps(
+          p_v,
+          _mm512_add_ps(log_p_v, _mm512_set1_ps(entropy)));
+      g_v = _mm512_fmadd_ps(
+          _mm512_set1_ps(beta_over_t), bonus_shape, g_v);
+    }
+    _mm512_storeu_ps(g_logits, g_v);
+    if (chosen < 16) {
+      g_logits[chosen] -= adv_over_t;
+    }
+    return;
+  }
+#endif
+
+  for (int64_t i = 0; i < n; ++i) {
+    const std::size_t idx = static_cast<std::size_t>(i);
+    float g = p[idx] * adv_over_t;
+    if (entropy_beta != 0.0f) {
+      g += beta_over_t * p[idx] * (entropy + log_p[idx]);
+    }
+    g_logits[idx] = g;
+  }
+  if (chosen < static_cast<uint32_t>(n)) {
+    g_logits[chosen] -= adv_over_t;
+  }
+}
+
 }  // namespace
 
 SimplexOnlineLearner::SimplexOnlineLearner(
@@ -156,7 +228,8 @@ SimplexOnlineLearner::SimplexOnlineLearner(
     uint64_t ema_interval,
     float gerber_c,
     uint64_t lambda_hxh_warmup_events,
-    float lambda_hxh_clip)
+    float lambda_hxh_clip,
+    float entropy_beta)
     : history_(num_slots, max_entries_per_slot),
       fast_slow_(ema_alpha, ema_interval),
       sgd_(learning_rate),
@@ -164,6 +237,7 @@ SimplexOnlineLearner::SimplexOnlineLearner(
       gerber_c_(gerber_c),
       lambda_hxh_warmup_events_(lambda_hxh_warmup_events),
       lambda_hxh_clip_(lambda_hxh_clip),
+      entropy_beta_(entropy_beta),
       sgd_interval_(sgd_interval) {
   if (sgd_interval == 0) {
     throw std::invalid_argument(
@@ -172,6 +246,10 @@ SimplexOnlineLearner::SimplexOnlineLearner(
   if (lambda_hxh_clip < 0.0f) {
     throw std::invalid_argument(
         "SimplexOnlineLearner lambda_hxh_clip must be non-negative");
+  }
+  if (entropy_beta < 0.0f) {
+    throw std::invalid_argument(
+        "SimplexOnlineLearner entropy_beta must be non-negative");
   }
 }
 
@@ -331,7 +409,7 @@ void SimplexOnlineLearner::on_replay_outcome(const ReplayOutcome& ev) {
   advantage *= std::pow(gamma_, static_cast<float>(step_gap));
   last_advantage_ = advantage;
 
-  if (advantage == 0.0f) {
+  if (advantage == 0.0f && entropy_beta_ == 0.0f) {
     return;  // Zero gradient; skip the rest of the work.
   }
 
@@ -369,11 +447,15 @@ void SimplexOnlineLearner::on_replay_outcome(const ReplayOutcome& ev) {
   if (gate == 0.0f) {
     last_advantage_ = 0.0f;
     ++telemetry_.gerber_rejected_actions;
-    return;
+    if (entropy_beta_ == 0.0f) {
+      return;
+    }
+    advantage = 0.0f;
+  } else {
+    ++telemetry_.gerber_accepted_actions;
+    advantage *= gate;
+    last_advantage_ = advantage;
   }
-  ++telemetry_.gerber_accepted_actions;
-  advantage *= gate;
-  last_advantage_ = advantage;
 
   simplex_backward(*match, fwd, advantage);
   ++actions_since_sgd_;
@@ -396,12 +478,38 @@ void SimplexOnlineLearner::simplex_backward(
   const uint32_t chosen = entry.chosen_idx;
 
   // ---- g_logits = advantage * (p - one_hot(chosen)) / T --------------
-  std::vector<float> g_logits_buf(static_cast<size_t>(N), 0.0f);
-  for (int64_t i = 0; i < N; ++i) {
-    const float indicator = (static_cast<uint32_t>(i) == chosen) ? 1.0f : 0.0f;
-    g_logits_buf[i] = advantage * (fwd.p[i] - indicator) / T;
+  // Hot path is the production N=16 simplex: stack-backed, contiguous,
+  // and one-cache-line wide. On SPR the arithmetic half dispatches to
+  // one AVX-512 vector; scalar fallback keeps the same memory shape.
+  std::array<float, 16> g_logits_stack{};
+  std::array<float, 16> log_p_stack{};
+  std::vector<float> g_logits_heap;
+  std::vector<float> log_p_heap;
+  float* g_logits_ptr = g_logits_stack.data();
+  float* log_p_ptr = log_p_stack.data();
+  if (N > 16) {
+    g_logits_heap.assign(static_cast<std::size_t>(N), 0.0f);
+    log_p_heap.assign(static_cast<std::size_t>(N), 0.0f);
+    g_logits_ptr = g_logits_heap.data();
+    log_p_ptr = log_p_heap.data();
   }
-  at::Tensor g_logits = view_1d(g_logits_buf, N);
+  float entropy = 0.0f;
+  build_logits_gradient(
+      fwd.p,
+      chosen,
+      advantage,
+      T,
+      entropy_beta_,
+      g_logits_ptr,
+      log_p_ptr,
+      N,
+      entropy);
+  telemetry_.last_entropy = entropy;
+  telemetry_.last_entropy_bonus_weight = entropy_beta_;
+
+  // loss_total = -advantage * log p[chosen] - beta * H(p).
+  // d(-beta*H)/dlogits_j = beta * p_j * (H + log p_j) / T.
+  at::Tensor g_logits = view_1d_ptr(g_logits_ptr, N);
 
   // ---- Layer 3 — logit head: logits = mixed_h @ W_lh + b_lh ----------
   // mixed_h is [N, H], W_lh is [H], logits is [N], b_lh is scalar.

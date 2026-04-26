@@ -1608,12 +1608,18 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           &chaoscontrol::simplex::SimplexLearnerTelemetry::last_global_type_stddev)
       .def_readonly(
           "last_lambda_hxh",
-          &chaoscontrol::simplex::SimplexLearnerTelemetry::last_lambda_hxh);
+          &chaoscontrol::simplex::SimplexLearnerTelemetry::last_lambda_hxh)
+      .def_readonly(
+          "last_entropy",
+          &chaoscontrol::simplex::SimplexLearnerTelemetry::last_entropy)
+      .def_readonly(
+          "last_entropy_bonus_weight",
+          &chaoscontrol::simplex::SimplexLearnerTelemetry::last_entropy_bonus_weight);
 
   pybind11::class_<chaoscontrol::simplex::SimplexOnlineLearner>(
       m, "SimplexOnlineLearner")
       .def(pybind11::init<uint32_t, uint32_t, float, float, uint32_t, float,
-                          uint64_t, float, uint64_t, float>(),
+                          uint64_t, float, uint64_t, float, float>(),
            pybind11::arg("num_slots") = 4096,
            pybind11::arg("max_entries_per_slot") = 64,
            pybind11::arg("gamma") = 0.995f,
@@ -1623,7 +1629,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
            pybind11::arg("ema_interval") = 64,
            pybind11::arg("gerber_c") = 0.5f,
            pybind11::arg("lambda_hxh_warmup_events") = 1024,
-           pybind11::arg("lambda_hxh_clip") = 1.0f)
+           pybind11::arg("lambda_hxh_clip") = 1.0f,
+           pybind11::arg("entropy_beta") = 0.0f)
       .def("initialize_simplex_weights",
            &chaoscontrol::simplex::SimplexOnlineLearner::initialize_simplex_weights,
            pybind11::arg("weights"),

@@ -35,6 +35,8 @@ struct SimplexLearnerTelemetry {
   float last_bucket_type_stddev = 0.0f;
   float last_global_type_stddev = 0.0f;
   float last_lambda_hxh = 0.0f;
+  float last_entropy = 0.0f;
+  float last_entropy_bonus_weight = 0.0f;
 };
 
 // V1 online learner: REINFORCE over the simplex policy. Keeps fast / slow /
@@ -71,7 +73,8 @@ class SimplexOnlineLearner {
       uint64_t ema_interval = 64,
       float gerber_c = 0.5f,
       uint64_t lambda_hxh_warmup_events = 1024,
-      float lambda_hxh_clip = 1.0f);
+      float lambda_hxh_clip = 1.0f,
+      float entropy_beta = 0.0f);
 
   void initialize_simplex_weights(SimplexWeights weights);
   void record_simplex_decision(
@@ -120,6 +123,7 @@ class SimplexOnlineLearner {
   float gerber_c_;
   uint64_t lambda_hxh_warmup_events_;
   float lambda_hxh_clip_;
+  float entropy_beta_;
   uint32_t sgd_interval_;
   uint32_t actions_since_sgd_ = 0;
   bool weights_initialized_ = false;

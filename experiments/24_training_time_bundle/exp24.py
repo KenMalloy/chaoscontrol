@@ -1047,6 +1047,10 @@ def build_episodic_controller_v1_matrix(
     simplex_controller_online = {
         **simplex_controller_frozen,
         "controller_train_online": True,
+        # Anti-collapse regularizer for BC-saturated policies: small
+        # enough for CE-delta REINFORCE to dominate once signal appears,
+        # but large enough to keep the 16-way simplex exploratory.
+        "episodic_controller_entropy_beta": 0.05,
     }
     arm_specs: list[tuple[str, dict[str, Any]]] = [
         (

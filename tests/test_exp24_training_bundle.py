@@ -1520,15 +1520,18 @@ def test_episodic_controller_v1_matrix_has_five_arms_three_seeds():
     for entry in by_arm["arm_c_simplex_frozen"]:
         assert entry["eval_episodic_cache_mode"] == "cold"
         assert entry["controller_train_online"] is False
+        assert "episodic_controller_entropy_beta" not in entry
 
     for entry in by_arm["arm_d_simplex_online"]:
         assert entry["eval_episodic_cache_mode"] == "cold"
         assert entry["controller_train_online"] is True
+        assert entry["episodic_controller_entropy_beta"] == 0.05
 
     for entry in by_arm["arm_e_simplex_warm_online"]:
         assert entry["eval_episodic_cache_mode"] == "warm"
         assert entry["eval_episodic_cache_source"] == "checkpoint"
         assert entry["controller_train_online"] is True
+        assert entry["episodic_controller_entropy_beta"] == 0.05
 
     for arm in simplex_arms:
         for entry in by_arm[arm]:

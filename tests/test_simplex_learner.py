@@ -526,6 +526,7 @@ def _assert_simplex_gradient_matches_torch_autograd_reference(
     *,
     atol: float,
     rtol: float,
+    entropy_beta: float = 0.0,
 ) -> None:
     """Run the load-bearing C++ learner vs torch autograd parity check.
 
@@ -539,6 +540,10 @@ def _assert_simplex_gradient_matches_torch_autograd_reference(
     """
     seed = 7
     weights_init = _random_weights(seed)
+    if entropy_beta != 0.0:
+        # Non-unit temperature makes the autograd reference verify the
+        # softmax-temperature factor in the entropy derivative.
+        weights_init["temperature"] = 0.75
     V, E, sf = _random_simplex_inputs(seed * 2)
     chosen = 9
     advantage = 0.7  # ce_delta_raw - bucket_baseline (gamma=1, step_gap=1)
@@ -553,13 +558,15 @@ def _assert_simplex_gradient_matches_torch_autograd_reference(
     alpha = torch.tensor(weights_init["alpha"], dtype=torch.float32, requires_grad=True)
     weights_torch = {
         "W_vp": W_vp, "b_vp": b_vp, "W_lh": W_lh, "b_lh": b_lh,
-        "W_sb": W_sb, "alpha": alpha, "temperature": 1.0,
+        "W_sb": W_sb, "alpha": alpha,
+        "temperature": weights_init["temperature"],
     }
     _, p = _torch_simplex_forward(V, E, sf, weights_torch)
     log_p_chosen = torch.log(p[chosen] + 1e-30)
+    entropy = -(p * torch.log(p + 1e-30)).sum()
     # Match the C++ scaling: advantage uses gamma=1.0, step_gap=(11-10)=1,
     # so the multiplier reduces to advantage * 1.0 = advantage.
-    loss = -advantage * log_p_chosen
+    loss = -advantage * log_p_chosen - entropy_beta * entropy
     loss.backward()
 
     expected = {
@@ -576,6 +583,7 @@ def _assert_simplex_gradient_matches_torch_autograd_reference(
         num_slots=8, max_entries_per_slot=4,
         gamma=1.0, learning_rate=lr,
         sgd_interval=1, ema_interval=999999,
+        entropy_beta=entropy_beta,
     )
     learner.initialize_simplex_weights(_build_weights_struct(weights_init))
     fwd_before = _ext.simplex_forward(
@@ -615,6 +623,10 @@ def _assert_simplex_gradient_matches_torch_autograd_reference(
         actual_W_sb, expected["W_sb"], atol=atol, rtol=rtol
     )
     assert abs(actual_alpha - expected["alpha"]) < atol
+    if entropy_beta != 0.0:
+        t = learner.telemetry()
+        assert t.last_entropy == pytest.approx(float(entropy.detach()), abs=1e-5)
+        assert t.last_entropy_bonus_weight == pytest.approx(entropy_beta)
 
 
 def test_simplex_gradient_matches_torch_autograd_reference():
@@ -627,6 +639,20 @@ def test_simplex_gradient_matches_torch_autograd_reference():
     _assert_simplex_gradient_matches_torch_autograd_reference(
         atol=1e-4,
         rtol=1e-3,
+    )
+
+
+def test_entropy_bonus_matches_torch_autograd_reference():
+    """REINFORCE + entropy bonus matches a direct torch autograd loss."""
+    if _ext.amx_bf16_kernel_available() and _ext.has_amx_bf16():
+        pytest.skip(
+            "AMX BF16 dispatch is live; strict fp32 tolerance is covered by "
+            "the bf16-loose learner parity test"
+        )
+    _assert_simplex_gradient_matches_torch_autograd_reference(
+        atol=1e-4,
+        rtol=1e-3,
+        entropy_beta=0.05,
     )
 
 
