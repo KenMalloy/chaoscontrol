@@ -70,18 +70,31 @@ def _load_episodic_cache_from_ckpt(blob: dict):
     return EpisodicCache.from_dict(payload)
 
 
-def _make_fresh_episodic_cache():
-    """Default cache shape for the Arm D / train-no-cache fallback.
+def _make_fresh_episodic_cache(cfg: RunConfig, model_dim: int):
+    """Build the Arm D / train-no-cache-fallback empty cache.
 
-    Capacity / span / key_rep_dim defaults are conservative — Phase 1 of
-    the memory-aware-optimizer plan uses these knobs as construction-time
-    defaults; future configs will let the run override them. Today the
-    fresh-cache path exists so an Arm D run can construct a cache when
-    the checkpoint was produced without one, not so it can populate one
-    (no eval-time write path yet).
+    Reads shape from ``cfg`` so all four falsifier arms (especially Arm B
+    vs Arm D) share an identical cache shape — diverging here would let a
+    cache-shape difference look like a cache-content difference and
+    silently corrupt the matrix's contrast.
+
+    ``cfg.episodic_key_rep_dim == -1`` is a sentinel meaning "use the
+    model's hidden dim" — matches the trainer's
+    ``_construct_episodic_cache`` default. Negative key_rep_dim would fail
+    EpisodicCache's positive-int check, which is what surfaces the
+    misconfigure.
     """
     from chaoscontrol.optim.episodic_cache import EpisodicCache
-    return EpisodicCache(capacity=1024, span_length=8, key_rep_dim=16)
+    key_rep_dim = (
+        int(model_dim) if cfg.episodic_key_rep_dim == -1
+        else int(cfg.episodic_key_rep_dim)
+    )
+    return EpisodicCache(
+        capacity=int(cfg.episodic_cache_capacity),
+        span_length=int(cfg.episodic_span_length),
+        key_rep_dim=key_rep_dim,
+        grace_steps=int(cfg.episodic_grace_steps),
+    )
 
 
 def _sha256_file(path: Path, chunk_size: int = 1 << 20) -> str:
@@ -164,9 +177,15 @@ def run(cfg: RunConfig, jsonl_paths: list[str], sp_model_path: str) -> None:
     # spans onto the model's device for forward+backward.
     episodic_cache = None
     if cfg.episodic_cache_enabled:
+        # ckpt_cfg["dim"] is the trainer's hidden dim — what the trainer
+        # would have used for episodic_key_rep_dim's model_dim default.
+        # Reading it off the ckpt config (not a separate kwarg) ties the
+        # eval-time fresh-cache shape to the same source-of-truth as
+        # the trainer's _construct_episodic_cache.
+        model_dim = int(ckpt_cfg["dim"])
         episodic_cache = _load_episodic_cache_from_ckpt(ckpt_blob)
         if episodic_cache is None:
-            episodic_cache = _make_fresh_episodic_cache()
+            episodic_cache = _make_fresh_episodic_cache(cfg, model_dim)
             print(
                 "[exp20] episodic_cache: fresh empty cache "
                 f"(capacity={episodic_cache.capacity}, "

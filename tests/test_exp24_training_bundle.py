@@ -1378,3 +1378,45 @@ def test_run_exp24_cli_episodic_ttt_v1_dry_run(tmp_path):
     assert "exp24_phase3_episodic_ttt_v1_arm_a_no_cache_no_ttt_s1337" in stdout
     assert "exp24_phase3_episodic_ttt_v1_arm_b_cache_train_ttt_with_cache_s1337" in stdout
     assert '"exp24_mechanism": "episodic_ttt_v1"' in stdout
+
+
+def test_episodic_ttt_v1_matrix_pins_eval_cache_schema_on_all_arms():
+    """All four arms must carry the same cache schema fields (capacity,
+    span_length, key_rep_dim sentinel, grace_steps). Differing shape across
+    arms would let a cache-shape difference look like a cache-content
+    difference and silently corrupt the falsifier matrix's Arm B vs Arm D
+    contrast — defense-in-depth on top of the RunConfig defaults.
+    """
+    mod = _load_exp24()
+
+    entries = mod.build_episodic_ttt_v1_matrix(
+        speed_config={"batch_size": 1024, "chunk_size": 64},
+        world_size=4,
+        budget_seconds=600.0,
+    )
+
+    for entry in entries:
+        # Defaults that mirror runner_fast_path.py:_construct_episodic_cache.
+        assert entry["eval_episodic_cache_capacity"] == 4096
+        assert entry["eval_episodic_span_length"] == 4
+        assert entry["eval_episodic_key_rep_dim"] == -1, (
+            "-1 sentinel resolves to model_dim at cache construction; "
+            "matches trainer's episodic_key_rep_dim=model_dim default"
+        )
+        assert entry["eval_episodic_grace_steps"] == 1000
+
+    # Cross-arm: every arm has identical cache shape — Arm B vs Arm D
+    # cannot diverge here.
+    schema_fields = (
+        "eval_episodic_cache_capacity",
+        "eval_episodic_span_length",
+        "eval_episodic_key_rep_dim",
+        "eval_episodic_grace_steps",
+    )
+    shapes = {
+        tuple(entry[f] for f in schema_fields)
+        for entry in entries
+    }
+    assert len(shapes) == 1, (
+        f"all arms must share an identical cache shape; got {shapes!r}"
+    )

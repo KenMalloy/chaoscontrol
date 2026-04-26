@@ -243,3 +243,85 @@ def test_driver_resets_cache_per_doc_when_configured(tmp_path):
     assert combined.count("episodic_cache: reset for doc") == 3, (
         f"expected 3 per-doc reset markers; got: {combined!r}"
     )
+
+
+def _load_run_exp20_eval():
+    """Load run_exp20_eval.py as an importable module — the script does
+    sys.path bootstrap at top so it must be loaded from disk, not imported.
+    """
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "run_exp20_eval_for_tests", REPO / "scripts" / "run_exp20_eval.py",
+    )
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_run_config_exposes_episodic_cache_schema_fields():
+    """The driver reads four cache schema fields off RunConfig that mirror
+    the trainer defaults; same defaults so all four arms in the falsifier
+    matrix get an identical cache shape (Arm B vs Arm D shape divergence
+    would confound the cache-content contrast).
+    """
+    cfg = RunConfig()
+    assert cfg.episodic_cache_capacity == 4096
+    assert cfg.episodic_span_length == 4
+    assert cfg.episodic_key_rep_dim == -1, (
+        "-1 is the sentinel that resolves to the model's hidden dim at "
+        "cache construction; matches the trainer's "
+        "episodic_key_rep_dim=model_dim default."
+    )
+    assert cfg.episodic_grace_steps == 1000
+
+
+def test_make_fresh_episodic_cache_reads_from_cfg_not_hardcoded():
+    """``_make_fresh_episodic_cache`` must read shape from the RunConfig,
+    not the previous hardcoded values (capacity=1024, span_length=8,
+    key_rep_dim=16). Otherwise a config override gets silently dropped
+    and Arm D's fresh cache shape diverges from Arm B's loaded shape.
+    """
+    mod = _load_run_exp20_eval()
+    cfg = RunConfig(
+        episodic_cache_capacity=512,
+        episodic_span_length=6,
+        episodic_key_rep_dim=24,
+        episodic_grace_steps=300,
+    )
+    cache = mod._make_fresh_episodic_cache(cfg, model_dim=128)
+    assert cache.capacity == 512
+    assert cache.span_length == 6
+    assert cache.key_rep_dim == 24, (
+        "explicit non-sentinel key_rep_dim must override the model_dim "
+        "fallback"
+    )
+    assert cache.grace_steps == 300
+
+
+def test_make_fresh_episodic_cache_resolves_key_rep_dim_sentinel_to_model_dim():
+    """``episodic_key_rep_dim == -1`` is a sentinel meaning ``model_dim``,
+    matching the trainer default. The driver must resolve it at construction;
+    EpisodicCache rejects key_rep_dim<=0 so a leaked sentinel surfaces as
+    a ValueError, not a silent shape divergence.
+    """
+    mod = _load_run_exp20_eval()
+    cfg = RunConfig(episodic_key_rep_dim=-1)
+    cache = mod._make_fresh_episodic_cache(cfg, model_dim=192)
+    assert cache.key_rep_dim == 192
+
+
+def test_make_fresh_episodic_cache_default_shape_matches_trainer():
+    """RunConfig defaults must match runner_fast_path.py:_construct_episodic_cache
+    so the matrix's Arm B (loaded) and Arm D (fresh) caches are
+    indistinguishable on shape.
+    """
+    mod = _load_run_exp20_eval()
+    cfg = RunConfig()  # defaults only
+    cache = mod._make_fresh_episodic_cache(cfg, model_dim=64)
+    # Trainer defaults: capacity=4096, span_length=4, key_rep_dim=model_dim,
+    # grace_steps=1000.
+    assert cache.capacity == 4096
+    assert cache.span_length == 4
+    assert cache.key_rep_dim == 64
+    assert cache.grace_steps == 1000

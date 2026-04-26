@@ -1006,13 +1006,29 @@ def build_episodic_ttt_v1_matrix(
         "fast_slow_eval_copy": "slow",
     }
     # Eval-side shapes — A == C share no-TTT, B == D share cache-aware TTT.
+    #
+    # Cache schema fields are pinned identically across ALL FOUR arms (not
+    # just the TTT arms) so that if the contrast moves, it's the cache
+    # CONTENT (Arm B's loaded entries vs Arm D's empty cache) doing the
+    # work, not a cache SHAPE difference. ``eval_episodic_key_rep_dim=-1``
+    # is the sentinel that resolves to the trainer's model_dim at cache
+    # construction; defaults mirror runner_fast_path.py's
+    # _construct_episodic_cache.
+    eval_cache_schema_lock = {
+        "eval_episodic_cache_capacity": 4096,
+        "eval_episodic_span_length": 4,
+        "eval_episodic_key_rep_dim": -1,
+        "eval_episodic_grace_steps": 1000,
+    }
     eval_no_ttt_lock = {
+        **eval_cache_schema_lock,
         "eval_episodic_cache_enabled": False,
         "eval_steps_per_chunk": 0,
         "eval_adapt_set": "none",
         "eval_episodic_cache_reset_per_doc": False,
     }
     eval_ttt_with_cache_lock = {
+        **eval_cache_schema_lock,
         "eval_episodic_cache_enabled": True,
         "eval_steps_per_chunk": 1,
         "eval_adapt_set": "lm_head",
