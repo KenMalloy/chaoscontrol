@@ -59,6 +59,9 @@ def build_ext_modules() -> list:
     avx512_recurrence_rel = (
         this_dir.relative_to(repo_root) / "src" / "avx512_recurrence.cpp"
     )
+    avx512_matops_rel = (
+        this_dir.relative_to(repo_root) / "src" / "avx512_matops.cpp"
+    )
     optimizer_rel = this_dir.relative_to(repo_root) / "src" / "optimizer.cpp"
     online_learning_rel = (
         this_dir.relative_to(repo_root) / "src" / "online_learning.cpp"
@@ -75,6 +78,7 @@ def build_ext_modules() -> list:
                 str(cpu_features_rel),
                 str(amx_matmul_rel),
                 str(avx512_recurrence_rel),
+                str(avx512_matops_rel),
                 str(optimizer_rel),
                 str(online_learning_rel),
             ],

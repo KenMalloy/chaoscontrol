@@ -121,6 +121,18 @@ avx512_diagonal_recurrence = (
     getattr(_C, "avx512_diagonal_recurrence", _missing_extension)
     if _C is not None else _missing_extension
 )
+avx512_matops_kernel_available = (
+    getattr(_C, "avx512_matops_kernel_available", _missing_extension)
+    if _C is not None else _missing_extension
+)
+avx512_matvec_fma_with_decay = (
+    getattr(_C, "avx512_matvec_fma_with_decay", _missing_extension)
+    if _C is not None else _missing_extension
+)
+avx512_axpy_fma = (
+    getattr(_C, "avx512_axpy_fma", _missing_extension)
+    if _C is not None else _missing_extension
+)
 ActionHistoryEntry = (
     getattr(_C, "ActionHistoryEntry", _missing_extension)
     if _C is not None else _missing_extension
@@ -198,6 +210,9 @@ __all__ = [
     "amx_pack_b_vnni",
     "avx512_recurrence_kernel_available",
     "avx512_diagonal_recurrence",
+    "avx512_matops_kernel_available",
+    "avx512_matvec_fma_with_decay",
+    "avx512_axpy_fma",
     "ActionHistoryEntry",
     "PerSlotActionHistory",
     "SpscRingU64x1024",

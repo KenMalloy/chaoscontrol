@@ -17,6 +17,7 @@
 
 #include "action_history.h"
 #include "amx_matmul.h"
+#include "avx512_matops.h"
 #include "avx512_recurrence.h"
 #include "controller_main.h"
 #include "cpu_features.h"
@@ -982,6 +983,18 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         &chaoscontrol::avx512::avx512_diagonal_recurrence,
         pybind11::arg("decay"), pybind11::arg("x"), pybind11::arg("h"),
         "In-place AVX-512 diagonal recurrence: h = decay * h + x");
+  m.def("avx512_matops_kernel_available",
+        &chaoscontrol::avx512::avx512_matops_kernel_available,
+        "Whether this extension build includes the AVX-512 matops kernels");
+  m.def("avx512_matvec_fma_with_decay",
+        &chaoscontrol::avx512::avx512_matvec_fma_with_decay,
+        pybind11::arg("w"), pybind11::arg("decay"), pybind11::arg("state"),
+        pybind11::arg("x"), pybind11::arg("out"),
+        "out[i] = decay[i] * state[i] + sum_j(w[i, j] * x[j])");
+  m.def("avx512_axpy_fma",
+        &chaoscontrol::avx512::avx512_axpy_fma,
+        pybind11::arg("alpha"), pybind11::arg("x"), pybind11::arg("y"),
+        "y[j] += alpha * x[j], in place over y");
   m.def("backend_name", &backend_name, "Compiled backend name");
   m.def("wire_event_sizes", &wire_event_sizes,
         "Byte sizes of WriteEvent / QueryEvent / ReplayOutcome wire structs");
