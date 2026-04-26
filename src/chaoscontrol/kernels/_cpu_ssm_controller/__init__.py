@@ -89,6 +89,18 @@ controller_main = (
     getattr(_C, "controller_main", _missing_extension)
     if _C is not None else _missing_extension
 )
+cpu_features = (
+    getattr(_C, "cpu_features", _missing_extension)
+    if _C is not None else _missing_extension
+)
+has_avx512f = (
+    getattr(_C, "has_avx512f", _missing_extension)
+    if _C is not None else _missing_extension
+)
+has_amx_bf16 = (
+    getattr(_C, "has_amx_bf16", _missing_extension)
+    if _C is not None else _missing_extension
+)
 ActionHistoryEntry = (
     getattr(_C, "ActionHistoryEntry", _missing_extension)
     if _C is not None else _missing_extension
@@ -158,6 +170,9 @@ __all__ = [
     "RollingStddev",
     "OnlineLearningController",
     "controller_main",
+    "cpu_features",
+    "has_avx512f",
+    "has_amx_bf16",
     "ActionHistoryEntry",
     "PerSlotActionHistory",
     "SpscRingU64x1024",

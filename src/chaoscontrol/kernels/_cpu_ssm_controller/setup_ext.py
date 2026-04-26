@@ -23,6 +23,9 @@ def build_ext_modules() -> list:
         this_dir.relative_to(repo_root) / "src" / "action_history.cpp"
     )
     credit_rel = this_dir.relative_to(repo_root) / "src" / "credit.cpp"
+    cpu_features_rel = (
+        this_dir.relative_to(repo_root) / "src" / "cpu_features.cpp"
+    )
     optimizer_rel = this_dir.relative_to(repo_root) / "src" / "optimizer.cpp"
     online_learning_rel = (
         this_dir.relative_to(repo_root) / "src" / "online_learning.cpp"
@@ -36,6 +39,7 @@ def build_ext_modules() -> list:
                 str(event_handlers_rel),
                 str(action_history_rel),
                 str(credit_rel),
+                str(cpu_features_rel),
                 str(optimizer_rel),
                 str(online_learning_rel),
             ],

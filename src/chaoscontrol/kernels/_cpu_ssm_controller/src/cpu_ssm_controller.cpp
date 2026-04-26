@@ -17,6 +17,7 @@
 
 #include "action_history.h"
 #include "controller_main.h"
+#include "cpu_features.h"
 #include "credit.h"
 #include "online_learning.h"
 #include "optimizer.h"
@@ -530,20 +531,24 @@ pybind11::dict backward_step(
   return out;
 }
 
-bool has_amx_bf16() {
-#if defined(__AMX_BF16__)
-  return true;
-#else
-  return false;
-#endif
-}
-
 const char* backend_name() {
 #if defined(__AMX_BF16__)
   return "amx_bf16_compile_available";
 #else
   return "reference";
 #endif
+}
+
+pybind11::dict cpu_features() {
+  const auto features = chaoscontrol::cpu_features::detect_cpu_features();
+  pybind11::dict d;
+  d["is_x86"] = features.is_x86;
+  d["has_avx512f"] = features.has_avx512f;
+  d["has_amx_tile"] = features.has_amx_tile;
+  d["has_amx_bf16"] = features.has_amx_bf16;
+  d["os_avx512_enabled"] = features.os_avx512_enabled;
+  d["os_amx_enabled"] = features.os_amx_enabled;
+  return d;
 }
 
 // Wire-event introspection (Phase A1). Reports the byte sizes pinned by
@@ -935,7 +940,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def("update", &RollingStddev::update, pybind11::arg("x"))
       .def("stddev", &RollingStddev::stddev)
       .def_property_readonly("count", &RollingStddev::count);
-  m.def("has_amx_bf16", &has_amx_bf16, "Whether built with AMX BF16 support");
+  m.def("cpu_features", &cpu_features,
+        "Runtime CPU feature and OS-state detection for x86 AMX/AVX-512");
+  m.def("has_avx512f", &chaoscontrol::cpu_features::runtime_has_avx512f,
+        "Whether AVX-512F hardware and OS state are available at runtime");
+  m.def("has_amx_bf16", &chaoscontrol::cpu_features::runtime_has_amx_bf16,
+        "Whether AMX TILE/BF16 hardware and AMX OS state are available at runtime");
   m.def("backend_name", &backend_name, "Compiled backend name");
   m.def("wire_event_sizes", &wire_event_sizes,
         "Byte sizes of WriteEvent / QueryEvent / ReplayOutcome wire structs");
