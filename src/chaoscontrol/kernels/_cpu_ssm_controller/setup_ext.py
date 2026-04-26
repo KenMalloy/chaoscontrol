@@ -7,6 +7,19 @@ from pathlib import Path
 
 
 def _x86_accel_compile_args() -> list[str]:
+    # KNOWN-DEBT: distutils' Extension applies extra_compile_args at the
+    # extension level, not per-source. The -m flags below are visible to
+    # every translation unit in this extension, which means the compiler
+    # is free to auto-vectorize unrelated TUs (action_history.cpp,
+    # optimizer.cpp, etc.) using AVX-512 / AMX instructions. Practical
+    # fallout: the resulting .so will SIGILL on x86 hosts that lack
+    # AVX-512 even when the kernel paths themselves are gated off at
+    # runtime. The right fix is either (a) split into a "core" extension
+    # (no -m flags) and an "accel" extension (with), linking the latter
+    # as a static lib; or (b) replace the flags with #pragma GCC target
+    # scoped inside the AVX-512/AMX kernel files. We deploy only on
+    # Sapphire Rapids today, so this is theoretical for now — but anyone
+    # adding a non-AVX-512 x86 deployment target must address it first.
     machine = platform.machine().lower()
     requested = os.environ.get("CHAOSCONTROL_CPU_SSM_X86_ACCEL") == "1"
     if not requested or machine not in {"x86_64", "amd64"}:

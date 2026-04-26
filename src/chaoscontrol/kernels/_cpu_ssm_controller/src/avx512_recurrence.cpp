@@ -92,10 +92,18 @@ void avx512_diagonal_recurrence(
 
   std::size_t i = 0;
   for (; i + 16 <= n; i += 16) {
+    // loadu over load: torch's allocator returns 64B-aligned storage for
+    // contiguous tensors, but sliced/strided callers can land on unaligned
+    // offsets. Modern Intel/AMD uarch has no penalty for unaligned loads
+    // on aligned pointers, so loadu is correctness-equivalent and faster
+    // in the unaligned case.
     const __m512 d = _mm512_loadu_ps(decay_ptr + i);
     const __m512 xi = _mm512_loadu_ps(x_ptr + i);
     const __m512 hi = _mm512_loadu_ps(h_ptr + i);
-    _mm512_storeu_ps(h_ptr + i, _mm512_add_ps(_mm512_mul_ps(d, hi), xi));
+    // Explicit FMA: under -O3 clang/gcc would fuse add(mul(...)) into
+    // vfmadd231ps anyway, but spelling it out removes any ambiguity
+    // about rounding mode and survives -fno-fma builds.
+    _mm512_storeu_ps(h_ptr + i, _mm512_fmadd_ps(d, hi, xi));
   }
   for (; i < n; ++i) {
     h_ptr[i] = decay_ptr[i] * h_ptr[i] + x_ptr[i];
