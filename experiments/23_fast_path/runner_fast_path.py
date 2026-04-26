@@ -1577,6 +1577,8 @@ class _EpisodicConsumerState:
         "tagged_replay_queue",
         "query_event_log",
         "rank_query_seq",
+        "replay_outcome_log",
+        "bucket_baseline_ema",
     )
 
     def __init__(
@@ -1614,6 +1616,15 @@ class _EpisodicConsumerState:
         )
         self.rank_query_seq: dict[int, int] | None = (
             {} if episodic_event_log_enabled else None
+        )
+        # Phase B3 placeholder for REPLAY_OUTCOME wire records and its
+        # per-bucket reward baseline. Disabled keeps both None: no list, no
+        # EMA state, no event emission on the default path.
+        self.replay_outcome_log: list[dict[str, Any]] | None = (
+            [] if episodic_event_log_enabled else None
+        )
+        self.bucket_baseline_ema: list[float] | None = (
+            [0.0, 0.0, 0.0, 0.0] if episodic_event_log_enabled else None
         )
 
 
@@ -1759,6 +1770,114 @@ def _emit_query_event(
         "bucket": int(bucket),
     })
     return int(query_id)
+
+
+_REPLAY_STATUS_OK = 0
+_REPLAY_STATUS_SLOT_MISSING = 1
+_REPLAY_STATUS_STALE = 2
+_REPLAY_STATUS_NAN = 3
+_REPLAY_STATUS_SKIPPED = 4
+
+
+def _replay_id_from_tag(
+    *,
+    entry: dict[str, Any],
+    query_event_id: int,
+    selected_rank: int,
+) -> int:
+    if "replay_id" in entry:
+        return int(entry["replay_id"])
+    if int(query_event_id) < 0 or int(selected_rank) < 0:
+        return -1
+    # Sentinel until the trained controller owns replay_id: mirror
+    # controller.py's 56-bit clamp before adding the selected-rank byte so
+    # the derived id fits in u64 on the future wire path.
+    return ((int(query_event_id) & ((1 << 56) - 1)) << 8) | (
+        int(selected_rank) & 0xFF
+    )
+
+
+def _emit_replay_outcome(
+    *,
+    consumer: _EpisodicConsumerState,
+    entry: dict[str, Any],
+    current_step: int,
+    slot: int,
+    outcome_status: int,
+    source_write_id: int,
+    write_bucket: int,
+    ce_after_replay: float = float("nan"),
+    grad_cos_rare: float = float("nan"),
+    grad_cos_total: float = float("nan"),
+) -> dict[str, Any] | None:
+    """Append a REPLAY_OUTCOME dict to the Phase B3 placeholder log.
+
+    The real controller fields are threaded through when present. Sentinel
+    defaults are documented inline so Phase C can replace them deliberately.
+    """
+    replay_outcome_log = getattr(consumer, "replay_outcome_log", None)
+    bucket_baseline_ema = getattr(consumer, "bucket_baseline_ema", None)
+    if replay_outcome_log is None or bucket_baseline_ema is None:
+        return None
+
+    query_event_id = int(entry.get("query_event_id", -1))
+    selected_rank = int(entry.get("selected_rank", -1))
+    replay_id = _replay_id_from_tag(
+        entry=entry,
+        query_event_id=query_event_id,
+        selected_rank=selected_rank,
+    )
+    # Until the trained controller is wired, selection_step is the current GPU
+    # step proxy when a tag does not carry the controller's selection step.
+    selection_step = int(entry.get("selection_step", int(current_step)))
+    policy_version = int(entry.get("policy_version", 0))
+    teacher_score = float(entry.get("teacher_score", entry.get("score", 0.0)))
+    # Until the trained controller is wired, controller_logit is a zero
+    # sentinel rather than reusing the heuristic score.
+    controller_logit = float(entry.get("controller_logit", 0.0))
+    ce_before_replay = float(entry.get("ce_before_replay", float("nan")))
+    ce_after = float(ce_after_replay)
+    ce_delta_raw = ce_before_replay - ce_after
+
+    bucket = int(write_bucket)
+    baseline = 0.0
+    if 0 <= bucket < len(bucket_baseline_ema):
+        baseline = float(bucket_baseline_ema[bucket])
+    reward_shaped = ce_delta_raw - baseline
+    if (
+        0 <= bucket < len(bucket_baseline_ema)
+        and math.isfinite(ce_delta_raw)
+    ):
+        alpha = 0.05
+        bucket_baseline_ema[bucket] = (
+            (1.0 - alpha) * float(bucket_baseline_ema[bucket])
+            + alpha * float(ce_delta_raw)
+        )
+
+    event = {
+        "event_type": 3,
+        "replay_id": int(replay_id),
+        "gpu_step": int(current_step),
+        "query_event_id": int(query_event_id),
+        "source_write_id": int(source_write_id),
+        "slot_id": int(slot),
+        "selection_step": int(selection_step),
+        "policy_version": int(policy_version),
+        "selected_rank": int(selected_rank),
+        "teacher_score": float(teacher_score),
+        "controller_logit": float(controller_logit),
+        "ce_before_replay": float(ce_before_replay),
+        "ce_after_replay": float(ce_after),
+        "ce_delta_raw": float(ce_delta_raw),
+        "bucket_baseline": float(baseline),
+        "reward_shaped": float(reward_shaped),
+        "grad_cos_rare": float(grad_cos_rare),
+        "grad_cos_total": float(grad_cos_total),
+        "outcome_status": int(outcome_status),
+        "flags": 0,
+    }
+    replay_outcome_log.append(event)
+    return event
 
 
 def _controller_score_mode_from_config(config: dict[str, Any]) -> str:
@@ -2090,6 +2209,15 @@ def _run_episodic_replay_from_tagged_queue(
         entry = tagged.pop(0)
         slot = int(entry.get("slot", -1))
         if not (0 <= slot < int(cache.capacity)):
+            _emit_replay_outcome(
+                consumer=consumer,
+                entry=entry,
+                current_step=int(current_step),
+                slot=int(slot),
+                outcome_status=_REPLAY_STATUS_SLOT_MISSING,
+                source_write_id=int(entry.get("source_write_id", -1)),
+                write_bucket=int(entry.get("write_bucket", -1)),
+            )
             continue
         # Snapshot pre-replay utility so the log row pins the value
         # the EMA started from. Read from the underlying tensor field
@@ -2098,12 +2226,32 @@ def _run_episodic_replay_from_tagged_queue(
         if not bool(cache.occupied[slot].item()):
             # Slot evicted between the controller's tag and our
             # drain — race is documented in the design plan.
+            _emit_replay_outcome(
+                consumer=consumer,
+                entry=entry,
+                current_step=int(current_step),
+                slot=int(slot),
+                outcome_status=_REPLAY_STATUS_SLOT_MISSING,
+                source_write_id=int(
+                    entry.get(
+                        "source_write_id",
+                        int(cache.source_write_id[slot].item()),
+                    )
+                ),
+                write_bucket=int(entry.get("write_bucket", -1)),
+            )
             continue
         utility_pre = float(cache.utility_u[slot].item())
         write_step = int(cache.write_step[slot].item())
         key_fp = int(cache.key_fp[slot].item())
         write_pressure = float(cache.pressure_at_write[slot].item())
         write_bucket = int(cache.write_bucket[slot].item())
+        source_write_id = int(
+            entry.get(
+                "source_write_id",
+                int(cache.source_write_id[slot].item()),
+            )
+        )
         # X's contract says the queue entry carries ``score`` (=
         # cosine × utility). The diagnostic log wants ``query_cosine``
         # (= raw cosine). Until the controller emits the raw cosine
@@ -2124,6 +2272,15 @@ def _run_episodic_replay_from_tagged_queue(
         if result is None:
             # Race: slot evicted between our occupancy check and the
             # replay forward. Skip without logging.
+            _emit_replay_outcome(
+                consumer=consumer,
+                entry=entry,
+                current_step=int(current_step),
+                slot=int(slot),
+                outcome_status=_REPLAY_STATUS_SKIPPED,
+                source_write_id=int(source_write_id),
+                write_bucket=int(write_bucket),
+            )
             continue
         # Decision 0.10: feed the clamped value to update_utility so
         # the cache scoring rule (cosine × utility_u) keeps a
@@ -2149,9 +2306,26 @@ def _run_episodic_replay_from_tagged_queue(
                 slot, ce_delta=float(result["utility_signal_transformed"]),
             )
         utility_post = float(cache.utility_u[slot].item())
+        replay_loss = float(result["replay_loss"])
+        replay_outcome_status = (
+            _REPLAY_STATUS_OK
+            if math.isfinite(replay_loss)
+            else _REPLAY_STATUS_NAN
+        )
+        _emit_replay_outcome(
+            consumer=consumer,
+            entry=entry,
+            current_step=int(current_step),
+            slot=int(slot),
+            outcome_status=int(replay_outcome_status),
+            source_write_id=int(source_write_id),
+            write_bucket=int(write_bucket),
+            ce_after_replay=float(replay_loss),
+            grad_cos_rare=float(result["replay_grad_cos_rare"]),
+            grad_cos_total=float(result["replay_grad_cos_total"]),
+        )
 
         if logger is not None:
-            replay_loss = float(result["replay_loss"])
             logger.write_row({
                 "step": int(current_step),
                 "slot": int(slot),
@@ -2163,12 +2337,7 @@ def _run_episodic_replay_from_tagged_queue(
                 "utility_pre": utility_pre,
                 "replay_id": int(entry.get("replay_id", -1)),
                 "query_event_id": int(entry.get("query_event_id", -1)),
-                "source_write_id": int(
-                    entry.get(
-                        "source_write_id",
-                        int(cache.source_write_id[slot].item()),
-                    )
-                ),
+                "source_write_id": int(source_write_id),
                 "selection_step": int(entry.get("selection_step", -1)),
                 "policy_version": int(entry.get("policy_version", 0)),
                 "selected_rank": int(entry.get("selected_rank", -1)),
