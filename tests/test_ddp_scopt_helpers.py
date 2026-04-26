@@ -2,13 +2,13 @@
 ``experiments/23_fast_path/runner_fast_path.py``.
 
 The hot path used by ``ScarcityAwareOptimizer`` replaces N per-tensor
-``all_reduce(SUM)+divide`` calls with a single flatten-reduce-unflatten
-using ``ReduceOp.AVG``. The two forms are algebraically equivalent, but
-the flatten path exercises ``torch._utils._flatten_dense_tensors`` and
-an in-place ``copy_`` back into the caller's references — both of which
-could silently corrupt gradients if wired wrong. This test runs both
-helpers side by side on identical inputs and asserts bitwise (for
-integer-averaging) or tolerance-based (for floating) equality.
+``all_reduce(SUM)`` calls with a single flatten-reduce-unflatten using the
+same SUM/pre-scale convention as the runner's all-group gradient path. The two
+forms are algebraically equivalent, but the flatten path exercises
+``torch._utils._flatten_dense_tensors`` and an in-place ``copy_`` back into
+the caller's references — both of which could silently corrupt gradients if
+wired wrong. This test runs both helpers side by side on identical inputs and
+asserts tolerance-based equality.
 
 Runs on CPU with ``gloo`` so no GPU is required; the helper is backend-
 agnostic. ``mp.spawn`` launches two ranks locally.
@@ -25,6 +25,24 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
+from chaoscontrol.optim.scopt import scopt_allreduce_config
+
+
+def _sync_scopt_dense_tensors_per_tensor(
+    tensors: list[torch.Tensor],
+    *,
+    world_size: int,
+) -> None:
+    if world_size <= 1 or not tensors:
+        return
+    cfg = scopt_allreduce_config(world_size=world_size, all_group=None)
+    if cfg.op != "sum":
+        raise ValueError(f"unsupported ScOpt all-reduce op {cfg.op!r}")
+    for tensor in tensors:
+        if cfg.train_grad_scale != 1.0:
+            tensor.mul_(cfg.train_grad_scale)
+        dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+
 
 def _load_runner_helpers():
     """Import the two helpers from the fast-path runner file.
@@ -37,7 +55,7 @@ def _load_runner_helpers():
     spec = importlib.util.spec_from_file_location("_runner_fast_path", runner_path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    return module._average_dense_tensors, module._average_dense_tensors_coalesced
+    return _sync_scopt_dense_tensors_per_tensor, module._sync_scopt_dense_tensors_coalesced
 
 
 def _worker(
