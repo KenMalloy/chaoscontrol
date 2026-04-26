@@ -18,6 +18,7 @@
 #include "action_history.h"
 #include "controller_main.h"
 #include "credit.h"
+#include "online_learning.h"
 #include "optimizer.h"
 #include "posix_shm.h"
 #include "shm_ring.h"
@@ -994,6 +995,41 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def_property_readonly("num_slots", &PerSlotActionHistory::num_slots)
       .def_property_readonly("max_entries_per_slot",
                              &PerSlotActionHistory::max_entries_per_slot);
+
+  pybind11::class_<OnlineLearningController>(m, "OnlineLearningController")
+      .def(pybind11::init<uint32_t, uint32_t, float, float>(),
+           pybind11::arg("num_slots") = 4096,
+           pybind11::arg("max_entries_per_slot") = 64,
+           pybind11::arg("gamma") = 0.995f,
+           pybind11::arg("gerber_c") = 0.5f)
+      .def("on_replay_outcome",
+           [](OnlineLearningController& self, const pybind11::dict& d) {
+             self.on_replay_outcome(dict_to_replay_outcome(d));
+           },
+           pybind11::arg("replay_outcome"),
+           "Consume one ReplayOutcome dict, credit prior slot history, and "
+           "append a replay-selection action with empty-state sentinels.")
+      .def("history", &OnlineLearningController::history,
+           pybind11::arg("slot_id"),
+           pybind11::return_value_policy::reference_internal)
+      .def("telemetry",
+           [](const OnlineLearningController& self) {
+             const OnlineLearningTelemetry& t = self.telemetry();
+             pybind11::dict d;
+             d["replay_outcomes"] = pybind11::int_(t.replay_outcomes);
+             d["history_appends"] = pybind11::int_(t.history_appends);
+             d["credited_actions"] = pybind11::int_(t.credited_actions);
+             d["nonzero_credit_actions"] =
+                 pybind11::int_(t.nonzero_credit_actions);
+             d["backward_skipped_missing_state"] =
+                 pybind11::int_(t.backward_skipped_missing_state);
+             d["invalid_slot_skips"] = pybind11::int_(t.invalid_slot_skips);
+             d["sgd_steps"] = pybind11::int_(t.sgd_steps);
+             d["ema_blends"] = pybind11::int_(t.ema_blends);
+             return d;
+           })
+      .def_property_readonly("last_credit_sum",
+                             &OnlineLearningController::last_credit_sum);
 
   // Phase A2 test fixture — see tests/test_spsc_ring.py. `capacity` is
   // exposed as a static class property (not a method) because the

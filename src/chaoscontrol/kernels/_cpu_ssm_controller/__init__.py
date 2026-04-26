@@ -81,6 +81,10 @@ RollingStddev = (
     getattr(_C, "RollingStddev", _missing_extension)
     if _C is not None else _missing_extension
 )
+OnlineLearningController = (
+    getattr(_C, "OnlineLearningController", _missing_extension)
+    if _C is not None else _missing_extension
+)
 controller_main = (
     getattr(_C, "controller_main", _missing_extension)
     if _C is not None else _missing_extension
@@ -152,6 +156,7 @@ __all__ = [
     "CreditedAction",
     "attribute_credit",
     "RollingStddev",
+    "OnlineLearningController",
     "controller_main",
     "ActionHistoryEntry",
     "PerSlotActionHistory",
