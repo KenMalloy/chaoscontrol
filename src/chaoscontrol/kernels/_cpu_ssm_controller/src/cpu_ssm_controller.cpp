@@ -14,6 +14,7 @@
 #include <tuple>
 #include <vector>
 
+#include "controller_main.h"
 #include "posix_shm.h"
 #include "shm_ring.h"
 #include "spsc_ring.h"
@@ -685,6 +686,27 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "Single int — minimum ShmRing slot alignment shared by all three wire events");
   m.def("wire_event_constants", &wire_event_constants,
         "Compile-time constants driving wire-event array dimensions");
+  m.def("controller_main",
+        [](const std::vector<std::string>& write_ring_names,
+           const std::string& query_ring_name,
+           const std::string& replay_ring_name,
+           const std::string& exit_flag_shm_name,
+           uint32_t idle_sleep_ns) {
+          pybind11::gil_scoped_release release;
+          return controller_main(
+              write_ring_names,
+              query_ring_name,
+              replay_ring_name,
+              exit_flag_shm_name,
+              idle_sleep_ns);
+        },
+        pybind11::arg("write_ring_names"),
+        pybind11::arg("query_ring_name"),
+        pybind11::arg("replay_ring_name"),
+        pybind11::arg("exit_flag_shm_name"),
+        pybind11::arg("idle_sleep_ns") = 100,
+        "Poll controller shm rings until the 1-byte exit flag is nonzero. "
+        "C1 stub handlers count records and return the total processed.");
 
   // Phase A2 test fixture — see tests/test_spsc_ring.py. `capacity` is
   // exposed as a static class property (not a method) because the

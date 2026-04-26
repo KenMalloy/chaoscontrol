@@ -13,10 +13,13 @@ def build_ext_modules() -> list:
     this_dir = Path(__file__).resolve().parent
     repo_root = this_dir.parents[3]
     cpp_rel = this_dir.relative_to(repo_root) / "src" / "cpu_ssm_controller.cpp"
+    controller_main_rel = (
+        this_dir.relative_to(repo_root) / "src" / "controller_main.cpp"
+    )
     return [
         CppExtension(
             name="chaoscontrol.kernels._cpu_ssm_controller._C",
-            sources=[str(cpp_rel)],
+            sources=[str(cpp_rel), str(controller_main_rel)],
             extra_compile_args={
                 "cxx": ["-O3", "-std=c++17"],
             },
