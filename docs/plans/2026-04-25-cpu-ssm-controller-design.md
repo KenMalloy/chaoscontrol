@@ -1,6 +1,6 @@
 # CPU SSM Controller Design
 
-**Status:** Brainstormed and approved 2026-04-25. Implementation plan is the next step (`writing-plans` skill).
+**Status:** Brainstormed and approved 2026-04-25. Implementation plan at `docs/plans/2026-04-26-cpu-ssm-controller.md`. Refreshed 2026-04-26 with insights from Phase A/B implementation (see "Implementation insights" section at the end).
 
 **Supersedes:** task #105's original "Simplex + controller-memory pivot (Pass E)" framing. The cosine-utility heuristic in X-controller becomes the bootstrap teacher, not the deliverable.
 
@@ -37,7 +37,7 @@ Each row corresponds to an interpretation of the SSM's output for the correspond
 
 Two-process boundary: GPU produces tensors → rank process (CPU) packs compact records into SPSC shared-memory rings → controller polls all rings round-robin. Per-rank SPSC because multi-producer would be MPSC. POSIX shm + lock-free SPSC ring per producer rank (the pre-Pass-C pattern; CPU↔GPU is the case it was designed for).
 
-### WRITE_EVENT (~552B)
+### WRITE_EVENT (568B — corrected from initial 552B estimate; see Implementation insights)
 
 | Field | Type |
 |---|---|
@@ -55,7 +55,7 @@ Two-process boundary: GPU produces tensors → rank process (CPU) packs compact 
 
 Controller action: `(admit, initial_utility, simplex_parent, evict_target_if_full)`.
 
-### QUERY_EVENT (~528B)
+### QUERY_EVENT (544B — corrected from initial 528B estimate; see Implementation insights)
 
 | Field | Type |
 |---|---|
@@ -68,7 +68,7 @@ Controller action: `(admit, initial_utility, simplex_parent, evict_target_if_ful
 | pre_query_ce | f32 |
 | bucket | u8 |
 
-### REPLAY_OUTCOME (~96B)
+### REPLAY_OUTCOME (96B — 20 non-pad fields; see Implementation insights)
 
 | Field | Type |
 |---|---|
@@ -234,7 +234,47 @@ C3's `to_dict`/`from_dict` are still load-bearing for trainer-side checkpointing
 
 ## Out of scope (V1)
 
-- Phase 4 rare-grad direction wiring (`grad_cos_rare` reward shaping). Schema-reserved, NaN-logged, no migration cost when wired.
-- ScOpt / episodic compatibility (ScOpt currently gated incompatible per Decision 0.10).
+- Phase 4 rare-grad direction wiring (`grad_cos_rare` reward shaping). Schema-reserved, NaN-logged, no migration cost when wired. Blocked on #95 (ScOpt allreduce migration).
+- ScOpt / episodic compatibility (ScOpt currently gated incompatible per Decision 0.10; #95 unblocks).
 - Multi-controller process fan-out (single controller is well within Sapphire Rapids budget).
 - Cross-eval-document persistence of cache state (per-doc reset semantics retained from W).
+
+## Implementation insights (refresh — 2026-04-26)
+
+Concrete corrections / additions surfaced during Phase A and B implementation. Recorded here so they're canonical for downstream subagents and Codex tasks.
+
+### Wire-event struct sizes (corrected)
+
+Initial size estimates (552 / 528 / 96) were arithmetically unreachable for the field set under `#pragma pack(push, 1)`. Phase A1's implementer caught this pre-flight. Corrected:
+
+- **WriteEvent**: 568 B (body 564 + `_pad1[4]` for 8-byte alignment)
+- **QueryEvent**: 544 B (body 544, naturally 8-byte-aligned, no `_pad1`)
+- **ReplayOutcome**: 96 B (body 94 + `_pad1[2]`)
+
+Throughput estimates elsewhere in this doc use the corrected sizes within ~3% rounding.
+
+### REPLAY_OUTCOME has 20 non-pad fields
+
+A5's implementer enumerated against `wire_events.h` and counted exactly 20 non-pad fields per `ReplayOutcome` (initial dispatch briefs that said 19 were off by one). Full set: `event_type, replay_id, gpu_step, query_event_id, source_write_id, slot_id, selection_step, policy_version, selected_rank, teacher_score, controller_logit, ce_before_replay, ce_after_replay, ce_delta_raw, bucket_baseline, reward_shaped, grad_cos_rare, grad_cos_total, outcome_status, flags`.
+
+### Producer-shape differs per event type (B2's insight)
+
+The "GPU-side producer" framing earlier in this doc papered over a real distinction caught by B2's Codex implementer:
+
+- **WRITE events** — emitted on each TRAIN RANK directly via `select_writes`. Per-train-rank ring producer (single producer per rank).
+- **QUERY events** — emitted on the EPISODIC RANK after `dist.gather`, aggregated per source-rank. Single producer (the episodic rank's main thread) carrying multiple source-rank ids in successive events.
+- **REPLAY_OUTCOME** — same shape as queries (episodic rank, post-replay-drain).
+
+Per-rank ring allocation in B4 reflects this: N write_rings (one per train rank), 1 query_ring on the episodic rank, 1 replay_outcome_ring on the episodic rank.
+
+### Reward-signal CE-pair gap (B3's surprise → B5)
+
+B3's implementer surfaced that the runner has no native code computing the pre-replay/post-step CE pair. Without a second forward, `ce_delta_raw` is NaN and the entire reward signal fails through Phase C's online learning. **B5** (a new task added after B3 landed) adds a `torch.no_grad()` second forward on the same value tokens after `optimizer.step()` to compute `ce_after_replay`. Gated behind `episodic_compute_replay_ce_pair: bool = False` so the ~1× replay-forward overhead is opt-in.
+
+### macOS shm page rounding masks size-mismatch detection (A4 platform note)
+
+POSIX shm rounds requested region sizes up to a 16 KB page boundary on macOS. A4's `ShmRing.attach` size-mismatch check is correctly designed but cannot fire on Darwin for sub-16 KB mismatches. Production wire-event ring sizes (8.875 MB / 8.5 MB / 768 KB) are many pages apart — collisions trigger correctly on any platform. The macOS test for this case is platform-skipped with a comment pointing here.
+
+### Controller-internal action log: `simplex_parent` and `edge_updates` are not wire fields
+
+Per Codex's wire-schema review (incorporated into the Event-log schema section above), simplex parent and edge updates are CONTROLLER ACTIONS — they belong in the controller-internal action log (`ADMISSION`, `REPLAY_SELECTION`, `UTILITY_UPDATE`, `EDGE_UPDATE` NDJSON files on the controller process), not on the wire crossing the GPU↔CPU boundary. The wire schema stays about facts crossing the boundary; controller actions stay where they're authored. The B-task placeholder dict-list pattern (B1/B2/B3) maintains this separation; B4's real shm-ring instantiations preserve it.
