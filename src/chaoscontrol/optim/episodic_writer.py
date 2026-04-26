@@ -29,6 +29,7 @@ incomplete payloads and skew the cache; cleanest to skip them.
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from typing import Sequence
 
@@ -40,6 +41,29 @@ import torch
 # at vocab sizes up to 32 bits.
 _FINGERPRINT_MODULUS = (1 << 61) - 1
 _FINGERPRINT_BASE = 1_000_003
+
+# Per-rank monotonically-increasing sequence used to mint candidate_id for the
+# admission trace (Phase D1 of the CPU SSM controller plan). The sequence is
+# module-level rather than thread-local because the runner's writer call sits
+# inside a single training step on each rank's process; cross-rank uniqueness
+# is supplied by packing source_rank into the high byte of candidate_id. The
+# trained controller (Phase B1) will replace this Python-side counter with a
+# proper rank_seq driven from the runner; for D1 the trace just needs unique
+# rank-local ids so downstream pretrain joins behave.
+_admission_trace_seq: int = 0
+
+
+def _reset_admission_trace_seq() -> None:
+    """Test-only hook to zero the admission-trace counter."""
+    global _admission_trace_seq
+    _admission_trace_seq = 0
+
+
+def _next_admission_trace_seq() -> int:
+    global _admission_trace_seq
+    seq = _admission_trace_seq
+    _admission_trace_seq += 1
+    return seq
 
 
 @dataclass(frozen=True)
@@ -182,6 +206,10 @@ def select_writes(
     top_p: float,
     fingerprint_window: int,
     span_length: int,
+    source_rank: int = 0,
+    gpu_step: int = 0,
+    write_bucket: int = 0,
+    admission_trace_path: str | None = None,
 ) -> list[WritePayload]:
     """Select and build write payloads for one training step.
 
@@ -194,6 +222,19 @@ def select_writes(
     Order of returned payloads is descending write_signal (highest
     surprise first), so a downstream queue with limited capacity will
     keep the most informative writes if it has to drop on overflow.
+
+    Optional admission-trace logging (Phase D1 of the CPU SSM controller
+    plan): when ``admission_trace_path`` is set, every top-K candidate —
+    admit AND boundary-reject — is appended as one NDJSON row matching
+    the WRITE_EVENT wire-schema column order. The trace is a side-effect
+    only; the returned payload list is bit-identical to a call with the
+    path unset. ``source_rank``, ``gpu_step`` and ``write_bucket`` are
+    plumbed through onto each row so the offline pretrain pipeline can
+    join admissions back to the WRITE_EVENT ring (once Phase B1 lands)
+    via ``candidate_id``. The first call inside a process should be
+    preceded by ``_reset_admission_trace_seq()`` if the runner wants to
+    pin the rank-local sequence to its own counter; otherwise the
+    sequence simply continues across calls.
     """
     if pressure.shape != per_token_ce.shape:
         raise ValueError(
@@ -220,12 +261,17 @@ def select_writes(
             f"key_rep_per_position [B, T] {tuple(key_rep_per_position.shape[:2])} "
             f"must match input_ids {tuple(input_ids.shape)}"
         )
+    if not 0 <= int(source_rank) < 256:
+        raise ValueError(
+            f"source_rank must fit in u8; got {source_rank}"
+        )
 
     write_signal = pressure.detach().to(dtype=torch.float32) * per_token_ce.detach().to(
         dtype=torch.float32
     )
     positions = select_top_p_positions(write_signal, top_p=top_p)
     payloads: list[WritePayload] = []
+    trace_rows: list[dict] = [] if admission_trace_path is not None else []
     for i in range(positions.shape[0]):
         b = int(positions[i, 0].item())
         t = int(positions[i, 1].item())
@@ -240,6 +286,46 @@ def select_writes(
         )
         if payload is not None:
             payloads.append(payload)
+        if admission_trace_path is not None:
+            # Reject path: ``payload is None`` means the candidate was
+            # boundary-trimmed — no fingerprint window or no full target
+            # span. The signal slice is still meaningful (pressure, CE,
+            # key_rep, anchor are all valid at every position), so we
+            # log them. ``key_fp`` is set to 0 on rejects because the
+            # rolling hash needs a complete preceding window; downstream
+            # consumers should filter on ``decision`` before joining on
+            # key_fp.
+            if payload is not None:
+                key_fp = int(payload.key_fp)
+                anchor_id = int(payload.value_anchor_id)
+            else:
+                key_fp = 0
+                anchor_id = int(target_ids[b, t].item())
+            key_rep_slice = key_rep_per_position[b, t]
+            l2 = float(torch.linalg.vector_norm(key_rep_slice).item())
+            rank_seq = _next_admission_trace_seq()
+            candidate_id = (int(source_rank) << 56) | (
+                rank_seq & ((1 << 56) - 1)
+            )
+            trace_rows.append({
+                "candidate_id": candidate_id,
+                "decision": 1 if payload is not None else 0,
+                "gpu_step": int(gpu_step),
+                "source_rank": int(source_rank),
+                "key_fp": key_fp,
+                "key_rep_l2": l2,
+                "value_anchor_id": anchor_id,
+                "pressure_at_write": float(pressure[b, t].item()),
+                "pre_write_ce": float(per_token_ce[b, t].item()),
+                "write_bucket": int(write_bucket),
+            })
+
+    if admission_trace_path is not None and trace_rows:
+        with open(admission_trace_path, "a") as fh:
+            for row in trace_rows:
+                fh.write(json.dumps(row, separators=(",", ":")))
+                fh.write("\n")
+
     return payloads
 
 
