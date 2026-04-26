@@ -37,7 +37,7 @@ def _ce(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
                            targets.reshape(-1), reduction="sum")
 
 
-def _build_model(ckpt_path: Path) -> tuple[torch.nn.Module, dict]:
+def _build_model(ckpt_path: Path) -> tuple[torch.nn.Module, dict, dict]:
     from chaoscontrol.model import ChaosStudentLM
     # weights_only=False because the checkpoint payload is a dict with
     # {model, config, ...}, not a pure tensor. We trust our own checkpoints.
@@ -48,7 +48,60 @@ def _build_model(ckpt_path: Path) -> tuple[torch.nn.Module, dict]:
     # want to surface, not paper over. attach_trainable_h0 runs AFTER this
     # (see run() below) so eval-only params never need a loose load.
     model.load_state_dict(blob["model"], strict=True)
-    return model, cfg
+    return model, cfg, blob
+
+
+def _load_episodic_cache_from_ckpt(blob: dict):
+    """Construct an EpisodicCache from a checkpoint payload, or return None
+    when the checkpoint has no ``episodic_cache`` key.
+
+    Format mirrors the field-by-field shape produced by Y's training-time
+    save path (see episodic_cache.snapshot_to() and the trainer's save
+    contract). Returns None on absence so the caller can fall back to a
+    fresh empty cache (the train-no-cache + eval-cache "Arm D" path).
+    """
+    from chaoscontrol.optim.episodic_cache import EpisodicCache
+    payload = blob.get("episodic_cache")
+    if payload is None:
+        return None
+    cache = EpisodicCache(
+        capacity=int(payload["capacity"]),
+        span_length=int(payload["span_length"]),
+        key_rep_dim=int(payload["key_rep_dim"]),
+        grace_steps=int(payload.get("grace_steps", 200)),
+        utility_ema_decay=float(payload.get("utility_ema_decay", 0.99)),
+    )
+    cache.key_fp.copy_(payload["key_fp"])
+    cache.key_rep.copy_(payload["key_rep"])
+    cache.value_tok_ids.copy_(payload["value_tok_ids"])
+    cache.value_anchor_id.copy_(payload["value_anchor_id"])
+    cache.utility_u.copy_(payload["utility_u"])
+    cache.last_fired_step.copy_(payload["last_fired_step"])
+    cache.write_step.copy_(payload["write_step"])
+    cache.birth_embedding_version.copy_(payload["birth_embedding_version"])
+    cache.occupied.copy_(payload["occupied"])
+    # Rebuild the hash index from the loaded fingerprints — append/query
+    # both consult ``_fp_index`` and the persisted ckpt does not (and
+    # should not) carry a Python dict. Iterate occupied slots only so
+    # zeroed entries don't pollute the index with fp=0 collisions.
+    for slot in range(cache.capacity):
+        if bool(cache.occupied[slot].item()):
+            cache._fp_index[int(cache.key_fp[slot].item())] = slot
+    return cache
+
+
+def _make_fresh_episodic_cache():
+    """Default cache shape for the Arm D / train-no-cache fallback.
+
+    Capacity / span / key_rep_dim defaults are conservative — Phase 1 of
+    the memory-aware-optimizer plan uses these knobs as construction-time
+    defaults; future configs will let the run override them. Today the
+    fresh-cache path exists so an Arm D run can construct a cache when
+    the checkpoint was produced without one, not so it can populate one
+    (no eval-time write path yet).
+    """
+    from chaoscontrol.optim.episodic_cache import EpisodicCache
+    return EpisodicCache(capacity=1024, span_length=8, key_rep_dim=16)
 
 
 def _sha256_file(path: Path, chunk_size: int = 1 << 20) -> str:
@@ -113,7 +166,7 @@ def run(cfg: RunConfig, jsonl_paths: list[str], sp_model_path: str) -> None:
         torch.cuda.manual_seed_all(cfg.seed)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model, ckpt_cfg = _build_model(Path(cfg.checkpoint_path))
+    model, ckpt_cfg, ckpt_blob = _build_model(Path(cfg.checkpoint_path))
     model.to(device)
 
     # attach_trainable_h0 AFTER load_state_dict so strict=True works on the
@@ -125,13 +178,43 @@ def run(cfg: RunConfig, jsonl_paths: list[str], sp_model_path: str) -> None:
     adapt_params = select_adapt_params(model, adapt_set=cfg.adapt_set)
     optimizers = _build_optimizer(adapt_params, cfg.eval_lr) if adapt_params else []
 
+    # Episodic cache wiring — opt-in via cfg.episodic_cache_enabled. The
+    # cache lives on CPU (per EpisodicCache contract); the controller
+    # snapshots / queries it on demand and the replay path moves token
+    # spans onto the model's device for forward+backward.
+    episodic_cache = None
+    if cfg.episodic_cache_enabled:
+        episodic_cache = _load_episodic_cache_from_ckpt(ckpt_blob)
+        if episodic_cache is None:
+            episodic_cache = _make_fresh_episodic_cache()
+            print(
+                "[exp20] episodic_cache: fresh empty cache "
+                f"(capacity={episodic_cache.capacity}, "
+                f"span_length={episodic_cache.span_length}, "
+                f"key_rep_dim={episodic_cache.key_rep_dim})",
+                flush=True,
+            )
+        else:
+            print(
+                "[exp20] episodic_cache: loaded from checkpoint "
+                f"(capacity={episodic_cache.capacity}, "
+                f"occupied={int(episodic_cache.occupied.sum().item())})",
+                flush=True,
+            )
+
     streamer = DocStreamer(
         jsonl_paths=[Path(p) for p in jsonl_paths],
         sp_model_path=Path(sp_model_path),
         max_docs=cfg.max_docs,
     )
     state_mgr = StateManager(model, persistence_mode=cfg.persistence_mode)
-    controller = LegalityController(model, loss_fn=_ce)
+    # Pass cache=None when episodic_cache is not enabled so the controller
+    # path is bit-identical to the pre-cache driver. ``cache=None`` is
+    # also the default kwarg, but spelling it out makes the back-compat
+    # contract visible at the call site.
+    controller = LegalityController(
+        model, loss_fn=_ce, cache=episodic_cache,
+    )
     collector = MetricsCollector(output_path=Path(cfg.output_path))
     budget = BudgetTracker(
         total_budget_seconds=cfg.budget_seconds,
@@ -157,6 +240,12 @@ def run(cfg: RunConfig, jsonl_paths: list[str], sp_model_path: str) -> None:
                 break
             state_mgr.start_doc(doc_id=doc.doc_id, batch_size=1)
             controller.mark_new_epoch()
+            if cfg.episodic_cache_reset_per_doc and episodic_cache is not None:
+                episodic_cache.reset()
+                print(
+                    f"[exp20] episodic_cache: reset for doc {doc.doc_id}",
+                    flush=True,
+                )
 
             doc_ce_nats = 0.0
             doc_tokens = 0

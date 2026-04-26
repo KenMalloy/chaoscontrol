@@ -245,6 +245,31 @@ class EpisodicCache:
         self.write_step[slot] = -1
         self.utility_u[slot] = 0.0
 
+    def reset(self) -> None:
+        """Return the cache to its post-construction state.
+
+        Zeros every field tensor, clears the hash index, and re-applies the
+        ``last_fired_step``/``write_step`` sentinel of -1. Capacity and the
+        construction-time shape parameters (``span_length``, ``key_rep_dim``,
+        ``grace_steps``, ``utility_ema_decay``) are preserved.
+
+        Used by the eval-time runner for per-doc reset semantics — each doc
+        starts with a fresh cache so cross-document leakage in the
+        retrieval index is structurally impossible. (Per-doc reset is opt-in
+        via ``RunConfig.episodic_cache_reset_per_doc``; the default loaded-
+        from-checkpoint path keeps the cache live across docs.)
+        """
+        self.key_fp.zero_()
+        self.key_rep.zero_()
+        self.value_tok_ids.zero_()
+        self.value_anchor_id.zero_()
+        self.utility_u.zero_()
+        self.last_fired_step.fill_(-1)
+        self.write_step.fill_(-1)
+        self.birth_embedding_version.zero_()
+        self.occupied.zero_()
+        self._fp_index.clear()
+
     # ---- snapshot -------------------------------------------------------------
 
     def snapshot_to(self, device: torch.device) -> dict[str, torch.Tensor]:

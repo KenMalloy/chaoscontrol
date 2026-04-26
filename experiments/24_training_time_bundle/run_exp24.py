@@ -28,6 +28,7 @@ from exp24 import (  # noqa: E402
     build_criticality_distillation_first_smoke_matrix,
     build_criticality_distillation_multiseed_matrix,
     build_episodic_dw_curation_v1_matrix,
+    build_episodic_ttt_v1_matrix,
     build_fastslow_dreamworld_matrix,
     build_first_wave_mechanism_matrix,
     build_phase_a_sampling_matrix,
@@ -234,6 +235,13 @@ def _build_entries(
             budget_seconds=budget_seconds,
             seed_values=seeds,
         )
+    if matrix == "episodic_ttt_v1":
+        return build_episodic_ttt_v1_matrix(
+            speed_config=speed_config,
+            world_size=world_size,
+            budget_seconds=budget_seconds,
+            seed_values=seeds,
+        )
     if matrix == "cd_first_smoke":
         return build_criticality_distillation_first_smoke_matrix(
             speed_config=speed_config,
@@ -300,6 +308,7 @@ def _default_world_size_for_matrix(matrix: str) -> int:
         "phase0_confirm",
         "phase0_fastslow_only_control",
         "episodic_dw_curation_v1",
+        "episodic_ttt_v1",
     }:
         return 4
     return 8
@@ -340,6 +349,7 @@ def main(argv: list[str] | None = None) -> int:
             "phase0_confirm",
             "phase0_fastslow_only_control",
             "episodic_dw_curation_v1",
+            "episodic_ttt_v1",
             "cd_first_smoke",
             "cd_multiseed",
             "all",
