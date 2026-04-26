@@ -349,6 +349,7 @@ def test_reset_preserves_capacity_and_config():
     cache = EpisodicCache(
         capacity=8, span_length=6, key_rep_dim=12,
         grace_steps=128, utility_ema_decay=0.95,
+        fingerprint_window=10,
     )
     cache.append(**_entry_kwargs(
         key_fp=1, span_length=6, key_rep_dim=12, current_step=0,
@@ -359,3 +360,102 @@ def test_reset_preserves_capacity_and_config():
     assert cache.key_rep_dim == 12
     assert cache.grace_steps == 128
     assert cache.utility_ema_decay == pytest.approx(0.95)
+    assert cache.fingerprint_window == 10
+
+
+def test_to_dict_from_dict_round_trip_preserves_state():
+    """The save/load envelope must round-trip every field byte-equal — any
+    silent default in from_dict is the failure mode that lets Arm B's
+    cache shape silently diverge from the trainer's.
+    """
+    cache = EpisodicCache(
+        capacity=4, span_length=4, key_rep_dim=8,
+        grace_steps=50, utility_ema_decay=0.97,
+        fingerprint_window=6,
+    )
+    # Populate two entries so the hash index, occupancy, and per-slot
+    # tensors all carry non-default values.
+    cache.append(**_entry_kwargs(
+        key_fp=42, span_length=4, key_rep_dim=8,
+        current_step=3, embedding_version=7, value_anchor_id=11,
+    ))
+    cache.append(**_entry_kwargs(
+        key_fp=99, span_length=4, key_rep_dim=8,
+        current_step=8, embedding_version=7, value_anchor_id=22,
+        span_start=100,
+    ))
+    e = cache.query(42)
+    assert e is not None
+    cache.mark_fired(e.slot, current_step=15)
+    cache.update_utility(e.slot, ce_delta=2.5)
+
+    blob = cache.to_dict()
+    restored = EpisodicCache.from_dict(blob)
+
+    # Config fields equal.
+    assert restored.capacity == cache.capacity
+    assert restored.span_length == cache.span_length
+    assert restored.key_rep_dim == cache.key_rep_dim
+    assert restored.grace_steps == cache.grace_steps
+    assert restored.utility_ema_decay == pytest.approx(cache.utility_ema_decay)
+    assert restored.fingerprint_window == cache.fingerprint_window
+
+    # Per-slot tensors equal element-wise.
+    for name in EpisodicCache._TENSOR_FIELDS:
+        original = getattr(cache, name)
+        loaded = getattr(restored, name)
+        assert torch.equal(original, loaded), f"{name} diverged after round-trip"
+
+    # Hash index entries equal — must reconstruct content-addressable lookup.
+    assert restored._fp_index == cache._fp_index
+    # Functional check: queries on the restored cache return the same entries.
+    e_orig = cache.query(42)
+    e_load = restored.query(42)
+    assert e_orig is not None and e_load is not None
+    assert e_load.slot == e_orig.slot
+    assert e_load.write_step == e_orig.write_step
+    assert e_load.last_fired_step == e_orig.last_fired_step
+    assert e_load.utility_u == pytest.approx(e_orig.utility_u)
+    assert torch.equal(e_load.value_tok_ids, e_orig.value_tok_ids)
+
+
+def test_to_dict_returns_clones_so_mutating_blob_does_not_corrupt_cache():
+    """to_dict must hand back tensor clones — otherwise a downstream save
+    pipeline mutating the blob would silently corrupt live cache state."""
+    cache = EpisodicCache(capacity=2, span_length=2, key_rep_dim=4)
+    cache.append(**_entry_kwargs(
+        key_fp=1, span_length=2, key_rep_dim=4, current_step=0,
+    ))
+    blob = cache.to_dict()
+    blob["key_fp"][0] = 99999
+    # Live cache fingerprint must be unchanged.
+    assert int(cache.key_fp[0].item()) == 1
+    # And the index lookup still works.
+    assert cache.query(1) is not None
+
+
+def test_from_dict_raises_keyerror_on_missing_required_field():
+    """Silent defaults here are the falsifier-failure mode: if a checkpoint
+    payload is missing a required field, the load MUST raise KeyError so
+    the run aborts early instead of silently scoring noise."""
+    # Build a valid blob, then drop one required field at a time.
+    cache = EpisodicCache(capacity=2, span_length=2, key_rep_dim=4)
+    cache.append(**_entry_kwargs(
+        key_fp=1, span_length=2, key_rep_dim=4, current_step=0,
+    ))
+    full = cache.to_dict()
+
+    # Empty dict is missing every required field.
+    with pytest.raises(KeyError, match="capacity"):
+        EpisodicCache.from_dict({})
+
+    required_fields = (
+        *EpisodicCache._CONFIG_FIELDS,
+        *EpisodicCache._TENSOR_FIELDS,
+        "fp_index",
+    )
+    for field_name in required_fields:
+        partial = dict(full)
+        partial.pop(field_name)
+        with pytest.raises(KeyError, match=field_name):
+            EpisodicCache.from_dict(partial)

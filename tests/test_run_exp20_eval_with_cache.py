@@ -96,22 +96,10 @@ def _make_tiny_corpus_and_ckpt(tmp_path: Path, *, with_cache: bool = False):
             value_anchor_id=4,
             current_step=0, embedding_version=0,
         )
-        blob["episodic_cache"] = {
-            "capacity": cache.capacity,
-            "span_length": cache.span_length,
-            "key_rep_dim": cache.key_rep_dim,
-            "grace_steps": cache.grace_steps,
-            "utility_ema_decay": cache.utility_ema_decay,
-            "key_fp": cache.key_fp,
-            "key_rep": cache.key_rep,
-            "value_tok_ids": cache.value_tok_ids,
-            "value_anchor_id": cache.value_anchor_id,
-            "utility_u": cache.utility_u,
-            "last_fired_step": cache.last_fired_step,
-            "write_step": cache.write_step,
-            "birth_embedding_version": cache.birth_embedding_version,
-            "occupied": cache.occupied,
-        }
+        # Use the canonical to_dict so this fixture stays in sync with the
+        # save/load contract — hand-rolled payloads here would re-introduce
+        # the schema-drift the from_dict strictness exists to catch.
+        blob["episodic_cache"] = cache.to_dict()
     torch.save(blob, ckpt_path)
     return jsonl, f"{sp_prefix}.model", ckpt_path
 

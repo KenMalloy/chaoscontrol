@@ -32,6 +32,7 @@ drift that Titans Revisited flagged.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 
 import torch
 
@@ -73,6 +74,7 @@ class EpisodicCache:
         key_rep_dim: int = 16,
         grace_steps: int = 200,
         utility_ema_decay: float = 0.99,
+        fingerprint_window: int = 8,
     ) -> None:
         if capacity <= 0:
             raise ValueError(f"capacity must be positive; got {capacity}")
@@ -84,12 +86,22 @@ class EpisodicCache:
             raise ValueError(
                 f"utility_ema_decay must be in (0, 1); got {utility_ema_decay}"
             )
+        if fingerprint_window <= 0:
+            raise ValueError(
+                f"fingerprint_window must be positive; got {fingerprint_window}"
+            )
 
         self.capacity = int(capacity)
         self.span_length = int(span_length)
         self.key_rep_dim = int(key_rep_dim)
         self.grace_steps = int(grace_steps)
         self.utility_ema_decay = float(utility_ema_decay)
+        # Carried on the cache so the trainer's W choice rides into the
+        # eval-time controller via the saved payload — preventing the
+        # silent W-mismatch failure mode where the cache holds W=8
+        # fingerprints but the controller queries with W=4 and scores
+        # zero hits.
+        self.fingerprint_window = int(fingerprint_window)
 
         # Storage. Parallel tensors keyed by slot index.
         self.key_fp = torch.zeros(self.capacity, dtype=torch.int64)
@@ -251,7 +263,8 @@ class EpisodicCache:
         Zeros every field tensor, clears the hash index, and re-applies the
         ``last_fired_step``/``write_step`` sentinel of -1. Capacity and the
         construction-time shape parameters (``span_length``, ``key_rep_dim``,
-        ``grace_steps``, ``utility_ema_decay``) are preserved.
+        ``grace_steps``, ``utility_ema_decay``, ``fingerprint_window``) are
+        preserved.
 
         Used by the eval-time runner for per-doc reset semantics — each doc
         starts with a fresh cache so cross-document leakage in the
@@ -296,6 +309,87 @@ class EpisodicCache:
             ),
             "occupied": self.occupied.to(device, non_blocking=True),
         }
+
+    # ---- save / load ----------------------------------------------------------
+
+    # Construction parameters that round-trip through to_dict/from_dict.
+    # These match the keyword arguments accepted by ``__init__``.
+    _CONFIG_FIELDS: tuple[str, ...] = (
+        "capacity",
+        "span_length",
+        "key_rep_dim",
+        "grace_steps",
+        "utility_ema_decay",
+        "fingerprint_window",
+    )
+    # Per-slot tensor fields that round-trip as torch.Tensor (kept native
+    # so the trainer's saved payload can copy_() into the new cache without
+    # an extra dtype/shape conversion). The ``_fp_index`` Python dict is
+    # carried separately under the ``fp_index`` key.
+    _TENSOR_FIELDS: tuple[str, ...] = (
+        "key_fp",
+        "key_rep",
+        "value_tok_ids",
+        "value_anchor_id",
+        "utility_u",
+        "last_fired_step",
+        "write_step",
+        "birth_embedding_version",
+        "occupied",
+    )
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize the cache to a plain dict — symmetric with ``from_dict``.
+
+        Construction params live as Python scalars; per-slot fields stay as
+        torch tensors (clone() so callers can't mutate live cache state via
+        the returned blob); the hash index ``fp_index`` rides along as a
+        plain ``dict[int, int]`` so ``from_dict`` can rebuild content-
+        addressable lookup without a re-scan.
+
+        Used by the trainer to pack ``ckpt['episodic_cache']`` for save and
+        by the eval-time loader to reconstruct on load. Both ends must speak
+        the same schema; ``_CONFIG_FIELDS`` and ``_TENSOR_FIELDS`` are the
+        canonical key list.
+        """
+        blob: dict[str, Any] = {name: getattr(self, name) for name in self._CONFIG_FIELDS}
+        for name in self._TENSOR_FIELDS:
+            blob[name] = getattr(self, name).clone()
+        # dict() copy so consumers can't mutate the cache's live index via
+        # the returned payload.
+        blob["fp_index"] = dict(self._fp_index)
+        return blob
+
+    @classmethod
+    def from_dict(cls, blob: dict[str, Any]) -> "EpisodicCache":
+        """Reconstruct a cache from a ``to_dict`` payload.
+
+        STRICT: every key in ``_CONFIG_FIELDS`` and ``_TENSOR_FIELDS`` plus
+        ``fp_index`` MUST be present. A missing key raises KeyError with a
+        message naming the field — silent defaults here are the failure
+        mode where Arm B's cache shape silently diverges from the trainer's
+        and the falsifier matrix's contrast collapses to noise.
+        """
+        missing = [
+            name for name in (*cls._CONFIG_FIELDS, *cls._TENSOR_FIELDS, "fp_index")
+            if name not in blob
+        ]
+        if missing:
+            raise KeyError(
+                f"EpisodicCache.from_dict missing required key(s): "
+                f"{sorted(missing)}. The payload must carry every field "
+                f"emitted by EpisodicCache.to_dict — silent defaults here "
+                f"would let saved-vs-loaded cache shape diverge."
+            )
+        cache = cls(**{name: blob[name] for name in cls._CONFIG_FIELDS})
+        for name in cls._TENSOR_FIELDS:
+            getattr(cache, name).copy_(blob[name])
+        # Cast keys/values to plain ``int`` so the loaded index behaves
+        # like one constructed by ``append()`` — tensor element types
+        # (e.g. numpy.int64 from a ckpt round-trip) compare unequal to
+        # plain ints in dict lookups.
+        cache._fp_index = {int(k): int(v) for k, v in blob["fp_index"].items()}
+        return cache
 
     # ---- internals ------------------------------------------------------------
 

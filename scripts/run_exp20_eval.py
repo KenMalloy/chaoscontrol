@@ -55,39 +55,19 @@ def _load_episodic_cache_from_ckpt(blob: dict):
     """Construct an EpisodicCache from a checkpoint payload, or return None
     when the checkpoint has no ``episodic_cache`` key.
 
-    Format mirrors the field-by-field shape produced by Y's training-time
-    save path (see episodic_cache.snapshot_to() and the trainer's save
-    contract). Returns None on absence so the caller can fall back to a
-    fresh empty cache (the train-no-cache + eval-cache "Arm D" path).
+    Delegates to ``EpisodicCache.from_dict`` for the actual reconstruction
+    so the trainer's save and the eval's load speak the same schema.
+    Returns None on absence so the caller can fall back to a fresh empty
+    cache (the train-no-cache + eval-cache "Arm D" path); a present-but-
+    malformed payload propagates ``KeyError`` from ``from_dict`` rather
+    than silently filling defaults — silent defaults are how the falsifier
+    matrix's Arm B vs Arm D contrast collapses to noise.
     """
     from chaoscontrol.optim.episodic_cache import EpisodicCache
     payload = blob.get("episodic_cache")
     if payload is None:
         return None
-    cache = EpisodicCache(
-        capacity=int(payload["capacity"]),
-        span_length=int(payload["span_length"]),
-        key_rep_dim=int(payload["key_rep_dim"]),
-        grace_steps=int(payload.get("grace_steps", 200)),
-        utility_ema_decay=float(payload.get("utility_ema_decay", 0.99)),
-    )
-    cache.key_fp.copy_(payload["key_fp"])
-    cache.key_rep.copy_(payload["key_rep"])
-    cache.value_tok_ids.copy_(payload["value_tok_ids"])
-    cache.value_anchor_id.copy_(payload["value_anchor_id"])
-    cache.utility_u.copy_(payload["utility_u"])
-    cache.last_fired_step.copy_(payload["last_fired_step"])
-    cache.write_step.copy_(payload["write_step"])
-    cache.birth_embedding_version.copy_(payload["birth_embedding_version"])
-    cache.occupied.copy_(payload["occupied"])
-    # Rebuild the hash index from the loaded fingerprints — append/query
-    # both consult ``_fp_index`` and the persisted ckpt does not (and
-    # should not) carry a Python dict. Iterate occupied slots only so
-    # zeroed entries don't pollute the index with fp=0 collisions.
-    for slot in range(cache.capacity):
-        if bool(cache.occupied[slot].item()):
-            cache._fp_index[int(cache.key_fp[slot].item())] = slot
-    return cache
+    return EpisodicCache.from_dict(payload)
 
 
 def _make_fresh_episodic_cache():
