@@ -18,6 +18,7 @@
 #include "action_history.h"
 #include "controller_main.h"
 #include "credit.h"
+#include "optimizer.h"
 #include "posix_shm.h"
 #include "shm_ring.h"
 #include "spsc_ring.h"
@@ -157,6 +158,21 @@ void check_tensor3(
           t.size(2) == dim2,
       name, " must have shape [", dim0, ", ", dim1, ", ", dim2, "]");
   TORCH_CHECK(t.is_contiguous(), name, " must be contiguous");
+}
+
+void check_sgd_tensor_pair(
+    const at::Tensor& weights,
+    const at::Tensor& gradients) {
+  TORCH_CHECK(!weights.is_cuda(), "weights must be a CPU tensor");
+  TORCH_CHECK(!gradients.is_cuda(), "gradients must be a CPU tensor");
+  TORCH_CHECK(weights.scalar_type() == at::kFloat, "weights must be float32");
+  TORCH_CHECK(
+      gradients.scalar_type() == at::kFloat, "gradients must be float32");
+  TORCH_CHECK(weights.is_contiguous(), "weights must be contiguous");
+  TORCH_CHECK(gradients.is_contiguous(), "gradients must be contiguous");
+  TORCH_CHECK(
+      weights.sizes().equals(gradients.sizes()),
+      "weights and gradients must have the same shape");
 }
 
 at::Tensor exact_gelu(const at::Tensor& x) {
@@ -827,6 +843,22 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         pybind11::arg("L_current"),
         pybind11::arg("H"),
         "Return 1 when both logits are active and agree in sign, else 0");
+  pybind11::class_<SgdStep>(m, "SgdStep")
+      .def(pybind11::init<float>(), pybind11::arg("lr"))
+      .def("apply",
+           [](const SgdStep& self,
+              at::Tensor weights,
+              const at::Tensor& gradients) {
+             check_sgd_tensor_pair(weights, gradients);
+             self.apply(
+                 weights.data_ptr<float>(),
+                 gradients.data_ptr<float>(),
+                 static_cast<std::size_t>(weights.numel()));
+           },
+           pybind11::arg("weights"),
+           pybind11::arg("gradients"),
+           "Apply one in-place plain SGD step: weights -= lr * gradients.")
+      .def_property_readonly("lr", &SgdStep::lr);
   pybind11::class_<CreditedAction>(m, "CreditedAction")
       .def_readonly("entry", &CreditedAction::entry)
       .def_readonly("credit", &CreditedAction::credit);

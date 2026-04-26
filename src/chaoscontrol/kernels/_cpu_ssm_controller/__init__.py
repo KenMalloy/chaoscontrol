@@ -61,6 +61,10 @@ gerber_weight = (
     getattr(_C, "gerber_weight", _missing_extension)
     if _C is not None else _missing_extension
 )
+SgdStep = (
+    getattr(_C, "SgdStep", _missing_extension)
+    if _C is not None else _missing_extension
+)
 CreditedAction = (
     getattr(_C, "CreditedAction", _missing_extension)
     if _C is not None else _missing_extension
@@ -139,6 +143,7 @@ __all__ = [
     "backward_step",
     "recency_decay",
     "gerber_weight",
+    "SgdStep",
     "CreditedAction",
     "attribute_credit",
     "RollingStddev",
