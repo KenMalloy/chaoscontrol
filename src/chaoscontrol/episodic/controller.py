@@ -93,18 +93,31 @@ def run_controller_cycle(
         empty, ``k_eff_per_query`` may be < k. Callers wanting both
         numbers should diff ``len(tagged_replay_queue)`` before/after.
     """
-    # Snapshot-and-clear under the lock so a concurrent producer
-    # (the drain function on the same rank's main thread) doesn't see
-    # a partially-mutated list. The default Python list mutation isn't
-    # atomic across append + clear, so the lock is load-bearing whenever
-    # the controller runs in a separate thread.
+    # Drain via repeated ``pop(0)``. Each ``pop(0)`` is a single CPython
+    # bytecode and therefore atomic w.r.t. the GIL — it cannot interleave
+    # with the producer's ``append()`` call (also single-bytecode, also
+    # atomic). This is the race-free pattern for "I cannot lock the
+    # producer side": ``snapshot = list(q); q.clear()`` would NOT be
+    # atomic across the two calls, so an ``append()`` racing in between
+    # would silently drop the newly appended item.
+    #
+    # A ``queue_lock`` is still respected when supplied: tests pass an
+    # explicit lock so they can deterministically synchronize a producer
+    # thread against the controller. In production the producer side
+    # (``_drain_episodic_payloads_gpu`` on the episodic rank's main
+    # thread) does NOT take the lock, so the controller relies on the
+    # GIL atomicity of ``pop(0)`` + ``append()``.
+    candidates: list[dict[str, Any]] = []
     if queue_lock is not None:
         with queue_lock:
-            candidates = list(controller_query_queue)
-            controller_query_queue.clear()
+            while controller_query_queue:
+                candidates.append(controller_query_queue.pop(0))
     else:
-        candidates = list(controller_query_queue)
-        controller_query_queue.clear()
+        while True:
+            try:
+                candidates.append(controller_query_queue.pop(0))
+            except IndexError:
+                break
 
     if not candidates:
         return 0
@@ -190,8 +203,8 @@ def controller_main(
     controller_query_queue: list[dict[str, Any]],
     tagged_replay_queue: list[dict[str, Any]],
     cache: EpisodicCache,
-    queue_lock: threading.Lock,
     stop_event: threading.Event,
+    queue_lock: threading.Lock | None = None,
     k: int = 16,
     score_mode: str = "cosine_utility_weighted",
     cycle_idle_sleep_s: float = 0.005,
@@ -203,6 +216,12 @@ def controller_main(
     ``stop_event`` is set. Each iteration calls ``run_controller_cycle``;
     if the cycle drained zero candidates, sleeps ``cycle_idle_sleep_s``
     seconds before checking again so the loop doesn't peg a CPU core.
+
+    ``queue_lock`` defaults to ``None``: the runner's production spawn
+    relies on GIL atomicity of ``list.append()`` (producer side) and
+    ``list.pop(0)`` (controller side) to coordinate without a lock.
+    Tests pass an explicit lock for deterministic synchronization with
+    a producer thread.
 
     The ``heartbeat`` parameter is an optional single-element list of
     int (mirrors ``_EpisodicConsumerState.heartbeat``); incremented
