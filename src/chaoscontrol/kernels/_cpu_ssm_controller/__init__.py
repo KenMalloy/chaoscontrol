@@ -53,6 +53,14 @@ controller_main = (
     getattr(_C, "controller_main", _missing_extension)
     if _C is not None else _missing_extension
 )
+ActionHistoryEntry = (
+    getattr(_C, "ActionHistoryEntry", _missing_extension)
+    if _C is not None else _missing_extension
+)
+PerSlotActionHistory = (
+    getattr(_C, "PerSlotActionHistory", _missing_extension)
+    if _C is not None else _missing_extension
+)
 
 # SpscRing test fixture (Phase A2). Exposes the SpscRing<uint64_t, 1024>
 # instantiation bound in cpu_ssm_controller.cpp so tests/test_spsc_ring.py
@@ -105,6 +113,8 @@ __all__ = [
     "load_weights_from_path",
     "forward_pretrain_model",
     "controller_main",
+    "ActionHistoryEntry",
+    "PerSlotActionHistory",
     "SpscRingU64x1024",
     "PosixShm",
     "ShmRingU64x1024",

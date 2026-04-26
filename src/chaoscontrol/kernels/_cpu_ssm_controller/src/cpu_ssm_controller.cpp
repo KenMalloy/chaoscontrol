@@ -14,6 +14,7 @@
 #include <tuple>
 #include <vector>
 
+#include "action_history.h"
 #include "controller_main.h"
 #include "posix_shm.h"
 #include "shm_ring.h"
@@ -707,6 +708,37 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         pybind11::arg("idle_sleep_ns") = 100,
         "Poll controller shm rings until the 1-byte exit flag is nonzero. "
         "C1 stub handlers count records and return the total processed.");
+
+  pybind11::class_<ActionHistoryEntry>(m, "ActionHistoryEntry")
+      .def(pybind11::init<>())
+      .def_readwrite("action_type", &ActionHistoryEntry::action_type)
+      .def_readwrite("gpu_step", &ActionHistoryEntry::gpu_step)
+      .def_readwrite("policy_version", &ActionHistoryEntry::policy_version)
+      .def_readwrite("output_logit", &ActionHistoryEntry::output_logit)
+      .def_readwrite("selected_rank", &ActionHistoryEntry::selected_rank)
+      .def_readwrite("neighbor_slot", &ActionHistoryEntry::neighbor_slot)
+      .def_readwrite("global_state", &ActionHistoryEntry::global_state)
+      .def_readwrite("slot_state", &ActionHistoryEntry::slot_state);
+
+  pybind11::class_<PerSlotActionHistory>(m, "PerSlotActionHistory")
+      .def(pybind11::init<uint32_t, uint32_t>(),
+           pybind11::arg("num_slots"),
+           pybind11::arg("max_entries_per_slot"))
+      .def("append", &PerSlotActionHistory::append,
+           pybind11::arg("slot_id"), pybind11::arg("entry"))
+      .def("history", &PerSlotActionHistory::history,
+           pybind11::arg("slot_id"),
+           pybind11::return_value_policy::reference_internal)
+      .def("mark_evicted", &PerSlotActionHistory::mark_evicted,
+           pybind11::arg("slot_id"), pybind11::arg("current_event_id"))
+      .def("gc", &PerSlotActionHistory::gc,
+           pybind11::arg("current_event_id"), pybind11::arg("gc_lookahead"))
+      .def("size", &PerSlotActionHistory::size, pybind11::arg("slot_id"))
+      .def("is_evicted", &PerSlotActionHistory::is_evicted,
+           pybind11::arg("slot_id"))
+      .def_property_readonly("num_slots", &PerSlotActionHistory::num_slots)
+      .def_property_readonly("max_entries_per_slot",
+                             &PerSlotActionHistory::max_entries_per_slot);
 
   // Phase A2 test fixture — see tests/test_spsc_ring.py. `capacity` is
   // exposed as a static class property (not a method) because the
