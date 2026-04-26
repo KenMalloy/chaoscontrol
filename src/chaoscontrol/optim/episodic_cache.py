@@ -5,6 +5,14 @@ hook writes to and the GPU-side snapshot copies from. A fixed-capacity store
 of (key, value, utility) entries with content-addressable lookup by uint64
 fingerprint and eviction by lowest retrieval-utility past a grace period.
 
+Eviction tracing (Phase D2 of docs/plans/2026-04-26-cpu-ssm-controller.md):
+when constructed with ``eviction_trace_path``, every slot displacement in
+``append()`` writes one NDJSON row to that path capturing the displaced
+slot's pre-overwrite state and the displacing write's id. Used offline to
+bootstrap the trained CPU SSM controller's eviction policy by behavior-
+cloning the heuristic. When unset (default), no file is created and
+behavior is bit-identical to pre-D2.
+
 Schema per entry (Phase 1, correctness-over-bytes; Phase 2 will tighten the
 layout to 64-byte alignment for GPU snapshot efficiency):
 
@@ -31,6 +39,7 @@ drift that Titans Revisited flagged.
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from typing import Any
 
@@ -80,6 +89,7 @@ class EpisodicCache:
         fingerprint_window: int = 8,
         slot_state_dim: int = 0,
         simplex_k_max: int = 0,
+        eviction_trace_path: str | None = None,
     ) -> None:
         if capacity <= 0:
             raise ValueError(f"capacity must be positive; got {capacity}")
@@ -117,6 +127,15 @@ class EpisodicCache:
         self.fingerprint_window = int(fingerprint_window)
         self.slot_state_dim = int(slot_state_dim)
         self.simplex_k_max = int(simplex_k_max)
+        # When set, append() emits one NDJSON row per eviction. None means
+        # tracing is off and behavior is bit-identical to pre-D2 — neither
+        # the file nor any side-effect IO happens. The path is opened in
+        # append mode on each eviction (low-frequency event; no need to
+        # hold a long-lived handle), so multi-process writers on the same
+        # path interleave at row granularity safely.
+        self.eviction_trace_path: str | None = (
+            str(eviction_trace_path) if eviction_trace_path is not None else None
+        )
 
         # Storage. Parallel tensors keyed by slot index.
         self.key_fp = torch.zeros(self.capacity, dtype=torch.int64)
@@ -181,11 +200,20 @@ class EpisodicCache:
         pressure_at_write: float = 0.0,
         source_write_id: int = -1,
         write_bucket: int = -1,
+        displacing_candidate_id: int = -1,
     ) -> int:
         """Insert one entry. If the cache is full, evict the lowest-utility
         entry past its grace period; if no entry is past grace, evict by
         oldest write_step (so a saturated cache during the warm-up window
         rotates by FIFO rather than refusing all writes).
+
+        ``displacing_candidate_id`` is the rank-prefixed uint64 id of the
+        ADMIT event that produced this write — packed as
+        ``(source_rank << 56) | rank_local_seq``. Carried into the eviction
+        trace row so the offline pretrain pipeline can join an EVICTION row
+        back to the ADMISSION row of the write that displaced it. Default
+        sentinel ``-1`` keeps existing call sites green (they don't
+        currently know their own admission id).
 
         Returns the slot index used.
         """
@@ -203,10 +231,21 @@ class EpisodicCache:
         slot = self._allocate_slot(current_step=current_step)
 
         # If the slot was occupied, drop its old fingerprint from the index.
+        # Eviction trace MUST happen here — before the slot's fields get
+        # overwritten — so the row carries the displacee's pre-overwrite
+        # state, not the new write's state.
         if self.occupied[slot].item():
             old_fp = int(self.key_fp[slot].item())
             if self._fp_index.get(old_fp) == slot:
                 self._fp_index.pop(old_fp, None)
+            if self.eviction_trace_path is not None:
+                self._emit_eviction_trace_row(
+                    evicted_slot=int(slot),
+                    evicted_key_fp=old_fp,
+                    gpu_step=int(current_step),
+                    displacing_candidate_id=int(displacing_candidate_id),
+                    displacing_key_fp=int(key_fp),
+                )
 
         self.key_fp[slot] = int(key_fp)
         self.key_rep[slot] = key_rep.to(dtype=torch.float32)
@@ -473,6 +512,45 @@ class EpisodicCache:
         return cache
 
     # ---- internals ------------------------------------------------------------
+
+    def _emit_eviction_trace_row(
+        self,
+        *,
+        evicted_slot: int,
+        evicted_key_fp: int,
+        gpu_step: int,
+        displacing_candidate_id: int,
+        displacing_key_fp: int,
+    ) -> None:
+        """Append one NDJSON eviction row.
+
+        Caller (``append``) must invoke this BEFORE overwriting the
+        evictee's fields, so the per-slot tensors still hold the
+        displaced state. Field order in the row dict is part of the
+        documented schema — controller training reads columns by
+        position, so we build the dict in exactly the documented order.
+        """
+        row: dict[str, int | float] = {
+            "evicted_slot_id": int(evicted_slot),
+            "evicted_key_fp": int(evicted_key_fp),
+            "evicted_utility_at_eviction": float(
+                self.utility_u[evicted_slot].item()
+            ),
+            "evicted_write_step": int(self.write_step[evicted_slot].item()),
+            "evicted_last_fired_step": int(
+                self.last_fired_step[evicted_slot].item()
+            ),
+            "gpu_step": int(gpu_step),
+            "displacing_candidate_id": int(displacing_candidate_id),
+            "displacing_key_fp": int(displacing_key_fp),
+        }
+        # Append-mode open per row: eviction is rare relative to
+        # training step rate, so the open/close cost is negligible
+        # compared to the bug surface of holding a long-lived handle
+        # across worker forks.
+        with open(self.eviction_trace_path, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(row, separators=(",", ":")))
+            fh.write("\n")
 
     def _check_slot(self, slot: int) -> None:
         if not 0 <= slot < self.capacity:
