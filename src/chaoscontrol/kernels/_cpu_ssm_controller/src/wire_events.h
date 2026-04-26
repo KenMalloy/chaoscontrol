@@ -13,8 +13,10 @@
 // Alignment note: `#pragma pack(push, 1)` makes `alignof(struct) == 1`
 // by definition. The alignment that matters for ring-slot placement is
 // `alignof(uint64_t)` so a u64 load from any field is naturally aligned.
-// `wire_event_alignments()` therefore reports 8 (the largest member's
-// natural alignment), not `alignof(struct)`.
+// `wire_event_min_slot_alignment()` therefore reports 8 (the largest
+// member's natural alignment), not `alignof(struct)`. All three structs
+// share this single value, which is why the binding returns a scalar
+// rather than a per-struct dict.
 #pragma once
 
 #include <cstdint>

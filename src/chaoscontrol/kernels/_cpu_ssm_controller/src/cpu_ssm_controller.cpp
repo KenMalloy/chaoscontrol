@@ -131,16 +131,15 @@ pybind11::dict wire_event_sizes() {
   return d;
 }
 
-pybind11::dict wire_event_alignments() {
-  // Largest member alignment, not `alignof(struct)` (= 1 under pack(1)).
-  // This is the alignment ShmRing slot stride must satisfy so a u64 load
-  // from any field lands on a natural boundary.
-  constexpr int64_t kSlotAlign = static_cast<int64_t>(alignof(uint64_t));
-  pybind11::dict d;
-  d["WriteEvent"] = kSlotAlign;
-  d["QueryEvent"] = kSlotAlign;
-  d["ReplayOutcome"] = kSlotAlign;
-  return d;
+pybind11::int_ wire_event_min_slot_alignment() {
+  // Largest member alignment across all three wire events, not
+  // `alignof(struct)` (= 1 under pack(1)). All three structs share the
+  // same requirement (`alignof(uint64_t)` = 8 on every targeted platform)
+  // because they all carry u64 fields and nothing wider; a single int
+  // matches the structural reality better than a dict-of-three identical
+  // values. ShmRing slot strides (Phase A4) must satisfy this value so a
+  // u64 load from any field lands on a natural boundary.
+  return static_cast<int64_t>(alignof(uint64_t));
 }
 
 pybind11::dict wire_event_constants() {
@@ -156,8 +155,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("backend_name", &backend_name, "Compiled backend name");
   m.def("wire_event_sizes", &wire_event_sizes,
         "Byte sizes of WriteEvent / QueryEvent / ReplayOutcome wire structs");
-  m.def("wire_event_alignments", &wire_event_alignments,
-        "Slot alignment for ShmRing placement (largest-member natural align)");
+  m.def("wire_event_min_slot_alignment", &wire_event_min_slot_alignment,
+        "Single int — minimum ShmRing slot alignment shared by all three wire events");
   m.def("wire_event_constants", &wire_event_constants,
         "Compile-time constants driving wire-event array dimensions");
 }

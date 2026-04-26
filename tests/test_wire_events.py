@@ -24,11 +24,13 @@ def test_wire_event_sizes_match_design():
     assert sizes["ReplayOutcome"] == 96, sizes
 
 
-def test_wire_event_alignments_are_8_byte():
-    aligns = _ext.wire_event_alignments()
-    assert aligns["WriteEvent"] == 8, aligns
-    assert aligns["QueryEvent"] == 8, aligns
-    assert aligns["ReplayOutcome"] == 8, aligns
+def test_wire_event_min_slot_alignment_is_8_bytes():
+    """All three wire events share the same minimum slot alignment
+    (alignof(uint64_t) = 8) — the dict-of-three from the original
+    binding was misleading because the alignment is structurally
+    identical across all three. ShmRing slot strides (Phase A4) must
+    satisfy this single value."""
+    assert _ext.wire_event_min_slot_alignment() == 8
 
 
 def test_wire_event_constants_exposed():
