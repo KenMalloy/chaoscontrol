@@ -43,6 +43,8 @@ The 3+1 split has different ranks contributing different gradient sources, and t
 
 **This is a deliberate scaling asymmetry, not a bug.** Main contributions land at average scale (`/(N-1)`); replay contributions land at full magnitude. Replay weight is therefore controlled by `dreamworld_weight` in the existing config, applied at replay-backward time. If Phase 3 results suggest replay grads should be down-scaled further, drop `dreamworld_weight`; don't try to fold scaling into the collective.
 
+**Footnote — Adam β₂ × replay_full timing.** On parameters touched by both main and replay (shared layers: embedding, final norm, lm_head, and any layer the SSM trunk touches that replay also touches), the optimizer's second-moment estimate becomes the moving average of `(main_avg + replay_full)²` rather than `main²` alone. With Adam-style optimizers `β₂ ≈ 0.999`, the variance estimate adapts on a slow timescale. Phase 1-3 are safe because (a) `dreamworld_weight` is constant from t=0 — the optimizer adapts ONCE during the cache-fill warm-up and is stable thereafter, and (b) the warm-up is symmetric across all four falsifier arms (cache starts empty in all of them). **If Phase 5+ ever schedules `dreamworld_weight` (e.g., a ramp from 0 to a target value):** the schedule must be slow relative to β₂ — ~10 × β₂'s effective window, so ~5000-10000 steps for the ramp — or the second-moment estimate gets perpetually mis-calibrated on shared params. Add a `dreamworld_weight_warmup_steps` analog to Thesis A's `gamma_warmup_steps` if scheduling lands.
+
 **Why a single SUM instead of two AVG collectives:** AVG-then-AVG over different subsets double-counts the first AVG result. SUM with pre-scaling gives full control and a single round-trip. NCCL subgroups are still useful for *non-gradient* coordination (heartbeats, status flags) but not for the main gradient path.
 
 ---
@@ -379,19 +381,28 @@ Schema per Decision 0.9. Log emitted as NDJSON to a per-rank file under the run 
 git commit -m "episodic: per-replay diagnostic log (DuckDB-ready NDJSON schema)"
 ```
 
-### Task 3.3: Falsifier matrix — `episodic_dw_curation_v1` (3 arms × 3 seeds, with escalation)
+### Task 3.3: Falsifier matrix — `episodic_dw_curation_v1` (4 arms × 3 seeds, with escalation)
 
 **Files:** Modify `experiments/24_training_time_bundle/exp24.py` (new matrix builder `build_episodic_dw_curation_v1_matrix`); modify `experiments/24_training_time_bundle/run_exp24.py` (register matrix); shape pin in `tests/test_exp24_training_bundle.py`.
 
-Three arms × three seeds = 9 cells. **All three arms must be topologically identical** — 3+1 rank layout, episodic rank present, same all-reduce path, same replay cadence, same `dreamworld_weight`, same wall budget. The ONLY difference between arms is described below; everything else (config, ScOpt, fused-CE backend, fast_slow recipe, seeds) is matched. Codex round 3: "uncurated DW should use the exact same episodic rank, replay cadence, loss weight, and all_group averaging as curated DW — otherwise the A/B delta can still be replay topology rather than memory curation."
+Four arms × three seeds = 12 cells. **All four arms must be topologically identical** — 3+1 rank layout, episodic rank present, same all-reduce path, same replay cadence, same `dreamworld_weight`, same wall budget. The ONLY difference between arms is the replay-candidate-selection mechanism; everything else (config, ScOpt, fused-CE backend, fast_slow recipe, seeds) is matched. Codex round 3: "uncurated DW should use the exact same episodic rank, replay cadence, loss weight, and all_group averaging as curated DW — otherwise the A/B delta can still be replay topology rather than memory curation."
 
-- **Arm A — uncurated DW:** episodic rank reads replay candidates from the existing online buffer (current `dreamworld.py` path); `episodic_enabled=False` for cache writes/queries. Replay backward runs on the episodic rank, gradients flow through the same all_group SUM all-reduce as Arm B.
-- **Arm B — curated DW:** episodic rank reads replay candidates from the cache's tagged-replay ring (Phase 3 Task 3.1 path); `episodic_enabled=True` for cache writes/queries. Replay backward, all-reduce, replay weight, and per-step replay frequency identical to Arm A.
+- **Arm A — uncurated DW:** episodic rank reads replay candidates from the existing online buffer (current `dreamworld.py` path); `episodic_enabled=False` for cache writes/queries. Replay backward runs on the episodic rank, gradients flow through the same all_group SUM all-reduce as Arms B/B'.
+- **Arm B — curated DW (cosine + utility-weighted retrieval):** episodic rank reads replay candidates from the cache's tagged-replay ring; `episodic_enabled=True` for cache writes/queries. Retrieval: `score = cosine_sim(query_residual, key_rep) × utility_u` (Decision 0.2). Replay backward, all-reduce, replay weight, and per-step replay frequency identical to Arms A/B'.
+- **Arm B' — curated DW (pressure-only retrieval) — MECHANISM-SPECIFICITY ARM:** identical to Arm B *except* retrieval ignores cosine similarity and utility_u entirely. Cache fills the same way (write trigger unchanged); replay candidates are selected by `score = pressure_at_write` only. **Purpose:** distinguish "memory persistence" from "any rare-grad-aligned retrieval policy." If Arm B beats both A and B' on rare-bucket val CE, the result is mechanism-specific (cosine + utility_u retrieval is doing the work). If Arm B ties Arm B', the thesis collapses to "replay-grad-rare-alignment" rather than memory persistence — Phase 4 ablation would catch this expensively; Arm B' catches it cheaply.
 - **Arm C — no DW reference:** episodic rank present, `dreamworld_weight=0` so replay backward fires but contributes zero gradient. Establishes the 3+1 topology baseline without any DW signal at all. Same all-reduce path so it pays the same overhead.
 
 Seeds: 1337, 2674, 4011. Budget 600s/cell + ~250s full-val/cell × 9 cells ≈ ~7-8h wall on 4×H100.
 
-**Pre-committed escalation rule (Decision 0.5):** if `σ(rare-bucket δ_bpb)` across 3 seeds on Arm B > 0.008 bpb, run 3 additional seeds on Arms A and B before declaring pass/fail.
+**Pre-committed escalation rule (Decision 0.5):** if `σ(rare-bucket δ_bpb)` across 3 seeds on Arm B > 0.008 bpb, run 3 additional seeds on Arms A, B, and B' before declaring pass/fail.
+
+**Updated decision gates (4-arm version):**
+- **Pass + mechanism-specific:** Arm B beats both Arm A AND Arm B' on rare-bucket val CE by ≥ 0.005 bpb. The thesis (memory persistence × similarity-based recall) is supported. Phase 4 unlocks; the ablation matrix expands the lesion set.
+- **Pass + mechanism-agnostic:** Arm B ties Arm B' (within stderr) but both beat Arm A. The thesis collapses to "any rare-grad-aligned replay curation works." Memory persistence is NOT load-bearing. Phase 4 still unlocks but the predictor-vector research (Phase 5.4) becomes less interesting and Phase 5.3 (refresh) likely never pays. Document and proceed.
+- **Mixed/null:** Arm B ties Arm A. Cache curation didn't help. See diagnostic checks below.
+- **Regression:** Treatment worse than control. Disable, root-cause.
+
+**Cost delta vs. 3-arm version:** +3 cells × 600s training × 4×H100 ≈ +90 min training + ~15 min full-val × 3 = ~2.25h additional wall-clock. Total Phase 3 falsifier wall: ~7.5h on a warm pod.
 
 ```bash
 git commit -m "exp24: episodic_dw_curation_v1 matrix (3+1 topology, 3 arms x 3 seeds)"
