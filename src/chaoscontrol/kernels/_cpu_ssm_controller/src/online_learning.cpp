@@ -83,6 +83,14 @@ OnlineLearningController::OnlineLearningController(
       chaoscontrol::cpu_features::runtime_has_avx512f();
 }
 
+bool OnlineLearningController::uses_avx512_matops() const {
+  return use_avx512_matops_;
+}
+
+void OnlineLearningController::set_use_avx512_matops(bool enabled) {
+  use_avx512_matops_ = enabled;
+}
+
 void OnlineLearningController::on_write(const WriteEvent&) {
   // WRITE_EVENT has candidate_id but no slot_id in the current wire schema.
   // Keep this as a no-op until admission events can be mapped to cache slots.

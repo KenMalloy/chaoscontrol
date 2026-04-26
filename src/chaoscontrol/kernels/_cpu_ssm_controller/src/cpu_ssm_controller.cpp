@@ -1142,7 +1142,17 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "weights_initialized",
           &OnlineLearningController::weights_initialized)
       .def_property_readonly("last_credit_sum",
-                             &OnlineLearningController::last_credit_sum);
+                             &OnlineLearningController::last_credit_sum)
+      .def_property_readonly("uses_avx512_matops",
+                             &OnlineLearningController::uses_avx512_matops)
+      .def("set_use_avx512_matops",
+           &OnlineLearningController::set_use_avx512_matops,
+           pybind11::arg("enabled"),
+           "Bench hook: force the AVX-512 vs scalar dispatch in "
+           "accumulate_backward. The constructor autodetects; this lets a "
+           "bench compare both paths in one process. Setting True on a "
+           "build without the AVX-512 kernel will SIGILL — check "
+           "avx512_matops_kernel_available() first.");
 
   // Phase A2 test fixture — see tests/test_spsc_ring.py. `capacity` is
   // exposed as a static class property (not a method) because the

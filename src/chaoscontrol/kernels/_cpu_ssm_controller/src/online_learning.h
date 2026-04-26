@@ -78,6 +78,17 @@ class OnlineLearningController {
   const OnlineLearningWeights& fast_weights() const;
   const OnlineLearningWeights& slow_weights() const;
   bool weights_initialized() const;
+  bool uses_avx512_matops() const;
+
+  // Benchmark hook. The constructor autodetects AVX-512 and routes
+  // accumulate_backward through it when available. This setter forces
+  // the dispatch flag for one controller instance so a single-process
+  // bench can measure scalar vs AVX-512 side-by-side. Caller's
+  // responsibility: setting true on a build without the AVX-512 kernel
+  // (or on non-AVX-512 hardware) will SIGILL when the kernel runs.
+  // Check avx512_matops_kernel_available() and runtime_has_avx512f()
+  // before flipping true.
+  void set_use_avx512_matops(bool enabled);
 
  private:
   std::vector<float> sigma_by_action_type() const;
