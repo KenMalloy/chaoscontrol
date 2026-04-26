@@ -66,6 +66,9 @@ def build_ext_modules() -> list:
     online_learning_rel = (
         this_dir.relative_to(repo_root) / "src" / "online_learning.cpp"
     )
+    simplex_policy_rel = (
+        this_dir.relative_to(repo_root) / "src" / "simplex_policy.cpp"
+    )
     return [
         CppExtension(
             name="chaoscontrol.kernels._cpu_ssm_controller._C",
@@ -81,6 +84,7 @@ def build_ext_modules() -> list:
                 str(avx512_matops_rel),
                 str(optimizer_rel),
                 str(online_learning_rel),
+                str(simplex_policy_rel),
             ],
             extra_compile_args={
                 "cxx": ["-O3", "-std=c++17", *_x86_accel_compile_args()],

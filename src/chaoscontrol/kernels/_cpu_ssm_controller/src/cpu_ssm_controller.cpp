@@ -26,6 +26,7 @@
 #include "optimizer.h"
 #include "posix_shm.h"
 #include "shm_ring.h"
+#include "simplex_policy.h"
 #include "spsc_ring.h"
 #include "wire_events.h"
 
@@ -1332,6 +1333,57 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "REGION_BYTES",
           [](pybind11::object) { return ShmRingQueryEventT::REGION_BYTES; },
           "Static byte size of SpscRing<QueryEvent, 16384>.");
+
+  // === Phase S1 — simplex policy forward kernel ===
+  //
+  // Per-query policy over a 16-vertex memory simplex induced by retrieval.
+  // The C++ struct fields are exposed as def_readwrite so the Python pretrain
+  // pipeline (S4) can populate weights without an intermediate dict; Layer 1/2/3
+  // forward is a single function call returning an opaque output struct whose
+  // saved-for-backward fields are def_readonly views S2 will read for the
+  // REINFORCE backward.
+  pybind11::class_<chaoscontrol::simplex::SimplexWeights>(m, "SimplexWeights")
+      .def(pybind11::init<>())
+      .def_readwrite("K_v", &chaoscontrol::simplex::SimplexWeights::K_v)
+      .def_readwrite("K_e", &chaoscontrol::simplex::SimplexWeights::K_e)
+      .def_readwrite("K_s", &chaoscontrol::simplex::SimplexWeights::K_s)
+      .def_readwrite("H", &chaoscontrol::simplex::SimplexWeights::H)
+      .def_readwrite("N", &chaoscontrol::simplex::SimplexWeights::N)
+      .def_readwrite("W_vp", &chaoscontrol::simplex::SimplexWeights::W_vp)
+      .def_readwrite("b_vp", &chaoscontrol::simplex::SimplexWeights::b_vp)
+      .def_readwrite("W_lh", &chaoscontrol::simplex::SimplexWeights::W_lh)
+      .def_readwrite("b_lh", &chaoscontrol::simplex::SimplexWeights::b_lh)
+      .def_readwrite("W_sb", &chaoscontrol::simplex::SimplexWeights::W_sb)
+      .def_readwrite("alpha", &chaoscontrol::simplex::SimplexWeights::alpha)
+      .def_readwrite(
+          "temperature",
+          &chaoscontrol::simplex::SimplexWeights::temperature)
+      .def_readwrite(
+          "bucket_embed",
+          &chaoscontrol::simplex::SimplexWeights::bucket_embed);
+
+  pybind11::class_<chaoscontrol::simplex::SimplexForwardOutput>(
+      m, "SimplexForwardOutput")
+      .def_readonly(
+          "logits", &chaoscontrol::simplex::SimplexForwardOutput::logits)
+      .def_readonly("p", &chaoscontrol::simplex::SimplexForwardOutput::p)
+      .def_readonly(
+          "vertex_h", &chaoscontrol::simplex::SimplexForwardOutput::vertex_h)
+      .def_readonly(
+          "mixed_h", &chaoscontrol::simplex::SimplexForwardOutput::mixed_h)
+      .def_readonly(
+          "attn", &chaoscontrol::simplex::SimplexForwardOutput::attn);
+
+  m.def("simplex_forward", &chaoscontrol::simplex::simplex_forward,
+        pybind11::arg("weights"),
+        pybind11::arg("V"),
+        pybind11::arg("E"),
+        pybind11::arg("simplex_features"),
+        "Forward pass of the simplex policy controller for one query. "
+        "Computes logits + softmax probabilities over the N=16 simplex "
+        "vertices via three layers (vertex projection, edge-aware mixing, "
+        "logit head) and saves the intermediate activations the S2 "
+        "REINFORCE backward will read.");
 
   pybind11::class_<ShmRingReplayOutcomeT>(m, "ShmRingReplayOutcome")
       .def_static("create", &ShmRingReplayOutcomeT::create, pybind11::arg("name"),
