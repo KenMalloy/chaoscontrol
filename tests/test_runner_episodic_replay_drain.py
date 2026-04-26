@@ -231,10 +231,16 @@ class TestEpisodicReplayDrain(unittest.TestCase):
                 # utility_signal_transformed = 0.0 deterministic.
                 self.assertEqual(row["utility_signal_transformed"], 0.0)
 
-            # Cache utility EMA moved (both slots replayed → both EMAs
-            # decayed toward 0 since transformed_signal=0).
-            self.assertLess(float(cache.utility_u[slot_a].item()), utility_pre_a)
-            self.assertLess(float(cache.utility_u[slot_b].item()), utility_pre_b)
+            # Cache utility EMA stayed at the init value because the
+            # raw signal was NaN and update_utility was skipped per the
+            # Phase 1 NaN-skip invariant (Y reviewer fix #3). Without
+            # the skip, replayed entries would decay toward 0 on every
+            # replay, getting evicted faster than unused entries —
+            # collapsing Arm B to "cosine × anti-frequency-of-replay."
+            # See test_runner_skips_utility_update_when_signal_is_nan
+            # for the standalone pin.
+            self.assertEqual(float(cache.utility_u[slot_a].item()), utility_pre_a)
+            self.assertEqual(float(cache.utility_u[slot_b].item()), utility_pre_b)
 
         # Replay backward fired → at least one param now has a grad.
         any_nonzero = False
@@ -365,6 +371,72 @@ class TestEpisodicReplayDrain(unittest.TestCase):
         self.assertEqual(result, [])
         # None consumer → empty list (defensive call site cover).
         self.assertEqual(self.mod._get_tagged_replay_queue(None), [])
+
+    def test_runner_skips_utility_update_when_signal_is_nan(self):
+        """Phase 1 NaN-skip invariant (Y reviewer fix #3).
+
+        With no live rare-grad direction in scope (the default until
+        Phase 4 wires the post-allreduce EMA snapshot), the replay's
+        utility_signal_raw is NaN. update_utility MUST be skipped in
+        that case — otherwise feeding 0.0 into the EMA decays utility
+        toward zero on every replay, replayed entries get evicted faster
+        than unused ones, and Arm B collapses to "cosine ×
+        anti-frequency-of-replay."
+
+        This test pins the skip: replay a slot once with NaN raw signal,
+        verify utility_u stays at its init value (1.0).
+        """
+        model = _TinyTokenModel()
+        cache = EpisodicCache(capacity=2, span_length=4, key_rep_dim=8)
+        slot = _populate_cache_slot(
+            cache,
+            slot_value_anchor=2,
+            span_tokens=torch.tensor([3, 5, 7, 9], dtype=torch.int64),
+            key_fp=42,
+            write_step=10,
+        )
+        # Sanity: cache is fresh, utility_u starts at the documented init.
+        self.assertEqual(float(cache.utility_u[slot].item()), 1.0)
+
+        consumer = _StubConsumerWithTaggedQueue(cache)
+        consumer.tagged_replay_queue.append({
+            "step": 11, "slot": int(slot), "score": 0.5, "selected_at": 11,
+        })
+
+        with TemporaryDirectory() as tmp:
+            log_path = Path(tmp) / "episodic_replay_log_rank3.ndjson"
+            logger = DiagnosticsLogger(log_path)
+
+            self.mod._run_train_step(
+                model=model,
+                inputs=torch.tensor([[1, 2, 3, 4]], dtype=torch.int64),
+                targets=torch.tensor([[2, 3, 4, 5]], dtype=torch.int64),
+                chunk_size=4,
+                precision="fp32",
+                ddp_active=False,
+                world_size=1,
+                rank=0,
+                lm_head_backward_mode="single",
+                grad_allreduce_mode="bulk",
+                is_episodic_rank=True,
+                all_group=None,
+                episodic_emit=None,
+                episodic_consumer=consumer,
+                episodic_replay_logger=logger,
+                current_step=11,
+                embedding_version=0,
+                dreamworld_weight=1.0,
+            )
+            logger.close()
+
+            # The replay fired (queue drained, log row written),
+            # but utility_u stayed at the init value because the raw
+            # signal was NaN and update_utility was skipped.
+            self.assertEqual(consumer.tagged_replay_queue, [])
+            log_lines = log_path.read_text().strip().splitlines()
+            self.assertEqual(len(log_lines), 1)
+            # Utility unchanged.
+            self.assertEqual(float(cache.utility_u[slot].item()), 1.0)
 
     def test_runner_skips_replay_for_evicted_slot(self):
         """A slot can be evicted between the controller's tag and our

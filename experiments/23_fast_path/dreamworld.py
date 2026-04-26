@@ -261,6 +261,16 @@ def _replay_grad_norm_flat(model: Any) -> float:
     Computed BEFORE the SUM all-reduce so the norm reflects the
     replay-only contribution, not the post-reduce ``main_avg + replay``
     aggregate.
+
+    **Cumulative semantics — load-bearing for Phase 3.5 readers.** The
+    runner drains the tagged-replay queue in a loop, calling this
+    helper after each replay's backward. Backwards are additive into
+    ``param.grad``, so replay #k's logged value is
+    ``||G_1 + G_2 + ... + G_k||``, NOT ``||G_k||``. To get the per-event
+    contribution, subtract consecutive rows in DuckDB. The "Phase 3.5
+    readers can backsolve" rule applies. (Pinned in the diagnostic log
+    columnar contract: ``replay_grad_norm`` = cumulative replay grad L2
+    at the moment of row emission.)
     """
     total = 0.0
     for p in model.parameters():

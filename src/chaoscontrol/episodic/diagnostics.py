@@ -14,16 +14,30 @@ Schema (rows pinned to exactly these 16 columns; see Decision 0.9 of
     write_step                 int64    -- step at which entry was originally written
     write_pressure             float64  -- pressure at write time
     write_bucket               int8     -- token-bucket index (0..3) of value_anchor_id
-    query_cosine               float64  -- cosine sim that retrieved this entry
+    query_cosine               float64  -- retrieval ranking signal that selected this
+                                        --   entry. Under cosine_utility_weighted mode
+                                        --   this is `cosine × utility_u` (the score),
+                                        --   NOT raw cosine. Under pressure_only mode
+                                        --   this is the pressure proxy. Phase 3.5 can
+                                        --   backsolve raw cosine via score / utility_pre
+                                        --   for the cosine_utility_weighted arm only.
+                                        --   Renaming to `query_score` is queued as a
+                                        --   Decision 0.9 amendment; for now the
+                                        --   semantic is documented inline.
     utility_pre                float64  -- utility_ema before this replay
     replay_loss                float64  -- CE on value tokens after replay forward
-    replay_grad_norm           float64
+    replay_grad_norm           float64  -- CUMULATIVE replay-only grad L2 across the
+                                        --   step's replays so far. Per-replay
+                                        --   contribution = consecutive-row delta.
     replay_grad_cos_common     float64  -- cosine vs live common-grad direction
     replay_grad_cos_rare       float64  -- cosine vs live rare-grad direction
     replay_grad_cos_total      float64  -- cosine vs total grad
     utility_signal_raw         float64  -- raw signal fed to update_utility (signed)
     utility_signal_transformed float64  -- transformed/clamped value actually applied
-    utility_post               float64  -- updated utility_ema after this replay
+    utility_post               float64  -- updated utility_ema after this replay (or
+                                        --   == utility_pre if utility update was
+                                        --   skipped this replay — see Phase 1 NaN
+                                        --   policy in compute_utility_signal)
 
 NaN values serialize as ``null`` so DuckDB ingests them as missing
 values; Phase 1 logs NaN for the three replay-grad cosines and the

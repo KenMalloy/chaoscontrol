@@ -1765,7 +1765,26 @@ def _run_episodic_replay_from_tagged_queue(
         # Decision 0.10: feed the clamped value to update_utility so
         # the cache scoring rule (cosine × utility_u) keeps a
         # well-defined ordering.
-        cache.update_utility(slot, ce_delta=float(result["utility_signal_transformed"]))
+        #
+        # Phase 1 NaN-skip: if utility_signal_raw is NaN (no live
+        # rare-grad direction in scope — the default until Phase 4
+        # wires the post-allreduce EMA snapshot), DON'T call
+        # update_utility. Otherwise every replay would feed 0.0 into
+        # the EMA, decaying utility_u by the EMA decay factor each
+        # time. Combined with the lowest-utility eviction policy and
+        # the cosine × utility_u retrieval rule, replayed entries
+        # would get evicted FASTER and down-weighted at retrieval —
+        # the cache would preferentially preserve UNUSED entries, and
+        # Arm B would collapse to "cosine × anti-frequency-of-replay."
+        # Skipping preserves utility_u=1.0 (init) for all entries until
+        # Phase 4 lands a real signal. Log row's utility_post then
+        # equals utility_pre, which Phase 3.5 readers can detect as
+        # "this replay didn't update utility."
+        raw = float(result["utility_signal_raw"])
+        if not math.isnan(raw):
+            cache.update_utility(
+                slot, ce_delta=float(result["utility_signal_transformed"]),
+            )
         utility_post = float(cache.utility_u[slot].item())
 
         if logger is not None:
