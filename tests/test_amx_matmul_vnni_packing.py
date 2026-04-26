@@ -164,6 +164,110 @@ def test_cpp_pack_b_vnni_matches_python_reference(M: int, N: int, K: int):
     np.testing.assert_array_equal(actual, ref)
 
 
+def _pack_b_vnni_numpy(b_bf16: np.ndarray) -> np.ndarray:
+    # Mirror the C++ pack_b_vnni: B (K, N) bf16 -> (K/2, 2N) bf16 with
+    # row r = [b[2r,0], b[2r+1,0], b[2r,1], b[2r+1,1], ...]
+    K, N = b_bf16.shape
+    assert K % 2 == 0, "pack_b_vnni: K must be even"
+    out = np.empty((K // 2, 2 * N), dtype=b_bf16.dtype)
+    for r in range(K // 2):
+        for n in range(N):
+            out[r, 2 * n + 0] = b_bf16[2 * r + 0, n]
+            out[r, 2 * n + 1] = b_bf16[2 * r + 1, n]
+    return out
+
+
+def simulate_tiled_amx_matmul(
+    a_bf16: np.ndarray,
+    b_bf16: np.ndarray,
+    *,
+    M: int,
+    N: int,
+    K: int,
+    M_TILE: int = 16,
+    N_TILE: int = 16,
+    K_TILE: int = 32,
+) -> np.ndarray:
+    """Pure-NumPy mirror of the tiled AMX matmul kernel.
+
+    Mirrors what ``amx_bf16_matmul`` will do in C++:
+      1. VNNI-pack B once into a (K/2, 2N) buffer.
+      2. Iterate output tiles (m0, n0) of size (m_block, n_block).
+         For each tile, _tile_zero an fp32 accumulator, run a K-loop
+         that accumulates _simulate_tdpbf16ps_with_vnni_packed over
+         (k0, k_block) sub-windows, and store the result into ``out``.
+
+    The simulator runs in pure NumPy on any host so the *tiling* logic
+    can be validated on arm64 — the hardware-gated parity test in
+    ``test_amx_matmul.py`` only fires on Sapphire Rapids.
+    """
+    assert a_bf16.shape == (M, K), f"A shape must be (M, K) = ({M}, {K}), got {a_bf16.shape}"
+    assert b_bf16.shape == (K, N), f"B shape must be (K, N) = ({K}, {N}), got {b_bf16.shape}"
+    assert K % 2 == 0, "K must be even for bf16 VNNI"
+
+    b_vnni = _pack_b_vnni_numpy(b_bf16)
+    out = np.zeros((M, N), dtype=np.float32)
+
+    for m0 in range(0, M, M_TILE):
+        m_block = min(M_TILE, M - m0)
+        for n0 in range(0, N, N_TILE):
+            n_block = min(N_TILE, N - n0)
+            # _tile_zero: start the dst-tile accumulator at zero.
+            acc = np.zeros((m_block, n_block), dtype=np.float32)
+            for k0 in range(0, K, K_TILE):
+                k_block = min(K_TILE, K - k0)
+                # A sub-tile: rows [m0, m0+m_block), cols [k0, k0+k_block).
+                a_sub = a_bf16[m0:m0 + m_block, k0:k0 + k_block]
+                # B-VNNI sub-tile: rows [k0/2, k0/2+k_block/2),
+                # cols [2*n0, 2*n0 + 2*n_block).
+                vnni_sub = b_vnni[
+                    k0 // 2:k0 // 2 + k_block // 2,
+                    2 * n0:2 * n0 + 2 * n_block,
+                ]
+                acc += _simulate_tdpbf16ps_with_vnni_packed(
+                    a_sub, vnni_sub, M=m_block, N=n_block, K=k_block,
+                )
+            out[m0:m0 + m_block, n0:n0 + n_block] = acc
+
+    return out
+
+
+@pytest.mark.parametrize(
+    "M, N, K",
+    [
+        (1, 32, 64),     # per-event matvec
+        (16, 32, 64),    # 16-event batch
+        (64, 64, 64),    # pretrain mid layer
+        (128, 32, 64),   # pretrain in_proj
+        (13, 17, 30),    # tail-sensitive: M tail, N tail, K tail all fire
+        (16, 16, 32),    # canonical single-tile sanity
+        (16, 16, 48),    # K > K_TILE with K-tail (exercises padding plumbing)
+        (16, 16, 66),    # K > 2*K_TILE with K-tail (multi-iter K + tail)
+    ],
+)
+def test_simulate_tiled_amx_matmul_matches_at_matmul(M: int, N: int, K: int):
+    """The tiled simulator agrees with ``A @ B`` to bf16 tolerance.
+
+    This pins the *tiling logic* against the matmul reference,
+    independent of whether the host can run TDPBF16PS. Without this,
+    the only validation for the C++ tiled kernel would be the
+    hardware-gated SPR parity test — too costly a bug surface.
+    """
+    rng = np.random.default_rng(0xC0FFEE ^ (M * 1009 + N * 31 + K))
+    a_np = rng.standard_normal((M, K)).astype(np.float32)
+    b_np = rng.standard_normal((K, N)).astype(np.float32)
+    a_bf16 = _to_bf16_then_fp32(a_np)
+    b_bf16 = _to_bf16_then_fp32(b_np)
+
+    expected = _simulate_tdpbf16ps_with_logical_b(a_bf16, b_bf16)
+
+    actual = simulate_tiled_amx_matmul(
+        a_bf16, b_bf16, M=M, N=N, K=K,
+    )
+
+    np.testing.assert_allclose(actual, expected, atol=1e-2, rtol=1e-2)
+
+
 @pytest.mark.parametrize(
     "M, N, K",
     [
