@@ -450,6 +450,141 @@ def test_wire_bridge_skips_wrap_when_train_online_false():
     assert consumer.online_learning_bridge is None
 
 
+class _StubQueryRing:
+    """Captures pushed dicts so the producer-side wire payload can be
+    asserted in-process without a real shared-memory ring. Mirrors the
+    push()/size() surface that ``_emit_query_event`` reaches for."""
+
+    def __init__(self) -> None:
+        self.pushed: list[dict] = []
+
+    def push(self, event: dict) -> bool:
+        self.pushed.append(dict(event))
+        return True
+
+
+def _consumer_with_stub_query_ring(mod):
+    """Fresh _EpisodicConsumerState with a stub query ring + zeroed seq
+    counter so ``_emit_query_event`` returns a deterministic query_id
+    on the first push."""
+    consumer = mod._EpisodicConsumerState(
+        cache=None,
+        heartbeat=[0],
+        controller_query_queue=[],
+        controller_query_enabled=False,
+    )
+    consumer.query_ring = _StubQueryRing()
+    consumer.rank_query_seq = {}
+    return consumer
+
+
+def test_runner_emit_query_event_threads_simplex_candidates():
+    """Phase S3 producer pin: when ``_emit_query_event`` is called with
+    a populated 16-id candidate list, the emitted wire-event dict carries
+    those slot ids in order (with cosines following the same shape).
+    The actual top-K retrieval that produces the candidate set lives in
+    Phase S5; S3 only verifies the producer threads the list through to
+    the wire payload unchanged."""
+    mod = _load_runner_module()
+    consumer = _consumer_with_stub_query_ring(mod)
+    residual = torch.zeros(16, dtype=torch.float32)
+    candidate_slot_ids = [10 * (i + 1) for i in range(16)]   # 10..160
+    candidate_cosines = [0.9 - 0.05 * i for i in range(16)]  # 0.90..0.15
+
+    qid = mod._emit_query_event(
+        consumer=consumer,
+        source_rank=0,
+        gpu_step=42,
+        query_residual=residual,
+        pressure=0.5,
+        pre_query_ce=2.0,
+        bucket=1,
+        candidate_slot_ids=candidate_slot_ids,
+        candidate_cosines=candidate_cosines,
+    )
+    assert qid is not None
+    assert len(consumer.query_ring.pushed) == 1
+    payload = consumer.query_ring.pushed[0]
+    assert payload["candidate_slot_ids"] == candidate_slot_ids
+    assert payload["candidate_cosines"] == pytest.approx(candidate_cosines)
+
+
+def test_runner_emit_query_event_sentinel_pads_when_candidates_omitted():
+    """V0 heuristic-only path: caller doesn't pass candidates → producer
+    sentinel-pads both arrays so the wire payload is always 16-wide. The
+    C++ controller reads ``candidate_slot_ids[0] == UINT64_MAX`` as the
+    fallback signal."""
+    mod = _load_runner_module()
+    consumer = _consumer_with_stub_query_ring(mod)
+    residual = torch.zeros(16, dtype=torch.float32)
+
+    mod._emit_query_event(
+        consumer=consumer,
+        source_rank=0,
+        gpu_step=7,
+        query_residual=residual,
+        pressure=0.25,
+        pre_query_ce=1.0,
+        bucket=2,
+    )
+    assert len(consumer.query_ring.pushed) == 1
+    payload = consumer.query_ring.pushed[0]
+    sentinel = (1 << 64) - 1
+    assert payload["candidate_slot_ids"] == [sentinel] * 16
+    assert payload["candidate_cosines"] == [0.0] * 16
+
+
+def test_runner_emit_query_event_sentinel_pads_short_candidate_list():
+    """Producer accepts a sub-16 candidate list (heuristic returned
+    fewer hits) and sentinel-pads the trailing slots so the wire
+    payload is always 16-wide."""
+    mod = _load_runner_module()
+    consumer = _consumer_with_stub_query_ring(mod)
+    residual = torch.zeros(16, dtype=torch.float32)
+    short_ids = [11, 22, 33]
+    short_cosines = [0.9, 0.8, 0.7]
+
+    mod._emit_query_event(
+        consumer=consumer,
+        source_rank=0,
+        gpu_step=11,
+        query_residual=residual,
+        pressure=0.5,
+        pre_query_ce=2.0,
+        bucket=1,
+        candidate_slot_ids=short_ids,
+        candidate_cosines=short_cosines,
+    )
+    payload = consumer.query_ring.pushed[0]
+    sentinel = (1 << 64) - 1
+    assert payload["candidate_slot_ids"][:3] == short_ids
+    assert payload["candidate_slot_ids"][3:] == [sentinel] * 13
+    assert payload["candidate_cosines"][:3] == pytest.approx(short_cosines)
+    assert payload["candidate_cosines"][3:] == [0.0] * 13
+
+
+def test_runner_emit_query_event_rejects_oversized_candidate_list():
+    """Caller passing >16 candidates is a programmer error, not a
+    silent truncation. The producer raises ValueError before it
+    constructs a payload."""
+    mod = _load_runner_module()
+    consumer = _consumer_with_stub_query_ring(mod)
+    residual = torch.zeros(16, dtype=torch.float32)
+
+    with pytest.raises(ValueError, match="exceeds simplex capacity"):
+        mod._emit_query_event(
+            consumer=consumer,
+            source_rank=0,
+            gpu_step=11,
+            query_residual=residual,
+            pressure=0.5,
+            pre_query_ce=2.0,
+            bucket=1,
+            candidate_slot_ids=[i for i in range(17)],
+        )
+    assert consumer.query_ring.pushed == []
+
+
 def test_wire_bridge_defaults_to_train_online_true_when_flag_absent():
     """Backwards compat: existing configs that don't set
     controller_train_online keep their pre-fix behavior (bridge wraps).

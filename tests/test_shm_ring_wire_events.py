@@ -54,7 +54,14 @@ def _sample_write_event() -> dict:
     }
 
 
+_QE_SLOT_SENTINEL = (1 << 64) - 1
+
+
 def _sample_query_event() -> dict:
+    # Default fixture rides the V0 heuristic-only path: simplex
+    # candidates sentinel-padded so the C++ controller will dispatch
+    # to per-slot fallback. Tests that exercise the simplex path
+    # override these two fields explicitly.
     return {
         "event_type": 2,
         "source_rank": 1,
@@ -64,6 +71,8 @@ def _sample_query_event() -> dict:
         "query_rep": [(i * 3) % 65536 for i in range(256)],
         "pressure": 0.875,
         "pre_query_ce": 3.5,
+        "candidate_slot_ids": [_QE_SLOT_SENTINEL] * 16,
+        "candidate_cosines": [0.0] * 16,
     }
 
 
@@ -147,6 +156,8 @@ def test_shm_ring_query_event_round_trip():
             assert ring.push(ev), f"push {i} failed"
         assert ring.size() == 100
         baseline_query_rep = [(j * 3) % 65536 for j in range(256)]
+        baseline_candidate_slot_ids = [_QE_SLOT_SENTINEL] * 16
+        baseline_candidate_cosines = [0.0] * 16
         for i in range(100):
             popped = ring.pop()
             assert popped is not None
@@ -158,7 +169,103 @@ def test_shm_ring_query_event_round_trip():
             assert popped["query_rep"] == baseline_query_rep
             assert popped["pressure"] == pytest.approx(0.875)
             assert popped["pre_query_ce"] == pytest.approx(3.5)
+            # Phase S3: simplex candidate arrays round-trip even on the
+            # heuristic-only path (sentinel fill survives the wire).
+            assert popped["candidate_slot_ids"] == baseline_candidate_slot_ids
+            assert popped["candidate_cosines"] == baseline_candidate_cosines
         assert ring.pop() is None
+    finally:
+        _ext.ShmRingQueryEvent.unlink(name)
+
+
+# ---------------------------------------------------------------------------
+# QueryEvent simplex candidate set (Phase S3)
+# ---------------------------------------------------------------------------
+
+def test_query_event_roundtrip_with_simplex_candidates():
+    """Push a QueryEvent dict with a populated 16-slot simplex candidate
+    set; pop and verify the slot ids and cosines survive the wire byte-
+    equal in order. Pins the Phase S3 schema bump end-to-end through the
+    SpscRing<QueryEvent, 16384> instantiation."""
+    name = "/cc_test_shm_query_simplex"
+    _force_unlink(_ext.ShmRingQueryEvent, name)
+    ring = _ext.ShmRingQueryEvent.create(name)
+    try:
+        ev = _sample_query_event()
+        slot_ids = [10 * (i + 1) for i in range(16)]      # 10, 20, ..., 160
+        cosines = [0.95 - 0.05 * i for i in range(16)]    # 0.95 .. 0.20
+        ev["candidate_slot_ids"] = list(slot_ids)
+        ev["candidate_cosines"] = list(cosines)
+        assert ring.push(ev)
+        popped = ring.pop()
+        assert popped is not None
+        assert popped["candidate_slot_ids"] == slot_ids
+        for i, c in enumerate(cosines):
+            assert popped["candidate_cosines"][i] == pytest.approx(c)
+    finally:
+        _ext.ShmRingQueryEvent.unlink(name)
+
+
+def test_query_event_roundtrip_with_sentinel_candidates():
+    """V0 heuristic-only path: producer fills both candidate arrays
+    with sentinels (UINT64_MAX × 16 / 0.0 × 16). Verify the sentinels
+    survive the wire and the popped dict can be matched against the
+    sentinel constants for fallback dispatch."""
+    name = "/cc_test_shm_query_sentinel"
+    _force_unlink(_ext.ShmRingQueryEvent, name)
+    ring = _ext.ShmRingQueryEvent.create(name)
+    try:
+        ev = _sample_query_event()
+        ev["candidate_slot_ids"] = [_QE_SLOT_SENTINEL] * 16
+        ev["candidate_cosines"] = [0.0] * 16
+        assert ring.push(ev)
+        popped = ring.pop()
+        assert popped is not None
+        assert popped["candidate_slot_ids"] == [_QE_SLOT_SENTINEL] * 16
+        assert popped["candidate_cosines"] == [0.0] * 16
+        # Dispatch contract: controller treats slot_id[0] == sentinel as
+        # "no simplex; fall back to per-slot V0 path."
+        assert popped["candidate_slot_ids"][0] == _QE_SLOT_SENTINEL
+    finally:
+        _ext.ShmRingQueryEvent.unlink(name)
+
+
+def test_query_event_dict_validates_candidate_array_length():
+    """The candidate arrays are uint64[16] / float[16] — wrong length is
+    a programmer error (should have been sentinel-padded by the
+    producer, not silently zero-filled by the wire glue)."""
+    name = "/cc_test_shm_query_badlen"
+    _force_unlink(_ext.ShmRingQueryEvent, name)
+    ring = _ext.ShmRingQueryEvent.create(name)
+    try:
+        bad = _sample_query_event()
+        bad["candidate_slot_ids"] = [1] * 15       # one short
+        with pytest.raises((ValueError, KeyError)):
+            ring.push(bad)
+        bad = _sample_query_event()
+        bad["candidate_cosines"] = [0.5] * 17      # one long
+        with pytest.raises((ValueError, KeyError)):
+            ring.push(bad)
+    finally:
+        _ext.ShmRingQueryEvent.unlink(name)
+
+
+def test_query_event_dict_accepts_omitted_candidate_keys():
+    """Backward-compat: a dict that predates Phase S3 (no candidate
+    arrays) must still push. The C++ glue defaults each array to its
+    sentinel fill so the popped dict carries the sentinel pattern."""
+    name = "/cc_test_shm_query_omit"
+    _force_unlink(_ext.ShmRingQueryEvent, name)
+    ring = _ext.ShmRingQueryEvent.create(name)
+    try:
+        ev = _sample_query_event()
+        del ev["candidate_slot_ids"]
+        del ev["candidate_cosines"]
+        assert ring.push(ev)
+        popped = ring.pop()
+        assert popped is not None
+        assert popped["candidate_slot_ids"] == [_QE_SLOT_SENTINEL] * 16
+        assert popped["candidate_cosines"] == [0.0] * 16
     finally:
         _ext.ShmRingQueryEvent.unlink(name)
 
@@ -349,7 +456,8 @@ def test_shm_ring_region_bytes_at_least_slot_array():
     must be at least sizeof(slot_array). The two cacheline-padded
     indices (128B) plus alignment slack is the only overhead."""
     write_min = 568 * 16384
-    query_min = 544 * 16384
+    # Phase S3: QueryEvent grew 544 → 736 to carry the simplex candidate set.
+    query_min = 736 * 16384
     replay_min = 96 * 8192
     assert _ext.ShmRingWriteEvent.REGION_BYTES >= write_min
     assert _ext.ShmRingQueryEvent.REGION_BYTES >= query_min

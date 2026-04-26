@@ -47,7 +47,15 @@ def _write_event(seq: int = 0) -> dict[str, Any]:
     }
 
 
+_QUERY_SLOT_SENTINEL = (1 << 64) - 1
+
+
 def _query_event(seq: int = 0) -> dict[str, Any]:
+    # Phase S3: QueryEvent now carries the 16-slot simplex candidate set
+    # in-band. The cross-process round-trip uses sentinel-padded fields
+    # so the popped dict equals the pushed dict bit-identically — the
+    # ring serializes the full struct on every push regardless of which
+    # producer path emitted it.
     return {
         "event_type": 2,
         "source_rank": 1,
@@ -57,6 +65,8 @@ def _query_event(seq: int = 0) -> dict[str, Any]:
         "query_rep": [(seq + i) % 65536 for i in range(256)],
         "pressure": 0.875,
         "pre_query_ce": 1.25,
+        "candidate_slot_ids": [_QUERY_SLOT_SENTINEL] * 16,
+        "candidate_cosines": [0.0] * 16,
     }
 
 

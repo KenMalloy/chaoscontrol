@@ -582,6 +582,8 @@ pybind11::dict wire_event_constants() {
   pybind11::dict d;
   d["KEY_REP_DIM_DEFAULT"] = static_cast<int64_t>(KEY_REP_DIM_DEFAULT);
   d["SPAN_LENGTH_DEFAULT"] = static_cast<int64_t>(SPAN_LENGTH_DEFAULT);
+  d["SIMPLEX_CANDIDATES_DEFAULT"] =
+      static_cast<int64_t>(SIMPLEX_CANDIDATES_DEFAULT);
   return d;
 }
 
@@ -651,6 +653,43 @@ void check_dict_keys(const pybind11::dict& d,
   }
 }
 
+// Variant validator that allows a separate set of optional keys in
+// addition to the strict required set. Used by QueryEvent (Phase S3)
+// where `candidate_slot_ids` and `candidate_cosines` are back-compat
+// optional — present for simplex producers, absent for legacy V0
+// heuristic-only producers. The required set is still enforced
+// (missing → KeyError) and any key not in {required, optional} is
+// rejected as before (typo guard).
+void check_dict_keys_with_optional(const pybind11::dict& d,
+                                   const char* const* required_keys,
+                                   std::size_t required_count,
+                                   const char* const* optional_keys,
+                                   std::size_t optional_count,
+                                   const char* event_name) {
+  for (std::size_t i = 0; i < required_count; ++i) {
+    if (!d.contains(required_keys[i])) {
+      throw pybind11::key_error(
+          std::string(event_name) + " dict missing required key '" +
+          required_keys[i] + "'");
+    }
+  }
+  for (auto item : d) {
+    const std::string k = pybind11::str(item.first);
+    bool found = false;
+    for (std::size_t i = 0; i < required_count && !found; ++i) {
+      if (k == required_keys[i]) found = true;
+    }
+    for (std::size_t i = 0; i < optional_count && !found; ++i) {
+      if (k == optional_keys[i]) found = true;
+    }
+    if (!found) {
+      throw pybind11::key_error(
+          std::string(event_name) + " dict has unexpected key '" +
+          k + "'");
+    }
+  }
+}
+
 // Copy a Python sequence of length `n` into a uint16_t array. Used by
 // WriteEvent.key_rep / value_tok_ids and QueryEvent.query_rep. Raises
 // ValueError on length mismatch (programmer error, not silent
@@ -675,6 +714,58 @@ pybind11::list u16_array_to_list(const uint16_t* src, std::size_t n) {
   pybind11::list out(n);
   for (std::size_t i = 0; i < n; ++i) {
     out[i] = pybind11::int_(src[i]);
+  }
+  return out;
+}
+
+// Copy a Python sequence of length `n` into a uint64_t array. Used by
+// QueryEvent.candidate_slot_ids (Phase S3). Same length-mismatch
+// contract as copy_u16_array — wrong length is a programmer error,
+// not a silent fill, so the caller hears about it on push.
+void copy_u64_array(const pybind11::handle& seq,
+                    uint64_t* dst,
+                    std::size_t n,
+                    const char* field_name) {
+  auto pyseq = pybind11::reinterpret_borrow<pybind11::sequence>(seq);
+  if (static_cast<std::size_t>(pybind11::len(pyseq)) != n) {
+    throw pybind11::value_error(
+        std::string("field '") + field_name + "' must have length " +
+        std::to_string(n) + ", got " + std::to_string(pybind11::len(pyseq)));
+  }
+  for (std::size_t i = 0; i < n; ++i) {
+    dst[i] = pyseq[i].cast<uint64_t>();
+  }
+}
+
+pybind11::list u64_array_to_list(const uint64_t* src, std::size_t n) {
+  pybind11::list out(n);
+  for (std::size_t i = 0; i < n; ++i) {
+    out[i] = pybind11::int_(src[i]);
+  }
+  return out;
+}
+
+// Copy a Python sequence of length `n` into a float array. Used by
+// QueryEvent.candidate_cosines (Phase S3).
+void copy_f32_array(const pybind11::handle& seq,
+                    float* dst,
+                    std::size_t n,
+                    const char* field_name) {
+  auto pyseq = pybind11::reinterpret_borrow<pybind11::sequence>(seq);
+  if (static_cast<std::size_t>(pybind11::len(pyseq)) != n) {
+    throw pybind11::value_error(
+        std::string("field '") + field_name + "' must have length " +
+        std::to_string(n) + ", got " + std::to_string(pybind11::len(pyseq)));
+  }
+  for (std::size_t i = 0; i < n; ++i) {
+    dst[i] = pyseq[i].cast<float>();
+  }
+}
+
+pybind11::list f32_array_to_list(const float* src, std::size_t n) {
+  pybind11::list out(n);
+  for (std::size_t i = 0; i < n; ++i) {
+    out[i] = pybind11::float_(src[i]);
   }
   return out;
 }
@@ -724,6 +815,12 @@ pybind11::dict write_event_to_dict(const WriteEvent& ev) {
 }
 
 // --- QueryEvent dict <-> struct ---
+//
+// Required keys (must be present on every push) and optional keys (Phase
+// S3 simplex candidate set — present for simplex producers, sentinel-
+// filled when absent so V0 heuristic-only producers remain unchanged).
+// `query_event_to_dict` always emits both optional keys on pop so the
+// returned dict is the complete struct snapshot.
 constexpr const char* kQueryEventKeys[] = {
     "event_type", "source_rank", "bucket",
     "query_id", "gpu_step", "query_rep",
@@ -732,8 +829,19 @@ constexpr const char* kQueryEventKeys[] = {
 constexpr std::size_t kQueryEventKeyCount =
     sizeof(kQueryEventKeys) / sizeof(kQueryEventKeys[0]);
 
+constexpr const char* kQueryEventOptionalKeys[] = {
+    "candidate_slot_ids",
+    "candidate_cosines",
+};
+constexpr std::size_t kQueryEventOptionalKeyCount =
+    sizeof(kQueryEventOptionalKeys) / sizeof(kQueryEventOptionalKeys[0]);
+
 QueryEvent dict_to_query_event(const pybind11::dict& d) {
-  check_dict_keys(d, kQueryEventKeys, kQueryEventKeyCount, "QueryEvent");
+  check_dict_keys_with_optional(d,
+                                kQueryEventKeys, kQueryEventKeyCount,
+                                kQueryEventOptionalKeys,
+                                kQueryEventOptionalKeyCount,
+                                "QueryEvent");
   QueryEvent ev{};
   ev.event_type   = d["event_type"].cast<uint8_t>();
   ev.source_rank  = d["source_rank"].cast<uint8_t>();
@@ -743,19 +851,45 @@ QueryEvent dict_to_query_event(const pybind11::dict& d) {
   copy_u16_array(d["query_rep"], ev.query_rep, KEY_REP_DIM_DEFAULT, "query_rep");
   ev.pressure     = d["pressure"].cast<float>();
   ev.pre_query_ce = d["pre_query_ce"].cast<float>();
+
+  // Simplex candidate set (Phase S3). Each array defaults independently
+  // to its sentinel fill when absent — supplying populated ids without
+  // populated cosines (or vice versa) is a valid intermediate state for
+  // producers wiring the simplex retrieval up incrementally. Length
+  // mismatch on either array raises ValueError via copy_*_array.
+  if (d.contains("candidate_slot_ids")) {
+    copy_u64_array(d["candidate_slot_ids"], ev.candidate_slot_ids,
+                   SIMPLEX_CANDIDATES_DEFAULT, "candidate_slot_ids");
+  } else {
+    for (int i = 0; i < SIMPLEX_CANDIDATES_DEFAULT; ++i) {
+      ev.candidate_slot_ids[i] = SIMPLEX_CANDIDATE_SLOT_SENTINEL;
+    }
+  }
+  if (d.contains("candidate_cosines")) {
+    copy_f32_array(d["candidate_cosines"], ev.candidate_cosines,
+                   SIMPLEX_CANDIDATES_DEFAULT, "candidate_cosines");
+  } else {
+    for (int i = 0; i < SIMPLEX_CANDIDATES_DEFAULT; ++i) {
+      ev.candidate_cosines[i] = SIMPLEX_CANDIDATE_COSINE_SENTINEL;
+    }
+  }
   return ev;
 }
 
 pybind11::dict query_event_to_dict(const QueryEvent& ev) {
   pybind11::dict d;
-  d["event_type"]   = pybind11::int_(ev.event_type);
-  d["source_rank"]  = pybind11::int_(ev.source_rank);
-  d["bucket"]       = pybind11::int_(ev.bucket);
-  d["query_id"]     = pybind11::int_(ev.query_id);
-  d["gpu_step"]     = pybind11::int_(ev.gpu_step);
-  d["query_rep"]    = u16_array_to_list(ev.query_rep, KEY_REP_DIM_DEFAULT);
-  d["pressure"]     = pybind11::float_(ev.pressure);
-  d["pre_query_ce"] = pybind11::float_(ev.pre_query_ce);
+  d["event_type"]         = pybind11::int_(ev.event_type);
+  d["source_rank"]        = pybind11::int_(ev.source_rank);
+  d["bucket"]             = pybind11::int_(ev.bucket);
+  d["query_id"]           = pybind11::int_(ev.query_id);
+  d["gpu_step"]           = pybind11::int_(ev.gpu_step);
+  d["query_rep"]          = u16_array_to_list(ev.query_rep, KEY_REP_DIM_DEFAULT);
+  d["pressure"]           = pybind11::float_(ev.pressure);
+  d["pre_query_ce"]       = pybind11::float_(ev.pre_query_ce);
+  d["candidate_slot_ids"] = u64_array_to_list(
+      ev.candidate_slot_ids, SIMPLEX_CANDIDATES_DEFAULT);
+  d["candidate_cosines"]  = f32_array_to_list(
+      ev.candidate_cosines, SIMPLEX_CANDIDATES_DEFAULT);
   return d;
 }
 

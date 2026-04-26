@@ -20,7 +20,10 @@ from chaoscontrol.kernels import _cpu_ssm_controller as _ext
 def test_wire_event_sizes_match_design():
     sizes = _ext.wire_event_sizes()
     assert sizes["WriteEvent"] == 568, sizes
-    assert sizes["QueryEvent"] == 544, sizes
+    # QueryEvent grew by 192B in Phase S3 of the simplex-controller pivot:
+    # candidate_slot_ids[16]*u64 (+128B) + candidate_cosines[16]*f32 (+64B).
+    # Pre-pivot size was 544B; post-pivot is 736B.
+    assert sizes["QueryEvent"] == 736, sizes
     assert sizes["ReplayOutcome"] == 96, sizes
 
 

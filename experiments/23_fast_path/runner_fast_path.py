@@ -1897,6 +1897,58 @@ def _rank_prefixed_event_id(*, source_rank: int, rank_seq: int) -> int:
     return (int(source_rank) << 56) | (seq & ((1 << 56) - 1))
 
 
+_SIMPLEX_CANDIDATES = 16
+_SIMPLEX_SLOT_SENTINEL = (1 << 64) - 1   # UINT64_MAX
+_SIMPLEX_COSINE_SENTINEL = 0.0
+
+
+def _pad_simplex_slot_ids(
+    candidate_slot_ids: list[int] | None,
+) -> list[int]:
+    """Sentinel-pad a candidate slot id list to length 16.
+
+    None / empty list → all-sentinel (heuristic-only / V0 path; the C++
+    controller dispatches on ``candidate_slot_ids[0] == UINT64_MAX``).
+    Shorter list → trailing slots filled with the sentinel. Length > 16
+    is a programmer error, not a silent truncation.
+    """
+    if candidate_slot_ids is None:
+        return [_SIMPLEX_SLOT_SENTINEL] * _SIMPLEX_CANDIDATES
+    ids = [int(s) for s in candidate_slot_ids]
+    if len(ids) > _SIMPLEX_CANDIDATES:
+        raise ValueError(
+            f"candidate_slot_ids length {len(ids)} exceeds simplex "
+            f"capacity {_SIMPLEX_CANDIDATES}"
+        )
+    if len(ids) < _SIMPLEX_CANDIDATES:
+        ids = ids + [_SIMPLEX_SLOT_SENTINEL] * (
+            _SIMPLEX_CANDIDATES - len(ids)
+        )
+    return ids
+
+
+def _pad_simplex_cosines(
+    candidate_cosines: list[float] | None,
+) -> list[float]:
+    """Sentinel-pad a candidate cosine list to length 16. Symmetric to
+    ``_pad_simplex_slot_ids`` so the two arrays default independently —
+    a producer wiring the simplex retrieval up incrementally can supply
+    one without the other."""
+    if candidate_cosines is None:
+        return [_SIMPLEX_COSINE_SENTINEL] * _SIMPLEX_CANDIDATES
+    cosines = [float(c) for c in candidate_cosines]
+    if len(cosines) > _SIMPLEX_CANDIDATES:
+        raise ValueError(
+            f"candidate_cosines length {len(cosines)} exceeds simplex "
+            f"capacity {_SIMPLEX_CANDIDATES}"
+        )
+    if len(cosines) < _SIMPLEX_CANDIDATES:
+        cosines = cosines + [_SIMPLEX_COSINE_SENTINEL] * (
+            _SIMPLEX_CANDIDATES - len(cosines)
+        )
+    return cosines
+
+
 def _emit_query_event(
     *,
     consumer: _EpisodicConsumerState,
@@ -1906,11 +1958,22 @@ def _emit_query_event(
     pressure: float,
     pre_query_ce: float,
     bucket: int,
+    candidate_slot_ids: list[int] | None = None,
+    candidate_cosines: list[float] | None = None,
 ) -> int | None:
     """Push a QUERY_EVENT dict to the Phase B4 shm ring.
 
     Returns the query_id when an event is emitted; returns None when the event
     ring is disabled. The dict field order mirrors QueryEvent in wire_events.h.
+
+    ``candidate_slot_ids`` / ``candidate_cosines`` carry the simplex
+    candidate set (Phase S3 of the simplex-controller pivot). Pass the
+    heuristic top-K retrieval result (up to 16 slot ids and their query
+    cosines) to enable the simplex policy path; pass ``None`` (or omit)
+    to ride the V0 heuristic-only path — the wire payload is sentinel-
+    padded and the C++ controller falls back to per-slot scoring. Top-K
+    retrieval lives in S5; S3 only ships the wire schema + producer
+    plumbing.
     """
     if consumer.query_ring is None or consumer.rank_query_seq is None:
         return None
@@ -1931,6 +1994,8 @@ def _emit_query_event(
             "query_rep": tensor_fp16_to_u16_wire(query_residual),
             "pressure": float(pressure),
             "pre_query_ce": float(pre_query_ce),
+            "candidate_slot_ids": _pad_simplex_slot_ids(candidate_slot_ids),
+            "candidate_cosines": _pad_simplex_cosines(candidate_cosines),
         },
     )
     return int(query_id)

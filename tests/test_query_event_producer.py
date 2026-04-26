@@ -22,6 +22,10 @@ QUERY_EVENT_KEYS = (
     "query_rep",
     "pressure",
     "pre_query_ce",
+    # Phase S3 simplex candidate set; emitted on every QueryEvent pop.
+    # Heuristic-only (V0) producer path sentinel-fills both arrays.
+    "candidate_slot_ids",
+    "candidate_cosines",
 )
 
 
