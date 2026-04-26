@@ -320,8 +320,32 @@ def test_make_fresh_episodic_cache_default_shape_matches_trainer():
     cfg = RunConfig()  # defaults only
     cache = mod._make_fresh_episodic_cache(cfg, model_dim=64)
     # Trainer defaults: capacity=4096, span_length=4, key_rep_dim=model_dim,
-    # grace_steps=1000.
+    # grace_steps=1000, fingerprint_window=8.
     assert cache.capacity == 4096
     assert cache.span_length == 4
     assert cache.key_rep_dim == 64
     assert cache.grace_steps == 1000
+    assert cache.fingerprint_window == 8
+
+
+def test_run_config_exposes_episodic_fingerprint_window():
+    """The driver reads episodic_fingerprint_window off RunConfig and
+    threads it to BOTH the fresh-cache constructor AND the LegalityController
+    so a config-only run (no loaded cache payload) still aligns W on both
+    ends. Default 8 mirrors runner_fast_path.py's
+    episodic_fingerprint_window.
+    """
+    cfg = RunConfig()
+    assert cfg.episodic_fingerprint_window == 8
+    cfg2 = RunConfig(episodic_fingerprint_window=12)
+    assert cfg2.episodic_fingerprint_window == 12
+
+
+def test_make_fresh_episodic_cache_threads_fingerprint_window_from_cfg():
+    """Without C1's plumbing, fingerprint_window defaulted to the cache
+    class's own default; cfg overrides were silently dropped.
+    """
+    mod = _load_run_exp20_eval()
+    cfg = RunConfig(episodic_fingerprint_window=12)
+    cache = mod._make_fresh_episodic_cache(cfg, model_dim=64)
+    assert cache.fingerprint_window == 12

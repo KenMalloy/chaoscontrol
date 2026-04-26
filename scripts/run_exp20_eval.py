@@ -94,6 +94,7 @@ def _make_fresh_episodic_cache(cfg: RunConfig, model_dim: int):
         span_length=int(cfg.episodic_span_length),
         key_rep_dim=key_rep_dim,
         grace_steps=int(cfg.episodic_grace_steps),
+        fingerprint_window=int(cfg.episodic_fingerprint_window),
     )
 
 
@@ -211,8 +212,19 @@ def run(cfg: RunConfig, jsonl_paths: list[str], sp_model_path: str) -> None:
     # path is bit-identical to the pre-cache driver. ``cache=None`` is
     # also the default kwarg, but spelling it out makes the back-compat
     # contract visible at the call site.
+    #
+    # Fingerprint window MUST equal the W the trainer used at write time,
+    # else the rolling-hash fingerprints don't align and the cache scores
+    # zero hits silently. Prefer the value carried on the loaded cache
+    # (the trainer's exact W) and fall back to the cfg field for the
+    # fresh-cache and no-cache paths.
+    if episodic_cache is not None:
+        controller_fp_window = int(episodic_cache.fingerprint_window)
+    else:
+        controller_fp_window = int(cfg.episodic_fingerprint_window)
     controller = LegalityController(
         model, loss_fn=_ce, cache=episodic_cache,
+        fingerprint_window=controller_fp_window,
     )
     collector = MetricsCollector(output_path=Path(cfg.output_path))
     budget = BudgetTracker(

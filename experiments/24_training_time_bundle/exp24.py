@@ -1019,6 +1019,13 @@ def build_episodic_ttt_v1_matrix(
         "eval_episodic_span_length": 4,
         "eval_episodic_key_rep_dim": -1,
         "eval_episodic_grace_steps": 1000,
+        # W must match the trainer's episodic_fingerprint_window or the
+        # cache's stored rolling-hash fingerprints don't align with the
+        # controller's queries — silent zero-hit-rate failure. Pinned
+        # explicitly on every arm so a future config drift on the train
+        # side surfaces as an Arm B vs Arm D shape mismatch (loud) rather
+        # than a hit-rate collapse (silent).
+        "eval_episodic_fingerprint_window": 8,
     }
     eval_no_ttt_lock = {
         **eval_cache_schema_lock,

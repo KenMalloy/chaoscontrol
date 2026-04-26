@@ -1404,6 +1404,10 @@ def test_episodic_ttt_v1_matrix_pins_eval_cache_schema_on_all_arms():
             "matches trainer's episodic_key_rep_dim=model_dim default"
         )
         assert entry["eval_episodic_grace_steps"] == 1000
+        assert entry["eval_episodic_fingerprint_window"] == 8, (
+            "W must match runner_fast_path.py's episodic_fingerprint_window "
+            "default; mismatch silently zeros the cache hit rate"
+        )
 
     # Cross-arm: every arm has identical cache shape — Arm B vs Arm D
     # cannot diverge here.
@@ -1412,6 +1416,7 @@ def test_episodic_ttt_v1_matrix_pins_eval_cache_schema_on_all_arms():
         "eval_episodic_span_length",
         "eval_episodic_key_rep_dim",
         "eval_episodic_grace_steps",
+        "eval_episodic_fingerprint_window",
     )
     shapes = {
         tuple(entry[f] for f in schema_fields)

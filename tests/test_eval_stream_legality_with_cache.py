@@ -282,3 +282,98 @@ def test_reset_between_docs_clears_pending_hits():
     assert controller._pending_cache_hits
     controller.mark_new_epoch()
     assert controller._pending_cache_hits == []
+
+
+def test_w8_cache_w8_controller_scores_real_hit_on_matching_suffix():
+    """Pin the W=8 ↔ W=8 contract: when the cache stores a fingerprint
+    over an 8-token window and the controller queries with W=8, a chunk
+    whose last 8 tokens match that window MUST produce a non-empty
+    pending-hit list — otherwise Arm B's hit rate is silently zero and
+    the falsifier matrix's cache-content contrast collapses to noise.
+
+    Uses the same fingerprint_tokens helper the controller uses, so a
+    hash-function divergence (e.g. modulus drift) can't mask itself.
+    """
+    torch.manual_seed(0)
+    model = _TinyLM()
+    # Cache constructed with W=8 — same as the trainer default. The cache
+    # itself doesn't enforce W on writes (that's the writer's job); the
+    # contract is: cache.fingerprint_window is what the writer USED, and
+    # the controller must query with the same value.
+    cache = EpisodicCache(
+        capacity=4, span_length=SPAN, key_rep_dim=KEY_REP_DIM,
+        fingerprint_window=8,
+    )
+    # Build an 8-token window of distinct values, write its fingerprint
+    # into the cache, then build a longer chunk whose LAST 8 tokens are
+    # exactly that window.
+    fp_window_tokens = torch.tensor([3, 7, 11, 13, 17, 19, 23, 29], dtype=torch.long)
+    assert fp_window_tokens.numel() == 8
+    fp = fingerprint_tokens(fp_window_tokens)
+    cache.append(
+        key_fp=fp,
+        key_rep=torch.zeros(KEY_REP_DIM),
+        value_tok_ids=torch.tensor([2, 4, 6, 8], dtype=torch.int64),
+        value_anchor_id=29,
+        current_step=0,
+        embedding_version=0,
+    )
+
+    # Chunk: random prefix, then the matching 8-token suffix. Length must
+    # be >= 2 (CE guard) and >= W (fingerprint guard); 16 is comfortably above.
+    prefix = torch.tensor([0, 1, 2, 5, 8, 12, 16, 20], dtype=torch.long)
+    chunk_row = torch.cat([prefix, fp_window_tokens])
+    chunk = chunk_row.unsqueeze(0)
+
+    controller = LegalityController(
+        model, loss_fn=_loss, cache=cache, fingerprint_window=8,
+    )
+    controller.score_chunk(chunk)
+    assert controller._pending_cache_hits, (
+        "W=8 cache + W=8 controller + matching 8-token suffix MUST hit; "
+        "an empty hit list here means the rolling-hash alignment is broken "
+        "and Arm B's measured cache hit rate is silently zero."
+    )
+    hit = controller._pending_cache_hits[0]
+    assert hit.key_fp == fp
+    assert hit.value_tok_ids.tolist() == [2, 4, 6, 8]
+
+
+def test_w_mismatch_between_cache_and_controller_misses_silently_today():
+    """Documents the failure mode the W=8↔W=8 test exists to catch: if the
+    cache stores fingerprints over W=8 windows but the controller queries
+    with W=4, the rolling hash sees a different prefix and the lookup
+    misses. Asserts the miss explicitly so a future change that re-aligns
+    the hashes (or makes them W-invariant) will fail this test loudly.
+    """
+    torch.manual_seed(0)
+    model = _TinyLM()
+    cache = EpisodicCache(
+        capacity=4, span_length=SPAN, key_rep_dim=KEY_REP_DIM,
+        fingerprint_window=8,
+    )
+    fp_window_tokens = torch.tensor([3, 7, 11, 13, 17, 19, 23, 29], dtype=torch.long)
+    fp = fingerprint_tokens(fp_window_tokens)
+    cache.append(
+        key_fp=fp,
+        key_rep=torch.zeros(KEY_REP_DIM),
+        value_tok_ids=torch.tensor([2, 4, 6, 8], dtype=torch.int64),
+        value_anchor_id=29,
+        current_step=0,
+        embedding_version=0,
+    )
+    chunk = torch.cat([
+        torch.tensor([0, 1, 2, 5, 8, 12, 16, 20], dtype=torch.long),
+        fp_window_tokens,
+    ]).unsqueeze(0)
+
+    # Controller queries with W=4: its tail is fp_window_tokens[-4:],
+    # whose hash differs from the cached W=8 fingerprint.
+    controller = LegalityController(
+        model, loss_fn=_loss, cache=cache, fingerprint_window=4,
+    )
+    controller.score_chunk(chunk)
+    assert controller._pending_cache_hits == [], (
+        "W=8 cache vs W=4 controller MUST miss — this is the silent-zero-"
+        "hit-rate failure mode the substrate fix exists to prevent."
+    )

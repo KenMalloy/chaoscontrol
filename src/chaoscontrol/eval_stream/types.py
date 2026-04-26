@@ -76,3 +76,10 @@ class RunConfig:
     episodic_span_length: int = 4
     episodic_key_rep_dim: int = -1
     episodic_grace_steps: int = 1000
+    # Fingerprint window — must match the W the trainer used at write time
+    # or the rolling-hash fingerprints don't align and the cache scores
+    # zero hits. Default 8 mirrors runner_fast_path.py's
+    # episodic_fingerprint_window default. The eval-time controller
+    # prefers the value carried on the loaded cache payload (the trainer's
+    # exact W) and falls back to this cfg field for the fresh-cache path.
+    episodic_fingerprint_window: int = 8
