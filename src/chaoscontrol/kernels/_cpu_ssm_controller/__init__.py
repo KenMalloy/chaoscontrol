@@ -58,6 +58,17 @@ PosixShm = (
     _C.PosixShm if _C is not None else _missing_extension
 )
 
+# ShmRing test fixture (Phase A4). Exposes the
+# ShmRing<uint64_t, 1024> instantiation bound in cpu_ssm_controller.cpp
+# so tests/test_shm_ring.py can drive it without reaching into `_C`.
+# The real wire-event ring instantiations
+# (ShmRing<WriteEvent, ...>, ShmRing<QueryEvent, ...>,
+# ShmRing<ReplayOutcome, ...>) land in B4 when the per-rank lifecycle
+# goes into the runner.
+ShmRingU64x1024 = (
+    _C.ShmRingU64x1024 if _C is not None else _missing_extension
+)
+
 __all__ = [
     "_C",
     "wire_event_sizes",
@@ -65,4 +76,5 @@ __all__ = [
     "wire_event_constants",
     "SpscRingU64x1024",
     "PosixShm",
+    "ShmRingU64x1024",
 ]

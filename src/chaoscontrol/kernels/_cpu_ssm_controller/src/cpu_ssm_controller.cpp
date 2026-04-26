@@ -11,6 +11,7 @@
 #include <tuple>
 
 #include "posix_shm.h"
+#include "shm_ring.h"
 #include "spsc_ring.h"
 #include "wire_events.h"
 
@@ -169,6 +170,15 @@ pybind11::dict wire_event_constants() {
 // pybind11 / heap pressure.
 using TestRing = SpscRing<uint64_t, 1024>;
 
+// Concrete ShmRing instantiation used only by the Phase A4 Python test
+// (tests/test_shm_ring.py). Same TestRing payload/capacity as A2 but
+// with the SPSC state placed in POSIX shared memory so a fork()'d
+// child can attach by name. Real wire-event ring instantiations
+// (ShmRing<WriteEvent, ...>, ShmRing<QueryEvent, ...>,
+// ShmRing<ReplayOutcome, ...>) land in B4 when the per-rank lifecycle
+// goes into the runner.
+using TestShmRing = ShmRing<uint64_t, 1024>;
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("forward_step", &forward_step, "CPU SSM controller reference step");
   m.def("has_amx_bf16", &has_amx_bf16, "Whether built with AMX BF16 support");
@@ -236,4 +246,41 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
            },
            pybind11::arg("offset"), pybind11::arg("length"),
            "Test-only: read `length` bytes from the region at offset.");
+
+  // Phase A4 binding — see tests/test_shm_ring.py. Move-only class
+  // (owns a PosixShm) so we expose factory methods via def_static and
+  // omit the default `def(py::init<>())`. pybind11's default
+  // unique_ptr holder handles move-only types returned by value from
+  // factories. `capacity` and `REGION_BYTES` are exposed as static
+  // class properties (compile-time template parameters), matching the
+  // A2 pattern for `capacity`.
+  pybind11::class_<TestShmRing>(m, "ShmRingU64x1024")
+      .def_static("create", &TestShmRing::create, pybind11::arg("name"),
+                  "Creator-side factory: shm_open(O_CREAT|O_RDWR), "
+                  "ftruncate, mmap, then placement-new the SpscRing into "
+                  "the region. Returns the owning ShmRing handle.")
+      .def_static("attach", &TestShmRing::attach, pybind11::arg("name"),
+                  "Attacher-side factory: shm_open(O_RDWR), mmap an "
+                  "existing region. Does NOT re-construct the ring; the "
+                  "SPSC state is already there from the creator.")
+      .def("push", &TestShmRing::push, pybind11::arg("item"),
+           "Push u64; returns False if full. Producer-side only.")
+      .def("pop", &TestShmRing::pop,
+           "Pop u64; returns None if empty. Consumer-side only.")
+      .def("size", &TestShmRing::size,
+           "Approximate occupied-slot count.")
+      .def("name", &TestShmRing::name,
+           "POSIX shm name (the '/'-prefixed region name).")
+      .def_static("unlink", &TestShmRing::unlink, pybind11::arg("name"),
+                  "Remove the name from the kernel namespace. Forwards "
+                  "to PosixShm::unlink, which treats ENOENT as a no-op.")
+      .def_property_readonly_static(
+          "capacity",
+          [](pybind11::object) { return TestShmRing::capacity(); },
+          "Compile-time capacity (1024).")
+      .def_property_readonly_static(
+          "REGION_BYTES",
+          [](pybind11::object) { return TestShmRing::REGION_BYTES; },
+          "Static byte size of the underlying SpscRing<T, Capacity> — "
+          "the shm region size required by `create` / `attach`.");
 }
