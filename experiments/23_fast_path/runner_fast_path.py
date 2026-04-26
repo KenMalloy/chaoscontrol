@@ -1693,10 +1693,13 @@ def _spawn_episodic_controller(
     )
 
     stop_event = threading.Event()
-    # The controller thread shares ``consumer.heartbeat`` with the
-    # episodic-rank step body; the runner's outer loop reads either
-    # source for liveness. A single-element list mirrors the existing
-    # heartbeat convention.
+    # The controller thread has its OWN heartbeat (exposed via
+    # ``handle.heartbeat``), separate from ``consumer.heartbeat`` (which
+    # the episodic-rank step body increments). The runner's outer loop
+    # can poll BOTH for independent liveness signals: consumer.heartbeat
+    # tracks step-loop drain progress; this one tracks controller-thread
+    # progress. A regression that stalled the controller thread without
+    # stalling the step loop would surface as drift between the two.
     controller_heartbeat: list[int] = [0]
     thread = threading.Thread(
         target=controller_main,

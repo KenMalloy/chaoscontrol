@@ -194,6 +194,11 @@ def _scores_for_slots(
         cosines = keys_n @ q
         return cosines * util
     if score_mode == "pressure_only":
+        # TODO(task #101): replace with cache.pressure_at_write[slots]
+        # once the EpisodicCache schema gains the field. utility_u is
+        # the closest available proxy today; semantically wrong for the
+        # Arm B' mechanism-specificity test (spec wants pressure-only
+        # to ignore utility entirely).
         return cache.utility_u.to(device)[slots]
     raise ValueError(f"unknown score_mode={score_mode!r}")
 

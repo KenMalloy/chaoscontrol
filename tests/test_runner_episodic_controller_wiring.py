@@ -153,3 +153,94 @@ def test_consumer_state_back_compat_with_disabled_episodic():
     assert consumer.heartbeat == [0]
     assert consumer.controller_query_queue == []
     assert consumer.tagged_replay_queue == []
+
+
+def _make_disabled_consumer(mod, *, with_cache: bool = True):
+    """Build a consumer state where every gate-enabling precondition
+    is met EXCEPT one. Each test below flips a single gate to False to
+    pin that the spawn returns None for that flag specifically.
+    """
+    consumer = mod._attach_episodic_consumer(
+        episodic_enabled=True,
+        is_episodic_rank=True,
+        world_size=2,
+        config={
+            "episodic_capacity": 16,
+            "episodic_span_length": 2,
+            "episodic_key_rep_dim": 4,
+            "controller_query_enabled": True,
+        },
+        model_dim=4,
+        all_group=None,
+    )
+    if not with_cache:
+        consumer.cache = None
+    return consumer
+
+
+def test_spawn_returns_none_when_episodic_disabled():
+    """Gate cascade #1: episodic_enabled=False short-circuits the spawn."""
+    mod = _load_runner_module()
+    consumer = _make_disabled_consumer(mod)
+    handle = mod._spawn_episodic_controller(
+        consumer=consumer,
+        is_episodic_rank=True,
+        episodic_enabled=False,
+        config={},
+    )
+    assert handle is None
+
+
+def test_spawn_returns_none_when_not_episodic_rank():
+    """Gate cascade #2: train ranks never spawn the controller."""
+    mod = _load_runner_module()
+    consumer = _make_disabled_consumer(mod)
+    handle = mod._spawn_episodic_controller(
+        consumer=consumer,
+        is_episodic_rank=False,
+        episodic_enabled=True,
+        config={},
+    )
+    assert handle is None
+
+
+def test_spawn_returns_none_when_cache_missing():
+    """Gate cascade #3: no cache → no controller (the consumer
+    state's no-op shape on a misconfigured episodic rank)."""
+    mod = _load_runner_module()
+    consumer = _make_disabled_consumer(mod, with_cache=False)
+    handle = mod._spawn_episodic_controller(
+        consumer=consumer,
+        is_episodic_rank=True,
+        episodic_enabled=True,
+        config={},
+    )
+    assert handle is None
+
+
+def test_spawn_returns_none_when_controller_query_disabled():
+    """Gate cascade #4: controller_query_enabled=False (Pass C default)
+    silently disables both the drain and the spawn. Single flag, double
+    gate — verified end-to-end."""
+    mod = _load_runner_module()
+    # Override the consumer to flip controller_query_enabled off.
+    consumer = mod._attach_episodic_consumer(
+        episodic_enabled=True,
+        is_episodic_rank=True,
+        world_size=2,
+        config={
+            "episodic_capacity": 16,
+            "episodic_span_length": 2,
+            "episodic_key_rep_dim": 4,
+            "controller_query_enabled": False,
+        },
+        model_dim=4,
+        all_group=None,
+    )
+    handle = mod._spawn_episodic_controller(
+        consumer=consumer,
+        is_episodic_rank=True,
+        episodic_enabled=True,
+        config={},
+    )
+    assert handle is None

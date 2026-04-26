@@ -349,3 +349,51 @@ def test_controller_main_drops_residuals_after_processing():
             assert not isinstance(v, torch.Tensor), (
                 f"tag carried a tensor: {tag} — would pin VRAM"
             )
+
+
+def test_controller_main_releases_residual_tensor_via_weakref():
+    """Stronger version of the above: the controller's local
+    ``cand["residual"] = None`` reference-drop MUST actually release the
+    tensor. Without this test, the previous one would pass even if the
+    reference-drop line were deleted (because the queue itself never
+    held a tensor — just the stack frame inside the controller did).
+
+    Use a weakref to confirm that after run_controller_cycle returns AND
+    the test's local reference is dropped, the residual is garbage-
+    collected. If the controller pinned it past one cycle (in any local
+    list, snapshot, or tag), the weakref stays live.
+    """
+    import gc
+    import weakref
+
+    cache = _make_cache(key_rep_dim=4)
+    _populate_cache(
+        cache,
+        key_reps=[torch.tensor([1.0, 0.0, 0.0, 0.0])],
+        utilities=[0.5],
+    )
+    residual = torch.tensor([1.0, 0.0, 0.0, 0.0])
+    wr = weakref.ref(residual)
+    controller_query_queue = [{
+        "step": 1,
+        "rank": 0,
+        "k": 0,
+        "pressure": 0.5,
+        "residual": residual,
+    }]
+    tagged_replay_queue: list[dict] = []
+    run_controller_cycle(
+        controller_query_queue=controller_query_queue,
+        tagged_replay_queue=tagged_replay_queue,
+        cache=cache,
+        k=1,
+        score_mode="cosine_utility_weighted",
+    )
+    # Drop our test's local references to the residual.
+    del residual
+    del controller_query_queue  # also drops the dict's reference
+    gc.collect()
+    assert wr() is None, (
+        "controller pinned the residual past one cycle; "
+        "the cand['residual'] = None reference-drop is missing or broken"
+    )

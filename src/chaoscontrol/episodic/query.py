@@ -97,9 +97,14 @@ def query_topk(
         cosines = keys_n @ q  # [N_occ]
         scores = cosines * util  # [N_occ]
     else:  # pressure_only
-        # Decision: with no ``pressure_at_write`` in the schema,
-        # ``utility_u`` IS the pressure-only proxy. Inline note for the
-        # Phase 3 reviewer.
+        # TODO(task #101): when EpisodicCache gains a pressure_at_write
+        # field (Phase 3 prereq), replace this proxy with
+        # ``cache.pressure_at_write[occupied_idx]``. Until then,
+        # ``utility_u`` is the closest available signal — but it's
+        # semantically wrong for the Arm B' mechanism-specificity test
+        # (spec wants Arm B' to ignore cosine AND utility entirely).
+        # Phase 3 falsifier loses some discriminative power until #101
+        # lands. Documented in the spec-review report.
         scores = cache.utility_u.to(device)[occupied_idx]  # [N_occ]
 
     k_eff = min(int(k), int(scores.numel()))
