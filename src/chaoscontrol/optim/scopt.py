@@ -19,6 +19,7 @@ from __future__ import annotations
 import math
 from collections import defaultdict
 from collections.abc import Iterable, Mapping
+from dataclasses import dataclass
 from typing import Any, Callable
 
 import torch
@@ -203,6 +204,57 @@ def scarcity_pressure_from_ce(
 
 def _default_is_matrix(param: Tensor, name: str | None) -> bool:  # noqa: ARG001
     return param.ndim == 2
+
+
+@dataclass(frozen=True)
+class ScOptAllReduceConfig:
+    """Gradient sync policy for ScOpt's runner-owned all-reduce sites."""
+
+    op: str
+    train_grad_scale: float
+    train_rank_count: int
+    materialize_zeros: bool
+
+
+def scopt_allreduce_config(
+    *,
+    world_size: int,
+    all_group: object | None,
+) -> ScOptAllReduceConfig:
+    """Return ScOpt's SUM/pre-scale all-reduce convention.
+
+    ScOpt's gradients are reduced by the runner, not inside the optimizer.
+    The current fast-path convention is to pre-scale train-rank gradients
+    and use a SUM collective. In the symmetric DDP case this is algebraic
+    AVG. In the asymmetric all-group topology, the non-train rank submits
+    zero gradients and the train ranks pre-scale by ``1 / N_train`` so the
+    SUM reconstructs the train-rank average without a post-collective divide.
+    """
+    world = int(world_size)
+    if world <= 1:
+        return ScOptAllReduceConfig(
+            op="sum",
+            train_grad_scale=1.0,
+            train_rank_count=1,
+            materialize_zeros=False,
+        )
+    if all_group is None:
+        train_rank_count = world
+        materialize_zeros = False
+    else:
+        train_rank_count = world - 1
+        if train_rank_count < 1:
+            raise ValueError(
+                "ScOpt all_group topology requires world_size >= 2 "
+                f"(1 train + 1 non-train), got world_size={world}"
+            )
+        materialize_zeros = True
+    return ScOptAllReduceConfig(
+        op="sum",
+        train_grad_scale=1.0 / float(train_rank_count),
+        train_rank_count=train_rank_count,
+        materialize_zeros=materialize_zeros,
+    )
 
 
 def _as_name_mapping(

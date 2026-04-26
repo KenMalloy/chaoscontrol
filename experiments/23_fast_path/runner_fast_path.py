@@ -86,6 +86,7 @@ from chaoscontrol.optim.scopt import (  # noqa: E402
     FrequencyBucketBaseline,
     ScarcityAwareOptimizer,
     scarcity_pressure_from_ce,
+    scopt_allreduce_config,
 )
 from chaoscontrol.optim.criticality import CriticalityDistillation  # noqa: E402
 from chaoscontrol.optim.semantic import SemanticOptimizer  # noqa: E402
@@ -574,24 +575,13 @@ def _optimizer_diagnostics(optimizer: torch.optim.Optimizer) -> dict[str, Any]:
     return diagnostics
 
 
-def _average_dense_tensors(
+def _sync_scopt_dense_tensors_coalesced(
     tensors: list[torch.Tensor],
     *,
     world_size: int,
+    all_group: "dist.ProcessGroup | None" = None,
 ) -> None:
-    if world_size <= 1:
-        return
-    for tensor in tensors:
-        dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
-        tensor.div_(world_size)
-
-
-def _average_dense_tensors_coalesced(
-    tensors: list[torch.Tensor],
-    *,
-    world_size: int,
-) -> None:
-    """Flatten-reduce-unflatten for a list of same-dtype dense tensors.
+    """Flatten-reduce-unflatten for ScOpt dense state tensors.
 
     Matches the ``allreduce_grads`` pattern in ``src/chaoscontrol/distributed.py``
     and collapses N per-tensor NCCL launches (each paying ~100-500µs of
@@ -604,9 +594,14 @@ def _average_dense_tensors_coalesced(
     """
     if world_size <= 1 or not tensors:
         return
+    cfg = scopt_allreduce_config(world_size=world_size, all_group=all_group)
+    if cfg.op != "sum":
+        raise ValueError(f"unsupported ScOpt all-reduce op {cfg.op!r}")
     contig = [t.contiguous() for t in tensors]
     flat = torch._utils._flatten_dense_tensors(contig)
-    dist.all_reduce(flat, op=dist.ReduceOp.AVG)
+    if cfg.train_grad_scale != 1.0:
+        flat.mul_(cfg.train_grad_scale)
+    dist.all_reduce(flat, op=dist.ReduceOp.SUM, group=all_group)
     synced = torch._utils._unflatten_dense_tensors(flat, contig)
     for original, s in zip(tensors, synced, strict=True):
         original.copy_(s)
@@ -795,6 +790,28 @@ def _should_run_scopt_split_step(
     return int(step) % split_every == 0
 
 
+def _allreduce_scopt_grads(
+    model: torch.nn.Module,
+    *,
+    world_size: int,
+    all_group: "dist.ProcessGroup | None",
+) -> None:
+    cfg = scopt_allreduce_config(world_size=world_size, all_group=all_group)
+    if cfg.op != "sum":
+        raise ValueError(f"unsupported ScOpt all-reduce op {cfg.op!r}")
+    if cfg.train_grad_scale != 1.0:
+        for p in model.parameters():
+            if p.grad is not None:
+                p.grad.mul_(cfg.train_grad_scale)
+    allreduce_grads(
+        model,
+        world_size,
+        group=all_group,
+        op=dist.ReduceOp.SUM,
+        materialize_zeros=cfg.materialize_zeros,
+    )
+
+
 def _run_scopt_common_train_step(
     *,
     model: torch.nn.Module,
@@ -809,6 +826,7 @@ def _run_scopt_common_train_step(
     lm_head_tile_size: int = 1024,
     grad_allreduce_mode: str = "bulk",
     baseline: FrequencyBucketBaseline | torch.Tensor | float | None = None,
+    all_group: "dist.ProcessGroup | None" = None,
 ) -> torch.Tensor:
     """Fast ScOpt common step for warmup/non-split iterations.
 
@@ -839,7 +857,11 @@ def _run_scopt_common_train_step(
         if ddp_active and world_size > 1:
             if str(grad_allreduce_mode).strip().lower() != "bulk":
                 raise ValueError("ScOpt currently requires grad_allreduce_mode='bulk'")
-            allreduce_grads(model, world_size)
+            _allreduce_scopt_grads(
+                model,
+                world_size=world_size,
+                all_group=all_group,
+            )
         return loss
 
     return _run_train_step(
@@ -854,6 +876,7 @@ def _run_scopt_common_train_step(
         lm_head_backward_mode=lm_head_backward_mode,
         lm_head_tile_size=lm_head_tile_size,
         grad_allreduce_mode=grad_allreduce_mode,
+        all_group=all_group,
     )
 
 
@@ -1052,6 +1075,7 @@ def _run_scopt_train_step(
     pressure_upper_floor: float = 1.0,
     lm_head_backward_mode: str = "fused",
     lm_head_tile_size: int = 1024,
+    all_group: "dist.ProcessGroup | None" = None,
 ) -> tuple[torch.Tensor, _ScOptPending | None]:
     """ScOpt training step with retained graph and rare-grad split.
 
@@ -1147,7 +1171,11 @@ def _run_scopt_train_step(
     for param, grad in zip(params, common_grads, strict=True):
         param.grad = None if grad is None else grad.detach().contiguous()
     if ddp_active and world_size > 1:
-        allreduce_grads(model, world_size)
+        _allreduce_scopt_grads(
+            model,
+            world_size=world_size,
+            all_group=all_group,
+        )
 
     if not is_split_step:
         return total_loss.detach(), None
@@ -1197,7 +1225,11 @@ def _run_scopt_train_step(
         rare_map[name] = dense
         dense_rare.append(dense)
     if ddp_active and world_size > 1 and dense_rare:
-        _average_dense_tensors_coalesced(dense_rare, world_size=world_size)
+        _sync_scopt_dense_tensors_coalesced(
+            dense_rare,
+            world_size=world_size,
+            all_group=all_group,
+        )
 
     # Iterate activations in sorted order so every rank issues all_reduce
     # calls in identical sequence. Duplicate activation tensors reuse the
@@ -1216,9 +1248,10 @@ def _run_scopt_train_step(
         pressure_vec = dh.detach().float().abs().mean(dim=reduce_dims)
         channel_pressure_items.append((key, pressure_vec))
     if ddp_active and world_size > 1 and channel_pressure_items:
-        _average_dense_tensors_coalesced(
+        _sync_scopt_dense_tensors_coalesced(
             [vec for _, vec in channel_pressure_items],
             world_size=world_size,
+            all_group=all_group,
         )
 
     # Row pressure is derived from CE (not gradients), so it doesn't
@@ -1230,7 +1263,11 @@ def _run_scopt_train_step(
         vocab_size=int(token_frequencies.numel()),
     )
     if row_pressure is not None and ddp_active and world_size > 1:
-        _average_dense_tensors([row_pressure], world_size=world_size)
+        _sync_scopt_dense_tensors_coalesced(
+            [row_pressure],
+            world_size=world_size,
+            all_group=all_group,
+        )
 
     pressure_stats = _pressure_summary(pressure)
 
@@ -3323,11 +3360,10 @@ def train_fast_for_budget(
     if episodic_enabled and scopt_active:
         raise ValueError(
             "episodic_enabled=True is incompatible with the ScOpt "
-            "optimizer in Phase 1: the ScOpt train step still uses the "
-            "AVG-over-WORLD collective at lines 826/1134, which the "
-            "episodic rank's None grads would deadlock or silently "
-            "average wrong. Migrate ScOpt to the SUM/all_group path "
-            "before combining the two."
+            "optimizer in Phase 1: the ScOpt runner branch does not yet "
+            "implement the episodic rank's skip-main/replay path. Add the "
+            "episodic branch before combining ScOpt with the asymmetric "
+            "topology."
         )
     if episodic_enabled and predictive_aux_weight > 0.0:
         raise ValueError(
@@ -3921,6 +3957,7 @@ def train_fast_for_budget(
                         pressure_upper_floor=scopt_pressure_upper_floor,
                         lm_head_backward_mode=lm_head_backward_mode,
                         lm_head_tile_size=lm_head_tile_size,
+                        all_group=all_group,
                     )
                 else:
                     loss = _run_scopt_common_train_step(
@@ -3936,6 +3973,7 @@ def train_fast_for_budget(
                         lm_head_tile_size=lm_head_tile_size,
                         grad_allreduce_mode=grad_allreduce_mode_,
                         baseline=scopt_baseline,
+                        all_group=all_group,
                     )
             else:
                 loss = _run_train_step(
