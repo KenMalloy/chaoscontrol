@@ -28,6 +28,7 @@ import torch.distributed as dist
 import torch.nn.functional as F
 
 from chaoscontrol.eval_stream.budget import BudgetTracker
+from chaoscontrol.eval_stream.legality import LegalityController
 from chaoscontrol.eval_stream.val_cache import CachedDoc, ValCache, load_val_cache
 from chaoscontrol.evaluation import compute_bpb
 
@@ -270,14 +271,87 @@ def resolve_distributed_context(env: dict[str, str] | None = None) -> dict[str, 
     }
 
 
-def _build_model(ckpt_path: Path) -> tuple[torch.nn.Module, dict]:
+def _fast_score_ce(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+    return F.cross_entropy(
+        logits.reshape(-1, logits.size(-1)),
+        targets.reshape(-1).to(torch.long),
+        reduction="sum",
+    )
+
+
+def _build_model_with_blob(ckpt_path: Path) -> tuple[torch.nn.Module, dict, dict]:
     from chaoscontrol.model import ChaosStudentLM
 
     blob = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     cfg = blob["config"]
     model = ChaosStudentLM(**cfg)
     model.load_state_dict(blob["model"], strict=True)
+    return model, cfg, blob
+
+
+def _build_model(ckpt_path: Path) -> tuple[torch.nn.Module, dict]:
+    model, cfg, _blob = _build_model_with_blob(ckpt_path)
     return model, cfg
+
+
+def _load_episodic_cache_from_ckpt(blob: dict):
+    """Construct an EpisodicCache from a checkpoint payload when present."""
+    from chaoscontrol.optim.episodic_cache import EpisodicCache
+
+    payload = blob.get("episodic_cache")
+    if payload is None:
+        return None
+    return EpisodicCache.from_dict(payload)
+
+
+def _make_fresh_episodic_cache(args: argparse.Namespace, model_dim: int):
+    """Build the train-no-cache / eval-fresh-cache fallback shape."""
+    from chaoscontrol.optim.episodic_cache import EpisodicCache
+
+    key_rep_dim = (
+        int(model_dim)
+        if int(args.episodic_key_rep_dim) == -1
+        else int(args.episodic_key_rep_dim)
+    )
+    return EpisodicCache(
+        capacity=int(args.episodic_cache_capacity),
+        span_length=int(args.episodic_span_length),
+        key_rep_dim=key_rep_dim,
+        grace_steps=int(args.episodic_grace_steps),
+        fingerprint_window=int(args.episodic_fingerprint_window),
+    )
+
+
+def _build_legality_controller(
+    model: torch.nn.Module,
+    *,
+    args: argparse.Namespace,
+    ckpt_cfg: dict,
+    ckpt_blob: dict,
+) -> tuple[LegalityController, object | None, str]:
+    """Mirror run_exp20_eval.py's eval-side episodic cache construction."""
+    episodic_cache = None
+    cache_source = "disabled"
+    if bool(args.episodic_cache_enabled):
+        model_dim = int(ckpt_cfg["dim"])
+        episodic_cache = _load_episodic_cache_from_ckpt(ckpt_blob)
+        if episodic_cache is None:
+            episodic_cache = _make_fresh_episodic_cache(args, model_dim)
+            cache_source = "fresh"
+        else:
+            cache_source = "loaded"
+
+    if episodic_cache is not None:
+        controller_fp_window = int(episodic_cache.fingerprint_window)
+    else:
+        controller_fp_window = int(args.episodic_fingerprint_window)
+    controller = LegalityController(
+        model,
+        loss_fn=_fast_score_ce,
+        cache=episodic_cache,
+        fingerprint_window=controller_fp_window,
+    )
+    return controller, episodic_cache, cache_source
 
 
 def _token_chunk_ranges(token_len: int, chunk_size: int) -> list[tuple[int, int]]:
@@ -860,7 +934,7 @@ def run(args: argparse.Namespace) -> dict:
 
     setup_t0 = time.monotonic()
     cache = load_val_cache(args.cache_dir)
-    model, _ckpt_cfg = _build_model(args.checkpoint_path)
+    model, ckpt_cfg, ckpt_blob = _build_model_with_blob(args.checkpoint_path)
     model.to(device)
     model.eval()
     if args.torch_compile_mode != "none":
@@ -868,6 +942,29 @@ def run(args: argparse.Namespace) -> dict:
         if args.torch_compile_mode != "default":
             compile_kwargs["mode"] = args.torch_compile_mode
         model = torch.compile(model, **compile_kwargs)
+    legality_controller, episodic_cache, episodic_cache_source = (
+        _build_legality_controller(
+            model,
+            args=args,
+            ckpt_cfg=ckpt_cfg,
+            ckpt_blob=ckpt_blob,
+        )
+    )
+    if episodic_cache_source == "fresh":
+        print(
+            "[exp20_fast_score] episodic_cache: fresh empty cache "
+            f"(capacity={episodic_cache.capacity}, "
+            f"span_length={episodic_cache.span_length}, "
+            f"key_rep_dim={episodic_cache.key_rep_dim})",
+            flush=True,
+        )
+    elif episodic_cache_source == "loaded":
+        print(
+            "[exp20_fast_score] episodic_cache: loaded from checkpoint "
+            f"(capacity={episodic_cache.capacity}, "
+            f"occupied={int(episodic_cache.occupied.sum().item())})",
+            flush=True,
+        )
 
     rank_output_path = _rank_output_path(args.output_path, rank, world_size)
     rank_output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -961,6 +1058,16 @@ def run(args: argparse.Namespace) -> dict:
                 timed_out = True
                 break
             batch_work = doc_work[batch_start:batch_start + doc_batch_size]
+            # Keep the cache-aware LegalityController's per-doc scratch state
+            # aligned with reset-mode scoring. The optimized scorer below owns
+            # the CE hot path; the controller construction is still load-bearing
+            # because cache-aware eval arms must load the checkpoint cache and
+            # carry the trainer's fingerprint window into the eval substrate.
+            if episodic_cache is not None:
+                for work_item in batch_work:
+                    legality_controller.mark_new_epoch()
+                    if args.episodic_cache_reset_per_doc:
+                        episodic_cache.reset()
             score_t0 = time.monotonic()
             if len(batch_work) == 1 or args.chunk_size < 0:
                 scores = []
@@ -1109,6 +1216,19 @@ def run(args: argparse.Namespace) -> dict:
         "score_graph_enabled": score_graph_runner is not None,
         "graph_replay_count": graph_stats.replay_count if graph_stats is not None else 0,
         "graph_fallback_count": graph_stats.fallback_count if graph_stats is not None else 0,
+        "episodic_cache_enabled": bool(args.episodic_cache_enabled),
+        "episodic_cache_source": episodic_cache_source,
+        "episodic_cache_capacity": (
+            int(episodic_cache.capacity) if episodic_cache is not None else None
+        ),
+        "episodic_cache_occupied": (
+            int(episodic_cache.occupied.sum().item())
+            if episodic_cache is not None
+            else None
+        ),
+        "episodic_fingerprint_window": int(
+            legality_controller.fingerprint_window
+        ),
     })
     if world_size == 4:
         summary["projected_8x_wall_seconds"] = elapsed * 4.0 / 8.0
@@ -1165,6 +1285,13 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--score-warmup-steps", type=int, default=0)
     parser.add_argument("--score-graph-mode", choices=["none", "cuda"], default="none")
+    parser.add_argument("--episodic-cache-enabled", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--episodic-cache-reset-per-doc", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--episodic-cache-capacity", type=int, default=4096)
+    parser.add_argument("--episodic-span-length", type=int, default=4)
+    parser.add_argument("--episodic-key-rep-dim", type=int, default=-1)
+    parser.add_argument("--episodic-grace-steps", type=int, default=1000)
+    parser.add_argument("--episodic-fingerprint-window", type=int, default=8)
     parser.add_argument("--device", default="auto")
     return parser.parse_args()
 
