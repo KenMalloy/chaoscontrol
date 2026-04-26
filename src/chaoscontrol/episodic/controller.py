@@ -51,6 +51,139 @@ from chaoscontrol.episodic.query import query_topk
 from chaoscontrol.optim.episodic_cache import EpisodicCache
 
 
+_SIMPLEX_K_V = 16  # vertex feature dim — must match the pretrain spec.
+_SIMPLEX_K_S = 4   # simplex feature dim.
+_SIMPLEX_AGE_NORMALIZER = 1000.0  # divide age in steps by this for V[i, 2].
+
+
+def _is_simplex_runtime(runtime: Any) -> bool:
+    # Duck-type: SimplexOnlineLearner has record_simplex_decision +
+    # fast_weights; V0 CpuSsmControllerRuntime / _OnlineLearningRuntimeBridge
+    # have score_slot / score_slot_with_snapshot. The two surfaces don't
+    # overlap, so a single attribute check picks the right path without
+    # the controller importing the kernel extension.
+    return runtime is not None and hasattr(runtime, "record_simplex_decision")
+
+
+def _build_simplex_inputs(
+    *,
+    residual: torch.Tensor,
+    cache: EpisodicCache,
+    slots: torch.Tensor,
+    scores: torch.Tensor,
+    current_step: int,
+    pad_to: int = 16,
+) -> tuple[list[float], list[float], list[float], list[int]]:
+    """Build (V, E, simplex_features, padded_slot_ids) for one query.
+
+    V[i, 0..K_v-1]: per-vertex features. Column 0 is utility (matches
+    the BC pretrain target = argmax(V[:, 0])); other columns carry
+    cosine, normalized age, pressure-at-write. Unused columns zero-pad
+    to ``K_v=16``.
+
+    E[i, j]: pairwise cosine over key_rep. Diagonal = 1.
+
+    simplex_features[K_s=4]: top-1 utility, mean utility, top-1
+    cosine_q, cosine_q spread (max - min).
+
+    Returns the V/E/sf vectors as flat float lists ready for the C++
+    record_simplex_decision call, plus the padded slot_ids list (length
+    ``pad_to``, zero-padded when fewer than 16 candidates were
+    retrieved). The simplex forward takes the padded shape; vertices
+    beyond the actual candidate count have zero features and contribute
+    zero gradient (the policy can't favor them).
+    """
+    n_actual = int(slots.numel())
+    n = int(pad_to)
+
+    # Per-slot scalars
+    slot_indices = slots.detach().to(device="cpu", dtype=torch.long).tolist()
+    score_list = scores.detach().to(device="cpu", dtype=torch.float32).tolist()
+    utilities = [0.0] * n
+    cosines = [0.0] * n
+    ages = [0.0] * n
+    pressures = [0.0] * n
+    padded_slot_ids = [0] * n
+    for rank, slot_i in enumerate(slot_indices):
+        utilities[rank] = float(cache.utility_u[int(slot_i)].item())
+        cosines[rank] = float(score_list[rank])
+        ages[rank] = float(
+            (int(current_step) - int(cache.write_step[int(slot_i)].item()))
+            / _SIMPLEX_AGE_NORMALIZER
+        )
+        pressures[rank] = float(
+            cache.pressure_at_write[int(slot_i)].item()
+            if hasattr(cache, "pressure_at_write") else 0.0
+        )
+        padded_slot_ids[rank] = int(slot_i)
+
+    # V[i, 0]=utility, V[i, 1]=cosine, V[i, 2]=age, V[i, 3]=pressure;
+    # K_v=16 → indices 4..15 are zero. Column 0 is the BC-pretrain
+    # target signal, so the pretrained W_vp leans on it most.
+    V = [0.0] * (n * _SIMPLEX_K_V)
+    for i in range(n_actual):
+        base = i * _SIMPLEX_K_V
+        V[base + 0] = utilities[i]
+        V[base + 1] = cosines[i]
+        V[base + 2] = ages[i]
+        V[base + 3] = pressures[i]
+
+    # E[i, j] = cosine(key_rep[i], key_rep[j]). Diagonal = 1 (own dot
+    # over own norm).
+    if n_actual > 0 and hasattr(cache, "key_rep"):
+        key_reps = cache.key_rep[slots.to(dtype=torch.long)]
+        norms = key_reps.norm(dim=1, keepdim=True).clamp_min(1e-12)
+        normed = key_reps / norms
+        cos_actual = (normed @ normed.T).clamp(-1.0, 1.0)
+    else:
+        cos_actual = torch.zeros(n_actual, n_actual, dtype=torch.float32)
+
+    E = [0.0] * (n * n)
+    for i in range(n_actual):
+        for j in range(n_actual):
+            E[i * n + j] = float(cos_actual[i, j].item())
+    # Diagonal beyond n_actual: leave at 0 (padded vertices have no
+    # self-similarity to anything real).
+
+    # Simplex features
+    if n_actual > 0:
+        util_slice = utilities[:n_actual]
+        cos_slice = cosines[:n_actual]
+        sf = [
+            float(max(util_slice)),
+            float(sum(util_slice) / len(util_slice)),
+            float(max(cos_slice)),
+            float(max(cos_slice) - min(cos_slice)),
+        ]
+    else:
+        sf = [0.0] * _SIMPLEX_K_S
+    return V, E, sf, padded_slot_ids
+
+
+def _record_simplex_decision_snapshot(
+    *,
+    simplex_runtime: Any,
+    chosen_slot_id: int,
+    gpu_step: int,
+    policy_version: int,
+    chosen_idx: int,
+    p_chosen: float,
+    V: list[float],
+    E: list[float],
+    sf: list[float],
+) -> None:
+    simplex_runtime.record_simplex_decision(
+        chosen_slot_id=int(chosen_slot_id),
+        gpu_step=int(gpu_step),
+        policy_version=int(policy_version),
+        chosen_idx=int(chosen_idx),
+        p_chosen_decision=float(p_chosen),
+        V=V,
+        E=E,
+        simplex_features=sf,
+    )
+
+
 def run_controller_cycle(
     *,
     controller_query_queue: list[dict[str, Any]],
@@ -135,6 +268,8 @@ def run_controller_cycle(
         # training step at queue-emit time).
         selected_at = int(time.monotonic_ns() // 1_000_000)
 
+    is_simplex = _is_simplex_runtime(controller_runtime)
+
     for cand in candidates:
         residual = cand["residual"]
         # ``query_topk`` returns the ranked slot indices; we re-derive
@@ -157,13 +292,93 @@ def run_controller_cycle(
             slots=slots,
             score_mode=score_mode,
         )
-        # ``slots`` and ``scores`` are tensors; ``.tolist()`` does the
-        # device-to-host sync once per candidate (cheap — slots is at
-        # most ``k`` int64 entries, scores is the same).
-        slot_list = slots.tolist()
-        score_list = scores.tolist()
         producer_step = int(cand.get("step", -1))
         query_event_id = _query_event_id_for_candidate(cand)
+
+        if is_simplex:
+            # Simplex V1 path: build the candidate matrix from the top-K
+            # slots, run simplex_forward once over the whole set, choose
+            # one vertex (argmax for V1; sampling is V2). Append a
+            # SINGLE tag for the chosen slot — fundamental output-shape
+            # difference vs the V0 per-slot loop, which appended K tags
+            # per query.
+            from chaoscontrol.kernels import _cpu_ssm_controller as _ext
+
+            V, E, sf, padded_slot_ids = _build_simplex_inputs(
+                residual=residual,
+                cache=cache,
+                slots=slots,
+                scores=scores,
+                current_step=producer_step,
+                pad_to=16,
+            )
+            fwd = _ext.simplex_forward(
+                controller_runtime.fast_weights(), V, E, sf,
+            )
+            # argmax across the actual candidate count (don't pick a
+            # zero-padded vertex by accident if the policy somehow
+            # weighs them above the real ones).
+            n_actual = int(slots.numel())
+            best = 0
+            best_p = float(fwd.p[0])
+            for idx in range(n_actual):
+                if float(fwd.p[idx]) > best_p:
+                    best = idx
+                    best_p = float(fwd.p[idx])
+            chosen_idx = best
+            chosen_slot = int(padded_slot_ids[chosen_idx])
+            p_chosen = best_p
+            controller_logit = float(fwd.logits[chosen_idx])
+
+            if action_recorder is not None:
+                _record_simplex_decision_snapshot(
+                    simplex_runtime=action_recorder,
+                    chosen_slot_id=chosen_slot,
+                    gpu_step=producer_step,
+                    policy_version=int(policy_version),
+                    chosen_idx=chosen_idx,
+                    p_chosen=p_chosen,
+                    V=V, E=E, sf=sf,
+                )
+
+            replay_id = (
+                (int(query_event_id) & ((1 << 56) - 1)) << 8
+            ) | (int(chosen_idx) & 0xFF)
+            tag = {
+                "step": producer_step,
+                "slot": int(chosen_slot),
+                "score": float(scores[chosen_idx].item())
+                if chosen_idx < int(scores.numel()) else 0.0,
+                "selected_at": int(selected_at),
+                "replay_id": replay_id,
+                "query_event_id": int(query_event_id),
+                "source_write_id": int(
+                    cache.source_write_id[int(chosen_slot)].item()
+                    if hasattr(cache, "source_write_id")
+                    else cand.get("source_write_id", -1)
+                ),
+                "selected_rank": int(chosen_idx),
+                "teacher_score": float(
+                    scores[chosen_idx].item()
+                    if chosen_idx < int(scores.numel()) else 0.0
+                ),
+                "controller_logit": float(controller_logit),
+                "selection_step": int(selected_at),
+                "policy_version": int(policy_version),
+                "outcome_status": "pending",
+                "simplex_p_chosen": float(p_chosen),
+                "simplex_chosen_idx": int(chosen_idx),
+            }
+            tagged_replay_queue.append(tag)
+            cand["residual"] = None
+            continue
+
+        # V0 per-slot path (unchanged below). ``slots`` and ``scores``
+        # are tensors; ``.tolist()`` does the device-to-host sync once
+        # per candidate (cheap — slots is at most ``k`` int64 entries,
+        # scores is the same).
+        slot_list = slots.tolist()
+        score_list = scores.tolist()
         for selected_rank, (slot_i, score_i) in enumerate(
             zip(slot_list, score_list, strict=True)
         ):

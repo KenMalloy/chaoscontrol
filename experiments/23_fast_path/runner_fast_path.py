@@ -2269,6 +2269,66 @@ def _controller_score_mode_from_config(config: dict[str, Any]) -> str:
     ).strip()
 
 
+def _build_simplex_learner_from_cswg(
+    weights_path: str,
+    *,
+    config: dict[str, Any],
+) -> Any:
+    # Load CSWG v2 (the simplex policy artifact produced by
+    # experiments/25_controller_pretrain/dump_to_cpp.py) and construct
+    # an _ext.SimplexOnlineLearner with those weights. The learner IS
+    # the runtime for simplex_v1 mode — it carries score-side state
+    # (fast/slow weights) plus the REINFORCE backward path. No
+    # _OnlineLearningRuntimeBridge wrap is needed.
+    import sys
+    pretrain_dir = (
+        Path(__file__).resolve().parent.parent / "25_controller_pretrain"
+    )
+    if str(pretrain_dir) not in sys.path:
+        sys.path.insert(0, str(pretrain_dir))
+    from dump_to_cpp import load_cswg_v2  # noqa: E402
+
+    artifact = load_cswg_v2(weights_path)
+    header = artifact["header"]
+    tensors = artifact["tensors"]
+
+    weights = _ext.SimplexWeights()
+    weights.K_v = int(header["k_v"])
+    weights.K_e = int(header["k_e"])
+    weights.K_s = int(header["k_s"])
+    weights.H = int(header["h"])
+    weights.N = int(header["n_vertices"])
+    # CSWG v2 stores tensors as fp16; cast to fp32 lists for the C++ side
+    # which expects std::vector<float>. The bf16 cast for AMX dispatch
+    # happens inside simplex_policy.cpp, not here.
+    weights.W_vp = tensors["W_vp"].to(torch.float32).flatten().tolist()
+    weights.b_vp = tensors["b_vp"].to(torch.float32).flatten().tolist()
+    weights.W_lh = tensors["W_lh"].to(torch.float32).flatten().tolist()
+    weights.b_lh = float(tensors["b_lh"].to(torch.float32).item())
+    weights.W_sb = tensors["W_sb"].to(torch.float32).flatten().tolist()
+    weights.alpha = float(tensors["alpha"].to(torch.float32).item())
+    weights.temperature = float(tensors["temperature"].to(torch.float32).item())
+    weights.bucket_embed = (
+        tensors["bucket_embed"].to(torch.float32).flatten().tolist()
+    )
+
+    learner = _ext.SimplexOnlineLearner(
+        num_slots=int(config.get("episodic_capacity", 4096)),
+        max_entries_per_slot=int(
+            config.get("episodic_controller_history_entries", 64)
+        ),
+        gamma=float(config.get("episodic_controller_credit_gamma", 0.995)),
+        learning_rate=float(
+            config.get("episodic_controller_learning_rate", 1.0e-3)
+        ),
+        sgd_interval=int(config.get("episodic_controller_sgd_interval", 256)),
+        ema_alpha=float(config.get("episodic_controller_ema_alpha", 0.25)),
+        ema_interval=int(config.get("episodic_controller_ema_interval", 64)),
+    )
+    learner.initialize_simplex_weights(weights)
+    return learner
+
+
 def _build_controller_runtime_from_config(
     config: dict[str, Any],
     *,
@@ -2277,12 +2337,24 @@ def _build_controller_runtime_from_config(
     mode = str(config.get("episodic_controller_runtime", "heuristic")).strip()
     if mode in {"", "heuristic", "python_heuristic"}:
         return None
+    if mode == "simplex_v1":
+        weights_path = config.get("episodic_controller_weights_path")
+        if not weights_path:
+            raise ValueError(
+                f"episodic_controller_runtime={mode!r} requires "
+                "episodic_controller_weights_path (CSWG v2 path produced "
+                "by experiments/25_controller_pretrain/pretrain_controller.py)"
+            )
+        return _build_simplex_learner_from_cswg(
+            str(weights_path), config=config
+        )
     prefer_cpp = mode in {"cpp", "cpu_ssm_cpp", "cpp_reference"}
     prefer_reference = mode in {"reference", "cpu_ssm_reference", "python_reference"}
     if not prefer_cpp and not prefer_reference:
         raise ValueError(
             "episodic_controller_runtime must be one of "
-            "'heuristic', 'cpp_reference', or 'cpu_ssm_reference'; "
+            "'heuristic', 'cpp_reference', 'cpu_ssm_reference', or "
+            "'simplex_v1'; "
             f"got {mode!r}"
         )
     from chaoscontrol.episodic.cpu_ssm_controller import (
@@ -2435,27 +2507,35 @@ def _wire_online_learning_bridge(
     Returns ``(action_recorder, controller_runtime_for_thread)``.
 
     ``controller_train_online`` (default True for backwards compat) gates
-    the bridge. F1's ``arm_c_trained_cold_frozen`` sets it False so the
-    trained controller scores from loaded weights without recording
-    snapshots or running SGD; ``arm_d`` / ``arm_e`` set it True so the
-    bridge wraps the runtime and credit attribution + SGD + EMA all run
-    during the 600s training window.
+    the bridge. F1's frozen arms set it False so the trained controller
+    scores from loaded weights without recording snapshots or running
+    SGD; the online arms set it True so the bridge wraps the runtime
+    and credit attribution + SGD + EMA all run during the 600s training
+    window.
 
-    When True: builds the bridge, sets ``consumer.online_learning_bridge``,
-    and returns the bridge as the runtime-for-thread.
+    Three runtime shapes:
 
-    When False: leaves ``consumer.online_learning_bridge`` unset so
-    ``_notify_online_learning_bridge`` no-ops on every replay outcome.
-    The raw runtime still handles ``score_slot_with_snapshot`` for the
-    query path (the bridge delegates identically when wrapped).
-
-    Heuristic-only / no-trained-runtime callers pass
-    ``controller_runtime=None`` and get ``(None, None)`` back regardless
-    of the flag — there's nothing to wrap.
+    1. ``controller_runtime is None`` (heuristic-only) — returns
+       ``(None, None)``; nothing to wrap.
+    2. ``controller_runtime`` is a V0 ``CpuSsmControllerRuntime`` — when
+       train_online, wraps in ``_OnlineLearningRuntimeBridge`` so the
+       per-slot REINFORCE updates land back in the runtime's scoring
+       weights. When frozen, returns the raw runtime so
+       ``score_slot_with_snapshot`` still works for the query path.
+    3. ``controller_runtime`` is a V1 ``_ext.SimplexOnlineLearner`` — the
+       learner IS the bridge; it carries fast/slow weights and the
+       REINFORCE backward path. When train_online, ``consumer.online_learning_bridge``
+       points at it so ``_notify_online_learning_bridge`` routes replay
+       outcomes via ``on_replay_outcome``. When frozen, ``online_learning_bridge``
+       stays unset (no SGD); the controller thread still calls
+       ``simplex_forward`` on the learner's frozen weights.
     """
     if controller_runtime is None:
         return None, None
     train_online = bool(config.get("controller_train_online", True))
+    is_simplex_learner = isinstance(
+        controller_runtime, _ext.SimplexOnlineLearner
+    )
     if not train_online:
         print(
             "[runner_fast_path] controller_train_online=False — wrapping "
@@ -2464,6 +2544,13 @@ def _wire_online_learning_bridge(
             flush=True,
         )
         return None, controller_runtime
+    if is_simplex_learner:
+        # Simplex V1: the learner is its own bridge. Set the consumer
+        # field so _notify_online_learning_bridge routes replay outcomes
+        # to it; pass the learner through to the controller thread as
+        # the runtime so simplex_forward is callable on its weights.
+        consumer.online_learning_bridge = controller_runtime
+        return controller_runtime, controller_runtime
     bridge = _OnlineLearningRuntimeBridge(
         runtime=controller_runtime,
         capacity=int(consumer.cache.capacity),

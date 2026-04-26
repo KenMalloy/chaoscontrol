@@ -669,3 +669,121 @@ def test_replay_id_packs_into_u64_at_max_rank():
     packed_at_max = ((expected_qid & ((1 << 56) - 1)) << 8) | max_rank
     assert packed_at_max < (1 << 64)
     assert tag["replay_id"] < (1 << 64)
+
+
+def _build_test_simplex_learner():
+    """Construct a SimplexOnlineLearner with random weights for the
+    simplex-path tests below. K_v=16, H=32, N=16 — same dims as the
+    BC pretrain spec and the C++ kernel's design.
+    """
+    from chaoscontrol.kernels import _cpu_ssm_controller as _ext
+
+    g = torch.Generator().manual_seed(1)
+    K_V, H, K_S, N = 16, 32, 4, 16
+    w = _ext.SimplexWeights()
+    w.K_v, w.K_e, w.K_s, w.H, w.N = K_V, 1, K_S, H, N
+    w.W_vp = (torch.randn(K_V, H, generator=g) * 0.1).flatten().tolist()
+    w.b_vp = (torch.randn(H, generator=g) * 0.05).tolist()
+    w.W_lh = (torch.randn(H, generator=g) * 0.1).tolist()
+    w.b_lh = float(torch.randn((), generator=g) * 0.05)
+    w.W_sb = (torch.randn(K_S, generator=g) * 0.05).tolist()
+    w.alpha = float(torch.randn((), generator=g) * 0.1)
+    w.temperature = 1.0
+    w.bucket_embed = torch.zeros(8, 8).flatten().tolist()
+    learner = _ext.SimplexOnlineLearner(num_slots=16, max_entries_per_slot=4)
+    learner.initialize_simplex_weights(w)
+    return learner
+
+
+def test_simplex_runtime_emits_one_tag_per_query_and_records_decision():
+    """Simplex controller path: instead of K=16 tags per query (V0
+    per-slot loop), emits exactly 1 tag for the chosen vertex and
+    records the full simplex snapshot via record_simplex_decision.
+    """
+    learner = _build_test_simplex_learner()
+    cache = _make_cache(capacity=8, key_rep_dim=4)
+    _populate_cache(
+        cache,
+        key_reps=[
+            torch.tensor([1.0, 0.0, 0.0, 0.0]),
+            torch.tensor([0.0, 1.0, 0.0, 0.0]),
+            torch.tensor([0.0, 0.0, 1.0, 0.0]),
+            torch.tensor([0.0, 0.0, 0.0, 1.0]),
+        ],
+        utilities=[0.9, 0.5, 0.3, 0.1],
+    )
+    controller_query_queue: list[dict] = [
+        {
+            "step": 100,
+            "rank": 0,
+            "k": 0,
+            "pressure": 0.5,
+            "residual": torch.tensor([1.0, 0.0, 0.0, 0.0]),
+        }
+    ]
+    tagged_replay_queue: list[dict] = []
+    run_controller_cycle(
+        controller_query_queue=controller_query_queue,
+        tagged_replay_queue=tagged_replay_queue,
+        cache=cache,
+        k=4,  # 4 occupied slots in the test cache
+        score_mode="cosine_utility_weighted",
+        controller_runtime=learner,
+        action_recorder=learner,
+    )
+    # Exactly one tag emitted (one per query, not one per candidate slot).
+    assert len(tagged_replay_queue) == 1
+    tag = tagged_replay_queue[0]
+    assert "simplex_p_chosen" in tag
+    assert "simplex_chosen_idx" in tag
+    assert 0.0 <= tag["simplex_p_chosen"] <= 1.0
+    assert 0 <= tag["simplex_chosen_idx"] < 4
+
+    # Decision recorded under the chosen slot id; learner's history has
+    # one entry with the simplex snapshot fields populated.
+    chosen_slot = tag["slot"]
+    history = learner.history(chosen_slot)
+    assert len(history) == 1
+    entry = history[0]
+    assert entry.action_type == 2  # V1 simplex
+    assert entry.chosen_idx == tag["simplex_chosen_idx"]
+    assert entry.gpu_step == tag["step"]
+    # V is N*K_v = 16*16 = 256 floats; E is N*N = 256 floats; sf is K_s = 4.
+    assert len(entry.V) == 256
+    assert len(entry.E) == 256
+    assert len(entry.simplex_features) == 4
+
+
+def test_simplex_runtime_skips_when_action_recorder_is_none():
+    """controller_train_online=False path: simplex_runtime is set but
+    action_recorder is None → forward runs, tag is emitted, but no
+    decision recorded (no history append, no snapshot).
+    """
+    learner = _build_test_simplex_learner()
+    cache = _make_cache(capacity=8, key_rep_dim=4)
+    _populate_cache(
+        cache,
+        key_reps=[
+            torch.tensor([1.0, 0.0, 0.0, 0.0]),
+            torch.tensor([0.0, 1.0, 0.0, 0.0]),
+        ],
+        utilities=[0.9, 0.5],
+    )
+    tagged_replay_queue: list[dict] = []
+    run_controller_cycle(
+        controller_query_queue=[{
+            "step": 100,
+            "rank": 0,
+            "k": 0,
+            "pressure": 0.5,
+            "residual": torch.tensor([1.0, 0.0, 0.0, 0.0]),
+        }],
+        tagged_replay_queue=tagged_replay_queue,
+        cache=cache,
+        k=2,
+        controller_runtime=learner,
+        action_recorder=None,
+    )
+    assert len(tagged_replay_queue) == 1
+    # No history appended (frozen mode wouldn't credit anyway).
+    assert learner.telemetry().history_appends == 0
