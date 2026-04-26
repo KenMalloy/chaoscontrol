@@ -219,6 +219,53 @@ def test_adapt_on_chunk_with_cache_steps_optimizer_and_consumes_hits():
     assert controller._pending_cache_hits == []
 
 
+def test_adapt_on_chunk_returns_chunk_ce_loss_not_replay_loss():
+    """Contract pin: adapt_on_chunk's return is the chunk-CE loss from the
+    last chunk-driven step. Cache replay is bonus work whose loss is in a
+    different unit (CE on the value span, not the chunk); composing them
+    into the same return slot would silently change the meaning of
+    MetricsCollector.record_doc(loss_after=...) per-chunk based on hit/miss.
+
+    Asserted by: the value returned with cache enabled + a hit must equal
+    the value the controller would have returned with cache disabled, when
+    fed the same chunk and starting from the same weights.
+    """
+    torch.manual_seed(0)
+    cache = _make_cache()
+    chunk = torch.randint(0, VOCAB, (1, 32))
+    _populate_cache_with_chunk_tail(cache, chunk)
+
+    # Run #1: cache disabled — capture the chunk-CE loss the original
+    # controller would return from the last chunk-driven step.
+    torch.manual_seed(0)
+    model_no_cache = _TinyLM()
+    opt_no_cache = torch.optim.SGD(model_no_cache.parameters(), lr=0.0)
+    ctrl_no_cache = LegalityController(model_no_cache, loss_fn=_loss)
+    loss_after_no_cache = ctrl_no_cache.adapt_on_chunk(
+        chunk, optimizer=opt_no_cache, steps=1,
+    )
+
+    # Run #2: cache enabled, same chunk, same model state, hit present.
+    torch.manual_seed(0)
+    model_with_cache = _TinyLM()
+    opt_with_cache = torch.optim.SGD(model_with_cache.parameters(), lr=0.0)
+    ctrl_with_cache = LegalityController(
+        model_with_cache, loss_fn=_loss, cache=cache,
+        fingerprint_window=FP_WINDOW,
+    )
+    ctrl_with_cache.score_chunk(chunk)
+    assert ctrl_with_cache._pending_cache_hits  # hit present
+    loss_after_with_cache = ctrl_with_cache.adapt_on_chunk(
+        chunk, optimizer=opt_with_cache, steps=1, cache_replay_steps=1,
+    )
+
+    # lr=0 keeps both models bit-identical, so the chunk-CE loss must match
+    # exactly. The cache-enabled run does extra forward+backward+step on the
+    # cached span; if the return value were silently replaced with the
+    # replay loss, this assertion would fail.
+    assert loss_after_with_cache == loss_after_no_cache
+
+
 def test_reset_between_docs_clears_pending_hits():
     """mark_new_epoch is the per-doc boundary; pending hits from the prior
     doc must NOT leak into the next doc's adapt step."""

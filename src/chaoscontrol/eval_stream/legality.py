@@ -186,13 +186,20 @@ class LegalityController:
         # ``_replay_from_cache_at_eval`` takes one slot per call; consume up
         # to ``cache_replay_steps`` hits this turn and leave the rest (none,
         # in the Phase 1 top-1 design) for next chunk.
+        #
+        # The return value of adapt_on_chunk is the *chunk-CE* loss from the
+        # last chunk-driven step. Replay losses are bonus work whose units
+        # (CE on the value span) don't compose with the chunk-CE loss the
+        # MetricsCollector logs as ``loss_after``. Keeping ``final_loss``
+        # pointing at the last chunk step preserves the metric's meaning
+        # whether or not the cache hit on this chunk.
         if self.cache is not None and self._pending_cache_hits:
             replay_budget = max(0, int(cache_replay_steps))
             consumed = 0
             for hit in list(self._pending_cache_hits):
                 if consumed >= replay_budget:
                     break
-                replay_loss = _replay_from_cache_at_eval(
+                _replay_from_cache_at_eval(
                     model=self.model,
                     cache=self.cache,
                     entry=hit,
@@ -200,8 +207,6 @@ class LegalityController:
                     loss_fn=self.loss_fn,
                 )
                 consumed += 1
-                if replay_loss is not None:
-                    final_loss = replay_loss
             # Drain unconditionally — partial consumption + leftover hits
             # would replay across chunks and break the score-before-update
             # association the controller is meant to enforce.
