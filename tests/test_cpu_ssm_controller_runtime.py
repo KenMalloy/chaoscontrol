@@ -5,6 +5,7 @@ replace the inner loops later as long as this ABI and numerical contract hold.
 """
 from __future__ import annotations
 
+import importlib.util
 from pathlib import Path
 
 import pytest
@@ -17,6 +18,17 @@ from chaoscontrol.episodic.cpu_ssm_controller import (
     cpp_available,
     forward_step,
 )
+
+
+def _load_runner_module():
+    path = (
+        Path(__file__).resolve().parent.parent
+        / "experiments" / "23_fast_path" / "runner_fast_path.py"
+    )
+    spec = importlib.util.spec_from_file_location("runner_fast_path", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
 
 
 def _weights() -> CpuSsmControllerWeights:
@@ -108,3 +120,60 @@ def test_runtime_tracks_global_and_per_slot_state_independently():
     assert not torch.equal(runtime.global_state, torch.zeros_like(runtime.global_state))
     assert torch.equal(runtime.slot_state[0], slot0_after_first)
     assert not torch.equal(runtime.slot_state[1], slot1_initial)
+
+
+def test_runtime_raises_when_weights_path_missing_for_trained_mode():
+    """Trained-runtime modes (cpp_reference / cpu_ssm_reference) must
+    refuse to construct from default zero weights — that previously
+    produced ``controller_logit ≡ 0`` for every event, indistinguishable
+    from "controller-on, no signal." The error message must point at the
+    config knob the caller has to set.
+    """
+    mod = _load_runner_module()
+    with pytest.raises(ValueError, match="episodic_controller_weights_path"):
+        mod._build_controller_runtime_from_config(
+            {
+                "episodic_controller_runtime": "cpu_ssm_reference",
+                "episodic_controller_weights_path": None,
+            },
+            capacity=4,
+        )
+
+
+def test_runtime_loads_when_weights_path_provided(tmp_path: Path):
+    """Trained runtime constructs successfully when a real weights path
+    is supplied. Mirrors the production wiring: dump weights to disk, set
+    the config knob, builder loads them. ``prefer_cpp=False`` via the
+    ``cpu_ssm_reference`` mode so the test is portable across environments
+    that don't have the C++ extension built.
+    """
+    mod = _load_runner_module()
+    weights = _weights()
+    weights_path = tmp_path / "controller_weights.pt"
+    weights.save(weights_path)
+
+    runtime = mod._build_controller_runtime_from_config(
+        {
+            "episodic_controller_runtime": "cpu_ssm_reference",
+            "episodic_controller_weights_path": str(weights_path),
+        },
+        capacity=4,
+    )
+    assert isinstance(runtime, CpuSsmControllerRuntime)
+    assert runtime.slot_state.shape == (4, weights.slot_dim)
+    assert runtime.global_state.shape == (weights.global_dim,)
+
+
+def test_runtime_heuristic_mode_does_not_require_weights():
+    """Heuristic mode short-circuits to ``None`` and never needs weights.
+    Pin this so the I1 raise doesn't accidentally tighten the heuristic
+    path — only the trained modes are affected.
+    """
+    mod = _load_runner_module()
+    out = mod._build_controller_runtime_from_config(
+        {"episodic_controller_runtime": "heuristic"},
+        capacity=4,
+    )
+    assert out is None
+    out_default = mod._build_controller_runtime_from_config({}, capacity=4)
+    assert out_default is None

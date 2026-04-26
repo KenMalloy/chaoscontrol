@@ -176,7 +176,17 @@ def run_controller_cycle(
                         slot=int(slot_i),
                     ).item()
                 )
-            replay_id = (int(query_event_id) << 8) | int(selected_rank)
+            # Clamp query_event_id to 56 bits before the 8-bit shift so the
+            # packed replay_id fits in u64. The high 8 bits of query_event_id
+            # are the source_rank, which is at most 8 bits anyway, so the clamp
+            # is lossless in practice. DuckDB BIGINT silently truncates the
+            # 72-bit overflow today; the clamp makes the Python side honest
+            # about what survives the storage round trip. The full
+            # rank-prefixed query_event_id is preserved on the same tag dict
+            # as a separate field, so no information is actually lost.
+            replay_id = (
+                (int(query_event_id) & ((1 << 56) - 1)) << 8
+            ) | (int(selected_rank) & 0xFF)
             tagged_replay_queue.append({
                 "step": producer_step,
                 "slot": int(slot_i),

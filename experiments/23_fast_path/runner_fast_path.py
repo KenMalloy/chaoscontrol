@@ -1712,22 +1712,21 @@ def _build_controller_runtime_from_config(
     if prefer_cpp:
         require_cpp()
 
+    # Trained-runtime modes (cpp_reference / cpu_ssm_reference) require
+    # real weights. The previous default of all-zeros silently produced
+    # ``controller_logit ≡ 0`` for every event, indistinguishable from
+    # "controller-on, no signal" — the wiring-vs-existence failure mode
+    # the design explicitly calls out. Heuristic mode short-circuits
+    # above and never reaches this branch.
     weights_path = config.get("episodic_controller_weights_path")
-    if weights_path:
-        weights = CpuSsmControllerWeights.load(str(weights_path))
-    else:
-        feature_dim = 4
-        global_dim = int(config.get("episodic_controller_global_dim", 8))
-        slot_dim = int(config.get("episodic_controller_slot_dim", 4))
-        weights = CpuSsmControllerWeights(
-            w_global_in=torch.zeros(global_dim, feature_dim, dtype=torch.float32),
-            w_slot_in=torch.zeros(slot_dim, feature_dim, dtype=torch.float32),
-            decay_global=torch.zeros(global_dim, dtype=torch.float32),
-            decay_slot=torch.zeros(slot_dim, dtype=torch.float32),
-            w_global_out=torch.zeros(global_dim, dtype=torch.float32),
-            w_slot_out=torch.zeros(slot_dim, dtype=torch.float32),
-            bias=torch.zeros((), dtype=torch.float32),
+    if not weights_path:
+        raise ValueError(
+            f"episodic_controller_runtime={mode!r} requires "
+            "episodic_controller_weights_path; refusing to construct a "
+            "trained runtime with all-zeros default weights (would "
+            "silently emit controller_logit=0 for every event)"
         )
+    weights = CpuSsmControllerWeights.load(str(weights_path))
     return CpuSsmControllerRuntime(
         weights,
         capacity=int(capacity),
@@ -1905,6 +1904,11 @@ def _drain_episodic_payloads_gpu(
             # 600s). Phase 2's controller bring-up flips the flag True at
             # the same time it adds the consumer that drains the queue.
             if consumer.controller_query_enabled:
+                # Phase 1 bridge: query_event_id and source_write_id share the same
+                # packed value because the QUERY_EVENT producer hasn't landed yet.
+                # TODO(controller): split into independent IDs once the QUERY_EVENT
+                # wire path lands. Downstream joins must NOT treat equal values as
+                # evidence of the same admission until then.
                 queue.append({
                     "step": int(current_step),
                     "rank": int(r),

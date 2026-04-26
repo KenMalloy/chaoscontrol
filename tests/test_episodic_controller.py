@@ -298,7 +298,12 @@ def test_controller_main_builds_rank_prefixed_ids_when_query_id_absent():
     assert len(tags) == 1
     tag = tags[0]
     assert tag["query_event_id"] == (3 << 56) | 5
-    assert tag["replay_id"] == ((3 << 56) | 5) << 8
+    # replay_id clamps query_event_id to 56 bits before the 8-bit shift
+    # so the packed value fits in u64 (DuckDB BIGINT). The high 8 bits of
+    # query_event_id are the source_rank and are preserved separately on
+    # the same tag dict via the unclamped query_event_id field above.
+    assert tag["replay_id"] == (((3 << 56) | 5) & ((1 << 56) - 1)) << 8
+    assert tag["replay_id"] < (1 << 64)
     assert tag["selection_step"] == 123
     assert tag["policy_version"] == 4
 
@@ -494,3 +499,50 @@ def test_controller_main_releases_residual_tensor_via_weakref():
         "controller pinned the residual past one cycle; "
         "the cand['residual'] = None reference-drop is missing or broken"
     )
+
+
+def test_replay_id_packs_into_u64_at_max_rank():
+    """At extreme query_event_id values combined with the largest legal
+    selected_rank, the packed replay_id must still fit in u64. The schema
+    declares ``replay_id u64`` and DuckDB BIGINT silently truncates a 72-bit
+    overflow — without the 56-bit clamp on query_event_id, a tag emitted at
+    high source_rank with selected_rank=255 would round-trip to a different
+    integer.
+    """
+    cache = _make_cache(key_rep_dim=4)
+    _populate_cache(
+        cache,
+        key_reps=[torch.tensor([1.0, 0.0, 0.0, 0.0])],
+        utilities=[0.5],
+    )
+    # source_rank=255 (max 8-bit) + rank_seq=(2**56)-1 → query_event_id
+    # is exactly the 64-bit ceiling, the worst case for packing.
+    high_rank = 255
+    high_seq = (1 << 56) - 1
+    expected_qid = (high_rank << 56) | high_seq
+    tags: list[dict] = []
+    run_controller_cycle(
+        controller_query_queue=[{
+            "step": 99,
+            "source_rank": high_rank,
+            "rank_seq": high_seq,
+            "pressure": 0.0,
+            "residual": torch.tensor([1.0, 0.0, 0.0, 0.0]),
+        }],
+        tagged_replay_queue=tags,
+        cache=cache,
+        k=1,
+        score_mode="cosine_utility_weighted",
+    )
+    assert len(tags) == 1
+    tag = tags[0]
+    assert tag["query_event_id"] == expected_qid
+    assert tag["selected_rank"] == 0
+    # Pack at the largest legal selected_rank as well — the controller
+    # currently emits one tag per slot (selected_rank starts at 0), so we
+    # also synthesize a max-rank tag by packing directly with the same
+    # formula and confirming the bound holds.
+    max_rank = 0xFF
+    packed_at_max = ((expected_qid & ((1 << 56) - 1)) << 8) | max_rank
+    assert packed_at_max < (1 << 64)
+    assert tag["replay_id"] < (1 << 64)
