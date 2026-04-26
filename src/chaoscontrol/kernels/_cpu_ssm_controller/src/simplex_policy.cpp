@@ -78,6 +78,26 @@ at::Tensor view_2d(const std::vector<float>& v, int64_t rows, int64_t cols) {
       at::TensorOptions().dtype(at::kFloat).device(at::kCPU));
 }
 
+at::Tensor view_2d_ptr(const float* data, int64_t rows, int64_t cols) {
+  return at::from_blob(
+      const_cast<float*>(data),
+      {rows, cols},
+      at::TensorOptions().dtype(at::kFloat).device(at::kCPU));
+}
+
+float edge_feature(
+    const std::vector<float>& E,
+    uint32_t N,
+    uint32_t K_e,
+    uint32_t i,
+    uint32_t j,
+    uint32_t k) {
+  if (E.size() == static_cast<std::size_t>(N) * N) {
+    return k == 0 ? E[static_cast<std::size_t>(i) * N + j] : 0.0f;
+  }
+  return E[(static_cast<std::size_t>(i) * N + j) * K_e + k];
+}
+
 // AMX-aware GEMM dispatch. Inputs are fp32 contiguous CPU tensors with the
 // inner dim matching (a: M x K, b: K x N). When the AMX BF16 kernel is built
 // in AND the runtime has AMX tile state AND the shapes are kernel-friendly
@@ -125,11 +145,14 @@ SimplexForwardOutput simplex_forward(
     const std::vector<float>& simplex_features) {
   const uint32_t N = weights.N;
   const uint32_t K_v = weights.K_v;
+  const uint32_t K_e = weights.K_e;
   const uint32_t K_s = weights.K_s;
   const uint32_t H = weights.H;
+  const uint32_t n_heads = weights.n_heads;
 
   TORCH_CHECK(N > 0, "SimplexWeights.N must be positive");
   TORCH_CHECK(K_v > 0, "SimplexWeights.K_v must be positive");
+  TORCH_CHECK(K_e > 0, "SimplexWeights.K_e must be positive");
   TORCH_CHECK(H > 0, "SimplexWeights.H must be positive");
   TORCH_CHECK(K_s > 0, "SimplexWeights.K_s must be positive");
   TORCH_CHECK(weights.temperature > 0.0f,
@@ -149,11 +172,39 @@ SimplexForwardOutput simplex_forward(
               weights.W_sb.size());
   TORCH_CHECK(V.size() == static_cast<std::size_t>(N) * K_v,
               "V must have N*K_v = ", N * K_v, " elements, got ", V.size());
-  TORCH_CHECK(E.size() == static_cast<std::size_t>(N) * N,
-              "E must have N*N = ", N * N, " elements, got ", E.size());
+  TORCH_CHECK(
+      E.size() == static_cast<std::size_t>(N) * N ||
+          E.size() == static_cast<std::size_t>(N) * N * K_e,
+      "E must have N*N or N*N*K_e elements (", N * N, " or ",
+      N * N * K_e, "), got ", E.size());
   TORCH_CHECK(simplex_features.size() == K_s,
               "simplex_features must have K_s = ", K_s, " elements, got ",
               simplex_features.size());
+  if (n_heads > 0 || weights.lambda_hxh != 0.0f) {
+    TORCH_CHECK(n_heads > 0,
+                "SimplexWeights.n_heads must be positive when lambda_hxh != 0");
+    const std::size_t hh =
+        static_cast<std::size_t>(n_heads) * H * H;
+    const std::size_t ho =
+        static_cast<std::size_t>(n_heads) * H;
+    const std::size_t he =
+        static_cast<std::size_t>(n_heads) * K_e;
+    TORCH_CHECK(weights.W_q.size() == hh,
+                "SimplexWeights.W_q must have n_heads*H*H elements, got ",
+                weights.W_q.size());
+    TORCH_CHECK(weights.W_k.size() == hh,
+                "SimplexWeights.W_k must have n_heads*H*H elements, got ",
+                weights.W_k.size());
+    TORCH_CHECK(weights.W_v.size() == hh,
+                "SimplexWeights.W_v must have n_heads*H*H elements, got ",
+                weights.W_v.size());
+    TORCH_CHECK(weights.W_o.size() == ho,
+                "SimplexWeights.W_o must have n_heads*H elements, got ",
+                weights.W_o.size());
+    TORCH_CHECK(weights.W_e.size() == he,
+                "SimplexWeights.W_e must have n_heads*K_e elements, got ",
+                weights.W_e.size());
+  }
 
   SimplexForwardOutput out;
   out.logits.resize(N);
@@ -161,6 +212,7 @@ SimplexForwardOutput simplex_forward(
   out.vertex_h.resize(static_cast<std::size_t>(N) * H);
   out.mixed_h.resize(static_cast<std::size_t>(N) * H);
   out.attn.resize(static_cast<std::size_t>(N) * N);
+  out.logits_hxh.assign(N, 0.0f);
 
   // ---- Layer 1: vertex projection ----
   // vertex_h = gelu(V @ W_vp + b_vp)        [N, K_v] @ [K_v, H] -> [N, H]
@@ -201,9 +253,8 @@ SimplexForwardOutput simplex_forward(
     for (uint32_t i = 0; i < N; ++i) {
       float* row = out.attn.data() + static_cast<std::size_t>(i) * N;
       const float* drow = dots + static_cast<std::size_t>(i) * N;
-      const float* erow = E.data() + static_cast<std::size_t>(i) * N;
       for (uint32_t j = 0; j < N; ++j) {
-        row[j] = drow[j] * scale + alpha * erow[j];
+        row[j] = drow[j] * scale + alpha * edge_feature(E, N, K_e, i, j, 0);
       }
     }
     rowwise_softmax_inplace(out.attn.data(), N, N);
@@ -236,6 +287,84 @@ SimplexForwardOutput simplex_forward(
         out.logits.data(),
         logits_t.data_ptr<float>(),
         static_cast<std::size_t>(N) * sizeof(float));
+
+    // Optional HxH residual branch. It treats the 16 vertices as the
+    // simplex itself: each head attends over all vertices with learned
+    // Q/K/V projections and an edge-feature bias, then emits a per-vertex
+    // logit residual. The scalar lambda_hxh gates the whole branch so the
+    // stable base simplex path remains the default behavior.
+    if (n_heads > 0) {
+      out.hxh_q.assign(static_cast<std::size_t>(n_heads) * N * H, 0.0f);
+      out.hxh_k.assign(static_cast<std::size_t>(n_heads) * N * H, 0.0f);
+      out.hxh_v.assign(static_cast<std::size_t>(n_heads) * N * H, 0.0f);
+      out.hxh_mixed.assign(static_cast<std::size_t>(n_heads) * N * H, 0.0f);
+      out.hxh_attn.assign(static_cast<std::size_t>(n_heads) * N * N, 0.0f);
+      at::Tensor vh_t = view_2d(out.vertex_h, N, H);
+      const float inv_sqrt_H = 1.0f / std::sqrt(static_cast<float>(H));
+      const float inv_heads = 1.0f / static_cast<float>(n_heads);
+      for (uint32_t head = 0; head < n_heads; ++head) {
+        const std::size_t hh_offset =
+            static_cast<std::size_t>(head) * H * H;
+        const std::size_t nh_offset =
+            static_cast<std::size_t>(head) * N * H;
+        const std::size_t nn_offset =
+            static_cast<std::size_t>(head) * N * N;
+        at::Tensor Wq_t =
+            view_2d_ptr(weights.W_q.data() + hh_offset, H, H);
+        at::Tensor Wk_t =
+            view_2d_ptr(weights.W_k.data() + hh_offset, H, H);
+        at::Tensor Wv_t =
+            view_2d_ptr(weights.W_v.data() + hh_offset, H, H);
+        std::vector<float> q = matmul_to_vec(vh_t, Wq_t);
+        std::vector<float> k = matmul_to_vec(vh_t, Wk_t);
+        std::vector<float> v = matmul_to_vec(vh_t, Wv_t);
+        std::copy(q.begin(), q.end(), out.hxh_q.begin() + nh_offset);
+        std::copy(k.begin(), k.end(), out.hxh_k.begin() + nh_offset);
+        std::copy(v.begin(), v.end(), out.hxh_v.begin() + nh_offset);
+
+        at::Tensor q_t = view_2d_ptr(out.hxh_q.data() + nh_offset, N, H);
+        at::Tensor k_t = view_2d_ptr(out.hxh_k.data() + nh_offset, N, H);
+        at::Tensor dots_t =
+            matmul_dispatch(q_t, k_t.transpose(0, 1).contiguous());
+        const float* dots = dots_t.data_ptr<float>();
+        float* attn = out.hxh_attn.data() + nn_offset;
+        const float* W_e_h =
+            weights.W_e.data() + static_cast<std::size_t>(head) * K_e;
+        for (uint32_t i = 0; i < N; ++i) {
+          float* row = attn + static_cast<std::size_t>(i) * N;
+          const float* drow = dots + static_cast<std::size_t>(i) * N;
+          for (uint32_t j = 0; j < N; ++j) {
+            float edge_bias = 0.0f;
+            for (uint32_t e = 0; e < K_e; ++e) {
+              edge_bias += W_e_h[e] * edge_feature(E, N, K_e, i, j, e);
+            }
+            row[j] = drow[j] * inv_sqrt_H + edge_bias;
+          }
+        }
+        rowwise_softmax_inplace(attn, N, N);
+
+        at::Tensor attn_t = view_2d_ptr(attn, N, N);
+        at::Tensor v_t = view_2d_ptr(out.hxh_v.data() + nh_offset, N, H);
+        std::vector<float> mixed = matmul_to_vec(attn_t, v_t);
+        std::copy(
+            mixed.begin(), mixed.end(), out.hxh_mixed.begin() + nh_offset);
+        const float* W_o_h =
+            weights.W_o.data() + static_cast<std::size_t>(head) * H;
+        for (uint32_t i = 0; i < N; ++i) {
+          const float* row =
+              out.hxh_mixed.data() + nh_offset + static_cast<std::size_t>(i) * H;
+          float logit = 0.0f;
+          for (uint32_t h = 0; h < H; ++h) {
+            logit += row[h] * W_o_h[h];
+          }
+          out.logits_hxh[i] += logit * inv_heads;
+        }
+      }
+      const float lambda = weights.lambda_hxh;
+      for (uint32_t i = 0; i < N; ++i) {
+        out.logits[i] += lambda * out.logits_hxh[i];
+      }
+    }
 
     float sb = 0.0f;
     for (uint32_t k = 0; k < K_s; ++k) {

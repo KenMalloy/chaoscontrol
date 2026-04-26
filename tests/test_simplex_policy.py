@@ -24,6 +24,7 @@ def _make_weights(
     K_s: int = 4,
     H: int = 32,
     N: int = 16,
+    n_heads: int = 0,
     seed: int = 0,
     scale: float = 1.0,
 ) -> "_ext.SimplexWeights":
@@ -35,6 +36,7 @@ def _make_weights(
     w.K_s = K_s
     w.H = H
     w.N = N
+    w.n_heads = n_heads
     w.W_vp = (rng.standard_normal((K_v, H)).astype(np.float32) * scale).flatten().tolist()
     w.b_vp = rng.standard_normal((H,)).astype(np.float32).tolist()
     w.W_lh = rng.standard_normal((H,)).astype(np.float32).tolist()
@@ -44,6 +46,23 @@ def _make_weights(
     w.temperature = 1.0
     # bucket_embed stays a placeholder; S1 stores it without consuming.
     w.bucket_embed = rng.standard_normal((8, 8)).astype(np.float32).flatten().tolist()
+    w.lambda_hxh = 0.0
+    if n_heads:
+        w.W_q = (
+            rng.standard_normal((n_heads, H, H)).astype(np.float32) * 0.05
+        ).flatten().tolist()
+        w.W_k = (
+            rng.standard_normal((n_heads, H, H)).astype(np.float32) * 0.05
+        ).flatten().tolist()
+        w.W_v = (
+            rng.standard_normal((n_heads, H, H)).astype(np.float32) * 0.05
+        ).flatten().tolist()
+        w.W_o = (
+            rng.standard_normal((n_heads, H)).astype(np.float32) * 0.05
+        ).flatten().tolist()
+        w.W_e = (
+            rng.standard_normal((n_heads, K_e)).astype(np.float32) * 0.05
+        ).flatten().tolist()
     return w
 
 
@@ -292,6 +311,55 @@ def test_simplex_forward_alpha_zero_recovers_per_vertex_softmax():
     assert int(np.argmax(cpp_p)) == int(np.argmax(per_vertex_p)), (
         "argmax(p) must match per-vertex softmax argmax under the loose-sanity setup"
     )
+
+
+def test_simplex_policy_reduces_to_heuristic_argmax_under_degenerate_weights():
+    """A degenerate simplex policy can recover utility-argmax selection.
+
+    This pins the thesis that the learned simplex policy is a strict
+    superset of the heuristic baseline, not a replacement that loses the
+    old control surface. Utility lives in ``V[:, 0]``; with alpha=0,
+    lambda_hxh=0, simplex bias zero, and a low temperature, the policy's
+    argmax must equal argmax utility on a separated positive-utility set.
+    """
+    weights = _make_weights(seed=42)
+    weights.alpha = 0.0
+    weights.lambda_hxh = 0.0
+    weights.temperature = 1e-3
+    weights.b_vp = [0.0] * weights.H
+    W_lh = [0.0] * weights.H
+    W_lh[0] = 1.0
+    weights.W_lh = W_lh
+    weights.b_lh = 0.0
+    weights.W_sb = [0.0] * weights.K_s
+    W_vp = np.zeros((weights.K_v, weights.H), dtype=np.float32)
+    W_vp[0, 0] = 8.0
+    weights.W_vp = W_vp.flatten().tolist()
+
+    V = np.zeros((weights.N, weights.K_v), dtype=np.float32)
+    utilities = np.array(
+        [0.20, 0.75, 0.35, 1.80, 0.40, 0.95, 0.10, 1.05,
+         0.60, 0.30, 1.25, 0.50, 0.85, 0.15, 0.70, 0.45],
+        dtype=np.float32,
+    )
+    V[:, 0] = utilities
+    E = np.eye(weights.N, dtype=np.float32)
+    s = np.zeros((weights.K_s,), dtype=np.float32)
+
+    out = _call_simplex_forward(weights, V, E, s)
+    assert int(np.argmax(out.p)) == int(np.argmax(utilities))
+
+
+def test_simplex_forward_hxh_residual_changes_logits_when_enabled():
+    weights = _make_weights(seed=5, n_heads=2)
+    V, E, s = _make_inputs(seed=5)
+    base = _call_simplex_forward(weights, V, E, s)
+    weights.lambda_hxh = 0.25
+    with_hxh = _call_simplex_forward(weights, V, E, s)
+    assert len(with_hxh.hxh_attn) == weights.n_heads * weights.N * weights.N
+    assert len(with_hxh.hxh_mixed) == weights.n_heads * weights.N * weights.H
+    assert len(with_hxh.logits_hxh) == weights.N
+    assert not np.allclose(with_hxh.logits, base.logits)
 
 
 def test_simplex_forward_savedstate_shapes_for_backward():

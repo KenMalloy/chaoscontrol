@@ -1172,6 +1172,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def_readwrite("global_state", &ActionHistoryEntry::global_state)
       .def_readwrite("slot_state", &ActionHistoryEntry::slot_state)
       .def_readwrite("chosen_idx", &ActionHistoryEntry::chosen_idx)
+      .def_readwrite("n_actual", &ActionHistoryEntry::n_actual)
+      .def_readwrite("write_bucket", &ActionHistoryEntry::write_bucket)
       .def_readwrite(
           "p_chosen_decision",
           &ActionHistoryEntry::p_chosen_decision)
@@ -1492,6 +1494,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def_readwrite("K_s", &chaoscontrol::simplex::SimplexWeights::K_s)
       .def_readwrite("H", &chaoscontrol::simplex::SimplexWeights::H)
       .def_readwrite("N", &chaoscontrol::simplex::SimplexWeights::N)
+      .def_readwrite("n_heads", &chaoscontrol::simplex::SimplexWeights::n_heads)
       .def_readwrite("W_vp", &chaoscontrol::simplex::SimplexWeights::W_vp)
       .def_readwrite("b_vp", &chaoscontrol::simplex::SimplexWeights::b_vp)
       .def_readwrite("W_lh", &chaoscontrol::simplex::SimplexWeights::W_lh)
@@ -1503,7 +1506,15 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           &chaoscontrol::simplex::SimplexWeights::temperature)
       .def_readwrite(
           "bucket_embed",
-          &chaoscontrol::simplex::SimplexWeights::bucket_embed);
+          &chaoscontrol::simplex::SimplexWeights::bucket_embed)
+      .def_readwrite(
+          "lambda_hxh",
+          &chaoscontrol::simplex::SimplexWeights::lambda_hxh)
+      .def_readwrite("W_q", &chaoscontrol::simplex::SimplexWeights::W_q)
+      .def_readwrite("W_k", &chaoscontrol::simplex::SimplexWeights::W_k)
+      .def_readwrite("W_v", &chaoscontrol::simplex::SimplexWeights::W_v)
+      .def_readwrite("W_o", &chaoscontrol::simplex::SimplexWeights::W_o)
+      .def_readwrite("W_e", &chaoscontrol::simplex::SimplexWeights::W_e);
 
   pybind11::class_<chaoscontrol::simplex::SimplexForwardOutput>(
       m, "SimplexForwardOutput")
@@ -1515,7 +1526,16 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def_readonly(
           "mixed_h", &chaoscontrol::simplex::SimplexForwardOutput::mixed_h)
       .def_readonly(
-          "attn", &chaoscontrol::simplex::SimplexForwardOutput::attn);
+          "attn", &chaoscontrol::simplex::SimplexForwardOutput::attn)
+      .def_readonly("hxh_q", &chaoscontrol::simplex::SimplexForwardOutput::hxh_q)
+      .def_readonly("hxh_k", &chaoscontrol::simplex::SimplexForwardOutput::hxh_k)
+      .def_readonly("hxh_v", &chaoscontrol::simplex::SimplexForwardOutput::hxh_v)
+      .def_readonly(
+          "hxh_mixed", &chaoscontrol::simplex::SimplexForwardOutput::hxh_mixed)
+      .def_readonly(
+          "hxh_attn", &chaoscontrol::simplex::SimplexForwardOutput::hxh_attn)
+      .def_readonly(
+          "logits_hxh", &chaoscontrol::simplex::SimplexForwardOutput::logits_hxh);
 
   m.def("simplex_forward", &chaoscontrol::simplex::simplex_forward,
         pybind11::arg("weights"),
@@ -1539,6 +1559,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def_readonly("backward_ready_actions",
                     &chaoscontrol::simplex::SimplexLearnerTelemetry::backward_ready_actions)
       .def_readonly(
+          "gerber_accepted_actions",
+          &chaoscontrol::simplex::SimplexLearnerTelemetry::gerber_accepted_actions)
+      .def_readonly(
+          "gerber_rejected_actions",
+          &chaoscontrol::simplex::SimplexLearnerTelemetry::gerber_rejected_actions)
+      .def_readonly(
           "backward_skipped_missing_state",
           &chaoscontrol::simplex::SimplexLearnerTelemetry::backward_skipped_missing_state)
       .def_readonly(
@@ -1549,19 +1575,55 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def_readonly("sgd_steps",
                     &chaoscontrol::simplex::SimplexLearnerTelemetry::sgd_steps)
       .def_readonly("ema_blends",
-                    &chaoscontrol::simplex::SimplexLearnerTelemetry::ema_blends);
+                    &chaoscontrol::simplex::SimplexLearnerTelemetry::ema_blends)
+      .def_readonly(
+          "last_gerber_weight",
+          &chaoscontrol::simplex::SimplexLearnerTelemetry::last_gerber_weight)
+      .def_readonly(
+          "last_advantage_raw",
+          &chaoscontrol::simplex::SimplexLearnerTelemetry::last_advantage_raw)
+      .def_readonly(
+          "last_advantage_standardized",
+          &chaoscontrol::simplex::SimplexLearnerTelemetry::last_advantage_standardized)
+      .def_readonly(
+          "last_advantage_mean",
+          &chaoscontrol::simplex::SimplexLearnerTelemetry::last_advantage_mean)
+      .def_readonly(
+          "last_advantage_stddev",
+          &chaoscontrol::simplex::SimplexLearnerTelemetry::last_advantage_stddev)
+      .def_readonly(
+          "last_behavior_logprob_margin",
+          &chaoscontrol::simplex::SimplexLearnerTelemetry::last_behavior_logprob_margin)
+      .def_readonly(
+          "last_current_logprob_margin",
+          &chaoscontrol::simplex::SimplexLearnerTelemetry::last_current_logprob_margin)
+      .def_readonly(
+          "last_gerber_threshold",
+          &chaoscontrol::simplex::SimplexLearnerTelemetry::last_gerber_threshold)
+      .def_readonly(
+          "last_bucket_type_stddev",
+          &chaoscontrol::simplex::SimplexLearnerTelemetry::last_bucket_type_stddev)
+      .def_readonly(
+          "last_global_type_stddev",
+          &chaoscontrol::simplex::SimplexLearnerTelemetry::last_global_type_stddev)
+      .def_readonly(
+          "last_lambda_hxh",
+          &chaoscontrol::simplex::SimplexLearnerTelemetry::last_lambda_hxh);
 
   pybind11::class_<chaoscontrol::simplex::SimplexOnlineLearner>(
       m, "SimplexOnlineLearner")
       .def(pybind11::init<uint32_t, uint32_t, float, float, uint32_t, float,
-                          uint64_t>(),
+                          uint64_t, float, uint64_t, float>(),
            pybind11::arg("num_slots") = 4096,
            pybind11::arg("max_entries_per_slot") = 64,
            pybind11::arg("gamma") = 0.995f,
            pybind11::arg("learning_rate") = 1.0e-3f,
            pybind11::arg("sgd_interval") = 256,
            pybind11::arg("ema_alpha") = 0.25f,
-           pybind11::arg("ema_interval") = 64)
+           pybind11::arg("ema_interval") = 64,
+           pybind11::arg("gerber_c") = 0.5f,
+           pybind11::arg("lambda_hxh_warmup_events") = 1024,
+           pybind11::arg("lambda_hxh_clip") = 1.0f)
       .def("initialize_simplex_weights",
            &chaoscontrol::simplex::SimplexOnlineLearner::initialize_simplex_weights,
            pybind11::arg("weights"),
@@ -1576,9 +1638,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
            pybind11::arg("V"),
            pybind11::arg("E"),
            pybind11::arg("simplex_features"),
+           pybind11::arg("n_actual") = 0,
+           pybind11::arg("write_bucket") = 0,
            "Record a simplex decision. Stores V, E, simplex_features, "
-           "chosen_idx, p_chosen_decision in the per-slot history under "
-           "chosen_slot_id so on_replay_outcome can match by gpu_step.")
+           "chosen_idx, p_chosen_decision, n_actual, and write_bucket in "
+           "the per-slot history under chosen_slot_id so on_replay_outcome "
+           "can match by gpu_step and Gerber-gate by bucket/type.")
       .def("on_replay_outcome",
            [](chaoscontrol::simplex::SimplexOnlineLearner& self,
               const pybind11::dict& d) {

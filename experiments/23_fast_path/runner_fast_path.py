@@ -67,6 +67,7 @@ from chaoscontrol.distributed import (  # noqa: E402
     should_stop_now,
 )
 from chaoscontrol.episodic.controller import controller_main  # noqa: E402
+from chaoscontrol.episodic.query import query_topk  # noqa: E402
 from chaoscontrol.episodic.gpu_slot import (  # noqa: E402
     make_slot_tensor,
     pack_payload,
@@ -1949,6 +1950,48 @@ def _pad_simplex_cosines(
     return cosines
 
 
+def _query_event_simplex_candidates(
+    *,
+    cache: EpisodicCache,
+    query_residual: torch.Tensor,
+    score_mode: str,
+    k: int,
+) -> tuple[list[int], list[float]]:
+    """Return the cache-side simplex candidate set for a QueryEvent.
+
+    The candidate ids follow the same top-K scorer the controller thread
+    will use; the companion values are raw query/key cosines for those ids.
+    This makes the wire event a real local simplex snapshot instead of a
+    sentinel-padded placeholder.
+    """
+    k_eff = min(_SIMPLEX_CANDIDATES, max(0, int(k)))
+    if k_eff <= 0 or cache is None or not cache.occupied.any():
+        return [], []
+    slots = query_topk(
+        query_residual,
+        cache,
+        k=k_eff,
+        score_mode=str(score_mode),
+    )
+    if slots.numel() == 0:
+        return [], []
+
+    device = query_residual.device
+    slot_idx = slots.to(device=device, dtype=torch.long)
+    keys = cache.key_rep.to(device=device, dtype=torch.float32)[slot_idx]
+    q = query_residual.detach().to(device=device, dtype=torch.float32)
+    q = q / (q.norm() + 1e-8)
+    keys_n = keys / (keys.norm(dim=1, keepdim=True) + 1e-8)
+    cosines = (keys_n @ q).clamp(-1.0, 1.0)
+    cosine_list = cosines.detach().to(
+        device="cpu", dtype=torch.float32,
+    ).tolist()
+    return (
+        [int(s) for s in slots.detach().cpu().tolist()],
+        [float(c) for c in cosine_list],
+    )
+
+
 def _emit_query_event(
     *,
     consumer: _EpisodicConsumerState,
@@ -1971,9 +2014,7 @@ def _emit_query_event(
     heuristic top-K retrieval result (up to 16 slot ids and their query
     cosines) to enable the simplex policy path; pass ``None`` (or omit)
     to ride the V0 heuristic-only path — the wire payload is sentinel-
-    padded and the C++ controller falls back to per-slot scoring. Top-K
-    retrieval lives in S5; S3 only ships the wire schema + producer
-    plumbing.
+    padded and the C++ controller falls back to per-slot scoring.
     """
     if consumer.query_ring is None or consumer.rank_query_seq is None:
         return None
@@ -2158,6 +2199,27 @@ def _notify_online_learning_bridge(
     if not math.isfinite(reward):
         return
     bridge.on_replay_outcome(event)
+    telemetry_fn = getattr(bridge, "telemetry", None)
+    telemetry = telemetry_fn() if callable(telemetry_fn) else None
+    if telemetry is None and hasattr(bridge, "learner"):
+        learner_telemetry = getattr(bridge.learner, "telemetry", None)
+        telemetry = learner_telemetry() if callable(learner_telemetry) else None
+    if telemetry is None:
+        return
+
+    def _metric(name: str, default: float = float("nan")) -> float:
+        if isinstance(telemetry, dict):
+            return float(telemetry.get(name, default))
+        return float(getattr(telemetry, name, default))
+
+    if hasattr(telemetry, "last_gerber_weight"):
+        event["gerber_weight"] = _metric("last_gerber_weight")
+        event["advantage_raw"] = _metric("last_advantage_raw")
+        event["advantage_corrected"] = float(
+            getattr(bridge, "last_advantage", _metric("last_advantage_standardized"))
+        )
+        event["advantage_standardized"] = _metric("last_advantage_standardized")
+        event["lambda_hxh"] = _metric("last_lambda_hxh", 0.0)
 
 
 def _write_replay_ndjson_row(
@@ -2223,6 +2285,27 @@ def _write_replay_ndjson_row(
                 entry.get("controller_logit", query_cosine),
             )
         ),
+        "arm": str(entry.get("arm", "")),
+        "chosen_idx": int(entry.get("simplex_chosen_idx", entry.get("selected_rank", -1))),
+        "p_chosen": float(entry.get("p_chosen", entry.get("simplex_p_chosen", float("nan")))),
+        "p_behavior": entry.get("p_behavior", entry.get("simplex_probabilities", [])),
+        "entropy": float(entry.get("entropy", float("nan"))),
+        "gerber_weight": float(_event_value("gerber_weight", float("nan"))),
+        "advantage_raw": float(_event_value("advantage_raw", float("nan"))),
+        "advantage_corrected": float(
+            _event_value("advantage_corrected", float("nan"))
+        ),
+        "lambda_hxh": float(
+            _event_value("lambda_hxh", entry.get("lambda_hxh", 0.0))
+        ),
+        "feature_manifest_hash": str(entry.get("feature_manifest_hash", "")),
+        "candidate_slot_ids": entry.get(
+            "candidate_slot_ids", entry.get("simplex_candidate_slot_ids", [])
+        ),
+        "candidate_scores": entry.get(
+            "candidate_scores", entry.get("simplex_candidate_scores", [])
+        ),
+        "logits": entry.get("logits", entry.get("simplex_logits", [])),
         "replay_loss": float(replay_loss),
         "ce_before_replay": float(
             _event_value("ce_before_replay", float("nan"))
@@ -2274,7 +2357,7 @@ def _build_simplex_learner_from_cswg(
     *,
     config: dict[str, Any],
 ) -> Any:
-    # Load CSWG v2 (the simplex policy artifact produced by
+    # Load CSWG v3 (the simplex policy artifact produced by
     # experiments/25_controller_pretrain/dump_to_cpp.py) and construct
     # an _ext.SimplexOnlineLearner with those weights. The learner IS
     # the runtime for simplex_v1 mode — it carries score-side state
@@ -2286,10 +2369,10 @@ def _build_simplex_learner_from_cswg(
     )
     if str(pretrain_dir) not in sys.path:
         sys.path.insert(0, str(pretrain_dir))
-    from dump_to_cpp import load_cswg_v2  # noqa: E402
+    from dump_to_cpp import load_cswg_v3  # noqa: E402
 
-    artifact = load_cswg_v2(weights_path)
-    header = artifact["header"]
+    artifact = load_cswg_v3(weights_path)
+    header = artifact["manifest"]["dims"]
     tensors = artifact["tensors"]
 
     weights = _ext.SimplexWeights()
@@ -2298,7 +2381,8 @@ def _build_simplex_learner_from_cswg(
     weights.K_s = int(header["k_s"])
     weights.H = int(header["h"])
     weights.N = int(header["n_vertices"])
-    # CSWG v2 stores tensors as fp16; cast to fp32 lists for the C++ side
+    weights.n_heads = int(header.get("n_heads", 0))
+    # CSWG v3 stores tensors as fp16; cast to fp32 lists for the C++ side
     # which expects std::vector<float>. The bf16 cast for AMX dispatch
     # happens inside simplex_policy.cpp, not here.
     weights.W_vp = tensors["W_vp"].to(torch.float32).flatten().tolist()
@@ -2311,6 +2395,13 @@ def _build_simplex_learner_from_cswg(
     weights.bucket_embed = (
         tensors["bucket_embed"].to(torch.float32).flatten().tolist()
     )
+    weights.lambda_hxh = float(tensors["lambda_hxh"].to(torch.float32).item())
+    if weights.n_heads > 0:
+        weights.W_q = tensors["W_q"].to(torch.float32).flatten().tolist()
+        weights.W_k = tensors["W_k"].to(torch.float32).flatten().tolist()
+        weights.W_v = tensors["W_v"].to(torch.float32).flatten().tolist()
+        weights.W_o = tensors["W_o"].to(torch.float32).flatten().tolist()
+        weights.W_e = tensors["W_e"].to(torch.float32).flatten().tolist()
 
     learner = _ext.SimplexOnlineLearner(
         num_slots=int(config.get("episodic_capacity", 4096)),
@@ -2324,6 +2415,13 @@ def _build_simplex_learner_from_cswg(
         sgd_interval=int(config.get("episodic_controller_sgd_interval", 256)),
         ema_alpha=float(config.get("episodic_controller_ema_alpha", 0.25)),
         ema_interval=int(config.get("episodic_controller_ema_interval", 64)),
+        gerber_c=float(config.get("episodic_controller_gerber_c", 0.5)),
+        lambda_hxh_warmup_events=int(
+            config.get("episodic_controller_lambda_hxh_warmup_events", 1024)
+        ),
+        lambda_hxh_clip=float(
+            config.get("episodic_controller_lambda_hxh_clip", 1.0)
+        ),
     )
     learner.initialize_simplex_weights(weights)
     return learner
@@ -2342,7 +2440,7 @@ def _build_controller_runtime_from_config(
         if not weights_path:
             raise ValueError(
                 f"episodic_controller_runtime={mode!r} requires "
-                "episodic_controller_weights_path (CSWG v2 path produced "
+                "episodic_controller_weights_path (CSWG v3 path produced "
                 "by experiments/25_controller_pretrain/pretrain_controller.py)"
             )
         return _build_simplex_learner_from_cswg(
@@ -2599,6 +2697,23 @@ def _spawn_episodic_controller(
     idle_sleep_s = float(
         config.get("episodic_controller_idle_sleep_s", 0.005)
     )
+    simplex_selection_mode = str(
+        config.get("episodic_controller_selection_mode", "argmax")
+    ).strip().lower()
+    if simplex_selection_mode not in {
+        "argmax", "greedy", "sample", "soft_sample", "stochastic",
+    }:
+        raise ValueError(
+            "episodic_controller_selection_mode must be one of "
+            "'argmax', 'greedy', 'sample', 'soft_sample', or 'stochastic'; "
+            f"got {simplex_selection_mode!r}"
+        )
+    simplex_generator = None
+    if simplex_selection_mode in {"sample", "soft_sample", "stochastic"}:
+        simplex_generator = torch.Generator(device="cpu")
+        simplex_generator.manual_seed(
+            int(config.get("episodic_controller_selection_seed", 0))
+        )
     controller_runtime = _build_controller_runtime_from_config(
         config,
         capacity=int(consumer.cache.capacity),
@@ -2642,6 +2757,8 @@ def _spawn_episodic_controller(
             "score_mode": score_mode,
             "controller_runtime": controller_runtime_for_thread,
             "action_recorder": action_recorder,
+            "simplex_selection_mode": simplex_selection_mode,
+            "simplex_generator": simplex_generator,
             "cycle_idle_sleep_s": idle_sleep_s,
             "heartbeat": controller_heartbeat,
         },
@@ -2688,6 +2805,8 @@ def _drain_episodic_payloads_gpu(
     embedding_version: int,
     pre_query_ce: float = float("nan"),
     query_bucket: int = -1,
+    controller_score_mode: str = "cosine_utility_weighted",
+    controller_topk_k: int = 16,
 ) -> None:
     """Episodic-rank drain: filter gather_list by valid_mask, route to cache + queue.
 
@@ -2723,15 +2842,6 @@ def _drain_episodic_payloads_gpu(
                 source_rank=int(r),
                 rank_seq=(int(current_step) << 16) | int(k),
             )
-            query_event_id = _emit_query_event(
-                consumer=consumer,
-                source_rank=int(r),
-                gpu_step=int(current_step),
-                query_residual=unpacked["residual"],
-                pressure=float(unpacked["pressure"]),
-                pre_query_ce=float(pre_query_ce),
-                bucket=int(query_bucket),
-            )
             appended_slot = cache.append(
                 key_fp=int(unpacked["key_fp"]),
                 key_rep=unpacked["key_rep"],
@@ -2741,7 +2851,32 @@ def _drain_episodic_payloads_gpu(
                 embedding_version=int(embedding_version),
                 pressure_at_write=float(unpacked["pressure"]),
                 source_write_id=int(source_write_id),
-                write_bucket=-1,
+                write_bucket=int(query_bucket),
+            )
+            candidate_slot_ids = None
+            candidate_cosines = None
+            if (
+                consumer.query_ring is not None
+                and consumer.rank_query_seq is not None
+            ):
+                candidate_slot_ids, candidate_cosines = (
+                    _query_event_simplex_candidates(
+                        cache=cache,
+                        query_residual=unpacked["residual"],
+                        score_mode=str(controller_score_mode),
+                        k=int(controller_topk_k),
+                    )
+                )
+            query_event_id = _emit_query_event(
+                consumer=consumer,
+                source_rank=int(r),
+                gpu_step=int(current_step),
+                query_residual=unpacked["residual"],
+                pressure=float(unpacked["pressure"]),
+                pre_query_ce=float(pre_query_ce),
+                bucket=int(query_bucket),
+                candidate_slot_ids=candidate_slot_ids,
+                candidate_cosines=candidate_cosines,
             )
             # Gate queue.append behind the consumer-enabled flag.
             # Phase 1 ships with the flag default False; the queue stays
@@ -2759,6 +2894,7 @@ def _drain_episodic_payloads_gpu(
                         else source_write_id
                     ),
                     "source_write_id": int(source_write_id),
+                    "write_bucket": int(query_bucket),
                     "slot": int(appended_slot),
                     "pressure": float(unpacked["pressure"]),
                     "residual": unpacked["residual"],
@@ -3204,6 +3340,8 @@ def _run_train_step(
     episodic_consumer: "_EpisodicConsumerState | None" = None,
     episodic_replay_logger: DiagnosticsLogger | None = None,
     episodic_replay_max_replays_per_step: int = 0,
+    episodic_controller_score_mode: str = "cosine_utility_weighted",
+    episodic_controller_topk_k: int = 16,
     current_step: int = 0,
     embedding_version: int = 0,
 ) -> torch.Tensor:
@@ -3270,6 +3408,8 @@ def _run_train_step(
                 k_max=k_max,
                 current_step=int(current_step),
                 embedding_version=int(embedding_version),
+                controller_score_mode=str(episodic_controller_score_mode),
+                controller_topk_k=int(episodic_controller_topk_k),
             )
         # Phase 3.1: drain ``tagged_replay_queue`` (X's controller
         # fills it during Phase 2). Each tagged slot triggers one
@@ -4023,6 +4163,8 @@ def train_fast_for_budget(
     episodic_controller_score_mode: str = "cosine_utility_weighted",
     episodic_controller_topk_k: int = 16,
     episodic_controller_idle_sleep_s: float = 0.005,
+    episodic_controller_selection_mode: str = "argmax",
+    episodic_controller_selection_seed: int | None = None,
     episodic_controller_runtime: str = "heuristic",
     episodic_controller_weights_path: str | None = None,
     episodic_controller_global_dim: int = 8,
@@ -4033,6 +4175,8 @@ def train_fast_for_budget(
     episodic_controller_ema_interval: int = 64,
     episodic_controller_credit_gamma: float = 0.995,
     episodic_controller_gerber_c: float = 0.5,
+    episodic_controller_lambda_hxh_warmup_events: int = 1024,
+    episodic_controller_lambda_hxh_clip: float = 1.0,
     episodic_controller_history_entries: int = 64,
     episodic_replay_max_replays_per_step: int = 0,
 ) -> dict[str, Any]:
@@ -4211,6 +4355,14 @@ def train_fast_for_budget(
         "episodic_controller_idle_sleep_s": float(
             episodic_controller_idle_sleep_s
         ),
+        "episodic_controller_selection_mode": str(
+            episodic_controller_selection_mode
+        ),
+        "episodic_controller_selection_seed": (
+            int(episodic_controller_selection_seed)
+            if episodic_controller_selection_seed is not None
+            else int(seed) + rank_
+        ),
         "episodic_controller_runtime": str(episodic_controller_runtime),
         "episodic_controller_weights_path": episodic_controller_weights_path,
         "episodic_controller_global_dim": int(episodic_controller_global_dim),
@@ -4227,6 +4379,12 @@ def train_fast_for_budget(
             episodic_controller_credit_gamma
         ),
         "episodic_controller_gerber_c": float(episodic_controller_gerber_c),
+        "episodic_controller_lambda_hxh_warmup_events": int(
+            episodic_controller_lambda_hxh_warmup_events
+        ),
+        "episodic_controller_lambda_hxh_clip": float(
+            episodic_controller_lambda_hxh_clip
+        ),
         "episodic_controller_history_entries": int(
             episodic_controller_history_entries
         ),
@@ -4800,6 +4958,10 @@ def train_fast_for_budget(
                     episodic_replay_max_replays_per_step=int(
                         episodic_replay_max_replays_per_step
                     ),
+                    episodic_controller_score_mode=str(
+                        episodic_controller_score_mode
+                    ),
+                    episodic_controller_topk_k=int(episodic_controller_topk_k),
                     current_step=steps,
                     embedding_version=0,
                     dreamworld_entry=dream_entry,
@@ -5649,6 +5811,14 @@ def run_condition(
         episodic_controller_idle_sleep_s=float(
             config.get("episodic_controller_idle_sleep_s", 0.005)
         ),
+        episodic_controller_selection_mode=str(
+            config.get("episodic_controller_selection_mode", "argmax")
+        ),
+        episodic_controller_selection_seed=(
+            int(config["episodic_controller_selection_seed"])
+            if config.get("episodic_controller_selection_seed") is not None
+            else None
+        ),
         episodic_controller_runtime=str(
             config.get("episodic_controller_runtime", "heuristic")
         ),
@@ -5680,6 +5850,12 @@ def run_condition(
         ),
         episodic_controller_gerber_c=float(
             config.get("episodic_controller_gerber_c", 0.5)
+        ),
+        episodic_controller_lambda_hxh_warmup_events=int(
+            config.get("episodic_controller_lambda_hxh_warmup_events", 1024)
+        ),
+        episodic_controller_lambda_hxh_clip=float(
+            config.get("episodic_controller_lambda_hxh_clip", 1.0)
         ),
         episodic_controller_history_entries=int(
             config.get("episodic_controller_history_entries", 64)

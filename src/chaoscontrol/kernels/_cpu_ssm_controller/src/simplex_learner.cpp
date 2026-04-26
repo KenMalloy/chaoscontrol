@@ -1,5 +1,8 @@
 #include "simplex_learner.h"
 
+#include "amx_matmul.h"
+#include "cpu_features.h"
+
 #include <ATen/ATen.h>
 
 #include <algorithm>
@@ -29,11 +32,68 @@ at::Tensor view_2d(const std::vector<float>& buf, int64_t rows, int64_t cols) {
       at::TensorOptions().dtype(at::kFloat).device(at::kCPU));
 }
 
+at::Tensor view_2d_ptr(const float* data, int64_t rows, int64_t cols) {
+  return at::from_blob(
+      const_cast<float*>(data),
+      {rows, cols},
+      at::TensorOptions().dtype(at::kFloat).device(at::kCPU));
+}
+
 at::Tensor view_1d(std::vector<float>& buf, int64_t n) {
   return at::from_blob(
       buf.data(),
       {n},
       at::TensorOptions().dtype(at::kFloat).device(at::kCPU));
+}
+
+at::Tensor view_1d(const std::vector<float>& buf, int64_t n) {
+  return at::from_blob(
+      const_cast<float*>(buf.data()),
+      {n},
+      at::TensorOptions().dtype(at::kFloat).device(at::kCPU));
+}
+
+float edge_feature(
+    const std::vector<float>& E,
+    int64_t N,
+    int64_t K_e,
+    int64_t i,
+    int64_t j,
+    int64_t k) {
+  if (E.size() == static_cast<std::size_t>(N) * N) {
+    return k == 0 ? E[static_cast<std::size_t>(i) * N + j] : 0.0f;
+  }
+  return E[(static_cast<std::size_t>(i) * N + j) * K_e + k];
+}
+
+void add_tensor_to_vector(
+    std::vector<float>& dst,
+    std::size_t offset,
+    const at::Tensor& src,
+    float scale = 1.0f) {
+  at::Tensor contiguous = src.contiguous();
+  const float* p = contiguous.data_ptr<float>();
+  const std::size_t n = static_cast<std::size_t>(contiguous.numel());
+  for (std::size_t i = 0; i < n; ++i) {
+    dst[offset + i] += scale * p[i];
+  }
+}
+
+// Same AMX-aware GEMM dispatch as simplex_policy.cpp. The backward pass is
+// also dominated by small M=16/N=16 GEMMs, so keeping it on raw at::matmul
+// would leave half of the simplex controller on the slow path on SPR.
+at::Tensor matmul_dispatch(const at::Tensor& a, const at::Tensor& b) {
+  if (chaoscontrol::amx::amx_bf16_kernel_available() &&
+      chaoscontrol::cpu_features::runtime_has_amx_bf16() &&
+      a.dim() == 2 && b.dim() == 2 &&
+      a.is_contiguous() && b.is_contiguous() &&
+      a.size(0) > 0 && a.size(1) > 0 && b.size(1) > 0 &&
+      a.size(1) == b.size(0) &&
+      (a.size(1) % 2) == 0) {
+    return chaoscontrol::amx::amx_bf16_matmul(
+        a.to(at::kBFloat16), b.to(at::kBFloat16));
+  }
+  return at::matmul(a, b).contiguous();
 }
 
 // dgelu(x)/dx = 0.5 * (1 + erf(x / sqrt(2))) + x * exp(-x^2/2) / sqrt(2*pi)
@@ -52,7 +112,13 @@ void zero_simplex_weights(SimplexWeights& w) {
   w.b_lh = 0.0f;
   std::fill(w.W_sb.begin(), w.W_sb.end(), 0.0f);
   w.alpha = 0.0f;
-  // temperature and bucket_embed are not trainable in V1 — leave alone.
+  w.lambda_hxh = 0.0f;
+  std::fill(w.W_q.begin(), w.W_q.end(), 0.0f);
+  std::fill(w.W_k.begin(), w.W_k.end(), 0.0f);
+  std::fill(w.W_v.begin(), w.W_v.end(), 0.0f);
+  std::fill(w.W_o.begin(), w.W_o.end(), 0.0f);
+  std::fill(w.W_e.begin(), w.W_e.end(), 0.0f);
+  // temperature and bucket_embed are not trainable — leave alone.
 }
 
 void copy_simplex_shape(const SimplexWeights& src, SimplexWeights& dst) {
@@ -61,6 +127,7 @@ void copy_simplex_shape(const SimplexWeights& src, SimplexWeights& dst) {
   dst.K_s = src.K_s;
   dst.H = src.H;
   dst.N = src.N;
+  dst.n_heads = src.n_heads;
   dst.W_vp.assign(src.W_vp.size(), 0.0f);
   dst.b_vp.assign(src.b_vp.size(), 0.0f);
   dst.W_lh.assign(src.W_lh.size(), 0.0f);
@@ -69,6 +136,12 @@ void copy_simplex_shape(const SimplexWeights& src, SimplexWeights& dst) {
   dst.alpha = 0.0f;
   dst.temperature = src.temperature;
   dst.bucket_embed.assign(src.bucket_embed.size(), 0.0f);
+  dst.lambda_hxh = 0.0f;
+  dst.W_q.assign(src.W_q.size(), 0.0f);
+  dst.W_k.assign(src.W_k.size(), 0.0f);
+  dst.W_v.assign(src.W_v.size(), 0.0f);
+  dst.W_o.assign(src.W_o.size(), 0.0f);
+  dst.W_e.assign(src.W_e.size(), 0.0f);
 }
 
 }  // namespace
@@ -80,23 +153,42 @@ SimplexOnlineLearner::SimplexOnlineLearner(
     float learning_rate,
     uint32_t sgd_interval,
     float ema_alpha,
-    uint64_t ema_interval)
+    uint64_t ema_interval,
+    float gerber_c,
+    uint64_t lambda_hxh_warmup_events,
+    float lambda_hxh_clip)
     : history_(num_slots, max_entries_per_slot),
       fast_slow_(ema_alpha, ema_interval),
       sgd_(learning_rate),
       gamma_(gamma),
+      gerber_c_(gerber_c),
+      lambda_hxh_warmup_events_(lambda_hxh_warmup_events),
+      lambda_hxh_clip_(lambda_hxh_clip),
       sgd_interval_(sgd_interval) {
   if (sgd_interval == 0) {
     throw std::invalid_argument(
         "SimplexOnlineLearner sgd_interval must be > 0");
   }
+  if (lambda_hxh_clip < 0.0f) {
+    throw std::invalid_argument(
+        "SimplexOnlineLearner lambda_hxh_clip must be non-negative");
+  }
 }
 
 void SimplexOnlineLearner::initialize_simplex_weights(SimplexWeights weights) {
+  if (lambda_hxh_warmup_events_ > 0 && weights.n_heads > 0) {
+    // The HxH path starts as a true residual: available to train via
+    // dL/dlambda, but not allowed to perturb decisions before warmup.
+    weights.lambda_hxh = 0.0f;
+  } else {
+    weights.lambda_hxh =
+        std::clamp(weights.lambda_hxh, -lambda_hxh_clip_, lambda_hxh_clip_);
+  }
   fast_weights_ = weights;
   slow_weights_ = weights;            // slow starts identical to fast
   copy_simplex_shape(weights, grad_weights_);
   weights_initialized_ = true;
+  telemetry_.last_lambda_hxh = fast_weights_.lambda_hxh;
 }
 
 void SimplexOnlineLearner::record_simplex_decision(
@@ -107,21 +199,61 @@ void SimplexOnlineLearner::record_simplex_decision(
     float p_chosen_decision,
     std::vector<float> V,
     std::vector<float> E,
-    std::vector<float> simplex_features) {
+    std::vector<float> simplex_features,
+    uint32_t n_actual,
+    int32_t write_bucket) {
   ActionHistoryEntry entry;
   entry.action_type = 2;  // V1 simplex selection (V0 used 1)
   entry.gpu_step = gpu_step;
   entry.policy_version = policy_version;
   entry.chosen_idx = chosen_idx;
+  entry.n_actual = n_actual > 0 ? n_actual : fast_weights_.N;
+  entry.write_bucket = write_bucket;
   entry.p_chosen_decision = p_chosen_decision;
   entry.V = std::move(V);
   entry.E = std::move(E);
   entry.simplex_features = std::move(simplex_features);
+  const uint32_t bucket = gerber_bucket_index(entry.write_bucket);
+  const std::size_t action_type = static_cast<std::size_t>(entry.action_type);
+  const float behavior_margin =
+      simplex_logprob_margin(entry.p_chosen_decision, entry.n_actual);
+  margin_stats_by_bucket_type_[bucket][action_type].update(behavior_margin);
+  margin_stats_global_by_type_[action_type].update(behavior_margin);
   // PerSlotActionHistory keys on uint32_t slot_id; the chosen_slot_id
   // is the cache slot the simplex point landed on. Truncate to u32 for
   // the history key (cache capacity is bounded well below 2^32).
   history_.append(static_cast<uint32_t>(chosen_slot_id), std::move(entry));
   ++telemetry_.history_appends;
+}
+
+uint32_t SimplexOnlineLearner::gerber_bucket_index(int32_t write_bucket) const {
+  if (write_bucket < 0) {
+    return 0;
+  }
+  const uint32_t bucket = static_cast<uint32_t>(write_bucket);
+  return std::min<uint32_t>(bucket, 3);
+}
+
+float SimplexOnlineLearner::simplex_logprob_margin(
+    float p_chosen,
+    uint32_t n_actual) const {
+  const uint32_t n = std::max<uint32_t>(1, n_actual);
+  const float p = std::max(p_chosen, 1.0e-30f);
+  return std::log(p) + std::log(static_cast<float>(n));
+}
+
+float SimplexOnlineLearner::lambda_hxh_bound() const {
+  if (lambda_hxh_clip_ <= 0.0f) {
+    return 0.0f;
+  }
+  if (lambda_hxh_warmup_events_ == 0) {
+    return lambda_hxh_clip_;
+  }
+  const float ramp = std::min(
+      1.0f,
+      static_cast<float>(telemetry_.gerber_accepted_actions) /
+          static_cast<float>(lambda_hxh_warmup_events_));
+  return lambda_hxh_clip_ * ramp;
 }
 
 void SimplexOnlineLearner::on_replay_outcome(const ReplayOutcome& ev) {
@@ -161,8 +293,10 @@ void SimplexOnlineLearner::on_replay_outcome(const ReplayOutcome& ev) {
   ++telemetry_.credited_actions;
 
   // Recompute the forward on the fast weights so the gradient reflects
-  // the policy at update time, not at decision time. (Off-policy ratio
-  // p_chosen_now / p_chosen_decision is V2 — V1 is on-policy REINFORCE.)
+  // the policy at update time, not at decision time. Off-policy stability
+  // is Gerber-gated on categorical log-prob margins rather than an
+  // importance ratio, which avoids division-by-near-zero blowups while
+  // still requiring behavior/current policy agreement.
   SimplexForwardOutput fwd =
       simplex_forward(fast_weights_, match->V, match->E, match->simplex_features);
 
@@ -173,10 +307,25 @@ void SimplexOnlineLearner::on_replay_outcome(const ReplayOutcome& ev) {
   // bucket; advantage centers the reward to reduce variance. Recency
   // decay shrinks credit for stale decisions, matching the existing
   // scalar reward contract.
-  float advantage = ev.ce_delta_raw - ev.bucket_baseline;
-  if (!std::isfinite(advantage)) {
-    advantage = 0.0f;
+  const uint32_t bucket = gerber_bucket_index(match->write_bucket);
+  float raw_advantage = ev.ce_delta_raw - ev.bucket_baseline;
+  if (!std::isfinite(raw_advantage)) {
+    raw_advantage = 0.0f;
   }
+  const float adv_mean = advantage_stats_by_bucket_[bucket].mean();
+  const float adv_std = advantage_stats_by_bucket_[bucket].stddev();
+  float advantage = raw_advantage;
+  if (
+      advantage_stats_by_bucket_[bucket].count() >= 2 &&
+      std::isfinite(adv_std) &&
+      adv_std > 1.0e-6f) {
+    advantage = (raw_advantage - adv_mean) / adv_std;
+  }
+  advantage_stats_by_bucket_[bucket].update(raw_advantage);
+  telemetry_.last_advantage_raw = raw_advantage;
+  telemetry_.last_advantage_standardized = advantage;
+  telemetry_.last_advantage_mean = adv_mean;
+  telemetry_.last_advantage_stddev = adv_std;
   const uint64_t step_gap =
       ev.gpu_step >= match->gpu_step ? (ev.gpu_step - match->gpu_step) : 0;
   advantage *= std::pow(gamma_, static_cast<float>(step_gap));
@@ -185,6 +334,46 @@ void SimplexOnlineLearner::on_replay_outcome(const ReplayOutcome& ev) {
   if (advantage == 0.0f) {
     return;  // Zero gradient; skip the rest of the work.
   }
+
+  const uint32_t n_actual =
+      match->n_actual > 0 ? match->n_actual : fast_weights_.N;
+  const uint32_t valid_n = std::min<uint32_t>(n_actual, fast_weights_.N);
+  float current_mass = 0.0f;
+  for (uint32_t i = 0; i < valid_n; ++i) {
+    current_mass += fwd.p[i];
+  }
+  if (!std::isfinite(current_mass) || current_mass <= 0.0f) {
+    current_mass = 1.0f;
+  }
+  const uint32_t chosen = match->chosen_idx;
+  const float p_current_chosen =
+      chosen < valid_n ? (fwd.p[chosen] / current_mass) : 0.0f;
+  const std::size_t action_type = static_cast<std::size_t>(match->action_type);
+  const float behavior_margin =
+      simplex_logprob_margin(match->p_chosen_decision, valid_n);
+  const float current_margin =
+      simplex_logprob_margin(p_current_chosen, valid_n);
+  const float bucket_std =
+      margin_stats_by_bucket_type_[bucket][action_type].stddev();
+  const float global_std =
+      margin_stats_global_by_type_[action_type].stddev();
+  const float threshold = gerber_c_ * bucket_std;
+  const float gate = gerber_weight(behavior_margin, current_margin, threshold);
+  telemetry_.last_gerber_weight = gate;
+  telemetry_.last_behavior_logprob_margin = behavior_margin;
+  telemetry_.last_current_logprob_margin = current_margin;
+  telemetry_.last_gerber_threshold = threshold;
+  telemetry_.last_bucket_type_stddev = bucket_std;
+  telemetry_.last_global_type_stddev = global_std;
+
+  if (gate == 0.0f) {
+    last_advantage_ = 0.0f;
+    ++telemetry_.gerber_rejected_actions;
+    return;
+  }
+  ++telemetry_.gerber_accepted_actions;
+  advantage *= gate;
+  last_advantage_ = advantage;
 
   simplex_backward(*match, fwd, advantage);
   ++actions_since_sgd_;
@@ -200,7 +389,9 @@ void SimplexOnlineLearner::simplex_backward(
   const int64_t N = static_cast<int64_t>(fast_weights_.N);
   const int64_t H = static_cast<int64_t>(fast_weights_.H);
   const int64_t K_v = static_cast<int64_t>(fast_weights_.K_v);
+  const int64_t K_e = static_cast<int64_t>(fast_weights_.K_e);
   const int64_t K_s = static_cast<int64_t>(fast_weights_.K_s);
+  const int64_t n_heads = static_cast<int64_t>(fast_weights_.n_heads);
   const float T = fast_weights_.temperature;
   const uint32_t chosen = entry.chosen_idx;
 
@@ -217,7 +408,9 @@ void SimplexOnlineLearner::simplex_backward(
   at::Tensor mixed_h = view_2d(fwd.mixed_h, N, H);
 
   // dL/dW_lh[h] = sum_i g_logits[i] * mixed_h[i, h]
-  at::Tensor g_W_lh = at::matmul(g_logits, mixed_h);  // [H]
+  at::Tensor g_W_lh =
+      matmul_dispatch(g_logits.unsqueeze(0).contiguous(), mixed_h)
+          .squeeze(0);                                  // [H]
   at::Tensor W_lh_acc = view_1d(grad_weights_.W_lh, H);
   W_lh_acc.add_(g_W_lh);
 
@@ -242,12 +435,21 @@ void SimplexOnlineLearner::simplex_backward(
   // ---- Layer 2 — edge-aware mixing -----------------------------------
   at::Tensor vertex_h = view_2d(fwd.vertex_h, N, H);
   at::Tensor attn = view_2d(fwd.attn, N, N);
-  at::Tensor E_t = view_2d(entry.E, N, N);
+  std::vector<float> E_base_buf(static_cast<std::size_t>(N) * N, 0.0f);
+  for (int64_t i = 0; i < N; ++i) {
+    for (int64_t j = 0; j < N; ++j) {
+      E_base_buf[static_cast<std::size_t>(i) * N + j] =
+          edge_feature(entry.E, N, K_e, i, j, 0);
+    }
+  }
+  at::Tensor E_t = view_2d(E_base_buf, N, N);
 
   // attn_out[i, h] = sum_j attn[i, j] * vertex_h[j, h]
   // dL/dattn[i, j] = sum_h g_mixed[i, h] * vertex_h[j, h]
   at::Tensor g_attn =
-      at::matmul(g_mixed, vertex_h.transpose(0, 1).contiguous());  // [N, N]
+      matmul_dispatch(
+          g_mixed.contiguous(),
+          vertex_h.transpose(0, 1).contiguous());          // [N, N]
 
   // g_attn_logits[i, k] = attn[i, k] * (g_attn[i, k]
   //                       - sum_j attn[i, j] * g_attn[i, j])
@@ -265,9 +467,10 @@ void SimplexOnlineLearner::simplex_backward(
   //     = sum_k g_attn_logits[k, i] * vh[k, h] / sqrt(H)
   const float inv_sqrt_H = 1.0f / std::sqrt(static_cast<float>(H));
   at::Tensor g_vh_attn_first =
-      at::matmul(g_attn_logits, vertex_h) * inv_sqrt_H;            // [N, H]
+      matmul_dispatch(g_attn_logits.contiguous(), vertex_h)
+      * inv_sqrt_H;                                                // [N, H]
   at::Tensor g_vh_attn_second =
-      at::matmul(g_attn_logits.transpose(0, 1).contiguous(), vertex_h)
+      matmul_dispatch(g_attn_logits.transpose(0, 1).contiguous(), vertex_h)
       * inv_sqrt_H;                                                // [N, H]
 
   // ---- backward through attn @ vh (mixed branch, vertex_h side) ------
@@ -275,24 +478,123 @@ void SimplexOnlineLearner::simplex_backward(
   // dL/dvh[i, h] (mixed branch)
   //     = sum_k g_mixed[k, h] * attn[k, i]
   at::Tensor g_vh_mixed =
-      at::matmul(attn.transpose(0, 1).contiguous(), g_mixed);      // [N, H]
+      matmul_dispatch(
+          attn.transpose(0, 1).contiguous(),
+          g_mixed.contiguous());                                  // [N, H]
 
   // ---- total g_vertex_h: attn-bilinear + mixed + residual ------------
   at::Tensor g_vertex_h =
       g_vh_attn_first + g_vh_attn_second + g_vh_mixed + g_mixed;   // [N, H]
+
+  // ---- Optional HxH residual branch ----------------------------------
+  // combined_logits = base_logits + lambda_hxh * logits_hxh.
+  // Each head computes Q/K/V attention over the full 16-vertex simplex,
+  // with edge-feature bias W_e · E[i,j,:], then projects its mixed value
+  // row to a logit. Gradients flow through lambda, W_q/k/v/o/e, and
+  // back into vertex_h so Layer 1 receives both base and HxH pressure.
+  if (n_heads > 0 && !fwd.hxh_attn.empty()) {
+    const float lambda = fast_weights_.lambda_hxh;
+    const float inv_sqrt_H = 1.0f / std::sqrt(static_cast<float>(H));
+    const float inv_heads = 1.0f / static_cast<float>(n_heads);
+    if (!fwd.logits_hxh.empty()) {
+      at::Tensor logits_hxh = view_1d(fwd.logits_hxh, N);
+      grad_weights_.lambda_hxh += (g_logits * logits_hxh).sum().item<float>();
+    }
+    at::Tensor g_logits_hxh = g_logits * lambda;                  // [N]
+    at::Tensor g_vertex_h_hxh = at::zeros({N, H}, vertex_h.options());
+
+    for (int64_t head = 0; head < n_heads; ++head) {
+      const std::size_t hh_offset =
+          static_cast<std::size_t>(head) * H * H;
+      const std::size_t nh_offset =
+          static_cast<std::size_t>(head) * N * H;
+      const std::size_t nn_offset =
+          static_cast<std::size_t>(head) * N * N;
+      const std::size_t he_offset =
+          static_cast<std::size_t>(head) * K_e;
+      const std::size_t ho_offset =
+          static_cast<std::size_t>(head) * H;
+
+      at::Tensor q = view_2d_ptr(fwd.hxh_q.data() + nh_offset, N, H);
+      at::Tensor k = view_2d_ptr(fwd.hxh_k.data() + nh_offset, N, H);
+      at::Tensor v = view_2d_ptr(fwd.hxh_v.data() + nh_offset, N, H);
+      at::Tensor hmix = view_2d_ptr(fwd.hxh_mixed.data() + nh_offset, N, H);
+      at::Tensor hattn = view_2d_ptr(fwd.hxh_attn.data() + nn_offset, N, N);
+      at::Tensor Wq = view_2d_ptr(fast_weights_.W_q.data() + hh_offset, H, H);
+      at::Tensor Wk = view_2d_ptr(fast_weights_.W_k.data() + hh_offset, H, H);
+      at::Tensor Wv = view_2d_ptr(fast_weights_.W_v.data() + hh_offset, H, H);
+      at::Tensor Wo = view_2d_ptr(fast_weights_.W_o.data() + ho_offset, H, 1)
+                          .squeeze(1);
+
+      at::Tensor g_W_o =
+          matmul_dispatch(g_logits_hxh.unsqueeze(0).contiguous(), hmix)
+              .squeeze(0) * inv_heads;                            // [H]
+      add_tensor_to_vector(grad_weights_.W_o, ho_offset, g_W_o);
+
+      at::Tensor g_hmix =
+          g_logits_hxh.unsqueeze(1) * Wo.unsqueeze(0) * inv_heads;  // [N,H]
+      at::Tensor g_hattn =
+          matmul_dispatch(g_hmix.contiguous(), v.transpose(0, 1).contiguous());
+      at::Tensor g_v =
+          matmul_dispatch(hattn.transpose(0, 1).contiguous(), g_hmix.contiguous());
+      at::Tensor h_row_dot =
+          (hattn * g_hattn).sum(1, /*keepdim=*/true);
+      at::Tensor g_hattn_logits = hattn * (g_hattn - h_row_dot);   // [N,N]
+
+      at::Tensor g_q =
+          matmul_dispatch(g_hattn_logits.contiguous(), k) * inv_sqrt_H;
+      at::Tensor g_k =
+          matmul_dispatch(g_hattn_logits.transpose(0, 1).contiguous(), q)
+              * inv_sqrt_H;
+
+      at::Tensor g_W_q =
+          matmul_dispatch(vertex_h.transpose(0, 1).contiguous(), g_q.contiguous());
+      at::Tensor g_W_k =
+          matmul_dispatch(vertex_h.transpose(0, 1).contiguous(), g_k.contiguous());
+      at::Tensor g_W_v =
+          matmul_dispatch(vertex_h.transpose(0, 1).contiguous(), g_v.contiguous());
+      add_tensor_to_vector(grad_weights_.W_q, hh_offset, g_W_q);
+      add_tensor_to_vector(grad_weights_.W_k, hh_offset, g_W_k);
+      add_tensor_to_vector(grad_weights_.W_v, hh_offset, g_W_v);
+
+      at::Tensor g_hattn_logits_c = g_hattn_logits.contiguous();
+      const float* g_ptr = g_hattn_logits_c.data_ptr<float>();
+      for (int64_t e = 0; e < K_e; ++e) {
+        float accum = 0.0f;
+        for (int64_t i = 0; i < N; ++i) {
+          for (int64_t j = 0; j < N; ++j) {
+            accum += g_ptr[static_cast<std::size_t>(i) * N + j] *
+                edge_feature(entry.E, N, K_e, i, j, e);
+          }
+        }
+        grad_weights_.W_e[he_offset + static_cast<std::size_t>(e)] += accum;
+      }
+
+      at::Tensor g_vh_q =
+          matmul_dispatch(g_q.contiguous(), Wq.transpose(0, 1).contiguous());
+      at::Tensor g_vh_k =
+          matmul_dispatch(g_k.contiguous(), Wk.transpose(0, 1).contiguous());
+      at::Tensor g_vh_v =
+          matmul_dispatch(g_v.contiguous(), Wv.transpose(0, 1).contiguous());
+      g_vertex_h_hxh = g_vertex_h_hxh + g_vh_q + g_vh_k + g_vh_v;
+    }
+    g_vertex_h = g_vertex_h + g_vertex_h_hxh;
+  }
 
   // ---- Layer 1 — vertex projection backward --------------------------
   // pre_gelu = V @ W_vp + b_vp; vertex_h = gelu(pre_gelu)
   at::Tensor V_t = view_2d(entry.V, N, K_v);
   at::Tensor W_vp = view_2d(fast_weights_.W_vp, K_v, H);
   at::Tensor b_vp = view_1d(fast_weights_.b_vp, H);
-  at::Tensor pre_gelu = at::matmul(V_t, W_vp) + b_vp;              // [N, H]
+  at::Tensor pre_gelu = matmul_dispatch(V_t, W_vp) + b_vp;         // [N, H]
 
   at::Tensor g_pre_gelu = g_vertex_h * gelu_grad(pre_gelu);        // [N, H]
 
   // dL/dW_vp[k, h] = sum_i V[i, k] * g_pre_gelu[i, h]
   at::Tensor g_W_vp =
-      at::matmul(V_t.transpose(0, 1).contiguous(), g_pre_gelu);    // [K_v, H]
+      matmul_dispatch(
+          V_t.transpose(0, 1).contiguous(),
+          g_pre_gelu.contiguous());                               // [K_v, H]
   at::Tensor W_vp_acc = view_2d(grad_weights_.W_vp, K_v, H);
   W_vp_acc.add_(g_W_vp);
 
@@ -317,6 +619,23 @@ void SimplexOnlineLearner::maybe_apply_sgd() {
   sgd_.apply(fast_weights_.W_sb.data(), grad_weights_.W_sb.data(),
              fast_weights_.W_sb.size());
   sgd_.apply(&fast_weights_.alpha, &grad_weights_.alpha, 1);
+  if (!fast_weights_.W_q.empty()) {
+    sgd_.apply(fast_weights_.W_q.data(), grad_weights_.W_q.data(),
+               fast_weights_.W_q.size());
+    sgd_.apply(fast_weights_.W_k.data(), grad_weights_.W_k.data(),
+               fast_weights_.W_k.size());
+    sgd_.apply(fast_weights_.W_v.data(), grad_weights_.W_v.data(),
+               fast_weights_.W_v.size());
+    sgd_.apply(fast_weights_.W_o.data(), grad_weights_.W_o.data(),
+               fast_weights_.W_o.size());
+    sgd_.apply(fast_weights_.W_e.data(), grad_weights_.W_e.data(),
+               fast_weights_.W_e.size());
+    sgd_.apply(&fast_weights_.lambda_hxh, &grad_weights_.lambda_hxh, 1);
+  }
+  const float lambda_bound = lambda_hxh_bound();
+  fast_weights_.lambda_hxh =
+      std::clamp(fast_weights_.lambda_hxh, -lambda_bound, lambda_bound);
+  telemetry_.last_lambda_hxh = fast_weights_.lambda_hxh;
   zero_grad();
   actions_since_sgd_ = 0;
   ++telemetry_.sgd_steps;
@@ -340,6 +659,19 @@ void SimplexOnlineLearner::maybe_blend_slow() {
   fast_slow_.blend(slow_weights_.W_sb.data(), fast_weights_.W_sb.data(),
                    slow_weights_.W_sb.size());
   fast_slow_.blend(&slow_weights_.alpha, &fast_weights_.alpha, 1);
+  if (!slow_weights_.W_q.empty()) {
+    fast_slow_.blend(slow_weights_.W_q.data(), fast_weights_.W_q.data(),
+                     slow_weights_.W_q.size());
+    fast_slow_.blend(slow_weights_.W_k.data(), fast_weights_.W_k.data(),
+                     slow_weights_.W_k.size());
+    fast_slow_.blend(slow_weights_.W_v.data(), fast_weights_.W_v.data(),
+                     slow_weights_.W_v.size());
+    fast_slow_.blend(slow_weights_.W_o.data(), fast_weights_.W_o.data(),
+                     slow_weights_.W_o.size());
+    fast_slow_.blend(slow_weights_.W_e.data(), fast_weights_.W_e.data(),
+                     slow_weights_.W_e.size());
+    fast_slow_.blend(&slow_weights_.lambda_hxh, &fast_weights_.lambda_hxh, 1);
+  }
   ++telemetry_.ema_blends;
 }
 

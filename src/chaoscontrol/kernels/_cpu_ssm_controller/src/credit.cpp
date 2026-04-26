@@ -81,6 +81,17 @@ void RollingStddev::update(float x) {
   ++count_;
 }
 
+float RollingStddev::mean() const {
+  if (count_ == 0) {
+    return 0.0f;
+  }
+  const double correction = 1.0 - std::pow(decay_, static_cast<double>(count_));
+  if (correction <= 0.0) {
+    return 0.0f;
+  }
+  return static_cast<float>(ema_ / correction);
+}
+
 float RollingStddev::stddev() const {
   if (count_ == 0) {
     return 0.0f;

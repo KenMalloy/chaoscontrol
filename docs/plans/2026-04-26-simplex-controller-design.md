@@ -21,7 +21,8 @@ Per query `q`:
 2. Build the candidate matrix `V[16, K_v]` from per-slot vertex features and
    the edge tensor `E[16, 16]` from pairwise cosine.
 3. Forward: `V, E, simplex_features → logits[16] → p = softmax(logits / T)`.
-4. Action: argmax for greedy, sample from `p` for exploration. Store
+4. Action: sample from `p` in simplex arms (argmax remains a greedy/debug
+   mode). Store
    `chosen_idx`, `p[chosen]`, and the full `V, E` snapshot.
 5. On replay outcome: `advantage = ce_delta_raw - bucket_baseline`. Loss is
    `-advantage * log p[chosen]`. SGD updates the policy parameters; fast/slow
@@ -73,6 +74,8 @@ mixed_h = mixed_h + vertex_h    # residual
 
 # Layer 3 — logit head (with simplex bias)
 logits = mixed_h @ W_lh + b_lh                          # [16, H] @ [H, 1] -> [16]
+logits_hxh = mean_heads(attn_hxh(Q,K,E) @ V_hxh @ W_o)  # optional residual branch
+logits = logits + lambda_hxh * logits_hxh
 simplex_bias = simplex_features @ W_sb                  # [K_s] @ [K_s, 1] -> [1]
 p = softmax((logits + simplex_bias) / T)                # [16]
 ```
@@ -82,13 +85,19 @@ geometry (`E[i, j]`) in the attention scores. This is the simplest spec that
 preserves both the SSM-native vertex transformation and the set-level
 information flow that per-slot scoring lacks.
 
+The HxH branch is a residual over the same 16 vertices, not a replacement for
+the base simplex. `lambda_hxh` starts at zero, is warmup-capped during online
+training, and is hard-clipped to `[-1, 1]`. Its rolling magnitude is telemetry:
+small means residual support; large means the learned controller is voting for
+the full set-attention path.
+
 `T` is a fixed temperature (no per-step learned schedule for V1). `simplex_bias`
 is a scalar added to all logits — affects entropy, not ranking. Both can graduate
 to per-vertex once V1 is bake-validated.
 
 ## AMX shape utilization
 
-Per-query forward in three GEMMs:
+Per-query forward in the base path plus optional HxH heads:
 
 1. `V @ W_vp`: `(16, K_v) @ (K_v, H) = (16, 32)` — one A-tile, K=16 needs one
    K-tile, N=32 needs two N-tiles → 2 `_tile_dpbf16ps`.
@@ -96,8 +105,9 @@ Per-query forward in three GEMMs:
 3. `mixed_h @ W_lh`: `(16, H) @ (H, 1) = (16, 1)` — N=1 wastes the N axis;
    `_tile_dpbf16ps` still works but underused. Acceptable; the head is small.
 
-Total: ~4-5 `_tile_dpbf16ps` per query. The tile is *used* — none of
-this is M=1 simulating M=16.
+Each HxH head adds the same `(16, H)` / `(16, 16)` tile shapes for Q/K/V,
+attention, and the residual mix. The tile is *used* — none of this is M=1
+simulating M=16.
 
 ## Backward — REINFORCE
 
@@ -109,24 +119,24 @@ snapshot = {
     "step": gpu_step, "slot_id": chosen_slot_id,
 }
 
-# At replay outcome (matched on chosen_slot_id + step proximity):
-advantage = ce_delta_raw - bucket_baseline                   # scalar
-# Optional importance ratio for off-policy correction:
-p_chosen_now = run_forward_again(snapshot)[chosen_idx]
-ratio = clip(p_chosen_now / p_chosen_decision, 0.5, 2.0)     # PPO-style clip
+# At replay outcome (matched on chosen_slot_id + selection_step):
+advantage_raw = ce_delta_raw - bucket_baseline
+advantage_std = (advantage_raw - mean_bucket) / std_bucket   # if stats warm
+advantage = recency_decay(advantage_std, gamma)
 
-loss = -advantage * ratio * log p_chosen_now
-# Standard backprop through the three layers.
+L_behavior = log(p_chosen_decision) - log(1 / n_actual)
+L_current = log(p_chosen_now) - log(1 / n_actual)
+gerber = Gerber(L_behavior, L_current, c * sigma_bucket_type)
+
+loss = -(advantage * gerber) * log p_chosen_now
+# Standard backprop through base + optional HxH residual branch.
 ```
 
-For V1 we run REINFORCE without the importance ratio — the policy doesn't
-shift much in 600s and the advantage signal is dominant. The ratio plumbing
-is reserved for V2.
-
-The advantage shaping (Gerber concordance, recency decay) carries over from
-the per-slot design. Same wire signal, same baseline math; what changes is
-the consumer: previously a scalar regression target, now a policy-gradient
-multiplier.
+Gerber is deliberately not an importance ratio. It gates the gradient when the
+behavior policy and current policy disagree on the categorical log-prob margin.
+The margin stddev used by the gate is per `(bucket, action_type)`; global stats
+are diagnostics only. Advantage standardization is per bucket and controls
+gradient magnitude, so one CE-delta outlier bucket cannot dominate SGD.
 
 ## What survives, what dies
 
@@ -138,8 +148,8 @@ multiplier.
   payload schema gets new fields.
 - Heuristic candidate generator. Becomes the simplex-vertex selector,
   not the final scorer.
-- Bucket baseline, recency decay, Gerber concordance — repurposed as
-  advantage shaping (multiplicative on the policy gradient) rather than
+- Bucket baseline, per-bucket advantage standardization, recency decay, and
+  Gerber concordance — repurposed as policy-gradient shaping rather than
   credit attribution to a single slot.
 - `episodic_writer` admission path. The cache write side is unchanged.
 
@@ -149,11 +159,12 @@ multiplier.
   Per-slot regression → REINFORCE over the simplex. Forward graph is
   different; backward is policy-gradient.
 - `OnlineLearningWeights` shape. Per-slot `(global, slot, feature)`
-  projections → simplex `(W_vp, W_lh, W_sb, alpha, T, embeddings)` head.
+  projections → simplex `(W_vp, W_lh, W_sb, alpha, T, lambda_hxh, HxH heads)`
+  head.
 - `record_replay_selection` payload. Single-slot snapshot →
   whole-simplex snapshot.
 - `ActionHistoryEntry` schema. New fields: `V`, `E`, `simplex_features`,
-  `chosen_idx`, `p_chosen_decision`.
+  `chosen_idx`, `n_actual`, `write_bucket`, `p_chosen_decision`.
 - F1 matrix arms. Frozen-vs-online stays. Cold-vs-warm is more meaningful
   with simplex (warm cache = richer simplex).
 
@@ -171,8 +182,9 @@ for Pass C heuristic-only diagnostics; SimplexQueryEvent is the policy path.
 
 V1 uses Option A — adding fields to QueryEvent under the existing
 `#pragma pack` keeps the wire path simple and lets the controller dispatch
-on whether `candidate_slot_ids[1]` is sentinel (heuristic-only) or populated
-(simplex). Net struct growth ~128B; QueryEvent goes from 544B to 672B.
+on whether `candidate_slot_ids[0]` is sentinel (heuristic-only) or populated
+(simplex). The landed wire struct also carries `candidate_cosines[16]`, so
+QueryEvent is 736B.
 
 ReplayOutcome stays unchanged — it carries the slot id of the chosen vertex
 and the CE-delta reward; the controller looks up the matching candidate
@@ -199,9 +211,9 @@ which is per-event, not per-state).
 |---|---|---|---|---|
 | `arm_a_control` | off | n/a | n/a | n/a |
 | `arm_b_heuristic` | on | heuristic-only | n/a | argmax(utility) |
-| `arm_c_simplex_frozen` | on | trained-simplex | off | `softmax(simplex_logits)` |
-| `arm_d_simplex_online` | on | trained-simplex | on | `softmax(simplex_logits)` |
-| `arm_e_simplex_warm_online` | on | trained-simplex (ckpt-warm) | on | `softmax(simplex_logits)` |
+| `arm_c_simplex_frozen` | on | trained-simplex | off | sample(`softmax(simplex_logits)`) |
+| `arm_d_simplex_online` | on | trained-simplex | on | sample(`softmax(simplex_logits)`) |
+| `arm_e_simplex_warm_online` | on | trained-simplex (ckpt-warm) | on | sample(`softmax(simplex_logits)`) |
 
 Five arms × 3 seeds = 15 cells. The cold-vs-warm pair becomes a real
 contrast because the simplex's edge structure changes when the cache is
@@ -209,16 +221,15 @@ warm-loaded vs fresh.
 
 ## Open questions deferred to V2
 
-- Importance ratio in the policy gradient (off-policy correction). V1 is
-  on-policy REINFORCE because the policy moves slowly within a 600s
-  window.
+- Richer Gerber diagnostics. The correction is live; next step is better
+  offline analysis of accepted/rejected updates by bucket and arm.
 - Diversity loss term. Useful when the cache surface is degenerate;
   simplex_features carries the signal but V1 doesn't penalize it.
 - Per-vertex temperature head. V1 uses a fixed `T`; learning a
   per-simplex `T` from `simplex_features` is V2.
-- Multi-head attention in Layer 2. Single `alpha`-blend is the V1
-  simplest spec; multi-head would let the controller learn separate
-  content/geometry weightings.
+- Edge-feature richness. HxH heads are live, but the only edge feature today
+  is cosine; redundancy/diversity/bucket interactions are the obvious next
+  signals.
 
 ## Artifact budget
 
@@ -232,8 +243,12 @@ Total controller parameter count, V1:
 | b_lh | (1,) | 1 |
 | W_sb | (K_s=4, 1) | 4 |
 | alpha | (1,) | 1 |
+| lambda_hxh | (1,) | 1 |
+| W_q/W_k/W_v | (heads=2, H=32, H=32) each | 6,144 |
+| W_o | (heads=2, H=32) | 64 |
+| W_e | (heads=2, K_e=1) | 2 |
 | bucket_embed | (8 buckets, 8 dim) | 64 |
-| **total** | | **~650 fp16 = ~1.3 KB** |
+| **total** | | **~6.9K fp16 = ~13.7 KB** |
 
 Negligible against the 16 MB artifact cap. The cache dominates.
 

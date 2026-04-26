@@ -24,6 +24,7 @@ struct SimplexWeights {
   uint32_t K_s = 0;     // simplex feature dim (V1: 4)
   uint32_t H = 0;       // hidden dim (V1: 32)
   uint32_t N = 0;       // simplex size (V1: 16)
+  uint32_t n_heads = 0; // optional HxH residual heads over the simplex
 
   std::vector<float> W_vp;          // (K_v, H) row-major — Layer 1 projection
   std::vector<float> b_vp;          // (H,)               — Layer 1 bias
@@ -33,6 +34,12 @@ struct SimplexWeights {
   float alpha = 0.0f;               //                    — edge-vs-content mixing scalar
   float temperature = 1.0f;         //                    — softmax temperature
   std::vector<float> bucket_embed;  // (n_buckets, embed_dim) — stored, unused in V1 forward
+  float lambda_hxh = 0.0f;          // residual scale for the HxH branch
+  std::vector<float> W_q;           // (n_heads, H, H) — HxH query projections
+  std::vector<float> W_k;           // (n_heads, H, H) — HxH key projections
+  std::vector<float> W_v;           // (n_heads, H, H) — HxH value projections
+  std::vector<float> W_o;           // (n_heads, H)    — per-head logit projections
+  std::vector<float> W_e;           // (n_heads, K_e)  — per-head edge-feature bias
 };
 
 // Saved-for-backward intermediates. S2's REINFORCE backward consumes:
@@ -45,6 +52,12 @@ struct SimplexForwardOutput {
   std::vector<float> vertex_h;   // (N, H)
   std::vector<float> mixed_h;    // (N, H) — post-residual
   std::vector<float> attn;       // (N, N) — row-wise softmax weights
+  std::vector<float> hxh_q;      // (n_heads, N, H) — optional branch
+  std::vector<float> hxh_k;      // (n_heads, N, H)
+  std::vector<float> hxh_v;      // (n_heads, N, H)
+  std::vector<float> hxh_mixed;  // (n_heads, N, H)
+  std::vector<float> hxh_attn;   // (n_heads, N, N)
+  std::vector<float> logits_hxh; // (N,) pre-lambda branch contribution
 };
 
 // Single-query forward pass. V is row-major (N, K_v); E is row-major (N, N)

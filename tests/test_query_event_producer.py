@@ -63,6 +63,7 @@ def _gather_list_with_valid_query(
     source_rank: int,
     k_max: int = 1,
     query_residual: torch.Tensor | None = None,
+    key_rep: torch.Tensor | None = None,
     pressure: float = 0.75,
 ) -> list[torch.Tensor]:
     span_length = 2
@@ -72,6 +73,11 @@ def _gather_list_with_valid_query(
         query_residual
         if query_residual is not None
         else torch.tensor([1.0, 2.0, 3.0, 4.0], dtype=torch.float32)
+    )
+    key = (
+        key_rep
+        if key_rep is not None
+        else torch.zeros(key_rep_dim, dtype=torch.float32)
     )
     for rank in range(source_rank + 1):
         t = make_slot_tensor(
@@ -89,7 +95,7 @@ def _gather_list_with_valid_query(
                     key_fp=1000 + k,
                     value_anchor_id=7,
                     value_tok_ids=torch.tensor([7, 8], dtype=torch.int64),
-                    key_rep=torch.zeros(key_rep_dim),
+                    key_rep=key + float(k),
                     residual=residual + float(k),
                     span_length=span_length,
                     key_rep_dim=key_rep_dim,
@@ -139,6 +145,51 @@ def test_query_event_emitted_when_log_enabled():
         assert event["bucket"] == 3
         assert len(event["query_rep"]) == 256
         assert event["query_rep"][:4] == _fp16_bits(residual)
+    finally:
+        mod._cleanup_episodic_event_rings(consumer)
+
+
+def test_query_event_populates_simplex_candidates_from_cache():
+    """Producer-side QueryEvent carries the current top-16 cache simplex."""
+    mod = _load_runner()
+    consumer = _consumer(mod, event_log_enabled=True)
+    assert consumer.cache is not None
+    pre_slot = consumer.cache.append(
+        key_fp=777,
+        key_rep=torch.tensor([1.0, 0.0, 0.0, 0.0], dtype=torch.float32),
+        value_tok_ids=torch.tensor([1, 2], dtype=torch.int64),
+        value_anchor_id=1,
+        current_step=1,
+        embedding_version=0,
+        pressure_at_write=0.1,
+        source_write_id=777,
+    )
+    consumer.cache.utility_u[pre_slot] = 0.5
+
+    try:
+        mod._drain_episodic_payloads_gpu(
+            consumer=consumer,
+            gather_list=_gather_list_with_valid_query(
+                source_rank=0,
+                query_residual=torch.tensor([1.0, 0.0, 0.0, 0.0]),
+                key_rep=torch.tensor([0.0, 1.0, 0.0, 0.0]),
+                pressure=0.25,
+            ),
+            span_length=2,
+            key_rep_dim=4,
+            k_max=1,
+            current_step=12,
+            embedding_version=0,
+        )
+
+        ring = _ext.ShmRingQueryEvent.attach(consumer.query_ring_name)
+        event = ring.pop()
+        assert event is not None
+        sentinel = (1 << 64) - 1
+        assert event["candidate_slot_ids"][:2] == [0, 1]
+        assert event["candidate_slot_ids"][2:] == [sentinel] * 14
+        assert event["candidate_cosines"][:2] == pytest.approx([1.0, 0.0])
+        assert event["candidate_cosines"][2:] == [0.0] * 14
     finally:
         mod._cleanup_episodic_event_rings(consumer)
 

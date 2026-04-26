@@ -50,9 +50,13 @@ import pytest
 import torch
 
 from chaoscontrol.episodic.controller import (
+    _build_simplex_inputs,
+    _choose_simplex_vertex,
+    _scores_for_slots,
     controller_main,
     run_controller_cycle,
 )
+from chaoscontrol.episodic.query import query_topk
 from chaoscontrol.optim.episodic_cache import EpisodicCache
 
 
@@ -736,8 +740,20 @@ def test_simplex_runtime_emits_one_tag_per_query_and_records_decision():
     tag = tagged_replay_queue[0]
     assert "simplex_p_chosen" in tag
     assert "simplex_chosen_idx" in tag
+    assert "p_behavior" in tag
+    assert "entropy" in tag
+    assert "feature_manifest_hash" in tag
+    assert "candidate_slot_ids" in tag
+    assert "logits" in tag
     assert 0.0 <= tag["simplex_p_chosen"] <= 1.0
+    assert tag["p_chosen"] == pytest.approx(tag["simplex_p_chosen"])
+    assert sum(tag["p_behavior"]) == pytest.approx(1.0)
+    assert tag["entropy"] > 0.0
+    assert isinstance(tag["feature_manifest_hash"], str)
+    assert tag["candidate_slot_ids"] == tag["simplex_candidate_slot_ids"]
+    assert tag["logits"] == tag["simplex_logits"]
     assert 0 <= tag["simplex_chosen_idx"] < 4
+    assert tag["selection_step"] == 100
 
     # Decision recorded under the chosen slot id; learner's history has
     # one entry with the simplex snapshot fields populated.
@@ -752,6 +768,224 @@ def test_simplex_runtime_emits_one_tag_per_query_and_records_decision():
     assert len(entry.V) == 256
     assert len(entry.E) == 256
     assert len(entry.simplex_features) == 4
+
+    learner.on_replay_outcome({
+        "event_type": 3,
+        "replay_id": int(tag["replay_id"]),
+        "gpu_step": 101,
+        "query_event_id": int(tag["query_event_id"]),
+        "source_write_id": int(tag["source_write_id"]),
+        "slot_id": int(tag["slot"]),
+        "policy_version": int(tag["policy_version"]),
+        "selection_step": int(tag["selection_step"]),
+        "selected_rank": int(tag["selected_rank"]),
+        "teacher_score": float(tag["teacher_score"]),
+        "controller_logit": float(tag["controller_logit"]),
+        "ce_before_replay": 1.0,
+        "ce_after_replay": 0.75,
+        "ce_delta_raw": 0.25,
+        "bucket_baseline": 0.0,
+        "reward_shaped": 0.25,
+        "grad_cos_rare": float("nan"),
+        "grad_cos_total": float("nan"),
+        "outcome_status": 0,
+        "flags": 0,
+    })
+    assert learner.telemetry().credited_actions == 1
+    assert learner.telemetry().gerber_accepted_actions == 1
+    assert learner.last_advantage != 0.0
+
+
+def test_run_controller_cycle_simplex_path_credits_a_full_round_trip():
+    """Real cache -> simplex tag -> ReplayOutcome echoes tag fields -> credit."""
+    learner = _build_test_simplex_learner()
+    cache = _make_cache(capacity=8, key_rep_dim=4)
+    _populate_cache(
+        cache,
+        key_reps=[
+            torch.tensor([1.0, 0.0, 0.0, 0.0]),
+            torch.tensor([0.0, 1.0, 0.0, 0.0]),
+            torch.tensor([0.0, 0.0, 1.0, 0.0]),
+            torch.tensor([0.0, 0.0, 0.0, 1.0]),
+        ],
+        utilities=[0.9, 0.5, 0.3, 0.1],
+    )
+
+    tagged_replay_queue: list[dict] = []
+    run_controller_cycle(
+        controller_query_queue=[{
+            "step": 321,
+            "source_rank": 2,
+            "rank_seq": 7,
+            "pressure": 0.5,
+            "residual": torch.tensor([1.0, 0.0, 0.0, 0.0]),
+        }],
+        tagged_replay_queue=tagged_replay_queue,
+        cache=cache,
+        k=4,
+        score_mode="cosine_utility_weighted",
+        controller_runtime=learner,
+        action_recorder=learner,
+    )
+
+    assert len(tagged_replay_queue) == 1
+    tag = tagged_replay_queue[0]
+    learner.on_replay_outcome({
+        "event_type": 3,
+        "replay_id": int(tag["replay_id"]),
+        "gpu_step": int(tag["step"]) + 1,
+        "query_event_id": int(tag["query_event_id"]),
+        "source_write_id": int(tag["source_write_id"]),
+        "slot_id": int(tag["slot"]),
+        "policy_version": int(tag["policy_version"]),
+        "selection_step": int(tag["selection_step"]),
+        "selected_rank": int(tag["selected_rank"]),
+        "teacher_score": float(tag["teacher_score"]),
+        "controller_logit": float(tag["controller_logit"]),
+        "ce_before_replay": 2.0,
+        "ce_after_replay": 1.25,
+        "ce_delta_raw": 0.75,
+        "bucket_baseline": 0.0,
+        "reward_shaped": 0.75,
+        "grad_cos_rare": float("nan"),
+        "grad_cos_total": float("nan"),
+        "outcome_status": 0,
+        "flags": 0,
+    })
+
+    telemetry = learner.telemetry()
+    assert telemetry.history_appends == 1
+    assert telemetry.credited_actions == 1
+    assert learner.last_advantage != 0.0
+
+
+def test_simplex_vertex_selection_samples_from_policy_distribution():
+    """Soft mode samples from p instead of collapsing the simplex to argmax."""
+    probs = [0.05, 0.15, 0.75, 0.05]
+    expected_g = torch.Generator().manual_seed(123)
+    actual_g = torch.Generator().manual_seed(123)
+    expected = int(
+        torch.multinomial(
+            torch.tensor(probs, dtype=torch.float32),
+            1,
+            generator=expected_g,
+        ).item()
+    )
+
+    chosen, p_chosen = _choose_simplex_vertex(
+        probs,
+        len(probs),
+        mode="sample",
+        generator=actual_g,
+    )
+    assert chosen == expected
+    assert p_chosen == pytest.approx(probs[expected])
+
+
+def test_simplex_runtime_soft_sampling_uses_seeded_policy_sample():
+    """run_controller_cycle threads soft sampling into the simplex path."""
+    learner = _build_test_simplex_learner()
+    cache = _make_cache(capacity=8, key_rep_dim=4)
+    _populate_cache(
+        cache,
+        key_reps=[
+            torch.tensor([1.0, 0.0, 0.0, 0.0]),
+            torch.tensor([0.0, 1.0, 0.0, 0.0]),
+            torch.tensor([0.0, 0.0, 1.0, 0.0]),
+            torch.tensor([0.0, 0.0, 0.0, 1.0]),
+        ],
+        utilities=[0.9, 0.5, 0.3, 0.1],
+    )
+    residual = torch.tensor([1.0, 0.0, 0.0, 0.0])
+    slots = query_topk(
+        residual,
+        cache,
+        k=4,
+        score_mode="cosine_utility_weighted",
+    )
+    scores = _scores_for_slots(
+        residual=residual,
+        cache=cache,
+        slots=slots,
+        score_mode="cosine_utility_weighted",
+    )
+    V, E, sf, _ = _build_simplex_inputs(
+        residual=residual,
+        cache=cache,
+        slots=slots,
+        scores=scores,
+        current_step=100,
+        pad_to=16,
+    )
+    from chaoscontrol.kernels import _cpu_ssm_controller as _ext
+
+    fwd = _ext.simplex_forward(learner.fast_weights(), V, E, sf)
+    expected, _ = _choose_simplex_vertex(
+        list(fwd.p),
+        int(slots.numel()),
+        mode="sample",
+        generator=torch.Generator().manual_seed(2026),
+    )
+
+    tagged_replay_queue: list[dict] = []
+    run_controller_cycle(
+        controller_query_queue=[{
+            "step": 100,
+            "rank": 0,
+            "k": 0,
+            "pressure": 0.5,
+            "residual": residual,
+        }],
+        tagged_replay_queue=tagged_replay_queue,
+        cache=cache,
+        k=4,
+        score_mode="cosine_utility_weighted",
+        controller_runtime=learner,
+        action_recorder=learner,
+        simplex_selection_mode="sample",
+        simplex_generator=torch.Generator().manual_seed(2026),
+    )
+    assert tagged_replay_queue[0]["simplex_chosen_idx"] == expected
+
+
+def test_sample_mode_is_deterministic_under_fixed_seed():
+    """Two public controller cycles with the same seed choose the same vertex."""
+
+    def _sample_once(seed: int) -> tuple[int, int]:
+        learner = _build_test_simplex_learner()
+        cache = _make_cache(capacity=8, key_rep_dim=4)
+        _populate_cache(
+            cache,
+            key_reps=[
+                torch.tensor([1.0, 0.0, 0.0, 0.0]),
+                torch.tensor([0.0, 1.0, 0.0, 0.0]),
+                torch.tensor([0.0, 0.0, 1.0, 0.0]),
+                torch.tensor([0.0, 0.0, 0.0, 1.0]),
+            ],
+            utilities=[0.9, 0.5, 0.3, 0.1],
+        )
+        tags: list[dict] = []
+        run_controller_cycle(
+            controller_query_queue=[{
+                "step": 100,
+                "rank": 0,
+                "k": 0,
+                "pressure": 0.5,
+                "residual": torch.tensor([1.0, 0.0, 0.0, 0.0]),
+            }],
+            tagged_replay_queue=tags,
+            cache=cache,
+            k=4,
+            score_mode="cosine_utility_weighted",
+            controller_runtime=learner,
+            action_recorder=None,
+            simplex_selection_mode="sample",
+            simplex_generator=torch.Generator().manual_seed(seed),
+        )
+        tag = tags[0]
+        return int(tag["simplex_chosen_idx"]), int(tag["slot"])
+
+    assert _sample_once(2026) == _sample_once(2026)
 
 
 def test_simplex_runtime_skips_when_action_recorder_is_none():

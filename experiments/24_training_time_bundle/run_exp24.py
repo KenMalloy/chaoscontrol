@@ -119,7 +119,7 @@ def _score_full_val(
     full_val_dir.mkdir(parents=True, exist_ok=True)
     logs_dir = results_dir / "logs"
     logs_dir.mkdir(parents=True, exist_ok=True)
-    scorer = REPO / "scripts" / "run_exp20_fast_score.py"
+    scorer = REPO / "scripts" / "run_exp20_full_val_score.py"
     commands: list[list[str]] = []
     for entry in entries:
         name = str(entry["name"])
@@ -434,7 +434,7 @@ def main(argv: list[str] | None = None) -> int:
         "--full-val-score",
         action=argparse.BooleanOptionalAction,
         default=False,
-        help="After training each entry, run scripts/run_exp20_fast_score.py on the saved checkpoint.",
+        help="After training each entry, run scripts/run_exp20_full_val_score.py on the saved checkpoint.",
     )
     parser.add_argument(
         "--val-cache-dir",
@@ -446,7 +446,7 @@ def main(argv: list[str] | None = None) -> int:
         "--val-budget-seconds",
         type=float,
         default=600.0,
-        help="Eval budget passed to run_exp20_fast_score.py.",
+        help="Eval budget passed to run_exp20_full_val_score.py.",
     )
     args = parser.parse_args(argv)
 

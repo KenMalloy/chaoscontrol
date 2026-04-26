@@ -32,6 +32,7 @@ def _build_weights_struct(weights_dict):
     w.K_s = K_S
     w.H = H
     w.N = N
+    w.n_heads = int(weights_dict.get("n_heads", 0))
     w.W_vp = weights_dict["W_vp"].flatten().tolist()
     w.b_vp = weights_dict["b_vp"].tolist()
     w.W_lh = weights_dict["W_lh"].tolist()
@@ -42,6 +43,13 @@ def _build_weights_struct(weights_dict):
     w.bucket_embed = weights_dict.get(
         "bucket_embed", torch.zeros(8, 8)
     ).flatten().tolist()
+    w.lambda_hxh = float(weights_dict.get("lambda_hxh", 0.0))
+    if w.n_heads:
+        w.W_q = weights_dict["W_q"].flatten().tolist()
+        w.W_k = weights_dict["W_k"].flatten().tolist()
+        w.W_v = weights_dict["W_v"].flatten().tolist()
+        w.W_o = weights_dict["W_o"].flatten().tolist()
+        w.W_e = weights_dict["W_e"].flatten().tolist()
     return w
 
 
@@ -56,6 +64,7 @@ def _random_weights(seed: int = 1337):
         "alpha": float(torch.randn((), generator=g) * 0.1),
         "temperature": 1.0,
         "bucket_embed": torch.zeros(8, 8),
+        "lambda_hxh": 0.0,
     }
 
 
@@ -129,17 +138,250 @@ def test_simplex_online_learner_records_decision_and_telemetry():
         V=V.flatten().tolist(),
         E=E.flatten().tolist(),
         simplex_features=sf.tolist(),
+        n_actual=11,
+        write_bucket=2,
     )
     history = learner.history(3)
     assert len(history) == 1
     e = history[0]
     assert e.gpu_step == 100
     assert e.chosen_idx == 5
+    assert e.n_actual == 11
+    assert e.write_bucket == 2
     assert e.action_type == 2  # V1 simplex selection
     t = learner.telemetry()
     assert t.history_appends == 1
     assert t.replay_outcomes == 0
     assert t.credited_actions == 0
+
+
+def test_simplex_gerber_rejects_when_categorical_margin_inactive():
+    """Gerber gates simplex credit on log-prob margin, not raw reward size."""
+    weights = _random_weights(8)
+    # Zero all trainable weights so the current policy is exactly uniform;
+    # a high behavior p then has no active current-policy margin to agree with.
+    for key in ("W_vp", "b_vp", "W_lh", "W_sb"):
+        weights[key] = torch.zeros_like(weights[key])
+    weights["b_lh"] = 0.0
+    weights["alpha"] = 0.0
+    learner = _ext.SimplexOnlineLearner(
+        num_slots=8, max_entries_per_slot=4,
+        gamma=1.0, learning_rate=1.0, sgd_interval=1, ema_interval=999999,
+        gerber_c=0.5,
+    )
+    learner.initialize_simplex_weights(_build_weights_struct(weights))
+    V, E, sf = _random_simplex_inputs(14)
+    learner.record_simplex_decision(
+        chosen_slot_id=2, gpu_step=10, policy_version=1,
+        chosen_idx=3, p_chosen_decision=0.9,
+        V=V.flatten().tolist(), E=E.flatten().tolist(),
+        simplex_features=sf.tolist(), n_actual=N, write_bucket=1,
+    )
+    learner.on_replay_outcome(
+        _replay_outcome_dict(slot_id=2, gpu_step=11, selection_step=10,
+                             ce_delta_raw=2.0, bucket_baseline=0.0)
+    )
+    t = learner.telemetry()
+    assert t.backward_ready_actions == 1
+    assert t.gerber_rejected_actions == 1
+    assert t.gerber_accepted_actions == 0
+    assert t.sgd_steps == 0
+    assert t.last_current_logprob_margin == pytest.approx(0.0, abs=1e-6)
+
+
+def test_simplex_gerber_threshold_is_bucket_type_local_not_global():
+    """Global margin stats are diagnostic; the actual gate uses bucket/type."""
+    weights = _random_weights(9)
+    learner = _ext.SimplexOnlineLearner(
+        num_slots=8, max_entries_per_slot=8,
+        gamma=1.0, learning_rate=0.1, sgd_interval=1, ema_interval=999999,
+        gerber_c=0.5,
+    )
+    learner.initialize_simplex_weights(_build_weights_struct(weights))
+    V, E, sf = _random_simplex_inputs(18)
+    fwd = _ext.simplex_forward(
+        learner.fast_weights(),
+        V.flatten().tolist(), E.flatten().tolist(), sf.tolist(),
+    )
+    chosen = int(np.argmax(np.asarray(fwd.p)))
+    p_chosen = float(fwd.p[chosen])
+    # Bucket 2 receives a very different behavior margin, but the replay
+    # below belongs to bucket 1. The gate must use bucket 1's stddev only.
+    learner.record_simplex_decision(
+        chosen_slot_id=4, gpu_step=1, policy_version=1,
+        chosen_idx=chosen, p_chosen_decision=0.99,
+        V=V.flatten().tolist(), E=E.flatten().tolist(),
+        simplex_features=sf.tolist(), n_actual=N, write_bucket=2,
+    )
+    learner.record_simplex_decision(
+        chosen_slot_id=3, gpu_step=10, policy_version=1,
+        chosen_idx=chosen, p_chosen_decision=p_chosen,
+        V=V.flatten().tolist(), E=E.flatten().tolist(),
+        simplex_features=sf.tolist(), n_actual=N, write_bucket=1,
+    )
+    learner.on_replay_outcome(
+        _replay_outcome_dict(slot_id=3, gpu_step=11, selection_step=10,
+                             ce_delta_raw=0.5, bucket_baseline=0.0)
+    )
+    t = learner.telemetry()
+    assert t.gerber_accepted_actions == 1
+    assert t.last_bucket_type_stddev == pytest.approx(0.0, abs=1e-8)
+    assert t.last_global_type_stddev > 0.0
+    assert t.last_gerber_threshold == pytest.approx(0.0, abs=1e-8)
+
+
+def test_simplex_replay_credits_when_selection_step_matches_producer_gpu_step():
+    """Replay credit is keyed by the producer gpu_step, not wall/consumer time."""
+    weights = _random_weights(15)
+    V, E, sf = _random_simplex_inputs(30)
+    learner = _ext.SimplexOnlineLearner(
+        num_slots=8, max_entries_per_slot=4,
+        gamma=1.0, learning_rate=0.1, sgd_interval=1, ema_interval=999999,
+        gerber_c=0.0,
+    )
+    learner.initialize_simplex_weights(_build_weights_struct(weights))
+    fwd = _ext.simplex_forward(
+        learner.fast_weights(),
+        V.flatten().tolist(), E.flatten().tolist(), sf.tolist(),
+    )
+    chosen = int(np.argmax(np.asarray(fwd.p)))
+    learner.record_simplex_decision(
+        chosen_slot_id=2, gpu_step=123, policy_version=1,
+        chosen_idx=chosen, p_chosen_decision=float(fwd.p[chosen]),
+        V=V.flatten().tolist(), E=E.flatten().tolist(),
+        simplex_features=sf.tolist(), n_actual=N, write_bucket=1,
+    )
+    learner.on_replay_outcome(
+        _replay_outcome_dict(
+            slot_id=2, gpu_step=124, selection_step=123,
+            ce_delta_raw=0.75, bucket_baseline=0.0,
+        )
+    )
+    assert learner.telemetry().credited_actions == 1
+    assert learner.last_advantage != 0.0
+
+    miss = _ext.SimplexOnlineLearner(
+        num_slots=8, max_entries_per_slot=4,
+        gamma=1.0, learning_rate=0.1, sgd_interval=1, ema_interval=999999,
+        gerber_c=0.0,
+    )
+    miss.initialize_simplex_weights(_build_weights_struct(weights))
+    miss.record_simplex_decision(
+        chosen_slot_id=2, gpu_step=123, policy_version=1,
+        chosen_idx=chosen, p_chosen_decision=float(fwd.p[chosen]),
+        V=V.flatten().tolist(), E=E.flatten().tolist(),
+        simplex_features=sf.tolist(), n_actual=N, write_bucket=1,
+    )
+    miss.on_replay_outcome(
+        _replay_outcome_dict(
+            slot_id=2, gpu_step=124, selection_step=124,
+            ce_delta_raw=0.75, bucket_baseline=0.0,
+        )
+    )
+    assert miss.telemetry().credited_actions == 0
+    assert miss.last_advantage == 0.0
+
+
+def test_simplex_learner_does_not_credit_sentinel_padded_slots():
+    """Short simplexes must not let zero-padded sentinel slots receive credit."""
+    weights = _random_weights(16)
+    V, E, sf = _random_simplex_inputs(32)
+    learner = _ext.SimplexOnlineLearner(
+        num_slots=8, max_entries_per_slot=4,
+        gamma=1.0, learning_rate=0.1, sgd_interval=1, ema_interval=999999,
+        gerber_c=0.0,
+    )
+    learner.initialize_simplex_weights(_build_weights_struct(weights))
+    fwd = _ext.simplex_forward(
+        learner.fast_weights(),
+        V.flatten().tolist(), E.flatten().tolist(), sf.tolist(),
+    )
+    chosen = int(np.argmax(np.asarray(fwd.p[:4])))
+    chosen_slot = 2 if chosen == 0 else 3
+    learner.record_simplex_decision(
+        chosen_slot_id=chosen_slot, gpu_step=50, policy_version=1,
+        chosen_idx=chosen, p_chosen_decision=float(fwd.p[chosen]),
+        V=V.flatten().tolist(), E=E.flatten().tolist(),
+        simplex_features=sf.tolist(), n_actual=4, write_bucket=2,
+    )
+    learner.on_replay_outcome(
+        _replay_outcome_dict(
+            slot_id=0, gpu_step=51, selection_step=50,
+            ce_delta_raw=1.0, bucket_baseline=0.0,
+        )
+    )
+    t = learner.telemetry()
+    assert t.credited_actions == 0
+    assert t.backward_skipped_missing_state == 1
+
+
+def test_gerber_correction_collapses_to_one_when_behavior_equals_current():
+    """On-policy categorical margins should pass Gerber with weight 1."""
+    weights = _random_weights(17)
+    V, E, sf = _random_simplex_inputs(34)
+    learner = _ext.SimplexOnlineLearner(
+        num_slots=8, max_entries_per_slot=4,
+        gamma=1.0, learning_rate=0.0, sgd_interval=1, ema_interval=999999,
+        gerber_c=0.5,
+    )
+    learner.initialize_simplex_weights(_build_weights_struct(weights))
+    fwd = _ext.simplex_forward(
+        learner.fast_weights(),
+        V.flatten().tolist(), E.flatten().tolist(), sf.tolist(),
+    )
+    chosen = int(np.argmax(np.asarray(fwd.p)))
+    learner.record_simplex_decision(
+        chosen_slot_id=6, gpu_step=77, policy_version=1,
+        chosen_idx=chosen, p_chosen_decision=float(fwd.p[chosen]),
+        V=V.flatten().tolist(), E=E.flatten().tolist(),
+        simplex_features=sf.tolist(), n_actual=N, write_bucket=0,
+    )
+    learner.on_replay_outcome(
+        _replay_outcome_dict(
+            slot_id=6, gpu_step=78, selection_step=77,
+            ce_delta_raw=0.5, bucket_baseline=0.0,
+        )
+    )
+    assert learner.telemetry().last_gerber_weight == pytest.approx(1.0)
+    assert learner.telemetry().gerber_accepted_actions == 1
+
+
+def test_simplex_standardizes_advantage_per_bucket_before_credit():
+    """Bucket baseline centers reward; per-bucket stddev scales magnitude."""
+    weights = _random_weights(10)
+    learner = _ext.SimplexOnlineLearner(
+        num_slots=8, max_entries_per_slot=8,
+        gamma=1.0, learning_rate=0.0, sgd_interval=1, ema_interval=999999,
+        gerber_c=0.0,
+    )
+    learner.initialize_simplex_weights(_build_weights_struct(weights))
+    V, E, sf = _random_simplex_inputs(22)
+    fwd = _ext.simplex_forward(
+        learner.fast_weights(),
+        V.flatten().tolist(), E.flatten().tolist(), sf.tolist(),
+    )
+    chosen = int(np.argmax(np.asarray(fwd.p)))
+    p_chosen = float(fwd.p[chosen])
+    for step, raw_adv in enumerate([1.0, 3.0, 5.0], start=1):
+        learner.record_simplex_decision(
+            chosen_slot_id=5, gpu_step=step * 10, policy_version=1,
+            chosen_idx=chosen, p_chosen_decision=p_chosen,
+            V=V.flatten().tolist(), E=E.flatten().tolist(),
+            simplex_features=sf.tolist(), n_actual=N, write_bucket=3,
+        )
+        learner.on_replay_outcome(
+            _replay_outcome_dict(
+                slot_id=5,
+                gpu_step=step * 10 + 1,
+                selection_step=step * 10,
+                ce_delta_raw=raw_adv,
+                bucket_baseline=0.0,
+            )
+        )
+    t = learner.telemetry()
+    assert t.last_advantage_raw == pytest.approx(5.0)
+    assert t.last_advantage_stddev > 0.0
+    assert abs(t.last_advantage_standardized) < abs(t.last_advantage_raw)
 
 
 def test_simplex_skip_when_weights_not_initialized():
@@ -280,8 +522,12 @@ def test_simplex_reinforce_decreases_p_chosen_for_negative_advantage():
     )
 
 
-def test_simplex_gradient_matches_torch_autograd_reference():
-    """Load-bearing parity test.
+def _assert_simplex_gradient_matches_torch_autograd_reference(
+    *,
+    atol: float,
+    rtol: float,
+) -> None:
+    """Run the load-bearing C++ learner vs torch autograd parity check.
 
     Run one REINFORCE event through the C++ kernel with sgd_interval=1
     and capture the post-update fast_weights. Run the same forward
@@ -355,12 +601,43 @@ def test_simplex_gradient_matches_torch_autograd_reference():
     actual_W_sb = np.array(fast.W_sb)
     actual_alpha = float(fast.alpha)
 
-    np.testing.assert_allclose(actual_W_vp, expected["W_vp"], atol=1e-4, rtol=1e-3)
-    np.testing.assert_allclose(actual_b_vp, expected["b_vp"], atol=1e-4, rtol=1e-3)
-    np.testing.assert_allclose(actual_W_lh, expected["W_lh"], atol=1e-4, rtol=1e-3)
-    assert abs(actual_b_lh - expected["b_lh"]) < 1e-4
-    np.testing.assert_allclose(actual_W_sb, expected["W_sb"], atol=1e-4, rtol=1e-3)
-    assert abs(actual_alpha - expected["alpha"]) < 1e-4
+    np.testing.assert_allclose(
+        actual_W_vp, expected["W_vp"], atol=atol, rtol=rtol
+    )
+    np.testing.assert_allclose(
+        actual_b_vp, expected["b_vp"], atol=atol, rtol=rtol
+    )
+    np.testing.assert_allclose(
+        actual_W_lh, expected["W_lh"], atol=atol, rtol=rtol
+    )
+    assert abs(actual_b_lh - expected["b_lh"]) < atol
+    np.testing.assert_allclose(
+        actual_W_sb, expected["W_sb"], atol=atol, rtol=rtol
+    )
+    assert abs(actual_alpha - expected["alpha"]) < atol
+
+
+def test_simplex_gradient_matches_torch_autograd_reference():
+    """Strict fp32 parity for the scalar/at::matmul learner path."""
+    if _ext.amx_bf16_kernel_available() and _ext.has_amx_bf16():
+        pytest.skip(
+            "AMX BF16 dispatch is live; strict fp32 tolerance is covered by "
+            "the bf16-loose learner parity test"
+        )
+    _assert_simplex_gradient_matches_torch_autograd_reference(
+        atol=1e-4,
+        rtol=1e-3,
+    )
+
+
+def test_simplex_gradient_matches_torch_autograd_reference_amx_bf16_path():
+    """Hardware-gated parity for AMX-dispatched simplex backward GEMMs."""
+    if not (_ext.amx_bf16_kernel_available() and _ext.has_amx_bf16()):
+        pytest.skip("AMX BF16 hardware/OS state and compiled kernel are required")
+    _assert_simplex_gradient_matches_torch_autograd_reference(
+        atol=3e-2,
+        rtol=3e-2,
+    )
 
 
 def test_simplex_sgd_apply_and_slow_ema_blend_cadences():
@@ -378,11 +655,18 @@ def test_simplex_sgd_apply_and_slow_ema_blend_cadences():
 
     for step in range(8):
         slot = step % 4
+        chosen = step % N
+        fwd = _ext.simplex_forward(
+            learner.fast_weights(),
+            V.flatten().tolist(), E.flatten().tolist(), sf.tolist(),
+        )
         learner.record_simplex_decision(
             chosen_slot_id=slot, gpu_step=10 * step, policy_version=1,
-            chosen_idx=(step % N), p_chosen_decision=0.1,
+            chosen_idx=chosen, p_chosen_decision=fwd.p[chosen],
             V=V.flatten().tolist(), E=E.flatten().tolist(),
             simplex_features=sf.tolist(),
+            n_actual=N,
+            write_bucket=step % 4,
         )
         learner.on_replay_outcome(
             _replay_outcome_dict(slot_id=slot, gpu_step=10 * step + 1,

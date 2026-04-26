@@ -28,6 +28,8 @@ struct ActionHistoryEntry {
   std::vector<float> slot_state;
   // V1 simplex snapshot:
   uint32_t chosen_idx = 0;
+  uint32_t n_actual = 0;
+  int32_t write_bucket = 0;
   float p_chosen_decision = 0.0f;
   std::vector<float> V;                 // (N * K_v)
   std::vector<float> E;                 // (N * N)

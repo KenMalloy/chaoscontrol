@@ -326,31 +326,34 @@ Train for some N steps until policy_acc on heuristic argmax ≈ 0.7-0.9
 (perfect mimicry is overkill — the controller should already start close
 to the heuristic but with room to deviate during online training).
 
-### CSWG header bump
+### CSWG schema bump
 
-Old header (28B):
+CSWG v3 replaces the duplicated fixed-order v2 layout with a self-describing
+binary:
+
 ```
-"CSWG" | version=1 | n_layers | d_global | d_slot | feature_dim | dtype
+fixed header: "CSWG" | version=3 | dtype | manifest_nbytes | reserved
+manifest: JSON { dims, tensors: [{name, shape, dtype, offset, nbytes}, ...] }
+payload: concatenated fp16 tensor bytes
 ```
 
-New header (32B):
-```
-"CSWG" | version=2 | n_simplex_vertices | K_v | K_e | K_s | H | dtype | reserved
-```
-
-C++ loader checks `version == 2` and rejects v1 with a clear message.
+The manifest is load-bearing: HxH tensors (`W_q`, `W_k`, `W_v`, `W_o`,
+`W_e`, `lambda_hxh`) are described by name and shape, so the runner can
+load base-only and residual-HxH artifacts without a second hard-coded tensor
+order.
 
 ### Tests
 
 1. `test_simplex_pretrain_synthetic_convergence` — policy_acc on
    heuristic argmax target reaches ≥ 0.7 on 1000 synthetic queries.
-2. `test_simplex_pretrain_dumps_cswg_v2_header` — round-trip C++ load
-   matches the Python tensors at fp16 precision.
+2. `test_cswg_v3_header_and_manifest_layout` — header + manifest dims.
+3. `test_cswg_v3_manifest_is_self_describing_for_hxh` — residual HxH tensors
+   are named and shaped in the manifest.
 
 ### Commit
 
 ```
-controller_pretrain: simplex BC pipeline + CSWG v2 export
+controller_pretrain: simplex BC pipeline + CSWG v3 export
 ```
 
 ## Phase S5 — F1 matrix + bench update
@@ -400,6 +403,48 @@ S5 waits on all four.
 I do S2 myself sequentially after the parallel three return — it's the
 trickiest piece (gradient correctness), and review-after-the-fact for a
 new gradient implementation is harder than just doing it carefully.
+
+## Blocker defensive tests
+
+These tests guard against silent invalidation bugs in the simplex
+producer -> controller -> replay-credit path. They are blockers before
+launching the 5-arm matrix:
+
+1. `test_simplex_replay_credits_when_selection_step_matches_producer_gpu_step`
+   in `tests/test_simplex_learner.py`: record a decision at `gpu_step=N`,
+   replay with `selection_step=N`, assert exactly one credit and non-zero
+   advantage. Paired negative case replays `selection_step=N+1` and asserts
+   zero credit.
+2. `test_build_simplex_learner_from_cswg_real_artifact` in
+   `tests/test_runner_episodic_controller_wiring.py`: synthetic mini-pretrain
+   -> CSWG v3 dump -> `_build_simplex_learner_from_cswg(path)` -> assert
+   loaded shapes match the CSWG manifest and the learner produces a
+   non-uniform forward.
+3. `test_run_controller_cycle_simplex_path_credits_a_full_round_trip` in
+   `tests/test_episodic_controller.py`: real tiny cache -> real query event
+   -> `run_controller_cycle(controller_runtime=learner,
+   action_recorder=learner)` -> tag -> matching ReplayOutcome -> assert
+   credited.
+4. `test_simplex_learner_does_not_credit_sentinel_padded_slots` in
+   `tests/test_simplex_learner.py`: record a decision with four real
+   candidates plus twelve sentinels, then replay a sentinel/collision slot
+   and assert no spurious credit.
+
+## Important defensive tests
+
+These tests are not launch blockers by themselves, but they pin the
+architecture's scientific invariants:
+
+1. `test_simplex_policy_reduces_to_heuristic_argmax_under_degenerate_weights`
+   in `tests/test_simplex_policy.py`: degenerate weights recover heuristic
+   utility argmax, proving the simplex policy is a strict superset of the
+   baseline selector.
+2. `test_gerber_correction_collapses_to_one_when_behavior_equals_current` in
+   `tests/test_simplex_learner.py`: when behavior and current categorical
+   margins match, Gerber weight is 1.0 and credit proceeds.
+3. `test_sample_mode_is_deterministic_under_fixed_seed` in
+   `tests/test_episodic_controller.py`: two `run_controller_cycle` sample
+   calls with the same seed produce the same chosen vertex and slot.
 
 ## Verification at end
 

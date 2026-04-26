@@ -28,6 +28,7 @@ class RollingStddev {
   explicit RollingStddev(float decay = 0.99f);
 
   void update(float x);
+  float mean() const;
   float stddev() const;
   uint64_t count() const;
 

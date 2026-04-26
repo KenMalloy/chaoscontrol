@@ -977,25 +977,10 @@ def build_episodic_controller_v1_matrix(
     at attach time. Pod runbook substitutes via the
     ``EPISODIC_CONTROLLER_V1_WEIGHTS_PATH`` env var.
 
-    KNOWN GAPS (these will surface at run time via runner / scorer
-    warnings; the pod runbook should treat them as pre-flight checks):
+    Remaining caveat:
 
-    1. ``episodic_controller_runtime: "simplex_v1"`` is matrix-side only
-       in this commit. The runner's _build_controller_runtime_from_config
-       still dispatches the per-slot V0 modes (``heuristic``,
-       ``cpu_ssm_reference``, ``cpp_reference``); a follow-up commit
-       will add ``simplex_v1`` dispatch that loads SimplexWeights from
-       CSWG v2, constructs a SimplexOnlineLearner, and threads the
-       candidate-set producer through to record_simplex_decision. Until
-       that lands, the trained arms (c, d, e) will hard-error at runner
-       startup with a clear "unsupported runtime" message. arm_a and
-       arm_b run as before.
-    2. ``controller_train_online`` is honored on the train side (V0): the
-       runner skips wrapping the controller runtime in the V0 bridge
-       when False. The V1 simplex bridge in the follow-up will honor the
-       same flag for arm_c (frozen) vs arm_d (online).
-    3. ``eval_episodic_cache_mode`` (cold/warm) is loaded by
-       run_exp20_fast_score.py but DOES NOT affect scored CE — the
+    ``eval_episodic_cache_mode`` (cold/warm) is loaded by
+       run_exp20_full_val_score.py but DOES NOT affect scored CE — the
        optimized fast-score loop bypasses the cache-aware
        LegalityController path. arm_d vs arm_e currently differs only
        in the train-side checkpoint payload (warm = cache serialized in
@@ -1049,6 +1034,10 @@ def build_episodic_controller_v1_matrix(
     simplex_controller_frozen = {
         "episodic_controller_runtime": "simplex_v1",
         "episodic_controller_weights_path": _resolve_episodic_controller_v1_weights_path(),
+        # The simplex thesis is a policy over all 16 candidates, not a
+        # hard rerank. Sample from p so replay credit can reinforce any
+        # vertex that pays off.
+        "episodic_controller_selection_mode": "sample",
         "controller_train_online": False,
         # Without the post-step CE pair the simplex policy's reward
         # signal is NaN (B5 gates the second forward on this flag).
@@ -1173,7 +1162,7 @@ def build_episodic_ttt_v1_matrix(
         recipe (interval=64, alpha=0.25, eval_copy=slow), seeds.
 
     The eval-side fields are RECORDED on the matrix entry for downstream
-    analysis but are not yet plumbed into ``run_exp20_fast_score.py`` (the
+    analysis but are not yet plumbed into ``run_exp20_full_val_score.py`` (the
     path used by ``run_exp24 --full-val-score``). Wiring them through is
     a separate task. ``run_exp20_eval.py`` already consumes them via
     ``RunConfig.episodic_cache_enabled`` and friends.

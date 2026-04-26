@@ -940,7 +940,7 @@ def test_run_exp24_full_val_defaults_checkpoint_dir(tmp_path):
     stdout = result.stdout
     assert "[exp24] full-val-score enabled" in stdout
     assert str(output_dir / "checkpoints") in stdout
-    assert "run_exp20_fast_score.py" in stdout
+    assert "run_exp20_full_val_score.py" in stdout
     assert "--nproc_per_node=4" in stdout
 
 
@@ -970,7 +970,7 @@ def test_score_full_val_builds_expected_cmd(tmp_path):
     assert "--rdzv-backend=c10d" in cmd
     rdzv_id = next(arg for arg in cmd if arg.startswith("--rdzv-id="))
     assert rdzv_id.startswith(f"--rdzv-id=score_{name}_")
-    assert str(REPO / "scripts" / "run_exp20_fast_score.py") in cmd
+    assert str(REPO / "scripts" / "run_exp20_full_val_score.py") in cmd
     assert cmd[cmd.index("--cache-dir") + 1] == str(tmp_path / "val-cache")
     assert cmd[cmd.index("--checkpoint-path") + 1] == str(checkpoint_dir / f"{name}.pt")
     assert cmd[cmd.index("--output-path") + 1] == str(tmp_path / "full_val" / f"{name}.jsonl")
@@ -1125,7 +1125,7 @@ def test_episodic_ttt_v1_matrix_shape():
     eval shape within each eval-side half (A=C, B=D).
 
     NOTE: the eval-side fields are RECORDED ON THE MATRIX ENTRY but
-    cannot today be plumbed into ``run_exp20_fast_score.py`` (the path
+    cannot today be plumbed into ``run_exp20_full_val_score.py`` (the path
     used by run_exp24's ``--full-val-score``). Wiring them through is a
     separate task; this matrix encodes the intent so downstream analysis
     can attribute outcomes correctly.
@@ -1512,6 +1512,7 @@ def test_episodic_controller_v1_matrix_has_five_arms_three_seeds():
             assert entry["eval_episodic_cache_enabled"] is True
             assert entry["episodic_event_log_enabled"] is True
             assert entry["episodic_controller_runtime"] == "simplex_v1"
+            assert entry["episodic_controller_selection_mode"] == "sample"
             assert entry["episodic_controller_weights_path"] == (
                 "TO_BE_FILLED/episodic_controller_v1_weights.pt"
             )

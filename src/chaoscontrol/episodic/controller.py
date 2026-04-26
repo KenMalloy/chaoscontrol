@@ -41,8 +41,10 @@ hook), heartbeat counter for the runner's outer loop, crash recovery.
 """
 from __future__ import annotations
 
+import hashlib
 import threading
 import time
+import math
 from typing import Any
 
 import torch
@@ -54,6 +56,14 @@ from chaoscontrol.optim.episodic_cache import EpisodicCache
 _SIMPLEX_K_V = 16  # vertex feature dim — must match the pretrain spec.
 _SIMPLEX_K_S = 4   # simplex feature dim.
 _SIMPLEX_AGE_NORMALIZER = 1000.0  # divide age in steps by this for V[i, 2].
+_SIMPLEX_FEATURE_MANIFEST = (
+    "simplex_v1:"
+    "V0=utility_u,V1=query_cosine,V2=age_steps/1000,V3=pressure_at_write,"
+    "V4..15=0,E0=key_rep_cosine,sf=(top1_u,mean_u,top1_cos,cos_spread)"
+)
+_SIMPLEX_FEATURE_MANIFEST_HASH = hashlib.sha256(
+    _SIMPLEX_FEATURE_MANIFEST.encode("utf-8")
+).hexdigest()[:16]
 
 
 def _is_simplex_runtime(runtime: Any) -> bool:
@@ -171,6 +181,8 @@ def _record_simplex_decision_snapshot(
     V: list[float],
     E: list[float],
     sf: list[float],
+    n_actual: int = 0,
+    write_bucket: int = 0,
 ) -> None:
     simplex_runtime.record_simplex_decision(
         chosen_slot_id=int(chosen_slot_id),
@@ -181,6 +193,56 @@ def _record_simplex_decision_snapshot(
         V=V,
         E=E,
         simplex_features=sf,
+        n_actual=int(n_actual),
+        write_bucket=int(write_bucket),
+    )
+
+
+def _choose_simplex_vertex(
+    probs: list[float],
+    n_actual: int,
+    *,
+    mode: str = "argmax",
+    generator: torch.Generator | None = None,
+) -> tuple[int, float]:
+    """Choose a simplex vertex from the policy distribution.
+
+    ``argmax`` preserves the V1 greedy behavior. ``sample`` / ``soft_sample``
+    turns the simplex into the actual action distribution: every one of the
+    16 vertices can receive credit when it is sampled and later pays off.
+    """
+    n = int(n_actual)
+    if n <= 0:
+        raise ValueError("n_actual must be positive for simplex selection")
+    valid = torch.tensor(
+        [max(float(probs[idx]), 0.0) for idx in range(n)],
+        dtype=torch.float32,
+        device="cpu",
+    )
+    total = valid.sum()
+    if not torch.isfinite(total) or float(total.item()) <= 0.0:
+        valid = torch.full((n,), 1.0 / float(n), dtype=torch.float32)
+    else:
+        valid = valid / total
+    mode_norm = str(mode).strip().lower()
+    if mode_norm in {"argmax", "greedy"}:
+        best = 0
+        best_p = float(valid[0].item())
+        for idx in range(n):
+            p = float(valid[idx].item())
+            if p > best_p:
+                best = idx
+                best_p = p
+        return int(best), float(best_p)
+
+    if mode_norm in {"sample", "soft_sample", "stochastic"}:
+        chosen = int(torch.multinomial(valid, 1, generator=generator).item())
+        return chosen, float(valid[chosen].item())
+
+    raise ValueError(
+        "simplex_selection_mode must be one of 'argmax', 'greedy', "
+        "'sample', 'soft_sample', or 'stochastic'; "
+        f"got {mode!r}"
     )
 
 
@@ -196,6 +258,8 @@ def run_controller_cycle(
     policy_version: int = 0,
     controller_runtime: Any | None = None,
     action_recorder: Any | None = None,
+    simplex_selection_mode: str = "argmax",
+    simplex_generator: torch.Generator | None = None,
 ) -> int:
     """Run a single controller cycle: drain queries, push tags.
 
@@ -225,6 +289,10 @@ def run_controller_cycle(
         action_recorder: optional C10 learning-loop bridge. When supplied and
             the controller runtime exposes decision snapshots, each selected
             replay action is appended with its decision-time input/state.
+        simplex_selection_mode: for ``simplex_v1`` runtimes, ``"argmax"``
+            keeps the greedy V1 path; ``"sample"`` / ``"soft_sample"``
+            samples the action from the 16-vertex policy distribution.
+        simplex_generator: optional CPU generator used only by soft sampling.
 
     Returns:
         Number of candidates drained from the query queue this cycle.
@@ -298,7 +366,7 @@ def run_controller_cycle(
         if is_simplex:
             # Simplex V1 path: build the candidate matrix from the top-K
             # slots, run simplex_forward once over the whole set, choose
-            # one vertex (argmax for V1; sampling is V2). Append a
+            # one vertex (greedy or sampled by config). Append a
             # SINGLE tag for the chosen slot — fundamental output-shape
             # difference vs the V0 per-slot loop, which appended K tags
             # per query.
@@ -315,20 +383,36 @@ def run_controller_cycle(
             fwd = _ext.simplex_forward(
                 controller_runtime.fast_weights(), V, E, sf,
             )
-            # argmax across the actual candidate count (don't pick a
-            # zero-padded vertex by accident if the policy somehow
+            # Select only across the actual candidate count (don't pick
+            # a zero-padded vertex by accident if the policy somehow
             # weighs them above the real ones).
             n_actual = int(slots.numel())
-            best = 0
-            best_p = float(fwd.p[0])
-            for idx in range(n_actual):
-                if float(fwd.p[idx]) > best_p:
-                    best = idx
-                    best_p = float(fwd.p[idx])
-            chosen_idx = best
+            chosen_idx, p_chosen = _choose_simplex_vertex(
+                list(fwd.p),
+                n_actual,
+                mode=simplex_selection_mode,
+                generator=simplex_generator,
+            )
             chosen_slot = int(padded_slot_ids[chosen_idx])
-            p_chosen = best_p
             controller_logit = float(fwd.logits[chosen_idx])
+            write_bucket = int(
+                cache.write_bucket[int(chosen_slot)].item()
+                if hasattr(cache, "write_bucket")
+                else cand.get("write_bucket", 0)
+            )
+            valid_mass = float(sum(max(float(x), 0.0) for x in list(fwd.p)[:n_actual]))
+            if not math.isfinite(valid_mass) or valid_mass <= 0.0:
+                simplex_probabilities = [1.0 / float(n_actual)] * n_actual
+            else:
+                simplex_probabilities = [
+                    max(float(x), 0.0) / valid_mass for x in list(fwd.p)[:n_actual]
+                ]
+            simplex_entropy = -sum(
+                p * math.log(max(p, 1e-30)) for p in simplex_probabilities
+            )
+            lambda_hxh = float(
+                getattr(controller_runtime.fast_weights(), "lambda_hxh", 0.0)
+            )
 
             if action_recorder is not None:
                 _record_simplex_decision_snapshot(
@@ -339,6 +423,8 @@ def run_controller_cycle(
                     chosen_idx=chosen_idx,
                     p_chosen=p_chosen,
                     V=V, E=E, sf=sf,
+                    n_actual=n_actual,
+                    write_bucket=write_bucket,
                 )
 
             replay_id = (
@@ -357,17 +443,46 @@ def run_controller_cycle(
                     if hasattr(cache, "source_write_id")
                     else cand.get("source_write_id", -1)
                 ),
+                "write_bucket": int(write_bucket),
                 "selected_rank": int(chosen_idx),
                 "teacher_score": float(
                     scores[chosen_idx].item()
                     if chosen_idx < int(scores.numel()) else 0.0
                 ),
                 "controller_logit": float(controller_logit),
-                "selection_step": int(selected_at),
+                # SimplexOnlineLearner records history by producer gpu_step;
+                # replay outcomes must echo the same value to credit it.
+                "selection_step": int(producer_step),
                 "policy_version": int(policy_version),
                 "outcome_status": "pending",
+                "arm": str(cand.get("arm", "")),
+                "p_chosen": float(p_chosen),
+                "p_behavior": simplex_probabilities,
+                "entropy": float(simplex_entropy),
+                "lambda_hxh": float(lambda_hxh),
+                "feature_manifest_hash": _SIMPLEX_FEATURE_MANIFEST_HASH,
+                "candidate_slot_ids": [
+                    int(x) for x in padded_slot_ids[:n_actual]
+                ],
+                "candidate_scores": [
+                    float(x) for x in scores.detach().cpu().tolist()[:n_actual]
+                ],
+                "logits": [
+                    float(x) for x in list(fwd.logits)[:n_actual]
+                ],
                 "simplex_p_chosen": float(p_chosen),
                 "simplex_chosen_idx": int(chosen_idx),
+                "simplex_n_actual": int(n_actual),
+                "simplex_candidate_slot_ids": [
+                    int(x) for x in padded_slot_ids[:n_actual]
+                ],
+                "simplex_candidate_scores": [
+                    float(x) for x in scores.detach().cpu().tolist()[:n_actual]
+                ],
+                "simplex_logits": [
+                    float(x) for x in list(fwd.logits)[:n_actual]
+                ],
+                "simplex_probabilities": simplex_probabilities,
             }
             tagged_replay_queue.append(tag)
             cand["residual"] = None
@@ -564,6 +679,8 @@ def controller_main(
     score_mode: str = "cosine_utility_weighted",
     controller_runtime: Any | None = None,
     action_recorder: Any | None = None,
+    simplex_selection_mode: str = "argmax",
+    simplex_generator: torch.Generator | None = None,
     cycle_idle_sleep_s: float = 0.005,
     heartbeat: list[int] | None = None,
 ) -> None:
@@ -601,6 +718,8 @@ def controller_main(
             queue_lock=queue_lock,
             controller_runtime=controller_runtime,
             action_recorder=action_recorder,
+            simplex_selection_mode=simplex_selection_mode,
+            simplex_generator=simplex_generator,
         )
         if heartbeat is not None:
             heartbeat[0] += 1

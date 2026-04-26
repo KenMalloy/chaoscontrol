@@ -22,7 +22,7 @@ Synthetic BC target: heuristic_argmax_idx = argmax(V[:, 0]) (column 0
 information independent of the target label. The controller is trained
 to softmax-match the heuristic.
 
-Output: a CSWG v2 binary at ``simplex_policy_v1.cswg`` which the F1
+Output: a CSWG v3 binary at ``simplex_policy_v1.cswg`` which the F1
 matrix loads via ``EPISODIC_CONTROLLER_V1_WEIGHTS_PATH``.
 """
 from __future__ import annotations
@@ -40,13 +40,14 @@ import torch.nn.functional as F
 
 # Dimensions are locked by the design doc (Forward architecture +
 # Artifact budget). They are NOT configurable: the C++ forward kernel,
-# the CSWG v2 header, and the heuristic retrieval pipeline all assume
+# the CSWG v3 manifest, and the heuristic retrieval pipeline all assume
 # these exact shapes.
 N_VERTICES = 16    # simplex size (top-K slots per query)
 K_V = 16           # vertex feature dim
 K_E = 1            # edge feature dim per pair
 K_S = 4            # simplex (global) feature dim
 H = 32             # hidden dim
+N_HEADS = 2        # optional residual HxH heads over the 16-vertex simplex
 N_BUCKETS = 8      # bucket_embed first axis
 BUCKET_EMBED_DIM = 8
 
@@ -56,8 +57,9 @@ class PretrainConfig:
     """Hyperparameters for the simplex BC pretrain.
 
     Architectural dims are exposed for tests but default to the locked
-    values. ``temperature`` is held fixed at 1.0 in V1; future versions
-    may train it.
+    values. ``temperature`` stays fixed at 1.0; lambda_hxh is trained but
+    starts at zero so the residual HxH path is available without steering
+    the initial controller away from the heuristic prior.
     """
 
     n_vertices: int = N_VERTICES
@@ -65,9 +67,11 @@ class PretrainConfig:
     k_e: int = K_E
     k_s: int = K_S
     h: int = H
+    n_heads: int = N_HEADS
     n_buckets: int = N_BUCKETS
     bucket_embed_dim: int = BUCKET_EMBED_DIM
     temperature: float = 1.0
+    lambda_hxh_init: float = 0.0
     learning_rate: float = 5e-3
     weight_decay: float = 1e-4
     batch_size: int = 64
@@ -78,10 +82,10 @@ class PretrainConfig:
 class SimplexPolicy(nn.Module):
     """PyTorch reimplementation of the C++ simplex forward kernel.
 
-    Parameter shapes match the CSWG v2 export layout exactly so the
+    Parameter shapes match the CSWG v3 export layout exactly so the
     state_dict can be dumped without reshaping. ``temperature`` and
-    ``bucket_embed`` are buffers (not trained in V1) but exported for
-    forward compatibility with the C++ runtime that consumes them.
+    ``bucket_embed`` are buffers but exported for the C++ runtime that
+    consumes them.
     """
 
     def __init__(self, cfg: PretrainConfig):
@@ -95,6 +99,31 @@ class SimplexPolicy(nn.Module):
         self.b_vp = nn.Parameter(torch.zeros(cfg.h))
         # Layer 2 -- single learned alpha mixes content with geometry.
         self.alpha = nn.Parameter(torch.zeros(()))
+        # Residual HxH branch over the full 16-vertex simplex. lambda starts
+        # at zero; online training warms/clips it so the branch is a residual,
+        # not an uncontrolled replacement for the base simplex path.
+        self.lambda_hxh = nn.Parameter(
+            torch.tensor(float(cfg.lambda_hxh_init), dtype=torch.float32)
+        )
+        self.W_q = nn.Parameter(
+            torch.empty(cfg.n_heads, cfg.h, cfg.h).normal_(
+                0.0, 1.0 / math.sqrt(cfg.h)
+            )
+        )
+        self.W_k = nn.Parameter(
+            torch.empty(cfg.n_heads, cfg.h, cfg.h).normal_(
+                0.0, 1.0 / math.sqrt(cfg.h)
+            )
+        )
+        self.W_v = nn.Parameter(
+            torch.empty(cfg.n_heads, cfg.h, cfg.h).normal_(
+                0.0, 1.0 / math.sqrt(cfg.h)
+            )
+        )
+        self.W_o = nn.Parameter(
+            torch.empty(cfg.n_heads, cfg.h).normal_(0.0, 1.0 / math.sqrt(cfg.h))
+        )
+        self.W_e = nn.Parameter(torch.zeros(cfg.n_heads, cfg.k_e))
         # Layer 3 -- logit head and simplex-features bias.
         # W_lh shape (H,): mixed_h @ W_lh -> (N,)
         self.W_lh = nn.Parameter(
@@ -107,7 +136,7 @@ class SimplexPolicy(nn.Module):
         # softmax is shift-invariant. Kept as a Parameter so AdamW
         # tracks it but its update is a no-op.)
         self.W_sb = nn.Parameter(torch.zeros(cfg.k_s))
-        # Buffers -- exported but not trained in V1.
+        # Buffers -- exported but not trained.
         self.register_buffer(
             "temperature",
             torch.tensor(float(cfg.temperature), dtype=torch.float32),
@@ -137,6 +166,17 @@ class SimplexPolicy(nn.Module):
         mixed_h = attn @ vertex_h + vertex_h                       # residual
         # Layer 3: logit head + simplex bias.
         logits = mixed_h @ self.W_lh + self.b_lh                   # (B, N)
+        if cfg.n_heads > 0:
+            q = torch.einsum("bnh,rhd->brnd", vertex_h, self.W_q)
+            k = torch.einsum("bnh,rhd->brnd", vertex_h, self.W_k)
+            v = torch.einsum("bnh,rhd->brnd", vertex_h, self.W_v)
+            hxh_logits = torch.einsum("brnd,brmd->brnm", q, k) * scale
+            E_features = E.unsqueeze(-1) if E.dim() == 3 else E
+            edge_bias = torch.einsum("bijk,rk->brij", E_features, self.W_e)
+            hxh_attn = F.softmax(hxh_logits + edge_bias, dim=-1)
+            hxh_mixed = torch.einsum("brnm,brmd->brnd", hxh_attn, v)
+            logits_hxh = torch.einsum("brnd,rd->brn", hxh_mixed, self.W_o)
+            logits = logits + self.lambda_hxh * logits_hxh.mean(dim=1)
         simplex_bias = simplex_features @ self.W_sb                # (B,)
         # Note: simplex_bias broadcasts uniformly over the N axis;
         # softmax is shift-invariant so this scalar does not change
@@ -201,7 +241,7 @@ def train(cfg: PretrainConfig | None = None) -> dict:
 
     Returns ``{"final_policy_acc", "final_loss", "model"}``. Tests use
     ``final_policy_acc`` to gate convergence; ``main`` writes the
-    state_dict out to a CSWG v2 binary.
+    state_dict out to a CSWG v3 binary.
     """
     if cfg is None:
         cfg = PretrainConfig()
@@ -266,10 +306,10 @@ def main() -> None:
 
     # Local import to avoid a circular dependency at module load time:
     # tests import pretrain_controller without needing the dumper.
-    from dump_to_cpp import dump_model_to_cswg_v2  # type: ignore
+    from dump_to_cpp import dump_model_to_cswg_v3  # type: ignore
 
     args.out.parent.mkdir(parents=True, exist_ok=True)
-    manifest = dump_model_to_cswg_v2(result["model"], args.out)
+    manifest = dump_model_to_cswg_v3(result["model"], args.out)
     print(f"wrote {manifest['path']} ({manifest['file_bytes']} bytes)")
 
 

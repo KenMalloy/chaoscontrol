@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import importlib.util
 import math
+import sys
 from pathlib import Path
 
 import pytest
@@ -50,6 +51,15 @@ def _load_runner_module():
     )
     spec = importlib.util.spec_from_file_location("runner_fast_path", path)
     mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _load_module(module_name: str, path: Path):
+    spec = importlib.util.spec_from_file_location(module_name, path)
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = mod
     spec.loader.exec_module(mod)
     return mod
 
@@ -262,6 +272,59 @@ def test_trainer_cache_checkpoint_preserves_configured_fingerprint_window(
     loaded_cache = mod.EpisodicCache.from_dict(ckpt["episodic_cache"])
 
     assert loaded_cache.fingerprint_window == 16
+
+
+def test_build_simplex_learner_from_cswg_real_artifact(tmp_path):
+    """Mini-pretrain -> CSWG v3 dump -> runner loader -> non-degenerate fwd."""
+    mod = _load_runner_module()
+    repo = Path(__file__).resolve().parent.parent
+    pretrain = _load_module(
+        "runner_pretrain_cswg_v3_test",
+        repo / "experiments" / "25_controller_pretrain" / "pretrain_controller.py",
+    )
+    dumper = _load_module(
+        "runner_dump_cswg_v3_test",
+        repo / "experiments" / "25_controller_pretrain" / "dump_to_cpp.py",
+    )
+    cfg = pretrain.PretrainConfig(n_batches=3, batch_size=16, seed=7)
+    result = pretrain.train(cfg)
+    path = tmp_path / "simplex_policy_v3.cswg"
+    dumper.dump_model_to_cswg_v3(result["model"], path)
+    artifact = dumper.load_cswg_v3(path)
+    dims = artifact["manifest"]["dims"]
+
+    learner = mod._build_simplex_learner_from_cswg(
+        str(path),
+        config={
+            "episodic_capacity": 32,
+            "episodic_controller_lambda_hxh_warmup_events": 0,
+        },
+    )
+    weights = learner.fast_weights()
+    assert weights.N == dims["n_vertices"] == cfg.n_vertices
+    assert weights.K_v == dims["k_v"] == cfg.k_v
+    assert weights.K_e == dims["k_e"] == cfg.k_e
+    assert weights.K_s == dims["k_s"] == cfg.k_s
+    assert weights.H == dims["h"] == cfg.h
+    assert weights.n_heads == dims["n_heads"] == cfg.n_heads
+    assert len(weights.W_q) == dims["n_heads"] * dims["h"] * dims["h"]
+    assert len(weights.W_e) == dims["n_heads"] * dims["k_e"]
+
+    from chaoscontrol.kernels import _cpu_ssm_controller as _ext
+
+    V, E, sf, _target = pretrain.synthetic_batch(
+        1, cfg, torch.Generator().manual_seed(11)
+    )
+    fwd = _ext.simplex_forward(
+        weights,
+        V[0].flatten().tolist(),
+        E[0].flatten().tolist(),
+        sf[0].tolist(),
+    )
+    assert len(fwd.p) == dims["n_vertices"]
+    assert all(math.isfinite(float(p)) for p in fwd.p)
+    assert sum(float(p) for p in fwd.p) == pytest.approx(1.0)
+    assert max(float(p) for p in fwd.p) - min(float(p) for p in fwd.p) > 1e-5
 
 
 def _make_disabled_consumer(mod, *, with_cache: bool = True):
@@ -481,10 +544,7 @@ def _consumer_with_stub_query_ring(mod):
 def test_runner_emit_query_event_threads_simplex_candidates():
     """Phase S3 producer pin: when ``_emit_query_event`` is called with
     a populated 16-id candidate list, the emitted wire-event dict carries
-    those slot ids in order (with cosines following the same shape).
-    The actual top-K retrieval that produces the candidate set lives in
-    Phase S5; S3 only verifies the producer threads the list through to
-    the wire payload unchanged."""
+    those slot ids in order (with cosines following the same shape)."""
     mod = _load_runner_module()
     consumer = _consumer_with_stub_query_ring(mod)
     residual = torch.zeros(16, dtype=torch.float32)

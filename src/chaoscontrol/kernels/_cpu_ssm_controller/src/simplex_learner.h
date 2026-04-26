@@ -17,11 +17,24 @@ struct SimplexLearnerTelemetry {
   uint64_t history_appends = 0;
   uint64_t credited_actions = 0;
   uint64_t backward_ready_actions = 0;
+  uint64_t gerber_accepted_actions = 0;
+  uint64_t gerber_rejected_actions = 0;
   uint64_t backward_skipped_missing_state = 0;
   uint64_t backward_skipped_missing_weights = 0;
   uint64_t invalid_slot_skips = 0;
   uint64_t sgd_steps = 0;
   uint64_t ema_blends = 0;
+  float last_gerber_weight = 0.0f;
+  float last_advantage_raw = 0.0f;
+  float last_advantage_standardized = 0.0f;
+  float last_advantage_mean = 0.0f;
+  float last_advantage_stddev = 0.0f;
+  float last_behavior_logprob_margin = 0.0f;
+  float last_current_logprob_margin = 0.0f;
+  float last_gerber_threshold = 0.0f;
+  float last_bucket_type_stddev = 0.0f;
+  float last_global_type_stddev = 0.0f;
+  float last_lambda_hxh = 0.0f;
 };
 
 // V1 online learner: REINFORCE over the simplex policy. Keeps fast / slow /
@@ -55,7 +68,10 @@ class SimplexOnlineLearner {
       float learning_rate = 1.0e-3f,
       uint32_t sgd_interval = 256,
       float ema_alpha = 0.25f,
-      uint64_t ema_interval = 64);
+      uint64_t ema_interval = 64,
+      float gerber_c = 0.5f,
+      uint64_t lambda_hxh_warmup_events = 1024,
+      float lambda_hxh_clip = 1.0f);
 
   void initialize_simplex_weights(SimplexWeights weights);
   void record_simplex_decision(
@@ -66,7 +82,9 @@ class SimplexOnlineLearner {
       float p_chosen_decision,
       std::vector<float> V,
       std::vector<float> E,
-      std::vector<float> simplex_features);
+      std::vector<float> simplex_features,
+      uint32_t n_actual = 0,
+      int32_t write_bucket = 0);
   void on_replay_outcome(const ReplayOutcome& ev);
 
   const std::vector<ActionHistoryEntry>& history(uint32_t slot_id) const;
@@ -91,11 +109,17 @@ class SimplexOnlineLearner {
   void maybe_apply_sgd();
   void maybe_blend_slow();
   void zero_grad();
+  uint32_t gerber_bucket_index(int32_t write_bucket) const;
+  float simplex_logprob_margin(float p_chosen, uint32_t n_actual) const;
+  float lambda_hxh_bound() const;
 
   PerSlotActionHistory history_;
   FastSlowEma fast_slow_;
   SgdStep sgd_;
   float gamma_;
+  float gerber_c_;
+  uint64_t lambda_hxh_warmup_events_;
+  float lambda_hxh_clip_;
   uint32_t sgd_interval_;
   uint32_t actions_since_sgd_ = 0;
   bool weights_initialized_ = false;
@@ -104,6 +128,9 @@ class SimplexOnlineLearner {
   SimplexWeights grad_weights_;
   SimplexLearnerTelemetry telemetry_;
   float last_advantage_ = 0.0f;
+  std::array<std::array<RollingStddev, 256>, 4> margin_stats_by_bucket_type_;
+  std::array<RollingStddev, 256> margin_stats_global_by_type_;
+  std::array<RollingStddev, 4> advantage_stats_by_bucket_;
 };
 
 }  // namespace chaoscontrol::simplex

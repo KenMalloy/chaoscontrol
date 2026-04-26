@@ -1,31 +1,15 @@
-"""Dump a trained ``SimplexPolicy`` to the CSWG v2 binary format.
+"""Dump a trained ``SimplexPolicy`` to the CSWG v3 binary format.
 
-CSWG v2 layout, little-endian. 32-byte header followed by an fp16
-tensor payload in fixed order:
-
-    offset  size  field
-    0       4     magic           = b"CSWG"
-    4       4     version         = 2
-    8       4     n_vertices      = 16  (N)
-    12      4     k_v             = 16
-    16      4     k_e             = 1
-    20      4     k_s             = 4
-    24      4     h               = 32
-    28      2     dtype           = 1 (fp16)
-    30      2     reserved        = 0
-
-    32 ..   payload (fp16 little-endian, in TENSOR_ORDER)
-
-Total payload (V1): W_vp(512) + b_vp(32) + W_lh(32) + b_lh(1)
-+ W_sb(4) + alpha(1) + temperature(1) + bucket_embed(64)
-= 647 fp16 = 1294 bytes. File total = 32 + 1294 = 1326 bytes.
-
-The C++ loader for v2 lives in S2; this module only writes the binary
-and exposes the parser used by S4 round-trip tests.
+CSWG v3 is self-describing: a small fixed header points at a JSON manifest,
+and the manifest names every tensor with shape, dtype, offset, and byte
+count. The C++/runner side no longer needs a duplicated fixed tensor order
+to know whether an artifact contains the base simplex policy only or the
+optional residual HxH branch.
 """
 from __future__ import annotations
 
 import argparse
+import json
 import struct
 from pathlib import Path
 from typing import Any
@@ -35,48 +19,28 @@ import torch
 
 
 MAGIC = b"CSWG"
-VERSION = 2
+VERSION = 3
 DTYPE_FP16 = 1
-# Header: 4-byte magic + 6 uint32 + 2 uint16 = 32 bytes.
-HEADER_STRUCT = struct.Struct("<4sIIIIIIHH")
+DTYPE_NAME = {DTYPE_FP16: "fp16"}
+HEADER_STRUCT = struct.Struct("<4sIIII")
 HEADER_SIZE = HEADER_STRUCT.size
-assert HEADER_SIZE == 32, f"header struct must be 32 bytes, got {HEADER_SIZE}"
 
-# Tensor order is part of the on-wire contract: changing it bumps the
-# CSWG version. Each entry is (state_dict_key, expected_shape_fn).
-# expected_shape_fn takes the dimension dict (see _dim_dict) and returns
-# the tuple shape; this lets the parser validate against the header
-# without hard-coding scalars vs vectors.
-TENSOR_ORDER: tuple[tuple[str, str], ...] = (
-    ("W_vp", "(K_v, H)"),
-    ("b_vp", "(H,)"),
-    ("W_lh", "(H,)"),
-    ("b_lh", "()"),
-    ("W_sb", "(K_s,)"),
-    ("alpha", "()"),
-    ("temperature", "()"),
-    ("bucket_embed", "(N_buckets, BucketEmbedDim)"),
+TENSOR_NAMES: tuple[str, ...] = (
+    "W_vp",
+    "b_vp",
+    "W_lh",
+    "b_lh",
+    "W_sb",
+    "alpha",
+    "temperature",
+    "bucket_embed",
+    "lambda_hxh",
+    "W_q",
+    "W_k",
+    "W_v",
+    "W_o",
+    "W_e",
 )
-# n_buckets and bucket_embed_dim are baked into V1 (8 x 8). They are
-# not in the CSWG v2 header so the loader must agree with this module.
-N_BUCKETS = 8
-BUCKET_EMBED_DIM = 8
-
-
-def _expected_shape(name: str, dims: dict[str, int]) -> tuple[int, ...]:
-    K_v = dims["k_v"]
-    K_s = dims["k_s"]
-    H = dims["h"]
-    return {
-        "W_vp": (K_v, H),
-        "b_vp": (H,),
-        "W_lh": (H,),
-        "b_lh": (),
-        "W_sb": (K_s,),
-        "alpha": (),
-        "temperature": (),
-        "bucket_embed": (N_BUCKETS, BUCKET_EMBED_DIM),
-    }[name]
 
 
 def _state_tensor(state: dict[str, Any], name: str) -> torch.Tensor:
@@ -84,166 +48,161 @@ def _state_tensor(state: dict[str, Any], name: str) -> torch.Tensor:
         raise KeyError(
             f"checkpoint missing tensor {name!r}; have {sorted(state.keys())}"
         )
-    return torch.as_tensor(state[name], dtype=torch.float32, device="cpu").contiguous()
+    return torch.as_tensor(
+        state[name], dtype=torch.float32, device="cpu"
+    ).contiguous()
 
 
-def dump_model_to_cswg_v2(model: Any, output_path: str | Path) -> dict[str, Any]:
-    """Write the simplex policy weights to a CSWG v2 binary.
-
-    ``model`` must be a ``SimplexPolicy`` (or any object exposing
-    ``cfg`` with the architectural dims and a ``state_dict()`` whose
-    keys match ``TENSOR_ORDER``). Returns a manifest dict.
-    """
-    cfg = getattr(model, "cfg", None)
-    if cfg is None:
-        raise ValueError("model must have a .cfg attribute (PretrainConfig)")
-    dims = {
+def _dims_from_cfg(cfg: Any) -> dict[str, int]:
+    return {
         "n_vertices": int(cfg.n_vertices),
         "k_v": int(cfg.k_v),
         "k_e": int(cfg.k_e),
         "k_s": int(cfg.k_s),
         "h": int(cfg.h),
+        "n_heads": int(getattr(cfg, "n_heads", 0)),
+        "n_buckets": int(cfg.n_buckets),
+        "bucket_embed_dim": int(cfg.bucket_embed_dim),
     }
-    if (cfg.n_buckets, cfg.bucket_embed_dim) != (N_BUCKETS, BUCKET_EMBED_DIM):
-        raise ValueError(
-            "CSWG v2 bakes bucket_embed at (8, 8); "
-            f"got ({cfg.n_buckets}, {cfg.bucket_embed_dim})"
-        )
 
+
+def dump_model_to_cswg_v3(model: Any, output_path: str | Path) -> dict[str, Any]:
+    """Write a self-describing fp16 CSWG v3 artifact and return its manifest."""
+    cfg = getattr(model, "cfg", None)
+    if cfg is None:
+        raise ValueError("model must have a .cfg attribute (PretrainConfig)")
+
+    dims = _dims_from_cfg(cfg)
     state = model.state_dict()
+    payload_parts: list[bytes] = []
+    tensor_entries: list[dict[str, Any]] = []
+    payload_offset = 0
+    max_drift = 0.0
+    for name in TENSOR_NAMES:
+        tensor = _state_tensor(state, name)
+        half = tensor.to(torch.float16).contiguous()
+        widened = half.to(torch.float32)
+        if tensor.numel() > 0:
+            max_drift = max(
+                max_drift,
+                float((tensor - widened).abs().max().item()),
+            )
+        raw = half.cpu().numpy().tobytes(order="C")
+        tensor_entries.append({
+            "name": name,
+            "shape": list(tensor.shape),
+            "dtype": "fp16",
+            "offset": payload_offset,
+            "nbytes": len(raw),
+        })
+        payload_parts.append(raw)
+        payload_offset += len(raw)
+
+    manifest = {
+        "magic": MAGIC.decode("ascii"),
+        "version": VERSION,
+        "dtype_code": DTYPE_FP16,
+        "dtype": DTYPE_NAME[DTYPE_FP16],
+        "dims": dims,
+        "tensors": tensor_entries,
+    }
+    manifest_bytes = json.dumps(
+        manifest,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
     out = Path(output_path)
     out.parent.mkdir(parents=True, exist_ok=True)
-    payload_bytes = 0
-    max_drift = 0.0
     with out.open("wb") as f:
         f.write(
             HEADER_STRUCT.pack(
                 MAGIC,
                 VERSION,
-                dims["n_vertices"],
-                dims["k_v"],
-                dims["k_e"],
-                dims["k_s"],
-                dims["h"],
                 DTYPE_FP16,
-                0,           # reserved
+                len(manifest_bytes),
+                0,
             )
         )
-        for name, _ in TENSOR_ORDER:
-            tensor = _state_tensor(state, name)
-            expected = _expected_shape(name, dims)
-            if tuple(tensor.shape) != expected:
-                raise ValueError(
-                    f"tensor {name!r} shape {tuple(tensor.shape)} != expected {expected}"
-                )
-            half = tensor.to(torch.float16).contiguous()
-            widened = half.to(torch.float32)
-            max_drift = max(max_drift, float((tensor - widened).abs().max().item()))
-            buf = half.cpu().numpy().tobytes(order="C")
-            f.write(buf)
-            payload_bytes += len(buf)
+        f.write(manifest_bytes)
+        for part in payload_parts:
+            f.write(part)
 
-    return {
+    manifest.update({
         "path": str(out),
-        "magic": MAGIC.decode("ascii"),
-        "version": VERSION,
-        "n_vertices": dims["n_vertices"],
-        "k_v": dims["k_v"],
-        "k_e": dims["k_e"],
-        "k_s": dims["k_s"],
-        "h": dims["h"],
-        "dtype_code": DTYPE_FP16,
-        "tensor_order": TENSOR_ORDER,
         "header_bytes": HEADER_SIZE,
-        "payload_bytes": payload_bytes,
-        "file_bytes": HEADER_SIZE + payload_bytes,
+        "manifest_bytes": len(manifest_bytes),
+        "payload_bytes": payload_offset,
+        "file_bytes": HEADER_SIZE + len(manifest_bytes) + payload_offset,
         "fp32_vs_fp16_max_abs_drift": max_drift,
-    }
+    })
+    return manifest
 
 
-def load_cswg_v2(path: str | Path) -> dict[str, Any]:
-    """Parse a CSWG v2 binary. Returns ``{"header": dict, "tensors": dict}``.
-
-    Raises ``ValueError`` with a clear message on bad magic or wrong
-    version (in particular, v1 payloads are rejected here -- the C++
-    side has its own check).
-    """
+def load_cswg_v3(path: str | Path) -> dict[str, Any]:
+    """Parse a CSWG v3 binary into ``{"header", "manifest", "tensors"}``."""
     raw = Path(path).read_bytes()
     if len(raw) < HEADER_SIZE:
         raise ValueError(
-            f"CSWG file too small: {len(raw)} bytes, need at least {HEADER_SIZE}"
+            f"CSWG file too small: {len(raw)} bytes, need {HEADER_SIZE}"
         )
-    (
-        magic,
-        version,
-        n_vertices,
-        k_v,
-        k_e,
-        k_s,
-        h,
-        dtype_code,
-        reserved,
-    ) = HEADER_STRUCT.unpack(raw[:HEADER_SIZE])
+    magic, version, dtype_code, manifest_nbytes, reserved = (
+        HEADER_STRUCT.unpack(raw[:HEADER_SIZE])
+    )
     if magic != MAGIC:
-        raise ValueError(
-            f"bad CSWG magic: expected {MAGIC!r}, got {magic!r}"
-        )
+        raise ValueError(f"bad CSWG magic: expected {MAGIC!r}, got {magic!r}")
     if version != VERSION:
         raise ValueError(
-            f"unsupported CSWG version: expected {VERSION}, got {version} "
-            f"(v1 layout is rejected; rebuild with this dumper)"
+            f"unsupported CSWG version: expected {VERSION}, got {version}"
         )
     if dtype_code != DTYPE_FP16:
         raise ValueError(
             f"unsupported dtype code: expected {DTYPE_FP16} (fp16), got {dtype_code}"
         )
-    dims = {
-        "n_vertices": int(n_vertices),
-        "k_v": int(k_v),
-        "k_e": int(k_e),
-        "k_s": int(k_s),
-        "h": int(h),
-        "dtype_code": int(dtype_code),
-        "reserved": int(reserved),
-    }
-
-    cursor = HEADER_SIZE
+    manifest_end = HEADER_SIZE + int(manifest_nbytes)
+    if manifest_end > len(raw):
+        raise ValueError(
+            f"CSWG manifest truncated: header says {manifest_nbytes} bytes, "
+            f"file has {len(raw) - HEADER_SIZE}"
+        )
+    manifest = json.loads(raw[HEADER_SIZE:manifest_end].decode("utf-8"))
+    if int(manifest.get("version", -1)) != VERSION:
+        raise ValueError("CSWG manifest version does not match header")
+    payload = raw[manifest_end:]
     tensors: dict[str, torch.Tensor] = {}
-    for name, _ in TENSOR_ORDER:
-        shape = _expected_shape(name, dims)
-        n_elems = 1
-        for d in shape:
-            n_elems *= d
-        n_bytes = n_elems * 2  # fp16
-        end = cursor + n_bytes
-        if end > len(raw):
+    for entry in manifest["tensors"]:
+        name = str(entry["name"])
+        shape = tuple(int(x) for x in entry["shape"])
+        offset = int(entry["offset"])
+        nbytes = int(entry["nbytes"])
+        end = offset + nbytes
+        if end > len(payload):
             raise ValueError(
                 f"CSWG payload truncated reading {name!r}: "
-                f"need {n_bytes} bytes at offset {cursor}, file ends at {len(raw)}"
+                f"need bytes [{offset}, {end}), payload has {len(payload)}"
             )
-        flat = np.frombuffer(raw[cursor:end], dtype=np.float16).copy()
-        cursor = end
-        if shape == ():
-            tensors[name] = torch.from_numpy(flat.astype(np.float32))[0].clone()
-        else:
-            tensors[name] = (
-                torch.from_numpy(flat.astype(np.float32)).reshape(shape).contiguous()
-            )
+        flat = np.frombuffer(payload[offset:end], dtype=np.float16).copy()
+        tensor = torch.from_numpy(flat.astype(np.float32))
+        tensors[name] = tensor.reshape(shape).contiguous()
 
-    if cursor != len(raw):
+    expected_end = max(
+        (int(e["offset"]) + int(e["nbytes"]) for e in manifest["tensors"]),
+        default=0,
+    )
+    if expected_end != len(payload):
         raise ValueError(
-            f"CSWG file has trailing bytes: cursor={cursor}, file_size={len(raw)}"
+            f"CSWG file has trailing payload bytes: manifest ends at "
+            f"{expected_end}, payload_size={len(payload)}"
         )
 
-    return {"header": dims, "tensors": tensors}
-
-
-# Back-compat shim: the top-level pretrain script imports this name.
-def dump_checkpoint_to_cpp(*args, **kwargs):
-    raise RuntimeError(
-        "dump_checkpoint_to_cpp is the v1 entry point. The simplex "
-        "controller uses CSWG v2; call dump_model_to_cswg_v2 instead."
-    )
+    header = {
+        "magic": magic.decode("ascii"),
+        "version": int(version),
+        "dtype_code": int(dtype_code),
+        "manifest_bytes": int(manifest_nbytes),
+        "reserved": int(reserved),
+    }
+    return {"header": header, "manifest": manifest, "tensors": tensors}
 
 
 def main() -> None:
@@ -263,9 +222,8 @@ def main() -> None:
             "the typical entry point is pretrain_controller.py main()."
         )
 
-    # Local import; importing pretrain_controller here would create a
-    # cycle when pretrain_controller imports the dumper.
     import importlib.util
+
     pretrain_path = Path(__file__).resolve().parent / "pretrain_controller.py"
     spec = importlib.util.spec_from_file_location("pretrain_controller", pretrain_path)
     assert spec is not None and spec.loader is not None
@@ -273,15 +231,21 @@ def main() -> None:
     spec.loader.exec_module(pretrain)
 
     blob = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
-    cfg_dict = blob["config"]
-    cfg = pretrain.PretrainConfig(**cfg_dict)
+    cfg = pretrain.PretrainConfig(**blob["config"])
     model = pretrain.SimplexPolicy(cfg)
     model.load_state_dict(blob["weights"])
-    manifest = dump_model_to_cswg_v2(model, args.output)
+    manifest = dump_model_to_cswg_v3(model, args.output)
+    dims = manifest["dims"]
     print(
         "wrote {path} version={version} dims=(N={n_vertices}, K_v={k_v}, "
-        "K_e={k_e}, K_s={k_s}, H={h}) file_bytes={file_bytes} "
-        "drift={fp32_vs_fp16_max_abs_drift:.6g}".format(**manifest)
+        "K_e={k_e}, K_s={k_s}, H={h}, heads={n_heads}) file_bytes={file_bytes} "
+        "drift={fp32_vs_fp16_max_abs_drift:.6g}".format(
+            path=manifest["path"],
+            version=manifest["version"],
+            file_bytes=manifest["file_bytes"],
+            fp32_vs_fp16_max_abs_drift=manifest["fp32_vs_fp16_max_abs_drift"],
+            **dims,
+        )
     )
 
 
