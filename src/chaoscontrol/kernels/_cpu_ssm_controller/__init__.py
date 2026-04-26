@@ -50,10 +50,19 @@ SpscRingU64x1024 = (
     _C.SpscRingU64x1024 if _C is not None else _missing_extension
 )
 
+# POSIX shm RAII wrapper (Phase A3). Exposes the C++ class binding from
+# cpu_ssm_controller.cpp so tests/test_posix_shm.py can drive it
+# without reaching into `_C`. Phase A4's ShmRing composes this with the
+# A2 SpscRing template.
+PosixShm = (
+    _C.PosixShm if _C is not None else _missing_extension
+)
+
 __all__ = [
     "_C",
     "wire_event_sizes",
     "wire_event_min_slot_alignment",
     "wire_event_constants",
     "SpscRingU64x1024",
+    "PosixShm",
 ]
