@@ -15,6 +15,7 @@ import math
 import os
 import random
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -65,6 +66,7 @@ from chaoscontrol.distributed import (  # noqa: E402
     clip_grad_norm_fused,
     should_stop_now,
 )
+from chaoscontrol.episodic.controller import controller_main  # noqa: E402
 from chaoscontrol.episodic.gpu_slot import (  # noqa: E402
     make_slot_tensor,
     pack_payload,
@@ -1497,20 +1499,28 @@ def _emit_episodic_payloads_gpu(
 
 
 class _EpisodicConsumerState:
-    """Episodic-rank consumer state: cache + heartbeat + controller queue.
+    """Episodic-rank consumer state: cache + heartbeat + controller queues.
 
     Constructed by ``_attach_episodic_consumer`` once per runner init. The
     no-op shape (``cache=None``, ``heartbeat=[0]``,
-    ``controller_query_queue=[]``) is what the train ranks and
-    ``episodic_enabled=False`` runs see so the ``_run_train_step``
-    consumer branch is bit-identical to pre-Pass-C on those code paths.
+    ``controller_query_queue=[]``, ``tagged_replay_queue=[]``) is what
+    the train ranks and ``episodic_enabled=False`` runs see so the
+    ``_run_train_step`` consumer branch is bit-identical to pre-Pass-C
+    on those code paths.
 
     Pass C dropped the ``write_rings`` field — the new path uses
     ``dist.gather`` instead of POSIX shm rings, so there are no rings to
     track on the consumer side. The ``controller_query_queue`` is the
-    in-process Python list that Phase 2's CPU controller will read from;
-    Phase 1 just appends one entry per valid slot per step and exposes
-    the list to the runner for telemetry.
+    in-process Python list that the Phase 2 CPU controller reads from;
+    Phase 1's drain just appends one entry per valid slot per step and
+    exposes the list to the runner for telemetry.
+
+    Phase 2 added ``tagged_replay_queue``: the controller's output. The
+    Y worktree's Phase 3 replay path drains this list each episodic-rank
+    step and runs Dreamworld backward on each tagged slot. The runner
+    spawns a daemon ``threading.Thread`` running
+    ``chaoscontrol.episodic.controller.controller_main`` that owns the
+    write side of this queue.
 
     The heartbeat is a single-element list so increments propagate back
     to the caller (the runner's outer loop reads it for telemetry).
@@ -1521,6 +1531,7 @@ class _EpisodicConsumerState:
         "heartbeat",
         "controller_query_queue",
         "controller_query_enabled",
+        "tagged_replay_queue",
     )
 
     def __init__(
@@ -1529,6 +1540,7 @@ class _EpisodicConsumerState:
         heartbeat: list[int],
         controller_query_queue: list[dict[str, Any]],
         controller_query_enabled: bool = False,
+        tagged_replay_queue: list[dict[str, Any]] | None = None,
     ) -> None:
         self.cache = cache
         self.heartbeat = heartbeat
@@ -1539,6 +1551,15 @@ class _EpisodicConsumerState:
         # controller-bring-up task flips this True at the same time it
         # adds the consumer that drains the queue.
         self.controller_query_enabled = bool(controller_query_enabled)
+        # Phase 2: tagged_replay_queue defaults to a fresh empty list on
+        # every consumer state. The controller thread (Y-side) writes
+        # to it; the replay path (Y-side) reads from it. Keeping the
+        # default ``None → []`` rather than a class-level mutable
+        # default avoids the classic Python gotcha where every consumer
+        # state shares the same list instance.
+        self.tagged_replay_queue = (
+            [] if tagged_replay_queue is None else tagged_replay_queue
+        )
 
 
 def _attach_episodic_consumer(
@@ -1601,6 +1622,138 @@ def _attach_episodic_consumer(
             config.get("controller_query_enabled", False)
         ),
     )
+
+
+class _EpisodicControllerHandle:
+    """Runner-init handle to the episodic controller thread.
+
+    Bundles the daemon thread + its stop event + heartbeat counter so
+    the runner's ``finally`` block can cleanly shut down the loop. None
+    on every code path that doesn't spawn the controller (train ranks,
+    ``episodic_enabled=False``, ``controller_query_enabled=False``,
+    or the episodic rank with no cache).
+
+    Plain ``__slots__`` class for the same importlib-from-spec
+    compatibility reason ``EpisodicGpuEmit`` and ``_ScOptPending`` use.
+    """
+
+    __slots__ = ("thread", "stop_event", "heartbeat")
+
+    def __init__(
+        self,
+        thread: threading.Thread,
+        stop_event: threading.Event,
+        heartbeat: list[int],
+    ) -> None:
+        self.thread = thread
+        self.stop_event = stop_event
+        self.heartbeat = heartbeat
+
+
+def _spawn_episodic_controller(
+    *,
+    consumer: _EpisodicConsumerState,
+    is_episodic_rank: bool,
+    episodic_enabled: bool,
+    config: dict[str, Any],
+) -> _EpisodicControllerHandle | None:
+    """Spawn the Phase 2 controller thread on the episodic rank.
+
+    Phase 2 simplification (see ``chaoscontrol.episodic.controller``
+    module docstring): in-process daemon ``threading.Thread`` rather
+    than ``multiprocessing.spawn`` per Decision 0.7. Pass C's
+    ``controller_query_queue`` carries GPU fp32 residual tensors that
+    cannot be cheaply marshalled across a process boundary; the plan
+    explicitly authorizes the in-process variant. Returns ``None`` on
+    every code path that doesn't spawn (train ranks, episodic disabled,
+    controller_query_enabled=False, episodic rank with no cache).
+
+    The single-flag gate is intentional: ``controller_query_enabled``
+    controls BOTH (a) whether the drain pushes residuals into the
+    queue and (b) whether the controller spawns to consume them. This
+    matches Pass C's design — gating one without the other would either
+    leak GPU residuals (drain on, controller off) or burn CPU on an
+    always-empty queue (drain off, controller on).
+    """
+    if not episodic_enabled:
+        return None
+    if not is_episodic_rank:
+        return None
+    if consumer.cache is None:
+        return None
+    if not consumer.controller_query_enabled:
+        return None
+
+    score_mode = str(
+        config.get("episodic_controller_score_mode", "cosine_utility_weighted")
+    ).strip()
+    k = int(config.get("episodic_controller_topk_k", 16))
+    idle_sleep_s = float(
+        config.get("episodic_controller_idle_sleep_s", 0.005)
+    )
+
+    stop_event = threading.Event()
+    # The controller thread has its OWN heartbeat (exposed via
+    # ``handle.heartbeat``), separate from ``consumer.heartbeat`` (which
+    # the episodic-rank step body increments). The runner's outer loop
+    # can poll BOTH for independent liveness signals: consumer.heartbeat
+    # tracks step-loop drain progress; this one tracks controller-thread
+    # progress. A regression that stalled the controller thread without
+    # stalling the step loop would surface as drift between the two.
+    controller_heartbeat: list[int] = [0]
+    thread = threading.Thread(
+        target=controller_main,
+        kwargs={
+            "controller_query_queue": consumer.controller_query_queue,
+            "tagged_replay_queue": consumer.tagged_replay_queue,
+            "cache": consumer.cache,
+            # No queue_lock: the producer side
+            # (``_drain_episodic_payloads_gpu``) does plain
+            # ``list.append()`` (atomic under the GIL) and the
+            # controller's drain uses ``list.pop(0)`` (also atomic).
+            # See ``run_controller_cycle`` docstring. Locking only the
+            # controller side would not help — the producer doesn't
+            # acquire it, so a hypothetical "snapshot + clear" race
+            # would still happen. Tests pass an explicit lock for
+            # deterministic test-thread synchronization; runtime
+            # relies on GIL atomicity of single-bytecode ops.
+            "queue_lock": None,
+            "stop_event": stop_event,
+            "k": k,
+            "score_mode": score_mode,
+            "cycle_idle_sleep_s": idle_sleep_s,
+            "heartbeat": controller_heartbeat,
+        },
+        daemon=True,
+        name="episodic_controller",
+    )
+    thread.start()
+    return _EpisodicControllerHandle(
+        thread=thread,
+        stop_event=stop_event,
+        heartbeat=controller_heartbeat,
+    )
+
+
+def _shutdown_episodic_controller(
+    handle: _EpisodicControllerHandle | None,
+    *,
+    join_timeout_s: float = 2.0,
+) -> None:
+    """Signal the controller thread to stop and join it.
+
+    Called from the runner's ``finally`` block. None handle is a no-op
+    so train ranks and ``episodic_enabled=False`` runs pay nothing. If
+    the thread doesn't exit within ``join_timeout_s`` seconds we leave
+    it running as a daemon — the process exit will reap it. Logging the
+    timeout would require the runner's logger; for now the silent
+    drop-on-timeout is acceptable for Phase 2 smoke (Phase 4 hardening
+    can wire a heartbeat assertion).
+    """
+    if handle is None:
+        return
+    handle.stop_event.set()
+    handle.thread.join(timeout=join_timeout_s)
 
 
 def _drain_episodic_payloads_gpu(
@@ -2482,6 +2635,10 @@ def train_fast_for_budget(
     episodic_capacity: int = 4096,
     episodic_grace_steps: int = 1000,
     episodic_utility_ema_decay: float = 0.99,
+    controller_query_enabled: bool = False,
+    episodic_controller_score_mode: str = "cosine_utility_weighted",
+    episodic_controller_topk_k: int = 16,
+    episodic_controller_idle_sleep_s: float = 0.005,
 ) -> dict[str, Any]:
     rank_ = int(rank)
     world_size_ = int(world_size)
@@ -2631,6 +2788,7 @@ def train_fast_for_budget(
         ),
         "episodic_grace_steps": int(episodic_grace_steps),
         "episodic_utility_ema_decay": float(episodic_utility_ema_decay),
+        "controller_query_enabled": bool(controller_query_enabled),
     }
     episodic_consumer = _attach_episodic_consumer(
         episodic_enabled=bool(episodic_enabled),
@@ -2640,6 +2798,22 @@ def train_fast_for_budget(
         model_dim=_model_dim_for_episodic or 1,
         all_group=all_group,
     )
+    # Initialize the controller handle to None up front so the outer
+    # ``finally`` block sees a defined name even if a pre-spawn raise
+    # exits the function. The actual spawn happens just before the
+    # ``try:`` block at the start of the train loop, AFTER all init
+    # guards have fired — that way a config-validation raise can't
+    # leak a running daemon thread.
+    episodic_controller_handle: _EpisodicControllerHandle | None = None
+    _episodic_controller_config = {
+        "episodic_controller_score_mode": str(
+            episodic_controller_score_mode
+        ),
+        "episodic_controller_topk_k": int(episodic_controller_topk_k),
+        "episodic_controller_idle_sleep_s": float(
+            episodic_controller_idle_sleep_s
+        ),
+    }
     if (
         scopt_active
         and int(scopt_baseline_buckets) > 0
@@ -2970,6 +3144,20 @@ def train_fast_for_budget(
             device=device,
             config=emit_config,
         )
+
+    # Phase 2: spawn the CPU controller thread on the episodic rank
+    # when controller_query_enabled=True. Returns None on every other
+    # code path (train ranks, episodic disabled, controller flag off).
+    # The spawn lands here — AFTER all init guards have fired — so a
+    # config-validation raise above can't leak a running daemon thread.
+    # The handle is consumed by ``_shutdown_episodic_controller`` in
+    # the outer ``finally`` block.
+    episodic_controller_handle = _spawn_episodic_controller(
+        consumer=episodic_consumer,
+        is_episodic_rank=bool(is_episodic_rank),
+        episodic_enabled=bool(episodic_enabled),
+        config=_episodic_controller_config,
+    )
 
     try:
         while True:
@@ -3422,6 +3610,11 @@ def train_fast_for_budget(
             prefetcher.close()
         if async_grad_reducer is not None:
             async_grad_reducer.close()
+        # Phase 2: stop the episodic controller thread. None handle
+        # (train ranks, episodic disabled, controller flag off) is a
+        # no-op. Bounded join so a stuck loop can't block the runner's
+        # exit indefinitely.
+        _shutdown_episodic_controller(episodic_controller_handle)
         # Pass C: no shm to clean up. The GPU slot tensors are plain
         # ``torch.Tensor`` objects; their lifetime ends with the
         # ``EpisodicGpuEmit`` handle going out of scope. The
@@ -3976,6 +4169,21 @@ def run_condition(
         episodic_grace_steps=int(config.get("episodic_grace_steps", 1000)),
         episodic_utility_ema_decay=float(
             config.get("episodic_utility_ema_decay", 0.99)
+        ),
+        controller_query_enabled=bool(
+            config.get("controller_query_enabled", False)
+        ),
+        episodic_controller_score_mode=str(
+            config.get(
+                "episodic_controller_score_mode",
+                "cosine_utility_weighted",
+            )
+        ),
+        episodic_controller_topk_k=int(
+            config.get("episodic_controller_topk_k", 16)
+        ),
+        episodic_controller_idle_sleep_s=float(
+            config.get("episodic_controller_idle_sleep_s", 0.005)
         ),
     )
 
