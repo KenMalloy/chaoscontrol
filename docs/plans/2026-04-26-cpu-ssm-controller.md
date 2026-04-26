@@ -29,16 +29,20 @@ The wire that carries WRITE_EVENT, QUERY_EVENT, REPLAY_OUTCOME records from each
 - Create: `src/chaoscontrol/kernels/_cpu_ssm_controller/src/wire_events.h`
 - Test: `tests/cpp/test_wire_events.cpp` (build via `setup_ext.py` test target — add target if not present)
 
+**Sizes (corrected from initial draft — 552/528 were unreachable arithmetic with K=256 + the field set; corrected target sizes are derived from the body + minimal 8-byte alignment padding):**
+- WriteEvent: 568 bytes (body 564, _pad1[4] aligns to 8)
+- QueryEvent: 544 bytes (body 544, naturally 8-aligned, no _pad1 needed)
+- ReplayOutcome: 96 bytes (body 94, _pad1[2] aligns to 8)
+
 **Step 1: Write the failing test**
 
 ```cpp
 // tests/cpp/test_wire_events.cpp
 #include "wire_events.h"
-#include <cassert>
 
 int main() {
-    static_assert(sizeof(WriteEvent) == 552, "WriteEvent must be 552 bytes");
-    static_assert(sizeof(QueryEvent) == 528, "QueryEvent must be 528 bytes");
+    static_assert(sizeof(WriteEvent) == 568, "WriteEvent must be 568 bytes");
+    static_assert(sizeof(QueryEvent) == 544, "QueryEvent must be 544 bytes");
     static_assert(sizeof(ReplayOutcome) == 96, "ReplayOutcome must be 96 bytes");
     static_assert(alignof(WriteEvent) == 8, "WriteEvent must be 8-byte aligned");
     return 0;
@@ -74,7 +78,7 @@ struct WriteEvent {
     uint32_t value_anchor_id;
     float    pressure_at_write;
     float    pre_write_ce;
-    uint8_t  _pad1[10];             // pad to 552
+    uint8_t  _pad1[4];              // align body 564 → 568 (8-byte boundary)
 };
 
 struct QueryEvent {
@@ -87,7 +91,7 @@ struct QueryEvent {
     uint16_t query_rep[KEY_REP_DIM_DEFAULT];
     float    pressure;
     float    pre_query_ce;
-    uint8_t  _pad1[2];              // pad to 528
+    // body 544 — already 8-aligned, no _pad1 required
 };
 
 struct ReplayOutcome {
@@ -112,13 +116,13 @@ struct ReplayOutcome {
     float    grad_cos_rare;         // NaN until Phase 4
     float    grad_cos_total;        // NaN until Phase 4
     uint16_t flags;
-    uint8_t  _pad1[6];              // pad to 96
+    uint8_t  _pad1[2];              // align body 94 → 96 (8-byte boundary)
 };
 
 #pragma pack(pop)
 
-static_assert(sizeof(WriteEvent) == 552);
-static_assert(sizeof(QueryEvent) == 528);
+static_assert(sizeof(WriteEvent) == 568);
+static_assert(sizeof(QueryEvent) == 544);
 static_assert(sizeof(ReplayOutcome) == 96);
 ```
 
