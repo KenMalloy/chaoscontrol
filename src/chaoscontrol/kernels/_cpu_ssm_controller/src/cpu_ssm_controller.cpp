@@ -617,6 +617,53 @@ using ShmRingWriteEventT = ShmRing<WriteEvent, 16384>;
 using ShmRingQueryEventT = ShmRing<QueryEvent, 16384>;
 using ShmRingReplayOutcomeT = ShmRing<ReplayOutcome, 8192>;
 
+bool write_event_cuda_pack_available() {
+#ifdef CHAOSCONTROL_CPU_SSM_CUDA_WRITE_EVENT_KERNEL
+  return true;
+#else
+  return false;
+#endif
+}
+
+#ifdef CHAOSCONTROL_CPU_SSM_CUDA_WRITE_EVENT_KERNEL
+void pack_write_events_cuda_(
+    at::Tensor out,
+    const at::Tensor& input_ids,
+    const at::Tensor& target_ids,
+    const at::Tensor& key_rep,
+    const at::Tensor& pressure,
+    const at::Tensor& per_token_ce,
+    const at::Tensor& positions,
+    const at::Tensor& candidate_base,
+    int64_t gpu_step,
+    int64_t source_rank,
+    int64_t write_bucket,
+    int64_t fingerprint_window,
+    int64_t span_length,
+    int64_t key_rep_dim);
+#else
+void pack_write_events_cuda_(
+    at::Tensor,
+    const at::Tensor&,
+    const at::Tensor&,
+    const at::Tensor&,
+    const at::Tensor&,
+    const at::Tensor&,
+    const at::Tensor&,
+    const at::Tensor&,
+    int64_t,
+    int64_t,
+    int64_t,
+    int64_t,
+    int64_t,
+    int64_t) {
+  TORCH_CHECK(
+      false,
+      "pack_write_events_cuda_ requires rebuilding _cpu_ssm_controller with "
+      "CHAOSCONTROL_CPU_SSM_CUDA_WRITE_EVENT=1");
+}
+#endif
+
 namespace {
 
 // Strict-key dict validator. Raises Python KeyError on extra or missing
@@ -814,6 +861,51 @@ pybind11::dict write_event_to_dict(const WriteEvent& ev) {
   d["pressure_at_write"] = pybind11::float_(ev.pressure_at_write);
   d["pre_write_ce"]      = pybind11::float_(ev.pre_write_ce);
   return d;
+}
+
+pybind11::dict push_write_event_tensor_batch(
+    ShmRingWriteEventT& ring,
+    const at::Tensor& events) {
+  TORCH_CHECK(!events.is_cuda(), "WriteEvent batch tensor must be on CPU");
+  TORCH_CHECK(
+      events.scalar_type() == at::ScalarType::Byte,
+      "WriteEvent batch tensor must have dtype=torch.uint8");
+  TORCH_CHECK(
+      events.dim() == 2,
+      "WriteEvent batch tensor must be 2-D [N, sizeof(WriteEvent)]");
+  TORCH_CHECK(
+      events.size(1) == static_cast<int64_t>(sizeof(WriteEvent)),
+      "WriteEvent batch width must equal sizeof(WriteEvent)=",
+      sizeof(WriteEvent),
+      ", got ",
+      events.size(1));
+  at::Tensor contig = events.contiguous();
+  const auto* base = contig.data_ptr<uint8_t>();
+  const int64_t n = contig.size(0);
+  int64_t pushed = 0;
+  int64_t skipped = 0;
+  int64_t dropped = 0;
+  {
+    pybind11::gil_scoped_release release;
+    for (int64_t i = 0; i < n; ++i) {
+      const auto* ev = reinterpret_cast<const WriteEvent*>(
+          base + static_cast<std::size_t>(i) * sizeof(WriteEvent));
+      if (ev->event_type != 1) {
+        ++skipped;
+        continue;
+      }
+      if (ring.push(*ev)) {
+        ++pushed;
+      } else {
+        ++dropped;
+      }
+    }
+  }
+  pybind11::dict out;
+  out["pushed"] = pybind11::int_(pushed);
+  out["skipped"] = pybind11::int_(skipped);
+  out["dropped"] = pybind11::int_(dropped);
+  return out;
 }
 
 // --- QueryEvent dict <-> struct ---
@@ -1138,6 +1230,26 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "Single int — minimum ShmRing slot alignment shared by all three wire events");
   m.def("wire_event_constants", &wire_event_constants,
         "Compile-time constants driving wire-event array dimensions");
+  m.def("write_event_cuda_pack_available",
+        &write_event_cuda_pack_available,
+        "Whether this build includes the CUDA WriteEvent pack kernel.");
+  m.def("pack_write_events_cuda_",
+        &pack_write_events_cuda_,
+        pybind11::arg("out"),
+        pybind11::arg("input_ids"),
+        pybind11::arg("target_ids"),
+        pybind11::arg("key_rep"),
+        pybind11::arg("pressure"),
+        pybind11::arg("per_token_ce"),
+        pybind11::arg("positions"),
+        pybind11::arg("candidate_base"),
+        pybind11::arg("gpu_step"),
+        pybind11::arg("source_rank"),
+        pybind11::arg("write_bucket"),
+        pybind11::arg("fingerprint_window"),
+        pybind11::arg("span_length"),
+        pybind11::arg("key_rep_dim"),
+        "CUDA-pack WriteEvent structs into an existing uint8 [M, sizeof(WriteEvent)] tensor.");
   m.def("controller_main",
         [](const std::vector<std::string>& write_ring_names,
            const std::string& query_ring_name,
@@ -1417,6 +1529,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
            pybind11::arg("event"),
            "Push a WriteEvent dict; returns False if the ring is full. "
            "Raises KeyError on missing/extra keys.")
+      .def("push_batch_tensor",
+           &push_write_event_tensor_batch,
+           pybind11::arg("events"),
+           "Push a CPU uint8 [N, sizeof(WriteEvent)] tensor of raw WriteEvent "
+           "structs; skips rows with event_type != 1 and returns counts.")
       .def("pop",
            [](ShmRingWriteEventT& self) -> pybind11::object {
              auto opt = self.pop();

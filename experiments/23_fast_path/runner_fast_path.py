@@ -19,6 +19,7 @@ import sys
 import threading
 import time
 import traceback
+from collections import deque
 from pathlib import Path
 from typing import Any
 
@@ -83,6 +84,7 @@ from chaoscontrol.kernels import _cpu_ssm_controller as _ext  # noqa: E402
 from chaoscontrol.optim.episodic_cache import EpisodicCache  # noqa: E402
 from chaoscontrol.optim.episodic_writer import (  # noqa: E402
     _next_admission_trace_seq,
+    _reserve_admission_trace_seq,
     build_write_event_dict,
     fingerprint_tokens,
     select_top_p_positions,
@@ -1381,6 +1383,114 @@ def _push_event_ring(
     return pushed
 
 
+class _CompatDeque(deque):
+    """Deque with list-compatible equality for older unit-test assertions."""
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, list):
+            return list(self) == other
+        return super().__eq__(other)
+
+
+class _CudaWriteEventPublisher:
+    """Publish completed CUDA-staged WriteEvent batches into a shm ring.
+
+    The train rank owns CUDA production; this helper owns the CPU side of the
+    stream. The hot path only calls ``submit`` after recording a CUDA event.
+    The background thread polls event completion and calls the C++ raw-tensor
+    ring API, so Python never materializes per-event dict/list payloads.
+    """
+
+    def __init__(
+        self,
+        *,
+        ring: Any,
+        k_max: int,
+        event_size: int,
+        depth: int,
+        device: torch.device,
+    ) -> None:
+        self.ring = ring
+        self.k_max = int(k_max)
+        self.event_size = int(event_size)
+        self.depth = max(1, int(depth))
+        self.gpu_slots = [
+            torch.empty(
+                (self.k_max, self.event_size),
+                device=device,
+                dtype=torch.uint8,
+            )
+            for _ in range(self.depth)
+        ]
+        self.cpu_slots = [
+            torch.empty(
+                (self.k_max, self.event_size),
+                device="cpu",
+                dtype=torch.uint8,
+                pin_memory=True,
+            )
+            for _ in range(self.depth)
+        ]
+        self.events = [torch.cuda.Event(blocking=False) for _ in range(self.depth)]
+        self.free_slots: deque[int] = deque(range(self.depth))
+        self.pending: deque[int] = deque()
+        self.lock = threading.Lock()
+        self.stop_event = threading.Event()
+        self.submitted_batches = 0
+        self.pushed_events = 0
+        self.skipped_events = 0
+        self.dropped_events = 0
+        self.dropped_batches = 0
+        self.thread = threading.Thread(
+            target=self._run,
+            name="cc-write-event-publisher",
+            daemon=True,
+        )
+        self.thread.start()
+
+    def acquire_slot(self) -> int | None:
+        with self.lock:
+            if not self.free_slots:
+                self.dropped_batches += 1
+                return None
+            return self.free_slots.popleft()
+
+    def gpu_slot(self, slot: int) -> torch.Tensor:
+        return self.gpu_slots[int(slot)]
+
+    def submit(self, slot: int) -> None:
+        slot_i = int(slot)
+        self.cpu_slots[slot_i].copy_(self.gpu_slots[slot_i], non_blocking=True)
+        self.events[slot_i].record(torch.cuda.current_stream())
+        with self.lock:
+            self.pending.append(slot_i)
+            self.submitted_batches += 1
+
+    def close(self, timeout: float = 2.0) -> None:
+        self.stop_event.set()
+        self.thread.join(timeout=timeout)
+
+    def _run(self) -> None:
+        while not self.stop_event.is_set() or self.pending:
+            slot: int | None = None
+            with self.lock:
+                if self.pending:
+                    candidate = self.pending[0]
+                    if bool(self.events[candidate].query()):
+                        slot = self.pending.popleft()
+            if slot is None:
+                time.sleep(0.0001)
+                continue
+            try:
+                stats = self.ring.push_batch_tensor(self.cpu_slots[slot])
+                self.pushed_events += int(stats.get("pushed", 0))
+                self.skipped_events += int(stats.get("skipped", 0))
+                self.dropped_events += int(stats.get("dropped", 0))
+            finally:
+                with self.lock:
+                    self.free_slots.append(slot)
+
+
 def _u8_wire(value: int, *, sentinel: int = 255) -> int:
     v = int(value)
     return v if 0 <= v <= 255 else int(sentinel)
@@ -1392,6 +1502,23 @@ def _u64_wire(value: int, *, sentinel: int = (1 << 64) - 1) -> int:
 
 
 def _cleanup_episodic_event_rings(owner: Any) -> None:
+    publisher = getattr(owner, "cuda_write_event_publisher", None)
+    if publisher is not None:
+        try:
+            publisher.close()
+        except Exception:
+            pass
+        try:
+            owner.write_ring_pushed = int(publisher.pushed_events)
+            owner.write_ring_skipped = int(publisher.skipped_events)
+            owner.write_ring_drops = int(publisher.dropped_events)
+            owner.write_ring_drop_batches = int(publisher.dropped_batches)
+        except Exception:
+            pass
+        try:
+            owner.cuda_write_event_publisher = None
+        except Exception:
+            pass
     write_ring_names = getattr(owner, "write_ring_names", None)
     if write_ring_names:
         for name in write_ring_names:
@@ -1583,7 +1710,15 @@ class EpisodicGpuEmit:
         "write_ring",
         "write_ring_name",
         "write_ring_drops",
+        "write_ring_pushed",
+        "write_ring_skipped",
+        "write_ring_drop_batches",
         "async_write_rings_enabled",
+        "cuda_write_event_stream_enabled",
+        "cuda_write_event_publisher",
+        "cuda_write_event_positions",
+        "cuda_write_event_candidate_base",
+        "cuda_write_event_empty_pressure",
         "event_ring_namespace",
         "controller_action_space",
         "controller_action_trace_log",
@@ -1601,6 +1736,11 @@ class EpisodicGpuEmit:
         write_ring: Any | None = None,
         write_ring_name: str | None = None,
         async_write_rings_enabled: bool = False,
+        cuda_write_event_stream_enabled: bool = False,
+        cuda_write_event_publisher: _CudaWriteEventPublisher | None = None,
+        cuda_write_event_positions: torch.Tensor | None = None,
+        cuda_write_event_candidate_base: torch.Tensor | None = None,
+        cuda_write_event_empty_pressure: torch.Tensor | None = None,
         event_ring_namespace: str | None = None,
         controller_action_space: ConstrainedActionSpace | None = None,
         controller_action_trace_log: Any | None = None,
@@ -1614,7 +1754,15 @@ class EpisodicGpuEmit:
         self.write_ring = write_ring
         self.write_ring_name = write_ring_name
         self.write_ring_drops = 0
+        self.write_ring_pushed = 0
+        self.write_ring_skipped = 0
+        self.write_ring_drop_batches = 0
         self.async_write_rings_enabled = bool(async_write_rings_enabled)
+        self.cuda_write_event_stream_enabled = bool(cuda_write_event_stream_enabled)
+        self.cuda_write_event_publisher = cuda_write_event_publisher
+        self.cuda_write_event_positions = cuda_write_event_positions
+        self.cuda_write_event_candidate_base = cuda_write_event_candidate_base
+        self.cuda_write_event_empty_pressure = cuda_write_event_empty_pressure
         self.event_ring_namespace = event_ring_namespace
         self.controller_action_space = controller_action_space
         self.controller_action_trace_log = controller_action_trace_log
@@ -1682,6 +1830,11 @@ def _create_episodic_emit(
     # and wire-event logging, but ring creation no longer depends on it.
     write_ring = None
     write_ring_name = None
+    cuda_write_event_publisher = None
+    cuda_write_event_positions = None
+    cuda_write_event_candidate_base = None
+    cuda_write_event_empty_pressure = None
+    cuda_write_event_stream_enabled = False
     controller_action_trace_log = None
     controller_action_space = None
     if (
@@ -1694,6 +1847,41 @@ def _create_episodic_emit(
             namespace=ring_namespace,
         )
         write_ring = _create_event_ring(_ext.ShmRingWriteEvent, write_ring_name)
+        try:
+            cuda_pack_available = bool(_ext.write_event_cuda_pack_available())
+        except Exception:
+            cuda_pack_available = False
+        cuda_write_event_stream_enabled = (
+            bool(config.get("episodic_cuda_write_event_stream_enabled", True))
+            and bool(async_write_rings_enabled)
+            and device.type == "cuda"
+            and cuda_pack_available
+        )
+        if cuda_write_event_stream_enabled:
+            event_size = int(_ext.wire_event_sizes()["WriteEvent"])
+            depth = int(config.get("episodic_cuda_write_event_stage_depth", 4))
+            cuda_write_event_publisher = _CudaWriteEventPublisher(
+                ring=write_ring,
+                k_max=k_max,
+                event_size=event_size,
+                depth=depth,
+                device=device,
+            )
+            cuda_write_event_positions = torch.empty(
+                (k_max, 2),
+                device=device,
+                dtype=torch.long,
+            )
+            cuda_write_event_candidate_base = torch.empty(
+                (1,),
+                device=device,
+                dtype=torch.long,
+            )
+            cuda_write_event_empty_pressure = torch.empty(
+                (0,),
+                device=device,
+                dtype=torch.float32,
+            )
     if (
         int(rank) != int(world_size) - 1
         and bool(config.get("episodic_controller_action_space_enabled", False))
@@ -1717,6 +1905,11 @@ def _create_episodic_emit(
         write_ring=write_ring,
         write_ring_name=write_ring_name,
         async_write_rings_enabled=async_write_rings_enabled,
+        cuda_write_event_stream_enabled=cuda_write_event_stream_enabled,
+        cuda_write_event_publisher=cuda_write_event_publisher,
+        cuda_write_event_positions=cuda_write_event_positions,
+        cuda_write_event_candidate_base=cuda_write_event_candidate_base,
+        cuda_write_event_empty_pressure=cuda_write_event_empty_pressure,
         event_ring_namespace=ring_namespace,
         controller_action_space=controller_action_space,
         controller_action_trace_log=controller_action_trace_log,
@@ -1749,17 +1942,37 @@ def _right_pad_per_token_signal(signal: torch.Tensor, T: int) -> torch.Tensor:
     return torch.cat([signal, signal.new_zeros((B, 1))], dim=1)
 
 
+def _valid_write_signal_window(
+    write_signal: torch.Tensor,
+    *,
+    fingerprint_window: int,
+    span_length: int,
+) -> tuple[torch.Tensor, int]:
+    """Return the boundary-valid column window and its original offset."""
+    T = int(write_signal.size(1))
+    W = max(0, int(fingerprint_window))
+    S = max(1, int(span_length))
+    first = min(W, T)
+    stop = max(first, min(T, T - S + 1))
+    if first == 0 and stop == T:
+        return write_signal, 0
+    return write_signal[:, first:stop], first
+
+
 def _select_write_positions_with_action_space(
     *,
     action_space: ConstrainedActionSpace | None,
     write_signal: torch.Tensor,
-    pressure_full: torch.Tensor,
+    pressure_full: torch.Tensor | None,
     ce_full: torch.Tensor,
     top_p: float,
     k_max: int,
     current_step: int,
     write_bucket: int,
 ) -> torch.Tensor:
+    n = int(write_signal.numel())
+    if n <= 0:
+        return torch.empty((0, 2), device=write_signal.device, dtype=torch.long)
     heuristic_positions = select_top_p_positions(write_signal, top_p=top_p)
     if action_space is None:
         return heuristic_positions
@@ -1768,19 +1981,15 @@ def _select_write_positions_with_action_space(
     if not write_head_active and budget_readiness <= 0.0:
         return heuristic_positions
 
-    flat_signal = write_signal.detach().to(dtype=torch.float32).flatten().cpu()
-    n = int(flat_signal.numel())
-    if n <= 0:
-        return torch.empty((0, 2), device=write_signal.device, dtype=torch.long)
     fallback_budget = min(int(k_max), int(heuristic_positions.size(0)))
     reward_context = {
         "bucket": float(write_bucket),
         "cache_fill": 0.0,
-        "pressure": float(
+        "pressure": 1.0 if pressure_full is None else float(
             pressure_full.detach().to(dtype=torch.float32).mean().item()
         ),
         "ce": float(ce_full.detach().to(dtype=torch.float32).mean().item()),
-        "score": float(flat_signal.mean().item()),
+        "score": float(write_signal.detach().to(dtype=torch.float32).mean().item()),
     }
     requested_budget = fallback_budget
     if budget_readiness > 0.0:
@@ -1793,24 +2002,46 @@ def _select_write_positions_with_action_space(
     requested_budget = max(0, min(int(k_max), n, requested_budget))
     if requested_budget <= 0:
         return torch.empty((0, 2), device=write_signal.device, dtype=torch.long)
+    if not write_head_active:
+        flat = write_signal.reshape(-1)
+        _, selected_flat = torch.topk(flat, k=requested_budget, largest=True)
+        T = int(write_signal.shape[1])
+        rows = (selected_flat // T).to(dtype=torch.int64)
+        cols = (selected_flat % T).to(dtype=torch.int64)
+        return torch.stack([rows, cols], dim=1)
 
-    heuristic_scores = [float(x) for x in flat_signal.tolist()]
-    if write_head_active:
-        effective_scores = action_space.effective_scores(
-            heuristic_scores=heuristic_scores,
-            learned_scores=None,
-            gpu_step=int(current_step),
-            head_name="write_admission",
-            reward_context=reward_context,
-        )
-    else:
-        effective_scores = heuristic_scores
+    # Learned write admission must not pull the full B*T grid to CPU. It gets
+    # a bounded heuristic candidate pool: enough slots for reranking/exploration
+    # inside a fixed top-M stream, never an unbounded per-token Python list.
+    pool_k = min(n, max(int(k_max), requested_budget * 4, 16))
+    _, pool_flat_idx = torch.topk(
+        write_signal.reshape(-1),
+        k=pool_k,
+        largest=True,
+    )
+    pool_scores = write_signal.reshape(-1).gather(0, pool_flat_idx)
+    heuristic_scores = [
+        float(x) for x in pool_scores.detach().to(dtype=torch.float32).cpu().tolist()
+    ]
+    effective_scores = action_space.effective_scores(
+        heuristic_scores=heuristic_scores,
+        learned_scores=None,
+        gpu_step=int(current_step),
+        head_name="write_admission",
+        reward_context=reward_context,
+    )
     selected = sorted(
-        range(n),
+        range(len(effective_scores)),
         key=lambda idx: (-float(effective_scores[idx]), idx),
     )[:requested_budget]
     T = int(write_signal.shape[1])
-    rows = [[idx // T, idx % T] for idx in selected]
+    selected_flat = pool_flat_idx[
+        torch.tensor(selected, device=pool_flat_idx.device, dtype=torch.long)
+    ]
+    rows = [
+        [int(idx) // T, int(idx) % T]
+        for idx in selected_flat.detach().cpu().tolist()
+    ]
     return torch.tensor(rows, device=write_signal.device, dtype=torch.long)
 
 
@@ -1843,12 +2074,88 @@ def _protection_score_for_write(
     ))
 
 
+def _emit_write_events_cuda_stream(
+    *,
+    emit: EpisodicGpuEmit,
+    inputs: torch.Tensor,
+    targets: torch.Tensor,
+    pressure_full: torch.Tensor | None,
+    ce_full: torch.Tensor,
+    hidden: torch.Tensor,
+    positions: torch.Tensor,
+    rank: int,
+    current_step: int,
+    write_bucket: int,
+) -> bool:
+    """CUDA-resident WRITE_EVENT production into pinned CPU staging.
+
+    Returns True when the CUDA stream path accepted the batch (or deliberately
+    dropped it because all staging slots were busy). Returns False when callers
+    should use the legacy Python pack path.
+    """
+    publisher = getattr(emit, "cuda_write_event_publisher", None)
+    pos_stage = getattr(emit, "cuda_write_event_positions", None)
+    base_stage = getattr(emit, "cuda_write_event_candidate_base", None)
+    empty_pressure = getattr(emit, "cuda_write_event_empty_pressure", None)
+    if (
+        publisher is None
+        or pos_stage is None
+        or base_stage is None
+        or empty_pressure is None
+        or emit.write_ring is None
+        or not inputs.is_cuda
+        or not targets.is_cuda
+        or not hidden.is_cuda
+        or not ce_full.is_cuda
+    ):
+        return False
+    slot = publisher.acquire_slot()
+    if slot is None:
+        # Publish-or-drop: a saturated staging ring must not stall the trunk.
+        emit.write_ring_drop_batches += 1
+        emit.write_ring_drops += int(emit.k_max)
+        return True
+    K = min(int(positions.size(0)), int(emit.k_max))
+    pos_stage.fill_(-1)
+    if K > 0:
+        pos_stage[:K].copy_(positions[:K], non_blocking=True)
+    base = _reserve_admission_trace_seq(int(K))
+    base_stage.fill_(int(base))
+    pressure_arg = (
+        pressure_full.contiguous()
+        if pressure_full is not None
+        else empty_pressure
+    )
+    _ext.pack_write_events_cuda_(
+        publisher.gpu_slot(slot),
+        inputs.contiguous(),
+        targets.contiguous(),
+        hidden.contiguous(),
+        pressure_arg,
+        ce_full.contiguous(),
+        pos_stage,
+        base_stage,
+        int(current_step),
+        int(rank),
+        int(write_bucket),
+        int(emit.fingerprint_window),
+        int(emit.span_length),
+        int(emit.key_rep_dim),
+    )
+    publisher.submit(slot)
+    emit.write_ring_pushed = int(publisher.pushed_events)
+    emit.write_ring_skipped = int(publisher.skipped_events)
+    emit.write_ring_drops = int(publisher.dropped_events)
+    emit.write_ring_drop_batches = int(publisher.dropped_batches)
+    return True
+
+
 def _emit_episodic_payloads_gpu(
     *,
     emit: EpisodicGpuEmit,
     inputs: torch.Tensor,
     targets: torch.Tensor,
-    pressure: torch.Tensor,
+    pressure: torch.Tensor | None,
     per_token_ce: torch.Tensor,
     hidden: torch.Tensor,
     rank: int,
@@ -1868,7 +2175,7 @@ def _emit_episodic_payloads_gpu(
     collective.
     """
     T = int(inputs.size(1))
-    pressure_full = _right_pad_per_token_signal(pressure, T)
+    pressure_full = None if pressure is None else _right_pad_per_token_signal(pressure, T)
     ce_full = _right_pad_per_token_signal(per_token_ce, T)
     # Default top_p = ``1 / (B * T)`` — one position per batch step in
     # expectation. ``emit.top_p`` is NaN when the config didn't pin a
@@ -1880,9 +2187,17 @@ def _emit_episodic_payloads_gpu(
         top_p = 1.0 / float(max(numel, 1))
     else:
         top_p = float(emit.top_p)
-    write_signal = (
-        pressure_full.detach().to(dtype=torch.float32)
-        * ce_full.detach().to(dtype=torch.float32)
+    if pressure_full is None:
+        write_signal_full = ce_full.detach().to(dtype=torch.float32)
+    else:
+        write_signal_full = (
+            pressure_full.detach().to(dtype=torch.float32)
+            * ce_full.detach().to(dtype=torch.float32)
+        )
+    write_signal, col_offset = _valid_write_signal_window(
+        write_signal_full,
+        fingerprint_window=int(emit.fingerprint_window),
+        span_length=int(emit.span_length),
     )
     positions = _select_write_positions_with_action_space(
         action_space=getattr(emit, "controller_action_space", None),
@@ -1894,6 +2209,9 @@ def _emit_episodic_payloads_gpu(
         current_step=int(current_step),
         write_bucket=int(write_bucket),
     )
+    if col_offset and int(positions.numel()) > 0:
+        positions = positions.clone()
+        positions[:, 1] += int(col_offset)
     K = int(positions.size(0))
     if K > emit.k_max:
         # Truncate silently — design doc says K > K_max is "config want
@@ -1901,6 +2219,20 @@ def _emit_episodic_payloads_gpu(
         # where top_p would explode K beyond the configured cap.
         positions = positions[: emit.k_max]
         K = emit.k_max
+    if _emit_write_events_cuda_stream(
+        emit=emit,
+        inputs=inputs,
+        targets=targets,
+        pressure_full=pressure_full,
+        ce_full=ce_full,
+        hidden=hidden.detach(),
+        positions=positions,
+        rank=int(rank),
+        current_step=int(current_step),
+        write_bucket=int(write_bucket),
+    ):
+        _ = (world_size, all_group)
+        return
     # Zero out the slot tensor so untouched rows have valid_mask=0 (the
     # drain's filter relies on this).
     emit.slot_tensor.zero_()
@@ -1940,7 +2272,7 @@ def _emit_episodic_payloads_gpu(
         # the slot dtype is fixed fp32 by the gpu_slot module contract.
         key_rep = hidden_detached[b, t]
         residual = hidden_detached[b, t]
-        pressure_value = float(pressure_full[b, t].item())
+        pressure_value = 1.0 if pressure_full is None else float(pressure_full[b, t].item())
         ce_value = float(ce_full[b, t].item())
         protection_score = _protection_score_for_write(
             action_space=getattr(emit, "controller_action_space", None),
@@ -1948,7 +2280,7 @@ def _emit_episodic_payloads_gpu(
             write_bucket=int(write_bucket),
             pressure=pressure_value,
             ce=ce_value,
-            score=float(write_signal[b, t].item()),
+            score=float(write_signal_full[b, t].item()),
         )
         pack_payload(
             emit.slot_tensor[k],
@@ -2042,9 +2374,9 @@ class _EpisodicConsumerState:
         self,
         cache: EpisodicCache | None,
         heartbeat: list[int],
-        controller_query_queue: list[dict[str, Any]],
+        controller_query_queue: Any,
         controller_query_enabled: bool = False,
-        tagged_replay_queue: list[dict[str, Any]] | None = None,
+        tagged_replay_queue: Any | None = None,
         episodic_event_log_enabled: bool = False,
         compute_replay_ce_pair: bool = False,
         controller_action_space_enabled: bool = False,
@@ -2067,7 +2399,7 @@ class _EpisodicConsumerState:
         # default avoids the classic Python gotcha where every consumer
         # state shares the same list instance.
         self.tagged_replay_queue = (
-            [] if tagged_replay_queue is None else tagged_replay_queue
+            _CompatDeque() if tagged_replay_queue is None else tagged_replay_queue
         )
         self.write_ring_names = list(write_ring_names or [])
         self.write_rings: list[Any | None] = [None for _ in self.write_ring_names]
@@ -2165,7 +2497,7 @@ def _attach_episodic_consumer(
     no_op = _EpisodicConsumerState(
         cache=None,
         heartbeat=[0],
-        controller_query_queue=[],
+        controller_query_queue=_CompatDeque(),
     )
     if not episodic_enabled or not is_episodic_rank:
         return no_op
@@ -2208,7 +2540,7 @@ def _attach_episodic_consumer(
     return _EpisodicConsumerState(
         cache=cache,
         heartbeat=[0],
-        controller_query_queue=[],
+        controller_query_queue=_CompatDeque(),
         controller_query_enabled=bool(
             config.get("controller_query_enabled", False)
         ),
@@ -3613,9 +3945,10 @@ def _order_replay_queue_with_action_space(
     if not timing_active and budget_readiness <= 0.0:
         return int(max_replays_per_step), False
 
+    tagged_list = list(tagged)
     scores = [
         float(entry.get("action_space_score", entry.get("score", 0.0)))
-        for entry in tagged
+        for entry in tagged_list
     ]
     reward_context = {
         "queue_depth": float(len(tagged)),
@@ -3634,7 +3967,7 @@ def _order_replay_queue_with_action_space(
             fallback=float(fallback_budget),
             reward_context=reward_context,
         )))
-    budget = max(0, min(len(tagged), int(budget)))
+    budget = max(0, min(len(tagged_list), int(budget)))
     if timing_active:
         effective_scores = action_space.effective_scores(
             heuristic_scores=scores,
@@ -3646,7 +3979,7 @@ def _order_replay_queue_with_action_space(
     else:
         effective_scores = scores
     selected = sorted(
-        range(len(tagged)),
+        range(len(tagged_list)),
         key=lambda idx: (-float(effective_scores[idx]), idx),
     )[:budget]
     credit_heads: list[str] = []
@@ -3655,7 +3988,7 @@ def _order_replay_queue_with_action_space(
     if budget_readiness > 0.0:
         credit_heads.append("replay_budget")
     for idx in selected:
-        entry = tagged[idx]
+        entry = tagged_list[idx]
         replay_id = int(
             entry.get(
                 "replay_id",
@@ -3674,10 +4007,15 @@ def _order_replay_queue_with_action_space(
             },
         )
     selected_set = set(selected)
-    tagged[:] = (
-        [tagged[idx] for idx in selected]
-        + [entry for idx, entry in enumerate(tagged) if idx not in selected_set]
+    reordered = (
+        [tagged_list[idx] for idx in selected]
+        + [entry for idx, entry in enumerate(tagged_list) if idx not in selected_set]
     )
+    if hasattr(tagged, "clear") and hasattr(tagged, "extend"):
+        tagged.clear()
+        tagged.extend(reordered)
+    else:
+        tagged[:] = reordered
     return int(budget), True
 
 
@@ -3730,7 +4068,8 @@ def _run_episodic_replay_from_tagged_queue(
         (not learned_replay_cap and max_replays <= 0)
         or replayed < max_replays
     ):
-        entry = tagged.pop(0)
+        pop_left = getattr(tagged, "popleft", None)
+        entry = pop_left() if pop_left is not None else tagged.pop(0)
         slot = int(entry.get("slot", -1))
         if not (0 <= slot < int(cache.capacity)):
             _emit_replay_outcome(
@@ -4331,12 +4670,11 @@ def _run_train_step(
                     per_token_ce_bt = per_token_ce_for_episodic.detach().reshape(
                         targets.shape
                     )
-                    pressure_bt = torch.ones_like(per_token_ce_bt)
                     _emit_episodic_payloads_gpu(
                         emit=episodic_emit,
                         inputs=inputs,
                         targets=targets,
-                        pressure=pressure_bt,
+                        pressure=None,
                         per_token_ce=per_token_ce_bt,
                         hidden=hidden,
                         rank=int(rank),
@@ -4383,12 +4721,11 @@ def _run_train_step(
                     reduction="none",
                 ).reshape_as(targets)
         per_token_ce_bt = per_token_ce_for_episodic.detach().reshape(targets.shape)
-        pressure_bt = torch.ones_like(per_token_ce_bt)
         _emit_episodic_payloads_gpu(
             emit=episodic_emit,
             inputs=inputs,
             targets=targets,
-            pressure=pressure_bt,
+            pressure=None,
             per_token_ce=per_token_ce_bt,
             hidden=hidden,
             rank=int(rank),
@@ -4423,6 +4760,9 @@ def _cuda_graph_rejection_reasons(
     if device.type != "cuda" or not torch.cuda.is_available():
         reasons.append("cuda_required")
     if ddp_active:
+        # Keep full-step graph capture away from DDP/NCCL collectives. The
+        # episodic memory producer has its own per-rank CUDA staging stream;
+        # it must not make the trunk SSM a stricter lockstep machine.
         reasons.append("ddp_not_supported")
     if activation_checkpoint:
         reasons.append("activation_checkpoint_not_supported")
@@ -4880,6 +5220,8 @@ def train_fast_for_budget(
     controller_query_enabled: bool = False,
     episodic_event_log_enabled: bool = False,
     episodic_async_write_rings_enabled: bool = True,
+    episodic_cuda_write_event_stream_enabled: bool = True,
+    episodic_cuda_write_event_stage_depth: int = 4,
     episodic_event_ring_id: str | None = None,
     episodic_write_ring_max_drain_per_step: int = 4096,
     episodic_write_ring_idle_sleep_s: float = 0.001,
@@ -5124,6 +5466,12 @@ def train_fast_for_budget(
         "episodic_event_log_enabled": bool(episodic_event_log_enabled),
         "episodic_async_write_rings_enabled": bool(
             episodic_async_write_rings_enabled
+        ),
+        "episodic_cuda_write_event_stream_enabled": bool(
+            episodic_cuda_write_event_stream_enabled
+        ),
+        "episodic_cuda_write_event_stage_depth": int(
+            episodic_cuda_write_event_stage_depth
         ),
         "episodic_event_ring_id": episodic_event_ring_id,
         "episodic_write_ring_max_drain_per_step": int(
@@ -5523,6 +5871,12 @@ def train_fast_for_budget(
             "episodic_event_log_enabled": bool(episodic_event_log_enabled),
             "episodic_async_write_rings_enabled": bool(
                 episodic_async_write_rings_enabled
+            ),
+            "episodic_cuda_write_event_stream_enabled": bool(
+                episodic_cuda_write_event_stream_enabled
+            ),
+            "episodic_cuda_write_event_stage_depth": int(
+                episodic_cuda_write_event_stage_depth
             ),
             "episodic_event_ring_id": episodic_event_ring_id,
             "model_dim": resolved_key_rep_dim,
@@ -6174,8 +6528,28 @@ def train_fast_for_budget(
             "episodic_async_writes": {
                 "enabled": bool(episodic_enabled)
                 and bool(episodic_async_write_rings_enabled),
+                "cuda_stream_enabled": bool(
+                    getattr(
+                        episodic_emit_handle,
+                        "cuda_write_event_stream_enabled",
+                        False,
+                    )
+                ),
                 "publish_drops": int(
                     getattr(episodic_emit_handle, "write_ring_drops", 0)
+                ),
+                "publish_drop_batches": int(
+                    getattr(
+                        episodic_emit_handle,
+                        "write_ring_drop_batches",
+                        0,
+                    )
+                ),
+                "pushed": int(
+                    getattr(episodic_emit_handle, "write_ring_pushed", 0)
+                ),
+                "skipped": int(
+                    getattr(episodic_emit_handle, "write_ring_skipped", 0)
                 ),
                 "drained": int(
                     getattr(episodic_consumer, "write_ring_events_drained", 0)
@@ -6648,6 +7022,12 @@ def run_condition(
         ),
         episodic_async_write_rings_enabled=bool(
             config.get("episodic_async_write_rings_enabled", True)
+        ),
+        episodic_cuda_write_event_stream_enabled=bool(
+            config.get("episodic_cuda_write_event_stream_enabled", True)
+        ),
+        episodic_cuda_write_event_stage_depth=int(
+            config.get("episodic_cuda_write_event_stage_depth", 4)
         ),
         episodic_event_ring_id=(
             str(config["episodic_event_ring_id"])

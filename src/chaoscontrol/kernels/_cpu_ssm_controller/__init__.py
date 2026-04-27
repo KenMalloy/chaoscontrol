@@ -41,6 +41,14 @@ wire_event_min_slot_alignment = (
 wire_event_constants = (
     _C.wire_event_constants if _C is not None else _missing_extension
 )
+write_event_cuda_pack_available = (
+    getattr(_C, "write_event_cuda_pack_available", _missing_extension)
+    if _C is not None else _missing_extension
+)
+pack_write_events_cuda_ = (
+    getattr(_C, "pack_write_events_cuda_", _missing_extension)
+    if _C is not None else _missing_extension
+)
 load_weights_from_path = (
     getattr(_C, "load_weights_from_path", _missing_extension)
     if _C is not None else _missing_extension
@@ -222,6 +230,8 @@ __all__ = [
     "wire_event_sizes",
     "wire_event_min_slot_alignment",
     "wire_event_constants",
+    "write_event_cuda_pack_available",
+    "pack_write_events_cuda_",
     "load_weights_from_path",
     "forward_pretrain_model",
     "backward_step",

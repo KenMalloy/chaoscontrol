@@ -399,3 +399,32 @@ def test_right_pad_per_token_signal_rejects_unexpected_shape() -> None:
     signal = torch.zeros(3, 7)
     with pytest.raises(ValueError):
         mod._right_pad_per_token_signal(signal, T=5)
+
+
+def test_valid_write_signal_window_excludes_unwritable_boundaries() -> None:
+    """Write selection should never spend top-k or candidate ids on positions
+    that cannot carry a full fingerprint/value span."""
+    mod = _load_runner_module()
+    signal = torch.arange(6, dtype=torch.float32).reshape(1, 6)
+
+    valid, offset = mod._valid_write_signal_window(
+        signal,
+        fingerprint_window=2,
+        span_length=2,
+    )
+
+    assert offset == 2
+    assert torch.equal(valid, signal[:, 2:5])
+    positions = mod._select_write_positions_with_action_space(
+        action_space=None,
+        write_signal=valid,
+        pressure_full=None,
+        ce_full=signal,
+        top_p=1.0,
+        k_max=8,
+        current_step=0,
+        write_bucket=0,
+    )
+    positions = positions.clone()
+    positions[:, 1] += offset
+    assert set(int(t) for t in positions[:, 1].tolist()) == {2, 3, 4}

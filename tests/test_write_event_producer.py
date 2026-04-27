@@ -510,7 +510,11 @@ def test_learned_write_admission_can_rerank_candidate_positions():
         write_bucket=0,
     )
 
-    assert positions.tolist() == [[0, 1]]
+    # Learned admission now sees a bounded top-M pool rather than the full
+    # flattened B*T grid. rank=1 therefore means the second heuristic candidate
+    # (flat index 2), proving it can rerank inside the stream without a full-grid
+    # CPU copy.
+    assert positions.tolist() == [[0, 2]]
 
 
 def test_learned_eviction_head_sets_slot_protection_score():

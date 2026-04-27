@@ -33,6 +33,10 @@ def _x86_accel_compile_args() -> list[str]:
     ]
 
 
+def _cuda_write_event_enabled() -> bool:
+    return os.environ.get("CHAOSCONTROL_CPU_SSM_CUDA_WRITE_EVENT") == "1"
+
+
 def build_ext_modules() -> list:
     try:
         from torch.utils.cpp_extension import CppExtension
@@ -72,27 +76,47 @@ def build_ext_modules() -> list:
     simplex_learner_rel = (
         this_dir.relative_to(repo_root) / "src" / "simplex_learner.cpp"
     )
+    write_event_pack_cuda_rel = (
+        this_dir.relative_to(repo_root) / "src" / "write_event_pack.cu"
+    )
+    sources = [
+        str(cpp_rel),
+        str(controller_main_rel),
+        str(event_handlers_rel),
+        str(action_history_rel),
+        str(credit_rel),
+        str(cpu_features_rel),
+        str(amx_matmul_rel),
+        str(avx512_recurrence_rel),
+        str(avx512_matops_rel),
+        str(optimizer_rel),
+        str(online_learning_rel),
+        str(simplex_policy_rel),
+        str(simplex_learner_rel),
+    ]
+    extra_compile_args = {
+        "cxx": ["-O3", "-std=c++17", *_x86_accel_compile_args()],
+    }
+    extension_cls = CppExtension
+    if _cuda_write_event_enabled():
+        try:
+            from torch.utils.cpp_extension import CUDAExtension
+        except ImportError:
+            return []
+        extension_cls = CUDAExtension
+        sources.append(str(write_event_pack_cuda_rel))
+        extra_compile_args["cxx"].append(
+            "-DCHAOSCONTROL_CPU_SSM_CUDA_WRITE_EVENT_KERNEL=1"
+        )
+        extra_compile_args["nvcc"] = [
+            "-O3",
+            "-DCHAOSCONTROL_CPU_SSM_CUDA_WRITE_EVENT_KERNEL=1",
+        ]
     return [
-        CppExtension(
+        extension_cls(
             name="chaoscontrol.kernels._cpu_ssm_controller._C",
-            sources=[
-                str(cpp_rel),
-                str(controller_main_rel),
-                str(event_handlers_rel),
-                str(action_history_rel),
-                str(credit_rel),
-                str(cpu_features_rel),
-                str(amx_matmul_rel),
-                str(avx512_recurrence_rel),
-                str(avx512_matops_rel),
-                str(optimizer_rel),
-                str(online_learning_rel),
-                str(simplex_policy_rel),
-                str(simplex_learner_rel),
-            ],
-            extra_compile_args={
-                "cxx": ["-O3", "-std=c++17", *_x86_accel_compile_args()],
-            },
+            sources=sources,
+            extra_compile_args=extra_compile_args,
         )
     ]
 

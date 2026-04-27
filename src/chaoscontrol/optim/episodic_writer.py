@@ -68,6 +68,15 @@ def _next_admission_trace_seq() -> int:
     return seq
 
 
+def _reserve_admission_trace_seq(count: int) -> int:
+    """Reserve ``count`` rank-local admission ids and return the first id."""
+    global _admission_trace_seq
+    n = max(0, int(count))
+    seq = _admission_trace_seq
+    _admission_trace_seq += n
+    return seq
+
+
 def tensor_fp16_to_u16_wire(
     values: torch.Tensor,
     *,

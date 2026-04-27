@@ -45,6 +45,11 @@ REQUIRED_RARE_BUCKET_KEYS = {
     "rare_bucket_ce_eval_tokens",
     "rare_bucket_ce_eval_num_tokens",
 }
+REQUIRED_EPISODIC_WRITE_KEYS = {
+    "episodic_async_write_rings_enabled",
+    "episodic_cuda_write_event_stream_enabled",
+    "episodic_cuda_write_event_stage_depth",
+}
 
 
 def test_cd_kwargs_all_present_on_train_fast_for_budget():
@@ -76,3 +81,12 @@ def test_rare_bucket_ce_kwargs_all_present_on_train_fast_for_budget():
     sig = inspect.signature(mod.train_fast_for_budget)
     missing = [k for k in REQUIRED_RARE_BUCKET_KEYS if k not in sig.parameters]
     assert not missing, f"missing rare-bucket CE kwargs: {missing}"
+
+
+def test_episodic_write_stream_kwargs_all_present_on_train_fast_for_budget():
+    mod = _load_runner_module()
+    sig = inspect.signature(mod.train_fast_for_budget)
+    missing = [
+        k for k in REQUIRED_EPISODIC_WRITE_KEYS if k not in sig.parameters
+    ]
+    assert not missing, f"missing episodic write-stream kwargs: {missing}"

@@ -19,8 +19,10 @@ Spec: docs/plans/2026-04-26-cpu-ssm-controller.md (Task A5).
 from __future__ import annotations
 
 import math
+import struct
 
 import pytest
+import torch
 
 from chaoscontrol.kernels import _cpu_ssm_controller as _ext
 
@@ -134,6 +136,56 @@ def test_shm_ring_write_event_round_trip():
             assert popped["value_anchor_id"] == 7
             assert popped["pressure_at_write"] == pytest.approx(1.25)
             assert popped["pre_write_ce"] == pytest.approx(2.34)
+        assert ring.pop() is None
+    finally:
+        _ext.ShmRingWriteEvent.unlink(name)
+
+
+def _pack_write_event_bytes(ev: dict) -> bytes:
+    return struct.pack(
+        "<BBB5xQQQ256H4HIff4x",
+        int(ev["event_type"]),
+        int(ev["source_rank"]),
+        int(ev["write_bucket"]),
+        int(ev["candidate_id"]),
+        int(ev["gpu_step"]),
+        int(ev["key_fp"]),
+        *[int(x) for x in ev["key_rep"]],
+        *[int(x) for x in ev["value_tok_ids"]],
+        int(ev["value_anchor_id"]),
+        float(ev["pressure_at_write"]),
+        float(ev["pre_write_ce"]),
+    )
+
+
+def test_shm_ring_write_event_push_batch_tensor_skips_invalid_rows():
+    """Raw tensor batch push is the producer hot-path API: no dict/list
+    marshal for the 256-element key_rep array."""
+    name = "/cc_test_shm_write_batch_tensor"
+    _force_unlink(_ext.ShmRingWriteEvent, name)
+    ring = _ext.ShmRingWriteEvent.create(name)
+    try:
+        event_size = int(_ext.wire_event_sizes()["WriteEvent"])
+        ev0 = _sample_write_event()
+        ev0["candidate_id"] = 10
+        ev1 = _sample_write_event()
+        ev1["candidate_id"] = 11
+        invalid = bytearray(event_size)
+        rows = [
+            _pack_write_event_bytes(ev0),
+            bytes(invalid),
+            _pack_write_event_bytes(ev1),
+        ]
+        raw = torch.tensor(
+            list(b"".join(rows)),
+            dtype=torch.uint8,
+        ).reshape(3, event_size)
+
+        stats = ring.push_batch_tensor(raw)
+
+        assert dict(stats) == {"pushed": 2, "skipped": 1, "dropped": 0}
+        assert ring.pop()["candidate_id"] == 10
+        assert ring.pop()["candidate_id"] == 11
         assert ring.pop() is None
     finally:
         _ext.ShmRingWriteEvent.unlink(name)

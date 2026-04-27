@@ -2623,6 +2623,8 @@ def test_run_condition_threads_max_steps_from_config(monkeypatch):
             "stride": 1,
             "batch_size": 2,
             "max_steps": 517,
+            "episodic_cuda_write_event_stream_enabled": False,
+            "episodic_cuda_write_event_stage_depth": 7,
         },
         data_path="unused",
         sp_model_path="unused.model",
@@ -2633,6 +2635,8 @@ def test_run_condition_threads_max_steps_from_config(monkeypatch):
     )
 
     assert seen_kwargs["max_steps"] == 517
+    assert seen_kwargs["episodic_cuda_write_event_stream_enabled"] is False
+    assert seen_kwargs["episodic_cuda_write_event_stage_depth"] == 7
     assert result["train"]["steps"] == 517
 
 

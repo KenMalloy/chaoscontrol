@@ -336,13 +336,9 @@ def run_controller_cycle(
         empty, ``k_eff_per_query`` may be < k. Callers wanting both
         numbers should diff ``len(tagged_replay_queue)`` before/after.
     """
-    # Drain via repeated ``pop(0)``. Each ``pop(0)`` is a single CPython
-    # bytecode and therefore atomic w.r.t. the GIL — it cannot interleave
-    # with the producer's ``append()`` call (also single-bytecode, also
-    # atomic). This is the race-free pattern for "I cannot lock the
-    # producer side": ``snapshot = list(q); q.clear()`` would NOT be
-    # atomic across the two calls, so an ``append()`` racing in between
-    # would silently drop the newly appended item.
+    # Drain via deque.popleft when available. list.pop(0) is kept only for
+    # older tests/callers; production runner queues are deques so backlog drain
+    # stays O(1) per event.
     #
     # A ``queue_lock`` is still respected when supplied: tests pass an
     # explicit lock so they can deterministically synchronize a producer
@@ -351,14 +347,21 @@ def run_controller_cycle(
     # thread) does NOT take the lock, so the controller relies on the
     # GIL atomicity of ``pop(0)`` + ``append()``.
     candidates: list[dict[str, Any]] = []
+    pop_left = getattr(controller_query_queue, "popleft", None)
     if queue_lock is not None:
         with queue_lock:
             while controller_query_queue:
-                candidates.append(controller_query_queue.pop(0))
+                if pop_left is not None:
+                    candidates.append(pop_left())
+                else:
+                    candidates.append(controller_query_queue.pop(0))
     else:
         while True:
             try:
-                candidates.append(controller_query_queue.pop(0))
+                if pop_left is not None:
+                    candidates.append(pop_left())
+                else:
+                    candidates.append(controller_query_queue.pop(0))
             except IndexError:
                 break
 
