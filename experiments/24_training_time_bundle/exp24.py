@@ -1134,6 +1134,13 @@ def build_episodic_controller_v1_matrix(
                 budget_seconds=budget_seconds,
             )
             entry.update(arm)
+            # The runner rejects episodic_enabled=True with
+            # train_sampling_mode='sequential_epoch' because the
+            # episodic-shard skip-main flow drops 1/N of the dataset
+            # per epoch. Per the runner's own ValueError remediation,
+            # use 'random' for every cell that turns the cache on.
+            if arm.get("episodic_enabled"):
+                entry["train_sampling_mode"] = "random"
             # Per-cell NDJSON trace for simplex arms. Operationalizes
             # docs/plans/2026-04-26-learned-controller-action-space.md:
             # "A stop that is not logged is a hidden experimental

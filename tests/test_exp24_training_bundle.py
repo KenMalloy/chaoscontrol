@@ -1558,6 +1558,14 @@ def test_episodic_controller_v1_matrix_has_five_arms_three_seeds():
         for entry in by_arm[arm]:
             assert "episodic_controller_simplex_trace_path" not in entry
 
+    # Every cell with episodic_enabled=True must use random sampling.
+    # The runner rejects sequential_epoch + episodic_enabled because the
+    # episodic-shard skip-main flow drops 1/N of the dataset per epoch.
+    for arm in ("arm_b_heuristic", *simplex_arms):
+        for entry in by_arm[arm]:
+            assert entry.get("episodic_enabled") is True
+            assert entry["train_sampling_mode"] == "random"
+
 
 def test_episodic_controller_v1_weights_path_honors_env_override(monkeypatch):
     """Pod runbook substitutes the real weights via env var; matrix builder
