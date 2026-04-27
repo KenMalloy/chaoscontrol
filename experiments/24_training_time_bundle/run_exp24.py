@@ -46,6 +46,150 @@ from fast_path import read_speed_config, write_matrix  # noqa: E402
 from launch import DRY_RUN_RDZV_PORT, pick_free_port, run_matrix_entries  # noqa: E402
 
 
+# Smoke-first policy: before a real matrix launch, run ONE cell with a
+# tight budget against the most-instrumented arm and assert that the
+# load-bearing telemetry actually fires. Catches the silent-fallback
+# failure mode where episodic-on-CUDA runs land on the legacy CPU path
+# and look fine in logs but never exercise the new producer pipeline.
+# See docs/reports/2026-04-27-step3-results.md for the incident the
+# policy is meant to prevent.
+SMOKE_BUDGET_SECONDS = 90.0
+SMOKE_ARM_PREFIX_BY_MATRIX = {
+    "episodic_controller_v1": "arm_e_simplex_warm_online",
+}
+
+
+def smoke_check_result(
+    *,
+    result_path: Path,
+    entry: dict[str, Any],
+) -> tuple[bool, list[str]]:
+    """Validate a smoke cell's result JSON. Returns (ok, failures).
+
+    The contract: when ``episodic_enabled`` is on and the run had a CUDA
+    device, every load-bearing producer counter must have fired. Silent
+    fallback to the legacy CPU path is the failure mode this catches.
+    """
+    failures: list[str] = []
+    if not result_path.exists():
+        return False, [f"result JSON not produced at {result_path}"]
+    try:
+        d = json.loads(result_path.read_text())
+    except Exception as exc:  # noqa: BLE001
+        return False, [f"result JSON malformed: {exc!r}"]
+    if "error" in d:
+        return False, [f"runner reported error: {d.get('error')!r}"]
+    train = d.get("train", {})
+    if not isinstance(train, dict) or "steps" not in train:
+        return False, ["result JSON missing train block / train.steps"]
+    aw = train.get("mechanisms", {}).get("episodic_async_writes", {})
+    if entry.get("episodic_enabled") and aw.get("enabled"):
+        # CUDA-side gates that catch the 2026-04-27 silent-fallback mode.
+        if not aw.get("cuda_stream_enabled"):
+            failures.append(
+                "cuda_stream_enabled=false on episodic-enabled cell — "
+                "GPU-pack producer pipeline did not activate; runs would "
+                "silently fall back to the legacy CPU producer"
+            )
+        if int(aw.get("submitted_batches", 0)) == 0:
+            failures.append("submitted_batches=0 — no producer batches were submitted")
+        if int(aw.get("pushed", 0)) == 0:
+            failures.append("pushed=0 — no events made it onto the shm ring")
+        if int(aw.get("drain_errors", 0)) != 0:
+            failures.append(f"drain_errors={aw['drain_errors']}")
+        if aw.get("publisher_error"):
+            failures.append(f"publisher_error={aw['publisher_error']!r}")
+    if "simplex" in str(entry.get("name", "")):
+        trace_path = entry.get("episodic_controller_simplex_trace_path")
+        if trace_path:
+            tp = Path(trace_path)
+            if not tp.exists():
+                failures.append(f"simplex trace not produced at {tp}")
+            else:
+                n_decision = n_credit = 0
+                min_entropy = float("inf")
+                with tp.open("r") as fh:
+                    for i, line in enumerate(fh):
+                        if i >= 2000:
+                            break
+                        try:
+                            row = json.loads(line)
+                        except Exception:
+                            continue
+                        rt = row.get("row_type")
+                        if rt == "decision":
+                            n_decision += 1
+                            ent = row.get("entropy")
+                            if isinstance(ent, (int, float)) and ent < min_entropy:
+                                min_entropy = float(ent)
+                        elif rt == "credit":
+                            n_credit += 1
+                if n_decision == 0:
+                    failures.append("simplex trace has no decision rows")
+                if n_credit == 0:
+                    failures.append("simplex trace has no credit rows (no replay reached the learner)")
+                # ln(16) ≈ 2.7726. If every sampled decision is at near-max
+                # entropy the policy is degenerate (all-zero weights, empty
+                # candidates, etc.). One non-uniform decision proves the
+                # path is at least live; full-matrix tells us whether it
+                # learns over time.
+                if min_entropy > 2.5 and n_decision > 0:
+                    failures.append(
+                        f"all {n_decision} sampled decision rows have entropy > 2.5 "
+                        f"(min={min_entropy:.4f}); policy stuck at near-uniform"
+                    )
+    return len(failures) == 0, failures
+
+
+def _run_smoke(
+    *,
+    matrix_name: str,
+    entries: list[dict[str, Any]],
+    runner_path: Path,
+    data_path: str,
+    sp_model_paths: dict[int, str],
+    full_results_dir: Path,
+    world_size: int,
+) -> tuple[bool, list[str]]:
+    """Pick the most-instrumented arm, run it with a 90s budget, assert."""
+    prefix = SMOKE_ARM_PREFIX_BY_MATRIX.get(matrix_name)
+    if prefix is None:
+        return True, [f"smoke skipped: no smoke arm registered for {matrix_name}"]
+    candidates = [e for e in entries if prefix in str(e.get("name", ""))]
+    if not candidates:
+        return False, [f"smoke arm prefix {prefix!r} matched no entries in matrix {matrix_name}"]
+    smoke_entry = dict(candidates[0])
+    smoke_entry["budget_seconds"] = SMOKE_BUDGET_SECONDS
+    smoke_entry["name"] = f"smoke_{smoke_entry['name']}"
+    smoke_dir = full_results_dir / ".smoke"
+    smoke_dir.mkdir(parents=True, exist_ok=True)
+    # Re-route the trace path so the smoke run doesn't clobber any
+    # existing trace file from a real matrix launch.
+    if smoke_entry.get("episodic_controller_simplex_trace_path"):
+        smoke_entry["episodic_controller_simplex_trace_path"] = str(
+            smoke_dir / "smoke_simplex_trace.ndjson"
+        )
+    print(
+        f"[smoke] running 1 cell ({smoke_entry['name']}) for "
+        f"{SMOKE_BUDGET_SECONDS:.0f}s before full matrix",
+        flush=True,
+    )
+    run_matrix_entries(
+        entries=[smoke_entry],
+        runner_path=runner_path,
+        data_path=data_path,
+        sp_model_paths=sp_model_paths,
+        results_dir=smoke_dir,
+        world_size=world_size,
+        limit=None,
+        dry_run=False,
+        skip_existing=False,
+        checkpoint_dir=None,
+    )
+    result_path = smoke_dir / f"{smoke_entry['name']}.json"
+    return smoke_check_result(result_path=result_path, entry=smoke_entry)
+
+
 def _prebuild_cache(data_path: str) -> None:
     from chaoscontrol.data import load_fineweb_tokens  # noqa: E402
 
@@ -448,6 +592,18 @@ def main(argv: list[str] | None = None) -> int:
         default=600.0,
         help="Eval budget passed to run_exp20_full_val_score.py.",
     )
+    parser.add_argument(
+        "--smoke",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Before launching the full matrix, run ONE cell with a "
+            f"{SMOKE_BUDGET_SECONDS:.0f}s budget against the most-instrumented arm "
+            "and assert that load-bearing telemetry fired. Catches silent "
+            "fallback to the legacy CPU producer. Auto-skipped for matrices "
+            "without a registered smoke arm."
+        ),
+    )
     args = parser.parse_args(argv)
 
     default_world_size = _default_world_size_for_matrix(args.matrix)
@@ -497,6 +653,27 @@ def main(argv: list[str] | None = None) -> int:
 
     if not effective_dry_run:
         _prebuild_cache(str(args.data_path))
+
+    if not effective_dry_run and args.smoke:
+        smoke_ok, smoke_msgs = _run_smoke(
+            matrix_name=args.matrix,
+            entries=entries,
+            runner_path=EXP23 / "runner_fast_path.py",
+            data_path=str(args.data_path),
+            sp_model_paths={16384: str(args.sp_model_path_16384)},
+            full_results_dir=args.output_dir,
+            world_size=world_size,
+        )
+        if not smoke_ok:
+            print("[smoke] FAILED — full matrix NOT launched. Failures:", flush=True)
+            for msg in smoke_msgs:
+                print(f"  - {msg}", flush=True)
+            return 2
+        if smoke_msgs:
+            for msg in smoke_msgs:
+                print(f"[smoke] {msg}", flush=True)
+        else:
+            print("[smoke] passed; launching full matrix", flush=True)
 
     summary = run_matrix_entries(
         entries=entries,

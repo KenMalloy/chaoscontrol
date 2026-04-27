@@ -1673,3 +1673,115 @@ def test_run_exp24_cli_episodic_controller_v1_dry_run(tmp_path):
     assert "exp24_phase3_episodic_controller_v1_arm_d_simplex_online_s1337" in stdout
     assert "exp24_phase3_episodic_controller_v1_arm_e_simplex_warm_online_s4011" in stdout
     assert '"exp24_mechanism": "episodic_controller_v1"' in stdout
+
+
+def _good_smoke_result(*, with_simplex_trace: Path | None = None) -> dict:
+    """Synthesise a result JSON that the smoke checker should accept."""
+    return {
+        "train": {
+            "steps": 540,
+            "elapsed_s": 90.0,
+            "final_loss": 3.7,
+            "mechanisms": {
+                "episodic_async_writes": {
+                    "enabled": True,
+                    "cuda_stream_enabled": True,
+                    "submitted_batches": 540,
+                    "pushed": 8640,
+                    "drained": 8640,
+                    "publish_drops": 0,
+                    "drain_errors": 0,
+                    "publisher_error": "",
+                },
+            },
+        },
+        "eval": {},
+    }
+
+
+def test_smoke_check_passes_on_healthy_simplex_cell(tmp_path):
+    mod = _load_run_exp24()
+    trace = tmp_path / "smoke_simplex_trace.ndjson"
+    rows = [
+        {"row_type": "decision", "entropy": 0.69, "n_actual": 2},
+        {"row_type": "decision", "entropy": 2.0, "n_actual": 16},
+        {"row_type": "credit", "entropy": 0.69, "current_entropy": 0.7},
+    ]
+    trace.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+    result_path = tmp_path / "smoke_arm_e.json"
+    result_path.write_text(json.dumps(_good_smoke_result()))
+    entry = {
+        "name": "smoke_arm_e_simplex_warm_online_s1337",
+        "episodic_enabled": True,
+        "episodic_controller_simplex_trace_path": str(trace),
+    }
+    ok, failures = mod.smoke_check_result(result_path=result_path, entry=entry)
+    assert ok, f"healthy cell rejected: {failures}"
+    assert failures == []
+
+
+def test_smoke_check_catches_silent_cuda_fallback(tmp_path):
+    """The 2026-04-27 incident: episodic on but cuda_stream_enabled=false."""
+    mod = _load_run_exp24()
+    payload = _good_smoke_result()
+    aw = payload["train"]["mechanisms"]["episodic_async_writes"]
+    aw["cuda_stream_enabled"] = False
+    aw["submitted_batches"] = 0
+    aw["pushed"] = 0
+    aw["drained"] = 0
+    result_path = tmp_path / "smoke_arm_e.json"
+    result_path.write_text(json.dumps(payload))
+    entry = {
+        "name": "smoke_arm_e_simplex_warm_online_s1337",
+        "episodic_enabled": True,
+    }
+    ok, failures = mod.smoke_check_result(result_path=result_path, entry=entry)
+    assert not ok
+    assert any("cuda_stream_enabled=false" in f for f in failures)
+    assert any("submitted_batches=0" in f for f in failures)
+    assert any("pushed=0" in f for f in failures)
+
+
+def test_smoke_check_flags_missing_simplex_trace(tmp_path):
+    mod = _load_run_exp24()
+    result_path = tmp_path / "smoke_arm_e.json"
+    result_path.write_text(json.dumps(_good_smoke_result()))
+    entry = {
+        "name": "smoke_arm_e_simplex_warm_online_s1337",
+        "episodic_enabled": True,
+        "episodic_controller_simplex_trace_path": str(tmp_path / "missing.ndjson"),
+    }
+    ok, failures = mod.smoke_check_result(result_path=result_path, entry=entry)
+    assert not ok
+    assert any("trace not produced" in f for f in failures)
+
+
+def test_smoke_check_flags_uniform_policy_collapse(tmp_path):
+    """Every sampled decision entropy at near-max → wiring degenerate."""
+    mod = _load_run_exp24()
+    trace = tmp_path / "trace.ndjson"
+    rows = [
+        {"row_type": "decision", "entropy": 2.77, "n_actual": 16}
+        for _ in range(50)
+    ] + [{"row_type": "credit", "entropy": 2.77, "current_entropy": 2.77}]
+    trace.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+    result_path = tmp_path / "result.json"
+    result_path.write_text(json.dumps(_good_smoke_result()))
+    entry = {
+        "name": "smoke_arm_e_simplex_warm_online_s1337",
+        "episodic_enabled": True,
+        "episodic_controller_simplex_trace_path": str(trace),
+    }
+    ok, failures = mod.smoke_check_result(result_path=result_path, entry=entry)
+    assert not ok
+    assert any("entropy > 2.5" in f for f in failures)
+
+
+def test_smoke_check_returns_runner_error_directly(tmp_path):
+    mod = _load_run_exp24()
+    result_path = tmp_path / "result.json"
+    result_path.write_text(json.dumps({"error": "returncode=1", "config": {}}))
+    entry = {"name": "smoke_arm_e_simplex_warm_online_s1337", "episodic_enabled": True}
+    ok, failures = mod.smoke_check_result(result_path=result_path, entry=entry)
+    assert not ok
+    assert any("runner reported error" in f for f in failures)
