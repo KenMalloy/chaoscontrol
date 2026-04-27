@@ -507,12 +507,6 @@ void SimplexOnlineLearner::record_simplex_decision(
   // is the cache slot the simplex point landed on. Truncate to u32 for
   // the history key (cache capacity is bounded well below 2^32).
   if (simplex_trace_writer_ != nullptr) {
-    float entropy = 0.0f;
-    for (const float p : entry.p_behavior) {
-      if (p > 0.0f && std::isfinite(p)) {
-        entropy -= p * std::log(std::max(p, 1.0e-30f));
-      }
-    }
     emit_simplex_trace_row(
         "decision",
         "ok",
@@ -523,7 +517,7 @@ void SimplexOnlineLearner::record_simplex_decision(
         gpu_step,
         chosen_slot_id,
         p_chosen_decision,
-        entropy,
+        std::numeric_limits<float>::quiet_NaN(),
         std::numeric_limits<float>::quiet_NaN(),
         std::numeric_limits<float>::quiet_NaN(),
         std::numeric_limits<float>::quiet_NaN(),
@@ -578,7 +572,7 @@ void SimplexOnlineLearner::emit_simplex_trace_row(
     uint64_t gpu_step,
     uint64_t slot_id,
     float p_chosen_current,
-    float entropy,
+    float current_entropy,
     float raw_advantage,
     float advantage_standardized,
     float recency_weight,
@@ -590,6 +584,21 @@ void SimplexOnlineLearner::emit_simplex_trace_row(
     float current_margin) {
   if (simplex_trace_writer_ == nullptr) {
     return;
+  }
+  // Behavior-policy entropy is the entropy of the action distribution
+  // that actually produced the sampled vertex — answers "how exploratory
+  // was the controller when it acted?". Always derived from the stored
+  // decision snapshot so decision and credit rows for the same
+  // (query_event_id, replay_id) report the SAME value. Current-policy
+  // entropy is reported separately in current_entropy.
+  float behavior_entropy = std::numeric_limits<float>::quiet_NaN();
+  if (entry != nullptr && !entry->p_behavior.empty()) {
+    behavior_entropy = 0.0f;
+    for (const float p : entry->p_behavior) {
+      if (p > 0.0f && std::isfinite(p)) {
+        behavior_entropy -= p * std::log(std::max(p, 1.0e-30f));
+      }
+    }
   }
 
   const uint32_t n_actual =
@@ -664,7 +673,9 @@ void SimplexOnlineLearner::emit_simplex_trace_row(
   line << ",\"p_current_chosen\":";
   json_float(line, p_chosen_current);
   line << ",\"entropy\":";
-  json_float(line, entropy);
+  json_float(line, behavior_entropy);
+  line << ",\"current_entropy\":";
+  json_float(line, current_entropy);
   line << ",\"temperature\":";
   json_float(line, fast_weights_.temperature);
   line << ",\"lambda_hxh\":";

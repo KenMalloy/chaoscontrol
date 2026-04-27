@@ -809,6 +809,7 @@ def test_simplex_trace_writes_decision_and_credit_rows_async(tmp_path):
         "p_chosen",
         "p_current_chosen",
         "entropy",
+        "current_entropy",
         "temperature",
         "lambda_hxh",
         "entropy_beta",
@@ -867,8 +868,16 @@ def test_simplex_trace_writes_decision_and_credit_rows_async(tmp_path):
         assert isinstance(credit[fname], (int, float)), fname
         assert math.isfinite(float(credit[fname])), fname
 
-    # entropy in [0, ln(N)]
+    # entropy in [0, ln(N)] — behavior-policy entropy on both row types,
+    # so decision and credit rows for the same (query, replay) MUST match.
     assert 0.0 <= float(credit["entropy"]) <= math.log(N) + 1e-5
+    assert decision["entropy"] == pytest.approx(credit["entropy"], abs=1e-6)
+    # current_entropy is null on decision rows (no replay-time forward yet)
+    # and finite on credit rows. Drift = current_entropy - entropy.
+    assert decision["current_entropy"] is None
+    assert isinstance(credit["current_entropy"], (int, float))
+    assert math.isfinite(float(credit["current_entropy"]))
+    assert 0.0 <= float(credit["current_entropy"]) <= math.log(N) + 1e-5
     # gerber_weight in [0, 1]
     assert 0.0 <= float(credit["gerber_weight"]) <= 1.0 + 1e-6
     # p_chosen in (0, 1]

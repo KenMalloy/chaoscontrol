@@ -38,7 +38,8 @@ Required columns:
 | `p_chosen` | `FLOAT` | Behavior-policy probability assigned to the sampled vertex after valid-candidate renormalization. |
 | `p_current_chosen` | `FLOAT` | Current-policy probability at replay attribution time; NaN on decision rows. |
 | `p_behavior` | `FLOAT[]` | Full behavior distribution over the valid candidates. |
-| `entropy` | `FLOAT` | `-sum(p_behavior * log(p_behavior))`. |
+| `entropy` | `FLOAT` | Behavior-policy entropy `-sum(p_behavior * log(p_behavior))`. Always derived from the stored decision snapshot, so decision and credit rows for the same `(query_event_id, replay_id)` report the SAME value. Answers "how exploratory was the controller when it acted?". NaN on skip rows that have no decision snapshot (`outcome_status`, `invalid_slot`, `missing_weights`, `missing_decision`). |
+| `current_entropy` | `FLOAT` | Current-policy entropy `-sum(p_current * log(p_current))` from the replay-time forward. NaN on `decision` rows. Populated on `credit` and on skip rows where the forward ran (`zero_advantage`, `gerber_rejected`). The drift `current_entropy - entropy` is a useful stability signal — if current entropy collapses relative to behavior entropy while credit still arrives late, the online learner may be hardening too fast. |
 | `temperature` | `FLOAT` | Active simplex softmax temperature. |
 | `entropy_beta` | `FLOAT` | Active entropy-bonus weight. |
 | `teacher_score` | `FLOAT` | Heuristic score for the chosen slot, usually cosine times utility. |
