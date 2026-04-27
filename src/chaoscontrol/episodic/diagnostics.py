@@ -53,6 +53,19 @@ event-log design):
                                         --   policy in compute_utility_signal)
     outcome_status             str      -- ok / slot_missing / stale / nan / skipped
     flags                      int64    -- reserved bit flags
+    arm                        str      -- experiment arm / controller mode
+    chosen_idx                 int64    -- chosen simplex vertex index
+    p_chosen                   float64  -- behavior probability of chosen vertex
+    p_behavior                 list     -- full behavior distribution
+    entropy                    float64  -- simplex policy entropy
+    gerber_weight              float64  -- off-policy correction weight
+    advantage_raw              float64  -- reward before correction/stddev scaling
+    advantage_corrected        float64  -- reward actually credited to policy
+    lambda_hxh                 float64  -- HxH residual mixing coefficient
+    feature_manifest_hash      str      -- feature-schema fingerprint
+    candidate_slot_ids         list     -- 16 candidate slot ids
+    candidate_scores           list     -- 16 heuristic candidate scores
+    logits                     list     -- 16 controller logits
 
 NaN values serialize as ``null`` so DuckDB ingests them as missing
 values; Phase 1 logs NaN for the three replay-grad cosines and the
@@ -164,6 +177,10 @@ def _coerce_serializable(value: Any) -> Any:
         return value
     if isinstance(value, (int, str, bool)):
         return value
+    if isinstance(value, (list, tuple)):
+        return [_coerce_serializable(v) for v in value]
+    if isinstance(value, dict):
+        return {str(k): _coerce_serializable(v) for k, v in value.items()}
     # torch.Tensor / numpy scalar — convert via .item() if available.
     item = getattr(value, "item", None)
     if callable(item):

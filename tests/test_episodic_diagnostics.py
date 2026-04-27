@@ -68,6 +68,19 @@ def _synthetic_row(**overrides: object) -> dict[str, object]:
         "utility_post": 0.553,
         "outcome_status": "ok",
         "flags": 0,
+        "arm": "unit",
+        "chosen_idx": 0,
+        "p_chosen": 0.25,
+        "p_behavior": [0.25, 0.25, 0.25, 0.25],
+        "entropy": 1.38629436,
+        "gerber_weight": 1.0,
+        "advantage_raw": 0.5,
+        "advantage_corrected": 0.4,
+        "lambda_hxh": 0.1,
+        "feature_manifest_hash": "unit_hash",
+        "candidate_slot_ids": [0, 1, 2, 3],
+        "candidate_scores": [0.9, 0.7, 0.2, 0.1],
+        "logits": [2.0, 1.0, 0.0, -1.0],
     }
     row.update(overrides)
     return row
@@ -112,9 +125,22 @@ class TestDiagnosticsSchema(unittest.TestCase):
             "utility_post",
             "outcome_status",
             "flags",
+            "arm",
+            "chosen_idx",
+            "p_chosen",
+            "p_behavior",
+            "entropy",
+            "gerber_weight",
+            "advantage_raw",
+            "advantage_corrected",
+            "lambda_hxh",
+            "feature_manifest_hash",
+            "candidate_slot_ids",
+            "candidate_scores",
+            "logits",
         )
         self.assertEqual(REPLAY_LOG_SCHEMA, expected)
-        self.assertEqual(len(REPLAY_LOG_SCHEMA), 31)
+        self.assertEqual(len(REPLAY_LOG_SCHEMA), 44)
 
 
 class TestDiagnosticsWriter(unittest.TestCase):

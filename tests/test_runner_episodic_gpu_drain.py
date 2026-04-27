@@ -1,10 +1,9 @@
-"""Tests for the episodic-rank GPU drain path (Perf Pass C.3 + C.4).
+"""Tests for the episodic-rank async WRITE_EVENT drain path.
 
-Replaces the POSIX-shm Phase 1 Task 1.5 consumer tests
-(``test_runner_episodic_drain.py`` pre-Pass-C). The new path receives
-``[K_max, slot_dim]`` fp32 tensors via ``dist.gather``, filters by
-``valid_mask``, and routes each surviving row to (a) ``cache.append``
-for the write side and (b) ``controller_query_queue`` for Phase 2.
+Train ranks publish WRITE_EVENT records into per-rank POSIX shm rings. The
+episodic rank lazily attaches those rings, drains without a train-step
+collective, and routes each surviving event to (a) ``cache.append`` for the
+write side and (b) ``controller_query_queue`` for Phase 2.
 
 Tests:
 
@@ -15,9 +14,8 @@ Tests:
      queue).
   3. ``test_attach_episodic_consumer_no_op_when_disabled`` — back-compat:
      ``episodic_enabled=False`` is a skip regardless of rank.
-  4. ``test_consumer_state_no_longer_has_write_rings`` — Pass C dropped
-     the ``write_rings`` field; pin the rename so any code reaching for
-     it surfaces immediately.
+  4. ``test_consumer_state_tracks_async_write_rings`` — async write-ring
+     bookkeeping is present but empty on no-op consumers.
   5. ``test_drain_filters_invalid_rows_and_appends_valid_ones`` —
      direct call to ``_drain_episodic_payloads_gpu`` with a hand-built
      gather_list verifies that valid_mask=1 rows fill the cache and
@@ -26,14 +24,14 @@ Tests:
      populates the ``controller_query_queue`` Python list with one
      entry per valid slot (Phase 2 prerequisite).
   7. ``test_4rank_gloo_end_to_end`` (mp.spawn) — 3 train + 1 episodic
-     gloo workers run a single ``_run_train_step`` each, train ranks
-     emit packed slot tensors, the episodic rank drains via
-     ``dist.gather``. Asserts cache_len matches the number of valid
-     rows produced and the controller_query_queue has the same length.
+     gloo workers run ``_run_train_step``; train ranks publish ring events,
+     and the episodic rank drains them after a barrier. Asserts cache_len
+     matches the number of valid rows produced and the controller_query_queue
+     has the same length.
 
 Tests 1-6 run single-process. Test 7 uses ``mp.spawn`` + gloo because
-that's the only way to exercise the ``dist.gather`` collective without
-real CUDA — and it's the load-bearing test for the IPC end-to-end.
+that's the cheapest way to exercise cross-process POSIX shm ring attachment
+and the all-rank gradient collective without real CUDA.
 """
 from __future__ import annotations
 
@@ -133,10 +131,8 @@ class TestEpisodicConsumerHelper(unittest.TestCase):
             self.assertIsNone(consumer.cache)
             self.assertEqual(consumer.controller_query_queue, [])
 
-    def test_consumer_state_no_longer_has_write_rings(self):
-        """Pass C dropped the ``write_rings`` field. Pin the rename so
-        any code reaching for the old attribute fails loudly.
-        """
+    def test_consumer_state_tracks_async_write_rings(self):
+        """Async write-ring fields are present and no-op when disabled."""
         mod = _load_runner_module()
         consumer = mod._attach_episodic_consumer(
             episodic_enabled=False,
@@ -146,7 +142,9 @@ class TestEpisodicConsumerHelper(unittest.TestCase):
             model_dim=4,
             all_group=None,
         )
-        self.assertFalse(hasattr(consumer, "write_rings"))
+        self.assertTrue(hasattr(consumer, "write_rings"))
+        self.assertEqual(consumer.write_rings, [])
+        self.assertEqual(consumer.write_ring_names, [])
         self.assertTrue(hasattr(consumer, "controller_query_queue"))
         self.assertTrue(hasattr(consumer, "cache"))
         self.assertTrue(hasattr(consumer, "heartbeat"))
@@ -387,13 +385,13 @@ def _gpu_drain_test_worker(
     key_rep_dim: int,
     k_max: int,
 ) -> None:
-    """4-rank gloo end-to-end smoke for the GPU IPC path.
+    """4-rank gloo end-to-end smoke for the async WRITE_EVENT path.
 
     Each train rank (0/1/2) runs one ``_run_train_step`` with a real
-    forward+backward; the episodic rank (3) skips main, calls
-    ``dist.gather`` as the destination, drains into the cache + queue,
-    and participates in the SUM all-reduce. Asserts both consumer-side
-    counters end up positive (cache filled, queue grew).
+    forward+backward and publishes write events; the episodic rank (3) skips
+    main and participates in the SUM all-reduce. After a barrier it drains the
+    rings into the cache + queue. Asserts both consumer-side counters end up
+    positive (cache filled, queue grew).
     """
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = str(master_port)
@@ -416,9 +414,8 @@ def _gpu_drain_test_worker(
         all_group = dist.new_group(list(range(world_size)))
 
         model = _TinyTokenTrainModel()
-        # Episodic rank's emit handle stays all-zeros; train ranks pack
-        # into theirs. Same K_max + slot_dim across all ranks → gather
-        # symmetric shape.
+        # Train ranks publish WRITE_EVENT rings; the episodic rank's handle is
+        # a no-op for write transport.
         emit_config = {
             "episodic_enabled": True,
             "episodic_span_length": span_length,
@@ -485,28 +482,39 @@ def _gpu_drain_test_worker(
         dist.barrier(group=all_group)
 
         if is_episodic_rank:
+            drained = mod._drain_episodic_write_rings(
+                consumer=consumer,
+                current_step=n_steps,
+                embedding_version=0,
+            )
             with open(result_path + f".{rank}", "w") as fh:
                 fh.write(
                     f"cache_len={len(consumer.cache)}\n"
                     f"heartbeat={consumer.heartbeat[0]}\n"
                     f"query_queue_len={len(consumer.controller_query_queue)}\n"
+                    f"drained={drained}\n"
                 )
         else:
             with open(result_path + f".{rank}", "w") as fh:
                 fh.write("ok\n")
     finally:
+        try:
+            mod._cleanup_episodic_event_rings(emit_handle)
+            mod._cleanup_episodic_event_rings(consumer)
+        except Exception:
+            pass
         if dist.is_initialized():
             dist.destroy_process_group()
 
 
 class TestEpisodicGpuDrainEndToEnd(unittest.TestCase):
-    """4-rank gloo coverage for the gather-based episodic IPC end-to-end."""
+    """4-rank gloo coverage for async episodic write IPC end-to-end."""
 
     def test_4rank_gloo_end_to_end(self):
-        """3 train ranks emit packed slot tensors; episodic rank drains
+        """3 train ranks emit ring events; episodic rank drains
         into the cache + queue. After 3 steps:
 
-          - cache_len > 0 (some valid slots survived the gather)
+          - cache_len > 0 (some valid WRITE_EVENTs were drained)
           - heartbeat == n_steps (drain ran every step)
           - query_queue_len == cache_len (one queue entry per cache append)
         """
@@ -534,6 +542,7 @@ class TestEpisodicGpuDrainEndToEnd(unittest.TestCase):
             cache_len = int(kv["cache_len"])
             heartbeat = int(kv["heartbeat"])
             queue_len = int(kv["query_queue_len"])
+            drained = int(kv["drained"])
             self.assertEqual(
                 heartbeat, n_steps,
                 f"episodic-rank heartbeat advances once per step; got "
@@ -544,6 +553,7 @@ class TestEpisodicGpuDrainEndToEnd(unittest.TestCase):
                 "cache should hold at least one valid slot end-to-end; "
                 f"got {cache_len}",
             )
+            self.assertEqual(drained, cache_len)
             # Phase 1 contract: every cache append also pushes a queue
             # entry. Pin them to be equal so a missing routing branch
             # would surface here.

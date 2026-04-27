@@ -83,6 +83,7 @@ def test_eviction_trace_records_displaced_slot():
             "evicted_utility_at_eviction",
             "evicted_write_step",
             "evicted_last_fired_step",
+            "evicted_protection_score",
             "gpu_step",
             "displacing_candidate_id",
             "displacing_key_fp",
@@ -94,6 +95,7 @@ def test_eviction_trace_records_displaced_slot():
         assert row["evicted_utility_at_eviction"] == 1.0  # init utility
         assert row["evicted_write_step"] == 10
         assert row["evicted_last_fired_step"] == -1  # never fired
+        assert row["evicted_protection_score"] == 0.0
         assert row["gpu_step"] == 20
         assert row["displacing_candidate_id"] == (7 << 56) | 42
         assert row["displacing_key_fp"] == 99

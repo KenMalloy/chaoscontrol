@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import hashlib
 import json
 import math
 import os
@@ -1294,15 +1295,12 @@ def _run_scopt_train_step(
 # Episodic-cache GPU-resident IPC (Perf Pass C)
 # ---------------------------------------------------------------------------
 #
-# Replaces the POSIX shm SPSC ring path from Phase 1 Tasks 1.4 + 1.5. A
-# train rank with ``episodic_enabled=True`` now packs its selected write
-# + query payloads into a single contiguous fp32 tensor of shape
-# ``[K_max, slot_dim]`` and emits via ``dist.gather(dst=N-1)``. The
-# episodic rank receives, filters by ``valid_mask``, and routes each
-# valid slot to (a) ``cache.append`` for the write side and (b) a
-# Python list ``controller_query_queue`` for Phase 2 query handling.
-# Slot layout lives in ``chaoscontrol.episodic.gpu_slot``; design doc
-# is ``docs/plans/2026-04-25-perf-pass-c-gpu-resident-ipc.md``.
+# Async episodic write transport. Train ranks publish WRITE_EVENT wire records
+# into per-rank POSIX shm SPSC rings and continue; the episodic rank drains on
+# memory's own clock and routes records to (a) ``cache.append`` and (b) the
+# controller query queue. The old per-step ``dist.gather`` was intentionally
+# removed from the trunk path: write memory may drop or lag, but it may not
+# stall the SSM train ranks.
 
 # Default K_max for the per-rank emit tensor. At Phase 1 ``top_p ≈
 # 1/(B*T)`` the typical valid-row count is 1-2 per step; K_max=16 leaves
@@ -1310,8 +1308,40 @@ def _run_scopt_train_step(
 _DEFAULT_EPISODIC_K_MAX = 16
 
 
-def _event_ring_name(prefix: str, *, rank: int | None = None) -> str:
+def _event_ring_namespace(config: dict[str, Any] | None = None) -> str:
+    """Return a short cross-rank namespace for POSIX shm event rings.
+
+    Train/episodic ranks run in separate processes, so PID-scoped names are
+    only useful for single-process tests. The async write path needs every rank
+    to derive the same per-run namespace without an extra rendezvous. Prefer an
+    explicit config/env id; fall back to torchrun's shared MASTER_PORT; finally
+    fall back to the local PID for direct unit-test calls.
+    """
+    raw = None
+    if config is not None:
+        raw = config.get("episodic_event_ring_id")
+    if raw is None:
+        raw = (
+            os.environ.get("CHAOSCONTROL_EPISODIC_RING_ID")
+            or os.environ.get("TORCHELASTIC_RUN_ID")
+            or os.environ.get("MASTER_PORT")
+        )
+    if raw is None:
+        raw = f"pid{os.getpid()}"
+    return hashlib.sha1(str(raw).encode("utf-8")).hexdigest()[:8]
+
+
+def _event_ring_name(
+    prefix: str,
+    *,
+    rank: int | None = None,
+    namespace: str | None = None,
+) -> str:
     pid = int(os.getpid())
+    if namespace is not None:
+        if rank is None:
+            return f"{prefix}_{namespace}"
+        return f"{prefix}_{namespace}_r{int(rank)}"
     if rank is None:
         return f"{prefix}_pid{pid}"
     exact = f"{prefix}_rank{int(rank)}_pid{pid}"
@@ -1361,6 +1391,23 @@ def _u64_wire(value: int, *, sentinel: int = (1 << 64) - 1) -> int:
 
 
 def _cleanup_episodic_event_rings(owner: Any) -> None:
+    write_ring_names = getattr(owner, "write_ring_names", None)
+    if write_ring_names:
+        for name in write_ring_names:
+            try:
+                _ext.ShmRingWriteEvent.unlink(str(name))
+            except Exception:
+                pass
+    if hasattr(owner, "write_rings"):
+        try:
+            owner.write_rings = []
+        except Exception:
+            pass
+    if hasattr(owner, "write_ring_names"):
+        try:
+            owner.write_ring_names = []
+        except Exception:
+            pass
     for name_attr, ring_attr, cls in (
         ("write_ring_name", "write_ring", _ext.ShmRingWriteEvent),
         ("query_ring_name", "query_ring", _ext.ShmRingQueryEvent),
@@ -1514,8 +1561,8 @@ class EpisodicGpuEmit:
     each step before pack), the slot-format dimensions (S, D), the
     fingerprint window, and the configured ``top_p`` (or NaN sentinel
     for "use ``1/(B*T)`` default"). The episodic rank does NOT receive
-    this handle — it allocates its own ``gather_list`` of empty
-    ``[K_max, slot_dim]`` tensors via ``_drain_episodic_payloads_gpu``.
+    this handle — WRITE_EVENT wire records move through per-train-rank
+    ``ShmRingWriteEvent`` rings instead.
 
     Plain ``__slots__`` class (not a ``@dataclass``) for the same
     importlib-from-spec compatibility reason ``_ScOptPending`` and the
@@ -1535,6 +1582,8 @@ class EpisodicGpuEmit:
         "write_ring",
         "write_ring_name",
         "write_ring_drops",
+        "async_write_rings_enabled",
+        "event_ring_namespace",
         "controller_action_space",
         "controller_action_trace_log",
     )
@@ -1550,6 +1599,8 @@ class EpisodicGpuEmit:
         top_p: float,
         write_ring: Any | None = None,
         write_ring_name: str | None = None,
+        async_write_rings_enabled: bool = False,
+        event_ring_namespace: str | None = None,
         controller_action_space: ConstrainedActionSpace | None = None,
         controller_action_trace_log: Any | None = None,
     ) -> None:
@@ -1562,6 +1613,8 @@ class EpisodicGpuEmit:
         self.write_ring = write_ring
         self.write_ring_name = write_ring_name
         self.write_ring_drops = 0
+        self.async_write_rings_enabled = bool(async_write_rings_enabled)
+        self.event_ring_namespace = event_ring_namespace
         self.controller_action_space = controller_action_space
         self.controller_action_trace_log = controller_action_trace_log
 
@@ -1576,11 +1629,10 @@ def _create_episodic_emit(
     """Build the per-rank emit-tensor handle.
 
     Returns the handle on every rank when ``episodic_enabled=True`` and
-    ``world_size > 1``. Both train ranks and the episodic rank carry
-    their own emit tensor — the train ranks pack into theirs, the
-    episodic rank's stays all-zeros (its valid_mask=0 rows contribute
-    no cache writes, but the gather collective is symmetric and every
-    rank must contribute the same shape).
+    ``world_size > 1``. Train ranks carry a local slot tensor for the
+    historical single-process pack tests and, in the production path, publish
+    WRITE_EVENT records into async rings. The episodic rank returns a no-op
+    emit handle and never participates in write transport.
 
     Returns ``None`` for ``episodic_enabled=False`` or ``world_size <=
     1`` so the caller's ``handle is None`` check is the back-compat
@@ -1618,18 +1670,27 @@ def _create_episodic_emit(
     # to signal "use the per-step default".
     top_p = float(config.get("episodic_top_p", float("nan")))
     event_log_enabled = bool(config.get("episodic_event_log_enabled", False))
-    # WRITE_EVENT producers live on train ranks. The episodic rank carries an
-    # all-zero gather tensor only, so allocating a ring there would be a false
-    # signal and would violate the default "no producer unless enabled"
-    # invariant.
+    async_write_rings_enabled = bool(
+        config.get("episodic_async_write_rings_enabled", True)
+    )
+    ring_namespace = _event_ring_namespace(config)
+    # WRITE_EVENT producers live on train ranks. Async rings are the memory
+    # write transport, not just an offline log: train ranks publish-or-drop and
+    # keep going; the episodic side drains on its own clock. The legacy
+    # `episodic_event_log_enabled` flag still allocates the same ring for tests
+    # and wire-event logging, but ring creation no longer depends on it.
     write_ring = None
     write_ring_name = None
     controller_action_trace_log = None
     controller_action_space = None
-    if event_log_enabled and int(rank) != int(world_size) - 1:
+    if (
+        (async_write_rings_enabled or event_log_enabled)
+        and int(rank) != int(world_size) - 1
+    ):
         write_ring_name = _event_ring_name(
-            "/cc_episodic_write",
+            "/cc_e_w",
             rank=int(rank),
+            namespace=ring_namespace,
         )
         write_ring = _create_event_ring(_ext.ShmRingWriteEvent, write_ring_name)
     if (
@@ -1654,6 +1715,8 @@ def _create_episodic_emit(
         top_p=top_p,
         write_ring=write_ring,
         write_ring_name=write_ring_name,
+        async_write_rings_enabled=async_write_rings_enabled,
+        event_ring_namespace=ring_namespace,
         controller_action_space=controller_action_space,
         controller_action_trace_log=controller_action_trace_log,
     )
@@ -1793,19 +1856,15 @@ def _emit_episodic_payloads_gpu(
     current_step: int = 0,
     write_bucket: int = 0,
 ) -> None:
-    """Train-rank emit: pack the slot tensor and call ``dist.gather``.
+    """Train-rank emit: pack selected writes and publish WRITE_EVENTs.
 
-    Only train ranks reach this function (the episodic rank's
-    ``is_episodic_rank`` branch in ``_run_train_step`` calls
-    ``dist.gather`` directly with its own ``gather_list``). Train ranks
-    pass ``gather_list=None`` to ``dist.gather`` so they emit-only.
-
-    The gather is a hard sync point across all ranks; train ranks block
-    here until the episodic rank also reaches its gather call. Packing
-    is a Python loop over ``select_top_p_positions``'s output (K is
-    small — default ``top_p ≈ 1/(B*T)`` produces 1-2 valid rows per
-    step). Boundary-dropped positions stay at ``valid_mask=0`` so the
-    drain's filter skips them.
+    The trunk SSM invariant is publish-or-drop, never wait. This helper keeps
+    the historical ``slot_tensor`` populated for unit tests and local
+    inspection, but the cross-rank transport is the per-rank
+    ``ShmRingWriteEvent``. A full ring increments ``write_ring_drops`` and the
+    train step continues. ``all_group`` is accepted for old call sites but is
+    intentionally unused: memory writes must not introduce a train-step
+    collective.
     """
     T = int(inputs.size(1))
     pressure_full = _right_pad_per_token_signal(pressure, T)
@@ -1923,18 +1982,7 @@ def _emit_episodic_payloads_gpu(
                     write_bucket=int(write_bucket),
                 ),
             )
-    # Single GPU-to-GPU collective. Train ranks emit-only — they pass
-    # ``gather_list=None`` to ``dist.gather`` and the episodic rank
-    # holds the receive list. ``all_group is None`` is the single-rank
-    # test path: callers inspect ``emit.slot_tensor`` directly without
-    # a collective.
-    if all_group is not None:
-        dist.gather(
-            emit.slot_tensor,
-            gather_list=None,
-            dst=int(world_size) - 1,
-            group=all_group,
-        )
+    _ = (world_size, all_group)
 
 
 class _EpisodicConsumerState:
@@ -1943,16 +1991,10 @@ class _EpisodicConsumerState:
     Constructed by ``_attach_episodic_consumer`` once per runner init. The
     no-op shape (``cache=None``, ``heartbeat=[0]``,
     ``controller_query_queue=[]``, ``tagged_replay_queue=[]``) is what
-    the train ranks and ``episodic_enabled=False`` runs see so the
-    ``_run_train_step`` consumer branch is bit-identical to pre-Pass-C
-    on those code paths.
-
-    Pass C dropped the ``write_rings`` field — the new path uses
-    ``dist.gather`` instead of POSIX shm rings, so there are no rings to
-    track on the consumer side. The ``controller_query_queue`` is the
-    in-process Python list that the Phase 2 CPU controller reads from;
-    Phase 1's drain just appends one entry per valid slot per step and
-    exposes the list to the runner for telemetry.
+    the train ranks and ``episodic_enabled=False`` runs see so those code
+    paths stay cheap. The episodic rank owns lazy-attached write rings and the
+    in-process Python ``controller_query_queue`` that the CPU controller reads
+    from.
 
     Phase 2 added ``tagged_replay_queue``: the controller's output. The
     Y worktree's Phase 3 replay path drains this list each episodic-rank
@@ -1971,6 +2013,14 @@ class _EpisodicConsumerState:
         "controller_query_queue",
         "controller_query_enabled",
         "tagged_replay_queue",
+        "write_ring_names",
+        "write_rings",
+        "write_ring_attach_misses",
+        "write_ring_events_drained",
+        "write_ring_event_age_sum",
+        "write_ring_event_age_max",
+        "write_ring_max_drain_per_step",
+        "write_ring_lock",
         "query_ring",
         "query_ring_name",
         "query_ring_drops",
@@ -1996,6 +2046,8 @@ class _EpisodicConsumerState:
         episodic_event_log_enabled: bool = False,
         compute_replay_ce_pair: bool = False,
         controller_action_space_enabled: bool = False,
+        write_ring_names: list[str] | None = None,
+        write_ring_max_drain_per_step: int = 4096,
     ) -> None:
         self.cache = cache
         self.heartbeat = heartbeat
@@ -2015,6 +2067,16 @@ class _EpisodicConsumerState:
         self.tagged_replay_queue = (
             [] if tagged_replay_queue is None else tagged_replay_queue
         )
+        self.write_ring_names = list(write_ring_names or [])
+        self.write_rings: list[Any | None] = [None for _ in self.write_ring_names]
+        self.write_ring_attach_misses = 0
+        self.write_ring_events_drained = 0
+        self.write_ring_event_age_sum = 0
+        self.write_ring_event_age_max = 0
+        self.write_ring_max_drain_per_step = max(
+            0, int(write_ring_max_drain_per_step)
+        )
+        self.write_ring_lock = threading.RLock()
         self.query_ring = None
         self.query_ring_name: str | None = None
         self.query_ring_drops = 0
@@ -2090,12 +2152,12 @@ def _attach_episodic_consumer(
     capacity=4096, span_length=4, key_rep_dim=model_dim,
     grace_steps=1000, utility_ema_decay=0.99. The
     ``controller_query_queue`` starts empty and grows one entry per
-    valid slot per gather drain.
+    valid async write when controller querying is enabled.
 
-    Pass C: the producer/consumer rendezvous from the POSIX shm path is
-    gone — the gather collective is its own implicit barrier, and there
-    are no shm segments to attach to. The ``all_group`` parameter is
-    accepted (for back-compat with the call site) but unused.
+    Async write transport: train ranks publish WRITE_EVENTs into stable
+    per-rank shm rings. The episodic consumer derives the same ring names and
+    attaches lazily, so there is no init-time barrier and no train-step gather.
+    The ``all_group`` parameter is accepted for older call sites but unused.
     """
     no_op = _EpisodicConsumerState(
         cache=None,
@@ -2124,6 +2186,22 @@ def _attach_episodic_consumer(
         slot_state_dim=int(config.get("episodic_slot_state_dim", 0)),
         simplex_k_max=int(config.get("episodic_simplex_k_max", 0)),
     )
+    async_write_rings_enabled = bool(
+        config.get("episodic_async_write_rings_enabled", True)
+    )
+    ring_namespace = _event_ring_namespace(config)
+    write_ring_names = (
+        [
+            _event_ring_name(
+                "/cc_e_w",
+                rank=r,
+                namespace=ring_namespace,
+            )
+            for r in range(max(0, int(world_size) - 1))
+        ]
+        if async_write_rings_enabled
+        else []
+    )
     return _EpisodicConsumerState(
         cache=cache,
         heartbeat=[0],
@@ -2139,6 +2217,10 @@ def _attach_episodic_consumer(
         ),
         controller_action_space_enabled=bool(
             config.get("episodic_controller_action_space_enabled", False)
+        ),
+        write_ring_names=write_ring_names,
+        write_ring_max_drain_per_step=int(
+            config.get("episodic_write_ring_max_drain_per_step", 4096)
         ),
     )
 
@@ -2167,6 +2249,100 @@ class _EpisodicControllerHandle:
         self.thread = thread
         self.stop_event = stop_event
         self.heartbeat = heartbeat
+
+
+class _EpisodicWriteDrainHandle:
+    """Daemon handle for async WRITE_EVENT ring consumption."""
+
+    __slots__ = ("thread", "stop_event", "heartbeat")
+
+    def __init__(
+        self,
+        thread: threading.Thread,
+        stop_event: threading.Event,
+        heartbeat: list[int],
+    ) -> None:
+        self.thread = thread
+        self.stop_event = stop_event
+        self.heartbeat = heartbeat
+
+
+def _write_drain_main(
+    *,
+    consumer: _EpisodicConsumerState,
+    stop_event: threading.Event,
+    idle_sleep_s: float,
+    embedding_version_ref: list[int],
+    controller_score_mode: str,
+    controller_topk_k: int,
+    heartbeat: list[int],
+) -> None:
+    current_step = 0
+    while not stop_event.is_set():
+        drained = _drain_episodic_write_rings(
+            consumer=consumer,
+            current_step=int(current_step),
+            embedding_version=int(embedding_version_ref[0]),
+            controller_score_mode=str(controller_score_mode),
+            controller_topk_k=int(controller_topk_k),
+        )
+        current_step += 1
+        heartbeat[0] += 1
+        if drained == 0 and stop_event.wait(timeout=float(idle_sleep_s)):
+            break
+
+
+def _spawn_episodic_write_drain(
+    *,
+    consumer: _EpisodicConsumerState,
+    is_episodic_rank: bool,
+    episodic_enabled: bool,
+    config: dict[str, Any],
+    embedding_version_ref: list[int],
+) -> _EpisodicWriteDrainHandle | None:
+    if not episodic_enabled or not is_episodic_rank:
+        return None
+    if consumer.cache is None or not consumer.write_ring_names:
+        return None
+    stop_event = threading.Event()
+    heartbeat = [0]
+    thread = threading.Thread(
+        target=_write_drain_main,
+        kwargs={
+            "consumer": consumer,
+            "stop_event": stop_event,
+            "idle_sleep_s": float(
+                config.get("episodic_write_ring_idle_sleep_s", 0.001)
+            ),
+            "embedding_version_ref": embedding_version_ref,
+            "controller_score_mode": str(
+                _controller_score_mode_from_config(config)
+            ),
+            "controller_topk_k": int(
+                config.get("episodic_controller_topk_k", 16)
+            ),
+            "heartbeat": heartbeat,
+        },
+        daemon=True,
+        name="episodic_write_drain",
+    )
+    thread.start()
+    return _EpisodicWriteDrainHandle(
+        thread=thread,
+        stop_event=stop_event,
+        heartbeat=heartbeat,
+    )
+
+
+def _shutdown_episodic_write_drain(
+    handle: _EpisodicWriteDrainHandle | None,
+    *,
+    timeout_s: float = 2.0,
+) -> None:
+    if handle is None:
+        return
+    handle.stop_event.set()
+    handle.thread.join(timeout=float(timeout_s))
 
 
 def _rank_prefixed_event_id(*, source_rank: int, rank_seq: int) -> int:
@@ -3084,17 +3260,10 @@ def _spawn_episodic_controller(
             "controller_query_queue": consumer.controller_query_queue,
             "tagged_replay_queue": consumer.tagged_replay_queue,
             "cache": consumer.cache,
-            # No queue_lock: the producer side
-            # (``_drain_episodic_payloads_gpu``) does plain
-            # ``list.append()`` (atomic under the GIL) and the
-            # controller's drain uses ``list.pop(0)`` (also atomic).
-            # See ``run_controller_cycle`` docstring. Locking only the
-            # controller side would not help — the producer doesn't
-            # acquire it, so a hypothetical "snapshot + clear" race
-            # would still happen. Tests pass an explicit lock for
-            # deterministic test-thread synchronization; runtime
-            # relies on GIL atomicity of single-bytecode ops.
-            "queue_lock": None,
+            # Shared cache+queue lock with the async write-drain thread.
+            # Queue ops are GIL-atomic, but cache.append and query_topk must
+            # not interleave once writes are drained off the train-step path.
+            "queue_lock": consumer.write_ring_lock,
             "stop_event": stop_event,
             "k": k,
             "score_mode": score_mode,
@@ -3249,6 +3418,144 @@ def _drain_episodic_payloads_gpu(
                     "pressure": float(unpacked["pressure"]),
                     "residual": unpacked["residual"],
                 })
+
+
+def _fp16_u16_wire_to_tensor(values: Any, *, width: int) -> torch.Tensor:
+    arr = np.asarray([int(x) for x in list(values)[:int(width)]], dtype=np.uint16)
+    if int(arr.size) < int(width):
+        arr = np.pad(arr, (0, int(width) - int(arr.size)), constant_values=0)
+    return torch.from_numpy(arr.view(np.float16).astype(np.float32, copy=True))
+
+
+def _drain_episodic_write_rings(
+    *,
+    consumer: _EpisodicConsumerState,
+    current_step: int,
+    embedding_version: int,
+    controller_score_mode: str = "cosine_utility_weighted",
+    controller_topk_k: int = 16,
+) -> int:
+    """Drain async per-train-rank WRITE_EVENT rings into cache + query queue.
+
+    This is the consumer half of the supercar invariant: memory consumes what
+    the trunk published, on memory's own clock. Missing rings, empty rings, and
+    backlog are observable state, never a reason for a train-rank collective.
+    """
+    if consumer.cache is None or not consumer.write_ring_names:
+        return 0
+    cache = consumer.cache
+    drained = 0
+    max_events = int(consumer.write_ring_max_drain_per_step)
+    with consumer.write_ring_lock:
+        for idx, name in enumerate(consumer.write_ring_names):
+            ring = consumer.write_rings[idx]
+            if ring is None:
+                try:
+                    ring = _ext.ShmRingWriteEvent.attach(str(name))
+                except Exception:
+                    consumer.write_ring_attach_misses += 1
+                    continue
+                consumer.write_rings[idx] = ring
+            while max_events <= 0 or drained < max_events:
+                event = ring.pop()
+                if event is None:
+                    break
+                source_rank = int(event["source_rank"])
+                write_step = int(event["gpu_step"])
+                write_bucket = int(event["write_bucket"])
+                pressure = float(event["pressure_at_write"])
+                pre_write_ce = float(event["pre_write_ce"])
+                key_rep = _fp16_u16_wire_to_tensor(
+                    event["key_rep"],
+                    width=int(cache.key_rep_dim),
+                )
+                value_tok_ids = torch.tensor(
+                    [int(x) for x in list(event["value_tok_ids"])[:cache.span_length]],
+                    dtype=torch.int64,
+                )
+                if int(value_tok_ids.numel()) < int(cache.span_length):
+                    value_tok_ids = torch.cat(
+                        [
+                            value_tok_ids,
+                            torch.zeros(
+                                int(cache.span_length) - int(value_tok_ids.numel()),
+                                dtype=torch.int64,
+                            ),
+                        ]
+                    )
+                protection_score = _protection_score_for_write(
+                    action_space=getattr(consumer, "controller_action_space", None),
+                    current_step=int(write_step),
+                    write_bucket=int(write_bucket),
+                    pressure=pressure,
+                    ce=pre_write_ce,
+                    score=pressure * pre_write_ce,
+                )
+                appended_slot = cache.append(
+                    key_fp=int(event["key_fp"]),
+                    key_rep=key_rep,
+                    value_tok_ids=value_tok_ids,
+                    value_anchor_id=int(event["value_anchor_id"]),
+                    current_step=int(write_step),
+                    embedding_version=int(embedding_version),
+                    pressure_at_write=pressure,
+                    source_write_id=int(event["candidate_id"]),
+                    write_bucket=int(write_bucket),
+                    displacing_candidate_id=int(event["candidate_id"]),
+                    protection_score=float(protection_score),
+                )
+                candidate_slot_ids = None
+                candidate_cosines = None
+                if (
+                    consumer.query_ring is not None
+                    and consumer.rank_query_seq is not None
+                ):
+                    candidate_slot_ids, candidate_cosines = (
+                        _query_event_simplex_candidates(
+                            cache=cache,
+                            query_residual=key_rep,
+                            score_mode=str(controller_score_mode),
+                            k=int(controller_topk_k),
+                        )
+                    )
+                query_event_id = _emit_query_event(
+                    consumer=consumer,
+                    source_rank=source_rank,
+                    gpu_step=write_step,
+                    query_residual=key_rep,
+                    pressure=pressure,
+                    pre_query_ce=pre_write_ce,
+                    bucket=write_bucket,
+                    candidate_slot_ids=candidate_slot_ids,
+                    candidate_cosines=candidate_cosines,
+                )
+                if consumer.controller_query_enabled:
+                    consumer.controller_query_queue.append({
+                        "step": int(write_step),
+                        "rank": int(source_rank),
+                        "k": 0,
+                        "query_event_id": int(
+                            query_event_id
+                            if query_event_id is not None
+                            else int(event["candidate_id"])
+                        ),
+                        "source_write_id": int(event["candidate_id"]),
+                        "write_bucket": int(write_bucket),
+                        "slot": int(appended_slot),
+                        "pressure": pressure,
+                        "residual": key_rep,
+                    })
+                age = max(0, int(current_step) - int(write_step))
+                consumer.write_ring_event_age_sum += int(age)
+                consumer.write_ring_event_age_max = max(
+                    int(consumer.write_ring_event_age_max),
+                    int(age),
+                )
+                drained += 1
+                consumer.write_ring_events_drained += 1
+            if max_events > 0 and drained >= max_events:
+                break
+    return int(drained)
 
 
 def _get_tagged_replay_queue(
@@ -3788,70 +4095,16 @@ def _run_train_step(
 ) -> torch.Tensor:
     _reject_unsupported(model)
     # ------------------------------------------------------------------
-    # Episodic rank: skip main, prepare slot tensor (all-zeros valid_mask),
-    # gather (as dst), drain into cache + controller queue, all-reduce.
+    # Episodic rank: skip main, optionally replay, then all-reduce. WRITE_EVENT
+    # ingestion happens on the background drain thread, not in this step body.
     # ------------------------------------------------------------------
     if is_episodic_rank:
         device = inputs.device
-        # The gather collective requires every rank to contribute a
-        # tensor of identical shape and dtype. The episodic rank's
-        # contribution is all zeros (valid_mask=0 for every k), so the
-        # train ranks' valid slots are the only ones that survive the
-        # drain's filter. Allocate from the emit handle when present
-        # (Pass C convention: the runner builds an emit handle on every
-        # rank including the episodic one); fall back to a zero tensor
-        # of the same shape if the caller forgot to thread an emit
-        # handle through.
-        if episodic_emit is not None:
-            episodic_emit.slot_tensor.zero_()
-            slot_self = episodic_emit.slot_tensor
-            k_max = int(episodic_emit.k_max)
-            span_length = int(episodic_emit.span_length)
-            key_rep_dim = int(episodic_emit.key_rep_dim)
-        else:
-            slot_self = None
-            k_max = 0
-            span_length = 0
-            key_rep_dim = 0
-        # Gather: episodic rank is the destination, allocates the
-        # gather_list. Train ranks pass gather_list=None.
-        gather_list: list[torch.Tensor] | None = None
-        if (
-            slot_self is not None
-            and ddp_active
-            and world_size > 1
-            and all_group is not None
-        ):
-            gather_list = [
-                torch.zeros_like(slot_self) for _ in range(int(world_size))
-            ]
-            dist.gather(
-                slot_self,
-                gather_list=gather_list,
-                dst=int(world_size) - 1,
-                group=all_group,
-            )
-        # Drain: filter by valid_mask, route each surviving row to
-        # ``cache.append`` and the controller queue. Drain runs BEFORE
-        # the all-reduce so the cache state is up to date before the
-        # optimizer step (Phase 3+ replay backward will read the cache
-        # post-drain).
-        if (
-            episodic_consumer is not None
-            and episodic_consumer.cache is not None
-            and gather_list is not None
-        ):
-            _drain_episodic_payloads_gpu(
-                consumer=episodic_consumer,
-                gather_list=gather_list,
-                span_length=span_length,
-                key_rep_dim=key_rep_dim,
-                k_max=k_max,
-                current_step=int(current_step),
-                embedding_version=int(embedding_version),
-                controller_score_mode=str(episodic_controller_score_mode),
-                controller_topk_k=int(episodic_controller_topk_k),
-            )
+        # Async WRITE_EVENT rings replaced the per-step dist.gather. The
+        # episodic step body no longer receives train-rank writes here; a
+        # daemon write-drain thread consumes the rings and mutates the cache on
+        # memory's own clock. This branch stays in the collective path only for
+        # gradient/replay semantics, never for write admission.
         # Phase 3.1: drain ``tagged_replay_queue`` (X's controller
         # fills it during Phase 2). Each tagged slot triggers one
         # replay backward; grads accumulate into ``param.grad`` so
@@ -3867,16 +4120,22 @@ def _run_train_step(
         # any DW signal. Single-process unit tests override the kwarg
         # explicitly.
         if episodic_consumer is not None and episodic_consumer.cache is not None:
-            _run_episodic_replay_from_tagged_queue(
-                consumer=episodic_consumer,
-                model=model,
-                current_step=int(current_step),
-                weight=float(dreamworld_weight),
-                lm_head_backward_mode=lm_head_backward_mode,
-                lm_head_tile_size=int(lm_head_tile_size),
-                logger=episodic_replay_logger,
-                max_replays_per_step=int(episodic_replay_max_replays_per_step),
+            write_lock = getattr(
+                episodic_consumer,
+                "write_ring_lock",
+                contextlib.nullcontext(),
             )
+            with write_lock:
+                _run_episodic_replay_from_tagged_queue(
+                    consumer=episodic_consumer,
+                    model=model,
+                    current_step=int(current_step),
+                    weight=float(dreamworld_weight),
+                    lm_head_backward_mode=lm_head_backward_mode,
+                    lm_head_tile_size=int(lm_head_tile_size),
+                    logger=episodic_replay_logger,
+                    max_replays_per_step=int(episodic_replay_max_replays_per_step),
+                )
         if episodic_consumer is not None:
             episodic_consumer.heartbeat[0] += 1
         # Train ranks reach the all-reduce after backward; the episodic
@@ -3898,7 +4157,7 @@ def _run_train_step(
             )
         return torch.zeros((), device=device, dtype=torch.float32)
     # ------------------------------------------------------------------
-    # Train rank: forward + backward, pack slot tensor, gather, all-reduce.
+    # Train rank: forward + backward, publish WRITE_EVENT records, all-reduce.
     # ------------------------------------------------------------------
     # Per-token CE is captured only when the episodic producer is wired —
     # the standard fast path stays on ``fused_lm_head_backward`` (which
@@ -4020,10 +4279,9 @@ def _run_train_step(
                 for p in model.parameters():
                     if p.grad is not None:
                         p.grad.mul_(inv_n_train)
-                # Pack slot tensor + gather BEFORE the SUM all-reduce
-                # per the design doc order. ``episodic_emit is None`` on
-                # ``episodic_enabled=False`` runs, in which case the
-                # gather is skipped entirely (back-compat).
+                # Publish WRITE_EVENT records before the SUM all-reduce. This
+                # is a local ring push only: no memory-side collective may sit
+                # in the train-rank critical path.
                 if episodic_emit is not None:
                     if per_token_ce_for_episodic is None:
                         # Non-fused LM-head modes don't return per-token
@@ -4600,6 +4858,10 @@ def train_fast_for_budget(
     episodic_utility_ema_decay: float = 0.99,
     controller_query_enabled: bool = False,
     episodic_event_log_enabled: bool = False,
+    episodic_async_write_rings_enabled: bool = True,
+    episodic_event_ring_id: str | None = None,
+    episodic_write_ring_max_drain_per_step: int = 4096,
+    episodic_write_ring_idle_sleep_s: float = 0.001,
     episodic_compute_replay_ce_pair: bool = False,
     episodic_controller_score_mode: str = "cosine_utility_weighted",
     episodic_controller_topk_k: int = 16,
@@ -4817,13 +5079,11 @@ def train_fast_for_budget(
         _action_space_config["episodic_controller_head_max_delta"] = dict(
             episodic_controller_head_max_delta
         )
-    # Pass C — episodic-rank consumer init. Builds the cache and the
-    # in-process controller_query_queue on the episodic rank only; on
-    # train ranks and ``episodic_enabled=False`` the helper returns the
-    # no-op state and the runner's outer loop treats it as a skip. No
-    # init-time barrier is needed under Pass C: the per-step
-    # ``dist.gather`` is itself the rendezvous, and there's no shm to
-    # coordinate.
+    # Episodic-rank consumer init. Builds the cache, in-process controller
+    # queues, and lazy async write-ring attachment names on the episodic rank
+    # only; train ranks and ``episodic_enabled=False`` get the no-op state.
+    # No init-time barrier is needed because ring attach retries are
+    # opportunistic and train ranks never wait for the memory side.
     _model_dim_for_episodic = (
         int(getattr(model, "dim", 0))
         or int(getattr(model.lm_head, "in_features", 0))
@@ -4841,6 +5101,13 @@ def train_fast_for_budget(
         "episodic_fingerprint_window": int(episodic_fingerprint_window),
         "controller_query_enabled": bool(controller_query_enabled),
         "episodic_event_log_enabled": bool(episodic_event_log_enabled),
+        "episodic_async_write_rings_enabled": bool(
+            episodic_async_write_rings_enabled
+        ),
+        "episodic_event_ring_id": episodic_event_ring_id,
+        "episodic_write_ring_max_drain_per_step": int(
+            episodic_write_ring_max_drain_per_step
+        ),
         "episodic_compute_replay_ce_pair": bool(
             episodic_compute_replay_ce_pair
         ),
@@ -4861,6 +5128,8 @@ def train_fast_for_budget(
     # guards have fired — that way a config-validation raise can't
     # leak a running daemon thread.
     episodic_controller_handle: _EpisodicControllerHandle | None = None
+    episodic_write_drain_handle: _EpisodicWriteDrainHandle | None = None
+    episodic_embedding_version_ref = [0]
     _episodic_controller_config = {
         "episodic_controller_score_mode": str(episodic_controller_score_mode),
         "episodic_controller_topk_k": int(episodic_controller_topk_k),
@@ -4905,6 +5174,9 @@ def train_fast_for_budget(
         ),
         "episodic_controller_history_entries": int(
             episodic_controller_history_entries
+        ),
+        "episodic_write_ring_idle_sleep_s": float(
+            episodic_write_ring_idle_sleep_s
         ),
         **_action_space_config,
     }
@@ -5201,13 +5473,10 @@ def train_fast_for_budget(
             batch_sampler=batch_sampler,
         )
 
-    # Episodic-cache GPU emit handle (Perf Pass C). Replaces the POSIX
-    # shm ring setup from Phase 1 Tasks 1.4 + 1.5. Every rank (train AND
-    # episodic) gets its own ``[K_max, slot_dim]`` slot tensor for the
-    # ``dist.gather`` collective; train ranks pack into theirs, the
-    # episodic rank's stays all-zeros (the gather symmetric-shape
-    # requirement). Returns ``None`` for ``episodic_enabled=False`` or
-    # ``world_size == 1`` runs.
+    # Episodic write emit handle. Train ranks get a local slot tensor for
+    # pack-test compatibility plus a WRITE_EVENT ring producer; the episodic
+    # rank gets a no-op handle. Returns ``None`` for ``episodic_enabled=False``
+    # or ``world_size == 1`` runs.
     episodic_emit_handle: EpisodicGpuEmit | None = None
     if episodic_enabled:
         # Default ``episodic_key_rep_dim`` to the model's hidden dim if
@@ -5231,6 +5500,10 @@ def train_fast_for_budget(
             "episodic_key_rep_dim": resolved_key_rep_dim,
             "episodic_k_max": int(episodic_k_max),
             "episodic_event_log_enabled": bool(episodic_event_log_enabled),
+            "episodic_async_write_rings_enabled": bool(
+                episodic_async_write_rings_enabled
+            ),
+            "episodic_event_ring_id": episodic_event_ring_id,
             "model_dim": resolved_key_rep_dim,
             **_action_space_config,
         }
@@ -5241,13 +5514,20 @@ def train_fast_for_budget(
             config=emit_config,
         )
 
-    # Phase 2: spawn the CPU controller thread on the episodic rank
-    # when controller_query_enabled=True. Returns None on every other
-    # code path (train ranks, episodic disabled, controller flag off).
-    # The spawn lands here — AFTER all init guards have fired — so a
-    # config-validation raise above can't leak a running daemon thread.
-    # The handle is consumed by ``_shutdown_episodic_controller`` in
-    # the outer ``finally`` block.
+    # Async WRITE_EVENT consumer on the episodic rank. It starts before the
+    # controller so the query queue can fill independently of train steps.
+    episodic_write_drain_handle = _spawn_episodic_write_drain(
+        consumer=episodic_consumer,
+        is_episodic_rank=bool(is_episodic_rank),
+        episodic_enabled=bool(episodic_enabled),
+        config=_episodic_controller_config,
+        embedding_version_ref=episodic_embedding_version_ref,
+    )
+
+    # Phase 2: spawn the CPU controller thread on the episodic rank when
+    # controller_query_enabled=True. Returns None on every other code path
+    # (train ranks, episodic disabled, controller flag off). The handle is
+    # consumed by ``_shutdown_episodic_controller`` in the outer ``finally``.
     episodic_controller_handle = _spawn_episodic_controller(
         consumer=episodic_consumer,
         is_episodic_rank=bool(is_episodic_rank),
@@ -5735,6 +6015,7 @@ def train_fast_for_budget(
         # no-op. Bounded join so a stuck loop can't block the runner's
         # exit indefinitely.
         _shutdown_episodic_controller(episodic_controller_handle)
+        _shutdown_episodic_write_drain(episodic_write_drain_handle)
         _cleanup_episodic_event_rings(episodic_emit_handle)
         _cleanup_episodic_event_rings(episodic_consumer)
 
@@ -5867,6 +6148,28 @@ def train_fast_for_budget(
                 ),
                 "pending": bool(event_sleep_pending),
                 "last_decision": event_sleep_last_decision,
+                "artifact_impact": "artifact_training_only",
+            },
+            "episodic_async_writes": {
+                "enabled": bool(episodic_enabled)
+                and bool(episodic_async_write_rings_enabled),
+                "publish_drops": int(
+                    getattr(episodic_emit_handle, "write_ring_drops", 0)
+                ),
+                "drained": int(
+                    getattr(episodic_consumer, "write_ring_events_drained", 0)
+                ),
+                "attach_misses": int(
+                    getattr(episodic_consumer, "write_ring_attach_misses", 0)
+                ),
+                "max_event_age_steps": int(
+                    getattr(episodic_consumer, "write_ring_event_age_max", 0)
+                ),
+                "drain_heartbeat": int(
+                    episodic_write_drain_handle.heartbeat[0]
+                    if episodic_write_drain_handle is not None
+                    else 0
+                ),
                 "artifact_impact": "artifact_training_only",
             },
         },
@@ -6318,6 +6621,20 @@ def run_condition(
         ),
         episodic_event_log_enabled=bool(
             config.get("episodic_event_log_enabled", False)
+        ),
+        episodic_async_write_rings_enabled=bool(
+            config.get("episodic_async_write_rings_enabled", True)
+        ),
+        episodic_event_ring_id=(
+            str(config["episodic_event_ring_id"])
+            if config.get("episodic_event_ring_id") is not None
+            else None
+        ),
+        episodic_write_ring_max_drain_per_step=int(
+            config.get("episodic_write_ring_max_drain_per_step", 4096)
+        ),
+        episodic_write_ring_idle_sleep_s=float(
+            config.get("episodic_write_ring_idle_sleep_s", 0.001)
         ),
         episodic_compute_replay_ce_pair=bool(
             config.get("episodic_compute_replay_ce_pair", False)

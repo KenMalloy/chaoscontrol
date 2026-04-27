@@ -1,10 +1,9 @@
-"""Tests for the train-rank GPU emit path (Perf Pass C.2).
+"""Tests for the train-rank episodic WRITE_EVENT emit path.
 
-Replaces the POSIX-shm Phase 1 Task 1.4 producer tests
-(``test_runner_episodic_writes.py`` pre-Pass-C). The new IPC path packs
-selected (b, t) positions into a single ``[K_max, slot_dim]`` fp32
-tensor and emits via ``dist.gather`` instead of writing per-slot numpy
-structs to a per-rank SPSC ring.
+The producer keeps the historical ``[K_max, slot_dim]`` fp32 tensor for local
+pack-semantics tests, but the cross-rank path publishes WRITE_EVENT structs to
+a per-rank SPSC shm ring. There is no write-side ``dist.gather`` in the train
+step anymore.
 
 Tests:
 
@@ -16,9 +15,8 @@ Tests:
      stays bit-identical.
   3. ``test_create_episodic_emit_returns_none_on_world_size_one`` —
      ``world_size <= 1`` is a no-op (no episodic rank exists).
-  4. ``test_create_episodic_emit_works_on_episodic_rank`` — Pass C
-     allocates an emit handle on EVERY rank including the episodic rank
-     (the gather collective requires symmetric-shape contributions).
+  4. ``test_create_episodic_emit_works_on_episodic_rank`` — the episodic
+     rank still gets a no-op handle for shape compatibility, but no ring.
   5. ``test_train_step_packs_slot_tensor_when_episodic_enabled`` — after
      a single ``_run_train_step`` with no process group (single-rank
      test mode), the emit handle's slot_tensor has at least one row
@@ -39,9 +37,7 @@ Tests:
 Tests 1-4 exercise ``_create_episodic_emit`` directly without booting
 a process group. Tests 5-8 drive ``_run_train_step`` with
 ``ddp_active=False`` and ``all_group=None`` so the runner's "single-rank
-back-compat" branch packs the slot tensor without calling
-``dist.gather`` — matches the pattern used by the pre-Pass-C tests for
-Task 1.4.
+back-compat" branch packs the slot tensor without standing up a process group.
 """
 from __future__ import annotations
 
@@ -99,6 +95,7 @@ def test_create_episodic_emit_returns_handle_when_episodic_enabled() -> None:
         "episodic_span_length": 4,
         "episodic_key_rep_dim": 8,
         "episodic_k_max": 16,
+        "episodic_async_write_rings_enabled": False,
         "model_dim": 8,
     }
     handle = mod._create_episodic_emit(
@@ -141,6 +138,7 @@ def test_create_episodic_emit_returns_none_on_world_size_one() -> None:
         config={
             "episodic_enabled": True,
             "episodic_key_rep_dim": 4,
+            "episodic_async_write_rings_enabled": False,
             "model_dim": 4,
         },
     )
@@ -148,13 +146,7 @@ def test_create_episodic_emit_returns_none_on_world_size_one() -> None:
 
 
 def test_create_episodic_emit_works_on_episodic_rank() -> None:
-    """Pass C: every rank gets an emit handle, even the episodic rank.
-
-    The gather collective requires symmetric-shape contributions; the
-    episodic rank's slot_tensor stays all-zero (valid_mask=0 for every
-    k) so its contribution gets filtered out by the drain. But the
-    handle MUST exist or the gather collective hangs / mismatches shape.
-    """
+    """The episodic rank gets a no-op handle and no write ring."""
     mod = _load_runner_module()
     handle = mod._create_episodic_emit(
         rank=1,  # rank 1 of world_size=2 == episodic rank
@@ -164,11 +156,13 @@ def test_create_episodic_emit_works_on_episodic_rank() -> None:
             "episodic_enabled": True,
             "episodic_key_rep_dim": 4,
             "episodic_k_max": 8,
+            "episodic_async_write_rings_enabled": False,
             "model_dim": 4,
         },
     )
     assert handle is not None
     assert handle.slot_tensor.shape == (8, slot_dim(span_length=4, key_rep_dim=4))
+    assert handle.write_ring is None
 
 
 def test_create_episodic_emit_rejects_non_positive_k_max() -> None:
@@ -198,9 +192,8 @@ def _drive_single_train_step_with_emit(mod):
 
     Returns the populated emit handle so the caller can inspect the
     slot tensor directly. The single-rank back-compat branch in
-    ``_run_train_step`` packs the slot tensor without calling
-    ``dist.gather`` (no peer to gather with), which is the only way to
-    pin pack semantics without standing up a process group.
+    ``_run_train_step`` packs the slot tensor without standing up a process
+    group, which is the cheapest way to pin pack semantics.
     """
     torch.manual_seed(17)
     model = _TinyTokenTrainModel()
@@ -215,6 +208,7 @@ def _drive_single_train_step_with_emit(mod):
         # selectable and most of those pass the boundary check.
         "episodic_top_p": 0.5,
         "episodic_k_max": 8,
+        "episodic_async_write_rings_enabled": False,
         "model_dim": 4,
     }
     handle = mod._create_episodic_emit(
@@ -337,6 +331,7 @@ def test_emit_truncates_when_k_exceeds_k_max() -> None:
         "episodic_key_rep_dim": 4,
         "episodic_top_p": 1.0,
         "episodic_k_max": 2,
+        "episodic_async_write_rings_enabled": False,
         "model_dim": 4,
     }
     handle = mod._create_episodic_emit(

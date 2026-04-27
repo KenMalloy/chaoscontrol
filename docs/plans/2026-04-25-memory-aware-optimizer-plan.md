@@ -218,7 +218,7 @@ git commit -m "exp23: episodic rank skip-main + unconditional all-rank replay co
 
 ### Task 1.4: Wire `select_writes` into per-rank write ring
 
-> **OBSOLETED 2026-04-25 by Perf Pass C.** The POSIX shm SPSC producer rings (`episodic_write_ring_rank{R}` + `episodic_query_ring_rank{R}`) were replaced by a single `dist.gather` collective over a contiguous fp32 slot tensor; see `docs/plans/2026-04-25-perf-pass-c-gpu-resident-ipc.md` and `src/chaoscontrol/episodic/gpu_slot.py`. The original Task 1.4 commit (`exp23: train step writes payloads + query candidates to per-rank rings`) shipped first, then was supplanted by Pass C.2 (`exp23: replace POSIX shm rings with dist.gather GPU IPC`). The original ring contract doc (`docs/plans/2026-04-25-ring-contract-tasks-1-4-and-1-5.md`) is supplanted by the Pass C design doc; ring helper modules `chaoscontrol.episodic.{ipc,payload_dtypes}` keep working but carry deprecation notes for the episodic path.
+> **CURRENT 2026-04-26:** Perf Pass C's synchronous `dist.gather` replacement was retired. The trunk-throughput invariant is now explicit: train ranks publish WRITE_EVENT records into per-rank `ShmRingWriteEvent` rings and continue; the episodic rank drains asynchronously. Memory may lag/drop under backpressure, but it must not add a train-step collective.
 
 **Files:** Modify `experiments/23_fast_path/runner_fast_path.py` (in `_build_optimizer` region for ring setup; in train step body after `per_token_ce`/`pressure` are computed); test `tests/test_runner_episodic_writes.py`.
 
@@ -234,7 +234,7 @@ git commit -m "exp23: train step writes payloads + query candidates to per-rank 
 
 ### Task 1.5: Episodic rank drains write rings into the cache
 
-> **OBSOLETED 2026-04-25 by Perf Pass C.** Drain logic now reads a `[N, K_max, slot_dim]` gather receive list, filters by `valid_mask`, routes valid rows to `cache.append` AND to a Python `controller_query_queue` (collapses the separate query-candidate ring into the same channel). See `_drain_episodic_payloads_gpu` in the runner; the test that pins this end-to-end is `tests/test_runner_episodic_gpu_drain.py::test_4rank_gloo_end_to_end`.
+> **CURRENT 2026-04-26:** The live drain is `_drain_episodic_write_rings` plus the `episodic_write_drain` daemon thread in `runner_fast_path.py`. `_drain_episodic_payloads_gpu` remains only as a legacy direct-test helper for the old slot-tensor format.
 
 **Files:** Modify `experiments/23_fast_path/runner_fast_path.py` (episodic rank's per-step loop body); test `tests/test_runner_episodic_drain.py`.
 

@@ -1,6 +1,10 @@
 # Perf Pass C — GPU-resident episodic IPC
 
-> **Status:** Design draft. Implementation lands after Phase 1 (Tasks 1.4 + 1.5) merges.
+> **Status:** Superseded on 2026-04-26. This draft's `dist.gather` path proved to be a synchronous train-step bottleneck. The current runner uses async per-rank `ShmRingWriteEvent` producers plus an episodic-rank drain thread: write memory is publish-or-drop and never adds a trunk collective.
+>
+> Kept for historical context because it explains the slot-tensor format and the abandoned gather tradeoff.
+>
+> **Original status:** Design draft. Implementation lands after Phase 1 (Tasks 1.4 + 1.5) merges.
 > **Goal:** Eliminate CPU↔GPU traversal in the episodic write path. Replace POSIX shm rings with a single per-step `dist.gather` collective on GPU. Collapses items 7 + 8 from the perf hit list into one architectural pivot.
 
 ## Why

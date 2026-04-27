@@ -196,12 +196,14 @@ def test_select_writes_without_write_ring_is_side_effect_free(tmp_path):
 def test_runner_emit_allocates_write_ring_only_on_train_rank_when_enabled():
     """B4's write ring lives on the train-rank emit handle."""
     mod = _load_runner()
+    ring_id = f"unit_write_alloc_{os.getpid()}"
     base_config = {
         "episodic_enabled": True,
         "episodic_span_length": 2,
         "episodic_fingerprint_window": 1,
         "episodic_key_rep_dim": 4,
         "episodic_k_max": 4,
+        "episodic_event_ring_id": ring_id,
         "model_dim": 4,
     }
 
@@ -209,7 +211,7 @@ def test_runner_emit_allocates_write_ring_only_on_train_rank_when_enabled():
         rank=0,
         world_size=2,
         device=torch.device("cpu"),
-        config=base_config,
+        config={**base_config, "episodic_async_write_rings_enabled": False},
     )
     assert disabled is not None
     assert disabled.write_ring is None
@@ -224,10 +226,8 @@ def test_runner_emit_allocates_write_ring_only_on_train_rank_when_enabled():
     assert enabled_train is not None
     try:
         assert enabled_train.write_ring is not None
-        assert enabled_train.write_ring_name in {
-            f"/cc_episodic_write_rank0_pid{os.getpid()}",
-            f"/cc_episodic_write_r0_pid{os.getpid()}",
-        }
+        assert enabled_train.write_ring_name.startswith("/cc_e_w_")
+        assert enabled_train.write_ring_name.endswith("_r0")
         assert enabled_train.write_ring_drops == 0
         attached = _ext.ShmRingWriteEvent.attach(enabled_train.write_ring_name)
         assert attached.pop() is None
@@ -249,6 +249,7 @@ def test_runner_emit_pushes_write_event_for_packed_slots():
     """The current runner producer packs directly; it still emits B1 records."""
     _reset_admission_trace_seq()
     mod = _load_runner()
+    ring_id = f"unit_write_push_{os.getpid()}"
     handle = mod._create_episodic_emit(
         rank=0,
         world_size=2,
@@ -261,6 +262,7 @@ def test_runner_emit_pushes_write_event_for_packed_slots():
             "episodic_top_p": 0.5,
             "episodic_k_max": 4,
             "episodic_event_log_enabled": True,
+            "episodic_event_ring_id": ring_id,
             "model_dim": 4,
         },
     )
@@ -311,6 +313,132 @@ def test_runner_emit_pushes_write_event_for_packed_slots():
     assert events[1]["value_tok_ids"][:2] == [4, 5]
 
 
+def test_runner_emit_is_publish_only_even_when_all_group_is_present(monkeypatch):
+    """WRITE_EVENT production must not call ``dist.gather`` anymore.
+
+    This is the trunk-throughput invariant: memory writes are local ring pushes
+    with backpressure-by-drop, never a synchronous train-step collective.
+    """
+    _reset_admission_trace_seq()
+    mod = _load_runner()
+    ring_id = f"unit_no_gather_{os.getpid()}"
+    handle = mod._create_episodic_emit(
+        rank=0,
+        world_size=2,
+        device=torch.device("cpu"),
+        config={
+            "episodic_enabled": True,
+            "episodic_span_length": 2,
+            "episodic_fingerprint_window": 1,
+            "episodic_key_rep_dim": 4,
+            "episodic_top_p": 0.5,
+            "episodic_k_max": 4,
+            "episodic_event_ring_id": ring_id,
+            "model_dim": 4,
+        },
+    )
+    assert handle is not None
+    assert handle.write_ring is not None
+
+    def _boom(*_args, **_kwargs):
+        raise AssertionError("dist.gather must not be on the write path")
+
+    monkeypatch.setattr(mod.dist, "gather", _boom)
+    try:
+        inputs = torch.tensor([[1, 2, 3, 4, 5]], dtype=torch.int64)
+        targets = torch.tensor([[2, 3, 4, 5, 0]], dtype=torch.int64)
+        pressure = torch.ones_like(targets, dtype=torch.float32)
+        ce = torch.tensor([[0.1, 9.0, 8.0, 0.2, 0.3]], dtype=torch.float32)
+        hidden = torch.arange(20, dtype=torch.float32).reshape(1, 5, 4)
+        mod._emit_episodic_payloads_gpu(
+            emit=handle,
+            inputs=inputs,
+            targets=targets,
+            pressure=pressure,
+            per_token_ce=ce,
+            hidden=hidden,
+            rank=0,
+            world_size=2,
+            all_group=object(),
+            current_step=7,
+            write_bucket=1,
+        )
+        attached = _ext.ShmRingWriteEvent.attach(handle.write_ring_name)
+        assert attached.pop() is not None
+    finally:
+        mod._cleanup_episodic_event_rings(handle)
+
+
+def test_async_write_ring_drain_populates_cache_and_query_queue():
+    """Episodic rank lazily attaches train-rank write rings and drains them."""
+    _reset_admission_trace_seq()
+    mod = _load_runner()
+    ring_id = f"unit_write_drain_{os.getpid()}"
+    config = {
+        "episodic_enabled": True,
+        "episodic_span_length": 2,
+        "episodic_fingerprint_window": 1,
+        "episodic_key_rep_dim": 4,
+        "episodic_top_p": 0.5,
+        "episodic_k_max": 4,
+        "episodic_event_ring_id": ring_id,
+        "controller_query_enabled": True,
+        "model_dim": 4,
+    }
+    producer = mod._create_episodic_emit(
+        rank=0,
+        world_size=2,
+        device=torch.device("cpu"),
+        config=config,
+    )
+    consumer = mod._attach_episodic_consumer(
+        episodic_enabled=True,
+        is_episodic_rank=True,
+        world_size=2,
+        config=config,
+        model_dim=4,
+        all_group=None,
+    )
+    assert producer is not None and producer.write_ring is not None
+    assert consumer.cache is not None
+    try:
+        inputs = torch.tensor([[1, 2, 3, 4, 5]], dtype=torch.int64)
+        targets = torch.tensor([[2, 3, 4, 5, 0]], dtype=torch.int64)
+        pressure = torch.ones_like(targets, dtype=torch.float32)
+        ce = torch.tensor([[0.1, 9.0, 8.0, 0.2, 0.3]], dtype=torch.float32)
+        hidden = torch.arange(20, dtype=torch.float32).reshape(1, 5, 4)
+        mod._emit_episodic_payloads_gpu(
+            emit=producer,
+            inputs=inputs,
+            targets=targets,
+            pressure=pressure,
+            per_token_ce=ce,
+            hidden=hidden,
+            rank=0,
+            world_size=2,
+            all_group=None,
+            current_step=11,
+            write_bucket=2,
+        )
+        drained = mod._drain_episodic_write_rings(
+            consumer=consumer,
+            current_step=12,
+            embedding_version=0,
+        )
+        assert drained == 2
+        assert consumer.write_ring_events_drained == 2
+        assert len(consumer.cache) == 2
+        assert len(consumer.controller_query_queue) == 2
+        first = consumer.controller_query_queue[0]
+        assert first["rank"] == 0
+        assert first["step"] == 11
+        assert first["write_bucket"] == 2
+        assert first["source_write_id"] >> 56 == 0
+    finally:
+        mod._cleanup_episodic_event_rings(producer)
+        mod._cleanup_episodic_event_rings(consumer)
+
+
 def test_learned_write_admission_can_rerank_candidate_positions():
     mod = _load_runner()
     action_space = mod.ConstrainedActionSpace(
@@ -347,6 +475,7 @@ def test_learned_eviction_head_sets_slot_protection_score():
             "episodic_key_rep_dim": 4,
             "episodic_top_p": 1.0 / 5.0,
             "episodic_k_max": 1,
+            "episodic_async_write_rings_enabled": False,
             "model_dim": 4,
             "episodic_controller_action_space_enabled": True,
             "episodic_controller_eviction_readiness": 1.0,

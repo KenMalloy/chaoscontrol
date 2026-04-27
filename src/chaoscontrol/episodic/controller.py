@@ -826,19 +826,38 @@ def controller_main(
     stop-event-driven exit path.
     """
     while not stop_event.is_set():
-        n = run_controller_cycle(
-            controller_query_queue=controller_query_queue,
-            tagged_replay_queue=tagged_replay_queue,
-            cache=cache,
-            k=k,
-            score_mode=score_mode,
-            queue_lock=queue_lock,
-            controller_runtime=controller_runtime,
-            action_recorder=action_recorder,
-            simplex_selection_mode=simplex_selection_mode,
-            simplex_generator=simplex_generator,
-            action_space=action_space,
-        )
+        if queue_lock is None:
+            n = run_controller_cycle(
+                controller_query_queue=controller_query_queue,
+                tagged_replay_queue=tagged_replay_queue,
+                cache=cache,
+                k=k,
+                score_mode=score_mode,
+                queue_lock=None,
+                controller_runtime=controller_runtime,
+                action_recorder=action_recorder,
+                simplex_selection_mode=simplex_selection_mode,
+                simplex_generator=simplex_generator,
+                action_space=action_space,
+            )
+        else:
+            # Production async write-drain uses this as a cache+queue lock:
+            # hold it across the whole query cycle so cache mutation cannot
+            # interleave with query_topk/simplex snapshot construction.
+            with queue_lock:
+                n = run_controller_cycle(
+                    controller_query_queue=controller_query_queue,
+                    tagged_replay_queue=tagged_replay_queue,
+                    cache=cache,
+                    k=k,
+                    score_mode=score_mode,
+                    queue_lock=None,
+                    controller_runtime=controller_runtime,
+                    action_recorder=action_recorder,
+                    simplex_selection_mode=simplex_selection_mode,
+                    simplex_generator=simplex_generator,
+                    action_space=action_space,
+                )
         if heartbeat is not None:
             heartbeat[0] += 1
         if n == 0:

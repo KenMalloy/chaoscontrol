@@ -129,9 +129,8 @@ def test_runner_does_not_create_tagged_replay_queue_when_disabled():
 
 def test_consumer_state_has_tagged_replay_queue_field():
     """Shape pin: ``_EpisodicConsumerState`` exposes
-    ``tagged_replay_queue`` as a documented field. Mirrors the Pass C
-    test_consumer_state_no_longer_has_write_rings shape pin so a future
-    rename surfaces here loudly.
+    ``tagged_replay_queue`` as a documented field so a future rename surfaces
+    here loudly.
     """
     mod = _load_runner_module()
     consumer = mod._attach_episodic_consumer(
