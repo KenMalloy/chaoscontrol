@@ -155,6 +155,19 @@ def test_simplex_online_learner_records_decision_and_telemetry():
     assert t.credited_actions == 0
 
 
+def test_simplex_online_learner_exposes_bounded_meta_setters():
+    learner = _ext.SimplexOnlineLearner()
+    learner.initialize_simplex_weights(_build_weights_struct(_random_weights(3)))
+
+    learner.set_temperature(1.75)
+    learner.set_entropy_beta(0.03)
+    learner.set_ema_alpha(0.1)
+
+    assert learner.fast_weights().temperature == pytest.approx(1.75)
+    assert learner.slow_weights().temperature == pytest.approx(1.75)
+    assert learner.telemetry().last_entropy_bonus_weight == pytest.approx(0.03)
+
+
 def test_simplex_gerber_rejects_when_categorical_margin_inactive():
     """Gerber gates simplex credit on log-prob margin, not raw reward size."""
     weights = _random_weights(8)

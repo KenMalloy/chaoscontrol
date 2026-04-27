@@ -111,6 +111,9 @@ class SimplexOnlineLearner {
   const SimplexWeights& slow_weights() const;
   bool weights_initialized() const;
   float last_advantage() const;
+  void set_temperature(float temperature);
+  void set_entropy_beta(float entropy_beta);
+  void set_ema_alpha(float ema_alpha);
 
  private:
   // Load-bearing: in-place backward through the simplex_forward graph.

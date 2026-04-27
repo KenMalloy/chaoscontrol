@@ -150,6 +150,35 @@ def test_eviction_prefers_lowest_utility_past_grace():
     assert cache.query(999) is not None
 
 
+def test_eviction_protection_score_resists_low_utility_eviction():
+    """Learned eviction head contributes a bounded protection residual.
+
+    The base utility still matters, but a protected entry should not be the
+    first past-grace victim when another entry has the lower combined score.
+    """
+    cache = EpisodicCache(
+        capacity=2, span_length=2, key_rep_dim=4, grace_steps=0,
+    )
+    slot_a = cache.append(**_entry_kwargs(
+        key_fp=10, span_length=2, key_rep_dim=4, current_step=0,
+    ))
+    slot_b = cache.append(**_entry_kwargs(
+        key_fp=11, span_length=2, key_rep_dim=4, current_step=1,
+    ))
+    cache.utility_u[slot_a] = 0.1
+    cache.utility_u[slot_b] = 0.4
+    cache.protection_score[slot_a] = 1.0
+    cache.protection_score[slot_b] = 0.0
+
+    cache.append(**_entry_kwargs(
+        key_fp=12, span_length=2, key_rep_dim=4, current_step=10,
+    ))
+
+    assert cache.query(10) is not None
+    assert cache.query(11) is None
+    assert cache.query(12) is not None
+
+
 def test_eviction_within_grace_falls_back_to_oldest_write_step():
     """When no entries are past their grace period, the cache must still
     rotate to make room — by oldest write_step (FIFO during warm-up)."""
@@ -265,7 +294,7 @@ def test_snapshot_to_returns_tensor_dict_on_requested_device():
         "key_fp", "key_rep", "value_tok_ids", "value_anchor_id",
         "utility_u", "last_fired_step", "write_step",
         "birth_embedding_version", "occupied", "pressure_at_write",
-        "source_write_id", "write_bucket", "slot_state",
+        "source_write_id", "write_bucket", "protection_score", "slot_state",
         "simplex_edge_slot", "simplex_edge_weight",
     }
     assert set(snap.keys()) == expected_keys
@@ -487,6 +516,7 @@ def test_cpu_ssm_extended_fields_round_trip_with_cache_payload():
         pressure_at_write=4.25,
         source_write_id=99,
         write_bucket=2,
+        protection_score=0.75,
     )
     cache.slot_state[slot] = torch.tensor([0.5, 1.5, 2.5], dtype=torch.float16)
     cache.simplex_edge_slot[slot] = torch.tensor([1, 2], dtype=torch.int64)
@@ -497,12 +527,14 @@ def test_cpu_ssm_extended_fields_round_trip_with_cache_payload():
     assert entry.pressure_at_write == pytest.approx(4.25)
     assert entry.source_write_id == 99
     assert entry.write_bucket == 2
+    assert entry.protection_score == pytest.approx(0.75)
 
     snap = cache.snapshot_to(torch.device("cpu"))
     for name in (
         "pressure_at_write",
         "source_write_id",
         "write_bucket",
+        "protection_score",
         "slot_state",
         "simplex_edge_slot",
         "simplex_edge_weight",
@@ -515,6 +547,7 @@ def test_cpu_ssm_extended_fields_round_trip_with_cache_payload():
     torch.testing.assert_close(restored.pressure_at_write, cache.pressure_at_write)
     assert torch.equal(restored.source_write_id, cache.source_write_id)
     assert torch.equal(restored.write_bucket, cache.write_bucket)
+    torch.testing.assert_close(restored.protection_score, cache.protection_score)
     torch.testing.assert_close(restored.slot_state, cache.slot_state)
     assert torch.equal(restored.simplex_edge_slot, cache.simplex_edge_slot)
     torch.testing.assert_close(restored.simplex_edge_weight, cache.simplex_edge_weight)

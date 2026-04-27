@@ -13,14 +13,16 @@ Slot layout (canonical — see
   ====== ===================== ========= ============================
   0      valid_mask            1         fp32 (0.0 = empty, 1.0 = valid)
   1      pressure              1         fp32
-  2..3   key_fp                2         int64 reinterpret (rolling-hash fingerprint)
-  4..5   value_anchor_id       2         int64 reinterpret (anchor token id)
-  6..6+2S-1 value_tok_ids      2*S       int64 reinterpret of S elements
-  6+2S.. key_rep               D         fp32 (write-time residual)
-  6+2S+D.. residual            D         fp32 (query-time residual)
+  2      pre_write_ce          1         fp32
+  3      protection_score      1         fp32
+  4..5   key_fp                2         int64 reinterpret (rolling-hash fingerprint)
+  6..7   value_anchor_id       2         int64 reinterpret (anchor token id)
+  8..8+2S-1 value_tok_ids      2*S       int64 reinterpret of S elements
+  8+2S.. key_rep               D         fp32 (write-time residual)
+  8+2S+D.. residual            D         fp32 (query-time residual)
   ====== ===================== ========= ============================
 
-  ``slot_dim = 6 + 2*S + 2*D``.
+  ``slot_dim = 8 + 2*S + 2*D``.
 
 Int64 fields are reinterpreted via ``view(torch.int64)`` over an
 even-aligned fp32 slice. The slot tensor is always contiguous fp32 so the
@@ -38,9 +40,10 @@ from typing import Any
 import torch
 
 
-SLOT_DIM_BASE = 6
+SLOT_DIM_BASE = 8
 """Number of fp32 cells in the fixed prefix (valid_mask + pressure +
-key_fp(2) + value_anchor_id(2)). The trailing ``2*S + 2*D`` cells
+pre_write_ce + protection_score + key_fp(2) + value_anchor_id(2)).
+The trailing ``2*S + 2*D`` cells
 depend on ``span_length`` and ``key_rep_dim``."""
 
 
@@ -122,6 +125,8 @@ def pack_payload(
     residual: torch.Tensor,
     span_length: int,
     key_rep_dim: int,
+    pre_write_ce: float = float("nan"),
+    protection_score: float = 0.0,
 ) -> None:
     """Pack one payload into a single slot tensor of shape ``[slot_dim]``.
 
@@ -182,17 +187,21 @@ def pack_payload(
     slot[0] = float(valid_mask)
     slot[1] = float(pressure)
     # int64 fields via view reinterpret on aligned (even-offset, 2-cell) slices.
-    slot[2:4].view(torch.int64)[0] = int(key_fp)
-    slot[4:6].view(torch.int64)[0] = int(value_anchor_id)
+    slot[2] = float(pre_write_ce)
+    slot[3] = float(protection_score)
+    slot[4:6].view(torch.int64)[0] = int(key_fp)
+    slot[6:8].view(torch.int64)[0] = int(value_anchor_id)
     # value_tok_ids: 2*S fp32 cells reinterpret as S int64s.
-    slot[6:6 + 2 * S].view(torch.int64).copy_(
+    value_off = 8
+    slot[value_off:value_off + 2 * S].view(torch.int64).copy_(
         value_tok_ids.detach().to(dtype=torch.int64)
     )
     # key_rep + residual: contiguous fp32 spans of width D each.
-    slot[6 + 2 * S:6 + 2 * S + D].copy_(
+    key_off = value_off + 2 * S
+    slot[key_off:key_off + D].copy_(
         key_rep.detach().to(dtype=torch.float32)
     )
-    slot[6 + 2 * S + D:6 + 2 * S + 2 * D].copy_(
+    slot[key_off + D:key_off + 2 * D].copy_(
         residual.detach().to(dtype=torch.float32)
     )
 
@@ -242,9 +251,11 @@ def unpack_payload(
     return {
         "valid_mask": float(slot[0].item()),
         "pressure": float(slot[1].item()),
-        "key_fp": int(slot[2:4].view(torch.int64)[0].item()),
-        "value_anchor_id": int(slot[4:6].view(torch.int64)[0].item()),
-        "value_tok_ids": slot[6:6 + 2 * S].view(torch.int64).clone(),
-        "key_rep": slot[6 + 2 * S:6 + 2 * S + D].clone(),
-        "residual": slot[6 + 2 * S + D:6 + 2 * S + 2 * D].clone(),
+        "pre_write_ce": float(slot[2].item()),
+        "protection_score": float(slot[3].item()),
+        "key_fp": int(slot[4:6].view(torch.int64)[0].item()),
+        "value_anchor_id": int(slot[6:8].view(torch.int64)[0].item()),
+        "value_tok_ids": slot[8:8 + 2 * S].view(torch.int64).clone(),
+        "key_rep": slot[8 + 2 * S:8 + 2 * S + D].clone(),
+        "residual": slot[8 + 2 * S + D:8 + 2 * S + 2 * D].clone(),
     }

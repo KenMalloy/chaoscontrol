@@ -24,6 +24,7 @@ class FastSlowEma {
   void blend(float* slow, const float* fast, std::size_t n) const;
   uint64_t event_count() const;
   float alpha() const;
+  void set_alpha(float alpha);
   uint64_t interval() const;
 
  private:

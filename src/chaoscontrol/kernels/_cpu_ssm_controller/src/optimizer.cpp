@@ -53,6 +53,13 @@ float FastSlowEma::alpha() const {
   return alpha_;
 }
 
+void FastSlowEma::set_alpha(float alpha) {
+  if (alpha < 0.0f || alpha > 1.0f) {
+    throw std::invalid_argument("FastSlowEma alpha must be in [0, 1]");
+  }
+  alpha_ = alpha;
+}
+
 uint64_t FastSlowEma::interval() const {
   return interval_;
 }

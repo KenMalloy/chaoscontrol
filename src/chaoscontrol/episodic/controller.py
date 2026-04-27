@@ -49,6 +49,7 @@ from typing import Any
 
 import torch
 
+from chaoscontrol.episodic.learned_action_space import coerce_action_space
 from chaoscontrol.episodic.query import query_topk
 from chaoscontrol.optim.episodic_cache import EpisodicCache
 
@@ -246,6 +247,36 @@ def _choose_simplex_vertex(
     )
 
 
+def _apply_simplex_meta_actions(
+    *,
+    controller_runtime: Any,
+    action_space: Any,
+    gpu_step: int,
+    reward_context: dict[str, Any],
+) -> None:
+    """Apply bounded meta-heads to the simplex runtime before forward."""
+    if action_space is None or controller_runtime is None:
+        return
+    weights = controller_runtime.fast_weights()
+    specs = (
+        ("temperature", "set_temperature", float(getattr(weights, "temperature", 1.0))),
+        ("entropy_beta", "set_entropy_beta", 0.0),
+        ("ema_alpha", "set_ema_alpha", 0.25),
+    )
+    for head_name, setter_name, fallback in specs:
+        if action_space.readiness(head_name) <= 0.0:
+            continue
+        value = action_space.scalar_value(
+            head_name=head_name,
+            gpu_step=int(gpu_step),
+            fallback=float(fallback),
+            reward_context=reward_context,
+        )
+        setter = getattr(controller_runtime, setter_name, None)
+        if callable(setter):
+            setter(float(value))
+
+
 def run_controller_cycle(
     *,
     controller_query_queue: list[dict[str, Any]],
@@ -260,6 +291,7 @@ def run_controller_cycle(
     action_recorder: Any | None = None,
     simplex_selection_mode: str = "argmax",
     simplex_generator: torch.Generator | None = None,
+    action_space: Any | None = None,
 ) -> int:
     """Run a single controller cycle: drain queries, push tags.
 
@@ -293,6 +325,9 @@ def run_controller_cycle(
             keeps the greedy V1 path; ``"sample"`` / ``"soft_sample"``
             samples the action from the 16-vertex policy distribution.
         simplex_generator: optional CPU generator used only by soft sampling.
+        action_space: optional ``ConstrainedActionSpace`` (or config dict)
+            that applies bounded learned residuals/clamps to the V0 per-slot
+            controller path. ``None`` preserves the historical path.
 
     Returns:
         Number of candidates drained from the query queue this cycle.
@@ -337,6 +372,7 @@ def run_controller_cycle(
         selected_at = int(time.monotonic_ns() // 1_000_000)
 
     is_simplex = _is_simplex_runtime(controller_runtime)
+    bounded_action_space = coerce_action_space(action_space)
 
     for cand in candidates:
         residual = cand["residual"]
@@ -380,6 +416,20 @@ def run_controller_cycle(
                 current_step=producer_step,
                 pad_to=16,
             )
+            if bounded_action_space is not None:
+                score_values = [float(x) for x in scores.detach().cpu().tolist()]
+                _apply_simplex_meta_actions(
+                    controller_runtime=controller_runtime,
+                    action_space=bounded_action_space,
+                    gpu_step=int(producer_step),
+                    reward_context={
+                        "query_event_id": float(query_event_id),
+                        "pressure": float(cand.get("pressure", 0.0)),
+                        "score": float(
+                            sum(score_values) / max(1, len(score_values))
+                        ),
+                    },
+                )
             fwd = _ext.simplex_forward(
                 controller_runtime.fast_weights(), V, E, sf,
             )
@@ -484,6 +534,24 @@ def run_controller_cycle(
                 ],
                 "simplex_probabilities": simplex_probabilities,
             }
+            if bounded_action_space is not None:
+                meta_heads = [
+                    head
+                    for head in ("temperature", "entropy_beta", "ema_alpha")
+                    if bounded_action_space.readiness(head) > 0.0
+                ]
+                if meta_heads and hasattr(
+                    bounded_action_space, "record_credit_assignment"
+                ):
+                    bounded_action_space.record_credit_assignment(
+                        key=int(replay_id),
+                        head_names=meta_heads,
+                        gpu_step=int(producer_step),
+                        reward_context={
+                            "query_event_id": float(query_event_id),
+                            "slot": float(chosen_slot),
+                        },
+                    )
             tagged_replay_queue.append(tag)
             cand["residual"] = None
             continue
@@ -493,9 +561,11 @@ def run_controller_cycle(
         # per candidate (cheap — slots is at most ``k`` int64 entries,
         # scores is the same).
         slot_list = slots.tolist()
-        score_list = scores.tolist()
-        for selected_rank, (slot_i, score_i) in enumerate(
-            zip(slot_list, score_list, strict=True)
+        score_list = [float(x) for x in scores.tolist()]
+        controller_logits: list[float] = []
+        controller_snapshots: list[dict[str, Any]] = []
+        for heuristic_rank, (slot_i, score_i) in enumerate(
+            zip(slot_list, score_list, strict=True),
         ):
             controller_logit = float(score_i)
             controller_snapshot: dict[str, Any] = {}
@@ -507,11 +577,43 @@ def run_controller_cycle(
                             heuristic_score=float(score_i),
                             pressure=float(cand.get("pressure", 0.0)),
                             utility=float(cache.utility_u[int(slot_i)].item()),
-                            selected_rank=int(selected_rank),
+                            selected_rank=int(heuristic_rank),
                         ),
                         slot=int(slot_i),
                     )
                 )
+            controller_logits.append(float(controller_logit))
+            controller_snapshots.append(controller_snapshot)
+
+        if bounded_action_space is None:
+            effective_scores = list(score_list)
+            selected_indices = list(range(len(slot_list)))
+        else:
+            reward_context = {
+                "query_event_id": int(query_event_id),
+                "source_rank": int(cand.get("source_rank", cand.get("rank", 0))),
+                "score_mode": str(score_mode),
+            }
+            effective_scores = bounded_action_space.effective_scores(
+                heuristic_scores=score_list,
+                learned_scores=(
+                    controller_logits if controller_runtime is not None else None
+                ),
+                gpu_step=producer_step,
+                reward_context=reward_context,
+            )
+            selected_indices = bounded_action_space.selected_indices(
+                effective_scores=effective_scores,
+                gpu_step=producer_step,
+                requested_budget=len(slot_list),
+                reward_context=reward_context,
+            )
+
+        for emitted_rank, idx in enumerate(selected_indices):
+            slot_i = slot_list[idx]
+            score_i = score_list[idx]
+            controller_logit = controller_logits[idx]
+            controller_snapshot = controller_snapshots[idx]
             # Clamp query_event_id to 56 bits before the 8-bit shift so the
             # packed replay_id fits in u64. The high 8 bits of query_event_id
             # are the source_rank, which is at most 8 bits anyway, so the clamp
@@ -522,7 +624,7 @@ def run_controller_cycle(
             # as a separate field, so no information is actually lost.
             replay_id = (
                 (int(query_event_id) & ((1 << 56) - 1)) << 8
-            ) | (int(selected_rank) & 0xFF)
+            ) | (int(emitted_rank) & 0xFF)
             tag = {
                 "step": producer_step,
                 "slot": int(slot_i),
@@ -535,13 +637,27 @@ def run_controller_cycle(
                     if hasattr(cache, "source_write_id")
                     else cand.get("source_write_id", -1)
                 ),
-                "selected_rank": int(selected_rank),
+                "selected_rank": int(emitted_rank),
                 "teacher_score": float(score_i),
                 "controller_logit": float(controller_logit),
                 "selection_step": int(selected_at),
                 "policy_version": int(policy_version),
                 "outcome_status": "pending",
             }
+            if (
+                bounded_action_space is not None
+                and (
+                    bounded_action_space.active_selection
+                    or bounded_action_space.max_tags_per_query is not None
+                )
+            ):
+                tag.update({
+                    "heuristic_rank": int(idx),
+                    "action_space_score": float(effective_scores[idx]),
+                    "action_space_readiness": float(
+                        bounded_action_space.selection_readiness
+                    ),
+                })
             tag.update(controller_snapshot)
             tagged_replay_queue.append(tag)
             if action_recorder is not None and controller_snapshot:
@@ -681,6 +797,7 @@ def controller_main(
     action_recorder: Any | None = None,
     simplex_selection_mode: str = "argmax",
     simplex_generator: torch.Generator | None = None,
+    action_space: Any | None = None,
     cycle_idle_sleep_s: float = 0.005,
     heartbeat: list[int] | None = None,
 ) -> None:
@@ -720,6 +837,7 @@ def controller_main(
             action_recorder=action_recorder,
             simplex_selection_mode=simplex_selection_mode,
             simplex_generator=simplex_generator,
+            action_space=action_space,
         )
         if heartbeat is not None:
             heartbeat[0] += 1

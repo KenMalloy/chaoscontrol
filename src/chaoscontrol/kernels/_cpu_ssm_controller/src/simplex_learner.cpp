@@ -865,4 +865,26 @@ float SimplexOnlineLearner::last_advantage() const {
   return last_advantage_;
 }
 
+void SimplexOnlineLearner::set_temperature(float temperature) {
+  if (!(temperature > 0.0f)) {
+    throw std::invalid_argument(
+        "SimplexOnlineLearner temperature must be positive");
+  }
+  fast_weights_.temperature = temperature;
+  slow_weights_.temperature = temperature;
+}
+
+void SimplexOnlineLearner::set_entropy_beta(float entropy_beta) {
+  if (entropy_beta < 0.0f) {
+    throw std::invalid_argument(
+        "SimplexOnlineLearner entropy_beta must be non-negative");
+  }
+  entropy_beta_ = entropy_beta;
+  telemetry_.last_entropy_bonus_weight = entropy_beta;
+}
+
+void SimplexOnlineLearner::set_ema_alpha(float ema_alpha) {
+  fast_slow_.set_alpha(ema_alpha);
+}
+
 }  // namespace chaoscontrol::simplex
