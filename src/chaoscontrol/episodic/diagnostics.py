@@ -105,6 +105,27 @@ REPLAY_LOG_SCHEMA: tuple[str, ...] = (
     "utility_post",
     "outcome_status",
     "flags",
+    # Simplex controller V1 diagnostics. Written by the runner's
+    # _write_replay_ndjson_row when the simplex policy is active
+    # (arms c/d/e of the episodic_controller_v1 matrix). Required for
+    # Step 4 telemetry-first decision tree: we look at p_chosen,
+    # entropy, gerber_weight, advantage_raw vs advantage_corrected to
+    # diagnose whether REINFORCE is finding signal or the policy
+    # collapsed. p_behavior, candidate_scores, logits are the full
+    # 16-vertex distributions for off-policy analysis.
+    "arm",
+    "chosen_idx",
+    "p_chosen",
+    "p_behavior",
+    "entropy",
+    "gerber_weight",
+    "advantage_raw",
+    "advantage_corrected",
+    "lambda_hxh",
+    "feature_manifest_hash",
+    "candidate_slot_ids",
+    "candidate_scores",
+    "logits",
 )
 _REPLAY_LOG_SCHEMA_SET: frozenset[str] = frozenset(REPLAY_LOG_SCHEMA)
 
