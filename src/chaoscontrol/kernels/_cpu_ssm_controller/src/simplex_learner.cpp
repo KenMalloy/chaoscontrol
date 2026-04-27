@@ -9,6 +9,8 @@
 #include <array>
 #include <cmath>
 #include <cstring>
+#include <iomanip>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 
@@ -253,6 +255,27 @@ SimplexOnlineLearner::SimplexOnlineLearner(
   }
 }
 
+void SimplexOnlineLearner::set_simplex_trace_path(const std::string& path) {
+  // Close any existing file first so an explicit "" call is a clean
+  // disable, and so re-pointing at a new path doesn't leak the old fd.
+  if (simplex_trace_file_.is_open()) {
+    simplex_trace_file_.close();
+  }
+  if (path.empty()) {
+    return;
+  }
+  // Append mode: matrix runs concurrently from multiple ranks may share
+  // a directory; each rank should be passed its own path by the caller,
+  // but append guards us against accidentally truncating mid-run if the
+  // learner is reconstructed within the same process.
+  simplex_trace_file_.open(path, std::ios::out | std::ios::app);
+  if (!simplex_trace_file_.is_open()) {
+    throw std::runtime_error(
+        "SimplexOnlineLearner::set_simplex_trace_path: failed to open '" +
+        path + "' for append");
+  }
+}
+
 void SimplexOnlineLearner::initialize_simplex_weights(SimplexWeights weights) {
   if (lambda_hxh_warmup_events_ > 0 && weights.n_heads > 0) {
     // The HxH path starts as a true residual: available to train via
@@ -444,6 +467,10 @@ void SimplexOnlineLearner::on_replay_outcome(const ReplayOutcome& ev) {
   telemetry_.last_bucket_type_stddev = bucket_std;
   telemetry_.last_global_type_stddev = global_std;
 
+  // Capture the gamma-decayed, standardized advantage BEFORE the Gerber
+  // multiplier is applied so the trace can show the gate's effect.
+  const float advantage_pre_gerber = advantage;
+
   if (gate == 0.0f) {
     last_advantage_ = 0.0f;
     ++telemetry_.gerber_rejected_actions;
@@ -459,6 +486,32 @@ void SimplexOnlineLearner::on_replay_outcome(const ReplayOutcome& ev) {
 
   simplex_backward(*match, fwd, advantage);
   ++actions_since_sgd_;
+
+  // Per-replay-event NDJSON trace. Emitted only on events that reached
+  // simplex_backward (this point); pure early returns above are not
+  // traced by design — see set_simplex_trace_path's docstring for the
+  // bounded-scope rationale.
+  if (simplex_trace_file_.is_open()) {
+    std::ostringstream line;
+    line << '{';
+    line << "\"gpu_step\":" << match->gpu_step;
+    line << ",\"chosen_idx\":" << match->chosen_idx;
+    line << std::fixed << std::setprecision(6);
+    const float p_chosen_traced =
+        match->chosen_idx < fwd.p.size() ? fwd.p[match->chosen_idx] : 0.0f;
+    line << ",\"p_chosen\":" << p_chosen_traced;
+    line << ",\"entropy\":" << telemetry_.last_entropy;
+    line << ",\"advantage_raw\":" << advantage_pre_gerber;
+    line << ",\"advantage_after_gerber\":" << last_advantage_;
+    line << ",\"gerber_gate\":" << gate;
+    line << ",\"gerber_threshold\":" << telemetry_.last_gerber_threshold;
+    // Reset to default formatting for any trailing integer fields.
+    line.unsetf(std::ios_base::floatfield);
+    line << ",\"write_bucket\":" << match->write_bucket;
+    line << '}' << '\n';
+    simplex_trace_file_ << line.str();
+    simplex_trace_file_.flush();
+  }
 
   maybe_apply_sgd();
   maybe_blend_slow();

@@ -713,3 +713,132 @@ def test_simplex_sgd_apply_and_slow_ema_blend_cadences():
     init_W_vp = weights["W_vp"].flatten().numpy()
     assert not np.allclose(fast, init_W_vp)
     assert not np.allclose(slow, init_W_vp)
+
+
+def test_simplex_trace_writes_ndjson_per_replay_event(tmp_path):
+    """One NDJSON line per replay event that reached simplex_backward.
+
+    Operationalizes the design doc's "A stop that is not logged is a hidden
+    experimental confound" for the simplex head. Scope for this commit is
+    events that reached `simplex_backward` (including the entropy-bonus
+    rejection branch where advantage is zeroed but the backward still fires);
+    pure early returns (missing weights, missing decision, sentinel slot,
+    zero-advantage zero-beta short-circuit) do not emit traces yet.
+    """
+    import json
+    weights = _random_weights(99)
+    learner = _ext.SimplexOnlineLearner(
+        num_slots=8, max_entries_per_slot=4,
+        gamma=1.0, learning_rate=0.1,
+        sgd_interval=1, ema_interval=999999,
+        gerber_c=0.0,  # accept everything so we exercise the post-backward path
+    )
+    learner.initialize_simplex_weights(_build_weights_struct(weights))
+
+    trace_path = tmp_path / "simplex_trace.ndjson"
+    learner.set_simplex_trace_path(str(trace_path))
+
+    V, E, sf = _random_simplex_inputs(123)
+    fwd_before = _ext.simplex_forward(
+        learner.fast_weights(),
+        V.flatten().tolist(), E.flatten().tolist(), sf.tolist(),
+    )
+    chosen = int(np.argmax(np.asarray(fwd_before.p)))
+    learner.record_simplex_decision(
+        chosen_slot_id=2, gpu_step=10, policy_version=1,
+        chosen_idx=chosen, p_chosen_decision=float(fwd_before.p[chosen]),
+        V=V.flatten().tolist(), E=E.flatten().tolist(),
+        simplex_features=sf.tolist(),
+        n_actual=N, write_bucket=1,
+    )
+    learner.on_replay_outcome(
+        _replay_outcome_dict(
+            slot_id=2, gpu_step=11, selection_step=10,
+            ce_delta_raw=0.5, bucket_baseline=0.0,
+        )
+    )
+
+    text = trace_path.read_text()
+    lines = [ln for ln in text.splitlines() if ln]
+    assert len(lines) == 1, f"expected exactly one NDJSON line, got {len(lines)}"
+
+    rec = json.loads(lines[0])
+    expected_fields = {
+        "gpu_step",
+        "chosen_idx",
+        "p_chosen",
+        "entropy",
+        "advantage_raw",
+        "advantage_after_gerber",
+        "gerber_gate",
+        "gerber_threshold",
+        "write_bucket",
+    }
+    assert set(rec.keys()) == expected_fields, (
+        f"unexpected fields: {set(rec.keys()) ^ expected_fields}"
+    )
+
+    # Integer fields: no formatting, exact ints
+    assert isinstance(rec["gpu_step"], int)
+    assert isinstance(rec["chosen_idx"], int)
+    assert isinstance(rec["write_bucket"], int)
+    assert rec["gpu_step"] == 10
+    assert rec["chosen_idx"] == chosen
+    assert rec["write_bucket"] == 1
+
+    # Float fields: must round-trip through float and stay finite
+    for fname in (
+        "p_chosen", "entropy", "advantage_raw",
+        "advantage_after_gerber", "gerber_gate", "gerber_threshold",
+    ):
+        assert isinstance(rec[fname], (int, float)), fname
+        assert math.isfinite(float(rec[fname])), fname
+
+    # entropy in [0, ln(N)]
+    assert 0.0 <= float(rec["entropy"]) <= math.log(N) + 1e-5
+    # gerber_gate in [0, 1]
+    assert 0.0 <= float(rec["gerber_gate"]) <= 1.0 + 1e-6
+    # p_chosen in (0, 1]
+    assert 0.0 < float(rec["p_chosen"]) <= 1.0 + 1e-6
+
+
+def test_simplex_trace_disabled_when_path_empty(tmp_path):
+    """Empty path means tracing off; no file should be created or grown."""
+    weights = _random_weights(99)
+    learner = _ext.SimplexOnlineLearner(
+        num_slots=8, max_entries_per_slot=4,
+        gamma=1.0, learning_rate=0.1,
+        sgd_interval=1, ema_interval=999999,
+        gerber_c=0.0,
+    )
+    learner.initialize_simplex_weights(_build_weights_struct(weights))
+
+    # Open-then-close: a previously enabled trace must be disabled by
+    # calling with an empty string. The file may or may not exist.
+    trace_path = tmp_path / "simplex_trace.ndjson"
+    learner.set_simplex_trace_path(str(trace_path))
+    learner.set_simplex_trace_path("")
+
+    V, E, sf = _random_simplex_inputs(123)
+    fwd = _ext.simplex_forward(
+        learner.fast_weights(),
+        V.flatten().tolist(), E.flatten().tolist(), sf.tolist(),
+    )
+    chosen = int(np.argmax(np.asarray(fwd.p)))
+    learner.record_simplex_decision(
+        chosen_slot_id=2, gpu_step=10, policy_version=1,
+        chosen_idx=chosen, p_chosen_decision=float(fwd.p[chosen]),
+        V=V.flatten().tolist(), E=E.flatten().tolist(),
+        simplex_features=sf.tolist(),
+        n_actual=N, write_bucket=1,
+    )
+    learner.on_replay_outcome(
+        _replay_outcome_dict(
+            slot_id=2, gpu_step=11, selection_step=10,
+            ce_delta_raw=0.5, bucket_baseline=0.0,
+        )
+    )
+
+    if trace_path.exists():
+        # Open-then-close-then-replay must not have appended anything.
+        assert trace_path.read_text() == ""

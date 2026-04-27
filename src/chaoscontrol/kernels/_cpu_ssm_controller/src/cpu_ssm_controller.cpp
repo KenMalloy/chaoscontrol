@@ -1635,6 +1635,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
            &chaoscontrol::simplex::SimplexOnlineLearner::initialize_simplex_weights,
            pybind11::arg("weights"),
            "Set fast = slow = weights and zero the gradient buffer.")
+      .def("set_simplex_trace_path",
+           &chaoscontrol::simplex::SimplexOnlineLearner::set_simplex_trace_path,
+           pybind11::arg("path"),
+           "Open (or close) the per-replay-event NDJSON trace file. "
+           "Empty string disables tracing; non-empty opens in append "
+           "mode. One JSON object per line, emitted for each replay "
+           "outcome that reached simplex_backward (including the "
+           "entropy-bonus zeroed-advantage branch).")
       .def("record_simplex_decision",
            &chaoscontrol::simplex::SimplexOnlineLearner::record_simplex_decision,
            pybind11::arg("chosen_slot_id"),

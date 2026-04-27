@@ -2,6 +2,8 @@
 
 #include <array>
 #include <cstdint>
+#include <fstream>
+#include <string>
 #include <vector>
 
 #include "action_history.h"
@@ -77,6 +79,19 @@ class SimplexOnlineLearner {
       float entropy_beta = 0.0f);
 
   void initialize_simplex_weights(SimplexWeights weights);
+
+  // Per-replay-event NDJSON trace. Empty path = disable tracing (close
+  // any currently open file). Non-empty path opens the file in append
+  // mode, so concurrent writers from sibling ranks coexist on a single
+  // file without blowing each other away. Operationalizes the design
+  // doc's "A stop that is not logged is a hidden experimental confound"
+  // rule for the simplex head: each surviving replay outcome (those
+  // that reached simplex_backward, including the entropy-bonus zeroed
+  // branch) emits one line. Pure early returns (missing weights, no
+  // matching decision, sentinel slot, zero-advantage zero-beta) do NOT
+  // emit yet — bounded scope to keep this commit small.
+  void set_simplex_trace_path(const std::string& path);
+
   void record_simplex_decision(
       uint64_t chosen_slot_id,
       uint64_t gpu_step,
@@ -135,6 +150,11 @@ class SimplexOnlineLearner {
   std::array<std::array<RollingStddev, 256>, 4> margin_stats_by_bucket_type_;
   std::array<RollingStddev, 256> margin_stats_global_by_type_;
   std::array<RollingStddev, 4> advantage_stats_by_bucket_;
+  // Default-constructed std::ofstream is in a "not associated with any
+  // file" state; checking is_open() is the canonical disabled-trace
+  // check, no std::optional wrapper needed. set_simplex_trace_path("")
+  // explicitly closes; non-empty re-open flushes any prior file first.
+  std::ofstream simplex_trace_file_;
 };
 
 }  // namespace chaoscontrol::simplex

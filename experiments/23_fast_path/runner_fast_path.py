@@ -2425,6 +2425,14 @@ def _build_simplex_learner_from_cswg(
         entropy_beta=float(config.get("episodic_controller_entropy_beta", 0.0)),
     )
     learner.initialize_simplex_weights(weights)
+    # NDJSON per-replay-event trace. Empty string disables. Configured
+    # AFTER initialize so a misconfigured weights path can't leak an
+    # opened trace file. Mirrors the entropy_beta plumbing one-for-one.
+    trace_path = str(
+        config.get("episodic_controller_simplex_trace_path", "") or ""
+    )
+    if trace_path:
+        learner.set_simplex_trace_path(trace_path)
     return learner
 
 
@@ -4179,6 +4187,7 @@ def train_fast_for_budget(
     episodic_controller_lambda_hxh_warmup_events: int = 1024,
     episodic_controller_lambda_hxh_clip: float = 1.0,
     episodic_controller_entropy_beta: float = 0.0,
+    episodic_controller_simplex_trace_path: str = "",
     episodic_controller_history_entries: int = 64,
     episodic_replay_max_replays_per_step: int = 0,
 ) -> dict[str, Any]:
@@ -4389,6 +4398,9 @@ def train_fast_for_budget(
         ),
         "episodic_controller_entropy_beta": float(
             episodic_controller_entropy_beta
+        ),
+        "episodic_controller_simplex_trace_path": str(
+            episodic_controller_simplex_trace_path or ""
         ),
         "episodic_controller_history_entries": int(
             episodic_controller_history_entries
@@ -5864,6 +5876,9 @@ def run_condition(
         ),
         episodic_controller_entropy_beta=float(
             config.get("episodic_controller_entropy_beta", 0.0)
+        ),
+        episodic_controller_simplex_trace_path=str(
+            config.get("episodic_controller_simplex_trace_path", "") or ""
         ),
         episodic_controller_history_entries=int(
             config.get("episodic_controller_history_entries", 64)
