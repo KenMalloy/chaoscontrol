@@ -1694,6 +1694,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def_readonly("ema_blends",
                     &chaoscontrol::simplex::SimplexLearnerTelemetry::ema_blends)
       .def_readonly(
+          "simplex_trace_rows",
+          &chaoscontrol::simplex::SimplexLearnerTelemetry::simplex_trace_rows)
+      .def_readonly(
+          "simplex_trace_drops",
+          &chaoscontrol::simplex::SimplexLearnerTelemetry::simplex_trace_drops)
+      .def_readonly(
           "last_gerber_weight",
           &chaoscontrol::simplex::SimplexLearnerTelemetry::last_gerber_weight)
       .def_readonly(
@@ -1755,11 +1761,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def("set_simplex_trace_path",
            &chaoscontrol::simplex::SimplexOnlineLearner::set_simplex_trace_path,
            pybind11::arg("path"),
-           "Open (or close) the per-replay-event NDJSON trace file. "
-           "Empty string disables tracing; non-empty opens in append "
-           "mode. One JSON object per line, emitted for each replay "
-           "outcome that reached simplex_backward (including the "
-           "entropy-bonus zeroed-advantage branch).")
+           "Open (or close) the async simplex NDJSON trace sink. "
+           "Empty string disables tracing and joins/flushes the writer; "
+           "non-empty opens in append mode. Decision, credit, and skip "
+           "rows are enqueued to a bounded background writer.")
       .def("record_simplex_decision",
            &chaoscontrol::simplex::SimplexOnlineLearner::record_simplex_decision,
            pybind11::arg("chosen_slot_id"),
@@ -1772,10 +1777,25 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
            pybind11::arg("simplex_features"),
            pybind11::arg("n_actual") = 0,
            pybind11::arg("write_bucket") = 0,
+           pybind11::arg("query_event_id") = 0,
+           pybind11::arg("replay_id") = 0,
+           pybind11::arg("source_write_id") = 0,
+           pybind11::arg("selected_rank") = 0,
+           pybind11::arg("teacher_score") = 0.0f,
+           pybind11::arg("controller_logit") = 0.0f,
+           pybind11::arg("arm") = "",
+           pybind11::arg("p_behavior") = std::vector<float>{},
+           pybind11::arg("candidate_slot_ids") = std::vector<uint64_t>{},
+           pybind11::arg("candidate_scores") = std::vector<float>{},
+           pybind11::arg("logits") = std::vector<float>{},
+           pybind11::arg("feature_manifest_hash") = "",
+           pybind11::arg("selection_mode") = "",
+           pybind11::arg("selection_seed") = -1,
            "Record a simplex decision. Stores V, E, simplex_features, "
-           "chosen_idx, p_chosen_decision, n_actual, and write_bucket in "
-           "the per-slot history under chosen_slot_id so on_replay_outcome "
-           "can match by gpu_step and Gerber-gate by bucket/type.")
+           "chosen_idx, p_chosen_decision, n_actual, write_bucket, and "
+           "trace/join metadata in the per-slot history under chosen_slot_id "
+           "so on_replay_outcome can match by gpu_step and Gerber-gate by "
+           "bucket/type.")
       .def("on_replay_outcome",
            [](chaoscontrol::simplex::SimplexOnlineLearner& self,
               const pybind11::dict& d) {

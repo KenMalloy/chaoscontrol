@@ -184,6 +184,20 @@ def _record_simplex_decision_snapshot(
     sf: list[float],
     n_actual: int = 0,
     write_bucket: int = 0,
+    query_event_id: int = 0,
+    replay_id: int = 0,
+    source_write_id: int = 0,
+    selected_rank: int = 0,
+    teacher_score: float = 0.0,
+    controller_logit: float = 0.0,
+    arm: str = "",
+    p_behavior: list[float] | None = None,
+    candidate_slot_ids: list[int] | None = None,
+    candidate_scores: list[float] | None = None,
+    logits: list[float] | None = None,
+    feature_manifest_hash: str = "",
+    selection_mode: str = "",
+    selection_seed: int = -1,
 ) -> None:
     simplex_runtime.record_simplex_decision(
         chosen_slot_id=int(chosen_slot_id),
@@ -196,6 +210,20 @@ def _record_simplex_decision_snapshot(
         simplex_features=sf,
         n_actual=int(n_actual),
         write_bucket=int(write_bucket),
+        query_event_id=int(query_event_id),
+        replay_id=int(replay_id),
+        source_write_id=int(source_write_id),
+        selected_rank=int(selected_rank),
+        teacher_score=float(teacher_score),
+        controller_logit=float(controller_logit),
+        arm=str(arm),
+        p_behavior=list(p_behavior or []),
+        candidate_slot_ids=[int(x) for x in list(candidate_slot_ids or [])],
+        candidate_scores=[float(x) for x in list(candidate_scores or [])],
+        logits=[float(x) for x in list(logits or [])],
+        feature_manifest_hash=str(feature_manifest_hash),
+        selection_mode=str(selection_mode),
+        selection_seed=int(selection_seed),
     )
 
 
@@ -466,6 +494,28 @@ def run_controller_cycle(
             lambda_hxh = float(
                 getattr(controller_runtime.fast_weights(), "lambda_hxh", 0.0)
             )
+            replay_id = (
+                (int(query_event_id) & ((1 << 56) - 1)) << 8
+            ) | (int(chosen_idx) & 0xFF)
+            source_write_id = int(
+                cache.source_write_id[int(chosen_slot)].item()
+                if hasattr(cache, "source_write_id")
+                else cand.get("source_write_id", -1)
+            )
+            teacher_score = float(
+                scores[chosen_idx].item()
+                if chosen_idx < int(scores.numel()) else 0.0
+            )
+            candidate_slot_ids = [int(x) for x in padded_slot_ids[:n_actual]]
+            candidate_scores = [
+                float(x) for x in scores.detach().cpu().tolist()[:n_actual]
+            ]
+            logits = [float(x) for x in list(fwd.logits)[:n_actual]]
+            selection_seed = (
+                int(simplex_generator.initial_seed())
+                if simplex_generator is not None
+                else -1
+            )
 
             if action_recorder is not None:
                 _record_simplex_decision_snapshot(
@@ -478,30 +528,33 @@ def run_controller_cycle(
                     V=V, E=E, sf=sf,
                     n_actual=n_actual,
                     write_bucket=write_bucket,
+                    query_event_id=int(query_event_id),
+                    replay_id=int(replay_id),
+                    source_write_id=int(source_write_id),
+                    selected_rank=int(chosen_idx),
+                    teacher_score=float(teacher_score),
+                    controller_logit=float(controller_logit),
+                    arm=str(cand.get("arm", "")),
+                    p_behavior=simplex_probabilities,
+                    candidate_slot_ids=candidate_slot_ids,
+                    candidate_scores=candidate_scores,
+                    logits=logits,
+                    feature_manifest_hash=_SIMPLEX_FEATURE_MANIFEST_HASH,
+                    selection_mode=str(simplex_selection_mode),
+                    selection_seed=int(selection_seed),
                 )
 
-            replay_id = (
-                (int(query_event_id) & ((1 << 56) - 1)) << 8
-            ) | (int(chosen_idx) & 0xFF)
             tag = {
                 "step": producer_step,
                 "slot": int(chosen_slot),
-                "score": float(scores[chosen_idx].item())
-                if chosen_idx < int(scores.numel()) else 0.0,
+                "score": float(teacher_score),
                 "selected_at": int(selected_at),
                 "replay_id": replay_id,
                 "query_event_id": int(query_event_id),
-                "source_write_id": int(
-                    cache.source_write_id[int(chosen_slot)].item()
-                    if hasattr(cache, "source_write_id")
-                    else cand.get("source_write_id", -1)
-                ),
+                "source_write_id": int(source_write_id),
                 "write_bucket": int(write_bucket),
                 "selected_rank": int(chosen_idx),
-                "teacher_score": float(
-                    scores[chosen_idx].item()
-                    if chosen_idx < int(scores.numel()) else 0.0
-                ),
+                "teacher_score": float(teacher_score),
                 "controller_logit": float(controller_logit),
                 # SimplexOnlineLearner records history by producer gpu_step;
                 # replay outcomes must echo the same value to credit it.
@@ -514,27 +567,15 @@ def run_controller_cycle(
                 "entropy": float(simplex_entropy),
                 "lambda_hxh": float(lambda_hxh),
                 "feature_manifest_hash": _SIMPLEX_FEATURE_MANIFEST_HASH,
-                "candidate_slot_ids": [
-                    int(x) for x in padded_slot_ids[:n_actual]
-                ],
-                "candidate_scores": [
-                    float(x) for x in scores.detach().cpu().tolist()[:n_actual]
-                ],
-                "logits": [
-                    float(x) for x in list(fwd.logits)[:n_actual]
-                ],
+                "candidate_slot_ids": candidate_slot_ids,
+                "candidate_scores": candidate_scores,
+                "logits": logits,
                 "simplex_p_chosen": float(p_chosen),
                 "simplex_chosen_idx": int(chosen_idx),
                 "simplex_n_actual": int(n_actual),
-                "simplex_candidate_slot_ids": [
-                    int(x) for x in padded_slot_ids[:n_actual]
-                ],
-                "simplex_candidate_scores": [
-                    float(x) for x in scores.detach().cpu().tolist()[:n_actual]
-                ],
-                "simplex_logits": [
-                    float(x) for x in list(fwd.logits)[:n_actual]
-                ],
+                "simplex_candidate_slot_ids": candidate_slot_ids,
+                "simplex_candidate_scores": candidate_scores,
+                "simplex_logits": logits,
                 "simplex_probabilities": simplex_probabilities,
             }
             if bounded_action_space is not None:

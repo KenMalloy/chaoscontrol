@@ -7,12 +7,19 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
+#include <condition_variable>
 #include <cmath>
 #include <cstring>
+#include <deque>
+#include <fstream>
 #include <iomanip>
+#include <limits>
+#include <mutex>
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <thread>
 
 #if defined(__x86_64__) && defined(__AVX512F__) && \
     defined(CHAOSCONTROL_CPU_SSM_AVX512_KERNEL)
@@ -218,7 +225,164 @@ void build_logits_gradient(
   }
 }
 
+void json_string(std::ostringstream& line, const std::string& value) {
+  line << '"';
+  for (const char c : value) {
+    switch (c) {
+      case '"':
+        line << "\\\"";
+        break;
+      case '\\':
+        line << "\\\\";
+        break;
+      case '\n':
+        line << "\\n";
+        break;
+      case '\r':
+        line << "\\r";
+        break;
+      case '\t':
+        line << "\\t";
+        break;
+      default:
+        line << c;
+        break;
+    }
+  }
+  line << '"';
+}
+
+void json_float(std::ostringstream& line, float value) {
+  if (!std::isfinite(value)) {
+    line << "null";
+    return;
+  }
+  line << std::setprecision(9) << value;
+}
+
+void json_float_vector(std::ostringstream& line, const std::vector<float>& xs) {
+  line << '[';
+  for (std::size_t i = 0; i < xs.size(); ++i) {
+    if (i > 0) {
+      line << ',';
+    }
+    json_float(line, xs[i]);
+  }
+  line << ']';
+}
+
+void json_float_prefix(
+    std::ostringstream& line,
+    const std::vector<float>& xs,
+    uint32_t n) {
+  const std::size_t limit =
+      std::min<std::size_t>(xs.size(), static_cast<std::size_t>(n));
+  line << '[';
+  for (std::size_t i = 0; i < limit; ++i) {
+    if (i > 0) {
+      line << ',';
+    }
+    json_float(line, xs[i]);
+  }
+  line << ']';
+}
+
+void json_u64_vector(
+    std::ostringstream& line,
+    const std::vector<uint64_t>& xs) {
+  line << '[';
+  for (std::size_t i = 0; i < xs.size(); ++i) {
+    if (i > 0) {
+      line << ',';
+    }
+    line << xs[i];
+  }
+  line << ']';
+}
+
 }  // namespace
+
+class AsyncNdjsonTraceWriter {
+ public:
+  explicit AsyncNdjsonTraceWriter(
+      const std::string& path,
+      std::size_t max_queue_rows = 8192,
+      std::size_t flush_every_rows = 64)
+      : max_queue_rows_(max_queue_rows),
+        flush_every_rows_(flush_every_rows),
+        file_(path, std::ios::out | std::ios::app) {
+    if (!file_.is_open()) {
+      throw std::runtime_error(
+          "AsyncNdjsonTraceWriter: failed to open '" + path + "' for append");
+    }
+    worker_ = std::thread([this]() { run(); });
+  }
+
+  ~AsyncNdjsonTraceWriter() {
+    {
+      std::lock_guard<std::mutex> lock(mu_);
+      stop_ = true;
+    }
+    cv_.notify_one();
+    if (worker_.joinable()) {
+      worker_.join();
+    }
+    file_.flush();
+  }
+
+  AsyncNdjsonTraceWriter(const AsyncNdjsonTraceWriter&) = delete;
+  AsyncNdjsonTraceWriter& operator=(const AsyncNdjsonTraceWriter&) = delete;
+
+  bool enqueue(std::string row) {
+    {
+      std::lock_guard<std::mutex> lock(mu_);
+      if (queue_.size() >= max_queue_rows_) {
+        return false;
+      }
+      queue_.push_back(std::move(row));
+    }
+    cv_.notify_one();
+    return true;
+  }
+
+ private:
+  void run() {
+    std::deque<std::string> local;
+    uint32_t rows_since_flush = 0;
+    while (true) {
+      {
+        std::unique_lock<std::mutex> lock(mu_);
+        cv_.wait_for(
+            lock,
+            std::chrono::milliseconds(100),
+            [this]() { return stop_ || !queue_.empty(); });
+        queue_.swap(local);
+        if (stop_ && local.empty()) {
+          break;
+        }
+      }
+      while (!local.empty()) {
+        file_ << local.front() << '\n';
+        local.pop_front();
+        ++rows_since_flush;
+        if (rows_since_flush >= flush_every_rows_) {
+          file_.flush();
+          rows_since_flush = 0;
+        }
+      }
+    }
+    file_.flush();
+  }
+
+  const std::size_t max_queue_rows_;
+  const std::size_t flush_every_rows_;
+  std::ofstream file_;
+  std::mutex mu_;
+  std::condition_variable cv_;
+  std::deque<std::string> queue_;
+  bool stop_ = false;
+  std::thread worker_;
+};
 
 SimplexOnlineLearner::SimplexOnlineLearner(
     uint32_t num_slots,
@@ -255,25 +419,16 @@ SimplexOnlineLearner::SimplexOnlineLearner(
   }
 }
 
+SimplexOnlineLearner::~SimplexOnlineLearner() = default;
+
 void SimplexOnlineLearner::set_simplex_trace_path(const std::string& path) {
-  // Close any existing file first so an explicit "" call is a clean
-  // disable, and so re-pointing at a new path doesn't leak the old fd.
-  if (simplex_trace_file_.is_open()) {
-    simplex_trace_file_.close();
-  }
+  // Resetting the writer joins its background thread and flushes queued rows.
+  // Empty path disables tracing; non-empty starts a fresh async sink.
+  simplex_trace_writer_.reset();
   if (path.empty()) {
     return;
   }
-  // Append mode: matrix runs concurrently from multiple ranks may share
-  // a directory; each rank should be passed its own path by the caller,
-  // but append guards us against accidentally truncating mid-run if the
-  // learner is reconstructed within the same process.
-  simplex_trace_file_.open(path, std::ios::out | std::ios::app);
-  if (!simplex_trace_file_.is_open()) {
-    throw std::runtime_error(
-        "SimplexOnlineLearner::set_simplex_trace_path: failed to open '" +
-        path + "' for append");
-  }
+  simplex_trace_writer_ = std::make_unique<AsyncNdjsonTraceWriter>(path);
 }
 
 void SimplexOnlineLearner::initialize_simplex_weights(SimplexWeights weights) {
@@ -302,7 +457,21 @@ void SimplexOnlineLearner::record_simplex_decision(
     std::vector<float> E,
     std::vector<float> simplex_features,
     uint32_t n_actual,
-    int32_t write_bucket) {
+    int32_t write_bucket,
+    uint64_t query_event_id,
+    uint64_t replay_id,
+    uint64_t source_write_id,
+    uint32_t selected_rank,
+    float teacher_score,
+    float controller_logit,
+    const std::string& arm,
+    std::vector<float> p_behavior,
+    std::vector<uint64_t> candidate_slot_ids,
+    std::vector<float> candidate_scores,
+    std::vector<float> logits,
+    const std::string& feature_manifest_hash,
+    const std::string& selection_mode,
+    int64_t selection_seed) {
   ActionHistoryEntry entry;
   entry.action_type = 2;  // V1 simplex selection (V0 used 1)
   entry.gpu_step = gpu_step;
@@ -311,6 +480,20 @@ void SimplexOnlineLearner::record_simplex_decision(
   entry.n_actual = n_actual > 0 ? n_actual : fast_weights_.N;
   entry.write_bucket = write_bucket;
   entry.p_chosen_decision = p_chosen_decision;
+  entry.query_event_id = query_event_id;
+  entry.replay_id = replay_id;
+  entry.source_write_id = source_write_id;
+  entry.selected_rank = static_cast<uint8_t>(std::min<uint32_t>(selected_rank, 255));
+  entry.teacher_score = teacher_score;
+  entry.controller_logit = controller_logit;
+  entry.selection_seed = selection_seed;
+  entry.arm = arm;
+  entry.feature_manifest_hash = feature_manifest_hash;
+  entry.selection_mode = selection_mode;
+  entry.p_behavior = std::move(p_behavior);
+  entry.candidate_slot_ids = std::move(candidate_slot_ids);
+  entry.candidate_scores = std::move(candidate_scores);
+  entry.logits = std::move(logits);
   entry.V = std::move(V);
   entry.E = std::move(E);
   entry.simplex_features = std::move(simplex_features);
@@ -323,6 +506,34 @@ void SimplexOnlineLearner::record_simplex_decision(
   // PerSlotActionHistory keys on uint32_t slot_id; the chosen_slot_id
   // is the cache slot the simplex point landed on. Truncate to u32 for
   // the history key (cache capacity is bounded well below 2^32).
+  if (simplex_trace_writer_ != nullptr) {
+    float entropy = 0.0f;
+    for (const float p : entry.p_behavior) {
+      if (p > 0.0f && std::isfinite(p)) {
+        entropy -= p * std::log(std::max(p, 1.0e-30f));
+      }
+    }
+    emit_simplex_trace_row(
+        "decision",
+        "ok",
+        "",
+        &entry,
+        nullptr,
+        nullptr,
+        gpu_step,
+        chosen_slot_id,
+        p_chosen_decision,
+        entropy,
+        std::numeric_limits<float>::quiet_NaN(),
+        std::numeric_limits<float>::quiet_NaN(),
+        std::numeric_limits<float>::quiet_NaN(),
+        std::numeric_limits<float>::quiet_NaN(),
+        std::numeric_limits<float>::quiet_NaN(),
+        std::numeric_limits<float>::quiet_NaN(),
+        std::numeric_limits<float>::quiet_NaN(),
+        behavior_margin,
+        std::numeric_limits<float>::quiet_NaN());
+  }
   history_.append(static_cast<uint32_t>(chosen_slot_id), std::move(entry));
   ++telemetry_.history_appends;
 }
@@ -357,20 +568,252 @@ float SimplexOnlineLearner::lambda_hxh_bound() const {
   return lambda_hxh_clip_ * ramp;
 }
 
+void SimplexOnlineLearner::emit_simplex_trace_row(
+    const char* row_type,
+    const char* status,
+    const char* status_reason,
+    const ActionHistoryEntry* entry,
+    const ReplayOutcome* ev,
+    const SimplexForwardOutput* fwd,
+    uint64_t gpu_step,
+    uint64_t slot_id,
+    float p_chosen_current,
+    float entropy,
+    float raw_advantage,
+    float advantage_standardized,
+    float recency_weight,
+    float advantage_pre_gerber,
+    float gerber_weight,
+    float advantage_final,
+    float gerber_threshold,
+    float behavior_margin,
+    float current_margin) {
+  if (simplex_trace_writer_ == nullptr) {
+    return;
+  }
+
+  const uint32_t n_actual =
+      entry != nullptr && entry->n_actual > 0 ? entry->n_actual : fast_weights_.N;
+  const uint32_t chosen_idx = entry != nullptr ? entry->chosen_idx : 0;
+  const float p_behavior_chosen =
+      entry != nullptr ? entry->p_chosen_decision : std::numeric_limits<float>::quiet_NaN();
+  const uint64_t query_event_id =
+      ev != nullptr ? ev->query_event_id : (entry != nullptr ? entry->query_event_id : 0);
+  const uint64_t replay_id =
+      ev != nullptr ? ev->replay_id : (entry != nullptr ? entry->replay_id : 0);
+  const uint64_t source_write_id =
+      ev != nullptr ? ev->source_write_id : (entry != nullptr ? entry->source_write_id : 0);
+  const uint32_t policy_version =
+      ev != nullptr ? ev->policy_version : (entry != nullptr ? entry->policy_version : 0);
+  const uint64_t selection_step =
+      ev != nullptr ? ev->selection_step : (entry != nullptr ? entry->gpu_step : 0);
+  const uint32_t selected_rank =
+      ev != nullptr ? ev->selected_rank : (entry != nullptr ? entry->selected_rank : 0);
+  const float teacher_score =
+      ev != nullptr ? ev->teacher_score : (entry != nullptr ? entry->teacher_score : 0.0f);
+  const float controller_logit =
+      ev != nullptr ? ev->controller_logit : (entry != nullptr ? entry->controller_logit : 0.0f);
+  const int outcome_status = ev != nullptr ? static_cast<int>(ev->outcome_status) : 0;
+  const float ce_before =
+      ev != nullptr ? ev->ce_before_replay : std::numeric_limits<float>::quiet_NaN();
+  const float ce_after =
+      ev != nullptr ? ev->ce_after_replay : std::numeric_limits<float>::quiet_NaN();
+  const float ce_delta =
+      ev != nullptr ? ev->ce_delta_raw : std::numeric_limits<float>::quiet_NaN();
+  const float bucket_baseline =
+      ev != nullptr ? ev->bucket_baseline : std::numeric_limits<float>::quiet_NaN();
+  const float reward_shaped =
+      ev != nullptr ? ev->reward_shaped : std::numeric_limits<float>::quiet_NaN();
+  const uint16_t flags = ev != nullptr ? ev->flags : 0;
+  const int write_bucket = entry != nullptr ? entry->write_bucket : -1;
+  const uint64_t step_gap =
+      entry != nullptr && ev != nullptr && ev->gpu_step >= entry->gpu_step
+          ? ev->gpu_step - entry->gpu_step
+          : 0;
+
+  std::ostringstream line;
+  line << '{';
+  line << "\"row_type\":";
+  json_string(line, row_type != nullptr ? row_type : "");
+  line << ",\"status\":";
+  json_string(line, status != nullptr ? status : "");
+  line << ",\"status_reason\":";
+  json_string(line, status_reason != nullptr ? status_reason : "");
+  line << ",\"gpu_step\":" << gpu_step;
+  line << ",\"slot_id\":" << slot_id;
+  line << ",\"query_event_id\":" << query_event_id;
+  line << ",\"replay_id\":" << replay_id;
+  line << ",\"source_write_id\":" << source_write_id;
+  line << ",\"selection_step\":" << selection_step;
+  line << ",\"policy_version\":" << policy_version;
+  line << ",\"selected_rank\":" << selected_rank;
+  line << ",\"outcome_status\":" << outcome_status;
+  line << ",\"flags\":" << flags;
+  line << ",\"arm\":";
+  json_string(line, entry != nullptr ? entry->arm : "");
+  line << ",\"write_bucket\":" << write_bucket;
+  line << ",\"slot_age_steps\":" << step_gap;
+  line << ",\"n_actual\":" << n_actual;
+  line << ",\"chosen_idx\":" << chosen_idx;
+  line << ",\"teacher_score\":";
+  json_float(line, teacher_score);
+  line << ",\"controller_logit\":";
+  json_float(line, controller_logit);
+  line << ",\"p_chosen\":";
+  json_float(line, p_behavior_chosen);
+  line << ",\"p_current_chosen\":";
+  json_float(line, p_chosen_current);
+  line << ",\"entropy\":";
+  json_float(line, entropy);
+  line << ",\"temperature\":";
+  json_float(line, fast_weights_.temperature);
+  line << ",\"lambda_hxh\":";
+  json_float(line, fast_weights_.lambda_hxh);
+  line << ",\"entropy_beta\":";
+  json_float(line, entropy_beta_);
+  line << ",\"ce_before_replay\":";
+  json_float(line, ce_before);
+  line << ",\"ce_after_replay\":";
+  json_float(line, ce_after);
+  line << ",\"ce_delta_raw\":";
+  json_float(line, ce_delta);
+  line << ",\"bucket_baseline\":";
+  json_float(line, bucket_baseline);
+  line << ",\"reward_shaped\":";
+  json_float(line, reward_shaped);
+  line << ",\"advantage_raw\":";
+  json_float(line, raw_advantage);
+  line << ",\"advantage_standardized\":";
+  json_float(line, advantage_standardized);
+  line << ",\"recency_weight\":";
+  json_float(line, recency_weight);
+  line << ",\"advantage_pre_gerber\":";
+  json_float(line, advantage_pre_gerber);
+  line << ",\"gerber_weight\":";
+  json_float(line, gerber_weight);
+  line << ",\"advantage_final\":";
+  json_float(line, advantage_final);
+  line << ",\"gerber_threshold\":";
+  json_float(line, gerber_threshold);
+  line << ",\"behavior_logprob_margin\":";
+  json_float(line, behavior_margin);
+  line << ",\"current_logprob_margin\":";
+  json_float(line, current_margin);
+  line << ",\"selection_mode\":";
+  json_string(line, entry != nullptr ? entry->selection_mode : "");
+  line << ",\"selection_seed\":" << (entry != nullptr ? entry->selection_seed : -1);
+  line << ",\"feature_manifest_hash\":";
+  json_string(line, entry != nullptr ? entry->feature_manifest_hash : "");
+  line << ",\"p_behavior\":";
+  if (entry != nullptr && !entry->p_behavior.empty()) {
+    json_float_vector(line, entry->p_behavior);
+  } else {
+    line << "[]";
+  }
+  line << ",\"candidate_slot_ids\":";
+  if (entry != nullptr && !entry->candidate_slot_ids.empty()) {
+    json_u64_vector(line, entry->candidate_slot_ids);
+  } else {
+    line << "[]";
+  }
+  line << ",\"candidate_scores\":";
+  if (entry != nullptr && !entry->candidate_scores.empty()) {
+    json_float_vector(line, entry->candidate_scores);
+  } else {
+    line << "[]";
+  }
+  line << ",\"logits\":";
+  if (entry != nullptr && !entry->logits.empty()) {
+    json_float_vector(line, entry->logits);
+  } else if (fwd != nullptr && !fwd->logits.empty()) {
+    json_float_prefix(line, fwd->logits, n_actual);
+  } else {
+    line << "[]";
+  }
+  line << '}';
+
+  if (simplex_trace_writer_->enqueue(line.str())) {
+    ++telemetry_.simplex_trace_rows;
+  } else {
+    ++telemetry_.simplex_trace_drops;
+  }
+}
+
 void SimplexOnlineLearner::on_replay_outcome(const ReplayOutcome& ev) {
   ++telemetry_.replay_outcomes;
+  const float nan = std::numeric_limits<float>::quiet_NaN();
 
   if (ev.outcome_status != 0) {
+    emit_simplex_trace_row(
+        "skip",
+        "skipped",
+        "outcome_status",
+        nullptr,
+        &ev,
+        nullptr,
+        ev.gpu_step,
+        ev.slot_id,
+        nan,
+        nan,
+        nan,
+        nan,
+        nan,
+        nan,
+        nan,
+        nan,
+        nan,
+        nan,
+        nan);
     return;  // Skip non-OK outcomes; reward signal is conditional on success.
   }
 
   const uint32_t slot_id_u32 = static_cast<uint32_t>(ev.slot_id);
   if (slot_id_u32 >= history_.num_slots()) {
     ++telemetry_.invalid_slot_skips;
+    emit_simplex_trace_row(
+        "skip",
+        "skipped",
+        "invalid_slot",
+        nullptr,
+        &ev,
+        nullptr,
+        ev.gpu_step,
+        ev.slot_id,
+        nan,
+        nan,
+        nan,
+        nan,
+        nan,
+        nan,
+        nan,
+        nan,
+        nan,
+        nan,
+        nan);
     return;
   }
   if (!weights_initialized_) {
     ++telemetry_.backward_skipped_missing_weights;
+    emit_simplex_trace_row(
+        "skip",
+        "skipped",
+        "missing_weights",
+        nullptr,
+        &ev,
+        nullptr,
+        ev.gpu_step,
+        ev.slot_id,
+        nan,
+        nan,
+        nan,
+        nan,
+        nan,
+        nan,
+        nan,
+        nan,
+        nan,
+        nan,
+        nan);
     return;
   }
 
@@ -388,6 +831,26 @@ void SimplexOnlineLearner::on_replay_outcome(const ReplayOutcome& ev) {
   }
   if (match == nullptr || match->V.empty()) {
     ++telemetry_.backward_skipped_missing_state;
+    emit_simplex_trace_row(
+        "skip",
+        "skipped",
+        "missing_decision",
+        nullptr,
+        &ev,
+        nullptr,
+        ev.gpu_step,
+        ev.slot_id,
+        nan,
+        nan,
+        nan,
+        nan,
+        nan,
+        nan,
+        nan,
+        nan,
+        nan,
+        nan,
+        nan);
     return;
   }
 
@@ -429,12 +892,9 @@ void SimplexOnlineLearner::on_replay_outcome(const ReplayOutcome& ev) {
   telemetry_.last_advantage_stddev = adv_std;
   const uint64_t step_gap =
       ev.gpu_step >= match->gpu_step ? (ev.gpu_step - match->gpu_step) : 0;
-  advantage *= std::pow(gamma_, static_cast<float>(step_gap));
+  const float recency_weight = std::pow(gamma_, static_cast<float>(step_gap));
+  advantage *= recency_weight;
   last_advantage_ = advantage;
-
-  if (advantage == 0.0f && entropy_beta_ == 0.0f) {
-    return;  // Zero gradient; skip the rest of the work.
-  }
 
   const uint32_t n_actual =
       match->n_actual > 0 ? match->n_actual : fast_weights_.N;
@@ -449,6 +909,36 @@ void SimplexOnlineLearner::on_replay_outcome(const ReplayOutcome& ev) {
   const uint32_t chosen = match->chosen_idx;
   const float p_current_chosen =
       chosen < valid_n ? (fwd.p[chosen] / current_mass) : 0.0f;
+  float current_entropy = 0.0f;
+  for (uint32_t i = 0; i < valid_n; ++i) {
+    const float p_i = std::max(fwd.p[i] / current_mass, 1.0e-30f);
+    current_entropy -= p_i * std::log(p_i);
+  }
+
+  if (advantage == 0.0f && entropy_beta_ == 0.0f) {
+    emit_simplex_trace_row(
+        "skip",
+        "skipped",
+        "zero_advantage",
+        match,
+        &ev,
+        &fwd,
+        ev.gpu_step,
+        ev.slot_id,
+        p_current_chosen,
+        current_entropy,
+        raw_advantage,
+        telemetry_.last_advantage_standardized,
+        recency_weight,
+        advantage,
+        nan,
+        0.0f,
+        nan,
+        nan,
+        nan);
+    return;  // Zero gradient; skip the rest of the work.
+  }
+
   const std::size_t action_type = static_cast<std::size_t>(match->action_type);
   const float behavior_margin =
       simplex_logprob_margin(match->p_chosen_decision, valid_n);
@@ -475,6 +965,26 @@ void SimplexOnlineLearner::on_replay_outcome(const ReplayOutcome& ev) {
     last_advantage_ = 0.0f;
     ++telemetry_.gerber_rejected_actions;
     if (entropy_beta_ == 0.0f) {
+      emit_simplex_trace_row(
+          "skip",
+          "skipped",
+          "gerber_rejected",
+          match,
+          &ev,
+          &fwd,
+          ev.gpu_step,
+          ev.slot_id,
+          p_current_chosen,
+          current_entropy,
+          raw_advantage,
+          telemetry_.last_advantage_standardized,
+          recency_weight,
+          advantage_pre_gerber,
+          gate,
+          0.0f,
+          threshold,
+          behavior_margin,
+          current_margin);
       return;
     }
     advantage = 0.0f;
@@ -487,31 +997,26 @@ void SimplexOnlineLearner::on_replay_outcome(const ReplayOutcome& ev) {
   simplex_backward(*match, fwd, advantage);
   ++actions_since_sgd_;
 
-  // Per-replay-event NDJSON trace. Emitted only on events that reached
-  // simplex_backward (this point); pure early returns above are not
-  // traced by design — see set_simplex_trace_path's docstring for the
-  // bounded-scope rationale.
-  if (simplex_trace_file_.is_open()) {
-    std::ostringstream line;
-    line << '{';
-    line << "\"gpu_step\":" << match->gpu_step;
-    line << ",\"chosen_idx\":" << match->chosen_idx;
-    line << std::fixed << std::setprecision(6);
-    const float p_chosen_traced =
-        match->chosen_idx < fwd.p.size() ? fwd.p[match->chosen_idx] : 0.0f;
-    line << ",\"p_chosen\":" << p_chosen_traced;
-    line << ",\"entropy\":" << telemetry_.last_entropy;
-    line << ",\"advantage_raw\":" << advantage_pre_gerber;
-    line << ",\"advantage_after_gerber\":" << last_advantage_;
-    line << ",\"gerber_gate\":" << gate;
-    line << ",\"gerber_threshold\":" << telemetry_.last_gerber_threshold;
-    // Reset to default formatting for any trailing integer fields.
-    line.unsetf(std::ios_base::floatfield);
-    line << ",\"write_bucket\":" << match->write_bucket;
-    line << '}' << '\n';
-    simplex_trace_file_ << line.str();
-    simplex_trace_file_.flush();
-  }
+  emit_simplex_trace_row(
+      "credit",
+      "ok",
+      gate == 0.0f ? "entropy_only" : "",
+      match,
+      &ev,
+      &fwd,
+      ev.gpu_step,
+      ev.slot_id,
+      p_current_chosen,
+      current_entropy,
+      raw_advantage,
+      telemetry_.last_advantage_standardized,
+      recency_weight,
+      advantage_pre_gerber,
+      gate,
+      last_advantage_,
+      threshold,
+      behavior_margin,
+      current_margin);
 
   maybe_apply_sgd();
   maybe_blend_slow();

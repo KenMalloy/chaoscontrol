@@ -728,16 +728,8 @@ def test_simplex_sgd_apply_and_slow_ema_blend_cadences():
     assert not np.allclose(slow, init_W_vp)
 
 
-def test_simplex_trace_writes_ndjson_per_replay_event(tmp_path):
-    """One NDJSON line per replay event that reached simplex_backward.
-
-    Operationalizes the design doc's "A stop that is not logged is a hidden
-    experimental confound" for the simplex head. Scope for this commit is
-    events that reached `simplex_backward` (including the entropy-bonus
-    rejection branch where advantage is zeroed but the backward still fires);
-    pure early returns (missing weights, missing decision, sentinel slot,
-    zero-advantage zero-beta short-circuit) do not emit traces yet.
-    """
+def test_simplex_trace_writes_decision_and_credit_rows_async(tmp_path):
+    """DuckDB trace logs both the decision and the later replay credit."""
     import json
     weights = _random_weights(99)
     learner = _ext.SimplexOnlineLearner(
@@ -763,6 +755,20 @@ def test_simplex_trace_writes_ndjson_per_replay_event(tmp_path):
         V=V.flatten().tolist(), E=E.flatten().tolist(),
         simplex_features=sf.tolist(),
         n_actual=N, write_bucket=1,
+        query_event_id=1234,
+        replay_id=1234 << 8,
+        source_write_id=99,
+        selected_rank=chosen,
+        teacher_score=0.25,
+        controller_logit=float(fwd_before.logits[chosen]),
+        arm="unit_simplex",
+        p_behavior=[float(x) for x in fwd_before.p],
+        candidate_slot_ids=list(range(N)),
+        candidate_scores=[0.1 * i for i in range(N)],
+        logits=[float(x) for x in fwd_before.logits],
+        feature_manifest_hash="manifest-test",
+        selection_mode="argmax",
+        selection_seed=-1,
     )
     learner.on_replay_outcome(
         _replay_outcome_dict(
@@ -770,49 +776,136 @@ def test_simplex_trace_writes_ndjson_per_replay_event(tmp_path):
             ce_delta_raw=0.5, bucket_baseline=0.0,
         )
     )
+    # Closing the trace path joins the async writer and flushes queued rows.
+    learner.set_simplex_trace_path("")
 
     text = trace_path.read_text()
     lines = [ln for ln in text.splitlines() if ln]
-    assert len(lines) == 1, f"expected exactly one NDJSON line, got {len(lines)}"
+    assert len(lines) == 2, f"expected decision+credit rows, got {len(lines)}"
 
-    rec = json.loads(lines[0])
+    decision = json.loads(lines[0])
+    credit = json.loads(lines[1])
     expected_fields = {
+        "row_type",
+        "status",
+        "status_reason",
         "gpu_step",
-        "chosen_idx",
-        "p_chosen",
-        "entropy",
-        "advantage_raw",
-        "advantage_after_gerber",
-        "gerber_gate",
-        "gerber_threshold",
+        "slot_id",
+        "query_event_id",
+        "replay_id",
+        "source_write_id",
+        "selection_step",
+        "policy_version",
+        "selected_rank",
+        "outcome_status",
+        "flags",
+        "arm",
         "write_bucket",
+        "slot_age_steps",
+        "n_actual",
+        "chosen_idx",
+        "teacher_score",
+        "controller_logit",
+        "p_chosen",
+        "p_current_chosen",
+        "entropy",
+        "temperature",
+        "lambda_hxh",
+        "entropy_beta",
+        "ce_before_replay",
+        "ce_after_replay",
+        "ce_delta_raw",
+        "bucket_baseline",
+        "reward_shaped",
+        "advantage_raw",
+        "advantage_standardized",
+        "recency_weight",
+        "advantage_pre_gerber",
+        "gerber_weight",
+        "advantage_final",
+        "gerber_threshold",
+        "behavior_logprob_margin",
+        "current_logprob_margin",
+        "selection_mode",
+        "selection_seed",
+        "feature_manifest_hash",
+        "p_behavior",
+        "candidate_slot_ids",
+        "candidate_scores",
+        "logits",
     }
-    assert set(rec.keys()) == expected_fields, (
-        f"unexpected fields: {set(rec.keys()) ^ expected_fields}"
-    )
+    assert set(decision.keys()) == expected_fields
+    assert set(credit.keys()) == expected_fields
 
-    # Integer fields: no formatting, exact ints
-    assert isinstance(rec["gpu_step"], int)
-    assert isinstance(rec["chosen_idx"], int)
-    assert isinstance(rec["write_bucket"], int)
-    assert rec["gpu_step"] == 10
-    assert rec["chosen_idx"] == chosen
-    assert rec["write_bucket"] == 1
+    assert decision["row_type"] == "decision"
+    assert decision["status"] == "ok"
+    assert decision["gpu_step"] == 10
+    assert decision["slot_id"] == 2
+    assert decision["chosen_idx"] == chosen
+    assert decision["query_event_id"] == 1234
+    assert decision["source_write_id"] == 99
+    assert decision["arm"] == "unit_simplex"
+    assert decision["feature_manifest_hash"] == "manifest-test"
+    assert decision["candidate_slot_ids"] == list(range(N))
+    assert len(decision["p_behavior"]) == N
+    assert len(decision["logits"]) == N
 
-    # Float fields: must round-trip through float and stay finite
+    assert credit["row_type"] == "credit"
+    assert credit["status"] == "ok"
+    assert credit["gpu_step"] == 11
+    assert credit["selection_step"] == 10
+    assert credit["slot_age_steps"] == 1
+    assert credit["advantage_final"] is not None
+    assert credit["gerber_weight"] == pytest.approx(1.0)
+
+    # Float fields: must round-trip through float and stay finite on credit.
     for fname in (
-        "p_chosen", "entropy", "advantage_raw",
-        "advantage_after_gerber", "gerber_gate", "gerber_threshold",
+        "p_chosen", "p_current_chosen", "entropy", "advantage_raw",
+        "advantage_pre_gerber", "advantage_final", "gerber_weight",
+        "gerber_threshold",
     ):
-        assert isinstance(rec[fname], (int, float)), fname
-        assert math.isfinite(float(rec[fname])), fname
+        assert isinstance(credit[fname], (int, float)), fname
+        assert math.isfinite(float(credit[fname])), fname
 
     # entropy in [0, ln(N)]
-    assert 0.0 <= float(rec["entropy"]) <= math.log(N) + 1e-5
-    # gerber_gate in [0, 1]
-    assert 0.0 <= float(rec["gerber_gate"]) <= 1.0 + 1e-6
+    assert 0.0 <= float(credit["entropy"]) <= math.log(N) + 1e-5
+    # gerber_weight in [0, 1]
+    assert 0.0 <= float(credit["gerber_weight"]) <= 1.0 + 1e-6
     # p_chosen in (0, 1]
-    assert 0.0 < float(rec["p_chosen"]) <= 1.0 + 1e-6
+    assert 0.0 < float(credit["p_chosen"]) <= 1.0 + 1e-6
+    assert learner.telemetry().simplex_trace_rows == 2
+    assert learner.telemetry().simplex_trace_drops == 0
+
+
+def test_simplex_trace_writes_skip_rows_for_missing_credit(tmp_path):
+    """A replay that cannot match history is an explicit skip row."""
+    import json
+    weights = _random_weights(100)
+    learner = _ext.SimplexOnlineLearner(
+        num_slots=8, max_entries_per_slot=4,
+        gamma=1.0, learning_rate=0.1,
+        sgd_interval=1, ema_interval=999999,
+    )
+    learner.initialize_simplex_weights(_build_weights_struct(weights))
+
+    trace_path = tmp_path / "simplex_trace_skip.ndjson"
+    learner.set_simplex_trace_path(str(trace_path))
+    learner.on_replay_outcome(
+        _replay_outcome_dict(
+            slot_id=2, gpu_step=11, selection_step=10,
+            ce_delta_raw=0.5, bucket_baseline=0.0,
+        )
+    )
+    learner.set_simplex_trace_path("")
+
+    rows = [json.loads(ln) for ln in trace_path.read_text().splitlines() if ln]
+    assert len(rows) == 1
+    assert rows[0]["row_type"] == "skip"
+    assert rows[0]["status"] == "skipped"
+    assert rows[0]["status_reason"] == "missing_decision"
+    assert rows[0]["slot_id"] == 2
+    assert learner.telemetry().simplex_trace_rows == 1
+    assert learner.telemetry().credited_actions == 0
 
 
 def test_simplex_trace_disabled_when_path_empty(tmp_path):

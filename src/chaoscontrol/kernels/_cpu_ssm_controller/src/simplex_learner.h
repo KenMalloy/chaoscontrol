@@ -2,7 +2,7 @@
 
 #include <array>
 #include <cstdint>
-#include <fstream>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -13,6 +13,8 @@
 #include "wire_events.h"
 
 namespace chaoscontrol::simplex {
+
+class AsyncNdjsonTraceWriter;
 
 struct SimplexLearnerTelemetry {
   uint64_t replay_outcomes = 0;
@@ -26,6 +28,8 @@ struct SimplexLearnerTelemetry {
   uint64_t invalid_slot_skips = 0;
   uint64_t sgd_steps = 0;
   uint64_t ema_blends = 0;
+  uint64_t simplex_trace_rows = 0;
+  uint64_t simplex_trace_drops = 0;
   float last_gerber_weight = 0.0f;
   float last_advantage_raw = 0.0f;
   float last_advantage_standardized = 0.0f;
@@ -77,19 +81,16 @@ class SimplexOnlineLearner {
       uint64_t lambda_hxh_warmup_events = 1024,
       float lambda_hxh_clip = 1.0f,
       float entropy_beta = 0.0f);
+  ~SimplexOnlineLearner();
 
   void initialize_simplex_weights(SimplexWeights weights);
 
-  // Per-replay-event NDJSON trace. Empty path = disable tracing (close
-  // any currently open file). Non-empty path opens the file in append
-  // mode, so concurrent writers from sibling ranks coexist on a single
-  // file without blowing each other away. Operationalizes the design
-  // doc's "A stop that is not logged is a hidden experimental confound"
-  // rule for the simplex head: each surviving replay outcome (those
-  // that reached simplex_backward, including the entropy-bonus zeroed
-  // branch) emits one line. Pure early returns (missing weights, no
-  // matching decision, sentinel slot, zero-advantage zero-beta) do NOT
-  // emit yet — bounded scope to keep this commit small.
+  // Per-decision / per-replay NDJSON trace. Empty path = disable tracing
+  // (close any currently open file). Non-empty path opens the file in
+  // append mode, so concurrent writers from sibling ranks coexist on a
+  // single file without blowing each other away. The trace intentionally
+  // logs decision, credit, and skip rows: a missing credit path is data,
+  // not an absence for the analyst to guess from.
   void set_simplex_trace_path(const std::string& path);
 
   void record_simplex_decision(
@@ -102,7 +103,21 @@ class SimplexOnlineLearner {
       std::vector<float> E,
       std::vector<float> simplex_features,
       uint32_t n_actual = 0,
-      int32_t write_bucket = 0);
+      int32_t write_bucket = 0,
+      uint64_t query_event_id = 0,
+      uint64_t replay_id = 0,
+      uint64_t source_write_id = 0,
+      uint32_t selected_rank = 0,
+      float teacher_score = 0.0f,
+      float controller_logit = 0.0f,
+      const std::string& arm = "",
+      std::vector<float> p_behavior = {},
+      std::vector<uint64_t> candidate_slot_ids = {},
+      std::vector<float> candidate_scores = {},
+      std::vector<float> logits = {},
+      const std::string& feature_manifest_hash = "",
+      const std::string& selection_mode = "",
+      int64_t selection_seed = -1);
   void on_replay_outcome(const ReplayOutcome& ev);
 
   const std::vector<ActionHistoryEntry>& history(uint32_t slot_id) const;
@@ -133,6 +148,26 @@ class SimplexOnlineLearner {
   uint32_t gerber_bucket_index(int32_t write_bucket) const;
   float simplex_logprob_margin(float p_chosen, uint32_t n_actual) const;
   float lambda_hxh_bound() const;
+  void emit_simplex_trace_row(
+      const char* row_type,
+      const char* status,
+      const char* status_reason,
+      const ActionHistoryEntry* entry,
+      const ReplayOutcome* ev,
+      const SimplexForwardOutput* fwd,
+      uint64_t gpu_step,
+      uint64_t slot_id,
+      float p_chosen_current,
+      float entropy,
+      float raw_advantage,
+      float advantage_standardized,
+      float recency_weight,
+      float advantage_pre_gerber,
+      float gerber_weight,
+      float advantage_final,
+      float gerber_threshold,
+      float behavior_margin,
+      float current_margin);
 
   PerSlotActionHistory history_;
   FastSlowEma fast_slow_;
@@ -153,11 +188,10 @@ class SimplexOnlineLearner {
   std::array<std::array<RollingStddev, 256>, 4> margin_stats_by_bucket_type_;
   std::array<RollingStddev, 256> margin_stats_global_by_type_;
   std::array<RollingStddev, 4> advantage_stats_by_bucket_;
-  // Default-constructed std::ofstream is in a "not associated with any
-  // file" state; checking is_open() is the canonical disabled-trace
-  // check, no std::optional wrapper needed. set_simplex_trace_path("")
-  // explicitly closes; non-empty re-open flushes any prior file first.
-  std::ofstream simplex_trace_file_;
+  // The writer owns all disk I/O on a background thread. The learner path
+  // formats/enqueues a bounded string row and drops if the writer falls
+  // behind; it never flushes or waits on the file.
+  std::unique_ptr<AsyncNdjsonTraceWriter> simplex_trace_writer_;
 };
 
 }  // namespace chaoscontrol::simplex

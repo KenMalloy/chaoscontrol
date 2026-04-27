@@ -42,6 +42,8 @@ back-compat" branch packs the slot tensor without standing up a process group.
 from __future__ import annotations
 
 import importlib.util
+import threading
+from collections import deque
 from pathlib import Path
 
 import pytest
@@ -80,6 +82,47 @@ class _TinyTokenTrainModel(nn.Module):
 
     def encode(self, inputs: torch.Tensor) -> torch.Tensor:
         return self.embed(inputs)
+
+
+def test_cuda_write_event_publisher_surfaces_daemon_failure():
+    """Publisher thread failures must become telemetry, not silent drops."""
+    mod = _load_runner_module()
+
+    class EventReady:
+        def query(self):
+            return True
+
+    class ExplodingRing:
+        def push_batch_tensor(self, _batch):
+            raise RuntimeError("publisher boom")
+
+    publisher = object.__new__(mod._CudaWriteEventPublisher)
+    publisher.ring = ExplodingRing()
+    publisher.k_max = 16
+    publisher.event_size = 568
+    publisher.depth = 1
+    publisher.gpu_slots = [object()]
+    publisher.cpu_slots = [object()]
+    publisher.events = [EventReady()]
+    publisher.free_slots = deque()
+    publisher.pending = deque([0])
+    publisher.lock = threading.Lock()
+    publisher.stop_event = threading.Event()
+    publisher.stop_event.set()
+    publisher.submitted_batches = 1
+    publisher.pushed_events = 0
+    publisher.skipped_events = 0
+    publisher.dropped_events = 0
+    publisher.dropped_batches = 0
+    publisher.failed = False
+    publisher.error = None
+
+    publisher._run()
+
+    assert publisher.failed is True
+    assert "RuntimeError: publisher boom" in publisher.error
+    assert list(publisher.pending) == []
+    assert list(publisher.free_slots) == [0]
 
 
 # ---------------------------------------------------------------------------

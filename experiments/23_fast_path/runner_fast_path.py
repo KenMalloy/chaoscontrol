@@ -1441,6 +1441,8 @@ class _CudaWriteEventPublisher:
         self.skipped_events = 0
         self.dropped_events = 0
         self.dropped_batches = 0
+        self.failed = False
+        self.error: str | None = None
         self.thread = threading.Thread(
             target=self._run,
             name="cc-write-event-publisher",
@@ -1450,6 +1452,9 @@ class _CudaWriteEventPublisher:
 
     def acquire_slot(self) -> int | None:
         with self.lock:
+            if self.failed:
+                self.dropped_batches += 1
+                return None
             if not self.free_slots:
                 self.dropped_batches += 1
                 return None
@@ -1460,9 +1465,18 @@ class _CudaWriteEventPublisher:
 
     def submit(self, slot: int) -> None:
         slot_i = int(slot)
+        with self.lock:
+            if self.failed:
+                self.free_slots.append(slot_i)
+                self.dropped_batches += 1
+                return
         self.cpu_slots[slot_i].copy_(self.gpu_slots[slot_i], non_blocking=True)
         self.events[slot_i].record(torch.cuda.current_stream())
         with self.lock:
+            if self.failed:
+                self.free_slots.append(slot_i)
+                self.dropped_batches += 1
+                return
             self.pending.append(slot_i)
             self.submitted_batches += 1
 
@@ -1471,24 +1485,35 @@ class _CudaWriteEventPublisher:
         self.thread.join(timeout=timeout)
 
     def _run(self) -> None:
-        while not self.stop_event.is_set() or self.pending:
-            slot: int | None = None
-            with self.lock:
-                if self.pending:
-                    candidate = self.pending[0]
-                    if bool(self.events[candidate].query()):
-                        slot = self.pending.popleft()
-            if slot is None:
-                time.sleep(0.0001)
-                continue
-            try:
-                stats = self.ring.push_batch_tensor(self.cpu_slots[slot])
-                self.pushed_events += int(stats.get("pushed", 0))
-                self.skipped_events += int(stats.get("skipped", 0))
-                self.dropped_events += int(stats.get("dropped", 0))
-            finally:
+        idle_sleep = 0.00001
+        idle_sleep_cap = 0.001
+        try:
+            while not self.stop_event.is_set() or self.pending:
+                slot: int | None = None
                 with self.lock:
-                    self.free_slots.append(slot)
+                    if self.pending:
+                        candidate = self.pending[0]
+                        if bool(self.events[candidate].query()):
+                            slot = self.pending.popleft()
+                if slot is None:
+                    time.sleep(idle_sleep)
+                    idle_sleep = min(idle_sleep * 2.0, idle_sleep_cap)
+                    continue
+                idle_sleep = 0.00001
+                try:
+                    stats = self.ring.push_batch_tensor(self.cpu_slots[slot])
+                    self.pushed_events += int(stats.get("pushed", 0))
+                    self.skipped_events += int(stats.get("skipped", 0))
+                    self.dropped_events += int(stats.get("dropped", 0))
+                finally:
+                    with self.lock:
+                        self.free_slots.append(slot)
+        except BaseException as exc:  # noqa: BLE001 - daemon failures must surface
+            with self.lock:
+                self.failed = True
+                self.error = f"{type(exc).__name__}: {exc}"
+                while self.pending:
+                    self.free_slots.append(self.pending.popleft())
 
 
 def _u8_wire(value: int, *, sentinel: int = 255) -> int:
@@ -1513,6 +1538,8 @@ def _cleanup_episodic_event_rings(owner: Any) -> None:
             owner.write_ring_skipped = int(publisher.skipped_events)
             owner.write_ring_drops = int(publisher.dropped_events)
             owner.write_ring_drop_batches = int(publisher.dropped_batches)
+            owner.write_ring_submitted_batches = int(publisher.submitted_batches)
+            owner.write_ring_publisher_error = str(publisher.error or "")
         except Exception:
             pass
         try:
@@ -1713,6 +1740,8 @@ class EpisodicGpuEmit:
         "write_ring_pushed",
         "write_ring_skipped",
         "write_ring_drop_batches",
+        "write_ring_submitted_batches",
+        "write_ring_publisher_error",
         "async_write_rings_enabled",
         "cuda_write_event_stream_enabled",
         "cuda_write_event_publisher",
@@ -1757,6 +1786,8 @@ class EpisodicGpuEmit:
         self.write_ring_pushed = 0
         self.write_ring_skipped = 0
         self.write_ring_drop_batches = 0
+        self.write_ring_submitted_batches = 0
+        self.write_ring_publisher_error = ""
         self.async_write_rings_enabled = bool(async_write_rings_enabled)
         self.cuda_write_event_stream_enabled = bool(cuda_write_event_stream_enabled)
         self.cuda_write_event_publisher = cuda_write_event_publisher
@@ -1858,6 +1889,21 @@ def _create_episodic_emit(
             and cuda_pack_available
         )
         if cuda_write_event_stream_enabled:
+            constants = _ext.wire_event_constants()
+            max_key_rep_dim = int(constants["KEY_REP_DIM_DEFAULT"])
+            max_span_length = int(constants["SPAN_LENGTH_DEFAULT"])
+            if int(key_rep_dim) > max_key_rep_dim:
+                raise ValueError(
+                    "episodic CUDA WRITE_EVENT pack requires "
+                    f"episodic_key_rep_dim <= {max_key_rep_dim}; "
+                    f"got {int(key_rep_dim)}"
+                )
+            if int(span_length) > max_span_length:
+                raise ValueError(
+                    "episodic CUDA WRITE_EVENT pack requires "
+                    f"episodic_span_length <= {max_span_length}; "
+                    f"got {int(span_length)}"
+                )
             event_size = int(_ext.wire_event_sizes()["WriteEvent"])
             depth = int(config.get("episodic_cuda_write_event_stage_depth", 4))
             cuda_write_event_publisher = _CudaWriteEventPublisher(
@@ -2112,6 +2158,8 @@ def _emit_write_events_cuda_stream(
     slot = publisher.acquire_slot()
     if slot is None:
         # Publish-or-drop: a saturated staging ring must not stall the trunk.
+        emit.write_ring_submitted_batches = int(publisher.submitted_batches)
+        emit.write_ring_publisher_error = str(publisher.error or "")
         emit.write_ring_drop_batches += 1
         emit.write_ring_drops += int(emit.k_max)
         return True
@@ -2143,10 +2191,12 @@ def _emit_write_events_cuda_stream(
         int(emit.key_rep_dim),
     )
     publisher.submit(slot)
+    emit.write_ring_submitted_batches = int(publisher.submitted_batches)
     emit.write_ring_pushed = int(publisher.pushed_events)
     emit.write_ring_skipped = int(publisher.skipped_events)
     emit.write_ring_drops = int(publisher.dropped_events)
     emit.write_ring_drop_batches = int(publisher.dropped_batches)
+    emit.write_ring_publisher_error = str(publisher.error or "")
     return True
 
 
@@ -6544,6 +6594,21 @@ def train_fast_for_budget(
                         "write_ring_drop_batches",
                         0,
                     )
+                ),
+                "submitted_batches": int(
+                    getattr(
+                        episodic_emit_handle,
+                        "write_ring_submitted_batches",
+                        0,
+                    )
+                ),
+                "publisher_error": str(
+                    getattr(
+                        episodic_emit_handle,
+                        "write_ring_publisher_error",
+                        "",
+                    )
+                    or ""
                 ),
                 "pushed": int(
                     getattr(episodic_emit_handle, "write_ring_pushed", 0)

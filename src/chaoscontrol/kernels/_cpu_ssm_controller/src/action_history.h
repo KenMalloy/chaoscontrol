@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <string>
 #include <vector>
 
 // Simplex policy snapshot stored at decision time so the replay-outcome
@@ -31,6 +32,19 @@ struct ActionHistoryEntry {
   uint32_t n_actual = 0;
   int32_t write_bucket = 0;
   float p_chosen_decision = 0.0f;
+  uint64_t query_event_id = 0;
+  uint64_t replay_id = 0;
+  uint64_t source_write_id = 0;
+  float teacher_score = 0.0f;
+  float controller_logit = 0.0f;
+  int64_t selection_seed = -1;
+  std::string arm;
+  std::string feature_manifest_hash;
+  std::string selection_mode;
+  std::vector<float> p_behavior;
+  std::vector<uint64_t> candidate_slot_ids;
+  std::vector<float> candidate_scores;
+  std::vector<float> logits;
   std::vector<float> V;                 // (N * K_v)
   std::vector<float> E;                 // (N * N)
   std::vector<float> simplex_features;  // (K_s)
