@@ -44,3 +44,8 @@ baselines/parameter_golf/manifest.json
 # OS / editor
 .DS_Store
 package-lock.json
+
+# Generated controller weight artifacts (CSWG v3). Reproducible from
+# experiments/25_controller_pretrain/pretrain_controller.py with a
+# fixed seed; no point versioning the binary.
+*.cswg
