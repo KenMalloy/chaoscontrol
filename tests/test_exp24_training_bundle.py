@@ -1541,6 +1541,23 @@ def test_episodic_controller_v1_matrix_has_five_arms_three_seeds():
         for entry in by_arm[arm]:
             assert "episodic_compute_replay_ce_pair" not in entry
 
+    # Per-cell NDJSON trace path: simplex arms have it, heuristic arms
+    # don't. The path is unique per (arm, seed) so concurrent cells don't
+    # clobber each other's traces.
+    seen_paths = set()
+    for arm in simplex_arms:
+        for entry in by_arm[arm]:
+            path = entry.get("episodic_controller_simplex_trace_path")
+            assert path, f"{arm} entry missing simplex trace path"
+            assert path.endswith(".ndjson")
+            assert arm in path
+            assert str(entry["seed"]) in path
+            assert path not in seen_paths
+            seen_paths.add(path)
+    for arm in ("arm_a_control", "arm_b_heuristic"):
+        for entry in by_arm[arm]:
+            assert "episodic_controller_simplex_trace_path" not in entry
+
 
 def test_episodic_controller_v1_weights_path_honors_env_override(monkeypatch):
     """Pod runbook substitutes the real weights via env var; matrix builder

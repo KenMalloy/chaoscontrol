@@ -922,6 +922,11 @@ EPISODIC_CONTROLLER_V1_WEIGHTS_PATH = (
 )
 EPISODIC_CONTROLLER_V1_WEIGHTS_PATH_ENV = "EPISODIC_CONTROLLER_V1_WEIGHTS_PATH"
 
+EPISODIC_CONTROLLER_V1_TRACE_DIR = (
+    "experiments/24_training_time_bundle/results/traces"
+)
+EPISODIC_CONTROLLER_V1_TRACE_DIR_ENV = "EPISODIC_CONTROLLER_V1_TRACE_DIR"
+
 
 def _resolve_episodic_controller_v1_weights_path() -> str:
     # Pod runbook substitutes the real artifact via the env var so this
@@ -931,6 +936,13 @@ def _resolve_episodic_controller_v1_weights_path() -> str:
     return os.environ.get(
         EPISODIC_CONTROLLER_V1_WEIGHTS_PATH_ENV,
         EPISODIC_CONTROLLER_V1_WEIGHTS_PATH,
+    )
+
+
+def _resolve_episodic_controller_v1_trace_dir() -> str:
+    return os.environ.get(
+        EPISODIC_CONTROLLER_V1_TRACE_DIR_ENV,
+        EPISODIC_CONTROLLER_V1_TRACE_DIR,
     )
 
 
@@ -1106,6 +1118,7 @@ def build_episodic_controller_v1_matrix(
         ),
     ]
     entries: list[dict[str, Any]] = []
+    trace_dir = _resolve_episodic_controller_v1_trace_dir()
     for arm_name, arm_overrides in arm_specs:
         arm = {
             "arm": arm_name,
@@ -1121,6 +1134,14 @@ def build_episodic_controller_v1_matrix(
                 budget_seconds=budget_seconds,
             )
             entry.update(arm)
+            # Per-cell NDJSON trace for simplex arms. Operationalizes
+            # docs/plans/2026-04-26-learned-controller-action-space.md:
+            # "A stop that is not logged is a hidden experimental
+            # confound." The runner mkdirs the parent before launch.
+            if "simplex" in arm_name:
+                entry["episodic_controller_simplex_trace_path"] = (
+                    f"{trace_dir}/episodic_controller_v1_{arm_name}_s{int(seed)}.ndjson"
+                )
             entries.append(
                 _named_entry(
                     base=entry,

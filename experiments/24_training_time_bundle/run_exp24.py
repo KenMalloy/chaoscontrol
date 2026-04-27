@@ -467,6 +467,15 @@ def main(argv: list[str] | None = None) -> int:
         seeds=[int(seed) for seed in args.seeds],
     )
     args.output_dir.mkdir(parents=True, exist_ok=True)
+    # Pre-create the trace dir so the C++ writer can open files in
+    # append mode without checking. Cells with no trace path skip this.
+    trace_targets = {
+        Path(entry["episodic_controller_simplex_trace_path"]).parent
+        for entry in entries
+        if entry.get("episodic_controller_simplex_trace_path")
+    }
+    for trace_dir in trace_targets:
+        trace_dir.mkdir(parents=True, exist_ok=True)
     write_matrix(args.output_dir / "matrix.json", entries)
 
     effective_dry_run = bool(args.dry_run or args.show)
