@@ -21,6 +21,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+import chaoscontrol.kernels._lm_head_loss as _lm_head_loss
 from chaoscontrol.model import ChaosStudentLM
 from chaoscontrol.training import chunked_cross_entropy
 from chaoscontrol.train_ssm import (
@@ -430,6 +431,10 @@ class TestTrainSSMStepEquivalence:
             d = (old_grads[name] - new_grads[name]).abs().max().item()
             assert d < 1e-5, f"single-backward grad mismatch on {name!r}: {d}"
 
+    @pytest.mark.skipif(
+        _lm_head_loss._C is None,
+        reason="fused_lm_head dispatcher no longer falls back on CPU; needs built _C",
+    )
     def test_fused_backward_mode_matches_bare_ssm_old_path(
         self, bare_ssm_model: ChaosStudentLM,
     ) -> None:
@@ -497,6 +502,10 @@ class TestTrainSSMStepEquivalence:
             )
         ]
 
+    @pytest.mark.skipif(
+        _lm_head_loss._C is None,
+        reason="fused_lm_head dispatcher no longer falls back on CPU; needs built _C",
+    )
     def test_fused_lm_head_backward_with_ce_returns_per_token_ce_matching_scalar(
         self,
     ) -> None:

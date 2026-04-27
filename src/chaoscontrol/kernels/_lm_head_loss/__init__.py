@@ -2,12 +2,16 @@
 
 ``fused_rms_norm`` replaces the Python-visible
 ``F.rms_norm(...).to(dtype) * weight`` fragment immediately before the LM
-head. ``fused_linear_cross_entropy`` is the projection+CE hook; until the
-native CUDA extension is built and eligible it falls back to the exact PyTorch
-``linear -> cross_entropy`` expression.
+head and silently falls back to the PyTorch reference on CPU / unsupported
+dtypes (no large intermediate; safe to leave silent).
 
-If the CUDA extension is unavailable, or if tensors are on CPU / unsupported
-dtypes, the public function falls back to the exact PyTorch expression.
+``fused_linear_cross_entropy`` and the three sibling fused-CE dispatchers
+DO NOT fall back silently. The fp32 reference materializes a full
+``(rows, vocab)`` logits tensor and OOMs at submission regime, so the
+public dispatchers ``_require_ext()`` upfront and raise ``RuntimeError`` if
+no backend predicate matches the inputs. Call ``_fallback_*`` helpers
+directly if you genuinely want the slow path (e.g. CPU numerical-reference
+tests).
 """
 from __future__ import annotations
 
@@ -1078,6 +1082,10 @@ def _fused_linear_cross_entropy_dispatch(
         raise ValueError(
             f"fused_linear_cross_entropy: tile_size must be positive, got {tile_size}"
         )
+    # Cheap argument validation runs first so callers on dev macs still see
+    # ValueError for bad reduction/shapes; from here on we are committing to
+    # a real CUDA backend, so a missing extension is a hard failure.
+    _require_ext()
     if backend_name == "streaming" and _is_linear_ce_kernel_eligible(
         x, weight, targets, backend="streaming"
     ):
@@ -1122,11 +1130,18 @@ def _fused_linear_cross_entropy_dispatch(
             reduction,
             int(tile_size),
         )
-    return _fallback_linear_cross_entropy(
-        x,
-        weight,
-        targets,
-        reduction=reduction,
+    raise RuntimeError(
+        "fused_linear_cross_entropy: no eligible kernel matched and silent "
+        "fallback is disabled. backend="
+        f"{backend_name!r}, x.shape={tuple(x.shape)}, x.dtype={x.dtype}, "
+        f"x.device={x.device}, weight.shape={tuple(weight.shape)}, "
+        f"weight.dtype={weight.dtype}, targets.dtype={targets.dtype}, "
+        "tile_size="
+        f"{int(tile_size)}. See _is_linear_ce_kernel_eligible (and the "
+        "dispatcher in chaoscontrol/kernels/_lm_head_loss/__init__.py) "
+        "for the predicates that gate each backend; if you genuinely want "
+        "the fp32 PyTorch reference, call _fallback_linear_cross_entropy "
+        "directly instead of routing through the public dispatcher."
     )
 
 
@@ -1287,6 +1302,9 @@ def _fused_linear_cross_entropy_weighted_dispatch(
         )
     if int(tile_size) <= 0:
         raise ValueError(f"{op_name}: tile_size must be positive, got {tile_size}")
+    # See unweighted dispatcher: arg-validation runs on every device; from here
+    # on we need a real CUDA backend, and a missing extension is a hard fail.
+    _require_ext()
     flat_token_weight = _flat_token_weight(
         token_weight,
         rows=rows,
@@ -1341,12 +1359,18 @@ def _fused_linear_cross_entropy_weighted_dispatch(
             int(tile_size),
             "v1",
         )
-    return _fallback_linear_cross_entropy_weighted(
-        x,
-        weight,
-        targets,
-        flat_token_weight,
-        op_name=op_name,
+    raise RuntimeError(
+        f"{op_name}: no eligible kernel matched and silent fallback is "
+        f"disabled. backend={backend_name!r}, x.shape={tuple(x.shape)}, "
+        f"x.dtype={x.dtype}, x.device={x.device}, "
+        f"weight.shape={tuple(weight.shape)}, weight.dtype={weight.dtype}, "
+        f"targets.dtype={targets.dtype}, "
+        f"token_weight.dtype={flat_token_weight.dtype}, "
+        f"tile_size={int(tile_size)}. See "
+        "_is_linear_ce_weighted_kernel_eligible (and the weighted dispatcher "
+        "in chaoscontrol/kernels/_lm_head_loss/__init__.py) for the gating "
+        "predicates; call _fallback_linear_cross_entropy_weighted directly "
+        "if you genuinely want the fp32 PyTorch reference."
     )
 
 
@@ -1442,6 +1466,9 @@ def _fused_rms_linear_cross_entropy_dispatch(
             "fused_rms_linear_cross_entropy: tile_size must be positive, "
             f"got {tile_size}"
         )
+    # See unweighted dispatcher: arg-validation runs on every device; from here
+    # on we need a real CUDA backend, and a missing extension is a hard fail.
+    _require_ext()
     if _is_rms_linear_ce_kernel_eligible(
         x,
         norm_weight,
@@ -1459,13 +1486,19 @@ def _fused_rms_linear_cross_entropy_dispatch(
             int(tile_size),
             backend_name,
         )
-    return _fallback_rms_linear_cross_entropy(
-        x,
-        norm_weight,
-        linear_weight,
-        targets,
-        eps=float(eps),
-        reduction=reduction,
+    raise RuntimeError(
+        "fused_rms_linear_cross_entropy: no eligible kernel matched and "
+        f"silent fallback is disabled. backend={backend_name!r}, "
+        f"x.shape={tuple(x.shape)}, x.dtype={x.dtype}, x.device={x.device}, "
+        f"norm_weight.shape={tuple(norm_weight.shape)}, "
+        f"norm_weight.dtype={norm_weight.dtype}, "
+        f"linear_weight.shape={tuple(linear_weight.shape)}, "
+        f"linear_weight.dtype={linear_weight.dtype}, "
+        f"targets.dtype={targets.dtype}, tile_size={int(tile_size)}. See "
+        "_is_rms_linear_ce_kernel_eligible (and the dispatcher in "
+        "chaoscontrol/kernels/_lm_head_loss/__init__.py) for the gating "
+        "predicates; call _fallback_rms_linear_cross_entropy directly if "
+        "you genuinely want the fp32 PyTorch reference."
     )
 
 
@@ -1565,6 +1598,9 @@ def _fused_rms_linear_cross_entropy_weighted_dispatch(
         )
     if int(tile_size) <= 0:
         raise ValueError(f"{op_name}: tile_size must be positive, got {tile_size}")
+    # See unweighted dispatcher: arg-validation runs on every device; from here
+    # on we need a real CUDA backend, and a missing extension is a hard fail.
+    _require_ext()
     flat_token_weight = _flat_token_weight(
         token_weight,
         rows=rows,
@@ -1644,14 +1680,21 @@ def _fused_rms_linear_cross_entropy_weighted_dispatch(
             int(tile_size),
             "v1",
         )
-    return _fallback_rms_linear_cross_entropy_weighted(
-        x,
-        norm_weight,
-        linear_weight,
-        targets,
-        flat_token_weight,
-        eps=float(eps),
-        op_name=op_name,
+    raise RuntimeError(
+        f"{op_name}: no eligible kernel matched and silent fallback is "
+        f"disabled. backend={backend_name!r}, x.shape={tuple(x.shape)}, "
+        f"x.dtype={x.dtype}, x.device={x.device}, "
+        f"norm_weight.shape={tuple(norm_weight.shape)}, "
+        f"norm_weight.dtype={norm_weight.dtype}, "
+        f"linear_weight.shape={tuple(linear_weight.shape)}, "
+        f"linear_weight.dtype={linear_weight.dtype}, "
+        f"targets.dtype={targets.dtype}, "
+        f"token_weight.dtype={flat_token_weight.dtype}, "
+        f"tile_size={int(tile_size)}. See _is_kernel_eligible / "
+        "_is_linear_ce_weighted_kernel_eligible (and the dispatcher in "
+        "chaoscontrol/kernels/_lm_head_loss/__init__.py) for the gating "
+        "predicates; call _fallback_rms_linear_cross_entropy_weighted "
+        "directly if you genuinely want the fp32 PyTorch reference."
     )
 
 

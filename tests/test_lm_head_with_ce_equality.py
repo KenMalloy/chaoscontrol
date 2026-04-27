@@ -8,17 +8,35 @@ a future kernel-dispatch refactor that touches one but not the other
 silently desyncs episodic mode from non-episodic — only Phase 3's
 falsifier matrix would catch it, and that's a 5-hour 4×H100 wakeup.
 This is a sub-second regression guard.
+
+Originally this test ran on CPU via the silent dispatcher fallback. The
+fallback is gone (it OOM'd in production via fp32 logits materialization),
+so the equality check now requires CUDA + the built native extension and
+skips on dev macs.
 """
 from __future__ import annotations
 
 import pytest
 import torch
 
+import chaoscontrol.kernels._lm_head_loss as _lm_head_loss
 from chaoscontrol.train_ssm import (
     fused_lm_head_backend_for_mode,
     fused_lm_head_backward,
     fused_lm_head_backward_with_ce,
 )
+
+
+pytestmark = [
+    pytest.mark.skipif(
+        not torch.cuda.is_available(),
+        reason="fused LM-head dispatchers no longer fall back on CPU",
+    ),
+    pytest.mark.skipif(
+        _lm_head_loss._C is None,
+        reason="chaoscontrol.kernels._lm_head_loss._C not built on this machine",
+    ),
+]
 
 
 _FUSED_BACKWARD_MODES = (
@@ -31,12 +49,15 @@ _FUSED_BACKWARD_MODES = (
 
 
 def _make_inputs(seed: int = 17):
+    """Build matched (hidden, RMSNorm, Linear, targets) on CUDA in bf16 so
+    the dispatcher's eligibility predicates accept us on a built pod."""
     torch.manual_seed(seed)
     B, T, D, V = 2, 4, 16, 32
-    hidden = torch.randn(B, T, D, requires_grad=True)
-    final_norm = torch.nn.RMSNorm(D, eps=1e-6)
-    lm_head = torch.nn.Linear(D, V, bias=False)
-    targets = torch.randint(0, V, (B, T), dtype=torch.long)
+    device = torch.device("cuda")
+    hidden = torch.randn(B, T, D, device=device, dtype=torch.bfloat16, requires_grad=True)
+    final_norm = torch.nn.RMSNorm(D, eps=1e-6).to(device=device, dtype=torch.bfloat16)
+    lm_head = torch.nn.Linear(D, V, bias=False).to(device=device, dtype=torch.bfloat16)
+    targets = torch.randint(0, V, (B, T), dtype=torch.long, device=device)
     return hidden, final_norm, lm_head, targets
 
 
@@ -44,13 +65,15 @@ def _run_backward(fn, mode, *, hidden, final_norm, lm_head, targets):
     """Invoke ``fn`` once and snapshot loss + grads on every parameter
     that participated in the backward pass."""
     backend = fused_lm_head_backend_for_mode(mode)
+    # tile_size must divide vocab (V=32) for the streaming_cached predicate;
+    # 8 divides 32 and matches the other backends as well.
     result = fn(
         hidden=hidden,
         final_norm=final_norm,
         lm_head=lm_head,
         targets=targets,
         backend=backend,
-        tile_size=1024,
+        tile_size=8,
     )
     loss = result[0] if isinstance(result, tuple) else result
     return {
@@ -119,7 +142,7 @@ def test_with_ce_per_token_ce_means_to_scalar_loss(mode):
         lm_head=lm_head,
         targets=targets,
         backend=backend,
-        tile_size=1024,
+        tile_size=8,
     )
     torch.testing.assert_close(
         per_token_ce.float().mean(),

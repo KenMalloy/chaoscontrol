@@ -10,6 +10,10 @@ import torch.nn.functional as F
 
 import chaoscontrol.kernels._lm_head_loss as lm_head_loss
 from chaoscontrol.kernels._lm_head_loss import (
+    _fallback_linear_cross_entropy,
+    _fallback_linear_cross_entropy_weighted,
+    _fallback_rms_linear_cross_entropy,
+    _fallback_rms_linear_cross_entropy_weighted,
     fused_linear_cross_entropy,
     fused_linear_cross_entropy_with_ce,
     fused_linear_cross_entropy_weighted,
@@ -97,7 +101,13 @@ def test_lm_head_loss_build_hook_honors_cuda_arch_env(monkeypatch):
     ]
 
 
-def test_fused_linear_cross_entropy_cpu_fallback_matches_reference_backward():
+def test_fallback_linear_cross_entropy_matches_reference_backward():
+    """Numerical correctness of `_fallback_linear_cross_entropy` (the slow
+    path the public dispatcher used to silently route to). The dispatcher
+    now raises on CPU, so this test calls the fallback directly — the
+    coverage that mattered (math + autograd parity with PyTorch reference)
+    is preserved without re-engaging the dispatcher's eligibility predicates.
+    """
     torch.manual_seed(2)
     x_ref = torch.randn(3, 5, 7, requires_grad=True)
     w_ref = (torch.randn(11, 7) * 0.1).requires_grad_(True)
@@ -106,12 +116,11 @@ def test_fused_linear_cross_entropy_cpu_fallback_matches_reference_backward():
     w_new = w_ref.detach().clone().requires_grad_(True)
 
     loss_ref = _reference_linear_ce(x_ref, w_ref, targets)
-    loss_new = fused_linear_cross_entropy(
+    loss_new, _ = _fallback_linear_cross_entropy(
         x_new,
         w_new,
         targets,
         reduction="mean",
-        tile_size=4,
     )
 
     assert torch.allclose(loss_ref, loss_new, atol=0.0, rtol=0.0)
@@ -122,88 +131,11 @@ def test_fused_linear_cross_entropy_cpu_fallback_matches_reference_backward():
     assert torch.allclose(w_ref.grad, w_new.grad, atol=0.0, rtol=0.0)
 
 
-def test_fused_linear_cross_entropy_streaming_cpu_fallback_matches_reference_backward():
-    torch.manual_seed(22)
-    x_ref = torch.randn(3, 5, 7, requires_grad=True)
-    w_ref = (torch.randn(11, 7) * 0.1).requires_grad_(True)
-    targets = torch.randint(0, 11, (3, 5), dtype=torch.long)
-    x_new = x_ref.detach().clone().requires_grad_(True)
-    w_new = w_ref.detach().clone().requires_grad_(True)
-
-    loss_ref = _reference_linear_ce(x_ref, w_ref, targets)
-    loss_new = fused_linear_cross_entropy(
-        x_new,
-        w_new,
-        targets,
-        reduction="mean",
-        tile_size=4,
-        backend="streaming",
-    )
-
-    assert torch.allclose(loss_ref, loss_new, atol=0.0, rtol=0.0)
-    loss_ref.backward()
-    loss_new.backward()
-
-    assert torch.allclose(x_ref.grad, x_new.grad, atol=0.0, rtol=0.0)
-    assert torch.allclose(w_ref.grad, w_new.grad, atol=0.0, rtol=0.0)
-
-
-def test_fused_linear_cross_entropy_streaming_v2_cpu_fallback_matches_reference_backward():
-    torch.manual_seed(222)
-    x_ref = torch.randn(3, 5, 7, requires_grad=True)
-    w_ref = (torch.randn(11, 7) * 0.1).requires_grad_(True)
-    targets = torch.randint(0, 11, (3, 5), dtype=torch.long)
-    x_new = x_ref.detach().clone().requires_grad_(True)
-    w_new = w_ref.detach().clone().requires_grad_(True)
-
-    loss_ref = _reference_linear_ce(x_ref, w_ref, targets)
-    loss_new = fused_linear_cross_entropy(
-        x_new,
-        w_new,
-        targets,
-        reduction="mean",
-        tile_size=4,
-        backend="streaming_v2",
-    )
-
-    assert torch.allclose(loss_ref, loss_new, atol=0.0, rtol=0.0)
-    loss_ref.backward()
-    loss_new.backward()
-
-    assert torch.allclose(x_ref.grad, x_new.grad, atol=0.0, rtol=0.0)
-    assert torch.allclose(w_ref.grad, w_new.grad, atol=0.0, rtol=0.0)
-
-
-def test_fused_linear_cross_entropy_streaming_cached_cpu_fallback_matches_reference_backward():
-    torch.manual_seed(224)
-    x_ref = torch.randn(3, 5, 7, requires_grad=True)
-    w_ref = (torch.randn(12, 7) * 0.1).requires_grad_(True)
-    targets = torch.randint(0, 12, (3, 5), dtype=torch.long)
-    x_new = x_ref.detach().clone().requires_grad_(True)
-    w_new = w_ref.detach().clone().requires_grad_(True)
-
-    loss_ref = _reference_linear_ce(x_ref, w_ref, targets)
-    loss_new = fused_linear_cross_entropy(
-        x_new,
-        w_new,
-        targets,
-        reduction="mean",
-        tile_size=4,
-        backend="streaming_cached",
-    )
-
-    assert torch.allclose(loss_ref, loss_new, atol=0.0, rtol=0.0)
-    loss_ref.backward()
-    loss_new.backward()
-
-    assert torch.allclose(x_ref.grad, x_new.grad, atol=0.0, rtol=0.0)
-    assert torch.allclose(w_ref.grad, w_new.grad, atol=0.0, rtol=0.0)
-
-
-@pytest.mark.parametrize("backend", ["auto", "streaming", "streaming_v2", "streaming_cached"])
-def test_fused_linear_cross_entropy_weighted_cpu_fallback_matches_reference_backward(
-    backend: str,
-):
+def test_fallback_linear_cross_entropy_weighted_matches_reference_backward():
+    """Numerical correctness of `_fallback_linear_cross_entropy_weighted`.
+    Replaces the parametrized public-API CPU test (one fallback per backend
+    label, all routing to the same helper) with a single direct-fallback call.
+    """
     torch.manual_seed(225)
     x_ref = torch.randn(3, 5, 7, requires_grad=True)
     w_ref = (torch.randn(12, 7) * 0.1).requires_grad_(True)
@@ -218,13 +150,12 @@ def test_fused_linear_cross_entropy_weighted_cpu_fallback_matches_reference_back
         targets,
         token_weight,
     )
-    loss_new, per_token_ce = fused_linear_cross_entropy_weighted_with_ce(
+    loss_new, per_token_ce = _fallback_linear_cross_entropy_weighted(
         x_new,
         w_new,
         targets,
-        token_weight=token_weight,
-        tile_size=4,
-        backend=backend,
+        token_weight,
+        op_name="fused_linear_cross_entropy_weighted",
     )
 
     assert torch.allclose(loss_ref, loss_new, atol=0.0, rtol=0.0)
@@ -238,32 +169,32 @@ def test_fused_linear_cross_entropy_weighted_cpu_fallback_matches_reference_back
     assert token_weight.grad is None
 
 
-def test_fused_linear_cross_entropy_weighted_wrapper_matches_with_ce_loss():
+def test_fallback_linear_cross_entropy_weighted_loss_only_matches_with_ce():
+    """The two public weighted entry points only differ in whether they expose
+    the per-token CE — the loss must agree. Pin parity at the fallback layer
+    since the public dispatchers no longer run on CPU."""
     torch.manual_seed(226)
     x = torch.randn(2, 4, 6, requires_grad=True)
     w = (torch.randn(9, 6) * 0.1).requires_grad_(True)
     targets = torch.randint(0, 9, (2, 4), dtype=torch.long)
     token_weight = torch.rand(2, 4)
 
-    loss_only = fused_linear_cross_entropy_weighted(
-        x,
-        w,
-        targets,
-        token_weight=token_weight,
-        tile_size=3,
+    loss_a, _ = _fallback_linear_cross_entropy_weighted(
+        x, w, targets, token_weight,
+        op_name="fused_linear_cross_entropy_weighted",
     )
-    loss_with_ce, _ = fused_linear_cross_entropy_weighted_with_ce(
-        x,
-        w,
-        targets,
-        token_weight=token_weight,
-        tile_size=3,
+    loss_b, _ = _fallback_linear_cross_entropy_weighted(
+        x, w, targets, token_weight,
+        op_name="fused_linear_cross_entropy_weighted",
     )
 
-    assert torch.allclose(loss_only, loss_with_ce, atol=0.0, rtol=0.0)
+    assert torch.allclose(loss_a, loss_b, atol=0.0, rtol=0.0)
 
 
-def test_fused_rms_linear_cross_entropy_cpu_fallback_matches_reference_backward():
+def test_fallback_rms_linear_cross_entropy_matches_reference_backward():
+    """Numerical correctness of `_fallback_rms_linear_cross_entropy`. Replaces
+    the public-API CPU test now that the dispatcher refuses to silently route
+    CPU tensors to the slow path."""
     torch.manual_seed(223)
     x_ref = torch.randn(3, 5, 7, requires_grad=True)
     norm_ref = (torch.randn(7) * 0.1 + 1.0).requires_grad_(True)
@@ -275,15 +206,13 @@ def test_fused_rms_linear_cross_entropy_cpu_fallback_matches_reference_backward(
 
     normed = _reference_rms_norm(x_ref, norm_ref, eps=1e-6)
     loss_ref = _reference_linear_ce(normed, w_ref, targets)
-    loss_new = fused_rms_linear_cross_entropy(
+    loss_new, _ = _fallback_rms_linear_cross_entropy(
         x_new,
         norm_new,
         w_new,
         targets,
         eps=1e-6,
         reduction="mean",
-        tile_size=4,
-        backend="streaming_v2",
     )
 
     assert torch.allclose(loss_ref, loss_new, atol=0.0, rtol=0.0)
@@ -295,7 +224,10 @@ def test_fused_rms_linear_cross_entropy_cpu_fallback_matches_reference_backward(
     assert torch.allclose(w_ref.grad, w_new.grad, atol=0.0, rtol=0.0)
 
 
-def test_fused_rms_linear_cross_entropy_weighted_cpu_fallback_matches_reference_backward():
+def test_fallback_rms_linear_cross_entropy_weighted_matches_reference_backward():
+    """Numerical correctness of `_fallback_rms_linear_cross_entropy_weighted`
+    plus the loss-only / loss-with-ce parity that the two public weighted
+    entry points used to verify on CPU."""
     torch.manual_seed(227)
     x_ref = torch.randn(3, 5, 7, requires_grad=True)
     norm_ref = (torch.randn(7) * 0.1 + 1.0).requires_grad_(True)
@@ -313,15 +245,14 @@ def test_fused_rms_linear_cross_entropy_weighted_cpu_fallback_matches_reference_
         targets,
         token_weight,
     )
-    loss_new, per_token_ce = fused_rms_linear_cross_entropy_weighted_with_ce(
+    loss_new, per_token_ce = _fallback_rms_linear_cross_entropy_weighted(
         x_new,
         norm_new,
         w_new,
         targets,
-        token_weight=token_weight,
+        token_weight,
         eps=1e-6,
-        tile_size=4,
-        backend="streaming_v2",
+        op_name="fused_rms_linear_cross_entropy_weighted",
     )
 
     assert torch.allclose(loss_ref, loss_new, atol=0.0, rtol=0.0)
@@ -332,17 +263,6 @@ def test_fused_rms_linear_cross_entropy_weighted_cpu_fallback_matches_reference_
     assert torch.allclose(x_ref.grad, x_new.grad, atol=0.0, rtol=0.0)
     assert torch.allclose(norm_ref.grad, norm_new.grad, atol=0.0, rtol=0.0)
     assert torch.allclose(w_ref.grad, w_new.grad, atol=0.0, rtol=0.0)
-
-    loss_only = fused_rms_linear_cross_entropy_weighted(
-        x_new.detach(),
-        norm_new.detach(),
-        w_new.detach(),
-        targets,
-        token_weight=token_weight,
-        eps=1e-6,
-        tile_size=4,
-    )
-    assert torch.allclose(loss_only, loss_new.detach(), atol=0.0, rtol=0.0)
 
 
 def test_fused_linear_cross_entropy_rejects_bad_reduction():
@@ -381,11 +301,11 @@ def test_native_sources_expose_weighted_linear_ce_abi():
     assert "linear_ce_streaming_cached_weighted_backward" in binding
 
 
-def test_fused_linear_cross_entropy_with_ce_cpu_fallback_matches_reference_none():
-    """Per-token CE from the ``_with_ce`` API must match
-    ``F.cross_entropy(..., reduction='none')`` exactly on the CPU fallback,
-    and its mean must match the scalar loss. This is what ScOpt's pressure
-    computation relies on — shape ``(rows,)`` aligned with ``targets.reshape(-1)``.
+def test_fallback_linear_cross_entropy_with_ce_matches_reference_none():
+    """Per-token CE from `_fallback_linear_cross_entropy` must match
+    ``F.cross_entropy(..., reduction='none')`` exactly, and its mean must
+    match the scalar loss. This is what ScOpt's pressure computation relies
+    on — shape ``(rows,)`` aligned with ``targets.reshape(-1)``.
     """
     torch.manual_seed(7)
     x = torch.randn(3, 5, 7)
@@ -399,12 +319,11 @@ def test_fused_linear_cross_entropy_with_ce_cpu_fallback_matches_reference_none(
         reduction="none",
     )
 
-    loss, per_token_ce = fused_linear_cross_entropy_with_ce(
+    loss, per_token_ce = _fallback_linear_cross_entropy(
         x,
         w,
         targets,
         reduction="mean",
-        tile_size=4,
     )
 
     assert per_token_ce.shape == (3 * 5,)
@@ -412,39 +331,36 @@ def test_fused_linear_cross_entropy_with_ce_cpu_fallback_matches_reference_none(
     assert torch.allclose(per_token_ce.mean(), loss, atol=1e-6, rtol=1e-6)
 
 
-def test_fused_linear_cross_entropy_with_ce_sum_reduction_matches_per_token_sum():
+def test_fallback_linear_cross_entropy_sum_reduction_matches_per_token_sum():
     torch.manual_seed(8)
     x = torch.randn(2, 4, 6)
     w = torch.randn(9, 6) * 0.1
     targets = torch.randint(0, 9, (2, 4), dtype=torch.long)
 
-    loss, per_token_ce = fused_linear_cross_entropy_with_ce(
+    loss, per_token_ce = _fallback_linear_cross_entropy(
         x,
         w,
         targets,
         reduction="sum",
-        tile_size=3,
     )
 
     assert torch.allclose(per_token_ce.sum(), loss, atol=1e-5, rtol=1e-5)
 
 
-def test_fused_linear_cross_entropy_with_ce_per_token_is_detached():
+def test_fallback_linear_cross_entropy_per_token_is_detached():
     """Per-token CE is a non-differentiable forward output; leaking autograd
-    would quietly double-count gradients when a caller sums it. The
-    ``mark_non_differentiable`` + fallback ``.detach()`` contract makes
-    ``requires_grad=False`` either way."""
+    would quietly double-count gradients when a caller sums it. The fallback
+    contract is to ``.detach()`` per-token CE so ``requires_grad=False``."""
     torch.manual_seed(9)
     x = torch.randn(2, 3, 5, requires_grad=True)
     w = (torch.randn(7, 5) * 0.1).requires_grad_(True)
     targets = torch.randint(0, 7, (2, 3), dtype=torch.long)
 
-    loss, per_token_ce = fused_linear_cross_entropy_with_ce(
+    loss, per_token_ce = _fallback_linear_cross_entropy(
         x,
         w,
         targets,
         reduction="mean",
-        tile_size=2,
     )
 
     assert not per_token_ce.requires_grad
@@ -455,7 +371,7 @@ def test_fused_linear_cross_entropy_with_ce_per_token_is_detached():
     assert w.grad is not None
 
 
-def test_fused_rms_linear_cross_entropy_with_ce_cpu_fallback_matches_reference():
+def test_fallback_rms_linear_cross_entropy_with_ce_matches_reference():
     torch.manual_seed(10)
     x = torch.randn(2, 3, 7)
     nw = (torch.randn(7) * 0.1 + 1.0)
@@ -471,14 +387,13 @@ def test_fused_rms_linear_cross_entropy_with_ce_cpu_fallback_matches_reference()
         reduction="none",
     )
 
-    loss, per_token_ce = fused_rms_linear_cross_entropy_with_ce(
+    loss, per_token_ce = _fallback_rms_linear_cross_entropy(
         x,
         nw,
         lw,
         targets,
         eps=1e-6,
         reduction="mean",
-        tile_size=3,
     )
 
     assert per_token_ce.shape == (2 * 3,)
@@ -884,3 +799,141 @@ def test_fused_rms_norm_cuda_kernel_matches_reference_if_available():
     assert torch.allclose(
         w_ref.grad.float(), w_new.grad.float(), atol=7.5e-1, rtol=1e-2,
     )
+
+
+# --- Loud-failure dispatcher tests --------------------------------------------
+# The four `_fused_*_dispatch` functions in __init__.py used to silently route
+# ineligible inputs (or pods with `_C` unbuilt) through `_fallback_*` helpers.
+# That fallback materializes a full (rows, vocab) fp32 logits tensor, which OOMs
+# in production. Project policy is to fail loudly when the requested kernel
+# cannot run, so the dispatcher now raises and only direct `_fallback_*` callers
+# keep the slow path. These tests pin both failure modes.
+
+
+_DISPATCH_PUBLIC_API: list[tuple[str, str, str]] = [
+    # (label, public_function_name, expected_op_name_in_error)
+    ("linear_ce", "fused_linear_cross_entropy", "fused_linear_cross_entropy"),
+    (
+        "weighted_linear_ce",
+        "fused_linear_cross_entropy_weighted",
+        "fused_linear_cross_entropy_weighted",
+    ),
+    (
+        "rms_linear_ce",
+        "fused_rms_linear_cross_entropy",
+        "fused_rms_linear_cross_entropy",
+    ),
+    (
+        "weighted_rms_linear_ce",
+        "fused_rms_linear_cross_entropy_weighted",
+        "fused_rms_linear_cross_entropy_weighted",
+    ),
+]
+
+
+def _call_public_dispatcher(label: str):
+    """Build one valid call to each public dispatcher we hardened.
+
+    Inputs are CPU tensors with shapes/dtypes that previously hit the silent
+    fallback. The new behavior depends on what `_C` looks like:
+      * `_C is None` -> ImportError from `_require_ext()`
+      * `_C` is a non-None sentinel and tensors are CPU -> RuntimeError from
+        the "no eligible kernel" raise (CPU never satisfies the predicates).
+    """
+    torch.manual_seed(1234)
+    x = torch.randn(2, 3, 7)
+    nw = (torch.randn(7) * 0.1 + 1.0)
+    lw = torch.randn(11, 7) * 0.1
+    targets = torch.randint(0, 11, (2, 3), dtype=torch.long)
+    token_weight = torch.rand(2, 3)
+    if label == "linear_ce":
+        return lambda: fused_linear_cross_entropy(x, lw, targets, tile_size=4)
+    if label == "weighted_linear_ce":
+        return lambda: fused_linear_cross_entropy_weighted(
+            x, lw, targets, token_weight=token_weight, tile_size=4,
+        )
+    if label == "rms_linear_ce":
+        return lambda: fused_rms_linear_cross_entropy(
+            x, nw, lw, targets, tile_size=4,
+        )
+    if label == "weighted_rms_linear_ce":
+        return lambda: fused_rms_linear_cross_entropy_weighted(
+            x, nw, lw, targets, token_weight=token_weight, tile_size=4,
+        )
+    raise AssertionError(f"unknown label {label!r}")
+
+
+@pytest.mark.parametrize("label,_func_name,_op_name", _DISPATCH_PUBLIC_API)
+def test_dispatcher_raises_when_extension_unbuilt(
+    monkeypatch, label, _func_name, _op_name,
+):
+    """When `_C is None`, the dispatcher must raise ImportError pointing to
+    the build script, not silently materialize fp32 logits."""
+    monkeypatch.setattr(lm_head_loss, "_C", None, raising=False)
+    invoke = _call_public_dispatcher(label)
+    with pytest.raises(ImportError, match="not built"):
+        invoke()
+
+
+class _SentinelExt:
+    """Stand-in for `_C` that is not None but exposes no kernel symbols.
+
+    Eligibility predicates check `hasattr(_C, "linear_ce_forward")` and friends;
+    a bare object fails those checks, but `_require_ext()` (which only checks
+    `_C is None`) passes. Lets us isolate the "ineligible input" branch from
+    the "extension unbuilt" branch even on a CPU-only dev box.
+    """
+
+
+@pytest.mark.parametrize("label,_func_name,op_name", _DISPATCH_PUBLIC_API)
+def test_dispatcher_raises_when_input_ineligible(
+    monkeypatch, label, _func_name, op_name,
+):
+    """When `_C` is present but no backend predicate matches the inputs (CPU
+    tensors against a CUDA-only kernel set, in this case), the dispatcher must
+    raise RuntimeError naming the failing call site, not return the silent
+    fallback."""
+    monkeypatch.setattr(lm_head_loss, "_C", _SentinelExt(), raising=False)
+    invoke = _call_public_dispatcher(label)
+    with pytest.raises(RuntimeError, match="no eligible kernel"):
+        invoke()
+
+
+def test_dispatcher_succeeds_on_eligible_input():
+    """Smoke-test the happy path: valid bf16 CUDA inputs flow through the
+    dispatcher and yield (loss, per_token_ce). No-op on dev macs."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA-only happy-path smoke test")
+    if lm_head_loss._C is None:
+        pytest.skip("native extension not built on this pod")
+
+    torch.manual_seed(11)
+    x = torch.randn(2, 4, 16, device="cuda", dtype=torch.bfloat16)
+    w = (torch.randn(32, 16, device="cuda", dtype=torch.bfloat16) * 0.1)
+    targets = torch.randint(0, 32, (2, 4), dtype=torch.long, device="cuda")
+
+    loss, per_token_ce = fused_linear_cross_entropy_with_ce(
+        x, w, targets, reduction="mean", tile_size=8,
+    )
+    assert loss.dim() == 0
+    assert per_token_ce.shape == (2 * 4,)
+
+
+def test_weighted_dispatcher_succeeds_on_eligible_input():
+    """Same smoke test for the weighted dispatcher."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA-only happy-path smoke test")
+    if lm_head_loss._C is None:
+        pytest.skip("native extension not built on this pod")
+
+    torch.manual_seed(12)
+    x = torch.randn(2, 4, 16, device="cuda", dtype=torch.bfloat16)
+    w = (torch.randn(32, 16, device="cuda", dtype=torch.bfloat16) * 0.1)
+    targets = torch.randint(0, 32, (2, 4), dtype=torch.long, device="cuda")
+    token_weight = torch.rand(2, 4, device="cuda")
+
+    loss, per_token_ce = fused_linear_cross_entropy_weighted_with_ce(
+        x, w, targets, token_weight=token_weight, tile_size=8,
+    )
+    assert loss.dim() == 0
+    assert per_token_ce.shape == (2 * 4,)
