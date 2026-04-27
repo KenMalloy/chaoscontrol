@@ -18,6 +18,7 @@ import random
 import sys
 import threading
 import time
+import traceback
 from pathlib import Path
 from typing import Any
 
@@ -2020,6 +2021,7 @@ class _EpisodicConsumerState:
         "write_ring_event_age_sum",
         "write_ring_event_age_max",
         "write_ring_max_drain_per_step",
+        "write_ring_drain_errors",
         "write_ring_lock",
         "query_ring",
         "query_ring_name",
@@ -2076,6 +2078,7 @@ class _EpisodicConsumerState:
         self.write_ring_max_drain_per_step = max(
             0, int(write_ring_max_drain_per_step)
         )
+        self.write_ring_drain_errors = 0
         self.write_ring_lock = threading.RLock()
         self.query_ring = None
         self.query_ring_name: str | None = None
@@ -2279,13 +2282,31 @@ def _write_drain_main(
 ) -> None:
     current_step = 0
     while not stop_event.is_set():
-        drained = _drain_episodic_write_rings(
-            consumer=consumer,
-            current_step=int(current_step),
-            embedding_version=int(embedding_version_ref[0]),
-            controller_score_mode=str(controller_score_mode),
-            controller_topk_k=int(controller_topk_k),
-        )
+        try:
+            drained = _drain_episodic_write_rings(
+                consumer=consumer,
+                current_step=int(current_step),
+                embedding_version=int(embedding_version_ref[0]),
+                controller_score_mode=str(controller_score_mode),
+                controller_topk_k=int(controller_topk_k),
+            )
+        except Exception:
+            # The drain runs on a daemon thread; an uncaught exception
+            # would silently kill it while train ranks keep publishing,
+            # leaving the cache permanently empty for the rest of the
+            # run. Bump the counter so telemetry surfaces the failure
+            # and continue — the next iteration retries the drain on a
+            # later batch of events.
+            consumer.write_ring_drain_errors += 1
+            print(
+                "[runner_fast_path] episodic write-drain error "
+                f"(step={current_step}, total_errors="
+                f"{consumer.write_ring_drain_errors}):",
+                file=sys.stderr,
+                flush=True,
+            )
+            traceback.print_exc(file=sys.stderr)
+            drained = 0
         current_step += 1
         heartbeat[0] += 1
         if drained == 0 and stop_event.wait(timeout=float(idle_sleep_s)):
@@ -6169,6 +6190,9 @@ def train_fast_for_budget(
                     episodic_write_drain_handle.heartbeat[0]
                     if episodic_write_drain_handle is not None
                     else 0
+                ),
+                "drain_errors": int(
+                    getattr(episodic_consumer, "write_ring_drain_errors", 0)
                 ),
                 "artifact_impact": "artifact_training_only",
             },

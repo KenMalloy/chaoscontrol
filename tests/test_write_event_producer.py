@@ -439,6 +439,57 @@ def test_async_write_ring_drain_populates_cache_and_query_queue():
         mod._cleanup_episodic_event_rings(consumer)
 
 
+def test_write_drain_daemon_survives_drain_exception():
+    """A raise inside ``_drain_episodic_write_rings`` must not kill the
+    daemon thread — bump ``write_ring_drain_errors``, log to stderr, and
+    keep iterating so a transient malformed event doesn't leave the
+    cache permanently empty for the rest of a multi-hour run.
+    """
+    import threading
+    import types
+
+    mod = _load_runner()
+    consumer = types.SimpleNamespace(write_ring_drain_errors=0)
+    stop_event = threading.Event()
+    heartbeat = [0]
+    call_count = [0]
+
+    def _flaky_drain(**_kwargs):
+        call_count[0] += 1
+        if call_count[0] <= 3:
+            raise RuntimeError(f"injected drain failure #{call_count[0]}")
+        # Recover: stop the daemon after we've proven it kept iterating.
+        stop_event.set()
+        return 0
+
+    original = mod._drain_episodic_write_rings
+    mod._drain_episodic_write_rings = _flaky_drain
+    try:
+        thread = threading.Thread(
+            target=mod._write_drain_main,
+            kwargs={
+                "consumer": consumer,
+                "stop_event": stop_event,
+                "idle_sleep_s": 0.001,
+                "embedding_version_ref": [0],
+                "controller_score_mode": "pressure_only",
+                "controller_topk_k": 16,
+                "heartbeat": heartbeat,
+            },
+            daemon=True,
+        )
+        thread.start()
+        thread.join(timeout=5.0)
+        assert not thread.is_alive(), "daemon thread did not exit cleanly"
+        assert call_count[0] == 4, (
+            f"daemon stopped iterating after exceptions; got {call_count[0]} calls"
+        )
+        assert consumer.write_ring_drain_errors == 3
+        assert heartbeat[0] == 4
+    finally:
+        mod._drain_episodic_write_rings = original
+
+
 def test_learned_write_admission_can_rerank_candidate_positions():
     mod = _load_runner()
     action_space = mod.ConstrainedActionSpace(
