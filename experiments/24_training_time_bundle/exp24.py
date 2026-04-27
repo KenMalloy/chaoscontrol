@@ -916,7 +916,17 @@ EPISODIC_CONTROLLER_V1_ARMS: tuple[str, ...] = (
     "arm_c_simplex_frozen",
     "arm_d_simplex_online",
     "arm_e_simplex_warm_online",
+    "arm_f_simplex_sharp_online",
 )
+# Initial-temperature override for arm_f. The CSWG-loaded simplex policy
+# starts near-uniform (max p ≈ 0.067 vs uniform 0.0625 per the
+# 2026-04-27 v2 trace inspection); REINFORCE on near-uniform behavior
+# can't bootstrap because the gradient direction cancels across events.
+# Sharpening to T=0.2 multiplies the effective logit magnitude by 5
+# without re-pretraining. Validated by scripts/simplex_bootstrap_microbench.py
+# (T=1.0 produces zero policy drift; T=0.2 produces 2x-uniform p[favored]
+# in 19 SGD steps).
+ARM_F_INITIAL_TEMPERATURE: float = 0.2
 EPISODIC_CONTROLLER_V1_WEIGHTS_PATH = (
     "TO_BE_FILLED/episodic_controller_v1_weights.pt"
 )
@@ -1114,6 +1124,22 @@ def build_episodic_controller_v1_matrix(
                 "episodic_event_log_enabled": True,
                 **simplex_controller_online,
                 **warm_eval_cache,
+            },
+        ),
+        # arm_f isolates the initial-temperature override from the cold-vs-warm
+        # cache contrast: same controller as arm_d (simplex_v1, online,
+        # cold cache) but with episodic_controller_initial_temperature=0.2
+        # to break the bootstrap pathology. arm_d vs arm_f directly tests
+        # whether a non-uniform initial sampling policy unblocks REINFORCE.
+        (
+            "arm_f_simplex_sharp_online",
+            {
+                "episodic_enabled": True,
+                "controller_query_enabled": True,
+                "episodic_event_log_enabled": True,
+                **simplex_controller_online,
+                "episodic_controller_initial_temperature": ARM_F_INITIAL_TEMPERATURE,
+                **cold_eval_cache,
             },
         ),
     ]

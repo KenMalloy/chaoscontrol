@@ -8,6 +8,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
 import yaml
 
 
@@ -1427,16 +1428,20 @@ def test_episodic_ttt_v1_matrix_pins_eval_cache_schema_on_all_arms():
     )
 
 
-def test_episodic_controller_v1_matrix_has_five_arms_three_seeds():
-    """Simplex controller V1 falsifier matrix: 5 arms x 3 seeds.
+def test_episodic_controller_v1_matrix_has_six_arms_three_seeds():
+    """Simplex controller V1 falsifier matrix: 6 arms x 3 seeds.
 
-    Three pairwise contrasts the matrix exposes:
+    Four pairwise contrasts the matrix exposes:
       - heuristic vs simplex: arm_b vs arm_c (frozen-trained policy is
         the only difference; same retrieval semantics).
       - frozen vs online: arm_c vs arm_d (online REINFORCE is the
         only difference).
       - cold vs warm cache: arm_d vs arm_e (online controller held
         constant; cache init is the only difference).
+      - default vs sharp temperature: arm_d vs arm_f (online controller
+        and cold cache held constant; initial-temperature override is
+        the only difference; tests whether sharper initial sampling
+        unblocks REINFORCE bootstrap).
     """
     mod = _load_exp24()
 
@@ -1446,8 +1451,8 @@ def test_episodic_controller_v1_matrix_has_five_arms_three_seeds():
         budget_seconds=600.0,
     )
 
-    assert len(entries) == 15
-    assert len({entry["name"] for entry in entries}) == 15
+    assert len(entries) == 18
+    assert len({entry["name"] for entry in entries}) == 18
     assert {entry["seed"] for entry in entries} == {1337, 2674, 4011}
 
     expected_arms = (
@@ -1456,6 +1461,7 @@ def test_episodic_controller_v1_matrix_has_five_arms_three_seeds():
         "arm_c_simplex_frozen",
         "arm_d_simplex_online",
         "arm_e_simplex_warm_online",
+        "arm_f_simplex_sharp_online",
     )
     assert {entry["arm"] for entry in entries} == set(expected_arms)
     assert {entry["exp24_mechanism"] for entry in entries} == {
@@ -1505,6 +1511,7 @@ def test_episodic_controller_v1_matrix_has_five_arms_three_seeds():
         "arm_c_simplex_frozen",
         "arm_d_simplex_online",
         "arm_e_simplex_warm_online",
+        "arm_f_simplex_sharp_online",
     )
     for arm in simplex_arms:
         for entry in by_arm[arm]:
@@ -1526,12 +1533,28 @@ def test_episodic_controller_v1_matrix_has_five_arms_three_seeds():
         assert entry["eval_episodic_cache_mode"] == "cold"
         assert entry["controller_train_online"] is True
         assert entry["episodic_controller_entropy_beta"] == 0.05
+        # arm_d does NOT override initial temperature; uses CSWG-loaded
+        # default. The arm_d vs arm_f pair tests this knob in isolation.
+        assert "episodic_controller_initial_temperature" not in entry
 
     for entry in by_arm["arm_e_simplex_warm_online"]:
         assert entry["eval_episodic_cache_mode"] == "warm"
         assert entry["eval_episodic_cache_source"] == "checkpoint"
         assert entry["controller_train_online"] is True
         assert entry["episodic_controller_entropy_beta"] == 0.05
+
+    for entry in by_arm["arm_f_simplex_sharp_online"]:
+        # arm_f: same controller config as arm_d (online + cold cache)
+        # but with the initial-temperature override. Sharper initial
+        # sampling distribution unblocks REINFORCE bootstrap (validated
+        # by scripts/simplex_bootstrap_microbench.py).
+        assert entry["eval_episodic_cache_mode"] == "cold"
+        assert entry["controller_train_online"] is True
+        assert entry["episodic_controller_entropy_beta"] == 0.05
+        assert entry["episodic_controller_initial_temperature"] == pytest.approx(
+            mod.ARM_F_INITIAL_TEMPERATURE
+        )
+        assert mod.ARM_F_INITIAL_TEMPERATURE == 0.2  # locked default
 
     for arm in simplex_arms:
         for entry in by_arm[arm]:
@@ -1588,6 +1611,7 @@ def test_episodic_controller_v1_weights_path_honors_env_override(monkeypatch):
             "arm_c_simplex_frozen",
             "arm_d_simplex_online",
             "arm_e_simplex_warm_online",
+            "arm_f_simplex_sharp_online",
         }
     ]
     assert simplex
@@ -1656,7 +1680,7 @@ def test_run_exp24_cli_episodic_controller_v1_dry_run(tmp_path):
             "episodic_controller_v1",
             "--dry-run",
             "--limit",
-            "15",
+            "18",
             "--output-dir",
             str(output_dir),
         ],
@@ -1668,10 +1692,11 @@ def test_run_exp24_cli_episodic_controller_v1_dry_run(tmp_path):
     stdout = result.stdout
     assert "matrix=episodic_controller_v1" in stdout
     assert "world_size=4" in stdout
-    assert "entries=15" in stdout
+    assert "entries=18" in stdout
     assert "exp24_phase3_episodic_controller_v1_arm_a_control_s1337" in stdout
     assert "exp24_phase3_episodic_controller_v1_arm_d_simplex_online_s1337" in stdout
     assert "exp24_phase3_episodic_controller_v1_arm_e_simplex_warm_online_s4011" in stdout
+    assert "exp24_phase3_episodic_controller_v1_arm_f_simplex_sharp_online_s1337" in stdout
     assert '"exp24_mechanism": "episodic_controller_v1"' in stdout
 
 

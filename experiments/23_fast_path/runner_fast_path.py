@@ -3337,6 +3337,19 @@ def _build_simplex_learner_from_cswg(
         entropy_beta=float(config.get("episodic_controller_entropy_beta", 0.0)),
     )
     learner.initialize_simplex_weights(weights)
+    # Optional sharper-policy override: the BC-pretrained simplex_v1 CSWG
+    # produces near-uniform initial p (max 0.0667 vs uniform 0.0625 —
+    # only 7% above per the 2026-04-27 v2 trace inspection). With
+    # near-uniform sampling REINFORCE gradients average to zero across
+    # events and the policy can't bootstrap. Setting a smaller initial
+    # temperature than what the CSWG carries (default 1.0) sharpens the
+    # softmax so the sampling policy is non-uniform from step 0, which
+    # gives REINFORCE a non-noise gradient direction to lock onto.
+    # Default None preserves the CSWG-loaded temperature; set e.g. 0.2
+    # for a 5x sharper policy.
+    initial_T_override = config.get("episodic_controller_initial_temperature")
+    if initial_T_override is not None:
+        learner.set_temperature(float(initial_T_override))
     # NDJSON per-replay-event trace. Empty string disables. Configured
     # AFTER initialize so a misconfigured weights path can't leak an
     # opened trace file. Mirrors the entropy_beta plumbing one-for-one.
