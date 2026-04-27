@@ -13,6 +13,7 @@ import pytest
 from chaoscontrol.episodic.learned_action_space import (
     BoundedScalarSpec,
     ConstrainedActionSpace,
+    SharedEventSsm,
 )
 
 
@@ -122,3 +123,71 @@ def test_bounded_scalar_spec_nan_maps_to_minimum():
 
     assert math.isfinite(spec.map(float("nan")))
     assert spec.map(float("nan")) == pytest.approx(0.01)
+
+
+def test_shared_event_ssm_is_deterministic_for_same_stream():
+    a = SharedEventSsm(hidden_dim=8, seed=123)
+    b = SharedEventSsm(hidden_dim=8, seed=123)
+    events = [
+        {"pressure": 0.2, "ce": 1.5, "score": 0.3, "bucket": 0.0},
+        {"pressure": 0.7, "ce": 2.0, "score": 1.4, "bucket": 3.0},
+    ]
+
+    out_a = [a.observe(event) for event in events]
+    out_b = [b.observe(event) for event in events]
+
+    assert out_a == out_b
+
+
+def test_scalar_head_blends_from_fallback_by_readiness():
+    trace: list[dict] = []
+    action_space = ConstrainedActionSpace(
+        head_readiness={"temperature": 0.5},
+        trace_log=trace,
+    )
+
+    value = action_space.scalar_value(
+        head_name="temperature",
+        raw_value=0.0,
+        gpu_step=5,
+        fallback=1.0,
+        reward_context={"score": 0.25},
+    )
+
+    # temperature raw=0 maps to the middle-ish closed range, then readiness
+    # blends it halfway with the legal fallback.
+    assert 1.0 < value < 4.0
+    assert trace[-1]["head_name"] == "temperature"
+    assert trace[-1]["event_type"] == "action_space_scalar"
+
+
+def test_shared_event_ssm_head_updates_from_recorded_reward():
+    ssm = SharedEventSsm(hidden_dim=4, seed=5)
+    action_space = ConstrainedActionSpace(
+        head_readiness={"replay_timing": 1.0},
+        head_max_delta={"replay_timing": 1.0},
+        event_ssm=ssm,
+        online_learning_rate=0.1,
+    )
+    action_space.effective_scores(
+        heuristic_scores=[0.1, 0.2],
+        learned_scores=None,
+        gpu_step=1,
+        head_name="replay_timing",
+        reward_context={"score": 0.15},
+    )
+    before = list(ssm.head_weights["replay_timing"])
+    action_space.record_credit_assignment(
+        key=123,
+        head_names=["replay_timing"],
+        gpu_step=1,
+    )
+
+    applied = action_space.apply_reward(
+        key=123,
+        reward=1.0,
+        gpu_step=2,
+    )
+
+    assert applied == 1
+    assert ssm.head_weights["replay_timing"] != before

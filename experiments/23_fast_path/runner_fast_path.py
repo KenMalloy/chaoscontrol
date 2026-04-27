@@ -69,6 +69,7 @@ from chaoscontrol.distributed import (  # noqa: E402
 from chaoscontrol.episodic.controller import controller_main  # noqa: E402
 from chaoscontrol.episodic.learned_action_space import (  # noqa: E402
     ConstrainedActionSpace,
+    make_shared_event_ssm_from_config,
 )
 from chaoscontrol.episodic.query import query_topk  # noqa: E402
 from chaoscontrol.episodic.gpu_slot import (  # noqa: E402
@@ -138,7 +139,10 @@ from dreamworld import (  # noqa: E402
     dreamworld_replay_backward,
     dreamworld_replay_from_cache_entry,
 )
-from chaoscontrol.episodic.diagnostics import DiagnosticsLogger  # noqa: E402
+from chaoscontrol.episodic.diagnostics import (  # noqa: E402
+    ActionSpaceTraceLogger,
+    DiagnosticsLogger,
+)
 from experiments._23_fast_path_runner_helpers import (  # noqa: E402
     _alloc_pinned_evidence_buffers,
     compute_ce_minus_entropy_pressure_from_fused,
@@ -1380,6 +1384,129 @@ def _cleanup_episodic_event_rings(owner: Any) -> None:
                 pass
 
 
+_ACTION_SPACE_HEADS = (
+    "write_admission",
+    "eviction",
+    "replay_timing",
+    "replay_budget",
+    "write_budget",
+    "temperature",
+    "entropy_beta",
+    "ema_alpha",
+    "consolidation",
+    "selection_rank",
+)
+
+
+def _action_trace_logger_from_config(
+    config: dict[str, Any],
+    *,
+    rank: int | str,
+) -> ActionSpaceTraceLogger | None:
+    path_value = config.get("episodic_controller_action_trace_path")
+    if not path_value:
+        return None
+    path = Path(str(path_value))
+    rank_label = str(rank)
+    if path.suffix:
+        path = path.with_name(f"{path.stem}.rank{rank_label}{path.suffix}")
+    else:
+        path = path / f"action_space_rank{rank_label}.ndjson"
+    return ActionSpaceTraceLogger(path)
+
+
+def _head_config_float(
+    config: dict[str, Any],
+    *,
+    head: str,
+    field: str,
+    default: float,
+) -> float:
+    table = config.get(f"episodic_controller_head_{field}")
+    if isinstance(table, dict) and head in table:
+        return float(table[head])
+    return float(config.get(f"episodic_controller_{head}_{field}", default))
+
+
+def _head_table_from_config(
+    config: dict[str, Any],
+    *,
+    field: str,
+) -> dict[str, float] | None:
+    table = config.get(f"episodic_controller_head_{field}")
+    out: dict[str, float] = {}
+    if isinstance(table, dict):
+        out.update({str(k): float(v) for k, v in table.items()})
+    for head in _ACTION_SPACE_HEADS:
+        key = f"episodic_controller_{head}_{field}"
+        if key in config:
+            out[head] = float(config[key])
+    return out or None
+
+
+def _build_action_space_from_config(
+    config: dict[str, Any],
+    *,
+    trace_log: Any | None,
+) -> ConstrainedActionSpace | None:
+    if not bool(config.get("episodic_controller_action_space_enabled", False)):
+        return None
+    max_tags = config.get("episodic_controller_max_tags_per_query")
+    head_readiness = {
+        head: _head_config_float(
+            config, head=head, field="readiness", default=0.0
+        )
+        for head in _ACTION_SPACE_HEADS
+    }
+    head_max_delta = {
+        head: _head_config_float(
+            config, head=head, field="max_delta", default=0.0
+        )
+        for head in _ACTION_SPACE_HEADS
+    }
+    selection_readiness = float(
+        config.get(
+            "episodic_controller_selection_readiness",
+            head_readiness.get("selection_rank", 0.0),
+        )
+    )
+    selection_max_delta = float(
+        config.get(
+            "episodic_controller_selection_max_delta",
+            head_max_delta.get("selection_rank", 0.0),
+        )
+    )
+    head_readiness["selection_rank"] = selection_readiness
+    head_max_delta["selection_rank"] = selection_max_delta
+    shared_ssm_enabled = bool(
+        config.get("episodic_controller_shared_event_ssm_enabled", True)
+    )
+    return ConstrainedActionSpace(
+        trace_only=bool(
+            config.get("episodic_controller_action_space_trace_only", False)
+        ),
+        selection_readiness=selection_readiness,
+        selection_max_delta=selection_max_delta,
+        max_tags_per_query=(
+            int(max_tags) if max_tags is not None else None
+        ),
+        head_readiness=head_readiness,
+        head_max_delta=head_max_delta,
+        event_ssm=(
+            make_shared_event_ssm_from_config(config)
+            if shared_ssm_enabled
+            else None
+        ),
+        trace_log=trace_log,
+        online_learning_rate=float(
+            config.get("episodic_controller_action_learning_rate", 0.0)
+        ),
+        reward_clip=float(
+            config.get("episodic_controller_action_reward_clip", 5.0)
+        ),
+    )
+
+
 class EpisodicGpuEmit:
     """Train-rank handle threaded into ``_run_train_step``.
 
@@ -1408,6 +1535,8 @@ class EpisodicGpuEmit:
         "write_ring",
         "write_ring_name",
         "write_ring_drops",
+        "controller_action_space",
+        "controller_action_trace_log",
     )
 
     def __init__(
@@ -1421,6 +1550,8 @@ class EpisodicGpuEmit:
         top_p: float,
         write_ring: Any | None = None,
         write_ring_name: str | None = None,
+        controller_action_space: ConstrainedActionSpace | None = None,
+        controller_action_trace_log: Any | None = None,
     ) -> None:
         self.slot_tensor = slot_tensor
         self.k_max = k_max
@@ -1431,6 +1562,8 @@ class EpisodicGpuEmit:
         self.write_ring = write_ring
         self.write_ring_name = write_ring_name
         self.write_ring_drops = 0
+        self.controller_action_space = controller_action_space
+        self.controller_action_trace_log = controller_action_trace_log
 
 
 def _create_episodic_emit(
@@ -1491,12 +1624,27 @@ def _create_episodic_emit(
     # invariant.
     write_ring = None
     write_ring_name = None
+    controller_action_trace_log = None
+    controller_action_space = None
     if event_log_enabled and int(rank) != int(world_size) - 1:
         write_ring_name = _event_ring_name(
             "/cc_episodic_write",
             rank=int(rank),
         )
         write_ring = _create_event_ring(_ext.ShmRingWriteEvent, write_ring_name)
+    if (
+        int(rank) != int(world_size) - 1
+        and bool(config.get("episodic_controller_action_space_enabled", False))
+    ):
+        controller_action_trace_log = _action_trace_logger_from_config(
+            config, rank=int(rank)
+        )
+        if controller_action_trace_log is None:
+            controller_action_trace_log = []
+        controller_action_space = _build_action_space_from_config(
+            config,
+            trace_log=controller_action_trace_log,
+        )
     return EpisodicGpuEmit(
         slot_tensor=slot,
         k_max=k_max,
@@ -1506,6 +1654,8 @@ def _create_episodic_emit(
         top_p=top_p,
         write_ring=write_ring,
         write_ring_name=write_ring_name,
+        controller_action_space=controller_action_space,
+        controller_action_trace_log=controller_action_trace_log,
     )
 
 
@@ -1533,6 +1683,100 @@ def _right_pad_per_token_signal(signal: torch.Tensor, T: int) -> torch.Tensor:
             "any other width is a coding error"
         )
     return torch.cat([signal, signal.new_zeros((B, 1))], dim=1)
+
+
+def _select_write_positions_with_action_space(
+    *,
+    action_space: ConstrainedActionSpace | None,
+    write_signal: torch.Tensor,
+    pressure_full: torch.Tensor,
+    ce_full: torch.Tensor,
+    top_p: float,
+    k_max: int,
+    current_step: int,
+    write_bucket: int,
+) -> torch.Tensor:
+    heuristic_positions = select_top_p_positions(write_signal, top_p=top_p)
+    if action_space is None:
+        return heuristic_positions
+    write_head_active = action_space.active_head("write_admission")
+    budget_readiness = action_space.readiness("write_budget")
+    if not write_head_active and budget_readiness <= 0.0:
+        return heuristic_positions
+
+    flat_signal = write_signal.detach().to(dtype=torch.float32).flatten().cpu()
+    n = int(flat_signal.numel())
+    if n <= 0:
+        return torch.empty((0, 2), device=write_signal.device, dtype=torch.long)
+    fallback_budget = min(int(k_max), int(heuristic_positions.size(0)))
+    reward_context = {
+        "bucket": float(write_bucket),
+        "cache_fill": 0.0,
+        "pressure": float(
+            pressure_full.detach().to(dtype=torch.float32).mean().item()
+        ),
+        "ce": float(ce_full.detach().to(dtype=torch.float32).mean().item()),
+        "score": float(flat_signal.mean().item()),
+    }
+    requested_budget = fallback_budget
+    if budget_readiness > 0.0:
+        requested_budget = int(round(action_space.scalar_value(
+            head_name="write_budget",
+            gpu_step=int(current_step),
+            fallback=float(fallback_budget),
+            reward_context=reward_context,
+        )))
+    requested_budget = max(0, min(int(k_max), n, requested_budget))
+    if requested_budget <= 0:
+        return torch.empty((0, 2), device=write_signal.device, dtype=torch.long)
+
+    heuristic_scores = [float(x) for x in flat_signal.tolist()]
+    if write_head_active:
+        effective_scores = action_space.effective_scores(
+            heuristic_scores=heuristic_scores,
+            learned_scores=None,
+            gpu_step=int(current_step),
+            head_name="write_admission",
+            reward_context=reward_context,
+        )
+    else:
+        effective_scores = heuristic_scores
+    selected = sorted(
+        range(n),
+        key=lambda idx: (-float(effective_scores[idx]), idx),
+    )[:requested_budget]
+    T = int(write_signal.shape[1])
+    rows = [[idx // T, idx % T] for idx in selected]
+    return torch.tensor(rows, device=write_signal.device, dtype=torch.long)
+
+
+def _protection_score_for_write(
+    *,
+    action_space: ConstrainedActionSpace | None,
+    current_step: int,
+    write_bucket: int,
+    pressure: float,
+    ce: float,
+    score: float,
+) -> float:
+    if action_space is None or action_space.readiness("eviction") <= 0.0:
+        return 0.0
+    reward_context = {
+        "bucket": float(write_bucket),
+        "pressure": float(pressure),
+        "ce": float(ce),
+        "score": float(score),
+    }
+    raw = None
+    if action_space.event_ssm is not None:
+        raw = action_space.event_ssm.observe(reward_context).get("eviction", 0.0)
+    return float(action_space.scalar_value(
+        head_name="eviction",
+        raw_value=raw,
+        gpu_step=int(current_step),
+        fallback=0.0,
+        reward_context=reward_context,
+    ))
 
 
 def _emit_episodic_payloads_gpu(
@@ -1580,7 +1824,16 @@ def _emit_episodic_payloads_gpu(
         pressure_full.detach().to(dtype=torch.float32)
         * ce_full.detach().to(dtype=torch.float32)
     )
-    positions = select_top_p_positions(write_signal, top_p=top_p)
+    positions = _select_write_positions_with_action_space(
+        action_space=getattr(emit, "controller_action_space", None),
+        write_signal=write_signal,
+        pressure_full=pressure_full,
+        ce_full=ce_full,
+        top_p=top_p,
+        k_max=int(emit.k_max),
+        current_step=int(current_step),
+        write_bucket=int(write_bucket),
+    )
     K = int(positions.size(0))
     if K > emit.k_max:
         # Truncate silently — design doc says K > K_max is "config want
@@ -1627,10 +1880,20 @@ def _emit_episodic_payloads_gpu(
         # the slot dtype is fixed fp32 by the gpu_slot module contract.
         key_rep = hidden_detached[b, t]
         residual = hidden_detached[b, t]
+        pressure_value = float(pressure_full[b, t].item())
+        ce_value = float(ce_full[b, t].item())
+        protection_score = _protection_score_for_write(
+            action_space=getattr(emit, "controller_action_space", None),
+            current_step=int(current_step),
+            write_bucket=int(write_bucket),
+            pressure=pressure_value,
+            ce=ce_value,
+            score=float(write_signal[b, t].item()),
+        )
         pack_payload(
             emit.slot_tensor[k],
             valid_mask=1.0,
-            pressure=float(pressure_full[b, t].item()),
+            pressure=pressure_value,
             key_fp=key_fp,
             value_anchor_id=anchor,
             value_tok_ids=value_tok_ids,
@@ -1638,6 +1901,8 @@ def _emit_episodic_payloads_gpu(
             residual=residual,
             span_length=S,
             key_rep_dim=D,
+            pre_write_ce=ce_value,
+            protection_score=protection_score,
         )
         if emit.write_ring is not None:
             assert candidate_id is not None
@@ -1653,8 +1918,8 @@ def _emit_episodic_payloads_gpu(
                     key_rep=key_rep,
                     value_tok_ids=value_tok_ids,
                     value_anchor_id=int(anchor),
-                    pressure_at_write=float(pressure_full[b, t].item()),
-                    pre_write_ce=float(ce_full[b, t].item()),
+                    pressure_at_write=pressure_value,
+                    pre_write_ce=ce_value,
                     write_bucket=int(write_bucket),
                 ),
             )
@@ -1718,6 +1983,7 @@ class _EpisodicConsumerState:
         "pending_post_step_replays",
         "online_learning_bridge",
         "controller_action_trace_log",
+        "controller_action_space",
     )
 
     def __init__(
@@ -1800,6 +2066,7 @@ class _EpisodicConsumerState:
         self.controller_action_trace_log: list[dict[str, Any]] | None = (
             [] if controller_action_space_enabled else None
         )
+        self.controller_action_space: ConstrainedActionSpace | None = None
 
 
 def _attach_episodic_consumer(
@@ -2204,13 +2471,24 @@ def _notify_online_learning_bridge(
     consumer: _EpisodicConsumerState,
     event: dict[str, Any],
 ) -> None:
-    bridge = getattr(consumer, "online_learning_bridge", None)
-    if bridge is None:
-        return
     if int(event.get("outcome_status", -1)) != _REPLAY_STATUS_OK:
         return
     reward = float(event.get("reward_shaped", float("nan")))
     if not math.isfinite(reward):
+        return
+    action_space = getattr(consumer, "controller_action_space", None)
+    if action_space is not None:
+        action_space.apply_reward(
+            key=int(event.get("replay_id", -1)),
+            reward=reward,
+            gpu_step=int(event.get("gpu_step", 0)),
+            reward_context={
+                "slot_id": float(event.get("slot_id", -1)),
+                "bucket_baseline": float(event.get("bucket_baseline", 0.0)),
+            },
+        )
+    bridge = getattr(consumer, "online_learning_bridge", None)
+    if bridge is None:
         return
     bridge.on_replay_outcome(event)
     telemetry_fn = getattr(bridge, "telemetry", None)
@@ -2299,27 +2577,6 @@ def _write_replay_ndjson_row(
                 entry.get("controller_logit", query_cosine),
             )
         ),
-        "arm": str(entry.get("arm", "")),
-        "chosen_idx": int(entry.get("simplex_chosen_idx", entry.get("selected_rank", -1))),
-        "p_chosen": float(entry.get("p_chosen", entry.get("simplex_p_chosen", float("nan")))),
-        "p_behavior": entry.get("p_behavior", entry.get("simplex_probabilities", [])),
-        "entropy": float(entry.get("entropy", float("nan"))),
-        "gerber_weight": float(_event_value("gerber_weight", float("nan"))),
-        "advantage_raw": float(_event_value("advantage_raw", float("nan"))),
-        "advantage_corrected": float(
-            _event_value("advantage_corrected", float("nan"))
-        ),
-        "lambda_hxh": float(
-            _event_value("lambda_hxh", entry.get("lambda_hxh", 0.0))
-        ),
-        "feature_manifest_hash": str(entry.get("feature_manifest_hash", "")),
-        "candidate_slot_ids": entry.get(
-            "candidate_slot_ids", entry.get("simplex_candidate_slot_ids", [])
-        ),
-        "candidate_scores": entry.get(
-            "candidate_scores", entry.get("simplex_candidate_scores", [])
-        ),
-        "logits": entry.get("logits", entry.get("simplex_logits", [])),
         "replay_loss": float(replay_loss),
         "ce_before_replay": float(
             _event_value("ce_before_replay", float("nan"))
@@ -2695,24 +2952,18 @@ def _build_controller_action_space(
     """
     if not bool(config.get("episodic_controller_action_space_enabled", False)):
         return None
-    max_tags = config.get("episodic_controller_max_tags_per_query")
+    if consumer.controller_action_trace_log is None:
+        consumer.controller_action_trace_log = (
+            _action_trace_logger_from_config(config, rank="controller")
+        )
     if consumer.controller_action_trace_log is None:
         consumer.controller_action_trace_log = []
-    return ConstrainedActionSpace(
-        trace_only=bool(
-            config.get("episodic_controller_action_space_trace_only", False)
-        ),
-        selection_readiness=float(
-            config.get("episodic_controller_selection_readiness", 0.0)
-        ),
-        selection_max_delta=float(
-            config.get("episodic_controller_selection_max_delta", 0.0)
-        ),
-        max_tags_per_query=(
-            int(max_tags) if max_tags is not None else None
-        ),
+    action_space = _build_action_space_from_config(
+        config,
         trace_log=consumer.controller_action_trace_log,
     )
+    consumer.controller_action_space = action_space
+    return action_space
 
 
 def _spawn_episodic_controller(
@@ -2914,6 +3165,7 @@ def _drain_episodic_payloads_gpu(
                 pressure_at_write=float(unpacked["pressure"]),
                 source_write_id=int(source_write_id),
                 write_bucket=int(query_bucket),
+                protection_score=float(unpacked.get("protection_score", 0.0)),
             )
             candidate_slot_ids = None
             candidate_cosines = None
@@ -2929,13 +3181,18 @@ def _drain_episodic_payloads_gpu(
                         k=int(controller_topk_k),
                     )
                 )
+            pre_query_ce_value = float(
+                unpacked.get("pre_write_ce", float("nan"))
+            )
+            if not math.isfinite(pre_query_ce_value):
+                pre_query_ce_value = float(pre_query_ce)
             query_event_id = _emit_query_event(
                 consumer=consumer,
                 source_rank=int(r),
                 gpu_step=int(current_step),
                 query_residual=unpacked["residual"],
                 pressure=float(unpacked["pressure"]),
-                pre_query_ce=float(pre_query_ce),
+                pre_query_ce=pre_query_ce_value,
                 bucket=int(query_bucket),
                 candidate_slot_ids=candidate_slot_ids,
                 candidate_cosines=candidate_cosines,
@@ -2982,6 +3239,89 @@ def _get_tagged_replay_queue(
     return getattr(consumer, "tagged_replay_queue", [])
 
 
+def _order_replay_queue_with_action_space(
+    *,
+    consumer: "_EpisodicConsumerState | None",
+    tagged: list[dict[str, Any]],
+    current_step: int,
+    max_replays_per_step: int,
+) -> tuple[int, bool]:
+    action_space = getattr(consumer, "controller_action_space", None)
+    if action_space is None or not tagged:
+        return int(max_replays_per_step), False
+    timing_active = action_space.active_head("replay_timing")
+    budget_readiness = action_space.readiness("replay_budget")
+    if not timing_active and budget_readiness <= 0.0:
+        return int(max_replays_per_step), False
+
+    scores = [
+        float(entry.get("action_space_score", entry.get("score", 0.0)))
+        for entry in tagged
+    ]
+    reward_context = {
+        "queue_depth": float(len(tagged)),
+        "score": float(sum(scores) / max(1, len(scores))),
+    }
+    fallback_budget = (
+        int(max_replays_per_step)
+        if int(max_replays_per_step) > 0
+        else len(tagged)
+    )
+    budget = fallback_budget
+    if budget_readiness > 0.0:
+        budget = int(round(action_space.scalar_value(
+            head_name="replay_budget",
+            gpu_step=int(current_step),
+            fallback=float(fallback_budget),
+            reward_context=reward_context,
+        )))
+    budget = max(0, min(len(tagged), int(budget)))
+    if timing_active:
+        effective_scores = action_space.effective_scores(
+            heuristic_scores=scores,
+            learned_scores=None,
+            gpu_step=int(current_step),
+            head_name="replay_timing",
+            reward_context=reward_context,
+        )
+    else:
+        effective_scores = scores
+    selected = sorted(
+        range(len(tagged)),
+        key=lambda idx: (-float(effective_scores[idx]), idx),
+    )[:budget]
+    credit_heads: list[str] = []
+    if timing_active:
+        credit_heads.append("replay_timing")
+    if budget_readiness > 0.0:
+        credit_heads.append("replay_budget")
+    for idx in selected:
+        entry = tagged[idx]
+        replay_id = int(
+            entry.get(
+                "replay_id",
+                (int(entry.get("step", current_step)) << 32)
+                ^ int(entry.get("slot", idx)),
+            )
+        )
+        action_space.record_credit_assignment(
+            key=replay_id,
+            head_names=credit_heads,
+            gpu_step=int(current_step),
+            reward_context={
+                **reward_context,
+                "slot": float(entry.get("slot", -1)),
+                "replay_id": float(replay_id),
+            },
+        )
+    selected_set = set(selected)
+    tagged[:] = (
+        [tagged[idx] for idx in selected]
+        + [entry for idx, entry in enumerate(tagged) if idx not in selected_set]
+    )
+    return int(budget), True
+
+
 def _run_episodic_replay_from_tagged_queue(
     *,
     consumer: "_EpisodicConsumerState | None",
@@ -3018,11 +3358,19 @@ def _run_episodic_replay_from_tagged_queue(
         return 0
     cache = consumer.cache
     replayed = 0
-    max_replays = int(max_replays_per_step)
+    max_replays, learned_replay_cap = _order_replay_queue_with_action_space(
+        consumer=consumer,
+        tagged=tagged,
+        current_step=int(current_step),
+        max_replays_per_step=int(max_replays_per_step),
+    )
     # Drain destructively. The controller is the producer; once we
     # consume an entry, it's done — the controller will push fresh
     # entries on the next cycle.
-    while tagged and (max_replays <= 0 or replayed < max_replays):
+    while tagged and (
+        (not learned_replay_cap and max_replays <= 0)
+        or replayed < max_replays
+    ):
         entry = tagged.pop(0)
         slot = int(entry.get("slot", -1))
         if not (0 <= slot < int(cache.capacity)):
@@ -4247,6 +4595,17 @@ def train_fast_for_budget(
     episodic_controller_selection_readiness: float = 0.0,
     episodic_controller_selection_max_delta: float = 0.0,
     episodic_controller_max_tags_per_query: int | None = None,
+    episodic_controller_action_trace_path: str | None = None,
+    episodic_controller_shared_event_ssm_enabled: bool = True,
+    episodic_controller_ssm_hidden_dim: int = 16,
+    episodic_controller_ssm_seed: int = 0,
+    episodic_controller_ssm_decay: float = 0.95,
+    episodic_controller_ssm_input_scale: float = 0.05,
+    episodic_controller_ssm_head_scale: float = 0.05,
+    episodic_controller_head_readiness: dict[str, float] | None = None,
+    episodic_controller_head_max_delta: dict[str, float] | None = None,
+    episodic_controller_action_learning_rate: float = 0.0,
+    episodic_controller_action_reward_clip: float = 5.0,
     episodic_replay_max_replays_per_step: int = 0,
 ) -> dict[str, Any]:
     rank_ = int(rank)
@@ -4375,6 +4734,58 @@ def train_fast_for_budget(
             "Phase-3 replay path will replace the placeholder; gate "
             "this combination on that work landing."
         )
+    _action_space_config = {
+        "episodic_controller_action_space_enabled": bool(
+            episodic_controller_action_space_enabled
+        ),
+        "episodic_controller_action_space_trace_only": bool(
+            episodic_controller_action_space_trace_only
+        ),
+        "episodic_controller_selection_readiness": float(
+            episodic_controller_selection_readiness
+        ),
+        "episodic_controller_selection_max_delta": float(
+            episodic_controller_selection_max_delta
+        ),
+        "episodic_controller_max_tags_per_query": (
+            int(episodic_controller_max_tags_per_query)
+            if episodic_controller_max_tags_per_query is not None
+            else None
+        ),
+        "episodic_controller_action_trace_path": (
+            str(episodic_controller_action_trace_path)
+            if episodic_controller_action_trace_path is not None
+            else None
+        ),
+        "episodic_controller_shared_event_ssm_enabled": bool(
+            episodic_controller_shared_event_ssm_enabled
+        ),
+        "episodic_controller_ssm_hidden_dim": int(
+            episodic_controller_ssm_hidden_dim
+        ),
+        "episodic_controller_ssm_seed": int(episodic_controller_ssm_seed),
+        "episodic_controller_ssm_decay": float(episodic_controller_ssm_decay),
+        "episodic_controller_ssm_input_scale": float(
+            episodic_controller_ssm_input_scale
+        ),
+        "episodic_controller_ssm_head_scale": float(
+            episodic_controller_ssm_head_scale
+        ),
+        "episodic_controller_action_learning_rate": float(
+            episodic_controller_action_learning_rate
+        ),
+        "episodic_controller_action_reward_clip": float(
+            episodic_controller_action_reward_clip
+        ),
+    }
+    if episodic_controller_head_readiness is not None:
+        _action_space_config["episodic_controller_head_readiness"] = dict(
+            episodic_controller_head_readiness
+        )
+    if episodic_controller_head_max_delta is not None:
+        _action_space_config["episodic_controller_head_max_delta"] = dict(
+            episodic_controller_head_max_delta
+        )
     # Pass C — episodic-rank consumer init. Builds the cache and the
     # in-process controller_query_queue on the episodic rank only; on
     # train ranks and ``episodic_enabled=False`` the helper returns the
@@ -4402,9 +4813,7 @@ def train_fast_for_budget(
         "episodic_compute_replay_ce_pair": bool(
             episodic_compute_replay_ce_pair
         ),
-        "episodic_controller_action_space_enabled": bool(
-            episodic_controller_action_space_enabled
-        ),
+        **_action_space_config,
     }
     episodic_consumer = _attach_episodic_consumer(
         episodic_enabled=bool(episodic_enabled),
@@ -4466,23 +4875,7 @@ def train_fast_for_budget(
         "episodic_controller_history_entries": int(
             episodic_controller_history_entries
         ),
-        "episodic_controller_action_space_enabled": bool(
-            episodic_controller_action_space_enabled
-        ),
-        "episodic_controller_action_space_trace_only": bool(
-            episodic_controller_action_space_trace_only
-        ),
-        "episodic_controller_selection_readiness": float(
-            episodic_controller_selection_readiness
-        ),
-        "episodic_controller_selection_max_delta": float(
-            episodic_controller_selection_max_delta
-        ),
-        "episodic_controller_max_tags_per_query": (
-            int(episodic_controller_max_tags_per_query)
-            if episodic_controller_max_tags_per_query is not None
-            else None
-        ),
+        **_action_space_config,
     }
     if (
         scopt_active
@@ -4808,6 +5201,7 @@ def train_fast_for_budget(
             "episodic_k_max": int(episodic_k_max),
             "episodic_event_log_enabled": bool(episodic_event_log_enabled),
             "model_dim": resolved_key_rep_dim,
+            **_action_space_config,
         }
         episodic_emit_handle = _create_episodic_emit(
             rank=rank_,
@@ -5977,6 +6371,41 @@ def run_condition(
             int(config["episodic_controller_max_tags_per_query"])
             if config.get("episodic_controller_max_tags_per_query") is not None
             else None
+        ),
+        episodic_controller_action_trace_path=(
+            str(config["episodic_controller_action_trace_path"])
+            if config.get("episodic_controller_action_trace_path") is not None
+            else None
+        ),
+        episodic_controller_shared_event_ssm_enabled=bool(
+            config.get("episodic_controller_shared_event_ssm_enabled", True)
+        ),
+        episodic_controller_ssm_hidden_dim=int(
+            config.get("episodic_controller_ssm_hidden_dim", 16)
+        ),
+        episodic_controller_ssm_seed=int(
+            config.get("episodic_controller_ssm_seed", 0)
+        ),
+        episodic_controller_ssm_decay=float(
+            config.get("episodic_controller_ssm_decay", 0.95)
+        ),
+        episodic_controller_ssm_input_scale=float(
+            config.get("episodic_controller_ssm_input_scale", 0.05)
+        ),
+        episodic_controller_ssm_head_scale=float(
+            config.get("episodic_controller_ssm_head_scale", 0.05)
+        ),
+        episodic_controller_head_readiness=_head_table_from_config(
+            config, field="readiness"
+        ),
+        episodic_controller_head_max_delta=_head_table_from_config(
+            config, field="max_delta"
+        ),
+        episodic_controller_action_learning_rate=float(
+            config.get("episodic_controller_action_learning_rate", 0.0)
+        ),
+        episodic_controller_action_reward_clip=float(
+            config.get("episodic_controller_action_reward_clip", 5.0)
         ),
         episodic_replay_max_replays_per_step=int(
             config.get("episodic_replay_max_replays_per_step", 0)

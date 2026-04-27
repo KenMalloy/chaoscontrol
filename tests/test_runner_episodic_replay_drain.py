@@ -41,6 +41,7 @@ from chaoscontrol.episodic.diagnostics import (
     REPLAY_LOG_SCHEMA,
     DiagnosticsLogger,
 )
+from chaoscontrol.episodic.learned_action_space import ConstrainedActionSpace
 from chaoscontrol.optim.episodic_cache import EpisodicCache
 
 
@@ -121,6 +122,7 @@ class _StubConsumerWithTaggedQueue:
         "controller_query_queue",
         "controller_query_enabled",
         "tagged_replay_queue",
+        "controller_action_space",
     )
 
     def __init__(self, cache: EpisodicCache) -> None:
@@ -129,6 +131,16 @@ class _StubConsumerWithTaggedQueue:
         self.controller_query_queue: list = []
         self.controller_query_enabled = False
         self.tagged_replay_queue: list[dict] = []
+        self.controller_action_space = None
+
+
+class _ReplayTimingFakeSsm:
+    def observe(self, features):
+        return {
+            "replay_timing": (
+                1000.0 if int(features.get("rank", -1)) == 1 else -1000.0
+            )
+        }
 
 
 class TestEpisodicReplayDrain(unittest.TestCase):
@@ -542,6 +554,52 @@ class TestEpisodicReplayDrain(unittest.TestCase):
         self.assertEqual(
             [entry["slot"] for entry in consumer.tagged_replay_queue],
             slots[1:],
+        )
+
+    def test_learned_replay_timing_reranks_before_budgeted_drain(self):
+        """Learned replay timing can change which pending tag is replayed
+        first, while the existing per-step cap still bounds treatment dose."""
+        model = _TinyTokenModel()
+        cache = EpisodicCache(capacity=4, span_length=4, key_rep_dim=8)
+        slots = [
+            _populate_cache_slot(
+                cache,
+                slot_value_anchor=2,
+                span_tokens=torch.tensor([3, 5, 7, 9], dtype=torch.int64),
+                key_fp=40 + i,
+                write_step=10 + i,
+            )
+            for i in range(3)
+        ]
+        consumer = _StubConsumerWithTaggedQueue(cache)
+        consumer.controller_action_space = ConstrainedActionSpace(
+            head_readiness={"replay_timing": 1.0},
+            head_max_delta={"replay_timing": 1000.0},
+            event_ssm=_ReplayTimingFakeSsm(),
+        )
+        for slot, score in zip(slots, [10.0, 1.0, 3.0], strict=True):
+            consumer.tagged_replay_queue.append({
+                "step": 11,
+                "slot": int(slot),
+                "score": float(score),
+                "selected_at": 11,
+            })
+
+        replayed = self.mod._run_episodic_replay_from_tagged_queue(
+            consumer=consumer,
+            model=model,
+            current_step=11,
+            weight=1.0,
+            lm_head_backward_mode="single",
+            lm_head_tile_size=1024,
+            logger=None,
+            max_replays_per_step=1,
+        )
+
+        self.assertEqual(replayed, 1)
+        self.assertEqual(
+            [entry["slot"] for entry in consumer.tagged_replay_queue],
+            [slots[0], slots[2]],
         )
 
     def test_runner_replay_drain_unbounded_when_budget_is_zero(self):

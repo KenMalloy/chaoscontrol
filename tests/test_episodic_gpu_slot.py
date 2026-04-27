@@ -36,14 +36,14 @@ from chaoscontrol.episodic.gpu_slot import (
 
 
 def test_slot_dim_layout() -> None:
-    """At the design defaults S=4, D=256 the slot is 526 fp32 cells.
+    """At the design defaults S=4, D=256 the slot is 528 fp32 cells.
 
-    Layout: ``6 + 2*S + 2*D = 6 + 8 + 512 = 526``. If this number
+    Layout: ``8 + 2*S + 2*D = 8 + 8 + 512 = 528``. If this number
     changes, every other test in this file is wrong AND the gather
     collective's per-rank tensor size on the runner is wrong, so it's
     pinned hard here.
     """
-    assert slot_dim(span_length=4, key_rep_dim=256) == 526
+    assert slot_dim(span_length=4, key_rep_dim=256) == 528
     # Generic formula check at a few other (S, D) values.
     assert slot_dim(span_length=1, key_rep_dim=1) == SLOT_DIM_BASE + 2 + 2
     assert slot_dim(span_length=8, key_rep_dim=128) == SLOT_DIM_BASE + 16 + 256
@@ -116,10 +116,14 @@ def test_pack_unpack_round_trip() -> None:
         residual=residual,
         span_length=S,
         key_rep_dim=D,
+        pre_write_ce=2.5,
+        protection_score=0.125,
     )
     out = unpack_payload(slot, span_length=S, key_rep_dim=D)
     assert out["valid_mask"] == 1.0
     assert out["pressure"] == pytest.approx(0.75)
+    assert out["pre_write_ce"] == pytest.approx(2.5)
+    assert out["protection_score"] == pytest.approx(0.125)
     # int64 fields: exact match
     assert out["key_fp"] == key_fp
     assert out["value_anchor_id"] == anchor

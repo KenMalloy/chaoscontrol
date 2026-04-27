@@ -62,6 +62,7 @@ class CacheEntry:
     pressure_at_write: float = 0.0
     source_write_id: int = -1
     write_bucket: int = -1
+    protection_score: float = 0.0
 
 
 class EpisodicCache:
@@ -162,6 +163,7 @@ class EpisodicCache:
         self.write_bucket = torch.full(
             (self.capacity,), -1, dtype=torch.int64,
         )
+        self.protection_score = torch.zeros(self.capacity, dtype=torch.float32)
         self.slot_state = torch.zeros(
             self.capacity, self.slot_state_dim, dtype=torch.float16,
         )
@@ -201,6 +203,7 @@ class EpisodicCache:
         source_write_id: int = -1,
         write_bucket: int = -1,
         displacing_candidate_id: int = -1,
+        protection_score: float = 0.0,
     ) -> int:
         """Insert one entry. If the cache is full, evict the lowest-utility
         entry past its grace period; if no entry is past grace, evict by
@@ -264,6 +267,7 @@ class EpisodicCache:
         self.pressure_at_write[slot] = float(pressure_at_write)
         self.source_write_id[slot] = int(source_write_id)
         self.write_bucket[slot] = int(write_bucket)
+        self.protection_score[slot] = float(protection_score)
         if self.slot_state_dim > 0:
             self.slot_state[slot].zero_()
         if self.simplex_k_max > 0:
@@ -306,6 +310,7 @@ class EpisodicCache:
             pressure_at_write=float(self.pressure_at_write[slot].item()),
             source_write_id=int(self.source_write_id[slot].item()),
             write_bucket=int(self.write_bucket[slot].item()),
+            protection_score=float(self.protection_score[slot].item()),
         )
 
     def mark_fired(self, slot: int, current_step: int) -> None:
@@ -343,6 +348,7 @@ class EpisodicCache:
         self.pressure_at_write[slot] = 0.0
         self.source_write_id[slot] = -1
         self.write_bucket[slot] = -1
+        self.protection_score[slot] = 0.0
         if self.slot_state_dim > 0:
             self.slot_state[slot].zero_()
         if self.simplex_k_max > 0:
@@ -376,6 +382,7 @@ class EpisodicCache:
         self.pressure_at_write.zero_()
         self.source_write_id.fill_(-1)
         self.write_bucket.fill_(-1)
+        self.protection_score.zero_()
         self.slot_state.zero_()
         self.simplex_edge_slot.fill_(-1)
         self.simplex_edge_weight.zero_()
@@ -413,6 +420,9 @@ class EpisodicCache:
                 device, non_blocking=True,
             ),
             "write_bucket": self.write_bucket.to(device, non_blocking=True),
+            "protection_score": self.protection_score.to(
+                device, non_blocking=True
+            ),
             "slot_state": self.slot_state.to(device, non_blocking=True),
             "simplex_edge_slot": self.simplex_edge_slot.to(
                 device, non_blocking=True,
@@ -453,6 +463,7 @@ class EpisodicCache:
         "pressure_at_write",
         "source_write_id",
         "write_bucket",
+        "protection_score",
         "slot_state",
         "simplex_edge_slot",
         "simplex_edge_weight",
@@ -540,6 +551,9 @@ class EpisodicCache:
             "evicted_last_fired_step": int(
                 self.last_fired_step[evicted_slot].item()
             ),
+            "evicted_protection_score": float(
+                self.protection_score[evicted_slot].item()
+            ),
             "gpu_step": int(gpu_step),
             "displacing_candidate_id": int(displacing_candidate_id),
             "displacing_key_fp": int(displacing_key_fp),
@@ -572,7 +586,7 @@ class EpisodicCache:
             # Among entries past grace, pick the lowest utility.
             utilities = torch.where(
                 past_grace,
-                self.utility_u,
+                self.utility_u + self.protection_score,
                 torch.full_like(self.utility_u, float("inf")),
             )
             return int(utilities.argmin().item())

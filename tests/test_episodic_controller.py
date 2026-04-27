@@ -53,6 +53,7 @@ from chaoscontrol.episodic.learned_action_space import ConstrainedActionSpace
 from chaoscontrol.episodic.controller import (
     _build_simplex_inputs,
     _choose_simplex_vertex,
+    _apply_simplex_meta_actions,
     _scores_for_slots,
     controller_main,
     run_controller_cycle,
@@ -612,6 +613,60 @@ def test_action_space_budget_clamp_limits_v0_tags_and_logs():
     assert trace[0]["event_type"] == "action_space_clamp"
     assert trace[0]["raw_action"] == 3
     assert trace[0]["bounded_action"] == 1
+
+
+def test_action_space_meta_heads_apply_to_simplex_runtime_setters():
+    class Weights:
+        temperature = 1.0
+
+    class Runtime:
+        def __init__(self):
+            self.weights = Weights()
+            self.calls: dict[str, float] = {}
+
+        def fast_weights(self):
+            return self.weights
+
+        def set_temperature(self, value):
+            self.calls["temperature"] = float(value)
+
+        def set_entropy_beta(self, value):
+            self.calls["entropy_beta"] = float(value)
+
+        def set_ema_alpha(self, value):
+            self.calls["ema_alpha"] = float(value)
+
+    runtime = Runtime()
+    trace: list[dict] = []
+    class MetaSsm:
+        def observe(self, features):
+            return {"temperature": 0.25, "entropy_beta": -0.5, "ema_alpha": 0.0}
+
+    action_space = ConstrainedActionSpace(
+        head_readiness={
+            "temperature": 1.0,
+            "entropy_beta": 1.0,
+            "ema_alpha": 1.0,
+        },
+        event_ssm=MetaSsm(),
+        trace_log=trace,
+    )
+
+    _apply_simplex_meta_actions(
+        controller_runtime=runtime,
+        action_space=action_space,
+        gpu_step=7,
+        reward_context={"score": 0.4},
+    )
+
+    assert 0.25 <= runtime.calls["temperature"] <= 4.0
+    assert 0.0 <= runtime.calls["entropy_beta"] <= 0.2
+    assert 0.0 <= runtime.calls["ema_alpha"] <= 0.5
+    assert {row["head_name"] for row in trace} == {
+        "temperature",
+        "entropy_beta",
+        "ema_alpha",
+    }
 
 
 def test_controller_thread_starts_and_stops_cleanly():

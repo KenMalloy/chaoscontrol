@@ -1688,7 +1688,19 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           &chaoscontrol::simplex::SimplexOnlineLearner::weights_initialized)
       .def_property_readonly(
           "last_advantage",
-          &chaoscontrol::simplex::SimplexOnlineLearner::last_advantage);
+          &chaoscontrol::simplex::SimplexOnlineLearner::last_advantage)
+      .def("set_temperature",
+           &chaoscontrol::simplex::SimplexOnlineLearner::set_temperature,
+           pybind11::arg("temperature"),
+           "Set the bounded online softmax temperature for fast/slow weights.")
+      .def("set_entropy_beta",
+           &chaoscontrol::simplex::SimplexOnlineLearner::set_entropy_beta,
+           pybind11::arg("entropy_beta"),
+           "Set the bounded online entropy-bonus coefficient.")
+      .def("set_ema_alpha",
+           &chaoscontrol::simplex::SimplexOnlineLearner::set_ema_alpha,
+           pybind11::arg("ema_alpha"),
+           "Set the bounded online fast/slow EMA alpha.");
 
   pybind11::class_<ShmRingReplayOutcomeT>(m, "ShmRingReplayOutcome")
       .def_static("create", &ShmRingReplayOutcomeT::create, pybind11::arg("name"),

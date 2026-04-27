@@ -247,6 +247,36 @@ def _choose_simplex_vertex(
     )
 
 
+def _apply_simplex_meta_actions(
+    *,
+    controller_runtime: Any,
+    action_space: Any,
+    gpu_step: int,
+    reward_context: dict[str, Any],
+) -> None:
+    """Apply bounded meta-heads to the simplex runtime before forward."""
+    if action_space is None or controller_runtime is None:
+        return
+    weights = controller_runtime.fast_weights()
+    specs = (
+        ("temperature", "set_temperature", float(getattr(weights, "temperature", 1.0))),
+        ("entropy_beta", "set_entropy_beta", 0.0),
+        ("ema_alpha", "set_ema_alpha", 0.25),
+    )
+    for head_name, setter_name, fallback in specs:
+        if action_space.readiness(head_name) <= 0.0:
+            continue
+        value = action_space.scalar_value(
+            head_name=head_name,
+            gpu_step=int(gpu_step),
+            fallback=float(fallback),
+            reward_context=reward_context,
+        )
+        setter = getattr(controller_runtime, setter_name, None)
+        if callable(setter):
+            setter(float(value))
+
+
 def run_controller_cycle(
     *,
     controller_query_queue: list[dict[str, Any]],
@@ -386,6 +416,20 @@ def run_controller_cycle(
                 current_step=producer_step,
                 pad_to=16,
             )
+            if bounded_action_space is not None:
+                score_values = [float(x) for x in scores.detach().cpu().tolist()]
+                _apply_simplex_meta_actions(
+                    controller_runtime=controller_runtime,
+                    action_space=bounded_action_space,
+                    gpu_step=int(producer_step),
+                    reward_context={
+                        "query_event_id": float(query_event_id),
+                        "pressure": float(cand.get("pressure", 0.0)),
+                        "score": float(
+                            sum(score_values) / max(1, len(score_values))
+                        ),
+                    },
+                )
             fwd = _ext.simplex_forward(
                 controller_runtime.fast_weights(), V, E, sf,
             )
@@ -490,6 +534,24 @@ def run_controller_cycle(
                 ],
                 "simplex_probabilities": simplex_probabilities,
             }
+            if bounded_action_space is not None:
+                meta_heads = [
+                    head
+                    for head in ("temperature", "entropy_beta", "ema_alpha")
+                    if bounded_action_space.readiness(head) > 0.0
+                ]
+                if meta_heads and hasattr(
+                    bounded_action_space, "record_credit_assignment"
+                ):
+                    bounded_action_space.record_credit_assignment(
+                        key=int(replay_id),
+                        head_names=meta_heads,
+                        gpu_step=int(producer_step),
+                        reward_context={
+                            "query_event_id": float(query_event_id),
+                            "slot": float(chosen_slot),
+                        },
+                    )
             tagged_replay_queue.append(tag)
             cand["residual"] = None
             continue

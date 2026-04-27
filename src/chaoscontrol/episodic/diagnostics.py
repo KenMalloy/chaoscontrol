@@ -130,6 +130,23 @@ REPLAY_LOG_SCHEMA: tuple[str, ...] = (
 _REPLAY_LOG_SCHEMA_SET: frozenset[str] = frozenset(REPLAY_LOG_SCHEMA)
 
 
+ACTION_SPACE_TRACE_SCHEMA: tuple[str, ...] = (
+    "gpu_step",
+    "event_type",
+    "head_name",
+    "raw_action_json",
+    "bounded_action_json",
+    "invariant_name",
+    "clamp_amount",
+    "readiness",
+    "reward_context_json",
+    "accepted",
+)
+_ACTION_SPACE_TRACE_SCHEMA_SET: frozenset[str] = frozenset(
+    ACTION_SPACE_TRACE_SCHEMA
+)
+
+
 def _coerce_serializable(value: Any) -> Any:
     """Convert a logged value to a JSON-friendly form.
 
@@ -224,6 +241,95 @@ class DiagnosticsLogger:
             self._fh.close()
 
     def __enter__(self) -> "DiagnosticsLogger":
+        return self
+
+    def __exit__(self, *exc: Any) -> None:
+        self.close()
+
+    def __del__(self) -> None:  # pragma: no cover - GC ordering varies
+        try:
+            self.close()
+        except Exception:
+            pass
+
+
+def _json_blob(value: Any) -> str:
+    return json.dumps(_coerce_nested(value), separators=(",", ":"))
+
+
+def _coerce_nested(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {str(k): _coerce_nested(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_coerce_nested(v) for v in value]
+    return _coerce_serializable(value)
+
+
+class ActionSpaceTraceLogger:
+    """Append-only DuckDB-ready NDJSON writer for action-space interventions."""
+
+    __slots__ = ("path", "_fh")
+
+    def __init__(self, path: Path | str) -> None:
+        self.path = Path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._fh = self.path.open("a", encoding="utf-8")
+
+    def append(self, row: dict[str, Any]) -> None:
+        """Duck-typed sink used by ConstrainedActionSpace._record()."""
+        keys = set(row.keys())
+        expected_input = {
+            "gpu_step",
+            "event_type",
+            "head_name",
+            "raw_action",
+            "bounded_action",
+            "invariant_name",
+            "clamp_amount",
+            "readiness",
+            "reward_context",
+            "accepted",
+        }
+        missing = expected_input - keys
+        if missing:
+            raise KeyError(
+                "ActionSpaceTraceLogger row missing columns: "
+                f"{sorted(missing)}"
+            )
+        extras = keys - expected_input
+        if extras:
+            raise KeyError(
+                "ActionSpaceTraceLogger row has unknown columns: "
+                f"{sorted(extras)}"
+            )
+        ordered = {
+            "gpu_step": int(row["gpu_step"]),
+            "event_type": str(row["event_type"]),
+            "head_name": str(row["head_name"]),
+            "raw_action_json": _json_blob(row["raw_action"]),
+            "bounded_action_json": _json_blob(row["bounded_action"]),
+            "invariant_name": str(row["invariant_name"]),
+            "clamp_amount": _coerce_serializable(float(row["clamp_amount"])),
+            "readiness": _coerce_serializable(float(row["readiness"])),
+            "reward_context_json": _json_blob(row["reward_context"]),
+            "accepted": bool(row["accepted"]),
+        }
+        if set(ordered.keys()) != _ACTION_SPACE_TRACE_SCHEMA_SET:
+            raise AssertionError("internal action-space trace schema mismatch")
+        self._fh.write(
+            json.dumps({col: ordered[col] for col in ACTION_SPACE_TRACE_SCHEMA})
+            + "\n"
+        )
+
+    def flush(self) -> None:
+        self._fh.flush()
+
+    def close(self) -> None:
+        if not self._fh.closed:
+            self._fh.flush()
+            self._fh.close()
+
+    def __enter__(self) -> "ActionSpaceTraceLogger":
         return self
 
     def __exit__(self, *exc: Any) -> None:

@@ -54,6 +54,21 @@ def _load_runner():
     return mod
 
 
+class _WriteAdmissionFakeSsm:
+    def observe(self, features):
+        return {
+            "write_admission": (
+                1000.0 if int(features.get("rank", -1)) == 1 else -1000.0
+            ),
+            "eviction": 0.0,
+        }
+
+
+class _ProtectionFakeSsm:
+    def observe(self, features):
+        return {"eviction": 10.0}
+
+
 def _mixed_admit_reject_inputs():
     B, T, D = 1, 12, 4
     input_ids = torch.arange(B * T, dtype=torch.int64).reshape(B, T)
@@ -294,3 +309,70 @@ def test_runner_emit_pushes_write_event_for_packed_slots():
         assert len(event["value_tok_ids"]) == 4
     assert events[0]["value_tok_ids"][:2] == [3, 4]
     assert events[1]["value_tok_ids"][:2] == [4, 5]
+
+
+def test_learned_write_admission_can_rerank_candidate_positions():
+    mod = _load_runner()
+    action_space = mod.ConstrainedActionSpace(
+        head_readiness={"write_admission": 1.0},
+        head_max_delta={"write_admission": 1000.0},
+        event_ssm=_WriteAdmissionFakeSsm(),
+    )
+    signal = torch.tensor([[10.0, 1.0, 3.0]], dtype=torch.float32)
+
+    positions = mod._select_write_positions_with_action_space(
+        action_space=action_space,
+        write_signal=signal,
+        pressure_full=torch.ones_like(signal),
+        ce_full=signal,
+        top_p=1.0 / 3.0,
+        k_max=1,
+        current_step=5,
+        write_bucket=0,
+    )
+
+    assert positions.tolist() == [[0, 1]]
+
+
+def test_learned_eviction_head_sets_slot_protection_score():
+    mod = _load_runner()
+    handle = mod._create_episodic_emit(
+        rank=0,
+        world_size=2,
+        device=torch.device("cpu"),
+        config={
+            "episodic_enabled": True,
+            "episodic_span_length": 2,
+            "episodic_fingerprint_window": 1,
+            "episodic_key_rep_dim": 4,
+            "episodic_top_p": 1.0 / 5.0,
+            "episodic_k_max": 1,
+            "model_dim": 4,
+            "episodic_controller_action_space_enabled": True,
+            "episodic_controller_eviction_readiness": 1.0,
+        },
+    )
+    assert handle is not None
+    assert handle.controller_action_space is not None
+    handle.controller_action_space.event_ssm = _ProtectionFakeSsm()
+
+    inputs = torch.tensor([[1, 2, 3, 4, 5]], dtype=torch.int64)
+    targets = torch.tensor([[2, 3, 4, 5, 0]], dtype=torch.int64)
+    pressure = torch.ones_like(targets, dtype=torch.float32)
+    ce = torch.tensor([[0.1, 9.0, 8.0, 0.2, 0.3]], dtype=torch.float32)
+    hidden = torch.arange(20, dtype=torch.float32).reshape(1, 5, 4)
+    mod._emit_episodic_payloads_gpu(
+        emit=handle,
+        inputs=inputs,
+        targets=targets,
+        pressure=pressure,
+        per_token_ce=ce,
+        hidden=hidden,
+        rank=0,
+        world_size=2,
+        all_group=None,
+        current_step=5,
+    )
+
+    out = mod.unpack_payload(handle.slot_tensor[0], span_length=2, key_rep_dim=4)
+    assert out["protection_score"] > 0.99
