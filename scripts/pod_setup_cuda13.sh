@@ -120,11 +120,23 @@ import chaoscontrol  # noqa: F401 — editable install present
 # extension is absent.
 from chaoscontrol.kernels._cublaslt import _C  # noqa: F401
 from chaoscontrol.kernels._ssm_scan import _C as _ssm_scan_C  # noqa: F401
+# CPU SSM controller (AMX BF16 backend) — load the C extension and
+# verify the CUDA write-event pack is available. Without the latter,
+# episodic-on-CUDA runs fall back to the legacy CPU producer path,
+# which is the silent regression that ate $30 of pod time on
+# 2026-04-27 (see docs/reports/2026-04-27-step3-results.md).
+from chaoscontrol.kernels import _cpu_ssm_controller as _cpu_ext
+assert _cpu_ext.write_event_cuda_pack_available(), (
+    "CPU SSM controller built without write_event_pack.cu; rebuild "
+    "with CHAOSCONTROL_CPU_SSM_CUDA_WRITE_EVENT=1 + matched cu13 "
+    "runtime pins (see step 4e of pod_setup_cuda13.sh)"
+)
 _ = te.Linear(16, 16, device='cuda' if torch.cuda.is_available() else 'cpu')
 PROBE
 then
     echo "    torch + TE + sentencepiece + numpy + pytest + chaoscontrol all import;"
-    echo "    cuBLASLt fp8 + SSM scan extensions importable; TE Linear constructs — skipping reinstall."
+    echo "    cuBLASLt fp8 + SSM scan extensions importable; CPU SSM controller has"
+    echo "    the CUDA write-event pack; TE Linear constructs — skipping reinstall."
     echo "    (force-reinstall by removing one of the above imports from the pod.)"
     echo ""
     echo "Pod ready."
@@ -183,6 +195,24 @@ pip install "${PIP_FLAGS[@]}" $NVIDIA_INDEX \
     'nvidia-nvvm==13.2.78' \
     'nvidia-cuda-cccl==13.2.27'
 
+echo "==> 4e/5 force-pinning runtime stack to match nvcc/cccl 13.2 (post-TE)"
+# The cccl headers `cuda/std/__cccl/cuda_toolkit.h` compare the compiler
+# major.minor against `CUDART_VERSION` (from cuda_runtime_api.h). Default
+# torch 2.11+cu130 pulls nvidia-cuda-runtime==13.0.96 / nvrtc==13.0.88 /
+# cupti==13.0.85 transitively. With nvcc/cccl at 13.2.x the version check
+# fails and any .cu compile aborts with
+#   "CUDA compiler and CUDA toolkit headers are incompatible".
+# Force-reinstall these three wheels to the 13.2 line, post-TE so TE's
+# transitive resolver can't drag them back. --no-deps avoids retriggering
+# any cuda-toolkit umbrella resolution. Observed 2026-04-27 on
+# pvapfq2vsyvh0o: write_event_pack.cu silently dropped from the build
+# without these pins, producing the $30 cuda_stream_enabled=False
+# regression (see docs/reports/2026-04-27-step3-results.md).
+pip install "${PIP_FLAGS[@]}" $NVIDIA_INDEX --force-reinstall --no-deps \
+    'nvidia-cuda-runtime==13.2.75' \
+    'nvidia-cuda-nvrtc==13.2.78' \
+    'nvidia-cuda-cupti==13.2.75'
+
 echo "==> 4d/5 creating libcudart.so symlink for torch's link step"
 # torch.utils.cpp_extension's link step emits both "-lcudart" (needs
 # unversioned .so) and "-l:libcudart.so.13" (versioned, redundant with
@@ -205,9 +235,19 @@ if [ -f "$REPO_ROOT/pyproject.toml" ] || [ -f "$REPO_ROOT/setup.py" ]; then
     # nvcc bin dir to PATH and point CUDA_HOME at the cu13 umbrella so
     # nvcc finds cccl headers and its own ptxas. MAX_JOBS fans the 9 TUs
     # out across ninja workers instead of compiling them serially.
+    # CHAOSCONTROL_CPU_SSM_CUDA_WRITE_EVENT=1 forces the .cu file into
+    # the _cpu_ssm_controller build (the auto-detect via
+    # torch.utils.cpp_extension.CUDA_HOME would also pick it up here, but
+    # explicit is safer for repeatable pod setups).
+    # NVCC_PREPEND_FLAGS=-DCCCL_DISABLE_CTK_COMPATIBILITY_CHECK is a
+    # belt-and-suspenders against the cccl header version check —
+    # step 4e's runtime pins should make it unnecessary, but the bypass
+    # is documented in cccl's own header as the supported escape hatch.
     MAX_JOBS=$(nproc) \
     PATH="$CU13_LIB/../bin:$PATH" \
     CUDA_HOME="$CU13_LIB/.." \
+    CHAOSCONTROL_CPU_SSM_CUDA_WRITE_EVENT=1 \
+    NVCC_PREPEND_FLAGS=-DCCCL_DISABLE_CTK_COMPATIBILITY_CHECK \
         pip install \
             -e . --no-deps --no-build-isolation
 else
