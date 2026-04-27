@@ -19,7 +19,7 @@ Required columns:
 | --- | --- | --- |
 | `row_type` | `VARCHAR` | `decision`, `credit`, or `skip`. |
 | `status` | `VARCHAR` | `ok` / `skipped`; analysis should not infer failure from missing rows. |
-| `status_reason` | `VARCHAR` | Empty for normal rows; otherwise `outcome_status`, `invalid_slot`, `missing_weights`, `missing_decision`, `zero_advantage`, or `gerber_rejected`. |
+| `status_reason` | `VARCHAR` | Empty for normal rows; otherwise `outcome_status`, `invalid_slot`, `missing_weights`, `missing_decision`, `zero_advantage`, `gerber_rejected`, or `entropy_only` (`gerber_weight=0` but entropy bonus still produced a backward pass). |
 | `gpu_step` | `BIGINT` | Producer GPU step for the query/decision; replay step on credit/skip rows. |
 | `slot_id` | `UBIGINT` | Chosen cache slot id. |
 | `arm` | `VARCHAR` | Matrix arm name; empty string when unavailable in-process. |
@@ -42,6 +42,11 @@ Required columns:
 | `current_entropy` | `FLOAT` | Current-policy entropy `-sum(p_current * log(p_current))` from the replay-time forward. NaN on `decision` rows. Populated on `credit` and on skip rows where the forward ran (`zero_advantage`, `gerber_rejected`). The drift `current_entropy - entropy` is a useful stability signal — if current entropy collapses relative to behavior entropy while credit still arrives late, the online learner may be hardening too fast. |
 | `temperature` | `FLOAT` | Active simplex softmax temperature. |
 | `entropy_beta` | `FLOAT` | Active entropy-bonus weight. |
+| `sgd_steps` | `UBIGINT` | Number of learner SGD applications completed before this row was emitted. |
+| `ema_blends` | `UBIGINT` | Number of slow-weight EMA blends completed before this row was emitted. |
+| `actions_since_sgd` | `UINTEGER` | Credit/entropy-only actions accumulated toward the next SGD application. |
+| `gerber_accepted_actions` | `UBIGINT` | Cumulative accepted Gerber-gated reward credits before this row. |
+| `gerber_rejected_actions` | `UBIGINT` | Cumulative Gerber-zero events before this row; includes entropy-only updates when `entropy_beta > 0`. |
 | `teacher_score` | `FLOAT` | Heuristic score for the chosen slot, usually cosine times utility. |
 | `controller_logit` | `FLOAT` | Controller logit for the chosen vertex. |
 | `ce_before_replay` | `FLOAT` | Replay CE before the optimizer step; NaN on decision-only rows. |

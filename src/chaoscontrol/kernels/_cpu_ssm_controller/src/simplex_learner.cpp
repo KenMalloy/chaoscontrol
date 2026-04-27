@@ -682,6 +682,11 @@ void SimplexOnlineLearner::emit_simplex_trace_row(
   json_float(line, fast_weights_.lambda_hxh);
   line << ",\"entropy_beta\":";
   json_float(line, entropy_beta_);
+  line << ",\"sgd_steps\":" << telemetry_.sgd_steps;
+  line << ",\"ema_blends\":" << telemetry_.ema_blends;
+  line << ",\"actions_since_sgd\":" << actions_since_sgd_;
+  line << ",\"gerber_accepted_actions\":" << telemetry_.gerber_accepted_actions;
+  line << ",\"gerber_rejected_actions\":" << telemetry_.gerber_rejected_actions;
   line << ",\"ce_before_replay\":";
   json_float(line, ce_before);
   line << ",\"ce_after_replay\":";

@@ -16,6 +16,14 @@ float recency_decay(float reward, uint64_t T, uint64_t P, float gamma) {
 
 float gerber_weight(float L_v, float L_current, float H) {
   const float threshold = std::max(H, 0.0f);
+  const float agreement_tol =
+      1.0e-6f * std::max({1.0f, std::fabs(L_v), std::fabs(L_current)});
+  if (
+      std::isfinite(L_v) &&
+      std::isfinite(L_current) &&
+      std::fabs(L_v - L_current) <= agreement_tol) {
+    return 1.0f;
+  }
   if (std::fabs(L_v) <= threshold || std::fabs(L_current) <= threshold) {
     return 0.0f;
   }

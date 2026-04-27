@@ -22,6 +22,15 @@ def test_gerber_weight_rejects_when_either_logit_is_below_threshold():
     assert _ext.gerber_weight(1.25, 0.49, 0.5) == 0.0
 
 
+def test_gerber_weight_accepts_exact_on_policy_uniform_margin():
+    """A uniform on-policy simplex still needs reward credit to break symmetry."""
+    assert _ext.gerber_weight(0.0, 0.0, 0.0) == 1.0
+
+
+def test_gerber_weight_rejects_inactive_off_policy_margin():
+    assert _ext.gerber_weight(0.0, 0.01, 0.5) == 0.0
+
+
 def test_gerber_weight_treats_equality_at_threshold_as_inactive():
     assert _ext.gerber_weight(0.5, 0.75, 0.5) == 0.0
 

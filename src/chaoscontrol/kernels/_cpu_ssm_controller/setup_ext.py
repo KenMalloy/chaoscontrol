@@ -34,7 +34,17 @@ def _x86_accel_compile_args() -> list[str]:
 
 
 def _cuda_write_event_enabled() -> bool:
-    return os.environ.get("CHAOSCONTROL_CPU_SSM_CUDA_WRITE_EVENT") == "1"
+    requested = os.environ.get("CHAOSCONTROL_CPU_SSM_CUDA_WRITE_EVENT")
+    if requested is not None:
+        return requested.strip().lower() in {"1", "true", "yes", "on"}
+    try:
+        from torch.utils.cpp_extension import CUDA_HOME
+    except ImportError:
+        return False
+    if CUDA_HOME is None:
+        return False
+    nvcc = Path(CUDA_HOME) / "bin" / "nvcc"
+    return nvcc.exists()
 
 
 def build_ext_modules() -> list:

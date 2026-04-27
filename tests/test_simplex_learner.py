@@ -813,6 +813,11 @@ def test_simplex_trace_writes_decision_and_credit_rows_async(tmp_path):
         "temperature",
         "lambda_hxh",
         "entropy_beta",
+        "sgd_steps",
+        "ema_blends",
+        "actions_since_sgd",
+        "gerber_accepted_actions",
+        "gerber_rejected_actions",
         "ce_before_replay",
         "ce_after_replay",
         "ce_delta_raw",
@@ -858,6 +863,10 @@ def test_simplex_trace_writes_decision_and_credit_rows_async(tmp_path):
     assert credit["slot_age_steps"] == 1
     assert credit["advantage_final"] is not None
     assert credit["gerber_weight"] == pytest.approx(1.0)
+    assert credit["sgd_steps"] == 0
+    assert credit["actions_since_sgd"] == 1
+    assert credit["gerber_accepted_actions"] == 1
+    assert credit["gerber_rejected_actions"] == 0
 
     # Float fields: must round-trip through float and stay finite on credit.
     for fname in (

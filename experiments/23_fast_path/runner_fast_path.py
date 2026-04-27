@@ -1742,6 +1742,7 @@ class EpisodicGpuEmit:
         "write_ring_drop_batches",
         "write_ring_submitted_batches",
         "write_ring_publisher_error",
+        "cuda_write_event_unavailable_reason",
         "async_write_rings_enabled",
         "cuda_write_event_stream_enabled",
         "cuda_write_event_publisher",
@@ -1788,6 +1789,7 @@ class EpisodicGpuEmit:
         self.write_ring_drop_batches = 0
         self.write_ring_submitted_batches = 0
         self.write_ring_publisher_error = ""
+        self.cuda_write_event_unavailable_reason = ""
         self.async_write_rings_enabled = bool(async_write_rings_enabled)
         self.cuda_write_event_stream_enabled = bool(cuda_write_event_stream_enabled)
         self.cuda_write_event_publisher = cuda_write_event_publisher
@@ -1866,6 +1868,7 @@ def _create_episodic_emit(
     cuda_write_event_candidate_base = None
     cuda_write_event_empty_pressure = None
     cuda_write_event_stream_enabled = False
+    cuda_unavailable_reason = ""
     controller_action_trace_log = None
     controller_action_space = None
     if (
@@ -1880,14 +1883,35 @@ def _create_episodic_emit(
         write_ring = _create_event_ring(_ext.ShmRingWriteEvent, write_ring_name)
         try:
             cuda_pack_available = bool(_ext.write_event_cuda_pack_available())
-        except Exception:
+        except Exception as exc:
             cuda_pack_available = False
+            cuda_unavailable_reason = f"availability_check_failed:{type(exc).__name__}"
+        else:
+            cuda_unavailable_reason = (
+                "" if cuda_pack_available else "cuda_pack_extension_unavailable"
+            )
+        cuda_write_requested = bool(
+            config.get("episodic_cuda_write_event_stream_enabled", True)
+        )
         cuda_write_event_stream_enabled = (
-            bool(config.get("episodic_cuda_write_event_stream_enabled", True))
+            cuda_write_requested
             and bool(async_write_rings_enabled)
             and device.type == "cuda"
             and cuda_pack_available
         )
+        if (
+            cuda_write_requested
+            and bool(async_write_rings_enabled)
+            and device.type == "cuda"
+            and not cuda_pack_available
+        ):
+            raise RuntimeError(
+                "episodic CUDA WRITE_EVENT stream was requested on CUDA, "
+                "but the _cpu_ssm_controller extension was built without "
+                "write_event_pack.cu. Rebuild on the pod with CUDA available "
+                "or set CHAOSCONTROL_CPU_SSM_CUDA_WRITE_EVENT=1 explicitly. "
+                f"reason={cuda_unavailable_reason}"
+            )
         if cuda_write_event_stream_enabled:
             constants = _ext.wire_event_constants()
             max_key_rep_dim = int(constants["KEY_REP_DIM_DEFAULT"])
@@ -1941,7 +1965,7 @@ def _create_episodic_emit(
             config,
             trace_log=controller_action_trace_log,
         )
-    return EpisodicGpuEmit(
+    handle = EpisodicGpuEmit(
         slot_tensor=slot,
         k_max=k_max,
         span_length=span_length,
@@ -1960,6 +1984,8 @@ def _create_episodic_emit(
         controller_action_space=controller_action_space,
         controller_action_trace_log=controller_action_trace_log,
     )
+    handle.cuda_write_event_unavailable_reason = str(cuda_unavailable_reason)
+    return handle
 
 
 def _right_pad_per_token_signal(signal: torch.Tensor, T: int) -> torch.Tensor:
@@ -6606,6 +6632,14 @@ def train_fast_for_budget(
                     getattr(
                         episodic_emit_handle,
                         "write_ring_publisher_error",
+                        "",
+                    )
+                    or ""
+                ),
+                "cuda_unavailable_reason": str(
+                    getattr(
+                        episodic_emit_handle,
+                        "cuda_write_event_unavailable_reason",
                         "",
                     )
                     or ""
