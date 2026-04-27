@@ -2543,6 +2543,12 @@ def _write_replay_ndjson_row(
             return fallback
         return event_dict.get(field, fallback)
 
+    def _entry_value(field: str, fallback: Any) -> Any:
+        value = _event_value(field, None)
+        if value is not None:
+            return value
+        return entry.get(field, fallback)
+
     logger.write_row({
         "step": int(_event_value("gpu_step", int(current_step))),
         "slot": int(_event_value("slot_id", int(slot))),
@@ -2598,6 +2604,31 @@ def _write_replay_ndjson_row(
         "utility_post": float(utility_post),
         "outcome_status": "ok",
         "flags": int(_event_value("flags", 0)),
+        "arm": str(_entry_value("arm", "")),
+        "chosen_idx": int(
+            _entry_value("chosen_idx", entry.get("simplex_chosen_idx", -1))
+        ),
+        "p_chosen": float(
+            _entry_value("p_chosen", entry.get("simplex_p_chosen", float("nan")))
+        ),
+        "p_behavior": _entry_value(
+            "p_behavior", entry.get("simplex_probabilities", [])
+        ),
+        "entropy": float(_entry_value("entropy", float("nan"))),
+        "gerber_weight": float(_entry_value("gerber_weight", float("nan"))),
+        "advantage_raw": float(_entry_value("advantage_raw", float("nan"))),
+        "advantage_corrected": float(
+            _entry_value("advantage_corrected", float("nan"))
+        ),
+        "lambda_hxh": float(_entry_value("lambda_hxh", float("nan"))),
+        "feature_manifest_hash": str(_entry_value("feature_manifest_hash", "")),
+        "candidate_slot_ids": _entry_value(
+            "candidate_slot_ids", entry.get("simplex_candidate_slot_ids", [])
+        ),
+        "candidate_scores": _entry_value(
+            "candidate_scores", entry.get("simplex_candidate_scores", [])
+        ),
+        "logits": _entry_value("logits", entry.get("simplex_logits", [])),
     })
 
 
