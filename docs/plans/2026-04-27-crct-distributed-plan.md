@@ -67,6 +67,7 @@ class TestModuleImports(unittest.TestCase):
             "create_crct_process_groups",
             "WeightMailbox",
             "TeacherResultMailbox",
+            "TeacherPayload",
             "Rank3MemoryCoprocessor",
             "rank3_coprocessor_loop",
             "fail_open_controller_term",
@@ -95,6 +96,7 @@ __all__ = [
     "create_crct_process_groups",
     "WeightMailbox",
     "TeacherResultMailbox",
+    "TeacherPayload",
     "Rank3MemoryCoprocessor",
     "rank3_coprocessor_loop",
     "fail_open_controller_term",
@@ -107,6 +109,10 @@ def create_crct_process_groups(world_size):
 
 class WeightMailbox:  # noqa: D101 — fleshed out in Task 3
     def __init__(self, *args, **kwargs): raise NotImplementedError
+
+
+class TeacherPayload:  # filled in Task 5
+    pass
 
 
 class TeacherResultMailbox:
@@ -361,42 +367,53 @@ git commit -m "crct_distributed: WeightMailbox flat-buffer snapshots + tests"
 
 ---
 
-## Task 4: `WeightMailbox.post_weights` non-blocking on rank 0
+## Task 4: `WeightMailbox.post_weights` non-blocking guard
 
-Add a wall-clock test guarding the non-blocking contract. The flat-buffer broadcast IS already async via `async_op=True`; this task verifies the bound. If the test passes without further changes, no daemon thread is needed — `async_op=True` is sufficient. If it fails (e.g., the snapshot copy itself takes long enough to matter), add a daemon-thread shim around the copy + broadcast launch.
+Pin the non-blocking contract directly: post_weights must NOT call the
+broadcast handle's `wait()`, and must return with the work handle in
+`is_completed()=False` state. This is a behavioral guard, not a wall-clock
+guard — magic wall-clock thresholds are forbidden by
+`feedback_test_threshold_math.md`.
+
+**Pre-decision:** The flat-buffer broadcast is async via `async_op=True`
+(Task 3 impl). No daemon thread needed. This task does NOT add one. If a
+future profile shows the snapshot copy itself blocks the train rank
+meaningfully, that's a separate perf-pass — open a new task there.
 
 **Files:**
 - Modify: `tests/test_crct_distributed.py`
-- Possibly: `src/chaoscontrol/crct_distributed.py`
 
-**Step 1: Write the failing/guarding test**
+**Step 1: Write the guarding test**
 
 ```python
-import time
-
 class TestWeightMailboxNonBlocking(unittest.TestCase):
-    def test_post_weights_returns_under_50ms_with_slow_broadcast(self):
-        """Even if the broadcast is mocked to never complete, post_weights
-        must return promptly. Wall-clock budget is generous (50 ms) — the
-        point is that we never block on the work handle."""
+    def test_post_weights_does_not_await_broadcast_handle(self):
+        """post_weights must return with work.is_completed()==False when
+        the underlying broadcast is mocked to never complete. Behavioral
+        contract: no .wait() in the post path."""
         m = _TinyModel()
         pg = FakeProcessGroup([0, 3])
         slow_work = FakeWork(completed=False)
+        broadcasts_started = []
         mb = crct.WeightMailbox(
             m, pg, sync_interval_steps=10, src_rank=0, my_rank=0,
-            broadcast_fn=lambda *a, **kw: slow_work,
+            broadcast_fn=lambda *a, **kw: (
+                broadcasts_started.append(1) or slow_work
+            ),
         )
-        t0 = time.monotonic()
         mb.post_weights(global_step=10)
-        elapsed = time.monotonic() - t0
-        self.assertLess(elapsed, 0.050)
-        self.assertFalse(slow_work.is_completed())  # broadcast not awaited
+        # Broadcast launched, but never awaited — proves non-blocking.
+        self.assertEqual(len(broadcasts_started), 1)
+        self.assertFalse(slow_work.is_completed())
+        self.assertEqual(mb.snapshots_posted, 1)
 ```
 
 **Step 2: Run test**
 
 Run: `pytest tests/test_crct_distributed.py::TestWeightMailboxNonBlocking -v`
-Expected: PASS (the existing impl is already non-blocking via async_op=True). If FAIL, add a `threading.Thread(target=…, daemon=True)` shim around the snapshot copy and broadcast launch.
+Expected: PASS. Task 3's impl already uses `async_op=True` and never
+calls `.wait()`, so this test should pass out-of-the-box. If it fails,
+the failure is the regression — fix the impl, do NOT add a thread.
 
 **Step 3: Commit**
 
@@ -437,11 +454,20 @@ class TestTeacherResultMailbox(unittest.TestCase):
             payload_shape=(2, 8, 16),
             broadcast_fn=lambda *a, **kw: done,
         )
-        # First call issues recv broadcast; mark completed and re-poll.
+        # Pre-stage the meta_buf so the assertion can verify decode.
+        mb._meta_buf[0] = 0.75   # loss_weight
+        mb._meta_buf[1] = 100.0  # step_id
+
+        # First call issues the recv-broadcast and stores the work
+        # handle; with a pre-completed mock the second call decodes.
         first = mb.try_get(step=100)
-        # depending on impl, may need second poke after marking complete
-        payload = first if first is not None else mb.try_get(step=101)
+        payload = first if first is not None else mb.try_get(step=100)
         self.assertIsNotNone(payload)
+        self.assertIsInstance(payload, crct.TeacherPayload)
+        self.assertEqual(payload.step_id, 100)
+        self.assertEqual(payload.target.shape, (2, 8, 16))
+        self.assertEqual(payload.conf.shape, (2, 8))
+        self.assertAlmostEqual(payload.loss_weight, 0.75)
 
     def test_post_result_drop_when_inflight(self):
         pg = FakeProcessGroup([0, 1, 2, 3])
@@ -618,9 +644,23 @@ git commit -m "crct_distributed: fail_open_controller_term + DDP-graph guard"
 
 ---
 
-## Task 7: `Rank3MemoryCoprocessor` — causal order
+## Task 7: `Rank3MemoryCoprocessor` — causal order + drop-don't-queue
 
-Test the call order first, then the bounded-queue interaction.
+Test the canonical phase order (reap-first, per design §2), then both
+in-flight branches (completed → reap fires; incomplete → drops += 1).
+Three sub-tests in one task; the impl lands once and all three run
+against it.
+
+**Phase order per design §2 (load-bearing):**
+1. Reap teacher (silent unless in-flight is completed)
+2. Gather (`dist.gather(..., dst=3, group=crct_pg)` — Pass C precedent)
+3. Episodic drain (`episodic_drain_fn()` processes gathered write events)
+4. Controller tick
+5. Maybe sync weights
+6. Maybe enqueue new score job (skipped if anything still in flight)
+
+Reap-first is the rule that lets a slow score from step N not block
+gather at step N+1. Reap-before-enqueue is what gives drop-don't-queue.
 
 **Files:**
 - Modify: `src/chaoscontrol/crct_distributed.py`
@@ -629,46 +669,75 @@ Test the call order first, then the bounded-queue interaction.
 **Step 1: Write the failing tests**
 
 ```python
+class _StubMailbox:
+    posts_attempted = 0
+    posts_dropped = 0
+    def __init__(self, events, name): self._events = events; self.name = name
+    def post_result(self, *a, **kw): self._events.append("teacher_post")
+    def try_get(self, *a, **kw): return None
+    def maybe_sync(self, *a, **kw): self._events.append("weight_sync")
+    def post_weights(self, *a, **kw): self._events.append("weight_post")
+
+
+def _make_copro(events, *, gather_returns=None):
+    return crct.Rank3MemoryCoprocessor(
+        model_copy=_TinyModel(),
+        weight_mailbox=_StubMailbox(events, "weights"),
+        result_mailbox=_StubMailbox(events, "results"),
+        score_fn=lambda *a, **kw: events.append("score") or None,
+        episodic_drain_fn=lambda: events.append("episodic_drain"),
+        controller_tick_fn=lambda: events.append("controller_tick"),
+        crct_pg=FakeProcessGroup([0, 1, 2, 3]),
+        sync_pg=FakeProcessGroup([0, 3]),
+        gather_fn=lambda *a, **kw: (
+            events.append("gather") or (gather_returns or object())
+        ),
+    )
+
+
 class TestCoprocessorCausalOrder(unittest.TestCase):
-    def test_step_once_runs_phases_in_canonical_order(self):
+    def test_empty_start_order_is_gather_drain_tick_sync_score(self):
+        """Reap is silent when nothing in flight; remaining phases fire
+        in design §2 order. Score enqueues because queue is empty."""
         events = []
-
-        # Stub mailboxes — minimal duck-typed objects, no real broadcast.
-        class _Stub:
-            posts_attempted = 0
-            posts_dropped = 0
-            def __init__(self, name): self.name = name
-            def post_result(self, *a, **kw): events.append("teacher_post")
-            def try_get(self, *a, **kw): return None
-            def maybe_sync(self, *a, **kw): events.append("weight_sync")
-            def post_weights(self, *a, **kw): events.append("weight_post")
-
-        weight_mb = _Stub("weights")
-        result_mb = _Stub("results")
-        copro = crct.Rank3MemoryCoprocessor(
-            model_copy=_TinyModel(),
-            weight_mailbox=weight_mb,
-            result_mailbox=result_mb,
-            score_fn=lambda *a, **kw: events.append("score") or None,
-            episodic_drain_fn=lambda: events.append("episodic_drain"),
-            controller_tick_fn=lambda: events.append("controller_tick"),
-            crct_pg=FakeProcessGroup([0, 1, 2, 3]),
-            sync_pg=FakeProcessGroup([0, 3]),
-            gather_fn=lambda *a, **kw: events.append("gather"),
-        )
+        copro = _make_copro(events)
         copro.step_once(global_step=10)
         self.assertEqual(
             events,
-            [
-                "gather",            # step 1 of §3 data-flow
-                "episodic_drain",
-                "controller_tick",
-                "weight_sync",
-                # teacher reap is a no-op here (no in-flight); enqueue
-                # happens because score_fn is provided -> triggers
-                "score",
-            ],
+            ["gather", "episodic_drain", "controller_tick",
+             "weight_sync", "score"],
         )
+        self.assertEqual(copro.metrics["scores_run"], 1)
+        self.assertEqual(copro.metrics["teacher_drops"], 0)
+
+    def test_inflight_completed_reaps_first_then_enqueues_new(self):
+        """Reap fires (posts result) BEFORE gather. After reap clears
+        the queue, the new gather + score can enqueue this step."""
+        events = []
+        copro = _make_copro(events)
+        copro._inflight_score = FakeWork(completed=True)
+        copro.step_once(global_step=10)
+        self.assertEqual(
+            events,
+            ["teacher_post", "gather", "episodic_drain",
+             "controller_tick", "weight_sync", "score"],
+        )
+
+    def test_inflight_incomplete_skips_score_and_increments_drops(self):
+        """Reap is silent when in-flight is incomplete; queue stays full;
+        score is skipped; teacher_drops increments. Two consecutive steps
+        each contribute one drop."""
+        events = []
+        copro = _make_copro(events)
+        copro._inflight_score = FakeWork(completed=False)
+        copro.step_once(global_step=10)
+        copro.step_once(global_step=11)
+        # Score never fires because in-flight never clears.
+        self.assertNotIn("score", events)
+        # Each step still runs gather → drain → tick → sync.
+        self.assertEqual(events.count("gather"), 2)
+        self.assertEqual(copro.metrics["scores_run"], 0)
+        self.assertEqual(copro.metrics["teacher_drops"], 2)
 ```
 
 **Step 2: Run, expect FAIL.**
@@ -691,84 +760,55 @@ class Rank3MemoryCoprocessor:
         self.sync_pg = sync_pg
         self.high_stream = high_stream
         self.low_stream = low_stream
+        # Real call shape (Pass C precedent):
+        #   dist.gather(slot_tensor, gather_list=[...], dst=3,
+        #               group=crct_pg, async_op=False)
+        # Injection-point keeps the test transport-agnostic.
         self._gather = gather_fn or _dist.gather
         self.metrics = {"teacher_drops": 0, "scores_run": 0}
         self._latest_batch = None
-        self._inflight_score = None  # placeholder for completed-event handle
+        self._inflight_score = None
 
     def step_once(self, global_step):
-        # Phase 1: receive batch from train ranks.
+        # Phase 1: reap teacher (silent unless in-flight is completed).
+        if self._inflight_score is not None and self._inflight_score.is_completed():
+            self.result_mailbox.post_result(
+                step_id=global_step,
+                target=getattr(self, "_pending_target", None),
+                conf=getattr(self, "_pending_conf", None),
+                loss_weight=getattr(self, "_pending_lw", 1.0),
+            )
+            self._inflight_score = None
+        # Phase 2: gather batch + write events from train ranks.
         batch = self._gather(group=self.crct_pg)
         self._latest_batch = batch
-        # Phase 2: episodic write commits.
+        # Phase 3: episodic write commits.
         self.episodic_drain_fn()
-        # Phase 3: controller tick.
+        # Phase 4: controller tick.
         self.controller_tick_fn()
-        # Phase 4: maybe sync weights.
+        # Phase 5: maybe sync weights.
         self.weight_mailbox.maybe_sync(global_step)
-        # Phase 5: reap teacher (no-op if nothing in flight).
-        if self._inflight_score is not None and self._inflight_score.is_completed():
-            # In real impl: post payload to result_mailbox. Stub: drop.
-            self._inflight_score = None
         # Phase 6: maybe enqueue new score job.
         if self._inflight_score is None and self._latest_batch is not None:
-            self._inflight_score = FakeWork(completed=True)  # placeholder
             self.score_fn(self.model, self._latest_batch)
+            self._inflight_score = FakeWork(completed=True)  # placeholder; real impl uses CUDA event
             self.metrics["scores_run"] += 1
         elif self._inflight_score is not None:
             self.metrics["teacher_drops"] += 1
 ```
 
-**Step 4: Run tests, expect PASS.**
+**Step 4: Run all three tests, expect PASS.**
 
 **Step 5: Commit**
 
 ```bash
 git add src/chaoscontrol/crct_distributed.py tests/test_crct_distributed.py
-git commit -m "crct_distributed: Rank3MemoryCoprocessor causal-order scheduler"
+git commit -m "crct_distributed: Rank3MemoryCoprocessor causal-order + drop-dont-queue"
 ```
 
 ---
 
-## Task 8: Drop-don't-queue invariant on the coprocessor
-
-**Step 1: Write the failing test**
-
-```python
-class TestCoprocessorDropDontQueue(unittest.TestCase):
-    def test_step_once_skips_score_when_prior_inflight(self):
-        score_calls = []
-        copro = crct.Rank3MemoryCoprocessor(
-            model_copy=_TinyModel(),
-            weight_mailbox=_Stub("w"),
-            result_mailbox=_Stub("r"),
-            score_fn=lambda *a, **kw: score_calls.append(1),
-            episodic_drain_fn=lambda: None,
-            controller_tick_fn=lambda: None,
-            crct_pg=FakeProcessGroup([0,1,2,3]),
-            sync_pg=FakeProcessGroup([0,3]),
-            gather_fn=lambda *a, **kw: object(),
-        )
-        # Force a never-completing in-flight score.
-        copro._inflight_score = FakeWork(completed=False)
-        copro.step_once(global_step=10)
-        copro.step_once(global_step=11)
-        self.assertEqual(len(score_calls), 0)
-        self.assertGreaterEqual(copro.metrics["teacher_drops"], 2)
-```
-
-**Step 2: Run, expect FAIL or PASS depending on Task 7's stub. Adjust impl if needed.**
-
-**Step 3: Commit**
-
-```bash
-git add tests/test_crct_distributed.py
-git commit -m "crct_distributed: pin coprocessor drop-don't-queue invariant"
-```
-
----
-
-## Task 9: `rank3_coprocessor_loop` driver
+## Task 8: `rank3_coprocessor_loop` driver
 
 **Files:**
 - Modify: `src/chaoscontrol/crct_distributed.py`
@@ -834,15 +874,19 @@ git commit -m "crct_distributed: rank3_coprocessor_loop driver + fallback no-op"
 
 ---
 
-## Task 10: `world_size < 4` synchronous fallback through `TeacherResultMailbox`
+## Task 9: `world_size < 4` synchronous fallback through `TeacherResultMailbox`
 
-The mailboxes must short-circuit when `crct_pg is None`. The fallback path lets training ranks call `score_fn` inline and have `try_get` return its result.
+The mailboxes must short-circuit when `crct_pg is None`. The fallback path
+lets training ranks call `score_fn` inline and have `try_get_with_input`
+return its result. **Critical:** the fallback path must set every
+attribute the distributed path sets, so any test or coprocessor code
+introspecting the object never hits an `AttributeError`.
 
 **Files:**
 - Modify: `src/chaoscontrol/crct_distributed.py`
 - Modify: `tests/test_crct_distributed.py`
 
-**Step 1: Write the failing test**
+**Step 1: Write the failing tests**
 
 ```python
 class TestSynchronousFallback(unittest.TestCase):
@@ -868,39 +912,80 @@ class TestSynchronousFallback(unittest.TestCase):
         )
         self.assertEqual(score_calls, [42])
         self.assertEqual(payload.step_id, 42)
+
+    def test_fallback_init_sets_all_attrs_uniformly(self):
+        """Fallback objects must expose the same attribute surface as
+        distributed-path objects so any introspecting code (metrics,
+        diagnostics) doesn't AttributeError on the fallback path."""
+        mb = crct.TeacherResultMailbox(
+            crct_pg=None, my_rank=0, num_train_ranks=1,
+            payload_shape=(2, 8, 16),
+            inline_score_fn=lambda *a, **kw: None,
+        )
+        for attr in ("posts_attempted", "posts_dropped",
+                     "_target_buf", "_conf_buf", "_meta_buf",
+                     "_inflight", "num_train_ranks", "payload_shape",
+                     "dtype"):
+            self.assertTrue(hasattr(mb, attr), f"missing {attr}")
+        self.assertEqual(mb.posts_attempted, 0)
+        self.assertEqual(mb.posts_dropped, 0)
+        self.assertIsNone(mb._inflight)
 ```
 
 **Step 2: Run, expect FAIL.**
 
-**Step 3: Implement — extend `TeacherResultMailbox.__init__` to accept `inline_score_fn` when `crct_pg is None`, and add `try_get_with_input` which is the inline path's name (distinct so callers can't accidentally call distributed `try_get` on a None pg).**
+**Step 3: Implement — uniform init for both paths; branch only on the
+broadcast vs inline-score divergence.**
 
 ```python
 # Patch TeacherResultMailbox:
 def __init__(self, crct_pg, *, my_rank, num_train_ranks,
              payload_shape, dtype=torch.float16, queue_depth=1,
              broadcast_fn=None, inline_score_fn=None):
+    if int(queue_depth) != 1:
+        raise NotImplementedError(
+            "queue_depth > 1 not in scope; see design §4"
+        )
+    # Uniform attribute set for distributed AND fallback paths.
+    self.crct_pg = crct_pg
+    self.my_rank = int(my_rank)
+    self.num_train_ranks = int(num_train_ranks)
+    self.payload_shape = payload_shape
+    self.dtype = dtype
+    self._target_buf = torch.zeros(payload_shape, dtype=dtype)
+    self._conf_buf = torch.zeros(payload_shape[:2], dtype=dtype)
+    self._meta_buf = torch.zeros(2, dtype=torch.float32)
+    self._inflight = None
+    self.posts_attempted = 0
+    self.posts_dropped = 0
+    # Path-divergent: distributed uses broadcast_fn; fallback uses
+    # inline_score_fn. Exactly one must be configured.
     if crct_pg is None:
         if inline_score_fn is None:
             raise ValueError(
                 "world_size < 4 fallback requires inline_score_fn"
             )
         self._inline_score = inline_score_fn
-        self.crct_pg = None
-        self.my_rank = int(my_rank)
-        return
-    # ... existing distributed path ...
+        self._broadcast = None
+    else:
+        self._inline_score = None
+        self._broadcast = broadcast_fn or _dist.broadcast
+
 
 def try_get_with_input(self, step, input_ids, valid_mask):
     if self.crct_pg is None:
         return self._inline_score(input_ids, valid_mask, step)
-    raise RuntimeError("try_get_with_input is for fallback path only; "
-                       "use try_get(step) under distributed CRCT.")
+    raise RuntimeError(
+        "try_get_with_input is for fallback path only; "
+        "use try_get(step) under distributed CRCT."
+    )
 ```
 
 **Step 4: Run all tests:**
 
-`pytest tests/test_crct_distributed.py -v`
-Expected: all PASS.
+Run: `pytest tests/test_crct_distributed.py -v`
+Expected: all PASS, including Task 5's tests which now exercise the
+distributed-path attribute surface that fallback init must mirror.
 
 **Step 5: Commit**
 
@@ -911,7 +996,7 @@ git commit -m "crct_distributed: synchronous fallback via inline_score_fn"
 
 ---
 
-## Task 11: Final consolidation — full-suite smoke + lint
+## Task 10: Final consolidation — full-suite smoke + lint
 
 **Step 1: Run the entire `crct_distributed` test file**
 
@@ -930,7 +1015,7 @@ Run: `git log --oneline -15`
 Expected output should include:
 - design doc commit
 - module skeleton commit
-- one commit per task
+- one commit per task (10 tasks total)
 
 **Step 4: Final commit cleanup if any docs need cross-references.**
 
