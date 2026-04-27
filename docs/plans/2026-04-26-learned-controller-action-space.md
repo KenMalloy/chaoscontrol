@@ -1,6 +1,7 @@
 # Learned Controller Action Space
 
-**Status:** Design note for the controller-learning-gates branch.
+**Status:** Design note plus first implementation slice on the
+controller-learning-gates branch.
 
 **Thesis:** the stable endpoint is not a learned controller plus a permanent
 hand-written governor. The stable endpoint is a learned event SSM whose action
@@ -245,6 +246,40 @@ learn ranking before learning rate
 learn local action before learning global budget
 learn behavior before learning meta-behavior
 ```
+
+## Landed Slice
+
+This branch implements the first safe surface in
+`chaoscontrol.episodic.learned_action_space`:
+
+- `ConstrainedActionSpace` maps learned controller logits to bounded residuals
+  over existing heuristic scores.
+- `selection_readiness=0` or `trace_only=True` reproduces the heuristic scores
+  exactly.
+- `selection_max_delta` is a hard residual cap:
+
+  ```python
+  effective_score = heuristic_score + readiness * max_delta * tanh(raw_logit)
+  ```
+
+- `max_tags_per_query` clamps replay fanout and writes a trace row when it
+  intervenes.
+- `BoundedScalarSpec` is the reusable bounded-coordinate mapper for later
+  meta-knobs such as `entropy_beta`, `temperature`, and `ema_alpha`.
+
+The runner exposes the slice through opt-in config keys:
+
+```yaml
+episodic_controller_action_space_enabled: true
+episodic_controller_action_space_trace_only: false
+episodic_controller_selection_readiness: 0.0
+episodic_controller_selection_max_delta: 0.0
+episodic_controller_max_tags_per_query: null
+```
+
+When disabled, no action-space object and no trace list are allocated. When
+enabled, the episodic consumer owns `controller_action_trace_log`, which is the
+temporary in-process sink until the event/ring writer absorbs these rows.
 
 ## Tests To Pin
 

@@ -147,6 +147,7 @@ def test_consumer_state_has_tagged_replay_queue_field():
     assert hasattr(consumer, "controller_query_queue")
     assert hasattr(consumer, "cache")
     assert hasattr(consumer, "heartbeat")
+    assert hasattr(consumer, "controller_action_trace_log")
 
 
 def test_consumer_state_back_compat_with_disabled_episodic():
@@ -167,6 +168,109 @@ def test_consumer_state_back_compat_with_disabled_episodic():
     assert consumer.heartbeat == [0]
     assert consumer.controller_query_queue == []
     assert consumer.tagged_replay_queue == []
+    assert consumer.controller_action_trace_log is None
+
+
+def test_controller_action_trace_log_allocates_only_when_enabled():
+    mod = _load_runner_module()
+    disabled = mod._attach_episodic_consumer(
+        episodic_enabled=True,
+        is_episodic_rank=True,
+        world_size=2,
+        config={
+            "episodic_capacity": 16,
+            "episodic_span_length": 4,
+            "episodic_key_rep_dim": 8,
+        },
+        model_dim=8,
+        all_group=None,
+    )
+    enabled = mod._attach_episodic_consumer(
+        episodic_enabled=True,
+        is_episodic_rank=True,
+        world_size=2,
+        config={
+            "episodic_capacity": 16,
+            "episodic_span_length": 4,
+            "episodic_key_rep_dim": 8,
+            "episodic_controller_action_space_enabled": True,
+        },
+        model_dim=8,
+        all_group=None,
+    )
+
+    assert disabled.controller_action_trace_log is None
+    assert enabled.controller_action_trace_log == []
+
+
+def test_build_controller_action_space_threads_config_and_trace_sink():
+    mod = _load_runner_module()
+    consumer = mod._attach_episodic_consumer(
+        episodic_enabled=True,
+        is_episodic_rank=True,
+        world_size=2,
+        config={
+            "episodic_capacity": 16,
+            "episodic_span_length": 4,
+            "episodic_key_rep_dim": 8,
+            "episodic_controller_action_space_enabled": True,
+        },
+        model_dim=8,
+        all_group=None,
+    )
+
+    action_space = mod._build_controller_action_space(
+        consumer=consumer,
+        config={
+            "episodic_controller_action_space_enabled": True,
+            "episodic_controller_selection_readiness": 0.75,
+            "episodic_controller_selection_max_delta": 0.25,
+            "episodic_controller_max_tags_per_query": 1,
+        },
+    )
+
+    assert isinstance(action_space, mod.ConstrainedActionSpace)
+    assert action_space.selection_readiness == pytest.approx(0.75)
+    assert action_space.selection_max_delta == pytest.approx(0.25)
+    assert action_space.max_tags_per_query == 1
+    assert action_space.trace_log is consumer.controller_action_trace_log
+
+    action_space.selected_indices(
+        effective_scores=[0.0, 1.0],
+        gpu_step=5,
+        requested_budget=2,
+    )
+    assert consumer.controller_action_trace_log is not None
+    assert consumer.controller_action_trace_log[0]["event_type"] == (
+        "action_space_clamp"
+    )
+
+
+def test_build_controller_action_space_allocates_trace_if_spawn_config_enables():
+    """Spawn config is authoritative if a helper-built consumer omitted the flag."""
+    mod = _load_runner_module()
+    consumer = mod._attach_episodic_consumer(
+        episodic_enabled=True,
+        is_episodic_rank=True,
+        world_size=2,
+        config={
+            "episodic_capacity": 16,
+            "episodic_span_length": 4,
+            "episodic_key_rep_dim": 8,
+        },
+        model_dim=8,
+        all_group=None,
+    )
+    assert consumer.controller_action_trace_log is None
+
+    action_space = mod._build_controller_action_space(
+        consumer=consumer,
+        config={"episodic_controller_action_space_enabled": True},
+    )
+
+    assert isinstance(action_space, mod.ConstrainedActionSpace)
+    assert consumer.controller_action_trace_log == []
+    assert action_space.trace_log is consumer.controller_action_trace_log
 
 
 def test_online_learning_bridge_updates_scoring_runtime_after_sgd():

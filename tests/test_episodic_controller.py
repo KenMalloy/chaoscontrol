@@ -49,6 +49,7 @@ import time
 import pytest
 import torch
 
+from chaoscontrol.episodic.learned_action_space import ConstrainedActionSpace
 from chaoscontrol.episodic.controller import (
     _build_simplex_inputs,
     _choose_simplex_vertex,
@@ -469,6 +470,148 @@ def test_controller_main_records_snapshot_to_action_history_recorder():
         tags[0]["controller_global_state"]
     )
     assert call["slot_state"] == pytest.approx(tags[0]["controller_slot_state"])
+
+
+def test_action_space_zero_readiness_is_controller_bit_identity():
+    """Supplying a dormant learned action space must not perturb V0 tags."""
+
+    class RuntimeStub:
+        def score_slot(self, features: torch.Tensor, *, slot: int) -> torch.Tensor:
+            return torch.tensor({0: -50.0, 1: 50.0}[int(slot)])
+
+    cache = _make_cache(capacity=2, key_rep_dim=4)
+    _populate_cache(
+        cache,
+        key_reps=[
+            torch.tensor([1.0, 0.0, 0.0, 0.0]),
+            torch.tensor([1.0, 0.0, 0.0, 0.0]),
+        ],
+        utilities=[0.9, 0.8],
+    )
+    candidate = {
+        "step": 12,
+        "rank": 0,
+        "k": 0,
+        "pressure": 0.25,
+        "residual": torch.tensor([1.0, 0.0, 0.0, 0.0]),
+    }
+    runtime = RuntimeStub()
+    baseline_tags: list[dict] = []
+    gated_tags: list[dict] = []
+    run_controller_cycle(
+        controller_query_queue=[dict(candidate)],
+        tagged_replay_queue=baseline_tags,
+        cache=cache,
+        k=2,
+        score_mode="cosine_utility_weighted",
+        selected_at=77,
+        controller_runtime=runtime,
+    )
+    run_controller_cycle(
+        controller_query_queue=[dict(candidate)],
+        tagged_replay_queue=gated_tags,
+        cache=cache,
+        k=2,
+        score_mode="cosine_utility_weighted",
+        selected_at=77,
+        controller_runtime=runtime,
+        action_space=ConstrainedActionSpace(
+            selection_readiness=0.0,
+            selection_max_delta=100.0,
+        ),
+    )
+
+    assert gated_tags == baseline_tags
+
+
+def test_action_space_can_rerank_inside_fixed_v0_query_budget():
+    """A ready learned head may change ranking, but only as a bounded delta."""
+
+    class RuntimeStub:
+        def score_slot(self, features: torch.Tensor, *, slot: int) -> torch.Tensor:
+            return torch.tensor({0: -20.0, 1: -20.0, 2: 20.0}[int(slot)])
+
+    cache = _make_cache(capacity=3, key_rep_dim=4)
+    _populate_cache(
+        cache,
+        key_reps=[
+            torch.tensor([1.0, 0.0, 0.0, 0.0]),
+            torch.tensor([1.0, 0.0, 0.0, 0.0]),
+            torch.tensor([1.0, 0.0, 0.0, 0.0]),
+        ],
+        utilities=[0.9, 0.8, 0.7],
+    )
+    trace: list[dict] = []
+    tags: list[dict] = []
+    run_controller_cycle(
+        controller_query_queue=[{
+            "step": 21,
+            "rank": 0,
+            "k": 0,
+            "pressure": 0.25,
+            "residual": torch.tensor([1.0, 0.0, 0.0, 0.0]),
+        }],
+        tagged_replay_queue=tags,
+        cache=cache,
+        k=3,
+        score_mode="cosine_utility_weighted",
+        selected_at=88,
+        controller_runtime=RuntimeStub(),
+        action_space=ConstrainedActionSpace(
+            selection_readiness=1.0,
+            selection_max_delta=1.0,
+            trace_log=trace,
+        ),
+    )
+
+    assert [tag["slot"] for tag in tags] == [2, 0, 1]
+    assert tags[0]["selected_rank"] == 0
+    assert tags[0]["heuristic_rank"] == 2
+    assert tags[0]["teacher_score"] == pytest.approx(0.7)
+    assert tags[0]["action_space_score"] > tags[1]["action_space_score"]
+    assert len(trace) == 1
+    assert trace[0]["event_type"] == "action_space_delta"
+    assert trace[0]["head_name"] == "selection_rank"
+
+
+def test_action_space_budget_clamp_limits_v0_tags_and_logs():
+    cache = _make_cache(capacity=3, key_rep_dim=4)
+    _populate_cache(
+        cache,
+        key_reps=[
+            torch.tensor([1.0, 0.0, 0.0, 0.0]),
+            torch.tensor([1.0, 0.0, 0.0, 0.0]),
+            torch.tensor([1.0, 0.0, 0.0, 0.0]),
+        ],
+        utilities=[0.9, 0.8, 0.7],
+    )
+    trace: list[dict] = []
+    tags: list[dict] = []
+    run_controller_cycle(
+        controller_query_queue=[{
+            "step": 22,
+            "rank": 0,
+            "k": 0,
+            "pressure": 0.25,
+            "residual": torch.tensor([1.0, 0.0, 0.0, 0.0]),
+        }],
+        tagged_replay_queue=tags,
+        cache=cache,
+        k=3,
+        score_mode="cosine_utility_weighted",
+        selected_at=89,
+        action_space=ConstrainedActionSpace(
+            max_tags_per_query=1,
+            trace_log=trace,
+        ),
+    )
+
+    assert len(tags) == 1
+    assert tags[0]["slot"] == 0
+    assert tags[0]["heuristic_rank"] == 0
+    assert trace[0]["event_type"] == "action_space_clamp"
+    assert trace[0]["raw_action"] == 3
+    assert trace[0]["bounded_action"] == 1
 
 
 def test_controller_thread_starts_and_stops_cleanly():

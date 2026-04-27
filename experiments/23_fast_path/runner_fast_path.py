@@ -67,6 +67,9 @@ from chaoscontrol.distributed import (  # noqa: E402
     should_stop_now,
 )
 from chaoscontrol.episodic.controller import controller_main  # noqa: E402
+from chaoscontrol.episodic.learned_action_space import (  # noqa: E402
+    ConstrainedActionSpace,
+)
 from chaoscontrol.episodic.query import query_topk  # noqa: E402
 from chaoscontrol.episodic.gpu_slot import (  # noqa: E402
     make_slot_tensor,
@@ -1714,6 +1717,7 @@ class _EpisodicConsumerState:
         "compute_replay_ce_pair",
         "pending_post_step_replays",
         "online_learning_bridge",
+        "controller_action_trace_log",
     )
 
     def __init__(
@@ -1725,6 +1729,7 @@ class _EpisodicConsumerState:
         tagged_replay_queue: list[dict[str, Any]] | None = None,
         episodic_event_log_enabled: bool = False,
         compute_replay_ce_pair: bool = False,
+        controller_action_space_enabled: bool = False,
     ) -> None:
         self.cache = cache
         self.heartbeat = heartbeat
@@ -1789,6 +1794,12 @@ class _EpisodicConsumerState:
             [] if self.compute_replay_ce_pair else None
         )
         self.online_learning_bridge = None
+        # Learned action-space heads are opt-in. When disabled, do not
+        # allocate even an empty trace list so the default controller path
+        # remains allocation-identical to the pre-gate runner.
+        self.controller_action_trace_log: list[dict[str, Any]] | None = (
+            [] if controller_action_space_enabled else None
+        )
 
 
 def _attach_episodic_consumer(
@@ -1858,6 +1869,9 @@ def _attach_episodic_consumer(
         ),
         compute_replay_ce_pair=bool(
             config.get("episodic_compute_replay_ce_pair", False)
+        ),
+        controller_action_space_enabled=bool(
+            config.get("episodic_controller_action_space_enabled", False)
         ),
     )
 
@@ -2667,6 +2681,40 @@ def _wire_online_learning_bridge(
     return bridge, bridge
 
 
+def _build_controller_action_space(
+    *,
+    consumer: _EpisodicConsumerState,
+    config: dict[str, Any],
+) -> ConstrainedActionSpace | None:
+    """Build the optional constrained action-space gate for the controller.
+
+    Disabled means ``None``: no object allocation on the controller hot path and
+    no trace list on the consumer. Enabled means learned controller logits are
+    interpreted as bounded residuals over the heuristic ranker; readiness=0 is
+    an explicit traceable-but-dormant stage.
+    """
+    if not bool(config.get("episodic_controller_action_space_enabled", False)):
+        return None
+    max_tags = config.get("episodic_controller_max_tags_per_query")
+    if consumer.controller_action_trace_log is None:
+        consumer.controller_action_trace_log = []
+    return ConstrainedActionSpace(
+        trace_only=bool(
+            config.get("episodic_controller_action_space_trace_only", False)
+        ),
+        selection_readiness=float(
+            config.get("episodic_controller_selection_readiness", 0.0)
+        ),
+        selection_max_delta=float(
+            config.get("episodic_controller_selection_max_delta", 0.0)
+        ),
+        max_tags_per_query=(
+            int(max_tags) if max_tags is not None else None
+        ),
+        trace_log=consumer.controller_action_trace_log,
+    )
+
+
 def _spawn_episodic_controller(
     *,
     consumer: _EpisodicConsumerState,
@@ -2734,6 +2782,10 @@ def _spawn_episodic_controller(
             config=config,
         )
     )
+    action_space = _build_controller_action_space(
+        consumer=consumer,
+        config=config,
+    )
 
     stop_event = threading.Event()
     # The controller thread has its OWN heartbeat (exposed via
@@ -2768,6 +2820,7 @@ def _spawn_episodic_controller(
             "action_recorder": action_recorder,
             "simplex_selection_mode": simplex_selection_mode,
             "simplex_generator": simplex_generator,
+            "action_space": action_space,
             "cycle_idle_sleep_s": idle_sleep_s,
             "heartbeat": controller_heartbeat,
         },
@@ -4189,6 +4242,11 @@ def train_fast_for_budget(
     episodic_controller_entropy_beta: float = 0.0,
     episodic_controller_simplex_trace_path: str = "",
     episodic_controller_history_entries: int = 64,
+    episodic_controller_action_space_enabled: bool = False,
+    episodic_controller_action_space_trace_only: bool = False,
+    episodic_controller_selection_readiness: float = 0.0,
+    episodic_controller_selection_max_delta: float = 0.0,
+    episodic_controller_max_tags_per_query: int | None = None,
     episodic_replay_max_replays_per_step: int = 0,
 ) -> dict[str, Any]:
     rank_ = int(rank)
@@ -4344,6 +4402,9 @@ def train_fast_for_budget(
         "episodic_compute_replay_ce_pair": bool(
             episodic_compute_replay_ce_pair
         ),
+        "episodic_controller_action_space_enabled": bool(
+            episodic_controller_action_space_enabled
+        ),
     }
     episodic_consumer = _attach_episodic_consumer(
         episodic_enabled=bool(episodic_enabled),
@@ -4404,6 +4465,23 @@ def train_fast_for_budget(
         ),
         "episodic_controller_history_entries": int(
             episodic_controller_history_entries
+        ),
+        "episodic_controller_action_space_enabled": bool(
+            episodic_controller_action_space_enabled
+        ),
+        "episodic_controller_action_space_trace_only": bool(
+            episodic_controller_action_space_trace_only
+        ),
+        "episodic_controller_selection_readiness": float(
+            episodic_controller_selection_readiness
+        ),
+        "episodic_controller_selection_max_delta": float(
+            episodic_controller_selection_max_delta
+        ),
+        "episodic_controller_max_tags_per_query": (
+            int(episodic_controller_max_tags_per_query)
+            if episodic_controller_max_tags_per_query is not None
+            else None
         ),
     }
     if (
@@ -5882,6 +5960,23 @@ def run_condition(
         ),
         episodic_controller_history_entries=int(
             config.get("episodic_controller_history_entries", 64)
+        ),
+        episodic_controller_action_space_enabled=bool(
+            config.get("episodic_controller_action_space_enabled", False)
+        ),
+        episodic_controller_action_space_trace_only=bool(
+            config.get("episodic_controller_action_space_trace_only", False)
+        ),
+        episodic_controller_selection_readiness=float(
+            config.get("episodic_controller_selection_readiness", 0.0)
+        ),
+        episodic_controller_selection_max_delta=float(
+            config.get("episodic_controller_selection_max_delta", 0.0)
+        ),
+        episodic_controller_max_tags_per_query=(
+            int(config["episodic_controller_max_tags_per_query"])
+            if config.get("episodic_controller_max_tags_per_query") is not None
+            else None
         ),
         episodic_replay_max_replays_per_step=int(
             config.get("episodic_replay_max_replays_per_step", 0)
