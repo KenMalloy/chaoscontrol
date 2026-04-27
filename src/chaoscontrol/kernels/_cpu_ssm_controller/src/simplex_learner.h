@@ -43,6 +43,16 @@ struct SimplexLearnerTelemetry {
   float last_lambda_hxh = 0.0f;
   float last_entropy = 0.0f;
   float last_entropy_bonus_weight = 0.0f;
+  // Per-event SGD diagnostics. Populated by simplex_backward;
+  // consumed by emit_simplex_trace_row. The aim is to surface whether
+  // each replay credit produces a nonzero gradient and whether
+  // accumulated gradient over a batch is large enough to actually move
+  // weights once apply_sgd fires. NaN-equivalent (0.0) on decision /
+  // skip-without-backward rows; populated on credit / skip-with-fwd.
+  float last_grad_logits_l2 = 0.0f;
+  float last_grad_w_lh_l2 = 0.0f;
+  float last_grad_w_lh_accum_l2 = 0.0f;
+  float last_w_lh_l2 = 0.0f;
 };
 
 // V1 online learner: REINFORCE over the simplex policy. Keeps fast / slow /

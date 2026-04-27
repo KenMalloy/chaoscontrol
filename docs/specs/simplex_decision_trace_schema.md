@@ -47,6 +47,10 @@ Required columns:
 | `actions_since_sgd` | `UINTEGER` | Credit/entropy-only actions accumulated toward the next SGD application. |
 | `gerber_accepted_actions` | `UBIGINT` | Cumulative accepted Gerber-gated reward credits before this row. |
 | `gerber_rejected_actions` | `UBIGINT` | Cumulative Gerber-zero events before this row; includes entropy-only updates when `entropy_beta > 0`. |
+| `grad_logits_l2` | `FLOAT` | L2 norm of `g_logits` (immediate REINFORCE gradient on the simplex logits) for this event. NaN on decision and skip-without-fwd rows. Use to verify per-event gradient signal magnitude. |
+| `grad_w_lh_l2` | `FLOAT` | L2 norm of this event's contribution to `dL/dW_lh` (the head onto policy logits). NaN on decision and skip-without-fwd rows. |
+| `grad_w_lh_accum_l2` | `FLOAT` | L2 norm of `grad_weights_.W_lh` (the accumulator across the in-progress SGD batch) AFTER this event's contribution. Resets to ~0 after each `apply_sgd`. NaN on decision and skip-without-fwd rows. Use to verify accumulated gradient over a batch is large enough to actually move weights — the load-bearing diagnostic for the 2026-04-27 v2 "online entropy doesn't move" finding. |
+| `w_lh_l2` | `FLOAT` | L2 norm of `fast_weights_.W_lh` (the current head weights). NaN on decision and skip-without-fwd rows. Use to verify cumulative weight drift over a run. |
 | `teacher_score` | `FLOAT` | Heuristic score for the chosen slot, usually cosine times utility. |
 | `controller_logit` | `FLOAT` | Controller logit for the chosen vertex. |
 | `ce_before_replay` | `FLOAT` | Replay CE before the optimizer step; NaN on decision-only rows. |

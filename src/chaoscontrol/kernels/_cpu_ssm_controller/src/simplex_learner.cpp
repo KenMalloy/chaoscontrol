@@ -687,6 +687,18 @@ void SimplexOnlineLearner::emit_simplex_trace_row(
   line << ",\"actions_since_sgd\":" << actions_since_sgd_;
   line << ",\"gerber_accepted_actions\":" << telemetry_.gerber_accepted_actions;
   line << ",\"gerber_rejected_actions\":" << telemetry_.gerber_rejected_actions;
+  // SGD diagnostics — populated only when this event ran simplex_backward
+  // (credit rows and skip-with-fwd rows). NaN/null on decision rows since
+  // backward hasn't run yet.
+  const float nan_v = std::numeric_limits<float>::quiet_NaN();
+  line << ",\"grad_logits_l2\":";
+  json_float(line, fwd != nullptr ? telemetry_.last_grad_logits_l2 : nan_v);
+  line << ",\"grad_w_lh_l2\":";
+  json_float(line, fwd != nullptr ? telemetry_.last_grad_w_lh_l2 : nan_v);
+  line << ",\"grad_w_lh_accum_l2\":";
+  json_float(line, fwd != nullptr ? telemetry_.last_grad_w_lh_accum_l2 : nan_v);
+  line << ",\"w_lh_l2\":";
+  json_float(line, fwd != nullptr ? telemetry_.last_w_lh_l2 : nan_v);
   line << ",\"ce_before_replay\":";
   json_float(line, ce_before);
   line << ",\"ce_after_replay\":";
@@ -1095,6 +1107,18 @@ void SimplexOnlineLearner::simplex_backward(
           .squeeze(0);                                  // [H]
   at::Tensor W_lh_acc = view_1d(grad_weights_.W_lh, H);
   W_lh_acc.add_(g_W_lh);
+
+  // SGD diagnostic snapshot, taken at the W_lh layer because that's the
+  // direct head onto the policy logits — moves there map 1:1 to changes
+  // in p[i]. Capture: this event's logits-gradient magnitude, this
+  // event's contribution to W_lh's gradient, the accumulated W_lh
+  // gradient up to and including this event (resets after apply_sgd),
+  // and the current W_lh L2 (so we can see drift over the run).
+  telemetry_.last_grad_logits_l2 = g_logits.norm().item<float>();
+  telemetry_.last_grad_w_lh_l2 = g_W_lh.norm().item<float>();
+  telemetry_.last_grad_w_lh_accum_l2 = W_lh_acc.norm().item<float>();
+  telemetry_.last_w_lh_l2 =
+      view_1d(fast_weights_.W_lh, H).norm().item<float>();
 
   // dL/db_lh = sum_i g_logits[i]
   grad_weights_.b_lh += g_logits.sum().item<float>();

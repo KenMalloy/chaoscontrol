@@ -49,3 +49,7 @@ package-lock.json
 # experiments/25_controller_pretrain/pretrain_controller.py with a
 # fixed seed; no point versioning the binary.
 *.cswg
+
+# Async communication folder for Ken-and-Claude when one is at work and
+# the other is iterating. Convention is in dispatch/README.md.
+/dispatch/

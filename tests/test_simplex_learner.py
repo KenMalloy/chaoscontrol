@@ -818,6 +818,10 @@ def test_simplex_trace_writes_decision_and_credit_rows_async(tmp_path):
         "actions_since_sgd",
         "gerber_accepted_actions",
         "gerber_rejected_actions",
+        "grad_logits_l2",
+        "grad_w_lh_l2",
+        "grad_w_lh_accum_l2",
+        "w_lh_l2",
         "ce_before_replay",
         "ce_after_replay",
         "ce_delta_raw",
@@ -887,6 +891,19 @@ def test_simplex_trace_writes_decision_and_credit_rows_async(tmp_path):
     assert isinstance(credit["current_entropy"], (int, float))
     assert math.isfinite(float(credit["current_entropy"]))
     assert 0.0 <= float(credit["current_entropy"]) <= math.log(N) + 1e-5
+    # SGD diagnostics (added 2026-04-27 in response to v2 'policy
+    # doesn't move' finding). Decision rows: NaN/null because backward
+    # hasn't run. Credit rows: all four norms are non-negative finite.
+    for fname in ("grad_logits_l2", "grad_w_lh_l2", "grad_w_lh_accum_l2", "w_lh_l2"):
+        assert decision[fname] is None, f"decision {fname!r} should be null"
+        assert isinstance(credit[fname], (int, float)), fname
+        assert math.isfinite(float(credit[fname])), fname
+        assert float(credit[fname]) >= 0.0, fname
+    # The accumulated W_lh-grad after one credit must be at least the
+    # per-event W_lh-grad (this credit was the only contribution to the
+    # accumulator since the last apply_sgd, so they should match).
+    assert float(credit["grad_w_lh_accum_l2"]) == pytest.approx(
+        float(credit["grad_w_lh_l2"]), rel=1e-5)
     # gerber_weight in [0, 1]
     assert 0.0 <= float(credit["gerber_weight"]) <= 1.0 + 1e-6
     # p_chosen in (0, 1]
