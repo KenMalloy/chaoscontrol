@@ -2200,10 +2200,15 @@ def _emit_write_events_cuda_stream(
         if pressure_full is not None
         else empty_pressure
     )
+    # The CUDA pack kernel requires int64 token tensors (TORCH_CHECK in
+    # write_event_pack.cu). The trunk passes int32 in production; cast
+    # here to match the legacy CPU path (`_emit_episodic_payloads_gpu`
+    # converts to int64 at line ~2319). `.to(dtype=...)` is a no-op when
+    # the tensor is already int64.
     _ext.pack_write_events_cuda_(
         publisher.gpu_slot(slot),
-        inputs.contiguous(),
-        targets.contiguous(),
+        inputs.to(dtype=torch.int64).contiguous(),
+        targets.to(dtype=torch.int64).contiguous(),
         hidden.contiguous(),
         pressure_arg,
         ce_full.contiguous(),
