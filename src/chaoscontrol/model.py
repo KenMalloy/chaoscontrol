@@ -17,6 +17,7 @@ import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint as _checkpoint
 
 from chaoscontrol.core import RMSNorm, FeedForward, ChaosSSMCore
+from chaoscontrol.controller_distillation import ControllerMLP, gate_from_logits
 from chaoscontrol.local_attn import LocalAttention, RollingKVCache
 from chaoscontrol.routing import RichBNN, DistributedB
 from chaoscontrol.memory import OuterModel, MultiSlotOuterModel, SemanticTier, BucketPrototypes
@@ -622,6 +623,8 @@ class ChaosStudentLM(nn.Module):
         local_attn_topk_random: bool = False,
         depth_recurrence_shared_layers: list[int] | None = None,
         depth_recurrence_count: int = 1,
+        enable_controller: bool = False,
+        controller_hidden_dim: int | None = None,
         activation_checkpoint: bool = False,
     ) -> None:
         super().__init__()
@@ -630,6 +633,12 @@ class ChaosStudentLM(nn.Module):
         self.activation_checkpoint = bool(activation_checkpoint)
         self.local_attn_window = local_attn_window
         self.embed = nn.Embedding(vocab_size, dim)
+        self.enable_controller = bool(enable_controller)
+        self.memory_controller: ControllerMLP | None = (
+            ControllerMLP(dim, hidden_dim=controller_hidden_dim)
+            if self.enable_controller
+            else None
+        )
 
         # Typed KV buffer config
         self.buffer_mode = buffer_mode
@@ -995,9 +1004,14 @@ class ChaosStudentLM(nn.Module):
         self,
         input_ids: torch.Tensor,
         *,
+        memory_mode: str = "controller",
+        cache_read_cutoff: int | None = None,
+        teacher_gate: torch.Tensor | None = None,
+        return_controller_logits: bool = False,
+        return_memory_meta: bool = False,
         initial_states: list[torch.Tensor] | None = None,
         return_final_states: bool = False,
-    ) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
+    ) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]] | dict[str, Any]:
         """Run every pre-LM-head computation and return the hidden state.
 
         Mirrors the encoder portion of ``forward()`` — embed → wernicke →
@@ -1018,11 +1032,26 @@ class ChaosStudentLM(nn.Module):
         ``train_ssm`` supports — produces none of those. Configs that
         need them must continue to use ``forward()`` + ``training.py``.
 
+        ``memory_mode`` controls the memory read/injection point for CRCT:
+        ``"off"`` disables memory reads; ``"force_on"`` uses the historical
+        full-strength read; ``"controller"`` lets the optional controller MLP
+        gate the memory bias; ``"teacher_gate"`` uses an externally supplied
+        gate.  With ``enable_controller=False`` the default ``"controller"``
+        path is intentionally bit-identical to the old full-strength memory
+        path.
+
         Side effects: none. Unlike ``forward()`` this path never
         performs memory writes (those live in ``forward()`` after
         ``lm_head`` and only fire when ``memory_write_mode='append_only'``,
         which is unused by the bare-SSM submission regime).
         """
+        if memory_mode not in {"off", "force_on", "controller", "teacher_gate"}:
+            raise ValueError(
+                "memory_mode must be one of 'off', 'force_on', 'controller', "
+                f"or 'teacher_gate', got {memory_mode!r}"
+            )
+        if memory_mode == "teacher_gate" and teacher_gate is None:
+            raise ValueError("memory_mode='teacher_gate' requires teacher_gate")
         if initial_states is not None:
             if len(initial_states) != len(self.layers):
                 raise ValueError(
@@ -1030,6 +1059,49 @@ class ChaosStudentLM(nn.Module):
                     f"num_layers {len(self.layers)}"
                 )
         x = self.embed(input_ids)
+        controller_logits: torch.Tensor | None = None
+        memory_gate: torch.Tensor | None = None
+
+        def _expanded_gate(reference: torch.Tensor) -> torch.Tensor | None:
+            nonlocal controller_logits, memory_gate
+            if memory_mode == "off":
+                return None
+            if memory_gate is None:
+                if memory_mode == "teacher_gate":
+                    assert teacher_gate is not None
+                    gate = teacher_gate.to(device=reference.device, dtype=reference.dtype)
+                elif memory_mode == "controller" and self.memory_controller is not None:
+                    controller_logits = self.memory_controller(reference)
+                    gate = gate_from_logits(controller_logits).to(dtype=reference.dtype)
+                else:
+                    gate = torch.ones(
+                        reference.shape[:2],
+                        device=reference.device,
+                        dtype=reference.dtype,
+                    )
+                if gate.dim() == 1:
+                    gate = gate[:, None].expand(reference.shape[0], reference.shape[1])
+                elif gate.dim() == 2:
+                    if gate.shape[1] == 1 and reference.shape[1] != 1:
+                        gate = gate.expand(reference.shape[0], reference.shape[1])
+                    elif gate.shape != reference.shape[:2]:
+                        raise ValueError(
+                            f"teacher_gate shape {tuple(gate.shape)} cannot gate "
+                            f"hidden shape {tuple(reference.shape[:2])}"
+                        )
+                else:
+                    raise ValueError(
+                        "teacher_gate/controller gate must have shape (B,), "
+                        "(B, 1), or (B, T)"
+                    )
+                memory_gate = gate
+            return memory_gate.unsqueeze(-1).to(dtype=reference.dtype)
+
+        def _add_memory_bias(reference: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
+            gate = _expanded_gate(reference)
+            if gate is None:
+                return reference
+            return reference + bias.to(device=reference.device, dtype=reference.dtype) * gate
 
         # Wernicke layer: compose bytes into typed units before SSM recurrence
         bucket_ids = None
@@ -1039,7 +1111,11 @@ class ChaosStudentLM(nn.Module):
         # Buffer read path (mirrors forward() body 1-for-1 for the configs
         # that wire an outer_model). For bare-SSM both branches are skipped
         # because ``self.outer_model`` is None.
-        if self.outer_model is not None and self.buffer_mode == "append_only":
+        if (
+            memory_mode != "off"
+            and self.outer_model is not None
+            and self.buffer_mode == "append_only"
+        ):
             batch = x.size(0)
             model_dim = x.size(2)
             if isinstance(self.outer_model, MultiSlotOuterModel) and self.outer_model._slots:
@@ -1060,7 +1136,7 @@ class ChaosStudentLM(nn.Module):
                         mode=self.retrieval_mode, k=self.retrieval_k, cue=cue,
                     )
                     outer_read[mask] = read.unsqueeze(1).to(dtype=x.dtype)
-                x = x + outer_read
+                x = _add_memory_bias(x, outer_read)
 
             if self.bucket_prototypes_module is not None and bucket_ids is not None:
                 per_sample_buckets = bucket_ids.mode(dim=1).values
@@ -1069,19 +1145,19 @@ class ChaosStudentLM(nn.Module):
                     mask = per_sample_buckets == b_id
                     proto = self.bucket_prototypes_module.read(int(mask.sum()), int(b_id.item()))
                     proto_bias[mask] = proto.unsqueeze(1).to(dtype=x.dtype)
-                x = x + proto_bias
+                x = _add_memory_bias(x, proto_bias)
 
-        elif self.outer_model is not None:
+        elif memory_mode != "off" and self.outer_model is not None:
             if isinstance(self.outer_model, MultiSlotOuterModel):
                 cue = x.detach().mean(dim=1) if self.cue_projection else None
                 outer_read = self.outer_model.read(x.size(0), cue=cue)
             else:
                 outer_read = self.outer_model.read(x.size(0))
-            x = x + outer_read.unsqueeze(1).to(dtype=x.dtype)
+            x = _add_memory_bias(x, outer_read.unsqueeze(1))
 
-        if self.semantic_tier is not None:
+        if memory_mode != "off" and self.semantic_tier is not None:
             semantic_bias = self.semantic_tier.read(x.size(0))
-            x = x + semantic_bias.unsqueeze(1).to(dtype=x.dtype)
+            x = _add_memory_bias(x, semantic_bias.unsqueeze(1))
 
         # Virtual-layer loop — weight-tied depth recurrence when configured;
         # otherwise list(range(num_layers)). Matches forward() exactly.
@@ -1125,21 +1201,21 @@ class ChaosStudentLM(nn.Module):
 
         # Posterior correction bias — bare-SSM path has self.posterior is None
         # so the block is skipped.
-        if self.posterior is not None:
+        if memory_mode != "off" and self.posterior is not None:
             if isinstance(self.posterior, GlobalDelta):
                 posterior_bias = self.posterior.read(x.size(0))
-                x = x + posterior_bias.unsqueeze(1)
+                x = _add_memory_bias(x, posterior_bias.unsqueeze(1))
             elif isinstance(self.posterior, BucketDelta) and bucket_ids is not None:
                 per_sample_buckets = bucket_ids.mode(dim=1).values
                 posterior_bias = torch.cat([
                     self.posterior.read(bucket_id=int(per_sample_buckets[i].item()), batch_size=1)
                     for i in range(x.size(0))
                 ], dim=0)
-                x = x + posterior_bias.unsqueeze(1)
+                x = _add_memory_bias(x, posterior_bias.unsqueeze(1))
             elif isinstance(self.posterior, ResidualCache):
                 query = x.detach().mean(dim=1)
                 posterior_bias = self.posterior.read(query)
-                x = x + posterior_bias.unsqueeze(1)
+                x = _add_memory_bias(x, posterior_bias.unsqueeze(1))
 
         if return_final_states:
             assert final_states is not None
@@ -1147,7 +1223,29 @@ class ChaosStudentLM(nn.Module):
                 "final_states has unvisited slots — virtual layer indices did not "
                 "cover every physical layer"
             )
+            if return_controller_logits or return_memory_meta:
+                out: dict[str, Any] = {"hidden": x, "final_states": final_states}
+                if return_controller_logits:
+                    out["controller_logits"] = controller_logits
+                if return_memory_meta:
+                    out["memory_meta"] = {
+                        "memory_mode": memory_mode,
+                        "cache_read_cutoff": cache_read_cutoff,
+                        "memory_gate": memory_gate,
+                    }
+                return out
             return x, final_states
+        if return_controller_logits or return_memory_meta:
+            out = {"hidden": x}
+            if return_controller_logits:
+                out["controller_logits"] = controller_logits
+            if return_memory_meta:
+                out["memory_meta"] = {
+                    "memory_mode": memory_mode,
+                    "cache_read_cutoff": cache_read_cutoff,
+                    "memory_gate": memory_gate,
+                }
+            return out
         return x
 
     def forward(
