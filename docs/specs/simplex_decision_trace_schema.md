@@ -52,6 +52,17 @@ Required columns:
 | `grad_w_lh_accum_l2` | `FLOAT` | L2 norm of `grad_weights_.W_lh` (the accumulator across the in-progress SGD batch) AFTER this event's contribution. Resets to ~0 after each `apply_sgd`. NaN on decision and skip-without-fwd rows. Use to verify accumulated gradient over a batch is large enough to actually move weights — the load-bearing diagnostic for the 2026-04-27 v2 "online entropy doesn't move" finding. |
 | `w_lh_l2` | `FLOAT` | L2 norm of `fast_weights_.W_lh` (the current head weights). NaN on decision and skip-without-fwd rows. Use to verify cumulative weight drift over a run. |
 | `teacher_score` | `FLOAT` | Heuristic score for the chosen slot, usually cosine times utility. |
+| `chosen_score` | `FLOAT` | Heuristic candidate score at `chosen_idx`. Answers whether the learned/sample policy picked a high-utility candidate on the same simplex. |
+| `chosen_score_gap_to_heuristic` | `FLOAT` | `heuristic_top_score - chosen_score`. Zero means the controller picked the heuristic top candidate; positive means it explored away from the heuristic. |
+| `chosen_heuristic_rank` | `BIGINT` | Rank of the chosen candidate by heuristic score, where 0 is best. `-1` when candidate scores are absent. |
+| `heuristic_top_idx` | `BIGINT` | Candidate index that the legacy heuristic would choose from this exact candidate set. |
+| `heuristic_top_slot_id` | `UBIGINT` | Slot id at `heuristic_top_idx`; 0 only meaningful when `heuristic_top_idx >= 0`. |
+| `heuristic_top_score` | `FLOAT` | Best heuristic score among the valid candidates. |
+| `candidate_score_mean` | `FLOAT` | Mean heuristic score across valid candidates. |
+| `candidate_score_stddev` | `FLOAT` | Standard deviation of heuristic scores across valid candidates. Low values mean the query simplex was nearly indifferent. |
+| `candidate_score_margin` | `FLOAT` | Difference between the top two heuristic candidate scores. Small margin means choosing away from the top candidate is less informative. |
+| `p_heuristic_top` | `FLOAT` | Behavior-policy probability assigned to the heuristic-top candidate at decision time. |
+| `p_current_heuristic_top` | `FLOAT` | Current-policy probability assigned to the heuristic-top candidate at replay attribution time; NaN on decision rows. |
 | `controller_logit` | `FLOAT` | Controller logit for the chosen vertex. |
 | `ce_before_replay` | `FLOAT` | Replay CE before the optimizer step; NaN on decision-only rows. |
 | `ce_after_replay` | `FLOAT` | Replay CE after the replay forward/step; NaN on decision-only rows. |

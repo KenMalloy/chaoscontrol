@@ -300,6 +300,105 @@ void json_u64_vector(
   line << ']';
 }
 
+struct CandidateTraceStats {
+  int64_t heuristic_top_idx = -1;
+  uint64_t heuristic_top_slot_id = 0;
+  float heuristic_top_score = std::numeric_limits<float>::quiet_NaN();
+  float chosen_score = std::numeric_limits<float>::quiet_NaN();
+  float chosen_score_gap_to_heuristic =
+      std::numeric_limits<float>::quiet_NaN();
+  int64_t chosen_heuristic_rank = -1;
+  float candidate_score_mean = std::numeric_limits<float>::quiet_NaN();
+  float candidate_score_stddev = std::numeric_limits<float>::quiet_NaN();
+  float candidate_score_margin = std::numeric_limits<float>::quiet_NaN();
+  float p_heuristic_top = std::numeric_limits<float>::quiet_NaN();
+  float p_current_heuristic_top = std::numeric_limits<float>::quiet_NaN();
+};
+
+CandidateTraceStats candidate_trace_stats(
+    const ActionHistoryEntry* entry,
+    const SimplexForwardOutput* fwd,
+    uint32_t valid_n) {
+  CandidateTraceStats stats;
+  if (entry == nullptr || entry->candidate_scores.empty() || valid_n == 0) {
+    return stats;
+  }
+
+  const std::size_t limit = std::min<std::size_t>(
+      entry->candidate_scores.size(), static_cast<std::size_t>(valid_n));
+  float sum = 0.0f;
+  float sum_sq = 0.0f;
+  uint32_t count = 0;
+  float best = -std::numeric_limits<float>::infinity();
+  float second = -std::numeric_limits<float>::infinity();
+
+  for (std::size_t i = 0; i < limit; ++i) {
+    const float score = entry->candidate_scores[i];
+    if (!std::isfinite(score)) {
+      continue;
+    }
+    sum += score;
+    sum_sq += score * score;
+    ++count;
+    if (score > best) {
+      second = best;
+      best = score;
+      stats.heuristic_top_idx = static_cast<int64_t>(i);
+    } else if (score > second) {
+      second = score;
+    }
+  }
+
+  if (count == 0 || stats.heuristic_top_idx < 0) {
+    return stats;
+  }
+
+  stats.heuristic_top_score = best;
+  if (
+      static_cast<std::size_t>(stats.heuristic_top_idx) <
+      entry->candidate_slot_ids.size()) {
+    stats.heuristic_top_slot_id =
+        entry->candidate_slot_ids[static_cast<std::size_t>(stats.heuristic_top_idx)];
+  }
+  stats.candidate_score_mean = sum / static_cast<float>(count);
+  const float variance =
+      std::max(0.0f, sum_sq / static_cast<float>(count) -
+                         stats.candidate_score_mean * stats.candidate_score_mean);
+  stats.candidate_score_stddev = std::sqrt(variance);
+  if (count >= 2 && std::isfinite(second)) {
+    stats.candidate_score_margin = best - second;
+  }
+
+  const std::size_t chosen = static_cast<std::size_t>(entry->chosen_idx);
+  if (chosen < limit && std::isfinite(entry->candidate_scores[chosen])) {
+    stats.chosen_score = entry->candidate_scores[chosen];
+    stats.chosen_score_gap_to_heuristic = best - stats.chosen_score;
+    int64_t rank = 0;
+    for (std::size_t i = 0; i < limit; ++i) {
+      const float score = entry->candidate_scores[i];
+      if (std::isfinite(score) && score > stats.chosen_score) {
+        ++rank;
+      }
+    }
+    stats.chosen_heuristic_rank = rank;
+  }
+
+  const std::size_t top = static_cast<std::size_t>(stats.heuristic_top_idx);
+  if (top < entry->p_behavior.size() && std::isfinite(entry->p_behavior[top])) {
+    stats.p_heuristic_top = entry->p_behavior[top];
+  }
+  if (fwd != nullptr && top < static_cast<std::size_t>(valid_n)) {
+    float current_mass = 0.0f;
+    for (uint32_t i = 0; i < valid_n; ++i) {
+      current_mass += fwd->p[i];
+    }
+    if (std::isfinite(current_mass) && current_mass > 0.0f) {
+      stats.p_current_heuristic_top = fwd->p[top] / current_mass;
+    }
+  }
+  return stats;
+}
+
 }  // namespace
 
 class AsyncNdjsonTraceWriter {
@@ -603,6 +702,9 @@ void SimplexOnlineLearner::emit_simplex_trace_row(
 
   const uint32_t n_actual =
       entry != nullptr && entry->n_actual > 0 ? entry->n_actual : fast_weights_.N;
+  const uint32_t valid_n = std::min<uint32_t>(n_actual, fast_weights_.N);
+  const CandidateTraceStats candidate_stats =
+      candidate_trace_stats(entry, fwd, valid_n);
   const uint32_t chosen_idx = entry != nullptr ? entry->chosen_idx : 0;
   const float p_behavior_chosen =
       entry != nullptr ? entry->p_chosen_decision : std::numeric_limits<float>::quiet_NaN();
@@ -666,6 +768,26 @@ void SimplexOnlineLearner::emit_simplex_trace_row(
   line << ",\"chosen_idx\":" << chosen_idx;
   line << ",\"teacher_score\":";
   json_float(line, teacher_score);
+  line << ",\"chosen_score\":";
+  json_float(line, candidate_stats.chosen_score);
+  line << ",\"chosen_score_gap_to_heuristic\":";
+  json_float(line, candidate_stats.chosen_score_gap_to_heuristic);
+  line << ",\"chosen_heuristic_rank\":" << candidate_stats.chosen_heuristic_rank;
+  line << ",\"heuristic_top_idx\":" << candidate_stats.heuristic_top_idx;
+  line << ",\"heuristic_top_slot_id\":"
+       << candidate_stats.heuristic_top_slot_id;
+  line << ",\"heuristic_top_score\":";
+  json_float(line, candidate_stats.heuristic_top_score);
+  line << ",\"candidate_score_mean\":";
+  json_float(line, candidate_stats.candidate_score_mean);
+  line << ",\"candidate_score_stddev\":";
+  json_float(line, candidate_stats.candidate_score_stddev);
+  line << ",\"candidate_score_margin\":";
+  json_float(line, candidate_stats.candidate_score_margin);
+  line << ",\"p_heuristic_top\":";
+  json_float(line, candidate_stats.p_heuristic_top);
+  line << ",\"p_current_heuristic_top\":";
+  json_float(line, candidate_stats.p_current_heuristic_top);
   line << ",\"controller_logit\":";
   json_float(line, controller_logit);
   line << ",\"p_chosen\":";

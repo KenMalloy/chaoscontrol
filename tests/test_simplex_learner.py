@@ -805,6 +805,17 @@ def test_simplex_trace_writes_decision_and_credit_rows_async(tmp_path):
         "n_actual",
         "chosen_idx",
         "teacher_score",
+        "chosen_score",
+        "chosen_score_gap_to_heuristic",
+        "chosen_heuristic_rank",
+        "heuristic_top_idx",
+        "heuristic_top_slot_id",
+        "heuristic_top_score",
+        "candidate_score_mean",
+        "candidate_score_stddev",
+        "candidate_score_margin",
+        "p_heuristic_top",
+        "p_current_heuristic_top",
         "controller_logit",
         "p_chosen",
         "p_current_chosen",
@@ -859,6 +870,20 @@ def test_simplex_trace_writes_decision_and_credit_rows_async(tmp_path):
     assert decision["candidate_slot_ids"] == list(range(N))
     assert len(decision["p_behavior"]) == N
     assert len(decision["logits"]) == N
+    assert decision["heuristic_top_idx"] == N - 1
+    assert decision["heuristic_top_slot_id"] == N - 1
+    assert decision["heuristic_top_score"] == pytest.approx(0.1 * (N - 1))
+    assert decision["chosen_score"] == pytest.approx(0.1 * chosen)
+    assert decision["chosen_score_gap_to_heuristic"] == pytest.approx(
+        0.1 * (N - 1 - chosen)
+    )
+    assert decision["chosen_heuristic_rank"] == N - 1 - chosen
+    assert decision["candidate_score_mean"] == pytest.approx(
+        sum(0.1 * i for i in range(N)) / N
+    )
+    assert decision["candidate_score_margin"] == pytest.approx(0.1)
+    assert decision["p_heuristic_top"] == pytest.approx(float(fwd_before.p[N - 1]))
+    assert decision["p_current_heuristic_top"] is None
 
     assert credit["row_type"] == "credit"
     assert credit["status"] == "ok"
@@ -871,6 +896,10 @@ def test_simplex_trace_writes_decision_and_credit_rows_async(tmp_path):
     assert credit["actions_since_sgd"] == 1
     assert credit["gerber_accepted_actions"] == 1
     assert credit["gerber_rejected_actions"] == 0
+    assert credit["heuristic_top_idx"] == N - 1
+    assert credit["heuristic_top_score"] == pytest.approx(0.1 * (N - 1))
+    assert isinstance(credit["p_current_heuristic_top"], (int, float))
+    assert math.isfinite(float(credit["p_current_heuristic_top"]))
 
     # Float fields: must round-trip through float and stay finite on credit.
     for fname in (
