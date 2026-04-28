@@ -1586,6 +1586,418 @@ class _CrctAsyncTeacherTransport:
         return completed
 
 
+class _CrctMailboxTeacherTransport:
+    """Same-node drop mailbox for CRCT teacher labels.
+
+    The collective transport is correct but not a true sidecar: issuing a
+    PyTorch ``broadcast(async_op=True)`` can still block rank 0 if rank 3 is
+    busy inside oracle scoring. This mailbox trades a small score-interval D2H
+    copy for the property the CRCT headline matrix needs: train ranks never
+    rendezvous with the teacher. Phase 2 can swap the file-backed payloads for
+    POSIX shm/SPSC slots without changing the runner contract.
+    """
+
+    def __init__(
+        self,
+        *,
+        rank: int,
+        world_size: int,
+        mailbox_dir: str,
+        payload_shape: tuple[int, int, int],
+        full_ids_shape: tuple[int, int],
+        device: torch.device,
+        payload_dtype: torch.dtype,
+        max_local_batches: int,
+        max_payload_lag_steps: int,
+        score_interval_steps: int = 1,
+        coordinator_rank: int = 0,
+    ) -> None:
+        self.rank = int(rank)
+        self.world_size = int(world_size)
+        self.memory_rank = self.world_size - 1
+        self.coordinator_rank = int(coordinator_rank)
+        self.mailbox_dir = Path(mailbox_dir)
+        self.mailbox_dir.mkdir(parents=True, exist_ok=True)
+        self.payload_shape = tuple(int(x) for x in payload_shape)
+        self.full_ids_shape = tuple(int(x) for x in full_ids_shape)
+        self.device = device
+        self.payload_dtype = payload_dtype
+        self.max_local_batches = max(1, int(max_local_batches))
+        self.max_payload_lag_steps = max(0, int(max_payload_lag_steps))
+        self.score_interval_steps = max(1, int(score_interval_steps))
+        self.pending_input_requests: deque[dict[str, Any]] = deque()
+        self.local_batches_by_step: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+        self.local_batch_order: deque[int] = deque()
+        self.metrics: dict[str, Any] = {
+            "mode": "async_rank0_memory_mailbox",
+            "transport_group": "rank0_memory_mailbox",
+            "coordinator_rank": int(self.coordinator_rank),
+            "memory_rank": int(self.memory_rank),
+            "participant": True,
+            "mailbox_dir": str(self.mailbox_dir),
+            "payload_dtype": str(payload_dtype).replace("torch.", ""),
+            "request_shape": list(self.full_ids_shape),
+            "payload_shape": list(self.payload_shape),
+            "max_local_batches": int(self.max_local_batches),
+            "max_payload_lag_steps": int(self.max_payload_lag_steps),
+            "score_interval_steps": int(self.score_interval_steps),
+            "requests_started": 0,
+            "result_broadcasts_started": 0,
+            "result_broadcasts_completed": 0,
+            "request_broadcasts_started": 0,
+            "request_broadcasts_completed": 0,
+            "request_interval_skips": 0,
+            "broadcast_interval_skips": 0,
+            "requests_stored": 0,
+            "local_request_evictions": 0,
+            "payloads_scored": 0,
+            "score_interval_skips": 0,
+            "payloads_sent": 0,
+            "payloads_received": 0,
+            "payloads_used": 0,
+            "sentinel_broadcasts": 0,
+            "sentinels_received": 0,
+            "stale_payloads_dropped": 0,
+            "orphan_payloads_dropped": 0,
+            "superseded_payloads_dropped": 0,
+            "completed_requests_dropped": 0,
+            "ready_result_drops": 0,
+            "shutdown_result_broadcasts_drained": 0,
+            "shutdown_input_requests_drained": 0,
+            "pre_sync_waits": 0,
+            "pre_sync_wait_seconds_sum": 0.0,
+            "pre_sync_wait_seconds_max": 0.0,
+            "score_seconds_sum": 0.0,
+            "score_seconds_max": 0.0,
+            "payload_lag_steps_sum": 0,
+            "payload_lag_steps_max": 0,
+            "max_pending_result_broadcasts": 0,
+            "max_pending_input_requests": 0,
+            "max_local_pending_batches": 0,
+            "last_scored_request_step": None,
+            "last_sent_request_step": None,
+            "last_received_request_step": None,
+            "last_used_request_step": None,
+            "last_drop_reason": "",
+            "errors": 0,
+            "last_error": "",
+            "mailbox_request_writes": 0,
+            "mailbox_result_writes": 0,
+            "mailbox_request_reads": 0,
+            "mailbox_result_reads": 0,
+            "mailbox_unlinks": 0,
+            "mailbox_write_seconds_sum": 0.0,
+            "mailbox_write_seconds_max": 0.0,
+            "mailbox_read_seconds_sum": 0.0,
+            "mailbox_read_seconds_max": 0.0,
+        }
+
+    def begin_step(
+        self,
+        *,
+        inputs: torch.Tensor,
+        targets: torch.Tensor,
+        step: int,
+    ) -> tuple[dict[str, torch.Tensor], torch.Tensor, torch.Tensor] | None:
+        if self.rank == self.coordinator_rank:
+            ready = self._poll_results(current_step=int(step))
+            if int(step) % int(self.score_interval_steps) == 0:
+                self._write_request(inputs=inputs, targets=targets, step=int(step))
+            else:
+                self.metrics["request_interval_skips"] += 1
+                self.metrics["broadcast_interval_skips"] += 1
+            return ready
+        if self.rank == self.memory_rank:
+            self._poll_requests()
+        return None
+
+    def after_optimizer_step(
+        self,
+        *,
+        model: torch.nn.Module,
+        cache: TransactionalWakeCache,
+        scarcity_optimizer: CrctScarcityAwareMemoryOptimizer | None,
+        step: int,
+        total_steps: int | None,
+        tau: float,
+        strength: float,
+        w_max: float,
+        alpha_max: float,
+        memory_write_tokens: int,
+        gradient_conflict_monitor: CrctGradientConflictMonitor | None = None,
+    ) -> None:
+        if self.rank != self.memory_rank or not self.pending_input_requests:
+            return
+        if len(self.pending_input_requests) > 1:
+            self.metrics["completed_requests_dropped"] += (
+                len(self.pending_input_requests) - 1
+            )
+            self.metrics["last_drop_reason"] = "newer_completed_request_won"
+        slot = self.pending_input_requests.pop()
+        self.pending_input_requests.clear()
+        request_step = int(slot["step"])
+        request_full_ids = slot["buffer"]
+        try:
+            train_inputs = request_full_ids[:, :-1].to(dtype=torch.int32)
+            train_targets = request_full_ids[:, 1:].to(dtype=torch.long)
+            t0 = time.perf_counter()
+            scored = _crct_score_payload_inline(
+                model=model,
+                cache=cache,
+                scarcity_optimizer=scarcity_optimizer,
+                inputs=train_inputs,
+                targets=train_targets,
+                step=request_step,
+                total_steps=total_steps,
+                tau=tau,
+                strength=strength,
+                w_max=w_max,
+                alpha_max=alpha_max,
+                memory_write_tokens=int(memory_write_tokens),
+                gradient_conflict_monitor=gradient_conflict_monitor,
+                update_model_memory_after=True,
+            )
+            score_s = time.perf_counter() - t0
+            self.metrics["score_seconds_sum"] += float(score_s)
+            self.metrics["score_seconds_max"] = max(
+                float(self.metrics["score_seconds_max"]),
+                float(score_s),
+            )
+            self.metrics["payloads_scored"] += 1
+            self.metrics["last_scored_request_step"] = request_step
+            self._write_result(request_step=request_step, scored=scored)
+        except Exception as exc:
+            self.metrics["errors"] += 1
+            self.metrics["last_error"] = "".join(
+                traceback.format_exception_only(type(exc), exc)
+            ).strip()
+            self.metrics["last_drop_reason"] = "score_exception"
+
+    def diagnostics(self) -> dict[str, Any]:
+        out = dict(self.metrics)
+        out.update(
+            {
+                "pending_result_broadcasts": 0,
+                "pending_input_requests": len(self.pending_input_requests),
+                "local_pending_batches": len(self.local_batches_by_step),
+                "ready_result_pending": False,
+                "ready_result_request_step": None,
+            }
+        )
+        used = int(out.get("payloads_used", 0))
+        out["payload_lag_steps_mean"] = (
+            float(out["payload_lag_steps_sum"]) / float(used) if used else 0.0
+        )
+        scored = int(out.get("payloads_scored", 0))
+        out["score_seconds_mean"] = (
+            float(out["score_seconds_sum"]) / float(scored) if scored else 0.0
+        )
+        return out
+
+    def wait_for_pending_collectives(self) -> None:
+        return
+
+    def close(self) -> None:
+        return
+
+    def _request_path(self, step: int) -> Path:
+        return self.mailbox_dir / f"request_{int(step):012d}.pt"
+
+    def _result_path(self, step: int) -> Path:
+        return self.mailbox_dir / f"result_{int(step):012d}.pt"
+
+    def _atomic_save(self, obj: dict[str, Any], path: Path) -> None:
+        t0 = time.perf_counter()
+        tmp = path.with_name(f"{path.name}.rank{self.rank}.tmp")
+        torch.save(obj, tmp)
+        tmp.replace(path)
+        elapsed = time.perf_counter() - t0
+        self.metrics["mailbox_write_seconds_sum"] += float(elapsed)
+        self.metrics["mailbox_write_seconds_max"] = max(
+            float(self.metrics["mailbox_write_seconds_max"]),
+            float(elapsed),
+        )
+
+    def _safe_unlink(self, path: Path) -> None:
+        try:
+            path.unlink()
+            self.metrics["mailbox_unlinks"] += 1
+        except FileNotFoundError:
+            pass
+
+    def _write_request(
+        self,
+        *,
+        inputs: torch.Tensor,
+        targets: torch.Tensor,
+        step: int,
+    ) -> None:
+        full_ids = _crct_full_input_ids(inputs, targets).contiguous()
+        if tuple(full_ids.shape) != self.full_ids_shape:
+            raise ValueError(
+                "CRCT mailbox transport saw a dynamic batch shape: "
+                f"{tuple(full_ids.shape)} != {self.full_ids_shape}"
+            )
+        self.local_batches_by_step[int(step)] = (
+            inputs.detach().clone(),
+            targets.detach().clone(),
+        )
+        self.local_batch_order.append(int(step))
+        self.metrics["requests_stored"] += 1
+        while len(self.local_batch_order) > self.max_local_batches:
+            old_step = self.local_batch_order.popleft()
+            if self.local_batches_by_step.pop(old_step, None) is not None:
+                self.metrics["local_request_evictions"] += 1
+                self.metrics["last_drop_reason"] = "local_request_evicted"
+        self._atomic_save(
+            {
+                "step": int(step),
+                "full_ids": full_ids.detach().to(device="cpu", dtype=torch.int32),
+            },
+            self._request_path(int(step)),
+        )
+        self.metrics["requests_started"] += 1
+        self.metrics["request_broadcasts_started"] += 1
+        self.metrics["mailbox_request_writes"] += 1
+        self.metrics["max_local_pending_batches"] = max(
+            int(self.metrics["max_local_pending_batches"]),
+            len(self.local_batches_by_step),
+        )
+
+    def _poll_requests(self) -> None:
+        paths = sorted(self.mailbox_dir.glob("request_*.pt"))
+        if not paths:
+            return
+        keep = paths[-1]
+        for old in paths[:-1]:
+            self._safe_unlink(old)
+            self.metrics["completed_requests_dropped"] += 1
+            self.metrics["last_drop_reason"] = "newer_request_file_won"
+        try:
+            t0 = time.perf_counter()
+            payload = torch.load(keep, map_location=self.device, weights_only=True)
+            elapsed = time.perf_counter() - t0
+            self.metrics["mailbox_read_seconds_sum"] += float(elapsed)
+            self.metrics["mailbox_read_seconds_max"] = max(
+                float(self.metrics["mailbox_read_seconds_max"]),
+                float(elapsed),
+            )
+            self._safe_unlink(keep)
+            full_ids = payload["full_ids"].to(device=self.device, dtype=torch.int32)
+            step = int(payload["step"])
+            self.pending_input_requests.append({"step": step, "buffer": full_ids})
+            self.metrics["request_broadcasts_completed"] += 1
+            self.metrics["mailbox_request_reads"] += 1
+            self.metrics["max_pending_input_requests"] = max(
+                int(self.metrics["max_pending_input_requests"]),
+                len(self.pending_input_requests),
+            )
+        except FileNotFoundError:
+            return
+        except Exception as exc:
+            self.metrics["errors"] += 1
+            self.metrics["last_error"] = "".join(
+                traceback.format_exception_only(type(exc), exc)
+            ).strip()
+            self.metrics["last_drop_reason"] = "request_mailbox_read_error"
+
+    def _write_result(self, *, request_step: int, scored: dict[str, torch.Tensor]) -> None:
+        payload = {
+            "step": int(request_step),
+            "target": scored["target"].detach().to(
+                device="cpu", dtype=self.payload_dtype
+            ),
+            "confidence": scored["confidence"].detach().to(
+                device="cpu", dtype=self.payload_dtype
+            ),
+            "loss_weight": scored["loss_weight"].detach().to(
+                device="cpu", dtype=self.payload_dtype
+            ),
+            "utility": scored["utility"].detach().to(
+                device="cpu", dtype=self.payload_dtype
+            ),
+        }
+        self._atomic_save(payload, self._result_path(int(request_step)))
+        self.metrics["payloads_sent"] += 1
+        self.metrics["payloads_received"] += 0
+        self.metrics["mailbox_result_writes"] += 1
+        self.metrics["result_broadcasts_started"] += 1
+        self.metrics["result_broadcasts_completed"] += 1
+        self.metrics["last_sent_request_step"] = int(request_step)
+
+    def _poll_results(
+        self,
+        *,
+        current_step: int,
+    ) -> tuple[dict[str, torch.Tensor], torch.Tensor, torch.Tensor] | None:
+        ready: tuple[dict[str, torch.Tensor], torch.Tensor, torch.Tensor] | None = None
+        for path in sorted(self.mailbox_dir.glob("result_*.pt")):
+            try:
+                t0 = time.perf_counter()
+                payload_cpu = torch.load(path, map_location="cpu", weights_only=True)
+                elapsed = time.perf_counter() - t0
+                self.metrics["mailbox_read_seconds_sum"] += float(elapsed)
+                self.metrics["mailbox_read_seconds_max"] = max(
+                    float(self.metrics["mailbox_read_seconds_max"]),
+                    float(elapsed),
+                )
+                self._safe_unlink(path)
+            except FileNotFoundError:
+                continue
+            except Exception as exc:
+                self.metrics["errors"] += 1
+                self.metrics["last_error"] = "".join(
+                    traceback.format_exception_only(type(exc), exc)
+                ).strip()
+                self.metrics["last_drop_reason"] = "result_mailbox_read_error"
+                continue
+            request_step = int(payload_cpu["step"])
+            lag = int(current_step) - request_step
+            batch = self.local_batches_by_step.pop(request_step, None)
+            try:
+                self.local_batch_order.remove(request_step)
+            except ValueError:
+                pass
+            if batch is None:
+                self.metrics["orphan_payloads_dropped"] += 1
+                self.metrics["last_drop_reason"] = "payload_without_local_batch"
+                continue
+            if self.max_payload_lag_steps > 0 and lag > self.max_payload_lag_steps:
+                self.metrics["stale_payloads_dropped"] += 1
+                self.metrics["last_drop_reason"] = "payload_too_stale"
+                continue
+            if ready is not None:
+                self.metrics["superseded_payloads_dropped"] += 1
+            payload = {
+                "step_id": torch.tensor(request_step, device=self.device),
+                "target": payload_cpu["target"].to(
+                    device=self.device, dtype=torch.float32
+                ),
+                "confidence": payload_cpu["confidence"].to(
+                    device=self.device, dtype=torch.float32
+                ),
+                "loss_weight": payload_cpu["loss_weight"].to(
+                    device=self.device, dtype=torch.float32
+                ),
+                "utility": payload_cpu["utility"].to(
+                    device=self.device, dtype=torch.float32
+                ),
+            }
+            inputs, targets = batch
+            ready = (payload, inputs, targets)
+            self.metrics["payloads_received"] += 1
+            self.metrics["payloads_used"] += 1
+            self.metrics["mailbox_result_reads"] += 1
+            self.metrics["last_received_request_step"] = request_step
+            self.metrics["last_used_request_step"] = request_step
+            self.metrics["payload_lag_steps_sum"] += max(0, lag)
+            self.metrics["payload_lag_steps_max"] = max(
+                int(self.metrics["payload_lag_steps_max"]),
+                max(0, lag),
+            )
+        return ready
+
+
 def _resolve_crct_async_payload_dtype(
     requested: str,
     *,
@@ -6315,6 +6727,8 @@ def train_fast_for_budget(
     crct_max_price: float = 0.50,
     crct_memory_write_tokens_per_step: int = 256,
     crct_async_teacher_transport: bool = True,
+    crct_async_teacher_transport_backend: str = "collective",
+    crct_teacher_mailbox_dir: str = "",
     crct_async_teacher_pending_batches: int = 64,
     crct_async_teacher_max_lag_steps: int = 128,
     crct_async_teacher_payload_dtype: str = "auto",
@@ -6994,16 +7408,28 @@ def train_fast_for_budget(
                 trace_max_rows=int(crct_gradient_conflict_trace_max_rows),
                 trace_flush_rows=int(crct_gradient_conflict_trace_flush_rows),
             )
-        crct_teacher_transport_mode = (
-            "async_rank0_memory_broadcast"
-            if (
-                bool(crct_async_teacher_transport)
-                and world_size_ >= 4
-                and teacher_group is not None
-                and dist.is_initialized()
+        crct_transport_backend = str(
+            crct_async_teacher_transport_backend
+        ).strip().lower()
+        if bool(crct_async_teacher_transport) and world_size_ >= 4 and dist.is_initialized():
+            if crct_transport_backend in {"mailbox", "file", "file_mailbox"}:
+                crct_teacher_transport_mode = "async_rank0_memory_mailbox"
+            elif crct_transport_backend in {"collective", "broadcast", "nccl"}:
+                crct_teacher_transport_mode = (
+                    "async_rank0_memory_broadcast"
+                    if teacher_group is not None
+                    else "sync_collective"
+                )
+            else:
+                raise ValueError(
+                    "crct_async_teacher_transport_backend must be one of "
+                    "'collective' or 'mailbox'; got "
+                    f"{crct_async_teacher_transport_backend!r}"
+                )
+        else:
+            crct_teacher_transport_mode = (
+                "sync_collective" if world_size_ >= 4 else "inline"
             )
-            else ("sync_collective" if world_size_ >= 4 else "inline")
-        )
 
     prefetcher = None
     async_grad_reducer = (
@@ -7249,17 +7675,27 @@ def train_fast_for_budget(
             if crct_enabled:
                 assert crct_cache is not None
                 crct_transport_participant = (
-                    crct_teacher_transport_mode == "async_rank0_memory_broadcast"
+                    crct_teacher_transport_mode
+                    in {
+                        "async_rank0_memory_broadcast",
+                        "async_rank0_memory_mailbox",
+                    }
                     and rank_ in {0, world_size_ - 1}
                 )
-                if crct_teacher_transport_mode == "async_rank0_memory_broadcast":
+                if crct_teacher_transport_mode in {
+                    "async_rank0_memory_broadcast",
+                    "async_rank0_memory_mailbox",
+                }:
                     if not crct_transport_participant:
                         crct_teacher_bypass_steps += 1
                     else:
                         crct_teacher_requests += 1
                     if not crct_transport_participant:
                         pass
-                    elif teacher_group is None:
+                    elif (
+                        crct_teacher_transport_mode == "async_rank0_memory_broadcast"
+                        and teacher_group is None
+                    ):
                         raise ValueError(
                             "CRCT async rank0-memory transport requires "
                             "teacher_group to be initialized"
@@ -7274,27 +7710,57 @@ def train_fast_for_budget(
                             int(targets.shape[0]),
                             int(targets.shape[1]),
                         )
-                        crct_teacher_transport = _CrctAsyncTeacherTransport(
-                            rank=rank_,
-                            world_size=world_size_,
-                            teacher_group=teacher_group,
-                            payload_shape=payload_shape,
-                            full_ids_shape=full_ids_shape,
+                        payload_dtype = _resolve_crct_async_payload_dtype(
+                            crct_async_teacher_payload_dtype,
                             device=inputs.device,
-                            payload_dtype=_resolve_crct_async_payload_dtype(
-                                crct_async_teacher_payload_dtype,
-                                device=inputs.device,
-                            ),
-                            max_local_batches=int(
-                                crct_async_teacher_pending_batches
-                            ),
-                            max_payload_lag_steps=int(
-                                crct_async_teacher_max_lag_steps
-                            ),
-                            score_interval_steps=int(
-                                crct_teacher_score_interval_steps
-                            ),
                         )
+                        if (
+                            crct_teacher_transport_mode
+                            == "async_rank0_memory_mailbox"
+                        ):
+                            mailbox_dir = str(crct_teacher_mailbox_dir or "").strip()
+                            if not mailbox_dir:
+                                raise ValueError(
+                                    "CRCT mailbox transport requires "
+                                    "crct_teacher_mailbox_dir to be set"
+                                )
+                            crct_teacher_transport = _CrctMailboxTeacherTransport(
+                                rank=rank_,
+                                world_size=world_size_,
+                                mailbox_dir=mailbox_dir,
+                                payload_shape=payload_shape,
+                                full_ids_shape=full_ids_shape,
+                                device=inputs.device,
+                                payload_dtype=payload_dtype,
+                                max_local_batches=int(
+                                    crct_async_teacher_pending_batches
+                                ),
+                                max_payload_lag_steps=int(
+                                    crct_async_teacher_max_lag_steps
+                                ),
+                                score_interval_steps=int(
+                                    crct_teacher_score_interval_steps
+                                ),
+                            )
+                        else:
+                            crct_teacher_transport = _CrctAsyncTeacherTransport(
+                                rank=rank_,
+                                world_size=world_size_,
+                                teacher_group=teacher_group,
+                                payload_shape=payload_shape,
+                                full_ids_shape=full_ids_shape,
+                                device=inputs.device,
+                                payload_dtype=payload_dtype,
+                                max_local_batches=int(
+                                    crct_async_teacher_pending_batches
+                                ),
+                                max_payload_lag_steps=int(
+                                    crct_async_teacher_max_lag_steps
+                                ),
+                                score_interval_steps=int(
+                                    crct_teacher_score_interval_steps
+                                ),
+                            )
                     if crct_teacher_transport is None:
                         ready = None
                     else:
@@ -7654,6 +8120,7 @@ def train_fast_for_budget(
             fast_slow.after_optimizer_step(model, step=steps + 1)
             if (
                 crct_teacher_transport is not None
+                and crct_teacher_transport_mode == "async_rank0_memory_broadcast"
                 and not bool(memory_rank_joins_grad)
                 and teacher_group is not None
                 and int(crct_teacher_param_sync_interval) > 0
@@ -8057,7 +8524,11 @@ def train_fast_for_budget(
                 "lm_weight_tau": float(crct_lm_weight_tau),
                 "teacher_transport_mode": str(crct_teacher_transport_mode),
                 "async_teacher_transport": bool(
-                    crct_teacher_transport_mode == "async_rank0_memory_broadcast"
+                    crct_teacher_transport_mode
+                    in {
+                        "async_rank0_memory_broadcast",
+                        "async_rank0_memory_mailbox",
+                    }
                 ),
                 "teacher_coordinator_rank": 0,
                 "teacher_memory_rank": int(world_size_ - 1),
@@ -8285,6 +8756,10 @@ def _warmup(
         crct_async_teacher_transport=bool(
             config.get("crct_async_teacher_transport", True)
         ),
+        crct_async_teacher_transport_backend=str(
+            config.get("crct_async_teacher_transport_backend", "collective")
+        ),
+        crct_teacher_mailbox_dir=str(config.get("crct_teacher_mailbox_dir", "")),
         crct_async_teacher_pending_batches=int(
             config.get("crct_async_teacher_pending_batches", 64)
         ),
@@ -8434,6 +8909,20 @@ def run_condition(
         ).clamp_min(1).to(device=device, dtype=torch.float32)
         rare_bucket_ce_eval_tokens = val_tokens
         rare_bucket_ce_eval_num_tokens = int(val_tokens.numel())
+
+    crct_teacher_mailbox_dir = str(config.get("crct_teacher_mailbox_dir", "") or "")
+    if (
+        bool(config.get("crct_enabled", False))
+        and str(config.get("crct_async_teacher_transport_backend", "")).strip().lower()
+        in {"mailbox", "file", "file_mailbox"}
+        and not crct_teacher_mailbox_dir
+    ):
+        stem = (
+            Path(output_json).stem
+            if output_json
+            else str(config.get("name", "crct_run"))
+        )
+        crct_teacher_mailbox_dir = str(Path("/dev/shm") / "chaoscontrol_crct" / stem)
 
     train_result = train_fast_for_budget(
         model,
@@ -8780,6 +9269,10 @@ def run_condition(
         crct_async_teacher_transport=bool(
             config.get("crct_async_teacher_transport", True)
         ),
+        crct_async_teacher_transport_backend=str(
+            config.get("crct_async_teacher_transport_backend", "collective")
+        ),
+        crct_teacher_mailbox_dir=crct_teacher_mailbox_dir,
         crct_async_teacher_pending_batches=int(
             config.get("crct_async_teacher_pending_batches", 64)
         ),

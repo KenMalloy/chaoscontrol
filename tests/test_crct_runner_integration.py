@@ -416,6 +416,57 @@ def test_crct_train_step_does_not_read_slots_on_trunk_path() -> None:
     assert float(grad.abs().sum()) > 0.0
 
 
+def test_crct_mailbox_transport_matches_stored_batch(tmp_path) -> None:
+    os.environ["CHAOSCONTROL_DIAG_SCAN_BACKEND"] = "chunked"
+    mod = _load_module("runner_fast_path_crct_mailbox", RUNNER_PATH)
+    model = _tiny_crct_model()
+    cache = TransactionalWakeCache(max_moments=0, max_hidden_buffer=0)
+    kwargs = {
+        "world_size": 4,
+        "mailbox_dir": str(tmp_path),
+        "payload_shape": (1, 2, 5),
+        "full_ids_shape": (2, 6),
+        "device": torch.device("cpu"),
+        "payload_dtype": torch.float32,
+        "max_local_batches": 8,
+        "max_payload_lag_steps": 8,
+        "score_interval_steps": 1,
+    }
+    rank0 = mod._CrctMailboxTeacherTransport(rank=0, **kwargs)
+    rank3 = mod._CrctMailboxTeacherTransport(rank=3, **kwargs)
+    base = torch.arange(10, dtype=torch.long).reshape(2, 5)
+    inputs = (base % 32).to(dtype=torch.int32)
+    targets = ((base + 1) % 32).to(dtype=torch.long)
+
+    assert rank0.begin_step(inputs=inputs, targets=targets, step=0) is None
+    assert rank3.begin_step(inputs=inputs, targets=targets, step=0) is None
+    rank3.after_optimizer_step(
+        model=model,
+        cache=cache,
+        scarcity_optimizer=None,
+        step=0,
+        total_steps=4,
+        tau=0.1,
+        strength=0.1,
+        w_max=1.2,
+        alpha_max=0.15,
+        memory_write_tokens=4,
+    )
+
+    ready = rank0.begin_step(inputs=inputs + 3, targets=targets + 3, step=1)
+    assert ready is not None
+    payload, train_inputs, train_targets = ready
+    assert int(payload["step_id"].item()) == 0
+    assert torch.equal(train_inputs, inputs)
+    assert torch.equal(train_targets, targets)
+    assert torch.isfinite(payload["loss_weight"]).all()
+    diag0 = rank0.diagnostics()
+    diag3 = rank3.diagnostics()
+    assert diag0["mode"] == "async_rank0_memory_mailbox"
+    assert diag0["payloads_used"] == 1
+    assert diag3["payloads_scored"] == 1
+
+
 def test_crct_teacher_payload_appends_memory_after_scoring() -> None:
     mod = _load_module("runner_fast_path_crct_payload", RUNNER_PATH)
     model = _tiny_crct_model()

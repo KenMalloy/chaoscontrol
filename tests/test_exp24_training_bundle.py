@@ -1728,6 +1728,7 @@ def test_crct_v1_matrix_threads_memory_controller_and_random_sampling():
     assert treatment["crct_lm_weight_w_max"] == 1.20
     assert treatment["crct_memory_write_tokens_per_step"] == 128
     assert treatment["crct_async_teacher_transport"] is True
+    assert treatment["crct_async_teacher_transport_backend"] == "mailbox"
     assert treatment["crct_async_teacher_pending_batches"] == 64
     assert treatment["crct_async_teacher_max_lag_steps"] == 128
     assert treatment["crct_teacher_score_interval_steps"] == 64

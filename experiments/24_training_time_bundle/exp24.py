@@ -1420,6 +1420,7 @@ def build_crct_v1_matrix(
         "crct_max_price": 0.50,
         "crct_memory_write_tokens_per_step": 128,
         "crct_async_teacher_transport": True,
+        "crct_async_teacher_transport_backend": "mailbox",
         "crct_async_teacher_pending_batches": 64,
         "crct_async_teacher_max_lag_steps": 128,
         "crct_async_teacher_payload_dtype": "auto",
