@@ -101,6 +101,35 @@ A future "single central memory" variant would need to broadcast encoded memory
 slot deltas from rank 3 to train ranks. That is a different transport contract,
 not the one this document is claiming for the current runner.
 
+## Gradient Conflict Sensor
+
+Gradient conflict detection is a controller input, not a replacement
+controller.  Rank 3 can cheaply sketch the LM-head gradient for tokens that
+would otherwise be written to memory:
+
+```python
+logits = lm_head(final_norm(hidden_candidate))
+p = softmax(logits)
+p[target] -= 1
+grad_sketch = normalize(p @ lm_head.weight)
+conflict_cos = dot(grad_sketch, recent_accepted_grad_ema)
+```
+
+The live runner exposes this as `crct_gradient_conflict_enabled`. When enabled,
+the scorer computes sketches only for the top `crct_memory_write_tokens_per_step`
+write candidates. Normal controller targets, confidence, and LM loss weights do
+not change. The monitor only adjusts the append-side write score; the hard
+`crct_gradient_conflict_catastrophic_threshold` is a circuit breaker for
+pathological anti-alignment. Soft gating is configurable but defaults to `0.0`
+so the first pod runs can use it as telemetry.
+
+Result JSON records `mechanisms.crct.gradient_conflict` from the memory rank
+with counters for `calls`, `candidates_seen`, `candidates_compared`,
+`admitted_candidates`, `guardrail_suppressed_candidates`,
+`soft_gated_candidates`, conflict min/max/mean, and the last write-token limit.
+That is the post-run answer to "did the memory gate suppress because it was
+protecting the trunk, or did the controller simply not find useful candidates?"
+
 ## Controller Target Transform
 
 ```python

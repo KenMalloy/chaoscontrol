@@ -31,6 +31,7 @@ __all__ = [
     "positive_only_lm_weight",
     "rank3_score_batch_causal",
     "ScarcityAwareMemoryOptimizer",
+    "CrctGradientConflictMonitor",
 ]
 
 
@@ -243,6 +244,248 @@ class ScarcityAwareMemoryOptimizer:
 
 
 # ---------------------------------------------------------------------------
+# Gradient-conflict sensing for write admission.
+# ---------------------------------------------------------------------------
+
+
+class CrctGradientConflictMonitor:
+    """Rank-3 write-admission sensor for conflicting memory candidates.
+
+    This is deliberately not a second controller.  It computes a compact
+    LM-head-gradient sketch for tokens that would otherwise be written to
+    memory, compares each sketch to an EMA of recent accepted sketches,
+    and returns an adjusted write score plus diagnostics.  The controller
+    and CRCT teacher targets still own normal behavior; the optional hard
+    threshold is a circuit breaker for catastrophic anti-alignment.
+    """
+
+    def __init__(
+        self,
+        *,
+        enabled: bool = True,
+        ema_beta: float = 0.95,
+        catastrophic_threshold: float = -0.90,
+        soft_gate_strength: float = 0.0,
+        soft_gate_floor: float = 0.05,
+        eps: float = 1e-8,
+    ) -> None:
+        self.enabled = bool(enabled)
+        self.ema_beta = float(ema_beta)
+        self.catastrophic_threshold = float(catastrophic_threshold)
+        self.soft_gate_strength = float(soft_gate_strength)
+        self.soft_gate_floor = float(soft_gate_floor)
+        self.eps = float(eps)
+        self._ema: torch.Tensor | None = None
+        self._diag: dict[str, Any] = {
+            "enabled": self.enabled,
+            "ema_beta": self.ema_beta,
+            "catastrophic_threshold": self.catastrophic_threshold,
+            "soft_gate_strength": self.soft_gate_strength,
+            "soft_gate_floor": self.soft_gate_floor,
+            "calls": 0,
+            "cold_start_calls": 0,
+            "candidates_seen": 0,
+            "candidates_compared": 0,
+            "admitted_candidates": 0,
+            "guardrail_suppressed_candidates": 0,
+            "soft_gated_candidates": 0,
+            "ema_updates": 0,
+            "mean_conflict_sum": 0.0,
+            "min_conflict": 1.0,
+            "max_conflict": -1.0,
+            "last_conflict_mean": 0.0,
+            "last_conflict_min": 0.0,
+            "last_conflict_max": 0.0,
+            "last_gate_mean": 1.0,
+            "last_suppressed": 0,
+            "last_admitted": 0,
+            "last_write_token_limit": None,
+            "last_reason": "",
+        }
+
+    @torch.no_grad()
+    def apply_to_write_scores(
+        self,
+        *,
+        model: Any,
+        hidden: torch.Tensor,
+        targets: torch.Tensor,
+        utility: torch.Tensor,
+        mask: torch.Tensor,
+        max_tokens: int | None,
+    ) -> tuple[torch.Tensor, int | None]:
+        """Return ``(write_score, write_token_limit)`` for memory append.
+
+        Only the append-side score is adjusted.  ``utility`` itself,
+        controller targets, confidence, and LM loss weights are left alone.
+        ``write_token_limit`` can be lower than ``max_tokens`` when the
+        hard guardrail suppresses candidates and leaves fewer safe writes.
+        """
+        if not self.enabled:
+            return utility, max_tokens
+
+        self._diag["calls"] += 1
+        selected = self._select_candidate_indices(
+            utility=utility,
+            mask=mask,
+            max_tokens=max_tokens,
+        )
+        n = int(selected.numel())
+        self._diag["candidates_seen"] += n
+        if n == 0:
+            self._diag["last_reason"] = "no_valid_candidates"
+            self._diag["last_write_token_limit"] = 0 if max_tokens is not None else None
+            return utility, 0 if max_tokens is not None else max_tokens
+
+        sketches = self._lm_head_gradient_sketches(
+            model=model,
+            hidden=hidden,
+            targets=targets,
+            selected=selected,
+        )
+        if sketches.numel() == 0:
+            self._diag["last_reason"] = "empty_sketch"
+            return utility, max_tokens
+
+        write_score = utility.detach().clone()
+        gate = torch.ones(n, device=utility.device, dtype=torch.float32)
+        suppressed = torch.zeros(n, device=utility.device, dtype=torch.bool)
+
+        if self._ema is None:
+            self._diag["cold_start_calls"] += 1
+            self._diag["last_reason"] = "cold_start"
+            conflict = torch.zeros(n, device=utility.device, dtype=torch.float32)
+        else:
+            ref = F.normalize(
+                self._ema.to(device=sketches.device, dtype=torch.float32),
+                dim=0,
+                eps=self.eps,
+            )
+            conflict = (sketches * ref.unsqueeze(0)).sum(dim=-1).clamp(-1.0, 1.0)
+            self._diag["candidates_compared"] += n
+            suppressed = conflict < self.catastrophic_threshold
+            if self.soft_gate_strength > 0.0:
+                severity = torch.relu(-conflict).clamp(0.0, 1.0)
+                gate = (1.0 - self.soft_gate_strength * severity).clamp(
+                    min=self.soft_gate_floor,
+                    max=1.0,
+                )
+                self._diag["soft_gated_candidates"] += int((gate < 1.0).sum().item())
+            flat_score = write_score.reshape(-1)
+            selected_score = flat_score.index_select(0, selected)
+            selected_score = selected_score * gate.to(
+                device=selected_score.device,
+                dtype=selected_score.dtype,
+            )
+            selected_score = torch.where(
+                suppressed.to(device=selected_score.device),
+                torch.full_like(selected_score, -torch.inf),
+                selected_score,
+            )
+            flat_score.index_copy_(0, selected, selected_score)
+
+        admitted_mask = ~suppressed
+        admitted = int(admitted_mask.sum().item())
+        suppressed_n = int(suppressed.sum().item())
+        self._diag["admitted_candidates"] += admitted
+        self._diag["guardrail_suppressed_candidates"] += suppressed_n
+        self._diag["last_gate_mean"] = float(gate.mean().item())
+        self._update_conflict_stats(conflict)
+        if admitted > 0:
+            self._update_ema(sketches[admitted_mask])
+        elif self._ema is None:
+            self._update_ema(sketches)
+
+        next_limit = admitted if max_tokens is None else min(int(max_tokens), admitted)
+        self._diag["last_write_token_limit"] = next_limit
+        self._diag["last_suppressed"] = suppressed_n
+        self._diag["last_admitted"] = admitted
+        if suppressed_n:
+            self._diag["last_reason"] = "guardrail_suppressed"
+        elif self.soft_gate_strength > 0.0 and bool((gate < 1.0).any().item()):
+            self._diag["last_reason"] = "soft_gated"
+        else:
+            self._diag["last_reason"] = "observed"
+        return write_score, next_limit
+
+    def diagnostics(self) -> dict[str, Any]:
+        out = dict(self._diag)
+        calls = int(out.get("calls", 0))
+        compared = int(out.get("candidates_compared", 0))
+        if calls:
+            out["mean_conflict_per_call"] = (
+                float(out["mean_conflict_sum"]) / float(calls)
+            )
+        else:
+            out["mean_conflict_per_call"] = 0.0
+        if compared == 0:
+            out["min_conflict"] = 0.0
+            out["max_conflict"] = 0.0
+        out["has_reference"] = self._ema is not None
+        return out
+
+    def _select_candidate_indices(
+        self,
+        *,
+        utility: torch.Tensor,
+        mask: torch.Tensor,
+        max_tokens: int | None,
+    ) -> torch.Tensor:
+        flat_mask = mask.reshape(-1).bool()
+        valid = torch.nonzero(flat_mask, as_tuple=False).reshape(-1)
+        if valid.numel() == 0:
+            return valid
+        if max_tokens is None or int(max_tokens) <= 0 or int(max_tokens) >= valid.numel():
+            return valid
+        flat_utility = utility.detach().reshape(-1).float()
+        valid_scores = flat_utility.index_select(0, valid)
+        local = torch.topk(valid_scores, k=int(max_tokens), largest=True, sorted=False).indices
+        return valid.index_select(0, local)
+
+    def _lm_head_gradient_sketches(
+        self,
+        *,
+        model: Any,
+        hidden: torch.Tensor,
+        targets: torch.Tensor,
+        selected: torch.Tensor,
+    ) -> torch.Tensor:
+        dim = int(hidden.shape[-1])
+        h = hidden.detach().reshape(-1, dim).index_select(0, selected)
+        y = targets.detach().reshape(-1).index_select(0, selected).long()
+        h_norm = model.final_norm(h)
+        logits = model.lm_head(h_norm).float()
+        probs = torch.softmax(logits, dim=-1)
+        probs[torch.arange(probs.shape[0], device=probs.device), y] -= 1.0
+        weight = model.lm_head.weight.detach().to(device=probs.device, dtype=torch.float32)
+        sketches = probs @ weight
+        return F.normalize(sketches, dim=-1, eps=self.eps)
+
+    def _update_ema(self, sketches: torch.Tensor) -> None:
+        mean = F.normalize(sketches.float().mean(dim=0), dim=0, eps=self.eps)
+        if self._ema is None:
+            self._ema = mean.detach().cpu()
+        else:
+            cur = self._ema.to(device=mean.device, dtype=torch.float32)
+            nxt = self.ema_beta * cur + (1.0 - self.ema_beta) * mean
+            self._ema = F.normalize(nxt, dim=0, eps=self.eps).detach().cpu()
+        self._diag["ema_updates"] += 1
+
+    def _update_conflict_stats(self, conflict: torch.Tensor) -> None:
+        if conflict.numel() == 0:
+            return
+        mean = float(conflict.mean().item())
+        cmin = float(conflict.min().item())
+        cmax = float(conflict.max().item())
+        self._diag["mean_conflict_sum"] += mean
+        self._diag["min_conflict"] = min(float(self._diag["min_conflict"]), cmin)
+        self._diag["max_conflict"] = max(float(self._diag["max_conflict"]), cmax)
+        self._diag["last_conflict_mean"] = mean
+        self._diag["last_conflict_min"] = cmin
+        self._diag["last_conflict_max"] = cmax
+
+
+# ---------------------------------------------------------------------------
 # Per-entry credit assignment.
 # ---------------------------------------------------------------------------
 
@@ -303,6 +546,7 @@ def rank3_score_batch_causal(
     w_max: float = 1.15,
     update_model_memory_after: bool = False,
     memory_write_tokens: int | None = None,
+    gradient_conflict_monitor: CrctGradientConflictMonitor | None = None,
 ) -> dict[str, torch.Tensor]:
     """Score a batch by comparing memory-on vs memory-off NLL.
 
@@ -366,6 +610,29 @@ def rank3_score_batch_causal(
                 "rank3_score_batch_causal(update_model_memory_after=True) "
                 "requires model.append_memory_from_hidden(...)"
             )
+        write_score = utility.detach()
+        write_limit = memory_write_tokens
+        if gradient_conflict_monitor is not None:
+            write_score, write_limit = gradient_conflict_monitor.apply_to_write_scores(
+                model=model,
+                hidden=h_off,
+                targets=y,
+                utility=utility,
+                mask=mask,
+                max_tokens=memory_write_tokens,
+            )
+        if write_limit is not None and int(write_limit) <= 0:
+            cache.commit(txn)
+            out = {
+                "utility": utility,
+                "controller_target": controller_target,
+                "confidence": confidence,
+                "loss_weight": loss_weight,
+            }
+            if gradient_conflict_monitor is not None:
+                out["gradient_conflict"] = torch.zeros_like(utility)
+                out["write_score"] = write_score.detach()
+            return out
         event_ids = None
         reserve_event_ids = getattr(cache, "reserve_event_ids", None)
         if callable(reserve_event_ids):
@@ -376,8 +643,8 @@ def rank3_score_batch_causal(
         wrote = bool(
             append_fn(
                 h_off.detach(),
-                score=utility.detach(),
-                max_tokens=memory_write_tokens,
+                score=write_score.detach(),
+                max_tokens=write_limit,
                 event_ids=event_ids,
             )
         )
@@ -394,4 +661,13 @@ def rank3_score_batch_causal(
         "controller_target": controller_target,
         "confidence": confidence,
         "loss_weight": loss_weight,
+        **(
+            {
+                "write_score": write_score.detach()
+                if "write_score" in locals()
+                else utility.detach()
+            }
+            if gradient_conflict_monitor is not None
+            else {}
+        ),
     }

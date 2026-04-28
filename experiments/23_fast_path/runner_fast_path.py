@@ -58,6 +58,7 @@ configure_exp23_fast_backend_defaults()
 
 from chaoscontrol.core import verify_diag_recurrence  # noqa: E402
 from chaoscontrol.cache_utility import (  # noqa: E402
+    CrctGradientConflictMonitor,
     ScarcityAwareMemoryOptimizer as CrctScarcityAwareMemoryOptimizer,
     alpha_ramp as crct_alpha_ramp,
     rank3_score_batch_causal,
@@ -1011,6 +1012,7 @@ def _crct_score_payload_inline(
     w_max: float,
     alpha_max: float,
     memory_write_tokens: int,
+    gradient_conflict_monitor: CrctGradientConflictMonitor | None = None,
     update_model_memory_after: bool = False,
 ) -> dict[str, torch.Tensor]:
     input_ids = _crct_full_input_ids(inputs, targets)
@@ -1030,6 +1032,7 @@ def _crct_score_payload_inline(
         w_max=float(w_max),
         update_model_memory_after=bool(update_model_memory_after),
         memory_write_tokens=int(memory_write_tokens),
+        gradient_conflict_monitor=gradient_conflict_monitor,
     )
     if scarcity_optimizer is not None:
         target = score["controller_target"]
@@ -1168,6 +1171,7 @@ class _CrctAsyncTeacherTransport:
         w_max: float,
         alpha_max: float,
         memory_write_tokens: int,
+        gradient_conflict_monitor: CrctGradientConflictMonitor | None = None,
     ) -> None:
         completed = self._reap_input_gathers()
         if self.rank != self.memory_rank:
@@ -1207,6 +1211,7 @@ class _CrctAsyncTeacherTransport:
                 w_max=w_max,
                 alpha_max=alpha_max,
                 memory_write_tokens=int(memory_write_tokens),
+                gradient_conflict_monitor=gradient_conflict_monitor,
                 update_model_memory_after=True,
             )
             score_s = time.perf_counter() - t0
@@ -1542,6 +1547,7 @@ def _collect_crct_teacher_payload(
     w_max: float,
     alpha_max: float,
     memory_write_tokens: int,
+    gradient_conflict_monitor: CrctGradientConflictMonitor | None = None,
 ) -> dict[str, torch.Tensor] | None:
     """Return this train rank's CRCT teacher payload.
 
@@ -1569,6 +1575,7 @@ def _collect_crct_teacher_payload(
             w_max=w_max,
             alpha_max=alpha_max,
             memory_write_tokens=int(memory_write_tokens),
+            gradient_conflict_monitor=gradient_conflict_monitor,
             update_model_memory_after=False,
         )
 
@@ -1600,6 +1607,7 @@ def _collect_crct_teacher_payload(
             w_max=w_max,
             alpha_max=alpha_max,
             memory_write_tokens=int(memory_write_tokens),
+            gradient_conflict_monitor=gradient_conflict_monitor,
             update_model_memory_after=True,
         )
         target_all = scored["target"].reshape(payload_shape).contiguous()
@@ -6202,6 +6210,11 @@ def train_fast_for_budget(
     crct_async_teacher_pending_batches: int = 64,
     crct_async_teacher_max_lag_steps: int = 32,
     crct_async_teacher_payload_dtype: str = "auto",
+    crct_gradient_conflict_enabled: bool = False,
+    crct_gradient_conflict_ema_beta: float = 0.95,
+    crct_gradient_conflict_catastrophic_threshold: float = -0.90,
+    crct_gradient_conflict_soft_gate_strength: float = 0.0,
+    crct_gradient_conflict_soft_gate_floor: float = 0.05,
 ) -> dict[str, Any]:
     rank_ = int(rank)
     world_size_ = int(world_size)
@@ -6796,6 +6809,7 @@ def train_fast_for_budget(
         )
     crct_cache: TransactionalWakeCache | None = None
     crct_scarcity: CrctScarcityAwareMemoryOptimizer | None = None
+    crct_gradient_conflict: CrctGradientConflictMonitor | None = None
     crct_teacher_requests = 0
     crct_teacher_payloads = 0
     crct_teacher_fail_open = 0
@@ -6815,6 +6829,18 @@ def train_fast_for_budget(
             ema_beta=float(crct_ema_beta),
             max_price=float(crct_max_price),
         )
+        if bool(crct_gradient_conflict_enabled):
+            crct_gradient_conflict = CrctGradientConflictMonitor(
+                enabled=True,
+                ema_beta=float(crct_gradient_conflict_ema_beta),
+                catastrophic_threshold=float(
+                    crct_gradient_conflict_catastrophic_threshold
+                ),
+                soft_gate_strength=float(
+                    crct_gradient_conflict_soft_gate_strength
+                ),
+                soft_gate_floor=float(crct_gradient_conflict_soft_gate_floor),
+            )
         crct_teacher_transport_mode = (
             "async_allgather_broadcast"
             if (
@@ -7113,6 +7139,7 @@ def train_fast_for_budget(
                         w_max=float(crct_lm_weight_w_max),
                         alpha_max=float(crct_lm_weight_alpha_max),
                         memory_write_tokens=int(crct_memory_write_tokens_per_step),
+                        gradient_conflict_monitor=crct_gradient_conflict,
                     )
                 if crct_payload is None:
                     crct_teacher_fail_open += 1
@@ -7451,6 +7478,7 @@ def train_fast_for_budget(
                     w_max=float(crct_lm_weight_w_max),
                     alpha_max=float(crct_lm_weight_alpha_max),
                     memory_write_tokens=int(crct_memory_write_tokens_per_step),
+                    gradient_conflict_monitor=crct_gradient_conflict,
                 )
             # Phase B5: deferred post-step CE pair pass on the episodic
             # rank. The in-step drain stages each successful replay and
@@ -7542,6 +7570,11 @@ def train_fast_for_budget(
                 else 0.0
             ),
             "memory_slots": int(len(getattr(model.outer_model, "_slots", []))),
+            "gradient_conflict": (
+                crct_gradient_conflict.diagnostics()
+                if crct_gradient_conflict is not None
+                else {"enabled": False}
+            ),
             "transport": (
                 crct_teacher_transport.diagnostics()
                 if crct_teacher_transport is not None
@@ -7577,6 +7610,18 @@ def train_fast_for_budget(
     peak_vram_mb = 0.0
     if device.type == "cuda":
         peak_vram_mb = torch.cuda.max_memory_allocated(device) / (1024 * 1024)
+    crct_gradient_conflict_summary: dict[str, Any] = (
+        crct_gradient_conflict.diagnostics()
+        if crct_gradient_conflict is not None
+        else {"enabled": False}
+    )
+    if crct_rank_diagnostics:
+        for diag in crct_rank_diagnostics:
+            if diag is not None and bool(diag.get("is_memory_rank", False)):
+                crct_gradient_conflict_summary = dict(
+                    diag.get("gradient_conflict", crct_gradient_conflict_summary)
+                )
+                break
     timing = summarize_train_timing(
         steps=steps,
         elapsed_s=elapsed_s,
@@ -7778,6 +7823,7 @@ def train_fast_for_budget(
                 "memory_write_tokens_per_step": int(
                     crct_memory_write_tokens_per_step
                 ),
+                "gradient_conflict": crct_gradient_conflict_summary,
                 "artifact_impact": "artifact_changes_weights_only",
             },
         },
@@ -7969,6 +8015,21 @@ def _warmup(
         ),
         crct_async_teacher_payload_dtype=str(
             config.get("crct_async_teacher_payload_dtype", "auto")
+        ),
+        crct_gradient_conflict_enabled=bool(
+            config.get("crct_gradient_conflict_enabled", False)
+        ),
+        crct_gradient_conflict_ema_beta=float(
+            config.get("crct_gradient_conflict_ema_beta", 0.95)
+        ),
+        crct_gradient_conflict_catastrophic_threshold=float(
+            config.get("crct_gradient_conflict_catastrophic_threshold", -0.90)
+        ),
+        crct_gradient_conflict_soft_gate_strength=float(
+            config.get("crct_gradient_conflict_soft_gate_strength", 0.0)
+        ),
+        crct_gradient_conflict_soft_gate_floor=float(
+            config.get("crct_gradient_conflict_soft_gate_floor", 0.05)
         ),
     )
 
@@ -8427,6 +8488,21 @@ def run_condition(
         ),
         crct_async_teacher_payload_dtype=str(
             config.get("crct_async_teacher_payload_dtype", "auto")
+        ),
+        crct_gradient_conflict_enabled=bool(
+            config.get("crct_gradient_conflict_enabled", False)
+        ),
+        crct_gradient_conflict_ema_beta=float(
+            config.get("crct_gradient_conflict_ema_beta", 0.95)
+        ),
+        crct_gradient_conflict_catastrophic_threshold=float(
+            config.get("crct_gradient_conflict_catastrophic_threshold", -0.90)
+        ),
+        crct_gradient_conflict_soft_gate_strength=float(
+            config.get("crct_gradient_conflict_soft_gate_strength", 0.0)
+        ),
+        crct_gradient_conflict_soft_gate_floor=float(
+            config.get("crct_gradient_conflict_soft_gate_floor", 0.05)
         ),
     )
     episodic_cache_payload = train_result.pop("_episodic_cache_payload", None)

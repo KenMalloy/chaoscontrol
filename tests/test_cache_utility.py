@@ -21,6 +21,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from chaoscontrol.cache_utility import (
+    CrctGradientConflictMonitor,
     ScarcityAwareMemoryOptimizer,
     alpha_ramp,
     assign_memory_credit,
@@ -334,6 +335,69 @@ class TestAlphaRamp:
 # ---------------------------------------------------------------------------
 
 
+class TestCrctGradientConflictMonitor:
+    def test_cold_start_observes_without_changing_write_score(self) -> None:
+        model = _MockModel(dim=8, vocab=32, seed=4)
+        monitor = CrctGradientConflictMonitor(enabled=True)
+        hidden = torch.randn(1, 4, 8)
+        targets = torch.tensor([[1, 2, 3, 4]])
+        utility = torch.tensor([[0.1, 0.5, -0.2, 0.3]])
+        mask = torch.ones_like(targets, dtype=torch.bool)
+
+        write_score, write_limit = monitor.apply_to_write_scores(
+            model=model,
+            hidden=hidden,
+            targets=targets,
+            utility=utility,
+            mask=mask,
+            max_tokens=2,
+        )
+
+        torch.testing.assert_close(write_score, utility)
+        assert write_limit == 2
+        diag = monitor.diagnostics()
+        assert diag["cold_start_calls"] == 1
+        assert diag["candidates_seen"] == 2
+        assert diag["admitted_candidates"] == 2
+        assert diag["guardrail_suppressed_candidates"] == 0
+        assert diag["has_reference"] is True
+
+    def test_guardrail_suppresses_catastrophic_anti_alignment(self) -> None:
+        model = _MockModel(dim=8, vocab=32, seed=5)
+        monitor = CrctGradientConflictMonitor(
+            enabled=True,
+            catastrophic_threshold=-0.50,
+        )
+        hidden = torch.randn(1, 1, 8)
+        targets = torch.tensor([[7]])
+        utility = torch.tensor([[1.0]])
+        mask = torch.ones_like(targets, dtype=torch.bool)
+        sketch = monitor._lm_head_gradient_sketches(
+            model=model,
+            hidden=hidden,
+            targets=targets,
+            selected=torch.tensor([0]),
+        )[0]
+        monitor._ema = (-sketch).detach().cpu()
+
+        write_score, write_limit = monitor.apply_to_write_scores(
+            model=model,
+            hidden=hidden,
+            targets=targets,
+            utility=utility,
+            mask=mask,
+            max_tokens=1,
+        )
+
+        assert write_limit == 0
+        assert write_score[0, 0].item() == float("-inf")
+        diag = monitor.diagnostics()
+        assert diag["candidates_compared"] == 1
+        assert diag["guardrail_suppressed_candidates"] == 1
+        assert diag["last_reason"] == "guardrail_suppressed"
+        assert diag["last_conflict_mean"] < -0.99
+
+
 class TestRank3ScoreBatchCausal:
     def _setup(self, batch: int = 2, seq: int = 6) -> tuple[_MockModel, _MockCache, torch.Tensor, torch.Tensor]:
         torch.manual_seed(0)
@@ -505,6 +569,31 @@ class TestRank3ScoreBatchCausal:
         event_ids = model.append_calls[0]["event_ids"]
         assert event_ids is not None
         assert event_ids.tolist() == list(range(10, 20))
+
+    def test_gradient_conflict_guardrail_can_skip_memory_write(self) -> None:
+        model, cache, ids, mask = self._setup(batch=1, seq=5)
+        monitor = CrctGradientConflictMonitor(
+            enabled=True,
+            catastrophic_threshold=1.1,
+        )
+        monitor._ema = F.normalize(torch.ones(model._dim), dim=0).cpu()
+
+        out = rank3_score_batch_causal(
+            model=model,
+            cache=cache,
+            input_ids=ids,
+            valid_mask=mask,
+            update_model_memory_after=True,
+            memory_write_tokens=3,
+            gradient_conflict_monitor=monitor,
+        )
+
+        assert len(model.append_calls) == 0
+        assert cache.commit_calls, "skipped write still commits the scoring txn"
+        assert "write_score" in out
+        diag = monitor.diagnostics()
+        assert diag["guardrail_suppressed_candidates"] == 3
+        assert diag["last_write_token_limit"] == 0
 
     def test_update_model_memory_writes_slots_newer_than_oracle_cutoff(self) -> None:
         torch.manual_seed(17)

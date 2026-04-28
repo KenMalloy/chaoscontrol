@@ -280,6 +280,7 @@ def _worker_async_crct_train_loop(
             crct_async_teacher_max_lag_steps=8,
             crct_async_teacher_payload_dtype="fp32",
             crct_memory_write_tokens_per_step=4,
+            crct_gradient_conflict_enabled=True,
         )
         if rank == 0:
             Path(result_dir, "rank0.json").write_text(
@@ -541,12 +542,17 @@ def test_crct_async_teacher_transport_wired_into_train_loop() -> None:
     assert crct["teacher_requests"] == 5
     assert crct["teacher_payloads"] >= 1
     assert crct["teacher_fail_open"] >= 1
+    assert crct["gradient_conflict"]["enabled"] is True
+    assert crct["gradient_conflict"]["calls"] >= 1
     ranks = crct["rank_diagnostics"]
     assert len(ranks) == 4
     train0 = ranks[0]["transport"]
     memory = ranks[3]["transport"]
+    memory_conflict = ranks[3]["gradient_conflict"]
     assert train0["requests_started"] == 5
     assert train0["payloads_used"] == crct["teacher_payloads"]
     assert train0["errors"] == 0
     assert memory["payloads_scored"] >= 2
     assert memory["payloads_sent"] >= 1
+    assert memory_conflict["calls"] == crct["gradient_conflict"]["calls"]
+    assert memory_conflict["candidates_seen"] > 0
