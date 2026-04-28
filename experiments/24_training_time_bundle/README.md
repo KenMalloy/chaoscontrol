@@ -16,6 +16,20 @@ Current operational lock for optimizer work:
 Dreamworld and sleep remain follow-up mechanism lanes, but they are not part of
 the locked static training base after the matched Phase 0 control.
 
+## Status (2026-04-28)
+
+Phase 0 trunk is locked at `phase0_fastslow_only_control`. The active
+falsifier on top of that trunk is **CRCT v1** — Cache-Reweighted
+Continuation Training in 3+1 mode, where rank 3 is the teacher/oracle
+and train ranks never touch CRCT memory. See
+`docs/crct-controller-architecture.md` for the architecture and
+`build_crct_v1_matrix` in `exp24.py` for the live matrix
+(`arm_a_fastslow_control` vs `arm_b_crct_controller`, 3 seeds each).
+
+The 4×H100 phase 3 run is the calibrate-and-validate pass for CRCT;
+the headline lives at 8×H100 (Phase 4 in
+`docs/plans/2026-04-25-memory-aware-optimizer-plan.md`).
+
 ## Run Order
 
 1. Ring 0 control: 2-3 seeds, 600s wall-clock, full validation after training.
@@ -25,6 +39,12 @@ the locked static training base after the matched Phase 0 control.
 4. First-wave mechanisms: fast/slow, spectral regularization, predictive
    auxiliary, scheduled Dreamworld hidden-state replay, and loss-triggered
    Dreamworld event replay.
+5. Phase 3 falsifiers on the locked Phase 0 trunk — current path is
+   `crct_v1` (rank-3 teacher, controller distillation, positive-only LM
+   reweighting, gradient-conflict telemetry). Earlier phase-3 builders
+   (`episodic_dw_curation_v1`, `episodic_controller_v1`, `episodic_ttt_v1`,
+   `criticality_distillation_*`) remain in `exp24.py` as reproducible
+   historical matrices.
 
 ## Dry Runs
 

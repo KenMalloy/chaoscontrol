@@ -1,5 +1,15 @@
 # Rank-3 Asynchronous Cache-Utility Teacher for ChaosControl
 
+> **Superseded (2026-04-28).** This is the original CRCT design sketch. The
+> live contract — `memory_mode="off"` vs `"force_on"` oracle encode passes,
+> two-rank `teacher_group=[0, world_size-1]` transport, train ranks that
+> never read or write CRCT slots, and the controller-distillation loss —
+> is documented in `docs/crct-controller-architecture.md`. Treat the rest
+> of this file as historical context, not an implementation reference.
+> Specifically wrong here vs the live runner: per-pair `util_pgs`,
+> `cache_read=False` boolean toggle on `encode()`, and the post-hoc
+> `hidden + cache_delta` utility comparison.
+
 Expert architecture review (via Codex). This is the reference implementation plan for CRCT.
 
 ## Core Design Principle

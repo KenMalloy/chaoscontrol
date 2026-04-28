@@ -1,5 +1,26 @@
 # Memory-Aware Optimizer Implementation Plan
 
+> **Superseded by CRCT (2026-04-28).** Phases 1–3 here describe the
+> curated-Dreamworld replay architecture: train ranks feed write payloads
+> into per-rank SPSC rings, the episodic rank runs replay backward, and
+> the controller drives query selection. The live Exp24 phase 3 mechanism
+> is CRCT, which keeps the 3+1 topology but reshapes the train-side
+> contract — train ranks never read or write CRCT memory, rank 3 is the
+> teacher/oracle (`memory_mode="off"` vs `"force_on"` utility), and the
+> controller is *distilled* from per-token utility labels rather than
+> driving cache reads. There is no Dreamworld replay backward in CRCT.
+> Live shape:
+>
+> - `docs/crct-controller-architecture.md` — current architecture
+> - `experiments/24_training_time_bundle/exp24.py::build_crct_v1_matrix` — live matrix
+> - `experiments/23_fast_path/runner_fast_path.py::_CrctAsyncTeacherTransport` — transport
+>
+> Phase 0 (trunk lock-in via `phase0_fastslow_only_control`) and the 3+1
+> hardware split notes still apply. Phase 4 (8×H100 6+2 scale) and
+> Phase 5 (research extensions) remain forward-looking. The Thesis-B
+> body below is preserved as design history; do not implement it as
+> written.
+
 > **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
 **Goal:** Build the curated-Dreamworld memory-aware architecture: an episodic cache on a dedicated GPU feeds Dreamworld replay via a CPU controller. Validated against the existing falsifier — uncurated Dreamworld did NOT transfer to artifact (`phase0_dw_sweep`, val_bpb 1.484, lost to fast_slow-only at 1.479) — and the prediction is that curation flips this.
