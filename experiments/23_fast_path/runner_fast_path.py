@@ -8262,7 +8262,9 @@ def run_condition(
 
     model = build_model(config, device, dtype)
     _apply_embed_init(model, config, device)
-    _reject_unsupported(model)
+    _reject_unsupported_fast_step(
+        model, crct_enabled=bool(config.get("crct_enabled", False))
+    )
     model_params = sum(p.numel() for p in model.parameters())
 
     if is_rank0:
