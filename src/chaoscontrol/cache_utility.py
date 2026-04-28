@@ -81,6 +81,9 @@ def positive_only_lm_weight(
 # ---------------------------------------------------------------------------
 
 
+_NLL_CHUNK_BUDGET_BYTES = 1 << 30  # 1 GiB peak per-chunk logits
+
+
 @torch.inference_mode()
 def chunked_nll_from_hidden(
     model: Any,
@@ -97,6 +100,12 @@ def chunked_nll_from_hidden(
     per-token NLL (``reduction='none'``) instead of a scalar loss —
     rank-3 scoring needs the per-position signal so it can compute
     utility deltas pointwise.
+
+    ``chunk_size`` is clamped against ``_NLL_CHUNK_BUDGET_BYTES`` so the
+    per-chunk allocation ``batch * chunk_size * vocab * 4`` (fp32 logits)
+    stays bounded regardless of the value a caller passes; otherwise an
+    over-large ``chunk_size`` (or one that exceeds ``seq`` and skips
+    chunking entirely) materialises the full logits tensor in one shot.
     """
     if chunk_size <= 0:
         raise ValueError(
@@ -107,10 +116,16 @@ def chunked_nll_from_hidden(
     lm_head = model.lm_head
     vocab = lm_head.out_features
 
+    budget_chunk = max(
+        1,
+        _NLL_CHUNK_BUDGET_BYTES // max(1, int(batch) * int(vocab) * 4),
+    )
+    effective_chunk = min(int(chunk_size), int(budget_chunk))
+
     out = hidden_states.new_zeros((batch, seq), dtype=torch.float32)
     start = 0
     while start < seq:
-        end = min(start + chunk_size, seq)
+        end = min(start + effective_chunk, seq)
         h_chunk = hidden_states[:, start:end, :]
         logits_chunk = lm_head(final_norm(h_chunk))
         tgt_chunk = targets[:, start:end]

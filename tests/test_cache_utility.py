@@ -290,6 +290,33 @@ class TestChunkedNllFromHidden:
         out = chunked_nll_from_hidden(model, hidden, targets, chunk_size=2)
         assert torch.allclose(out, ref, atol=1e-5)
 
+    def test_chunk_size_clamped_against_memory_budget(self) -> None:
+        # When chunk_size * batch * vocab * 4 exceeds the per-chunk
+        # budget the function must clamp chunk_size down and still
+        # produce identical per-token NLL.
+        torch.manual_seed(11)
+        from chaoscontrol.cache_utility import _NLL_CHUNK_BUDGET_BYTES
+
+        model = self._build_model(dim=4, vocab=8)
+        batch, seq = 3, 17
+        hidden = torch.randn(batch, seq, 4)
+        targets = torch.randint(0, 8, (batch, seq))
+        ref = chunked_nll_from_hidden(model, hidden, targets, chunk_size=1)
+
+        # Pick a chunk_size big enough that the loop would run once
+        # without the cap, and a vocab/batch combo that hits the budget.
+        # Force the cap to a tiny value to exercise the clamp.
+        from unittest.mock import patch
+
+        with patch("chaoscontrol.cache_utility._NLL_CHUNK_BUDGET_BYTES", 1):
+            # batch * vocab * 4 = 96 bytes; budget=1 → effective_chunk = 1
+            out = chunked_nll_from_hidden(
+                model, hidden, targets, chunk_size=10_000
+            )
+        assert torch.allclose(out, ref, atol=1e-6), (
+            "chunk_size budget clamp must not change the per-token NLL output"
+        )
+
 
 # ---------------------------------------------------------------------------
 # alpha_ramp
