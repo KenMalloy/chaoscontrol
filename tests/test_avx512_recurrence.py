@@ -15,6 +15,7 @@ def test_avx512_diagonal_recurrence_surface_imports():
     assert isinstance(_ext.avx512_recurrence_kernel_available(), bool)
 
 
+@pytest.mark.scalar_path_only
 def test_avx512_diagonal_recurrence_unavailable_raises_clear_error():
     if _ext.avx512_recurrence_kernel_available():
         pytest.skip("AVX-512 recurrence kernel is compiled in this extension build")

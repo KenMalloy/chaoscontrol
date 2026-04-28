@@ -16,6 +16,7 @@ def test_avx512_matops_surface_imports():
     assert isinstance(_ext.avx512_matops_kernel_available(), bool)
 
 
+@pytest.mark.scalar_path_only
 def test_avx512_matops_unavailable_raises_clear_error():
     if _ext.avx512_matops_kernel_available():
         pytest.skip("AVX-512 matops kernel is compiled in this extension build")

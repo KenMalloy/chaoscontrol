@@ -22,6 +22,7 @@ mamba = ["mamba-ssm>=2.3.0"]
 testpaths = ["tests"]
 markers = [
     "slow: marks tests as slow (deselect with '-m \"not slow\"'), used for GPU microbenches",
+    "scalar_path_only: marks tests that validate scalar/non-accelerated fallback behavior and should be deselected on accelerated H100/SPR sweeps",
 ]
 filterwarnings = [
     "ignore::DeprecationWarning:importlib._bootstrap",
