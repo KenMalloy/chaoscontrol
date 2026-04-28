@@ -1,4 +1,4 @@
-"""Structural tests for ``scripts/pod_setup_cuda13.sh``.
+"""Structural tests for pod setup scripts.
 
 The script's idempotent fast-path used to probe only ``transformer_engine``
 before declaring "Pod ready" — a pod with working TE but missing
@@ -18,6 +18,8 @@ from __future__ import annotations
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
+POD_BOOTSTRAP = REPO / "scripts" / "pod_bootstrap.sh"
+POD_BUILD_NATIVE_EXTENSIONS = REPO / "scripts" / "pod_build_native_extensions.sh"
 POD_SETUP = REPO / "scripts" / "pod_setup_cuda13.sh"
 
 
@@ -76,3 +78,35 @@ class TestPodSetupFastPathProbe:
             "fast-path probe must construct a TE Linear; import alone "
             "cannot catch cublas ABI mismatches"
         )
+
+
+class TestPodNativeExtensionBootstrap:
+    def test_one_command_bootstrap_builds_native_extensions(self) -> None:
+        """The active pod bootstrap must not rely on manual shell history
+        for the native extension build. This catches the exact failure mode
+        where a pod has CUDA-visible torch but `_C` modules are missing.
+        """
+        source = POD_BOOTSTRAP.read_text()
+        assert "scripts/pod_build_native_extensions.sh" in source
+        assert "from chaoscontrol.kernels._lm_head_loss import _C" in source
+        assert "from chaoscontrol.kernels._ssm_scan import _C" in source
+        assert "write_event_cuda_pack_available()" in source
+
+    def test_native_extension_helper_pins_cuda_home_and_builds_all_required_extensions(
+        self,
+    ) -> None:
+        """The helper encodes the H100 pod lesson: nvcc may exist under
+        /usr/local/cuda-12.8 without being on PATH, and the CPU SSM
+        controller must be built with the CUDA write-event pack.
+        """
+        source = POD_BUILD_NATIVE_EXTENSIONS.read_text()
+        assert "/usr/local/cuda-12.8" in source
+        assert 'export PATH="$WORKSPACE_VENV/bin:$CUDA_HOME/bin:$PATH"' in source
+        assert "CHAOSCONTROL_CUDA_ARCH_LIST" in source
+        assert "TORCH_CUDA_ARCH_LIST" in source
+        assert "CHAOSCONTROL_CPU_SSM_X86_ACCEL" in source
+        assert "CHAOSCONTROL_CPU_SSM_CUDA_WRITE_EVENT" in source
+        assert "src/chaoscontrol/kernels/_lm_head_loss/setup_ext.py" in source
+        assert "src/chaoscontrol/kernels/_cpu_ssm_controller/setup_ext.py" in source
+        assert "src/chaoscontrol/kernels/_ssm_scan/setup_ext.py" in source
+        assert "write_event_cuda_pack_available()" in source
