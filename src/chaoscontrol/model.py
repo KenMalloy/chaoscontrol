@@ -1008,6 +1008,7 @@ class ChaosStudentLM(nn.Module):
         bucket_ids: torch.Tensor | None = None,
         score: torch.Tensor | None = None,
         max_tokens: int | None = None,
+        event_ids: torch.Tensor | None = None,
     ) -> bool:
         """Append sequence hidden states into the append-only outer memory.
 
@@ -1031,6 +1032,17 @@ class ChaosStudentLM(nn.Module):
             return False
         batch, seq, dim = hidden.shape
         h_flat = hidden.detach().reshape(-1, dim)
+        event_flat = None
+        if event_ids is not None:
+            event_flat = event_ids.detach().reshape(-1).to(
+                device=hidden.device,
+                dtype=torch.long,
+            )
+            if event_flat.numel() != batch * seq:
+                raise ValueError(
+                    f"event_ids must have {batch * seq} entries for hidden shape "
+                    f"{tuple(hidden.shape)}, got {event_flat.numel()}"
+                )
         max_tokens_i = 0 if max_tokens is None else int(max_tokens)
         if max_tokens_i > 0 and h_flat.shape[0] > max_tokens_i:
             if score is not None:
@@ -1052,6 +1064,8 @@ class ChaosStudentLM(nn.Module):
                     device=hidden.device,
                 ).long()
             h_flat = h_flat.index_select(0, selected)
+            if event_flat is not None:
+                event_flat = event_flat.index_select(0, selected)
         else:
             selected = None
         encoded_flat = torch.tanh(
@@ -1072,7 +1086,14 @@ class ChaosStudentLM(nn.Module):
             )
             if selected is not None:
                 bids_flat = bids_flat.index_select(0, selected)
-        self.outer_model.append_kv_batch(encoded_flat, bids_flat)
+        if event_flat is None:
+            self.outer_model.append_kv_batch(encoded_flat, bids_flat)
+        else:
+            self.outer_model._append_kv_batch_committed(
+                encoded_flat,
+                bids_flat,
+                event_ids=event_flat,
+            )
         return True
 
     def encode(
@@ -1209,6 +1230,7 @@ class ChaosStudentLM(nn.Module):
                     read = self.outer_model.read_bucket(
                         int(mask.sum()), bucket_id=int(b_id.item()),
                         mode=self.retrieval_mode, k=self.retrieval_k, cue=cue,
+                        read_cutoff=cache_read_cutoff,
                     )
                     outer_read[mask] = read.unsqueeze(1).to(dtype=x.dtype)
                 x = _add_memory_bias(x, outer_read)
@@ -1225,7 +1247,11 @@ class ChaosStudentLM(nn.Module):
         elif memory_mode != "off" and self.outer_model is not None:
             if isinstance(self.outer_model, MultiSlotOuterModel):
                 cue = x.detach().mean(dim=1) if self.cue_projection else None
-                outer_read = self.outer_model.read(x.size(0), cue=cue)
+                outer_read = self.outer_model.read(
+                    x.size(0),
+                    cue=cue,
+                    read_cutoff=cache_read_cutoff,
+                )
             else:
                 outer_read = self.outer_model.read(x.size(0))
             x = _add_memory_bias(x, outer_read.unsqueeze(1))

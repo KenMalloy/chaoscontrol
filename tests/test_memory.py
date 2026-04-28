@@ -168,10 +168,28 @@ class TestMultiSlotOuterModel(unittest.TestCase):
         om.append_kv_batch(encoded, bucket_ids)
         assert len(om._slots) == 5
         assert om._slot_buckets == [0, 1, 2, 0, 1]
+        assert om._slot_event_ids == [0, 0, 0, 0, 0]
         assert all(s == 1.0 for s in om._survival)
         # Each slot should match the encoded entry
         for i in range(5):
             assert torch.allclose(om._slots[i], encoded[i:i+1])
+
+    def test_read_cutoff_hides_newer_committed_slots(self) -> None:
+        om = MultiSlotOuterModel(model_dim=4, outer_dim=4, max_slots=8)
+        with torch.no_grad():
+            om.decoder.weight.copy_(torch.eye(4))
+        encoded = torch.ones(1, 4)
+        om._append_kv_batch_committed(
+            encoded,
+            torch.tensor([0]),
+            event_ids=torch.tensor([2]),
+        )
+
+        before = om.read_bucket(1, bucket_id=0, read_cutoff=1)
+        visible = om.read_bucket(1, bucket_id=0, read_cutoff=2)
+
+        torch.testing.assert_close(before, torch.zeros_like(before), rtol=0, atol=0)
+        torch.testing.assert_close(visible, encoded, rtol=0, atol=0)
 
     def test_append_kv_batch_empty(self) -> None:
         om = MultiSlotOuterModel(model_dim=16, outer_dim=32, max_slots=100)
@@ -200,6 +218,7 @@ class TestCheckpointPersistence(unittest.TestCase):
         om.write(torch.randn(2, 16))
         om.write(torch.randn(2, 16))
         om._survival[0] = 42.0
+        om._slot_event_ids[0] = 7
         assert len(om._slots) == 2
 
         buf = io.BytesIO()
@@ -211,6 +230,7 @@ class TestCheckpointPersistence(unittest.TestCase):
         om2.load_state_dict(torch.load(buf, weights_only=False))
         assert len(om2._slots) == 2
         assert om2._survival[0] == 42.0
+        assert om2._slot_event_ids[0] == 7
 
 
 class TestSemanticTier(unittest.TestCase):

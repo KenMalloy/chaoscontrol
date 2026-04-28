@@ -36,6 +36,7 @@ class CacheTxn:
     staged_moments: list[dict[str, Any]] = field(default_factory=list)
     staged_hidden: list[torch.Tensor] = field(default_factory=list)
     committed: bool = False
+    rolled_back: bool = False
 
 
 class TransactionalWakeCache:
@@ -74,6 +75,8 @@ class TransactionalWakeCache:
     def commit(self, txn: CacheTxn) -> None:
         if txn.committed:
             raise RuntimeError("CacheTxn has already been committed")
+        if txn.rolled_back:
+            raise RuntimeError("CacheTxn has already been rolled back")
         for moment in txn.staged_moments:
             self._insert_moment(moment, event_id=self.clock.next())
         for hidden in txn.staged_hidden:
@@ -83,9 +86,33 @@ class TransactionalWakeCache:
         txn.committed = True
 
     def rollback(self, txn: CacheTxn) -> None:
+        if txn.committed:
+            raise RuntimeError("CacheTxn has already been committed")
+        if txn.rolled_back:
+            raise RuntimeError("CacheTxn has already been rolled back")
         txn.staged_moments.clear()
         txn.staged_hidden.clear()
-        txn.committed = True
+        txn.rolled_back = True
+
+    def reserve_event_ids(
+        self,
+        n: int,
+        *,
+        device: torch.device | str | None = None,
+    ) -> torch.Tensor:
+        """Reserve committed memory event ids for an external slot writer.
+
+        ``rank3_score_batch_causal`` writes model memory through
+        ``ChaosStudentLM.append_memory_from_hidden`` rather than through
+        ``WakeCache`` itself.  Reserving ids from the same clock keeps the
+        model-side slot MVCC and the cache-side transaction cutoff on one
+        monotone timeline.
+        """
+        count = int(n)
+        if count < 0:
+            raise ValueError(f"cannot reserve a negative number of event ids: {n}")
+        ids = [self.clock.next() for _ in range(count)]
+        return torch.tensor(ids, dtype=torch.long, device=device)
 
     def record_moment(
         self,
@@ -112,7 +139,7 @@ class TransactionalWakeCache:
         if txn is None:
             self._insert_moment(moment, event_id=self.clock.next())
         else:
-            if txn.committed:
+            if txn.committed or txn.rolled_back:
                 raise RuntimeError("cannot stage writes on a closed CacheTxn")
             txn.staged_moments.append(moment)
 
@@ -122,7 +149,7 @@ class TransactionalWakeCache:
             setattr(hidden_cpu, "_event_id", self.clock.next())
             self.base.hidden_buffer.append(hidden_cpu)
         else:
-            if txn.committed:
+            if txn.committed or txn.rolled_back:
                 raise RuntimeError("cannot stage writes on a closed CacheTxn")
             txn.staged_hidden.append(hidden_cpu)
 

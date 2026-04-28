@@ -29,7 +29,8 @@ The exact teacher should compare semantic stream with memory disabled vs memory 
 ### New encode() API
 
 ```python
-def encode(self, input_ids, *, memory_mode="controller", teacher_gate=None,
+def encode(self, input_ids, *, memory_mode="controller",
+           cache_read_cutoff=None, teacher_gate=None,
            return_controller_logits=False, return_memory_meta=False):
     """
     memory_mode:
@@ -37,6 +38,8 @@ def encode(self, input_ids, *, memory_mode="controller", teacher_gate=None,
         "force_on"     -> read memory and inject with gate = 1
         "controller"   -> controller decides gate
         "teacher_gate" -> use externally supplied gate
+    cache_read_cutoff:
+        optional MVCC event-id cutoff for append-only multislot memory reads
     """
 ```
 
@@ -63,8 +66,9 @@ def score_memory_teacher(model, input_ids, valid_mask, *, head_chunk_size=128):
     x = input_ids[:, :-1]
     y = input_ids[:, 1:]
     
-    h_off = model.encode(x, memory_mode="off")
-    h_mem = model.encode(x, memory_mode="force_on")
+    txn = cache.begin_batch()
+    h_off = model.encode(x, memory_mode="off", cache_read_cutoff=txn.read_cutoff)
+    h_mem = model.encode(x, memory_mode="force_on", cache_read_cutoff=txn.read_cutoff)
     
     nll_off = chunked_nll(model, h_off, y, head_chunk_size)
     nll_mem = chunked_nll(model, h_mem, y, head_chunk_size)
@@ -77,6 +81,25 @@ def score_memory_teacher(model, input_ids, valid_mask, *, head_chunk_size=128):
         "utility": utility,
     }
 ```
+
+Writes from the scored batch must reserve event ids strictly newer than
+`txn.read_cutoff` before they enter append-only memory. This is not just
+metadata: `MultiSlotOuterModel.read(...)` and `read_bucket(...)` filter slots
+by `cache_read_cutoff`, so both oracle encode passes see the same snapshot.
+
+## Runtime Memory Ownership
+
+Current Exp23/24 CRCT uses rank 3 as the teacher/oracle owner and train ranks
+as local controller-memory owners. Rank 3 scores the matched train batch and
+writes its oracle memory after scoring; train ranks append their own consumed
+payload batches locally after backward. That means the controller target is a
+rank-3 oracle label, while the forward-path memory read on a train rank is from
+that rank's local append-only memory. The runner exposes per-rank
+`memory_slots` plus transport counters so drift is visible in result JSON.
+
+A future "single central memory" variant would need to broadcast encoded memory
+slot deltas from rank 3 to train ranks. That is a different transport contract,
+not the one this document is claiming for the current runner.
 
 ## Controller Target Transform
 

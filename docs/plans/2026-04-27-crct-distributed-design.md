@@ -183,11 +183,13 @@ training ranks invoke `score_fn` inline through the synchronous-mode
 ```
 
 Causal order locks: rank 3 reads cache → scores → broadcasts targets →
-**then** drains write events. The `dist.gather` at step 2 carries both
-input_ids and the per-rank write-event payload (Pass C slot format);
-rank 3's reap (step 1) and broadcast post (carried over from prior
-iteration) happen before the new gather lands. Lag = 1 step is the
-simplest start; bounded by `crct_pg` round-trip latency.
+**then** admits writes with event ids newer than the scoring transaction's
+read cutoff. The current runner uses matched-batch `all_gather_into_tensor`
+for input ids and a separate broadcast for dense teacher payloads; it does
+not piggyback write-event payloads on that collective. Rank 3's reap
+(step 1) and broadcast post (carried over from the prior iteration) happen
+before the new gather lands. Lag = 1 step is the simplest start; bounded by
+`crct_pg` round-trip latency.
 
 ## §4. Failure / fallback
 

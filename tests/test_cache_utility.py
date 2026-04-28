@@ -4,9 +4,10 @@ The rank-3 oracle scoring module computes per-token utility signals
 (NLL with-memory minus NLL without-memory) and converts them into a
 controller probability target plus a positive-only loss reweighting.
 
-These tests are intentionally self-contained: ``TransactionalWakeCache``
-and ``model.encode(memory_mode=...)`` land on parallel branches; the
-mocks here document the contract the wiring task will satisfy.
+Most tests are intentionally self-contained: the lightweight mocks document
+the contract between the rank-3 scorer, ``TransactionalWakeCache``, and
+``model.encode(memory_mode=..., cache_read_cutoff=...)``. A small real-model
+regression test pins the same-batch causal cutoff end to end.
 """
 from __future__ import annotations
 
@@ -27,6 +28,8 @@ from chaoscontrol.cache_utility import (
     positive_only_lm_weight,
     rank3_score_batch_causal,
 )
+from chaoscontrol.model import ChaosStudentLM
+from chaoscontrol.wake_cache_txn import TransactionalWakeCache
 
 
 # ---------------------------------------------------------------------------
@@ -121,12 +124,14 @@ class _MockModel(nn.Module):
         *,
         score: torch.Tensor | None = None,
         max_tokens: int | None = None,
+        event_ids: torch.Tensor | None = None,
     ) -> bool:
         self.append_calls.append(
             {
                 "hidden": hidden.detach().clone(),
                 "score": None if score is None else score.detach().clone(),
                 "max_tokens": max_tokens,
+                "event_ids": None if event_ids is None else event_ids.detach().clone(),
             }
         )
         return True
@@ -151,8 +156,21 @@ class TestPositiveOnlyLmWeight:
         u = torch.full((2, 4), -1e6)
         mask = torch.ones_like(u, dtype=torch.bool)
         w = positive_only_lm_weight(u, mask, tau=0.1, strength=0.1, w_max=1.15)
-        # sigmoid → 0, raw → 1, mean → 1, normalized → 1.
+        # relu(tanh(.)) → 0, raw → 1, mean → 1, normalized → 1.
         assert torch.allclose(w[mask], torch.full_like(w[mask], 1.0), atol=1e-4)
+
+    def test_matches_positive_only_relu_tanh_reference(self) -> None:
+        u = torch.tensor([[-0.50, 0.0, 0.25, 1.0]])
+        mask = torch.ones_like(u, dtype=torch.bool)
+        tau = 0.5
+        strength = 0.2
+        w = positive_only_lm_weight(u, mask, tau=tau, strength=strength, w_max=2.0)
+
+        raw = 1.0 + strength * torch.relu(torch.tanh(u.float() / tau))
+        expected = raw / raw[mask].mean()
+        torch.testing.assert_close(w, expected, rtol=0, atol=1e-6)
+        assert raw[0, 0].item() == 1.0
+        assert raw[0, 1].item() == 1.0
 
     def test_mixed_signs_upweight_positives_relative_to_negatives(self) -> None:
         # Half saturated positive, half saturated negative.
@@ -451,6 +469,93 @@ class TestRank3ScoreBatchCausal:
         assert call["hidden"].shape == (2, 5, model._dim)
         assert call["score"].shape == out["utility"].shape
         assert call["max_tokens"] == 3
+        assert call["event_ids"] is None
+
+    def test_update_model_memory_reserves_event_ids_when_cache_supports_it(self) -> None:
+        class _ClockedMockCache(_MockCache):
+            def __init__(self) -> None:
+                super().__init__(cutoff=9)
+                self.reserved: tuple[int, torch.device] | None = None
+
+            def reserve_event_ids(
+                self,
+                n: int,
+                *,
+                device: torch.device | str | None = None,
+            ) -> torch.Tensor:
+                dev = torch.device("cpu" if device is None else device)
+                self.reserved = (int(n), dev)
+                return torch.arange(10, 10 + int(n), dtype=torch.long, device=dev)
+
+        model = _MockModel(dim=8, vocab=32, seed=3)
+        cache = _ClockedMockCache()
+        ids = torch.randint(0, 32, (2, 6))
+        mask = torch.ones((2, 6), dtype=torch.bool)
+
+        rank3_score_batch_causal(
+            model=model,
+            cache=cache,
+            input_ids=ids,
+            valid_mask=mask,
+            update_model_memory_after=True,
+            memory_write_tokens=3,
+        )
+
+        assert cache.reserved == (10, ids.device)
+        event_ids = model.append_calls[0]["event_ids"]
+        assert event_ids is not None
+        assert event_ids.tolist() == list(range(10, 20))
+
+    def test_update_model_memory_writes_slots_newer_than_oracle_cutoff(self) -> None:
+        torch.manual_seed(17)
+        model = ChaosStudentLM(
+            vocab_size=64,
+            dim=8,
+            num_layers=1,
+            ff_mult=2,
+            a_mode="diag",
+            rich_b_mode="none",
+            outer_model_dim=8,
+            outer_model_type="multislot",
+            outer_max_slots=8,
+            buffer_mode="append_only",
+            retrieval_mode="bucket_mean",
+        )
+        assert model.outer_model is not None
+        with torch.no_grad():
+            model.outer_model.decoder.weight.copy_(torch.eye(8))
+        cache = TransactionalWakeCache(max_moments=0, max_hidden_buffer=0)
+        ids = torch.randint(0, 64, (1, 5))
+        mask = torch.ones_like(ids, dtype=torch.bool)
+
+        rank3_score_batch_causal(
+            model=model,
+            cache=cache,
+            input_ids=ids,
+            valid_mask=mask,
+            update_model_memory_after=True,
+            memory_write_tokens=2,
+        )
+
+        assert len(model.outer_model._slot_event_ids) == 2
+        assert min(model.outer_model._slot_event_ids) > 0
+        hidden_at_old_cutoff = model.outer_model.read_bucket(
+            1,
+            bucket_id=0,
+            read_cutoff=0,
+        )
+        hidden_after_commit = model.outer_model.read_bucket(
+            1,
+            bucket_id=0,
+            read_cutoff=cache.clock.current,
+        )
+        torch.testing.assert_close(
+            hidden_at_old_cutoff,
+            torch.zeros_like(hidden_at_old_cutoff),
+            rtol=0,
+            atol=0,
+        )
+        assert hidden_after_commit.norm().item() > 0.0
 
     def test_confidence_in_unit_interval(self) -> None:
         model, cache, ids, mask = self._setup()

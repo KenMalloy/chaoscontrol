@@ -356,6 +356,7 @@ def test_crct_teacher_payload_appends_memory_after_scoring() -> None:
     assert payload["target"].shape == targets.shape
     assert payload["loss_weight"].shape == targets.shape
     assert len(model.outer_model._slots) == 3
+    assert min(model.outer_model._slot_event_ids) > 0
 
     with torch.no_grad():
         h_off = model.encode(inputs, memory_mode="off")

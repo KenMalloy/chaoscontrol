@@ -10,9 +10,9 @@ memory minus NLL with episodic memory — and converts it into:
 * per-entry credit/debit accumulators for memory housekeeping.
 
 The whole module runs on rank 3, which is otherwise idle during training.
-It assumes ``model.encode(memory_mode=...)`` and a transactional cache
-with a monotone read-cutoff clock — both land on parallel branches and
-will be wired into ``runner_fast_path.py`` in a follow-up task.
+It uses ``model.encode(memory_mode=..., cache_read_cutoff=...)`` and a
+transactional cache with a monotone event-id clock so scoring sees a stable
+memory snapshot and same-batch writes become visible only after scoring.
 """
 from __future__ import annotations
 
@@ -50,18 +50,20 @@ def positive_only_lm_weight(
     """Per-token language-model loss weight that never downweights.
 
     Tokens where memory helped (utility > 0) get a soft upweight via
-    ``1 + strength * sigmoid(utility / tau)``; tokens where memory hurt
-    (utility < 0) bottom out at ``1.0`` because ``sigmoid → 0``. The
-    raw weight is clamped to ``[1.0, w_max]`` as a safety bound, then
-    mean-1 normalized over the valid positions so the total gradient
-    magnitude across the batch is unchanged.
+    ``1 + strength * relu(tanh(utility / tau))``. Tokens where memory
+    hurt (utility <= 0) bottom out at ``1.0`` exactly, so a neutral
+    utility carries no hidden upweight before normalization. The raw
+    weight is clamped to ``[1.0, w_max]`` as a safety bound, then mean-1
+    normalized over the valid positions so the total gradient magnitude
+    across the batch is unchanged.
 
     Invalid positions (``mask == False``) are set to zero — they do
     not contribute to the mean and do not flow gradients through the
     LM head.
     """
     mask_bool = mask.bool()
-    raw = 1.0 + strength * torch.sigmoid(utility.float() / tau)
+    positive_utility = torch.relu(torch.tanh(utility.float() / tau))
+    raw = 1.0 + strength * positive_utility
     weights = raw.clamp(min=1.0, max=w_max)
 
     if mask_bool.any():
@@ -369,11 +371,19 @@ def rank3_score_batch_causal(
                 "rank3_score_batch_causal(update_model_memory_after=True) "
                 "requires model.append_memory_from_hidden(...)"
             )
+        event_ids = None
+        reserve_event_ids = getattr(cache, "reserve_event_ids", None)
+        if callable(reserve_event_ids):
+            event_ids = reserve_event_ids(
+                int(h_off.shape[0] * h_off.shape[1]),
+                device=h_off.device,
+            )
         wrote = bool(
             append_fn(
                 h_off.detach(),
                 score=utility.detach(),
                 max_tokens=memory_write_tokens,
+                event_ids=event_ids,
             )
         )
         if not wrote:

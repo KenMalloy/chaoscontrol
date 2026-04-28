@@ -45,6 +45,32 @@ def test_commit_is_single_use():
         cache.commit(txn)
 
 
+def test_rollback_closes_transaction_without_marking_committed():
+    cache = TransactionalWakeCache()
+    txn = cache.begin_batch()
+    _moment(cache, 1.0, txn=txn)
+
+    cache.rollback(txn)
+    assert not txn.committed
+    assert txn.rolled_back
+    assert len(cache.moments) == 0
+
+    with pytest.raises(RuntimeError, match="already been rolled back"):
+        cache.commit(txn)
+    with pytest.raises(RuntimeError, match="closed CacheTxn"):
+        _moment(cache, 2.0, txn=txn)
+
+
+def test_reserve_event_ids_advances_same_clock_as_transaction_cutoff():
+    cache = TransactionalWakeCache()
+    txn = cache.begin_batch()
+    ids = cache.reserve_event_ids(3)
+
+    assert txn.read_cutoff == 0
+    assert ids.tolist() == [1, 2, 3]
+    assert cache.clock.current == 3
+
+
 def test_immediate_write_gets_new_event_id_and_respects_wakecache_eviction():
     cache = TransactionalWakeCache(max_moments=2)
     _moment(cache, 0.1)

@@ -202,6 +202,46 @@ class TestChaosStudentLM(unittest.TestCase):
         assert out["memory_meta"]["cache_read_cutoff"] == 123
         assert out["memory_meta"]["memory_gate"].shape == (2, 6)
 
+    def test_encode_cache_read_cutoff_filters_append_only_multislot_reads(self) -> None:
+        torch.manual_seed(4)
+        model = ChaosStudentLM(
+            vocab_size=64,
+            dim=8,
+            num_layers=1,
+            ff_mult=2,
+            a_mode="diag",
+            rich_b_mode="none",
+            outer_model_dim=8,
+            outer_model_type="multislot",
+            outer_max_slots=8,
+            buffer_mode="append_only",
+            retrieval_mode="bucket_mean",
+        )
+        assert model.outer_model is not None
+        with torch.no_grad():
+            model.outer_model.decoder.weight.copy_(torch.eye(8))
+        model.outer_model._append_kv_batch_committed(
+            torch.ones(1, 8),
+            torch.tensor([0]),
+            event_ids=torch.tensor([2]),
+        )
+        ids = torch.randint(0, 64, (2, 6))
+
+        h_off = model.encode(ids, memory_mode="off")
+        h_cutoff_before_write = model.encode(
+            ids,
+            memory_mode="force_on",
+            cache_read_cutoff=1,
+        )
+        h_cutoff_at_write = model.encode(
+            ids,
+            memory_mode="force_on",
+            cache_read_cutoff=2,
+        )
+
+        torch.testing.assert_close(h_cutoff_before_write, h_off, rtol=0, atol=0)
+        assert not torch.allclose(h_cutoff_at_write, h_off)
+
 
 class TestChaosStudentLMHybrid(unittest.TestCase):
     def test_student_lm_with_hybrid_top_block(self) -> None:
