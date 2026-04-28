@@ -965,6 +965,39 @@ def _crct_central_broadcast_diagnostics(metrics: dict[str, Any]) -> dict[str, An
     return out
 
 
+def _crct_merge_slot_broadcast_diagnostics(
+    rank_diags: list[dict[str, Any] | None],
+) -> dict[str, Any] | None:
+    """Combine per-rank slot_broadcast counters into one summary view.
+
+    Why: each rank tracks its own role — the memory rank counts
+    ``publishes_sent``; receiver ranks count ``publishes_received``.
+    Serializing only the memory rank's view leaves ``publishes_received``
+    structurally zero and hides whether receivers actually got the
+    broadcast. The merged view replaces ``publishes_received`` with the
+    sum across receivers and exposes the per-receiver breakdown so a
+    silently-dropped broadcast is observable.
+    """
+    sender: dict[str, Any] | None = None
+    receiver_received: list[int] = []
+    for diag in rank_diags:
+        if diag is None:
+            continue
+        slot_broadcast = diag.get("slot_broadcast")
+        if slot_broadcast is None:
+            continue
+        if bool(diag.get("is_memory_rank", False)):
+            sender = slot_broadcast
+        else:
+            receiver_received.append(int(slot_broadcast.get("publishes_received", 0)))
+    if sender is None:
+        return None
+    merged = dict(sender)
+    merged["publishes_received"] = sum(receiver_received)
+    merged["publishes_received_per_rank"] = receiver_received
+    return merged
+
+
 def _crct_publish_central_slots(
     *,
     model: torch.nn.Module,
@@ -7779,10 +7812,12 @@ def train_fast_for_budget(
                 crct_gradient_conflict_summary = dict(
                     diag.get("gradient_conflict", crct_gradient_conflict_summary)
                 )
-                crct_slot_broadcast_summary = dict(
-                    diag.get("slot_broadcast", crct_slot_broadcast_summary)
-                )
                 break
+        merged_slot_broadcast = _crct_merge_slot_broadcast_diagnostics(
+            crct_rank_diagnostics
+        )
+        if merged_slot_broadcast is not None:
+            crct_slot_broadcast_summary = merged_slot_broadcast
     timing = summarize_train_timing(
         steps=steps,
         elapsed_s=elapsed_s,
