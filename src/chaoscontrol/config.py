@@ -168,6 +168,17 @@ class ChaosControlConfig:
     replay_eviction_max_seconds: float = 0.5
     replay_eviction_trace_path: str = ""
     replay_eviction_trace_max_rows: int = 0
+    replay_eviction_probe_chunk_size: int = 16
+    replay_eviction_drift_threshold: float = 0.3
+    replay_eviction_repr_drift_threshold: float = 0.2
+    replay_eviction_refresh_lr: float = 0.1
+    replay_eviction_refresh_margin: float = 0.001
+    replay_eviction_quarantine_threshold: float = -0.01
+    replay_eviction_max_quarantined: int = 8
+    replay_eviction_quarantine_release_streak: int = 2
+    replay_eviction_distill_peak_threshold: float = 0.04
+    replay_eviction_useful_threshold: float = 0.005
+    replay_eviction_min_score_count: int = 2
 
     def __post_init__(self) -> None:
         if self.buffer_mode not in _VALID_BUFFER_MODES:
