@@ -1424,7 +1424,12 @@ def build_crct_v1_matrix(
         "crct_async_teacher_max_lag_steps": 128,
         "crct_async_teacher_payload_dtype": "auto",
         "crct_teacher_score_interval_steps": 64,
-        "crct_teacher_param_sync_interval_steps": 64,
+        # Keep the rank-3 teacher as a true sidecar in the headline matrix:
+        # the teacher may run on a stale-but-consistent model snapshot, but it
+        # must never force rank 0 to rendezvous on the trunk clock. Explicit
+        # transport tests still cover synchronous param refresh when a caller
+        # opts into a positive interval.
+        "crct_teacher_param_sync_interval_steps": 0,
         "outer_model_dim": 64,
         "outer_model_type": "multislot",
         "outer_max_slots": 4096,
