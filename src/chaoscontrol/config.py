@@ -160,6 +160,15 @@ class ChaosControlConfig:
     polyphasic_topology: str = "slot_striped"  # "slot_striped" or "bucket_owned"
     polyphasic_swap_interval: int = 256
 
+    # Replay-eviction loop (CRCT rank-3 idle maintenance)
+    replay_eviction_enabled: bool = False
+    replay_eviction_threshold: float = 0.01
+    replay_eviction_ema_beta: float = 0.9
+    replay_eviction_min_age_steps: int = 128
+    replay_eviction_max_seconds: float = 0.5
+    replay_eviction_trace_path: str = ""
+    replay_eviction_trace_max_rows: int = 0
+
     def __post_init__(self) -> None:
         if self.buffer_mode not in _VALID_BUFFER_MODES:
             raise ValueError(
