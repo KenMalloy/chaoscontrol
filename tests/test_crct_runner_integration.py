@@ -157,38 +157,45 @@ def _worker_async_crct_transport(
         mod = _load_module(f"runner_fast_path_crct_async_{rank}", RUNNER_PATH)
         model = _tiny_crct_model()
         cache = TransactionalWakeCache(max_moments=0, max_hidden_buffer=0)
-        all_group = dist.new_group(list(range(world_size)))
-        transport = mod._CrctAsyncTeacherTransport(
-            rank=rank,
-            world_size=world_size,
-            all_group=all_group,
-            payload_shape=(world_size - 1, 2, 5),
-            full_ids_shape=(2, 6),
-            device=torch.device("cpu"),
-            payload_dtype=torch.float32,
-            max_local_batches=8,
-            max_payload_lag_steps=8,
-        )
+        teacher_group = dist.new_group([0, world_size - 1])
+        transport = None
+        if rank in {0, world_size - 1}:
+            transport = mod._CrctAsyncTeacherTransport(
+                rank=rank,
+                world_size=world_size,
+                teacher_group=teacher_group,
+                payload_shape=(1, 2, 5),
+                full_ids_shape=(2, 6),
+                device=torch.device("cpu"),
+                payload_dtype=torch.float32,
+                max_local_batches=8,
+                max_payload_lag_steps=8,
+            )
         expected: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
         matched: list[dict[str, object]] = []
         base = torch.arange(10, dtype=torch.long).reshape(2, 5)
         for step in range(6):
             inputs = ((base + rank * 7 + step * 3) % 32).to(dtype=torch.int32)
             targets = ((base + rank * 7 + step * 3 + 1) % 32).to(dtype=torch.long)
-            if rank < world_size - 1:
+            if rank == 0:
                 expected[step] = (inputs.clone(), targets.clone())
-            ready = transport.begin_step(inputs=inputs, targets=targets, step=step)
+            ready = (
+                transport.begin_step(inputs=inputs, targets=targets, step=step)
+                if transport is not None
+                else None
+            )
 
             # Make the unit test deterministic without changing production
             # semantics: production polls; this test waits so the next step can
             # reap the previous broadcast and prove the batch join is exact.
-            for slot in list(transport.pending_result_broadcasts):
-                for work in slot["works"]:
-                    work.wait()
-            for slot in list(transport.pending_input_gathers):
-                slot["work"].wait()
+            if transport is not None:
+                for slot in list(transport.pending_result_broadcasts):
+                    for work in slot["works"]:
+                        work.wait()
+                for slot in list(transport.pending_input_requests):
+                    slot["work"].wait()
 
-            if ready is not None and rank < world_size - 1:
+            if ready is not None and rank == 0:
                 payload, train_inputs, train_targets = ready
                 request_step = int(payload["step_id"].item())
                 exp_inputs, exp_targets = expected[request_step]
@@ -205,27 +212,44 @@ def _worker_async_crct_transport(
                     }
                 )
 
-            transport.after_optimizer_step(
-                model=model,
-                cache=cache,
-                scarcity_optimizer=None,
-                step=step,
-                total_steps=8,
-                tau=0.1,
-                strength=0.1,
-                w_max=1.2,
-                alpha_max=0.15,
-                memory_write_tokens=4,
-            )
+            if transport is not None:
+                transport.after_optimizer_step(
+                    model=model,
+                    cache=cache,
+                    scarcity_optimizer=None,
+                    step=step,
+                    total_steps=8,
+                    tau=0.1,
+                    strength=0.1,
+                    w_max=1.2,
+                    alpha_max=0.15,
+                    memory_write_tokens=4,
+                )
+            # Test-only synchronization: production deliberately polls the
+            # side channel, but this unit test wants deterministic proof that
+            # each scored rank0 request can be joined back to its originating
+            # local batch.
+            dist.barrier()
 
-        transport.close()
+        if transport is not None:
+            transport.close()
         Path(result_dir, f"rank{rank}.json").write_text(
             json.dumps(
                 {
                     "rank": int(rank),
                     "matched": matched,
                     "slots": int(len(model.outer_model._slots)),
-                    "diagnostics": transport.diagnostics(),
+                    "diagnostics": (
+                        transport.diagnostics()
+                        if transport is not None
+                        else {
+                            "mode": "async_rank0_memory_broadcast",
+                            "participant": False,
+                            "requests_started": 0,
+                            "payloads_used": 0,
+                            "errors": 0,
+                        }
+                    ),
                 }
             )
         )
@@ -552,20 +576,30 @@ def test_crct_async_teacher_transport_matches_stored_batch() -> None:
             for rank in range(world_size)
         ]
 
-    for rec in records[:3]:
-        assert len(rec["matched"]) >= 2
-        assert all(row["matched_inputs"] for row in rec["matched"])
-        assert all(row["matched_targets"] for row in rec["matched"])
-        assert all(row["finite"] for row in rec["matched"])
-        diag = rec["diagnostics"]
-        assert diag["mode"] == "async_allgather_broadcast"
-        assert diag["requests_started"] == 6
-        assert diag["payloads_used"] == len(rec["matched"])
-        assert diag["sentinels_received"] >= 1
-        assert diag["payload_lag_steps_max"] >= 1
-        assert diag["orphan_payloads_dropped"] == 0
-        assert diag["stale_payloads_dropped"] == 0
-        assert diag["errors"] == 0
+    rank0 = records[0]
+    assert len(rank0["matched"]) >= 2
+    assert all(row["matched_inputs"] for row in rank0["matched"])
+    assert all(row["matched_targets"] for row in rank0["matched"])
+    assert all(row["finite"] for row in rank0["matched"])
+    diag = rank0["diagnostics"]
+    assert diag["mode"] == "async_rank0_memory_broadcast"
+    assert diag["transport_group"] == "rank0_memory"
+    assert diag["participant"] is True
+    assert diag["coordinator_rank"] == 0
+    assert diag["memory_rank"] == 3
+    assert diag["requests_started"] == 6
+    assert diag["request_broadcasts_started"] == 6
+    assert diag["payloads_used"] == len(rank0["matched"])
+    assert diag["sentinels_received"] >= 1
+    assert diag["payload_lag_steps_max"] >= 1
+    assert diag["orphan_payloads_dropped"] == 0
+    assert diag["stale_payloads_dropped"] == 0
+    assert diag["errors"] == 0
+
+    for rec in records[1:3]:
+        assert rec["matched"] == []
+        assert rec["diagnostics"]["participant"] is False
+        assert rec["diagnostics"]["requests_started"] == 0
 
     memory_diag = records[3]["diagnostics"]
     assert memory_diag["payloads_scored"] >= 3
@@ -585,11 +619,14 @@ def test_crct_async_teacher_transport_wired_into_train_loop() -> None:
         )
         crct = json.loads(Path(tmp, "rank0.json").read_text())
 
-    assert crct["teacher_transport_mode"] == "async_allgather_broadcast"
+    assert crct["teacher_transport_mode"] == "async_rank0_memory_broadcast"
     assert crct["async_teacher_transport"] is True
     assert crct["teacher_requests"] == 5
     assert crct["teacher_payloads"] >= 1
     assert crct["teacher_fail_open"] >= 1
+    assert crct["teacher_coordinator_rank"] == 0
+    assert crct["teacher_memory_rank"] == 3
+    assert crct["teacher_bypass_steps"] == 0
     assert crct["teacher_param_sync_interval_steps"] == 1
     assert crct["teacher_param_syncs"] >= 1
     assert crct["memory_owner"] == "rank3_teacher_only"
@@ -613,8 +650,17 @@ def test_crct_async_teacher_transport_wired_into_train_loop() -> None:
     assert ranks[3]["stop_sync_group"] == "local"
     assert ranks[1]["memory_slots"] == 0
     assert ranks[2]["memory_slots"] == 0
+    assert ranks[1]["teacher_transport_participant"] is False
+    assert ranks[2]["teacher_transport_participant"] is False
+    assert ranks[1]["teacher_bypass_steps"] == 5
+    assert ranks[2]["teacher_bypass_steps"] == 5
+    assert ranks[1]["transport"]["participant"] is False
+    assert ranks[2]["transport"]["participant"] is False
+    assert ranks[1]["transport"]["requests_started"] == 0
+    assert ranks[2]["transport"]["requests_started"] == 0
     assert ranks[3]["memory_slots"] == crct["teacher_memory_slots"]
     assert train0["requests_started"] == 5
+    assert train0["request_broadcasts_started"] == 5
     assert train0["pre_sync_waits"] >= 1
     assert train0["payloads_used"] == crct["teacher_payloads"]
     assert train0["errors"] == 0

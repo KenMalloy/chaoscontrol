@@ -1062,17 +1062,20 @@ def _dist_work_done(work: Any) -> bool:
 class _CrctAsyncTeacherTransport:
     """Nonblocking CRCT teacher transport with matched-batch replay.
 
-    Every rank enters the same collective sequence each step:
+    Only rank 0 and the memory rank enter this transport. Ranks 1..N-2 stay
+    entirely inside the train-rank gradient subgroup; they do not know that the
+    sparse teacher side channel exists. The two participating ranks enter the
+    same sparse collective sequence:
 
-    1. broadcast the previous scored payload (or a sentinel),
-    2. all-gather this step's input ids for rank ``world_size - 1``.
+    1. memory-rank broadcasts the previous scored payload (or a sentinel),
+    2. rank 0 broadcasts this step's input ids to the memory rank.
 
-    Train ranks do not wait for either collective. They use a payload only
-    when a completed broadcast's ``request_step`` still has its original
-    ``(inputs, targets)`` in the local request table; otherwise the main
-    trainer falls open for that step. Rank 3 scores completed gathers after
-    the optimizer/all-reduce window via ``after_optimizer_step()``, so the
-    teacher work can be hidden under the next train-rank forward.
+    Rank 0 does not wait for either collective. It uses a payload only when a
+    completed broadcast's ``request_step`` still has its original
+    ``(inputs, targets)`` in the local request table; otherwise it fails open
+    for that step. The memory rank scores completed requests after the
+    optimizer/all-reduce window via ``after_optimizer_step()``, so teacher work
+    can overlap the next train-rank forward.
     """
 
     def __init__(
@@ -1080,7 +1083,7 @@ class _CrctAsyncTeacherTransport:
         *,
         rank: int,
         world_size: int,
-        all_group: "dist.ProcessGroup",
+        teacher_group: "dist.ProcessGroup",
         payload_shape: tuple[int, int, int],
         full_ids_shape: tuple[int, int],
         device: torch.device,
@@ -1088,12 +1091,14 @@ class _CrctAsyncTeacherTransport:
         max_local_batches: int,
         max_payload_lag_steps: int,
         score_interval_steps: int = 1,
+        coordinator_rank: int = 0,
     ) -> None:
         self.rank = int(rank)
         self.world_size = int(world_size)
         self.memory_rank = self.world_size - 1
         self.n_train = self.world_size - 1
-        self.all_group = all_group
+        self.coordinator_rank = int(coordinator_rank)
+        self.teacher_group = teacher_group
         self.payload_shape = tuple(int(x) for x in payload_shape)
         self.full_ids_shape = tuple(int(x) for x in full_ids_shape)
         self.device = device
@@ -1102,13 +1107,17 @@ class _CrctAsyncTeacherTransport:
         self.max_payload_lag_steps = max(0, int(max_payload_lag_steps))
         self.score_interval_steps = max(1, int(score_interval_steps))
         self.pending_result_broadcasts: deque[dict[str, Any]] = deque()
-        self.pending_input_gathers: deque[dict[str, Any]] = deque()
+        self.pending_input_requests: deque[dict[str, Any]] = deque()
         self.local_batches_by_step: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
         self.local_batch_order: deque[int] = deque()
         self.ready_result: dict[str, torch.Tensor] | None = None
         self.ready_result_request_step: int | None = None
         self.metrics: dict[str, Any] = {
-            "mode": "async_allgather_broadcast",
+            "mode": "async_rank0_memory_broadcast",
+            "transport_group": "rank0_memory",
+            "coordinator_rank": int(self.coordinator_rank),
+            "memory_rank": int(self.memory_rank),
+            "participant": True,
             "payload_dtype": str(payload_dtype).replace("torch.", ""),
             "request_shape": list(self.full_ids_shape),
             "payload_shape": list(self.payload_shape),
@@ -1118,8 +1127,8 @@ class _CrctAsyncTeacherTransport:
             "requests_started": 0,
             "result_broadcasts_started": 0,
             "result_broadcasts_completed": 0,
-            "input_gathers_started": 0,
-            "input_gathers_completed": 0,
+            "request_broadcasts_started": 0,
+            "request_broadcasts_completed": 0,
             "request_interval_skips": 0,
             "broadcast_interval_skips": 0,
             "requests_stored": 0,
@@ -1137,7 +1146,7 @@ class _CrctAsyncTeacherTransport:
             "completed_requests_dropped": 0,
             "ready_result_drops": 0,
             "shutdown_result_broadcasts_drained": 0,
-            "shutdown_input_gathers_drained": 0,
+            "shutdown_input_requests_drained": 0,
             "pre_sync_waits": 0,
             "pre_sync_wait_seconds_sum": 0.0,
             "pre_sync_wait_seconds_max": 0.0,
@@ -1146,7 +1155,7 @@ class _CrctAsyncTeacherTransport:
             "payload_lag_steps_sum": 0,
             "payload_lag_steps_max": 0,
             "max_pending_result_broadcasts": 0,
-            "max_pending_input_gathers": 0,
+            "max_pending_input_requests": 0,
             "max_local_pending_batches": 0,
             "last_scored_request_step": None,
             "last_sent_request_step": None,
@@ -1164,6 +1173,13 @@ class _CrctAsyncTeacherTransport:
         targets: torch.Tensor,
         step: int,
     ) -> tuple[dict[str, torch.Tensor], torch.Tensor, torch.Tensor] | None:
+        if self.rank == self.memory_rank:
+            # The memory rank has a much lighter per-step body than rank 0.
+            # Without side-channel backpressure it can queue teacher-group
+            # collectives several steps ahead, then collide with later world
+            # diagnostics. Throttle only the sidecar; ranks 1..N-2 still never
+            # enter teacher traffic, and rank 0 stays on the trunk clock.
+            self.wait_for_pending_collectives()
         payload_tuple = self._reap_result_broadcasts(current_step=int(step))
         interval = int(self.score_interval_steps)
         score_due = int(step) % interval == 0
@@ -1179,7 +1195,11 @@ class _CrctAsyncTeacherTransport:
         if not score_due:
             self.metrics["request_interval_skips"] += 1
             return payload_tuple
-        self._issue_input_all_gather(inputs=inputs, targets=targets, step=int(step))
+        self._issue_input_request_broadcast(
+            inputs=inputs,
+            targets=targets,
+            step=int(step),
+        )
         return payload_tuple
 
     def after_optimizer_step(
@@ -1197,7 +1217,7 @@ class _CrctAsyncTeacherTransport:
         memory_write_tokens: int,
         gradient_conflict_monitor: CrctGradientConflictMonitor | None = None,
     ) -> None:
-        completed = self._reap_input_gathers()
+        completed = self._reap_input_requests()
         if self.rank != self.memory_rank:
             return
         if not completed:
@@ -1217,15 +1237,10 @@ class _CrctAsyncTeacherTransport:
             self.metrics["last_drop_reason"] = "newer_completed_request_won"
         slot = completed[-1]
         request_step = int(slot["step"])
-        gathered = slot["buffer"]
+        request_full_ids = slot["buffer"]
         try:
-            batch = self.full_ids_shape[0]
-            train_full_ids = gathered[: self.n_train * batch].reshape(
-                self.n_train * self.full_ids_shape[0],
-                self.full_ids_shape[1],
-            )
-            train_inputs = train_full_ids[:, :-1].to(dtype=torch.int32)
-            train_targets = train_full_ids[:, 1:].to(dtype=torch.long)
+            train_inputs = request_full_ids[:, :-1].to(dtype=torch.int32)
+            train_targets = request_full_ids[:, 1:].to(dtype=torch.long)
             t0 = time.perf_counter()
             scored = _crct_score_payload_inline(
                 model=model,
@@ -1265,7 +1280,7 @@ class _CrctAsyncTeacherTransport:
         out.update(
             {
                 "pending_result_broadcasts": len(self.pending_result_broadcasts),
-                "pending_input_gathers": len(self.pending_input_gathers),
+                "pending_input_requests": len(self.pending_input_requests),
                 "local_pending_batches": len(self.local_batches_by_step),
                 "ready_result_pending": self.ready_result is not None,
                 "ready_result_request_step": self.ready_result_request_step,
@@ -1302,7 +1317,7 @@ class _CrctAsyncTeacherTransport:
                 if wait is not None:
                     wait()
                     waited = True
-        for slot in self.pending_input_gathers:
+        for slot in self.pending_input_requests:
             wait = getattr(slot["work"], "wait", None)
             if wait is not None:
                 wait()
@@ -1331,12 +1346,12 @@ class _CrctAsyncTeacherTransport:
                 ).strip()
                 self.metrics["last_drop_reason"] = "shutdown_broadcast_wait_error"
                 break
-        while self.pending_input_gathers:
-            slot = self.pending_input_gathers.popleft()
+        while self.pending_input_requests:
+            slot = self.pending_input_requests.popleft()
             try:
                 slot["work"].wait()
-                self.metrics["input_gathers_completed"] += 1
-                self.metrics["shutdown_input_gathers_drained"] += 1
+                self.metrics["request_broadcasts_completed"] += 1
+                self.metrics["shutdown_input_requests_drained"] += 1
             except Exception as exc:
                 self.metrics["errors"] += 1
                 self.metrics["last_error"] = "".join(
@@ -1410,31 +1425,31 @@ class _CrctAsyncTeacherTransport:
             dist.broadcast(
                 buffers["target"],
                 src=self.memory_rank,
-                group=self.all_group,
+                group=self.teacher_group,
                 async_op=True,
             ),
             dist.broadcast(
                 buffers["confidence"],
                 src=self.memory_rank,
-                group=self.all_group,
+                group=self.teacher_group,
                 async_op=True,
             ),
             dist.broadcast(
                 buffers["loss_weight"],
                 src=self.memory_rank,
-                group=self.all_group,
+                group=self.teacher_group,
                 async_op=True,
             ),
             dist.broadcast(
                 buffers["utility"],
                 src=self.memory_rank,
-                group=self.all_group,
+                group=self.teacher_group,
                 async_op=True,
             ),
             dist.broadcast(
                 buffers["meta"],
                 src=self.memory_rank,
-                group=self.all_group,
+                group=self.teacher_group,
                 async_op=True,
             ),
         ]
@@ -1447,7 +1462,7 @@ class _CrctAsyncTeacherTransport:
             len(self.pending_result_broadcasts),
         )
 
-    def _issue_input_all_gather(
+    def _issue_input_request_broadcast(
         self,
         *,
         inputs: torch.Tensor,
@@ -1460,7 +1475,7 @@ class _CrctAsyncTeacherTransport:
                 "CRCT async transport saw a dynamic batch shape: "
                 f"{tuple(full_ids.shape)} != {self.full_ids_shape}"
             )
-        if self.rank != self.memory_rank:
+        if self.rank == self.coordinator_rank:
             self.local_batches_by_step[int(step)] = (
                 inputs.detach().clone(),
                 targets.detach().clone(),
@@ -1472,25 +1487,27 @@ class _CrctAsyncTeacherTransport:
                 if self.local_batches_by_step.pop(old_step, None) is not None:
                     self.metrics["local_request_evictions"] += 1
                     self.metrics["last_drop_reason"] = "local_request_evicted"
-        gather_buf = torch.empty(
-            (self.world_size * self.full_ids_shape[0], self.full_ids_shape[1]),
-            device=self.device,
-            dtype=full_ids.dtype,
-        )
-        work = dist.all_gather_into_tensor(
-            gather_buf,
-            full_ids,
-            group=self.all_group,
+            request_buf = full_ids.detach().clone()
+        else:
+            request_buf = torch.empty(
+                self.full_ids_shape,
+                device=self.device,
+                dtype=full_ids.dtype,
+            )
+        work = dist.broadcast(
+            request_buf,
+            src=self.coordinator_rank,
+            group=self.teacher_group,
             async_op=True,
         )
-        self.pending_input_gathers.append(
-            {"work": work, "buffer": gather_buf, "step": int(step)}
+        self.pending_input_requests.append(
+            {"work": work, "buffer": request_buf, "step": int(step)}
         )
         self.metrics["requests_started"] += 1
-        self.metrics["input_gathers_started"] += 1
-        self.metrics["max_pending_input_gathers"] = max(
-            int(self.metrics["max_pending_input_gathers"]),
-            len(self.pending_input_gathers),
+        self.metrics["request_broadcasts_started"] += 1
+        self.metrics["max_pending_input_requests"] = max(
+            int(self.metrics["max_pending_input_requests"]),
+            len(self.pending_input_requests),
         )
         self.metrics["max_local_pending_batches"] = max(
             int(self.metrics["max_local_pending_batches"]),
@@ -1534,14 +1551,14 @@ class _CrctAsyncTeacherTransport:
                 continue
             payload = {
                 "step_id": torch.tensor(request_step, device=self.device),
-                "target": buffers["target"][self.rank].detach().clone().float(),
+                "target": buffers["target"][0].detach().clone().float(),
                 "confidence": (
-                    buffers["confidence"][self.rank].detach().clone().float()
+                    buffers["confidence"][0].detach().clone().float()
                 ),
                 "loss_weight": (
-                    buffers["loss_weight"][self.rank].detach().clone().float()
+                    buffers["loss_weight"][0].detach().clone().float()
                 ),
-                "utility": buffers["utility"][self.rank].detach().clone().float(),
+                "utility": buffers["utility"][0].detach().clone().float(),
             }
             if ready is not None:
                 self.metrics["superseded_payloads_dropped"] += 1
@@ -1558,14 +1575,14 @@ class _CrctAsyncTeacherTransport:
             )
         return ready
 
-    def _reap_input_gathers(self) -> list[dict[str, Any]]:
+    def _reap_input_requests(self) -> list[dict[str, Any]]:
         completed: list[dict[str, Any]] = []
-        while self.pending_input_gathers and _dist_work_done(
-            self.pending_input_gathers[0]["work"]
+        while self.pending_input_requests and _dist_work_done(
+            self.pending_input_requests[0]["work"]
         ):
-            completed.append(self.pending_input_gathers.popleft())
+            completed.append(self.pending_input_requests.popleft())
         if completed:
-            self.metrics["input_gathers_completed"] += len(completed)
+            self.metrics["request_broadcasts_completed"] += len(completed)
         return completed
 
 
@@ -5632,7 +5649,13 @@ def _run_train_step(
                         if grad_world_size is not None
                         else world_size - 1
                     )
-                    materialize_zeros = False
+                    # Rank0-only CRCT labels mean rank0 may produce
+                    # controller-head grads on payload steps while ranks 1/2
+                    # correctly skip that head. Materialize zeros inside the
+                    # train subgroup so the flattened grad buffer is identical
+                    # across train ranks without asking the memory rank to
+                    # join the trunk collective.
+                    materialize_zeros = bool(crct_enabled)
                 if n_train < 1:
                     raise ValueError(
                         "episodic rank topology requires world_size >= 2 "
@@ -6395,6 +6418,7 @@ def train_fast_for_budget(
     is_episodic_rank = False
     all_group = None
     train_group = None
+    teacher_group = None
     grad_group = None
     grad_world_size = world_size_
     memory_rank_joins_grad = True
@@ -6428,6 +6452,7 @@ def train_fast_for_budget(
             # without touching trunk SSM throughput.
             train_ranks = list(range(world_size_ - 1))
             train_group = dist.new_group(train_ranks)
+            teacher_group = dist.new_group([0, world_size_ - 1])
             grad_group = train_group
             grad_world_size = world_size_ - 1
             memory_rank_joins_grad = False
@@ -6938,6 +6963,7 @@ def train_fast_for_budget(
     )
     crct_teacher_transport: _CrctAsyncTeacherTransport | None = None
     crct_teacher_transport_mode = "disabled"
+    crct_teacher_bypass_steps = 0
     crct_rank_diagnostics: list[dict[str, Any] | None] | None = None
     if crct_enabled:
         crct_cache = TransactionalWakeCache(
@@ -6969,11 +6995,11 @@ def train_fast_for_budget(
                 trace_flush_rows=int(crct_gradient_conflict_trace_flush_rows),
             )
         crct_teacher_transport_mode = (
-            "async_allgather_broadcast"
+            "async_rank0_memory_broadcast"
             if (
                 bool(crct_async_teacher_transport)
                 and world_size_ >= 4
-                and all_group is not None
+                and teacher_group is not None
                 and dist.is_initialized()
             )
             else ("sync_collective" if world_size_ >= 4 else "inline")
@@ -7122,7 +7148,17 @@ def train_fast_for_budget(
                     stop_margin_seconds=stop_margin_seconds,
                     max_steps=max_steps,
                 )
-                if should_stop_now(local_stop, device, ddp_active):
+                stop_ddp_active = bool(ddp_active)
+                stop_group_eff = stop_group
+                if crct_enabled and not episodic_enabled and is_episodic_rank:
+                    stop_ddp_active = False
+                    stop_group_eff = None
+                if should_stop_now(
+                    local_stop,
+                    device,
+                    stop_ddp_active,
+                    group=stop_group_eff,
+                ):
                     break
 
             if prefetcher is not None:
@@ -7212,22 +7248,36 @@ def train_fast_for_budget(
             train_targets = targets
             if crct_enabled:
                 assert crct_cache is not None
-                crct_teacher_requests += 1
-                if crct_teacher_transport_mode == "async_allgather_broadcast":
-                    if crct_teacher_transport is None:
+                crct_transport_participant = (
+                    crct_teacher_transport_mode == "async_rank0_memory_broadcast"
+                    and rank_ in {0, world_size_ - 1}
+                )
+                if crct_teacher_transport_mode == "async_rank0_memory_broadcast":
+                    if not crct_transport_participant:
+                        crct_teacher_bypass_steps += 1
+                    else:
+                        crct_teacher_requests += 1
+                    if not crct_transport_participant:
+                        pass
+                    elif teacher_group is None:
+                        raise ValueError(
+                            "CRCT async rank0-memory transport requires "
+                            "teacher_group to be initialized"
+                        )
+                    elif crct_teacher_transport is None:
                         full_ids_shape = tuple(
                             int(x)
                             for x in _crct_full_input_ids(inputs, targets).shape
                         )
                         payload_shape = (
-                            world_size_ - 1,
+                            1,
                             int(targets.shape[0]),
                             int(targets.shape[1]),
                         )
                         crct_teacher_transport = _CrctAsyncTeacherTransport(
                             rank=rank_,
                             world_size=world_size_,
-                            all_group=all_group,
+                            teacher_group=teacher_group,
                             payload_shape=payload_shape,
                             full_ids_shape=full_ids_shape,
                             device=inputs.device,
@@ -7245,14 +7295,18 @@ def train_fast_for_budget(
                                 crct_teacher_score_interval_steps
                             ),
                         )
-                    ready = crct_teacher_transport.begin_step(
-                        inputs=inputs,
-                        targets=targets,
-                        step=steps,
-                    )
-                    if ready is not None:
-                        crct_payload, train_inputs, train_targets = ready
+                    if crct_teacher_transport is None:
+                        ready = None
+                    else:
+                        ready = crct_teacher_transport.begin_step(
+                            inputs=inputs,
+                            targets=targets,
+                            step=steps,
+                        )
+                        if ready is not None:
+                            crct_payload, train_inputs, train_targets = ready
                 else:
+                    crct_teacher_requests += 1
                     crct_payload = _collect_crct_teacher_payload(
                         model=model,
                         cache=crct_cache,
@@ -7272,8 +7326,9 @@ def train_fast_for_budget(
                         gradient_conflict_monitor=crct_gradient_conflict,
                     )
                 if crct_payload is None:
-                    crct_teacher_fail_open += 1
-                else:
+                    if rank_ == 0:
+                        crct_teacher_fail_open += 1
+                elif rank_ == 0:
                     crct_teacher_payloads += 1
 
             optimizer.zero_grad(set_to_none=True)
@@ -7600,7 +7655,7 @@ def train_fast_for_budget(
             if (
                 crct_teacher_transport is not None
                 and not bool(memory_rank_joins_grad)
-                and all_group is not None
+                and teacher_group is not None
                 and int(crct_teacher_param_sync_interval) > 0
                 and steps % int(crct_teacher_param_sync_interval) == 0
             ):
@@ -7609,7 +7664,7 @@ def train_fast_for_budget(
                 _broadcast_model_params_coalesced(
                     model,
                     src=0,
-                    group=all_group,
+                    group=teacher_group,
                 )
                 sync_s = time.perf_counter() - sync_t0
                 crct_teacher_param_syncs += 1
@@ -7721,9 +7776,15 @@ def train_fast_for_budget(
             "train_rank_slot_reads": 0,
             "train_rank_slot_writes": 0,
             "teacher_transport_mode": str(crct_teacher_transport_mode),
+            "teacher_transport_participant": bool(
+                crct_teacher_transport is not None
+            ),
+            "teacher_coordinator_rank": 0,
+            "teacher_memory_rank": int(world_size_ - 1),
             "teacher_requests": int(crct_teacher_requests),
             "teacher_payloads": int(crct_teacher_payloads),
             "teacher_fail_open": int(crct_teacher_fail_open),
+            "teacher_bypass_steps": int(crct_teacher_bypass_steps),
             "teacher_param_syncs": int(crct_teacher_param_syncs),
             "teacher_param_sync_interval_steps": int(
                 crct_teacher_param_sync_interval
@@ -7755,8 +7816,12 @@ def train_fast_for_budget(
                 if crct_teacher_transport is not None
                 else {
                     "mode": str(crct_teacher_transport_mode),
+                    "transport_group": "rank0_memory",
+                    "coordinator_rank": 0,
+                    "memory_rank": int(world_size_ - 1),
+                    "participant": False,
                     "requests_started": 0,
-                    "payloads_used": int(crct_teacher_payloads),
+                    "payloads_used": 0,
                     "payloads_scored": 0,
                     "payloads_sent": 0,
                     "payloads_received": 0,
@@ -7992,8 +8057,11 @@ def train_fast_for_budget(
                 "lm_weight_tau": float(crct_lm_weight_tau),
                 "teacher_transport_mode": str(crct_teacher_transport_mode),
                 "async_teacher_transport": bool(
-                    crct_teacher_transport_mode == "async_allgather_broadcast"
+                    crct_teacher_transport_mode == "async_rank0_memory_broadcast"
                 ),
+                "teacher_coordinator_rank": 0,
+                "teacher_memory_rank": int(world_size_ - 1),
+                "teacher_bypass_steps": int(crct_teacher_bypass_steps),
                 "async_teacher_pending_batches": int(
                     crct_async_teacher_pending_batches
                 ),

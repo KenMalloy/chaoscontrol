@@ -120,21 +120,24 @@ is visible immediately.
 
 Rank 3 scores opportunistically rather than every train step. The default
 `crct_teacher_score_interval_steps=64` keeps the teacher useful without making
-oracle scoring the cadence of the trunk all-reduce. Transport is sparse:
-input-id gathers happen only on score boundaries, and payload broadcasts happen
-on the score boundary plus the next sparse publish slot so labels arrive with
-single-digit lag when rank 3 keeps up. Result JSON records
+oracle scoring the cadence of the trunk all-reduce. Transport is sparse and
+two-rank only: rank 0 broadcasts one matched batch to rank 3 on score
+boundaries, and rank 3 broadcasts the small teacher payload back to rank 0 on
+the score boundary plus the next sparse publish slot. Ranks 1 and 2 never enter
+teacher collectives; they stay purely on the train-rank gradient clock. Result
+JSON records `teacher_transport_participant`, `teacher_bypass_steps`,
 `request_interval_skips`, `broadcast_interval_skips`, payload lag, stale drops,
-and score timings so a no-teacher or stale-teacher run is visible from the data.
-The Exp24 CRCT cell writes 128 memory candidates per teacher score; at the
-default cadence this still fills the 4096-slot teacher cache during a 600s run
-without overfeeding the memory side.
+and score timings so a no-teacher, stale-teacher, or accidentally all-rank run
+is visible from the data. The Exp24 CRCT cell writes 128 memory candidates per
+teacher score; at the default cadence this still fills the 4096-slot teacher
+cache during a 600s run without overfeeding the memory side.
 
 CRCT-only training syncs trunk gradients over the train-rank subgroup. Rank 3
-does not join the gradient all-reduce; it receives a coalesced parameter refresh
-on the teacher cadence. Telemetry records `grad_sync_group="train_ranks"`,
-`memory_rank_joins_grad=false`, and parameter-sync timings so accidental
-re-coupling is caught.
+does not join the gradient all-reduce; it receives a coalesced rank0->rank3
+parameter refresh on the teacher cadence through the same two-rank teacher
+group. Telemetry records `grad_sync_group="train_ranks"`,
+`memory_rank_joins_grad=false`, `teacher_coordinator_rank=0`, and
+parameter-sync timings so accidental re-coupling is caught.
 
 ## Gradient Conflict Sensor
 
