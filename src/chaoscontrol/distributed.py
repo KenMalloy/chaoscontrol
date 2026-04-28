@@ -220,6 +220,8 @@ def should_stop_now(
     local_should_stop: bool,
     device: torch.device,
     ddp_active: bool,
+    *,
+    group: "dist.ProcessGroup | None" = None,
 ) -> bool:
     """Synchronize the per-step stop decision across DDP ranks.
 
@@ -235,7 +237,7 @@ def should_stop_now(
         stop_flag = torch.tensor(
             [1.0 if local_should_stop else 0.0], device=device,
         )
-        dist.all_reduce(stop_flag, op=dist.ReduceOp.MAX)
+        dist.all_reduce(stop_flag, op=dist.ReduceOp.MAX, group=group)
         return stop_flag.item() > 0.5
     return local_should_stop
 

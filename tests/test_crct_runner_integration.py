@@ -279,9 +279,9 @@ def _worker_async_crct_train_loop(
             crct_async_teacher_pending_batches=8,
             crct_async_teacher_max_lag_steps=8,
             crct_async_teacher_payload_dtype="fp32",
+            crct_teacher_score_interval_steps=1,
             crct_memory_write_tokens_per_step=4,
             crct_gradient_conflict_enabled=True,
-            crct_slot_broadcast_interval_steps=1,
         )
         if rank == 0:
             Path(result_dir, "rank0.json").write_text(
@@ -343,10 +343,53 @@ def test_crct_train_step_uses_payload_and_trains_controller() -> None:
     grad = model.memory_controller.net[0].weight.grad
     assert grad is not None
     assert float(grad.abs().sum()) > 0.0
-    # Central slot broadcast is the only ownership path: train ranks must
-    # never CRCT-write to outer_model. Only the rank-3 staging path (via
-    # rank3_score_batch_causal) writes; train ranks read the broadcast.
+    # Rank 3 is the only CRCT memory writer. Train ranks can distill the
+    # controller from async payloads, but must not mutate local memory.
     assert len(model.outer_model._slots) == 0
+
+
+def test_crct_train_step_does_not_read_slots_on_trunk_path() -> None:
+    mod = _load_module("runner_fast_path_crct_no_trunk_memory_read", RUNNER_PATH)
+    model = _tiny_crct_model()
+    assert model.outer_model is not None
+    model.outer_model.append_kv_batch(
+        torch.randn(8, model.outer_model.outer_dim),
+        torch.zeros(8, dtype=torch.long),
+    )
+
+    def _forbidden_read(*_args, **_kwargs):
+        raise AssertionError("CRCT train-rank trunk path read outer memory")
+
+    model.outer_model.read = _forbidden_read  # type: ignore[method-assign]
+    model.outer_model.read_bucket = _forbidden_read  # type: ignore[method-assign]
+
+    inputs = torch.randint(0, 32, (2, 5), dtype=torch.int32)
+    targets = torch.randint(0, 32, (2, 5), dtype=torch.long)
+    payload = {
+        "target": torch.full((2, 5), 0.85),
+        "confidence": torch.ones(2, 5),
+        "loss_weight": torch.ones(2, 5),
+    }
+
+    loss = mod._run_train_step(
+        model=model,
+        inputs=inputs,
+        targets=targets,
+        chunk_size=8,
+        precision="fp32",
+        ddp_active=False,
+        world_size=1,
+        lm_head_backward_mode="single",
+        crct_enabled=True,
+        crct_payload=payload,
+        crct_lambda_controller=0.1,
+    )
+
+    assert torch.isfinite(loss)
+    assert model.memory_controller is not None
+    grad = model.memory_controller.net[0].weight.grad
+    assert grad is not None
+    assert float(grad.abs().sum()) > 0.0
 
 
 def test_crct_teacher_payload_appends_memory_after_scoring() -> None:
@@ -383,37 +426,7 @@ def test_crct_teacher_payload_appends_memory_after_scoring() -> None:
     assert not torch.allclose(h_off, h_mem)
 
 
-def test_crct_central_staging_write_does_not_mutate_active_memory() -> None:
-    mod = _load_module("runner_fast_path_crct_central_staging", RUNNER_PATH)
-    model = _tiny_crct_model()
-    staging = mod._crct_clone_outer_model(model)
-    cache = TransactionalWakeCache(max_moments=0, max_hidden_buffer=0)
-    inputs = torch.randint(0, 32, (2, 5), dtype=torch.int32)
-    targets = torch.randint(0, 32, (2, 5), dtype=torch.long)
-
-    payload = mod._crct_score_payload_inline(
-        model=model,
-        cache=cache,
-        scarcity_optimizer=None,
-        inputs=inputs,
-        targets=targets,
-        step=0,
-        total_steps=10,
-        tau=0.1,
-        strength=0.1,
-        w_max=1.2,
-        alpha_max=0.15,
-        memory_write_tokens=3,
-        memory_write_outer_model=staging,
-        update_model_memory_after=True,
-    )
-
-    assert payload["target"].shape == targets.shape
-    assert len(model.outer_model._slots) == 0
-    assert len(staging._slots) == 3
-
-
-def test_crct_fail_open_keeps_controller_grad_zero_but_present() -> None:
+def test_crct_fail_open_skips_controller_hot_path() -> None:
     mod = _load_module("runner_fast_path_crct_fail_open", RUNNER_PATH)
     model = _tiny_crct_model()
     inputs = torch.randint(0, 32, (2, 5), dtype=torch.int32)
@@ -433,9 +446,10 @@ def test_crct_fail_open_keeps_controller_grad_zero_but_present() -> None:
     )
 
     assert model.memory_controller is not None
-    grad = model.memory_controller.net[0].weight.grad
-    assert grad is not None
-    assert torch.equal(grad, torch.zeros_like(grad))
+    # Fail-open steps are hot-path trunk steps. With no teacher payload, the
+    # controller head is intentionally skipped rather than run for a formal
+    # zero gradient.
+    assert model.memory_controller.net[0].weight.grad is None
 
 
 def test_crct_rejects_async_grad_reducer_before_collectives() -> None:
@@ -576,23 +590,35 @@ def test_crct_async_teacher_transport_wired_into_train_loop() -> None:
     assert crct["teacher_requests"] == 5
     assert crct["teacher_payloads"] >= 1
     assert crct["teacher_fail_open"] >= 1
+    assert crct["teacher_param_sync_interval_steps"] == 1
+    assert crct["teacher_param_syncs"] >= 1
+    assert crct["memory_owner"] == "rank3_teacher_only"
+    assert crct["trunk_memory_mode"] == "off"
+    assert crct["grad_sync_group"] == "train_ranks"
+    assert crct["memory_rank_joins_grad"] is False
+    assert crct["stop_sync_group"] == "train_ranks"
+    assert crct["train_rank_slot_reads"] == 0
+    assert crct["train_rank_slot_writes"] == 0
+    assert crct["teacher_memory_slots"] > 0
     assert crct["gradient_conflict"]["enabled"] is True
     assert crct["gradient_conflict"]["calls"] >= 1
-    assert crct["slot_broadcast"]["enabled"] is True
-    assert crct["slot_broadcast"]["publishes_sent"] >= 1
-    assert crct["slot_broadcast"]["snapshot_slots"] > 0
     ranks = crct["rank_diagnostics"]
     assert len(ranks) == 4
     train0 = ranks[0]["transport"]
     memory = ranks[3]["transport"]
     memory_conflict = ranks[3]["gradient_conflict"]
-    train0_broadcast = ranks[0]["slot_broadcast"]
+    assert ranks[0]["memory_slots"] == 0
+    assert ranks[0]["grad_sync_group"] == "train_ranks"
+    assert ranks[0]["memory_rank_joins_grad"] is False
+    assert ranks[3]["stop_sync_group"] == "local"
+    assert ranks[1]["memory_slots"] == 0
+    assert ranks[2]["memory_slots"] == 0
+    assert ranks[3]["memory_slots"] == crct["teacher_memory_slots"]
     assert train0["requests_started"] == 5
+    assert train0["pre_sync_waits"] >= 1
     assert train0["payloads_used"] == crct["teacher_payloads"]
     assert train0["errors"] == 0
     assert memory["payloads_scored"] >= 2
     assert memory["payloads_sent"] >= 1
     assert memory_conflict["calls"] == crct["gradient_conflict"]["calls"]
     assert memory_conflict["candidates_seen"] > 0
-    assert train0_broadcast["publishes_received"] >= 1
-    assert ranks[0]["memory_slots"] == crct["slot_broadcast"]["snapshot_slots"]

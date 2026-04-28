@@ -1388,7 +1388,7 @@ def build_crct_v1_matrix(
     """CRCT v1 headline matrix.
 
     Holds the fast/slow trunk fixed and adds Cache-Reweighted Continuation
-    Training: controller-gated append-only memory, rank-3 teacher utility,
+    Training: rank-3 teacher memory, async utility labels,
     confidence-weighted controller BCE, and positive-only LM reweighting.
     The matrix forces random sampling on every arm because CRCT's final rank
     is a memory coprocessor in 3+1 mode; sequential epoch sharding would either
@@ -1418,11 +1418,13 @@ def build_crct_v1_matrix(
         "crct_dual_lr": 0.01,
         "crct_ema_beta": 0.95,
         "crct_max_price": 0.50,
-        "crct_memory_write_tokens_per_step": 256,
+        "crct_memory_write_tokens_per_step": 128,
         "crct_async_teacher_transport": True,
         "crct_async_teacher_pending_batches": 64,
-        "crct_async_teacher_max_lag_steps": 32,
+        "crct_async_teacher_max_lag_steps": 128,
         "crct_async_teacher_payload_dtype": "auto",
+        "crct_teacher_score_interval_steps": 64,
+        "crct_teacher_param_sync_interval_steps": 64,
         "outer_model_dim": 64,
         "outer_model_type": "multislot",
         "outer_max_slots": 4096,
@@ -1435,7 +1437,6 @@ def build_crct_v1_matrix(
         "train_sampling_mode": "random",
         "compile_full_path": False,
         "cuda_graph_mode": "none",
-        "crct_slot_broadcast_interval_steps": 16,
         "crct_gradient_conflict_enabled": True,
         "crct_gradient_conflict_soft_gate_strength": 0.0,
         "crct_gradient_conflict_trace_path": (

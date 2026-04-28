@@ -2,7 +2,9 @@
 
 ## Core Conceptual Correction
 
-The controller is NOT unnecessary. It should be tightly involved in the model path. But it must not define the utility label.
+The controller is NOT unnecessary. It is a distilled utility predictor, but it
+does not put cache reads in the timed train-rank trunk path and it must not
+define the utility label.
 
 ### The Clean Split
 
@@ -14,30 +16,29 @@ rank-3 oracle:
 
 controller:
     asks: "Can I cheaply predict that utility before seeing the target?"
-    gates memory injection into the semantic stream
+    learns the dense utility/readiness target
 
 training ranks:
     use oracle utility as:
         1. token loss weights (mild, positive-only initially)
         2. controller distillation targets
+    do not read CRCT memory during trunk encode
 ```
 
 ## Critical Correction: encode() memory_mode
 
 The exact teacher should compare semantic stream with memory disabled vs memory forcibly injected at the REAL injection point. NOT just `hidden + memory_delta` after the fact.
 
-### New encode() API
+### encode() API Used By CRCT
 
 ```python
-def encode(self, input_ids, *, memory_mode="controller",
+def encode(self, input_ids, *, memory_mode="off",
            cache_read_cutoff=None, teacher_gate=None,
            return_controller_logits=False, return_memory_meta=False):
     """
-    memory_mode:
-        "off"          -> no memory read/injection
-        "force_on"     -> read memory and inject with gate = 1
-        "controller"   -> controller decides gate
-        "teacher_gate" -> use externally supplied gate
+    CRCT uses:
+        "off"      -> train-rank trunk encode and oracle no-memory side
+        "force_on" -> rank-3 oracle memory side
     cache_read_cutoff:
         optional MVCC event-id cutoff for append-only multislot memory reads
     """
@@ -89,36 +90,51 @@ by `cache_read_cutoff`, so both oracle encode passes see the same snapshot.
 
 ## Runtime Memory Ownership
 
-Current Exp23/24 CRCT defaults to rank 3 as the teacher/oracle owner and train
-ranks as local controller-memory owners. Rank 3 scores the matched train batch
-and writes its oracle memory after scoring; train ranks append their own
-consumed payload batches locally after backward. That means the controller
-target is a rank-3 oracle label, while the forward-path memory read on a train
-rank is from that rank's local append-only memory. The runner exposes per-rank
-`memory_slots` plus transport counters so drift is visible in result JSON.
+Current Exp23/24 CRCT uses rank 3 as the teacher/oracle memory owner. Train
+ranks do **not** read CRCT slots on the trunk forward path; they run the normal
+pre-memory encoder, consume small async teacher tensors
+(`target`/`confidence`/`loss_weight`/`utility`) when available, and distill the
+controller head from that pre-memory hidden stream. If the teacher falls behind,
+the train rank fails open for that step rather than waiting on memory.
 
-`crct_central_slot_broadcast_enabled=True` switches to the cleaner ownership
-contract:
+The teacher-memory contract is:
 
 ```text
 train ranks:
-    read only the last ACTIVE memory generation
     never append CRCT slots locally
+    never read CRCT slots during the timed trunk forward
 
 rank 3:
-    reads ACTIVE while scoring the oracle comparison
-    writes accepted candidates into a separate STAGING outer memory
-
-publish boundary:
-    rank 3 broadcasts STAGING as the next ACTIVE generation
-    every train rank atomically swaps its local slots to that generation
+    owns the teacher cache/memory
+    scores the oracle comparison
+    writes accepted candidates after scoring
 ```
 
-The first implementation publishes a full snapshot via object broadcast at a
-configurable `crct_slot_broadcast_interval_steps` boundary. It records
-`mechanisms.crct.slot_broadcast` with epoch, slots, bytes, send/receive counts,
-skip reasons, and publish latency so pod data can say whether centralized memory
-was healthy before we interpret BPB.
+There is no train-rank memory snapshot mode in the CRCT matrix. The only data
+flowing back from the teacher path is the small async per-token payload:
+`target`, `confidence`, `loss_weight`, and `utility`. Result JSON records
+`mechanisms.crct.memory_owner="rank3_teacher_only"`,
+`trunk_memory_mode="off"`, zero train-rank slot reads/writes, and rank-3
+`teacher_memory_slots` so a run that accidentally re-couples trunk and memory
+is visible immediately.
+
+Rank 3 scores opportunistically rather than every train step. The default
+`crct_teacher_score_interval_steps=64` keeps the teacher useful without making
+oracle scoring the cadence of the trunk all-reduce. Transport is sparse:
+input-id gathers happen only on score boundaries, and payload broadcasts happen
+on the score boundary plus the next sparse publish slot so labels arrive with
+single-digit lag when rank 3 keeps up. Result JSON records
+`request_interval_skips`, `broadcast_interval_skips`, payload lag, stale drops,
+and score timings so a no-teacher or stale-teacher run is visible from the data.
+The Exp24 CRCT cell writes 128 memory candidates per teacher score; at the
+default cadence this still fills the 4096-slot teacher cache during a 600s run
+without overfeeding the memory side.
+
+CRCT-only training syncs trunk gradients over the train-rank subgroup. Rank 3
+does not join the gradient all-reduce; it receives a coalesced parameter refresh
+on the teacher cadence. Telemetry records `grad_sync_group="train_ranks"`,
+`memory_rank_joins_grad=false`, and parameter-sync timings so accidental
+re-coupling is caught.
 
 ## Gradient Conflict Sensor
 
@@ -194,18 +210,15 @@ Rank 3 computes utility but ranks 0-2 ignore it. Measure: step time impact, util
 ### Stage 1: Controller Distillation Only
 `loss = lm_loss + 0.01 * ctrl_loss`. No LM reweighting. Test: can controller learn memory-help/hurt boundary?
 
-### Stage 2: Controller-Gated Memory
-Online model uses `gate = sigmoid(controller_logits)` to inject memory. Oracle still bypasses controller for labels.
-
-### Stage 3: Mild Positive-Only LM Weighting
+### Stage 2: Mild Positive-Only LM Weighting
 `alpha = 0.05` initially, maybe up to 0.15.
 
-### Stage 4: Symmetric Weighting (only if proven)
+### Stage 3: Symmetric Weighting (only if proven)
 
 ## Critical Warnings
 
 1. **Causal leakage**: Score batch BEFORE writing it to cache. Wrong order will look amazing and fail eval.
-2. **Don't let controller define teacher labels**: force_on vs off, NOT controller-gated vs off.
+2. **Don't let controller define teacher labels**: force_on vs off, NOT predicted-gate vs off.
 3. **Stale teacher is OK for controller supervision, less OK for aggressive LM reweighting.**
 4. **Rank 3 is opportunistic. Late labels are dropped. Training never waits.**
 

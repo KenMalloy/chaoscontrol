@@ -670,7 +670,6 @@ def rank3_score_batch_causal(
     update_model_memory_after: bool = False,
     memory_write_tokens: int | None = None,
     gradient_conflict_monitor: CrctGradientConflictMonitor | None = None,
-    memory_write_outer_model: Any | None = None,
     step: int | None = None,
 ) -> dict[str, torch.Tensor]:
     """Score a batch by comparing memory-on vs memory-off NLL.
@@ -771,8 +770,6 @@ def rank3_score_batch_causal(
             "max_tokens": write_limit,
             "event_ids": event_ids,
         }
-        if memory_write_outer_model is not None:
-            append_kwargs["outer_model_override"] = memory_write_outer_model
         wrote = bool(append_fn(h_off.detach(), **append_kwargs))
         if not wrote:
             raise ValueError(

@@ -1009,7 +1009,6 @@ class ChaosStudentLM(nn.Module):
         score: torch.Tensor | None = None,
         max_tokens: int | None = None,
         event_ids: torch.Tensor | None = None,
-        outer_model_override: MultiSlotOuterModel | None = None,
     ) -> bool:
         """Append sequence hidden states into the append-only outer memory.
 
@@ -1025,15 +1024,10 @@ class ChaosStudentLM(nn.Module):
         callers can fail loudly instead of training against a zero-utility
         teacher by accident.
         """
-        target_outer = (
-            outer_model_override
-            if outer_model_override is not None
-            else self.outer_model
-        )
         if (
             self.buffer_mode != "append_only"
-            or target_outer is None
-            or not isinstance(target_outer, MultiSlotOuterModel)
+            or self.outer_model is None
+            or not isinstance(self.outer_model, MultiSlotOuterModel)
         ):
             return False
         batch, seq, dim = hidden.shape
@@ -1075,8 +1069,8 @@ class ChaosStudentLM(nn.Module):
         else:
             selected = None
         encoded_flat = torch.tanh(
-            target_outer.encoder(
-                h_flat.to(dtype=target_outer.encoder.weight.dtype)
+            self.outer_model.encoder(
+                h_flat.to(dtype=self.outer_model.encoder.weight.dtype)
             )
         )
         if bucket_ids is None:
@@ -1093,9 +1087,9 @@ class ChaosStudentLM(nn.Module):
             if selected is not None:
                 bids_flat = bids_flat.index_select(0, selected)
         if event_flat is None:
-            target_outer.append_kv_batch(encoded_flat, bids_flat)
+            self.outer_model.append_kv_batch(encoded_flat, bids_flat)
         else:
-            target_outer._append_kv_batch_committed(
+            self.outer_model._append_kv_batch_committed(
                 encoded_flat,
                 bids_flat,
                 event_ids=event_flat,

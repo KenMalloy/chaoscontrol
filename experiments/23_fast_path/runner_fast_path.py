@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import argparse
 import contextlib
-import copy
 import hashlib
 import json
 import math
@@ -615,6 +614,34 @@ def _optimizer_diagnostics(optimizer: torch.optim.Optimizer) -> dict[str, Any]:
     return diagnostics
 
 
+def _broadcast_model_params_coalesced(
+    model: torch.nn.Module,
+    *,
+    src: int = 0,
+    group: "dist.ProcessGroup | None" = None,
+) -> None:
+    """Synchronize model parameters with one broadcast per dtype/device bucket.
+
+    CRCT-only runs keep rank 3 out of the train-rank gradient collective so
+    teacher scoring cannot stall the trunk. This helper refreshes rank 3's
+    teacher snapshot at a coarse cadence without paying one collective per
+    parameter tensor.
+    """
+    buckets: dict[tuple[torch.device, torch.dtype], list[torch.Tensor]] = {}
+    for param in model.parameters():
+        buckets.setdefault((param.device, param.dtype), []).append(param.data)
+    with torch.no_grad():
+        for tensors in buckets.values():
+            if not tensors:
+                continue
+            contig = [tensor.contiguous() for tensor in tensors]
+            flat = torch._utils._flatten_dense_tensors(contig)
+            dist.broadcast(flat, src=int(src), group=group)
+            synced = torch._utils._unflatten_dense_tensors(flat, contig)
+            for original, value in zip(tensors, synced, strict=True):
+                original.copy_(value)
+
+
 def _sync_scopt_dense_tensors_coalesced(
     tensors: list[torch.Tensor],
     *,
@@ -930,162 +957,6 @@ def _crct_valid_mask(input_ids: torch.Tensor) -> torch.Tensor:
     return torch.ones_like(input_ids, dtype=torch.bool)
 
 
-def _crct_slot_count(outer_model: Any) -> int:
-    return int(len(getattr(outer_model, "_slots", [])))
-
-
-def _crct_state_nbytes(value: Any) -> int:
-    if isinstance(value, torch.Tensor):
-        return int(value.numel() * value.element_size())
-    if isinstance(value, dict):
-        return sum(_crct_state_nbytes(v) for v in value.values())
-    if isinstance(value, (list, tuple)):
-        return sum(_crct_state_nbytes(v) for v in value)
-    return 0
-
-
-def _crct_clone_outer_model(model: torch.nn.Module) -> Any:
-    outer = getattr(model, "outer_model", None)
-    if outer is None:
-        return None
-    clone = copy.deepcopy(outer)
-    clone.train(bool(getattr(outer, "training", False)))
-    return clone
-
-
-def _crct_central_broadcast_diagnostics(metrics: dict[str, Any]) -> dict[str, Any]:
-    out = dict(metrics)
-    attempts = int(out.get("publish_attempts", 0))
-    if attempts:
-        out["publish_seconds_mean"] = (
-            float(out.get("publish_seconds_sum", 0.0)) / float(attempts)
-        )
-    else:
-        out["publish_seconds_mean"] = 0.0
-    return out
-
-
-def _crct_merge_slot_broadcast_diagnostics(
-    rank_diags: list[dict[str, Any] | None],
-) -> dict[str, Any] | None:
-    """Combine per-rank slot_broadcast counters into one summary view.
-
-    Why: each rank tracks its own role — the memory rank counts
-    ``publishes_sent``; receiver ranks count ``publishes_received``.
-    Serializing only the memory rank's view leaves ``publishes_received``
-    structurally zero and hides whether receivers actually got the
-    broadcast. The merged view replaces ``publishes_received`` with the
-    sum across receivers and exposes the per-receiver breakdown so a
-    silently-dropped broadcast is observable.
-    """
-    sender: dict[str, Any] | None = None
-    receiver_received: list[int] = []
-    for diag in rank_diags:
-        if diag is None:
-            continue
-        slot_broadcast = diag.get("slot_broadcast")
-        if slot_broadcast is None:
-            continue
-        if bool(diag.get("is_memory_rank", False)):
-            sender = slot_broadcast
-        else:
-            receiver_received.append(int(slot_broadcast.get("publishes_received", 0)))
-    if sender is None:
-        return None
-    merged = dict(sender)
-    merged["publishes_received"] = sum(receiver_received)
-    merged["publishes_received_per_rank"] = receiver_received
-    return merged
-
-
-def _crct_publish_central_slots(
-    *,
-    model: torch.nn.Module,
-    staging_outer_model: Any | None,
-    metrics: dict[str, Any],
-    rank: int,
-    world_size: int,
-    all_group: "dist.ProcessGroup | None",
-    step: int,
-    interval_steps: int,
-    force: bool = False,
-) -> None:
-    """Broadcast rank-3's staged memory as the next active generation.
-
-    This is the deliberately simple centralized-memory contract: train ranks
-    never write CRCT memory locally when this mode is enabled; they only read
-    the active generation last published by the memory rank. Rank 3 writes
-    accepted candidates into ``staging_outer_model`` and publishes that staged
-    state at a known boundary.
-    """
-    metrics["enabled"] = True
-    metrics["active_slots"] = _crct_slot_count(getattr(model, "outer_model", None))
-    metrics["staging_slots"] = _crct_slot_count(staging_outer_model)
-    if world_size < 4 or all_group is None or not dist.is_initialized():
-        metrics["publish_skips"] += 1
-        metrics["last_skip_reason"] = "not_distributed_3plus1"
-        return
-    interval = max(1, int(interval_steps))
-    if not force and int(step) % interval != 0:
-        metrics["publish_skips"] += 1
-        metrics["last_skip_reason"] = "between_boundaries"
-        return
-
-    memory_rank = int(world_size) - 1
-    obj: list[Any] = [None]
-    if int(rank) == memory_rank:
-        source = staging_outer_model if staging_outer_model is not None else getattr(model, "outer_model", None)
-        if source is None:
-            payload = None
-        else:
-            state = source.get_extra_state()
-            payload = {
-                "epoch": int(metrics.get("active_epoch", 0)) + 1,
-                "step": int(step),
-                "slots": _crct_slot_count(source),
-                "snapshot_bytes": _crct_state_nbytes(state),
-                "state": state,
-            }
-        obj[0] = payload
-
-    t0 = time.perf_counter()
-    dist.broadcast_object_list(obj, src=memory_rank, group=all_group)
-    elapsed = time.perf_counter() - t0
-    metrics["publish_attempts"] += 1
-    metrics["publish_seconds_sum"] += float(elapsed)
-    metrics["publish_seconds_max"] = max(
-        float(metrics["publish_seconds_max"]),
-        float(elapsed),
-    )
-    payload = obj[0]
-    if payload is None:
-        metrics["publish_skips"] += 1
-        metrics["last_skip_reason"] = "empty_payload"
-        return
-
-    outer = getattr(model, "outer_model", None)
-    if outer is None:
-        metrics["publish_skips"] += 1
-        metrics["last_skip_reason"] = "missing_outer_model"
-        return
-    outer.set_extra_state(payload["state"])
-    if int(rank) == memory_rank and staging_outer_model is not None:
-        # Keep staging separate from active, but aligned immediately after
-        # publication; future accepted writes mutate only staging again.
-        staging_outer_model.set_extra_state(payload["state"])
-        metrics["publishes_sent"] += 1
-        metrics["last_publish_step"] = int(step)
-    else:
-        metrics["publishes_received"] += 1
-        metrics["last_receive_step"] = int(step)
-    metrics["active_epoch"] = int(payload["epoch"])
-    metrics["snapshot_bytes"] = int(payload["snapshot_bytes"])
-    metrics["snapshot_slots"] = int(payload["slots"])
-    metrics["active_slots"] = _crct_slot_count(outer)
-    metrics["staging_slots"] = _crct_slot_count(staging_outer_model)
-    metrics["last_skip_reason"] = ""
-
-
 def _crct_payload_controller_loss(
     payload: dict[str, torch.Tensor],
     controller_logits: torch.Tensor,
@@ -1143,7 +1014,6 @@ def _crct_score_payload_inline(
     alpha_max: float,
     memory_write_tokens: int,
     gradient_conflict_monitor: CrctGradientConflictMonitor | None = None,
-    memory_write_outer_model: Any | None = None,
     update_model_memory_after: bool = False,
 ) -> dict[str, torch.Tensor]:
     input_ids = _crct_full_input_ids(inputs, targets)
@@ -1164,7 +1034,6 @@ def _crct_score_payload_inline(
         update_model_memory_after=bool(update_model_memory_after),
         memory_write_tokens=int(memory_write_tokens),
         gradient_conflict_monitor=gradient_conflict_monitor,
-        memory_write_outer_model=memory_write_outer_model,
         step=int(step),
     )
     if scarcity_optimizer is not None:
@@ -1218,6 +1087,7 @@ class _CrctAsyncTeacherTransport:
         payload_dtype: torch.dtype,
         max_local_batches: int,
         max_payload_lag_steps: int,
+        score_interval_steps: int = 1,
     ) -> None:
         self.rank = int(rank)
         self.world_size = int(world_size)
@@ -1230,6 +1100,7 @@ class _CrctAsyncTeacherTransport:
         self.payload_dtype = payload_dtype
         self.max_local_batches = max(1, int(max_local_batches))
         self.max_payload_lag_steps = max(0, int(max_payload_lag_steps))
+        self.score_interval_steps = max(1, int(score_interval_steps))
         self.pending_result_broadcasts: deque[dict[str, Any]] = deque()
         self.pending_input_gathers: deque[dict[str, Any]] = deque()
         self.local_batches_by_step: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
@@ -1243,14 +1114,18 @@ class _CrctAsyncTeacherTransport:
             "payload_shape": list(self.payload_shape),
             "max_local_batches": int(self.max_local_batches),
             "max_payload_lag_steps": int(self.max_payload_lag_steps),
+            "score_interval_steps": int(self.score_interval_steps),
             "requests_started": 0,
             "result_broadcasts_started": 0,
             "result_broadcasts_completed": 0,
             "input_gathers_started": 0,
             "input_gathers_completed": 0,
+            "request_interval_skips": 0,
+            "broadcast_interval_skips": 0,
             "requests_stored": 0,
             "local_request_evictions": 0,
             "payloads_scored": 0,
+            "score_interval_skips": 0,
             "payloads_sent": 0,
             "payloads_received": 0,
             "payloads_used": 0,
@@ -1263,6 +1138,9 @@ class _CrctAsyncTeacherTransport:
             "ready_result_drops": 0,
             "shutdown_result_broadcasts_drained": 0,
             "shutdown_input_gathers_drained": 0,
+            "pre_sync_waits": 0,
+            "pre_sync_wait_seconds_sum": 0.0,
+            "pre_sync_wait_seconds_max": 0.0,
             "score_seconds_sum": 0.0,
             "score_seconds_max": 0.0,
             "payload_lag_steps_sum": 0,
@@ -1287,7 +1165,20 @@ class _CrctAsyncTeacherTransport:
         step: int,
     ) -> tuple[dict[str, torch.Tensor], torch.Tensor, torch.Tensor] | None:
         payload_tuple = self._reap_result_broadcasts(current_step=int(step))
-        self._issue_result_broadcast(send_step=int(step))
+        interval = int(self.score_interval_steps)
+        score_due = int(step) % interval == 0
+        # Score at step N, then give rank 3 one train step to finish enough
+        # work to publish on the next sparse all-group slot. The async
+        # broadcast may complete later if scoring is still running, but train
+        # ranks no longer have to wait a full score interval to see a label.
+        broadcast_due = score_due or int(step) % interval == 1
+        if broadcast_due:
+            self._issue_result_broadcast(send_step=int(step))
+        else:
+            self.metrics["broadcast_interval_skips"] += 1
+        if not score_due:
+            self.metrics["request_interval_skips"] += 1
+            return payload_tuple
         self._issue_input_all_gather(inputs=inputs, targets=targets, step=int(step))
         return payload_tuple
 
@@ -1305,12 +1196,16 @@ class _CrctAsyncTeacherTransport:
         alpha_max: float,
         memory_write_tokens: int,
         gradient_conflict_monitor: CrctGradientConflictMonitor | None = None,
-        memory_write_outer_model: Any | None = None,
     ) -> None:
         completed = self._reap_input_gathers()
         if self.rank != self.memory_rank:
             return
         if not completed:
+            return
+        if int(step) % int(self.score_interval_steps) != 0:
+            self.metrics["score_interval_skips"] += len(completed)
+            self.metrics["completed_requests_dropped"] += len(completed)
+            self.metrics["last_drop_reason"] = "score_interval"
             return
         if self.ready_result is not None:
             self.metrics["completed_requests_dropped"] += len(completed)
@@ -1346,7 +1241,6 @@ class _CrctAsyncTeacherTransport:
                 alpha_max=alpha_max,
                 memory_write_tokens=int(memory_write_tokens),
                 gradient_conflict_monitor=gradient_conflict_monitor,
-                memory_write_outer_model=memory_write_outer_model,
                 update_model_memory_after=True,
             )
             score_s = time.perf_counter() - t0
@@ -1390,6 +1284,37 @@ class _CrctAsyncTeacherTransport:
         else:
             out["score_seconds_mean"] = 0.0
         return out
+
+    def wait_for_pending_collectives(self) -> None:
+        """Drain already-issued transport collectives before another all-group op.
+
+        The transport intentionally uses async all-rank collectives. When CRCT
+        refreshes rank 3's teacher snapshot with a coalesced parameter
+        broadcast, wait for the previous payload/result collectives first so
+        the all-group ordering stays explicit and telemetry shows any overlap
+        cost instead of hiding it inside the parameter sync.
+        """
+        t0 = time.perf_counter()
+        waited = False
+        for slot in self.pending_result_broadcasts:
+            for work in slot["works"]:
+                wait = getattr(work, "wait", None)
+                if wait is not None:
+                    wait()
+                    waited = True
+        for slot in self.pending_input_gathers:
+            wait = getattr(slot["work"], "wait", None)
+            if wait is not None:
+                wait()
+                waited = True
+        if waited:
+            elapsed = time.perf_counter() - t0
+            self.metrics["pre_sync_waits"] += 1
+            self.metrics["pre_sync_wait_seconds_sum"] += float(elapsed)
+            self.metrics["pre_sync_wait_seconds_max"] = max(
+                float(self.metrics["pre_sync_wait_seconds_max"]),
+                float(elapsed),
+            )
 
     def close(self) -> None:
         while self.pending_result_broadcasts:
@@ -1683,7 +1608,6 @@ def _collect_crct_teacher_payload(
     alpha_max: float,
     memory_write_tokens: int,
     gradient_conflict_monitor: CrctGradientConflictMonitor | None = None,
-    memory_write_outer_model: Any | None = None,
 ) -> dict[str, torch.Tensor] | None:
     """Return this train rank's CRCT teacher payload.
 
@@ -1744,7 +1668,6 @@ def _collect_crct_teacher_payload(
             alpha_max=alpha_max,
             memory_write_tokens=int(memory_write_tokens),
             gradient_conflict_monitor=gradient_conflict_monitor,
-            memory_write_outer_model=memory_write_outer_model,
             update_model_memory_after=True,
         )
         target_all = scored["target"].reshape(payload_shape).contiguous()
@@ -5415,6 +5338,9 @@ def _run_train_step(
     dreamworld_generator: torch.Generator | None = None,
     is_episodic_rank: bool = False,
     all_group: "dist.ProcessGroup | None" = None,
+    grad_group: "dist.ProcessGroup | None" = None,
+    grad_world_size: int | None = None,
+    memory_rank_joins_grad: bool = True,
     episodic_emit: EpisodicGpuEmit | None = None,
     episodic_consumer: "_EpisodicConsumerState | None" = None,
     episodic_replay_logger: DiagnosticsLogger | None = None,
@@ -5476,8 +5402,19 @@ def _run_train_step(
         # Train ranks reach the all-reduce after backward; the episodic
         # rank skips backward, so we must enter the same collective with
         # all-None grads → ``materialize_zeros=True`` fills them.
-        if ddp_active and world_size > 1 and all_group is not None:
-            n_train = world_size - 1
+        if (
+            ddp_active
+            and world_size > 1
+            and all_group is not None
+            and bool(memory_rank_joins_grad)
+        ):
+            grad_group_eff = grad_group if grad_group is not None else all_group
+            grad_world = (
+                int(grad_world_size)
+                if grad_world_size is not None
+                else int(world_size)
+            )
+            n_train = grad_world - 1
             if n_train < 1:
                 raise ValueError(
                     "episodic rank topology requires world_size >= 2 "
@@ -5485,8 +5422,8 @@ def _run_train_step(
                 )
             allreduce_grads(
                 model,
-                world_size,
-                group=all_group,
+                grad_world,
+                group=grad_group_eff,
                 op=dist.ReduceOp.SUM,
                 materialize_zeros=True,
             )
@@ -5510,23 +5447,20 @@ def _run_train_step(
                 )
             hidden = _compiled_step_fn()(model, inputs)
         elif crct_enabled:
-            enc = model.encode(
-                inputs,
-                memory_mode="controller",
-                return_controller_logits=True,
-                return_memory_meta=True,
-            )
-            if not isinstance(enc, dict) or "hidden" not in enc:
-                raise ValueError(
-                    "crct_enabled=True requires model.encode(..., "
-                    "return_controller_logits=True) to return a dict"
-                )
-            hidden = enc["hidden"]
-            crct_controller_logits = enc.get("controller_logits")
-            if crct_controller_logits is None:
-                raise ValueError(
-                    "crct_enabled=True requires enable_controller=True on the model"
-                )
+            # CRCT's teacher/oracle can lag or fail open; the trunk SSM cannot.
+            # Train ranks therefore run the ordinary no-memory encoder and
+            # distill the tiny controller head from that pre-memory stream.
+            # Rank 3 owns central memory reads/writes off the train-rank hot
+            # path. This preserves the "memory may help when ready, but never
+            # stalls trunk throughput" contract.
+            hidden = model.encode(inputs, memory_mode="off")
+            if crct_payload is not None:
+                memory_controller = getattr(model, "memory_controller", None)
+                if memory_controller is None:
+                    raise ValueError(
+                        "crct_enabled=True requires enable_controller=True on the model"
+                    )
+                crct_controller_logits = memory_controller(hidden)
         else:
             hidden = model.encode(inputs)
         if (
@@ -5547,13 +5481,14 @@ def _run_train_step(
             else None
         )
         if crct_enabled:
-            if crct_controller_logits is None:
+            if crct_payload is not None and crct_controller_logits is None:
                 raise ValueError("CRCT controller logits were not materialized")
             mode = str(lm_head_backward_mode).strip().lower()
+            loss_backward_done = False
             if mode in _FUSED_LM_HEAD_MODES:
                 backend_name = fused_lm_head_backend_for_mode(mode)
                 if crct_token_weight is None:
-                    loss, per_token_ce_for_episodic = fused_lm_head_loss_with_ce(
+                    loss = fused_lm_head_backward(
                         hidden=hidden,
                         final_norm=model.final_norm,
                         lm_head=model.lm_head,
@@ -5561,6 +5496,7 @@ def _run_train_step(
                         backend=backend_name,
                         tile_size=int(lm_head_tile_size),
                     )
+                    loss_backward_done = True
                 else:
                     loss, per_token_ce_for_episodic = fused_lm_head_weighted_loss_with_ce(
                         hidden=hidden,
@@ -5586,17 +5522,18 @@ def _run_train_step(
                     loss = (
                         ce * crct_token_weight.reshape_as(ce)
                     ).sum() / crct_token_weight.sum().clamp_min(1.0)
-            total_loss = loss
             if crct_payload is None:
-                total_loss = total_loss + 0.0 * crct_controller_logits.sum()
+                if not loss_backward_done:
+                    loss.backward()
             else:
+                total_loss = loss
                 total_loss = total_loss + float(crct_lambda_controller) * (
                     _crct_payload_controller_loss(
                         crct_payload,
                         crct_controller_logits,
                     )
                 )
-            total_loss.backward()
+                total_loss.backward()
         elif lm_head_backward_mode == "single":
             loss = full_lm_head_backward(
                 hidden=hidden,
@@ -5673,7 +5610,8 @@ def _run_train_step(
     if ddp_active and world_size > 1:
         mode = str(grad_allreduce_mode).strip().lower()
         if mode == "bulk":
-            if all_group is not None:
+            grad_group_eff = grad_group if grad_group is not None else all_group
+            if grad_group_eff is not None:
                 # 3+1 episodic topology — train ranks pre-scale their
                 # grads by 1/N_train so the SUM collective with the
                 # zero-materialized episodic rank reconstructs the
@@ -5685,7 +5623,16 @@ def _run_train_step(
                 # operates on the same train-rank-average value as the
                 # legacy AVG path produced — clipping decisions are
                 # unchanged in expectation.
-                n_train = world_size - 1
+                if bool(memory_rank_joins_grad):
+                    n_train = world_size - 1
+                    materialize_zeros = True
+                else:
+                    n_train = (
+                        int(grad_world_size)
+                        if grad_world_size is not None
+                        else world_size - 1
+                    )
+                    materialize_zeros = False
                 if n_train < 1:
                     raise ValueError(
                         "episodic rank topology requires world_size >= 2 "
@@ -5740,10 +5687,10 @@ def _run_train_step(
                     )
                 allreduce_grads(
                     model,
-                    world_size,
-                    group=all_group,
+                    n_train,
+                    group=grad_group_eff,
                     op=dist.ReduceOp.SUM,
-                    materialize_zeros=True,
+                    materialize_zeros=materialize_zeros,
                 )
             else:
                 allreduce_grads(model, world_size)
@@ -6087,7 +6034,20 @@ def _train_fast_for_budget_cuda_graph(
                     stop_margin_seconds=stop_margin_seconds,
                     max_steps=max_steps,
                 )
-                if should_stop_now(local_stop, device, ddp_active):
+                stop_ddp_active = bool(ddp_active)
+                stop_group_eff = stop_group
+                if crct_enabled and not episodic_enabled and is_episodic_rank:
+                    # Rank 3 is deliberately off the trunk clock for CRCT.
+                    # It stops from its own wall timer; train ranks sync
+                    # stop decisions with each other through ``train_group``.
+                    stop_ddp_active = False
+                    stop_group_eff = None
+                if should_stop_now(
+                    local_stop,
+                    device,
+                    stop_ddp_active,
+                    group=stop_group_eff,
+                ):
                     break
 
             inputs, targets = next_batch()
@@ -6333,8 +6293,10 @@ def train_fast_for_budget(
     crct_memory_write_tokens_per_step: int = 256,
     crct_async_teacher_transport: bool = True,
     crct_async_teacher_pending_batches: int = 64,
-    crct_async_teacher_max_lag_steps: int = 32,
+    crct_async_teacher_max_lag_steps: int = 128,
     crct_async_teacher_payload_dtype: str = "auto",
+    crct_teacher_score_interval_steps: int = 64,
+    crct_teacher_param_sync_interval_steps: int | None = None,
     crct_gradient_conflict_enabled: bool = False,
     crct_gradient_conflict_ema_beta: float = 0.95,
     crct_gradient_conflict_catastrophic_threshold: float = -0.90,
@@ -6344,7 +6306,6 @@ def train_fast_for_budget(
     crct_gradient_conflict_trace_stride: int = 1,
     crct_gradient_conflict_trace_max_rows: int = 0,
     crct_gradient_conflict_trace_flush_rows: int = 256,
-    crct_slot_broadcast_interval_steps: int = 1,
 ) -> dict[str, Any]:
     rank_ = int(rank)
     world_size_ = int(world_size)
@@ -6433,6 +6394,11 @@ def train_fast_for_budget(
     # the same single collective with no API change at the call sites.
     is_episodic_rank = False
     all_group = None
+    train_group = None
+    grad_group = None
+    grad_world_size = world_size_
+    memory_rank_joins_grad = True
+    stop_group = None
     if episodic_enabled or (crct_enabled and world_size_ >= 4):
         if not ddp_active:
             raise ValueError(
@@ -6454,6 +6420,19 @@ def train_fast_for_budget(
         # subgroup. Here all_group is the world group, so all ranks
         # participate.
         all_group = dist.new_group(list(range(world_size_)))
+        grad_group = all_group
+        if crct_enabled and not episodic_enabled:
+            # CRCT's rank-3 teacher is an asynchronous coprocessor, not a
+            # replay-gradient producer. Keep train-rank gradients and
+            # stop checks on the train subgroup so oracle scoring can lag
+            # without touching trunk SSM throughput.
+            train_ranks = list(range(world_size_ - 1))
+            train_group = dist.new_group(train_ranks)
+            grad_group = train_group
+            grad_world_size = world_size_ - 1
+            memory_rank_joins_grad = False
+            if not is_episodic_rank:
+                stop_group = train_group
     scopt_active = isinstance(optimizer, ScarcityAwareOptimizer)
     if crct_enabled and scopt_active:
         raise ValueError(
@@ -6472,13 +6451,14 @@ def train_fast_for_budget(
         )
     if crct_enabled and str(getattr(model, "buffer_mode", "")) != "append_only":
         raise ValueError(
-            "crct_enabled=True requires buffer_mode='append_only' so train "
-            "and teacher paths can populate the same memory substrate."
+            "crct_enabled=True requires buffer_mode='append_only' so the "
+            "rank-3 teacher can populate its memory substrate."
         )
     if crct_enabled and world_size_ < 4:
         raise ValueError(
             "crct_enabled=True requires world_size>=4 so rank world_size-1 "
-            "can own the authoritative memory under central slot broadcast."
+            "can own the teacher memory without coupling train-rank trunk "
+            "forwards to cache reads."
         )
     if scopt_active and grad_allreduce_mode_ != "bulk":
         raise ValueError("ScOpt currently requires grad_allreduce_mode='bulk'")
@@ -6945,28 +6925,17 @@ def train_fast_for_budget(
     crct_cache: TransactionalWakeCache | None = None
     crct_scarcity: CrctScarcityAwareMemoryOptimizer | None = None
     crct_gradient_conflict: CrctGradientConflictMonitor | None = None
-    crct_staging_outer_model: Any | None = None
-    crct_slot_broadcast_metrics: dict[str, Any] = {
-        "interval_steps": int(crct_slot_broadcast_interval_steps),
-        "active_epoch": 0,
-        "publish_attempts": 0,
-        "publishes_sent": 0,
-        "publishes_received": 0,
-        "publish_skips": 0,
-        "publish_seconds_sum": 0.0,
-        "publish_seconds_max": 0.0,
-        "publish_seconds_mean": 0.0,
-        "last_publish_step": None,
-        "last_receive_step": None,
-        "last_skip_reason": "",
-        "snapshot_bytes": 0,
-        "snapshot_slots": 0,
-        "active_slots": 0,
-        "staging_slots": 0,
-    }
     crct_teacher_requests = 0
     crct_teacher_payloads = 0
     crct_teacher_fail_open = 0
+    crct_teacher_param_syncs = 0
+    crct_teacher_param_sync_seconds_sum = 0.0
+    crct_teacher_param_sync_seconds_max = 0.0
+    crct_teacher_param_sync_interval = (
+        int(crct_teacher_score_interval_steps)
+        if crct_teacher_param_sync_interval_steps is None
+        else int(crct_teacher_param_sync_interval_steps)
+    )
     crct_teacher_transport: _CrctAsyncTeacherTransport | None = None
     crct_teacher_transport_mode = "disabled"
     crct_rank_diagnostics: list[dict[str, Any] | None] | None = None
@@ -6999,8 +6968,6 @@ def train_fast_for_budget(
                 trace_max_rows=int(crct_gradient_conflict_trace_max_rows),
                 trace_flush_rows=int(crct_gradient_conflict_trace_flush_rows),
             )
-        if crct_enabled and rank_ == world_size_ - 1:
-            crct_staging_outer_model = _crct_clone_outer_model(model)
         crct_teacher_transport_mode = (
             "async_allgather_broadcast"
             if (
@@ -7274,6 +7241,9 @@ def train_fast_for_budget(
                             max_payload_lag_steps=int(
                                 crct_async_teacher_max_lag_steps
                             ),
+                            score_interval_steps=int(
+                                crct_teacher_score_interval_steps
+                            ),
                         )
                     ready = crct_teacher_transport.begin_step(
                         inputs=inputs,
@@ -7300,7 +7270,6 @@ def train_fast_for_budget(
                         alpha_max=float(crct_lm_weight_alpha_max),
                         memory_write_tokens=int(crct_memory_write_tokens_per_step),
                         gradient_conflict_monitor=crct_gradient_conflict,
-                        memory_write_outer_model=crct_staging_outer_model,
                     )
                 if crct_payload is None:
                     crct_teacher_fail_open += 1
@@ -7391,6 +7360,9 @@ def train_fast_for_budget(
                     predictive_aux_projection=predictive_aux_projection,
                     is_episodic_rank=is_episodic_rank,
                     all_group=all_group,
+                    grad_group=grad_group,
+                    grad_world_size=grad_world_size,
+                    memory_rank_joins_grad=memory_rank_joins_grad,
                     episodic_emit=episodic_emit_handle,
                     episodic_consumer=episodic_consumer,
                     episodic_replay_max_replays_per_step=int(
@@ -7625,6 +7597,27 @@ def train_fast_for_budget(
             if predictive_aux_optimizer is not None:
                 predictive_aux_optimizer.step()
             fast_slow.after_optimizer_step(model, step=steps + 1)
+            if (
+                crct_teacher_transport is not None
+                and not bool(memory_rank_joins_grad)
+                and all_group is not None
+                and int(crct_teacher_param_sync_interval) > 0
+                and steps % int(crct_teacher_param_sync_interval) == 0
+            ):
+                crct_teacher_transport.wait_for_pending_collectives()
+                sync_t0 = time.perf_counter()
+                _broadcast_model_params_coalesced(
+                    model,
+                    src=0,
+                    group=all_group,
+                )
+                sync_s = time.perf_counter() - sync_t0
+                crct_teacher_param_syncs += 1
+                crct_teacher_param_sync_seconds_sum += float(sync_s)
+                crct_teacher_param_sync_seconds_max = max(
+                    float(crct_teacher_param_sync_seconds_max),
+                    float(sync_s),
+                )
             if crct_teacher_transport is not None:
                 assert crct_cache is not None
                 crct_teacher_transport.after_optimizer_step(
@@ -7639,18 +7632,6 @@ def train_fast_for_budget(
                     alpha_max=float(crct_lm_weight_alpha_max),
                     memory_write_tokens=int(crct_memory_write_tokens_per_step),
                     gradient_conflict_monitor=crct_gradient_conflict,
-                    memory_write_outer_model=crct_staging_outer_model,
-                )
-            if crct_enabled:
-                _crct_publish_central_slots(
-                    model=model,
-                    staging_outer_model=crct_staging_outer_model,
-                    metrics=crct_slot_broadcast_metrics,
-                    rank=rank_,
-                    world_size=world_size_,
-                    all_group=all_group,
-                    step=steps + 1,
-                    interval_steps=int(crct_slot_broadcast_interval_steps),
                 )
             # Phase B5: deferred post-step CE pair pass on the episodic
             # rank. The in-step drain stages each successful replay and
@@ -7692,19 +7673,6 @@ def train_fast_for_budget(
         _cleanup_episodic_event_rings(episodic_emit_handle)
         _cleanup_episodic_event_rings(episodic_consumer)
 
-    if crct_enabled:
-        _crct_publish_central_slots(
-            model=model,
-            staging_outer_model=crct_staging_outer_model,
-            metrics=crct_slot_broadcast_metrics,
-            rank=rank_,
-            world_size=world_size_,
-            all_group=all_group,
-            step=steps,
-            interval_steps=int(crct_slot_broadcast_interval_steps),
-            force=True,
-        )
-
     if ddp_active:
         dist.barrier()
 
@@ -7740,10 +7708,32 @@ def train_fast_for_budget(
         crct_local_diagnostics: dict[str, Any] = {
             "rank": int(rank_),
             "is_memory_rank": bool(rank_ == world_size_ - 1 and world_size_ >= 4),
+            "memory_owner": "rank3_teacher_only",
+            "grad_sync_group": (
+                "all_ranks" if bool(memory_rank_joins_grad) else "train_ranks"
+            ),
+            "memory_rank_joins_grad": bool(memory_rank_joins_grad),
+            "stop_sync_group": (
+                "all_ranks"
+                if bool(memory_rank_joins_grad)
+                else ("local" if is_episodic_rank else "train_ranks")
+            ),
+            "train_rank_slot_reads": 0,
+            "train_rank_slot_writes": 0,
             "teacher_transport_mode": str(crct_teacher_transport_mode),
             "teacher_requests": int(crct_teacher_requests),
             "teacher_payloads": int(crct_teacher_payloads),
             "teacher_fail_open": int(crct_teacher_fail_open),
+            "teacher_param_syncs": int(crct_teacher_param_syncs),
+            "teacher_param_sync_interval_steps": int(
+                crct_teacher_param_sync_interval
+            ),
+            "teacher_param_sync_seconds_sum": float(
+                crct_teacher_param_sync_seconds_sum
+            ),
+            "teacher_param_sync_seconds_max": float(
+                crct_teacher_param_sync_seconds_max
+            ),
             "read_price": (
                 float(crct_scarcity.read_price)
                 if crct_scarcity is not None
@@ -7759,9 +7749,6 @@ def train_fast_for_budget(
                 crct_gradient_conflict.diagnostics()
                 if crct_gradient_conflict is not None
                 else {"enabled": False}
-            ),
-            "slot_broadcast": _crct_central_broadcast_diagnostics(
-                crct_slot_broadcast_metrics
             ),
             "transport": (
                 crct_teacher_transport.diagnostics()
@@ -7803,21 +7790,15 @@ def train_fast_for_budget(
         if crct_gradient_conflict is not None
         else {"enabled": False}
     )
-    crct_slot_broadcast_summary = _crct_central_broadcast_diagnostics(
-        crct_slot_broadcast_metrics
-    )
+    crct_teacher_memory_slots = 0
     if crct_rank_diagnostics:
         for diag in crct_rank_diagnostics:
             if diag is not None and bool(diag.get("is_memory_rank", False)):
                 crct_gradient_conflict_summary = dict(
                     diag.get("gradient_conflict", crct_gradient_conflict_summary)
                 )
+                crct_teacher_memory_slots = int(diag.get("memory_slots", 0))
                 break
-        merged_slot_broadcast = _crct_merge_slot_broadcast_diagnostics(
-            crct_rank_diagnostics
-        )
-        if merged_slot_broadcast is not None:
-            crct_slot_broadcast_summary = merged_slot_broadcast
     timing = summarize_train_timing(
         steps=steps,
         elapsed_s=elapsed_s,
@@ -7985,6 +7966,26 @@ def train_fast_for_budget(
             "crct": {
                 "enabled": bool(crct_enabled),
                 "lambda_controller": float(crct_lambda_controller),
+                "memory_owner": (
+                    "rank3_teacher_only" if bool(crct_enabled) else "disabled"
+                ),
+                "trunk_memory_mode": "off" if bool(crct_enabled) else "disabled",
+                "grad_sync_group": (
+                    "all_ranks"
+                    if bool(memory_rank_joins_grad)
+                    else "train_ranks"
+                ),
+                "memory_rank_joins_grad": bool(memory_rank_joins_grad),
+                "stop_sync_group": (
+                    "all_ranks"
+                    if bool(memory_rank_joins_grad)
+                    else "train_ranks"
+                )
+                if bool(crct_enabled)
+                else "disabled",
+                "train_rank_slot_reads": 0 if bool(crct_enabled) else None,
+                "train_rank_slot_writes": 0 if bool(crct_enabled) else None,
+                "teacher_memory_slots": int(crct_teacher_memory_slots),
                 "lm_weight_alpha_max": float(crct_lm_weight_alpha_max),
                 "lm_weight_strength": float(crct_lm_weight_strength),
                 "lm_weight_w_max": float(crct_lm_weight_w_max),
@@ -8001,6 +8002,19 @@ def train_fast_for_budget(
                 ),
                 "async_teacher_payload_dtype": str(
                     crct_async_teacher_payload_dtype
+                ),
+                "teacher_score_interval_steps": int(
+                    crct_teacher_score_interval_steps
+                ),
+                "teacher_param_sync_interval_steps": int(
+                    crct_teacher_param_sync_interval
+                ),
+                "teacher_param_syncs": int(crct_teacher_param_syncs),
+                "teacher_param_sync_seconds_sum": float(
+                    crct_teacher_param_sync_seconds_sum
+                ),
+                "teacher_param_sync_seconds_max": float(
+                    crct_teacher_param_sync_seconds_max
                 ),
                 "teacher_requests": int(crct_teacher_requests),
                 "teacher_payloads": int(crct_teacher_payloads),
@@ -8020,7 +8034,6 @@ def train_fast_for_budget(
                     crct_memory_write_tokens_per_step
                 ),
                 "gradient_conflict": crct_gradient_conflict_summary,
-                "slot_broadcast": crct_slot_broadcast_summary,
                 "artifact_impact": "artifact_changes_weights_only",
             },
         },
@@ -8208,10 +8221,18 @@ def _warmup(
             config.get("crct_async_teacher_pending_batches", 64)
         ),
         crct_async_teacher_max_lag_steps=int(
-            config.get("crct_async_teacher_max_lag_steps", 32)
+            config.get("crct_async_teacher_max_lag_steps", 128)
         ),
         crct_async_teacher_payload_dtype=str(
             config.get("crct_async_teacher_payload_dtype", "auto")
+        ),
+        crct_teacher_score_interval_steps=int(
+            config.get("crct_teacher_score_interval_steps", 64)
+        ),
+        crct_teacher_param_sync_interval_steps=(
+            None
+            if config.get("crct_teacher_param_sync_interval_steps") is None
+            else int(config.get("crct_teacher_param_sync_interval_steps", 64))
         ),
         crct_gradient_conflict_enabled=bool(
             config.get("crct_gradient_conflict_enabled", False)
@@ -8239,9 +8260,6 @@ def _warmup(
         ),
         crct_gradient_conflict_trace_flush_rows=int(
             config.get("crct_gradient_conflict_trace_flush_rows", 256)
-        ),
-        crct_slot_broadcast_interval_steps=int(
-            config.get("crct_slot_broadcast_interval_steps", 1)
         ),
     )
 
@@ -8698,10 +8716,18 @@ def run_condition(
             config.get("crct_async_teacher_pending_batches", 64)
         ),
         crct_async_teacher_max_lag_steps=int(
-            config.get("crct_async_teacher_max_lag_steps", 32)
+            config.get("crct_async_teacher_max_lag_steps", 128)
         ),
         crct_async_teacher_payload_dtype=str(
             config.get("crct_async_teacher_payload_dtype", "auto")
+        ),
+        crct_teacher_score_interval_steps=int(
+            config.get("crct_teacher_score_interval_steps", 64)
+        ),
+        crct_teacher_param_sync_interval_steps=(
+            None
+            if config.get("crct_teacher_param_sync_interval_steps") is None
+            else int(config.get("crct_teacher_param_sync_interval_steps", 64))
         ),
         crct_gradient_conflict_enabled=bool(
             config.get("crct_gradient_conflict_enabled", False)
@@ -8729,9 +8755,6 @@ def run_condition(
         ),
         crct_gradient_conflict_trace_flush_rows=int(
             config.get("crct_gradient_conflict_trace_flush_rows", 256)
-        ),
-        crct_slot_broadcast_interval_steps=int(
-            config.get("crct_slot_broadcast_interval_steps", 1)
         ),
     )
     episodic_cache_payload = train_result.pop("_episodic_cache_payload", None)
