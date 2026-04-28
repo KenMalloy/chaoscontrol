@@ -1435,7 +1435,7 @@ def build_crct_v1_matrix(
         "train_sampling_mode": "random",
         "compile_full_path": False,
         "cuda_graph_mode": "none",
-        "crct_slot_broadcast_interval_steps": 1,
+        "crct_slot_broadcast_interval_steps": 16,
         "crct_gradient_conflict_enabled": True,
         "crct_gradient_conflict_soft_gate_strength": 0.0,
         "crct_gradient_conflict_trace_path": (
