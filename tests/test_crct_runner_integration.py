@@ -129,6 +129,153 @@ def _worker_collect_crct_payload(
         dist.destroy_process_group()
 
 
+def _worker_async_crct_transport(
+    rank: int,
+    world_size: int,
+    port: int,
+    result_dir: str,
+) -> None:
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
+    os.environ["MASTER_PORT"] = str(port)
+    torch.set_num_threads(1)
+    dist.init_process_group("gloo", rank=rank, world_size=world_size)
+    try:
+        mod = _load_module(f"runner_fast_path_crct_async_{rank}", RUNNER_PATH)
+        model = _tiny_crct_model()
+        cache = TransactionalWakeCache(max_moments=0, max_hidden_buffer=0)
+        all_group = dist.new_group(list(range(world_size)))
+        transport = mod._CrctAsyncTeacherTransport(
+            rank=rank,
+            world_size=world_size,
+            all_group=all_group,
+            payload_shape=(world_size - 1, 2, 5),
+            full_ids_shape=(2, 6),
+            device=torch.device("cpu"),
+            payload_dtype=torch.float32,
+            max_local_batches=8,
+            max_payload_lag_steps=8,
+        )
+        expected: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+        matched: list[dict[str, object]] = []
+        base = torch.arange(10, dtype=torch.long).reshape(2, 5)
+        for step in range(6):
+            inputs = ((base + rank * 7 + step * 3) % 32).to(dtype=torch.int32)
+            targets = ((base + rank * 7 + step * 3 + 1) % 32).to(dtype=torch.long)
+            if rank < world_size - 1:
+                expected[step] = (inputs.clone(), targets.clone())
+            ready = transport.begin_step(inputs=inputs, targets=targets, step=step)
+
+            # Make the unit test deterministic without changing production
+            # semantics: production polls; this test waits so the next step can
+            # reap the previous broadcast and prove the batch join is exact.
+            for slot in list(transport.pending_result_broadcasts):
+                for work in slot["works"]:
+                    work.wait()
+            for slot in list(transport.pending_input_gathers):
+                slot["work"].wait()
+
+            if ready is not None and rank < world_size - 1:
+                payload, train_inputs, train_targets = ready
+                request_step = int(payload["step_id"].item())
+                exp_inputs, exp_targets = expected[request_step]
+                matched.append(
+                    {
+                        "request_step": request_step,
+                        "matched_inputs": bool(torch.equal(train_inputs, exp_inputs)),
+                        "matched_targets": bool(
+                            torch.equal(train_targets, exp_targets)
+                        ),
+                        "finite": bool(
+                            torch.isfinite(payload["loss_weight"]).all().item()
+                        ),
+                    }
+                )
+
+            transport.after_optimizer_step(
+                model=model,
+                cache=cache,
+                scarcity_optimizer=None,
+                step=step,
+                total_steps=8,
+                tau=0.1,
+                strength=0.1,
+                w_max=1.2,
+                alpha_max=0.15,
+                memory_write_tokens=4,
+            )
+
+        transport.close()
+        Path(result_dir, f"rank{rank}.json").write_text(
+            json.dumps(
+                {
+                    "rank": int(rank),
+                    "matched": matched,
+                    "slots": int(len(model.outer_model._slots)),
+                    "diagnostics": transport.diagnostics(),
+                }
+            )
+        )
+        dist.barrier()
+    finally:
+        dist.destroy_process_group()
+
+
+def _worker_async_crct_train_loop(
+    rank: int,
+    world_size: int,
+    port: int,
+    result_dir: str,
+) -> None:
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
+    os.environ["MASTER_PORT"] = str(port)
+    torch.set_num_threads(1)
+    dist.init_process_group("gloo", rank=rank, world_size=world_size)
+    try:
+        mod = _load_module(f"runner_fast_path_crct_loop_{rank}", RUNNER_PATH)
+        model = _tiny_crct_model()
+        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+        tokens = torch.arange(256, dtype=torch.long) % 32
+        result = mod.train_fast_for_budget(
+            model,
+            train_tokens=tokens,
+            train_num_tokens=int(tokens.numel()),
+            stride=5,
+            seq_len=5,
+            batch_size=2,
+            device=torch.device("cpu"),
+            optimizer=optimizer,
+            budget_seconds=5.0,
+            chunk_size=8,
+            grad_clip_norm=1.0,
+            fused_grad_clip=False,
+            rank=rank,
+            world_size=world_size,
+            seed=123,
+            precision="fp32",
+            stop_check_interval=1,
+            stop_margin_seconds=0.0,
+            vocab_size=32,
+            max_steps=5,
+            lm_head_backward_mode="single",
+            grad_allreduce_mode="bulk",
+            train_sampling_mode="random",
+            prefetch_batches=False,
+            crct_enabled=True,
+            crct_async_teacher_transport=True,
+            crct_async_teacher_pending_batches=8,
+            crct_async_teacher_max_lag_steps=8,
+            crct_async_teacher_payload_dtype="fp32",
+            crct_memory_write_tokens_per_step=4,
+        )
+        if rank == 0:
+            Path(result_dir, "rank0.json").write_text(
+                json.dumps(result["mechanisms"]["crct"])
+            )
+        dist.barrier()
+    finally:
+        dist.destroy_process_group()
+
+
 def test_exp24_model_builder_threads_crct_memory_and_controller() -> None:
     mod = _load_module("runner_exp21_crct_test", RUNNER21_PATH)
     cfg = {
@@ -324,3 +471,67 @@ def test_crct_teacher_payload_distributed_gather_score_broadcast() -> None:
         assert rec["finite"] is True
     assert records[3]["has_payload"] is False
     assert records[3]["slots"] == 4
+
+
+def test_crct_async_teacher_transport_matches_stored_batch() -> None:
+    world_size = 4
+    port = _pick_free_port_or_skip()
+    with tempfile.TemporaryDirectory() as tmp:
+        mp.spawn(
+            _worker_async_crct_transport,
+            args=(world_size, port, tmp),
+            nprocs=world_size,
+            join=True,
+        )
+        records = [
+            json.loads(Path(tmp, f"rank{rank}.json").read_text())
+            for rank in range(world_size)
+        ]
+
+    for rec in records[:3]:
+        assert len(rec["matched"]) >= 2
+        assert all(row["matched_inputs"] for row in rec["matched"])
+        assert all(row["matched_targets"] for row in rec["matched"])
+        assert all(row["finite"] for row in rec["matched"])
+        diag = rec["diagnostics"]
+        assert diag["mode"] == "async_allgather_broadcast"
+        assert diag["requests_started"] == 6
+        assert diag["payloads_used"] == len(rec["matched"])
+        assert diag["sentinels_received"] >= 1
+        assert diag["payload_lag_steps_max"] >= 1
+        assert diag["orphan_payloads_dropped"] == 0
+        assert diag["stale_payloads_dropped"] == 0
+        assert diag["errors"] == 0
+
+    memory_diag = records[3]["diagnostics"]
+    assert memory_diag["payloads_scored"] >= 3
+    assert memory_diag["payloads_sent"] >= 2
+    assert records[3]["slots"] > 0
+
+
+def test_crct_async_teacher_transport_wired_into_train_loop() -> None:
+    world_size = 4
+    port = _pick_free_port_or_skip()
+    with tempfile.TemporaryDirectory() as tmp:
+        mp.spawn(
+            _worker_async_crct_train_loop,
+            args=(world_size, port, tmp),
+            nprocs=world_size,
+            join=True,
+        )
+        crct = json.loads(Path(tmp, "rank0.json").read_text())
+
+    assert crct["teacher_transport_mode"] == "async_allgather_broadcast"
+    assert crct["async_teacher_transport"] is True
+    assert crct["teacher_requests"] == 5
+    assert crct["teacher_payloads"] >= 1
+    assert crct["teacher_fail_open"] >= 1
+    ranks = crct["rank_diagnostics"]
+    assert len(ranks) == 4
+    train0 = ranks[0]["transport"]
+    memory = ranks[3]["transport"]
+    assert train0["requests_started"] == 5
+    assert train0["payloads_used"] == crct["teacher_payloads"]
+    assert train0["errors"] == 0
+    assert memory["payloads_scored"] >= 2
+    assert memory["payloads_sent"] >= 1

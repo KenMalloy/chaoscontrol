@@ -1047,6 +1047,484 @@ def _crct_score_payload_inline(
     }
 
 
+def _dist_work_done(work: Any) -> bool:
+    try:
+        return bool(work.is_completed())
+    except Exception:
+        return False
+
+
+class _CrctAsyncTeacherTransport:
+    """Nonblocking CRCT teacher transport with matched-batch replay.
+
+    Every rank enters the same collective sequence each step:
+
+    1. broadcast the previous scored payload (or a sentinel),
+    2. all-gather this step's input ids for rank ``world_size - 1``.
+
+    Train ranks do not wait for either collective. They use a payload only
+    when a completed broadcast's ``request_step`` still has its original
+    ``(inputs, targets)`` in the local request table; otherwise the main
+    trainer falls open for that step. Rank 3 scores completed gathers after
+    the optimizer/all-reduce window via ``after_optimizer_step()``, so the
+    teacher work can be hidden under the next train-rank forward.
+    """
+
+    def __init__(
+        self,
+        *,
+        rank: int,
+        world_size: int,
+        all_group: "dist.ProcessGroup",
+        payload_shape: tuple[int, int, int],
+        full_ids_shape: tuple[int, int],
+        device: torch.device,
+        payload_dtype: torch.dtype,
+        max_local_batches: int,
+        max_payload_lag_steps: int,
+    ) -> None:
+        self.rank = int(rank)
+        self.world_size = int(world_size)
+        self.memory_rank = self.world_size - 1
+        self.n_train = self.world_size - 1
+        self.all_group = all_group
+        self.payload_shape = tuple(int(x) for x in payload_shape)
+        self.full_ids_shape = tuple(int(x) for x in full_ids_shape)
+        self.device = device
+        self.payload_dtype = payload_dtype
+        self.max_local_batches = max(1, int(max_local_batches))
+        self.max_payload_lag_steps = max(0, int(max_payload_lag_steps))
+        self.pending_result_broadcasts: deque[dict[str, Any]] = deque()
+        self.pending_input_gathers: deque[dict[str, Any]] = deque()
+        self.local_batches_by_step: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+        self.local_batch_order: deque[int] = deque()
+        self.ready_result: dict[str, torch.Tensor] | None = None
+        self.ready_result_request_step: int | None = None
+        self.metrics: dict[str, Any] = {
+            "mode": "async_allgather_broadcast",
+            "payload_dtype": str(payload_dtype).replace("torch.", ""),
+            "request_shape": list(self.full_ids_shape),
+            "payload_shape": list(self.payload_shape),
+            "max_local_batches": int(self.max_local_batches),
+            "max_payload_lag_steps": int(self.max_payload_lag_steps),
+            "requests_started": 0,
+            "result_broadcasts_started": 0,
+            "result_broadcasts_completed": 0,
+            "input_gathers_started": 0,
+            "input_gathers_completed": 0,
+            "requests_stored": 0,
+            "local_request_evictions": 0,
+            "payloads_scored": 0,
+            "payloads_sent": 0,
+            "payloads_received": 0,
+            "payloads_used": 0,
+            "sentinel_broadcasts": 0,
+            "sentinels_received": 0,
+            "stale_payloads_dropped": 0,
+            "orphan_payloads_dropped": 0,
+            "superseded_payloads_dropped": 0,
+            "completed_requests_dropped": 0,
+            "ready_result_drops": 0,
+            "shutdown_result_broadcasts_drained": 0,
+            "shutdown_input_gathers_drained": 0,
+            "score_seconds_sum": 0.0,
+            "score_seconds_max": 0.0,
+            "payload_lag_steps_sum": 0,
+            "payload_lag_steps_max": 0,
+            "max_pending_result_broadcasts": 0,
+            "max_pending_input_gathers": 0,
+            "max_local_pending_batches": 0,
+            "last_scored_request_step": None,
+            "last_sent_request_step": None,
+            "last_received_request_step": None,
+            "last_used_request_step": None,
+            "last_drop_reason": "",
+            "errors": 0,
+            "last_error": "",
+        }
+
+    def begin_step(
+        self,
+        *,
+        inputs: torch.Tensor,
+        targets: torch.Tensor,
+        step: int,
+    ) -> tuple[dict[str, torch.Tensor], torch.Tensor, torch.Tensor] | None:
+        payload_tuple = self._reap_result_broadcasts(current_step=int(step))
+        self._issue_result_broadcast(send_step=int(step))
+        self._issue_input_all_gather(inputs=inputs, targets=targets, step=int(step))
+        return payload_tuple
+
+    def after_optimizer_step(
+        self,
+        *,
+        model: torch.nn.Module,
+        cache: TransactionalWakeCache,
+        scarcity_optimizer: CrctScarcityAwareMemoryOptimizer | None,
+        step: int,
+        total_steps: int | None,
+        tau: float,
+        strength: float,
+        w_max: float,
+        alpha_max: float,
+        memory_write_tokens: int,
+    ) -> None:
+        completed = self._reap_input_gathers()
+        if self.rank != self.memory_rank:
+            return
+        if not completed:
+            return
+        if self.ready_result is not None:
+            self.metrics["completed_requests_dropped"] += len(completed)
+            self.metrics["ready_result_drops"] += len(completed)
+            self.metrics["last_drop_reason"] = "ready_result_pending"
+            return
+        if len(completed) > 1:
+            self.metrics["completed_requests_dropped"] += len(completed) - 1
+            self.metrics["last_drop_reason"] = "newer_completed_request_won"
+        slot = completed[-1]
+        request_step = int(slot["step"])
+        gathered = slot["buffer"]
+        try:
+            batch = self.full_ids_shape[0]
+            train_full_ids = gathered[: self.n_train * batch].reshape(
+                self.n_train * self.full_ids_shape[0],
+                self.full_ids_shape[1],
+            )
+            train_inputs = train_full_ids[:, :-1].to(dtype=torch.int32)
+            train_targets = train_full_ids[:, 1:].to(dtype=torch.long)
+            t0 = time.perf_counter()
+            scored = _crct_score_payload_inline(
+                model=model,
+                cache=cache,
+                scarcity_optimizer=scarcity_optimizer,
+                inputs=train_inputs,
+                targets=train_targets,
+                step=request_step,
+                total_steps=total_steps,
+                tau=tau,
+                strength=strength,
+                w_max=w_max,
+                alpha_max=alpha_max,
+                memory_write_tokens=int(memory_write_tokens),
+                update_model_memory_after=True,
+            )
+            score_s = time.perf_counter() - t0
+            self.metrics["score_seconds_sum"] += float(score_s)
+            self.metrics["score_seconds_max"] = max(
+                float(self.metrics["score_seconds_max"]),
+                float(score_s),
+            )
+            self.metrics["payloads_scored"] += 1
+            self.metrics["last_scored_request_step"] = request_step
+            self.ready_result = scored
+            self.ready_result_request_step = request_step
+        except Exception as exc:
+            self.metrics["errors"] += 1
+            self.metrics["last_error"] = "".join(
+                traceback.format_exception_only(type(exc), exc)
+            ).strip()
+            self.metrics["last_drop_reason"] = "score_exception"
+
+    def diagnostics(self) -> dict[str, Any]:
+        out = dict(self.metrics)
+        out.update(
+            {
+                "pending_result_broadcasts": len(self.pending_result_broadcasts),
+                "pending_input_gathers": len(self.pending_input_gathers),
+                "local_pending_batches": len(self.local_batches_by_step),
+                "ready_result_pending": self.ready_result is not None,
+                "ready_result_request_step": self.ready_result_request_step,
+            }
+        )
+        used = int(out.get("payloads_used", 0))
+        if used:
+            out["payload_lag_steps_mean"] = (
+                float(out["payload_lag_steps_sum"]) / float(used)
+            )
+        else:
+            out["payload_lag_steps_mean"] = 0.0
+        scored = int(out.get("payloads_scored", 0))
+        if scored:
+            out["score_seconds_mean"] = float(out["score_seconds_sum"]) / float(scored)
+        else:
+            out["score_seconds_mean"] = 0.0
+        return out
+
+    def close(self) -> None:
+        while self.pending_result_broadcasts:
+            slot = self.pending_result_broadcasts.popleft()
+            try:
+                for work in slot["works"]:
+                    work.wait()
+                self.metrics["result_broadcasts_completed"] += 1
+                self.metrics["shutdown_result_broadcasts_drained"] += 1
+            except Exception as exc:
+                self.metrics["errors"] += 1
+                self.metrics["last_error"] = "".join(
+                    traceback.format_exception_only(type(exc), exc)
+                ).strip()
+                self.metrics["last_drop_reason"] = "shutdown_broadcast_wait_error"
+                break
+        while self.pending_input_gathers:
+            slot = self.pending_input_gathers.popleft()
+            try:
+                slot["work"].wait()
+                self.metrics["input_gathers_completed"] += 1
+                self.metrics["shutdown_input_gathers_drained"] += 1
+            except Exception as exc:
+                self.metrics["errors"] += 1
+                self.metrics["last_error"] = "".join(
+                    traceback.format_exception_only(type(exc), exc)
+                ).strip()
+                self.metrics["last_drop_reason"] = "shutdown_gather_wait_error"
+                break
+
+    def _new_payload_buffers(self) -> dict[str, torch.Tensor]:
+        return {
+            "target": torch.zeros(
+                self.payload_shape,
+                device=self.device,
+                dtype=self.payload_dtype,
+            ),
+            "confidence": torch.zeros(
+                self.payload_shape,
+                device=self.device,
+                dtype=self.payload_dtype,
+            ),
+            "loss_weight": torch.ones(
+                self.payload_shape,
+                device=self.device,
+                dtype=self.payload_dtype,
+            ),
+            "utility": torch.zeros(
+                self.payload_shape,
+                device=self.device,
+                dtype=self.payload_dtype,
+            ),
+            "meta": torch.zeros(6, device=self.device, dtype=torch.float32),
+        }
+
+    def _issue_result_broadcast(self, *, send_step: int) -> None:
+        buffers = self._new_payload_buffers()
+        valid = False
+        request_step = -1
+        if self.rank == self.memory_rank and self.ready_result is not None:
+            request_step = int(
+                self.ready_result_request_step
+                if self.ready_result_request_step is not None
+                else -1
+            )
+            try:
+                for key in ("target", "confidence", "loss_weight", "utility"):
+                    buffers[key].copy_(
+                        self.ready_result[key].reshape(self.payload_shape).to(
+                            device=self.device,
+                            dtype=self.payload_dtype,
+                        )
+                    )
+                buffers["meta"][0] = 1.0
+                buffers["meta"][1] = float(request_step)
+                buffers["meta"][2] = float(send_step)
+                buffers["meta"][3] = float(request_step)
+                valid = True
+                self.metrics["payloads_sent"] += 1
+                self.metrics["last_sent_request_step"] = request_step
+            except Exception as exc:
+                self.metrics["errors"] += 1
+                self.metrics["last_error"] = "".join(
+                    traceback.format_exception_only(type(exc), exc)
+                ).strip()
+                self.metrics["last_drop_reason"] = "broadcast_pack_exception"
+            finally:
+                self.ready_result = None
+                self.ready_result_request_step = None
+        if not valid:
+            self.metrics["sentinel_broadcasts"] += 1
+        works = [
+            dist.broadcast(
+                buffers["target"],
+                src=self.memory_rank,
+                group=self.all_group,
+                async_op=True,
+            ),
+            dist.broadcast(
+                buffers["confidence"],
+                src=self.memory_rank,
+                group=self.all_group,
+                async_op=True,
+            ),
+            dist.broadcast(
+                buffers["loss_weight"],
+                src=self.memory_rank,
+                group=self.all_group,
+                async_op=True,
+            ),
+            dist.broadcast(
+                buffers["utility"],
+                src=self.memory_rank,
+                group=self.all_group,
+                async_op=True,
+            ),
+            dist.broadcast(
+                buffers["meta"],
+                src=self.memory_rank,
+                group=self.all_group,
+                async_op=True,
+            ),
+        ]
+        self.pending_result_broadcasts.append(
+            {"works": works, "buffers": buffers, "send_step": int(send_step)}
+        )
+        self.metrics["result_broadcasts_started"] += 1
+        self.metrics["max_pending_result_broadcasts"] = max(
+            int(self.metrics["max_pending_result_broadcasts"]),
+            len(self.pending_result_broadcasts),
+        )
+
+    def _issue_input_all_gather(
+        self,
+        *,
+        inputs: torch.Tensor,
+        targets: torch.Tensor,
+        step: int,
+    ) -> None:
+        full_ids = _crct_full_input_ids(inputs, targets).contiguous()
+        if tuple(full_ids.shape) != self.full_ids_shape:
+            raise ValueError(
+                "CRCT async transport saw a dynamic batch shape: "
+                f"{tuple(full_ids.shape)} != {self.full_ids_shape}"
+            )
+        if self.rank != self.memory_rank:
+            self.local_batches_by_step[int(step)] = (
+                inputs.detach().clone(),
+                targets.detach().clone(),
+            )
+            self.local_batch_order.append(int(step))
+            self.metrics["requests_stored"] += 1
+            while len(self.local_batch_order) > self.max_local_batches:
+                old_step = self.local_batch_order.popleft()
+                if self.local_batches_by_step.pop(old_step, None) is not None:
+                    self.metrics["local_request_evictions"] += 1
+                    self.metrics["last_drop_reason"] = "local_request_evicted"
+        gather_buf = torch.empty(
+            (self.world_size * self.full_ids_shape[0], self.full_ids_shape[1]),
+            device=self.device,
+            dtype=full_ids.dtype,
+        )
+        work = dist.all_gather_into_tensor(
+            gather_buf,
+            full_ids,
+            group=self.all_group,
+            async_op=True,
+        )
+        self.pending_input_gathers.append(
+            {"work": work, "buffer": gather_buf, "step": int(step)}
+        )
+        self.metrics["requests_started"] += 1
+        self.metrics["input_gathers_started"] += 1
+        self.metrics["max_pending_input_gathers"] = max(
+            int(self.metrics["max_pending_input_gathers"]),
+            len(self.pending_input_gathers),
+        )
+        self.metrics["max_local_pending_batches"] = max(
+            int(self.metrics["max_local_pending_batches"]),
+            len(self.local_batches_by_step),
+        )
+
+    def _reap_result_broadcasts(
+        self,
+        *,
+        current_step: int,
+    ) -> tuple[dict[str, torch.Tensor], torch.Tensor, torch.Tensor] | None:
+        ready: tuple[dict[str, torch.Tensor], torch.Tensor, torch.Tensor] | None = None
+        while self.pending_result_broadcasts and all(
+            _dist_work_done(work)
+            for work in self.pending_result_broadcasts[0]["works"]
+        ):
+            slot = self.pending_result_broadcasts.popleft()
+            self.metrics["result_broadcasts_completed"] += 1
+            if self.rank == self.memory_rank:
+                continue
+            buffers = slot["buffers"]
+            meta = buffers["meta"]
+            valid = bool(float(meta[0].detach().cpu().item()) > 0.5)
+            if not valid:
+                self.metrics["sentinels_received"] += 1
+                continue
+            request_step = int(float(meta[1].detach().cpu().item()))
+            lag = int(current_step) - request_step
+            batch = self.local_batches_by_step.pop(request_step, None)
+            try:
+                self.local_batch_order.remove(request_step)
+            except ValueError:
+                pass
+            if batch is None:
+                self.metrics["orphan_payloads_dropped"] += 1
+                self.metrics["last_drop_reason"] = "payload_without_local_batch"
+                continue
+            if self.max_payload_lag_steps > 0 and lag > self.max_payload_lag_steps:
+                self.metrics["stale_payloads_dropped"] += 1
+                self.metrics["last_drop_reason"] = "payload_too_stale"
+                continue
+            payload = {
+                "step_id": torch.tensor(request_step, device=self.device),
+                "target": buffers["target"][self.rank].detach().clone().float(),
+                "confidence": (
+                    buffers["confidence"][self.rank].detach().clone().float()
+                ),
+                "loss_weight": (
+                    buffers["loss_weight"][self.rank].detach().clone().float()
+                ),
+                "utility": buffers["utility"][self.rank].detach().clone().float(),
+            }
+            if ready is not None:
+                self.metrics["superseded_payloads_dropped"] += 1
+            inputs, targets = batch
+            ready = (payload, inputs, targets)
+            self.metrics["payloads_received"] += 1
+            self.metrics["payloads_used"] += 1
+            self.metrics["last_received_request_step"] = request_step
+            self.metrics["last_used_request_step"] = request_step
+            self.metrics["payload_lag_steps_sum"] += max(0, lag)
+            self.metrics["payload_lag_steps_max"] = max(
+                int(self.metrics["payload_lag_steps_max"]),
+                max(0, lag),
+            )
+        return ready
+
+    def _reap_input_gathers(self) -> list[dict[str, Any]]:
+        completed: list[dict[str, Any]] = []
+        while self.pending_input_gathers and _dist_work_done(
+            self.pending_input_gathers[0]["work"]
+        ):
+            completed.append(self.pending_input_gathers.popleft())
+        if completed:
+            self.metrics["input_gathers_completed"] += len(completed)
+        return completed
+
+
+def _resolve_crct_async_payload_dtype(
+    requested: str,
+    *,
+    device: torch.device,
+) -> torch.dtype:
+    value = str(requested).strip().lower()
+    if value == "auto":
+        return torch.float16 if device.type == "cuda" else torch.float32
+    if value in {"fp16", "float16", "half"}:
+        return torch.float16
+    if value in {"bf16", "bfloat16"}:
+        return torch.bfloat16
+    if value in {"fp32", "float32"}:
+        return torch.float32
+    raise ValueError(
+        "crct_async_teacher_payload_dtype must be one of "
+        "'auto', 'fp16', 'bf16', or 'fp32'; got "
+        f"{requested!r}"
+    )
+
+
 def _collect_crct_teacher_payload(
     *,
     model: torch.nn.Module,
@@ -5720,6 +6198,10 @@ def train_fast_for_budget(
     crct_ema_beta: float = 0.95,
     crct_max_price: float = 0.50,
     crct_memory_write_tokens_per_step: int = 256,
+    crct_async_teacher_transport: bool = True,
+    crct_async_teacher_pending_batches: int = 64,
+    crct_async_teacher_max_lag_steps: int = 32,
+    crct_async_teacher_payload_dtype: str = "auto",
 ) -> dict[str, Any]:
     rank_ = int(rank)
     world_size_ = int(world_size)
@@ -6317,6 +6799,9 @@ def train_fast_for_budget(
     crct_teacher_requests = 0
     crct_teacher_payloads = 0
     crct_teacher_fail_open = 0
+    crct_teacher_transport: _CrctAsyncTeacherTransport | None = None
+    crct_teacher_transport_mode = "disabled"
+    crct_rank_diagnostics: list[dict[str, Any] | None] | None = None
     if crct_enabled:
         crct_cache = TransactionalWakeCache(
             max_moments=0,
@@ -6329,6 +6814,16 @@ def train_fast_for_budget(
             dual_lr=float(crct_dual_lr),
             ema_beta=float(crct_ema_beta),
             max_price=float(crct_max_price),
+        )
+        crct_teacher_transport_mode = (
+            "async_allgather_broadcast"
+            if (
+                bool(crct_async_teacher_transport)
+                and world_size_ >= 4
+                and all_group is not None
+                and dist.is_initialized()
+            )
+            else ("sync_collective" if world_size_ >= 4 else "inline")
         )
 
     prefetcher = None
@@ -6560,26 +7055,65 @@ def train_fast_for_budget(
                 )
 
             crct_payload: dict[str, torch.Tensor] | None = None
+            train_inputs = inputs
+            train_targets = targets
             if crct_enabled:
                 assert crct_cache is not None
                 crct_teacher_requests += 1
-                crct_payload = _collect_crct_teacher_payload(
-                    model=model,
-                    cache=crct_cache,
-                    scarcity_optimizer=crct_scarcity,
-                    inputs=inputs,
-                    targets=targets,
-                    rank=rank_,
-                    world_size=world_size_,
-                    all_group=all_group,
-                    step=steps,
-                    total_steps=max_steps,
-                    tau=float(crct_lm_weight_tau),
-                    strength=float(crct_lm_weight_strength),
-                    w_max=float(crct_lm_weight_w_max),
-                    alpha_max=float(crct_lm_weight_alpha_max),
-                    memory_write_tokens=int(crct_memory_write_tokens_per_step),
-                )
+                if crct_teacher_transport_mode == "async_allgather_broadcast":
+                    if crct_teacher_transport is None:
+                        full_ids_shape = tuple(
+                            int(x)
+                            for x in _crct_full_input_ids(inputs, targets).shape
+                        )
+                        payload_shape = (
+                            world_size_ - 1,
+                            int(targets.shape[0]),
+                            int(targets.shape[1]),
+                        )
+                        crct_teacher_transport = _CrctAsyncTeacherTransport(
+                            rank=rank_,
+                            world_size=world_size_,
+                            all_group=all_group,
+                            payload_shape=payload_shape,
+                            full_ids_shape=full_ids_shape,
+                            device=inputs.device,
+                            payload_dtype=_resolve_crct_async_payload_dtype(
+                                crct_async_teacher_payload_dtype,
+                                device=inputs.device,
+                            ),
+                            max_local_batches=int(
+                                crct_async_teacher_pending_batches
+                            ),
+                            max_payload_lag_steps=int(
+                                crct_async_teacher_max_lag_steps
+                            ),
+                        )
+                    ready = crct_teacher_transport.begin_step(
+                        inputs=inputs,
+                        targets=targets,
+                        step=steps,
+                    )
+                    if ready is not None:
+                        crct_payload, train_inputs, train_targets = ready
+                else:
+                    crct_payload = _collect_crct_teacher_payload(
+                        model=model,
+                        cache=crct_cache,
+                        scarcity_optimizer=crct_scarcity,
+                        inputs=inputs,
+                        targets=targets,
+                        rank=rank_,
+                        world_size=world_size_,
+                        all_group=all_group,
+                        step=steps,
+                        total_steps=max_steps,
+                        tau=float(crct_lm_weight_tau),
+                        strength=float(crct_lm_weight_strength),
+                        w_max=float(crct_lm_weight_w_max),
+                        alpha_max=float(crct_lm_weight_alpha_max),
+                        memory_write_tokens=int(crct_memory_write_tokens_per_step),
+                    )
                 if crct_payload is None:
                     crct_teacher_fail_open += 1
                 else:
@@ -6648,8 +7182,8 @@ def train_fast_for_budget(
             else:
                 loss = _run_train_step(
                     model=model,
-                    inputs=inputs,
-                    targets=targets,
+                    inputs=train_inputs,
+                    targets=train_targets,
                     chunk_size=chunk_size,
                     precision=precision,
                     ddp_active=ddp_active,
@@ -6736,9 +7270,9 @@ def train_fast_for_budget(
                     except Exception:
                         use_fused_entropy = False
                 with torch.no_grad():
-                    hidden_cd = model.encode(inputs)
+                    hidden_cd = model.encode(train_inputs)
                     normed_cd = model.final_norm(hidden_cd)
-                    B_cd, T_cd = inputs.shape[0], inputs.shape[1]
+                    B_cd, T_cd = train_inputs.shape[0], train_inputs.shape[1]
                     if use_fused_entropy and fused_entropy_fn is not None:
                         try:
                             (
@@ -6749,7 +7283,7 @@ def train_fast_for_budget(
                             ) = fused_entropy_fn(
                                 normed_cd,
                                 model.lm_head.weight,
-                                targets,
+                                train_targets,
                                 tile_size=int(lm_head_tile_size),
                             )
                             per_token_ce_bt = per_token_ce_flat.reshape(B_cd, T_cd)
@@ -6766,7 +7300,7 @@ def train_fast_for_budget(
                         V_cd = logits_cd.shape[-1]
                         per_token_ce_flat = F.cross_entropy(
                             logits_cd.reshape(-1, V_cd),
-                            targets.reshape(-1),
+                            train_targets.reshape(-1),
                             reduction="none",
                         )
                         probs_cd = F.softmax(logits_cd, dim=-1)
@@ -6904,6 +7438,20 @@ def train_fast_for_budget(
             if predictive_aux_optimizer is not None:
                 predictive_aux_optimizer.step()
             fast_slow.after_optimizer_step(model, step=steps + 1)
+            if crct_teacher_transport is not None:
+                assert crct_cache is not None
+                crct_teacher_transport.after_optimizer_step(
+                    model=model,
+                    cache=crct_cache,
+                    scarcity_optimizer=crct_scarcity,
+                    step=steps,
+                    total_steps=max_steps,
+                    tau=float(crct_lm_weight_tau),
+                    strength=float(crct_lm_weight_strength),
+                    w_max=float(crct_lm_weight_w_max),
+                    alpha_max=float(crct_lm_weight_alpha_max),
+                    memory_write_tokens=int(crct_memory_write_tokens_per_step),
+                )
             # Phase B5: deferred post-step CE pair pass on the episodic
             # rank. The in-step drain stages each successful replay and
             # the just-emitted REPLAY_OUTCOME dict; this call runs a
@@ -6933,6 +7481,8 @@ def train_fast_for_budget(
             prefetcher.close()
         if async_grad_reducer is not None:
             async_grad_reducer.close()
+        if crct_teacher_transport is not None:
+            crct_teacher_transport.close()
         # Phase 2: stop the episodic controller thread. None handle
         # (train ranks, episodic disabled, controller flag off) is a
         # no-op. Bounded join so a stuck loop can't block the runner's
@@ -6972,6 +7522,55 @@ def train_fast_for_budget(
                 )
         else:
             episodic_cache_payload = local_cache_payload
+
+    if crct_enabled:
+        crct_local_diagnostics: dict[str, Any] = {
+            "rank": int(rank_),
+            "is_memory_rank": bool(rank_ == world_size_ - 1 and world_size_ >= 4),
+            "teacher_transport_mode": str(crct_teacher_transport_mode),
+            "teacher_requests": int(crct_teacher_requests),
+            "teacher_payloads": int(crct_teacher_payloads),
+            "teacher_fail_open": int(crct_teacher_fail_open),
+            "read_price": (
+                float(crct_scarcity.read_price)
+                if crct_scarcity is not None
+                else 0.0
+            ),
+            "read_rate_ema": (
+                float(crct_scarcity.read_rate_ema)
+                if crct_scarcity is not None
+                else 0.0
+            ),
+            "memory_slots": int(len(getattr(model.outer_model, "_slots", []))),
+            "transport": (
+                crct_teacher_transport.diagnostics()
+                if crct_teacher_transport is not None
+                else {
+                    "mode": str(crct_teacher_transport_mode),
+                    "requests_started": 0,
+                    "payloads_used": int(crct_teacher_payloads),
+                    "payloads_scored": 0,
+                    "payloads_sent": 0,
+                    "payloads_received": 0,
+                    "errors": 0,
+                    "last_error": "",
+                }
+            ),
+        }
+        if ddp_active and dist.is_initialized() and all_group is not None:
+            gathered_crct: list[dict[str, Any] | None] | None = (
+                [None for _ in range(world_size_)] if rank_ == 0 else None
+            )
+            dist.gather_object(
+                crct_local_diagnostics,
+                object_gather_list=gathered_crct,
+                dst=0,
+                group=all_group,
+            )
+            if rank_ == 0:
+                crct_rank_diagnostics = gathered_crct
+        else:
+            crct_rank_diagnostics = [crct_local_diagnostics]
 
     elapsed_s = time.perf_counter() - start_time
     loss_cpu = torch.stack(losses).cpu() if losses else torch.empty(0)
@@ -7149,9 +7748,23 @@ def train_fast_for_budget(
                 "lm_weight_strength": float(crct_lm_weight_strength),
                 "lm_weight_w_max": float(crct_lm_weight_w_max),
                 "lm_weight_tau": float(crct_lm_weight_tau),
+                "teacher_transport_mode": str(crct_teacher_transport_mode),
+                "async_teacher_transport": bool(
+                    crct_teacher_transport_mode == "async_allgather_broadcast"
+                ),
+                "async_teacher_pending_batches": int(
+                    crct_async_teacher_pending_batches
+                ),
+                "async_teacher_max_lag_steps": int(
+                    crct_async_teacher_max_lag_steps
+                ),
+                "async_teacher_payload_dtype": str(
+                    crct_async_teacher_payload_dtype
+                ),
                 "teacher_requests": int(crct_teacher_requests),
                 "teacher_payloads": int(crct_teacher_payloads),
                 "teacher_fail_open": int(crct_teacher_fail_open),
+                "rank_diagnostics": crct_rank_diagnostics,
                 "read_price": (
                     float(crct_scarcity.read_price)
                     if crct_scarcity is not None
@@ -7344,6 +7957,18 @@ def _warmup(
         crct_max_price=float(config.get("crct_max_price", 0.50)),
         crct_memory_write_tokens_per_step=int(
             config.get("crct_memory_write_tokens_per_step", 256)
+        ),
+        crct_async_teacher_transport=bool(
+            config.get("crct_async_teacher_transport", True)
+        ),
+        crct_async_teacher_pending_batches=int(
+            config.get("crct_async_teacher_pending_batches", 64)
+        ),
+        crct_async_teacher_max_lag_steps=int(
+            config.get("crct_async_teacher_max_lag_steps", 32)
+        ),
+        crct_async_teacher_payload_dtype=str(
+            config.get("crct_async_teacher_payload_dtype", "auto")
         ),
     )
 
@@ -7790,6 +8415,18 @@ def run_condition(
         crct_max_price=float(config.get("crct_max_price", 0.50)),
         crct_memory_write_tokens_per_step=int(
             config.get("crct_memory_write_tokens_per_step", 256)
+        ),
+        crct_async_teacher_transport=bool(
+            config.get("crct_async_teacher_transport", True)
+        ),
+        crct_async_teacher_pending_batches=int(
+            config.get("crct_async_teacher_pending_batches", 64)
+        ),
+        crct_async_teacher_max_lag_steps=int(
+            config.get("crct_async_teacher_max_lag_steps", 32)
+        ),
+        crct_async_teacher_payload_dtype=str(
+            config.get("crct_async_teacher_payload_dtype", "auto")
         ),
     )
     episodic_cache_payload = train_result.pop("_episodic_cache_payload", None)
