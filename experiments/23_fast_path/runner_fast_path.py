@@ -930,33 +930,6 @@ def _crct_valid_mask(input_ids: torch.Tensor) -> torch.Tensor:
     return torch.ones_like(input_ids, dtype=torch.bool)
 
 
-def _crct_append_memory_from_hidden(
-    model: torch.nn.Module,
-    hidden: torch.Tensor,
-    *,
-    score: torch.Tensor | None = None,
-    max_tokens: int | None = None,
-) -> None:
-    append_fn = getattr(model, "append_memory_from_hidden", None)
-    if append_fn is None:
-        raise ValueError(
-            "crct_enabled=True requires a model with append_memory_from_hidden(...)"
-        )
-    wrote = bool(
-        append_fn(
-            hidden.detach(),
-            score=score.detach() if score is not None else None,
-            max_tokens=max_tokens,
-        )
-    )
-    if not wrote:
-        raise ValueError(
-            "crct_enabled=True requires append-only multislot memory. "
-            "Without it the CRCT teacher compares memory-off to an empty "
-            "memory path and silently produces zero utility."
-        )
-
-
 def _crct_slot_count(outer_model: Any) -> int:
     return int(len(getattr(outer_model, "_slots", [])))
 
@@ -5420,7 +5393,6 @@ def _run_train_step(
     crct_enabled: bool = False,
     crct_payload: dict[str, torch.Tensor] | None = None,
     crct_lambda_controller: float = 0.01,
-    crct_update_memory: bool = True,
     crct_memory_write_tokens_per_step: int = 256,
 ) -> torch.Tensor:
     _reject_unsupported_fast_step(model, crct_enabled=bool(crct_enabled))
@@ -5645,17 +5617,6 @@ def _run_train_step(
                 "'fused_streaming_cached', or 'fused_norm_streaming_v2', "
                 f"got {lm_head_backward_mode!r}"
             )
-    if crct_enabled and crct_update_memory:
-        _crct_append_memory_from_hidden(
-            model,
-            hidden,
-            score=(
-                crct_payload.get("utility")
-                if crct_payload is not None and "utility" in crct_payload
-                else None
-            ),
-            max_tokens=int(crct_memory_write_tokens_per_step),
-        )
     if spectral_reg_lambda_dead > 0.0 or spectral_reg_lambda_sticky > 0.0:
         spectral_extra = spectral_regularization_loss(
             model,
@@ -6350,7 +6311,6 @@ def train_fast_for_budget(
     crct_gradient_conflict_trace_stride: int = 1,
     crct_gradient_conflict_trace_max_rows: int = 0,
     crct_gradient_conflict_trace_flush_rows: int = 256,
-    crct_central_slot_broadcast_enabled: bool = False,
     crct_slot_broadcast_interval_steps: int = 1,
 ) -> dict[str, Any]:
     rank_ = int(rank)
@@ -6482,13 +6442,10 @@ def train_fast_for_budget(
             "crct_enabled=True requires buffer_mode='append_only' so train "
             "and teacher paths can populate the same memory substrate."
         )
-    if bool(crct_central_slot_broadcast_enabled) and (
-        not crct_enabled or world_size_ < 4
-    ):
+    if crct_enabled and world_size_ < 4:
         raise ValueError(
-            "crct_central_slot_broadcast_enabled=True requires "
-            "crct_enabled=True and world_size>=4 so rank world_size-1 can "
-            "own the authoritative memory."
+            "crct_enabled=True requires world_size>=4 so rank world_size-1 "
+            "can own the authoritative memory under central slot broadcast."
         )
     if scopt_active and grad_allreduce_mode_ != "bulk":
         raise ValueError("ScOpt currently requires grad_allreduce_mode='bulk'")
@@ -6957,7 +6914,6 @@ def train_fast_for_budget(
     crct_gradient_conflict: CrctGradientConflictMonitor | None = None
     crct_staging_outer_model: Any | None = None
     crct_slot_broadcast_metrics: dict[str, Any] = {
-        "enabled": bool(crct_central_slot_broadcast_enabled),
         "interval_steps": int(crct_slot_broadcast_interval_steps),
         "active_epoch": 0,
         "publish_attempts": 0,
@@ -7010,9 +6966,8 @@ def train_fast_for_budget(
                 trace_max_rows=int(crct_gradient_conflict_trace_max_rows),
                 trace_flush_rows=int(crct_gradient_conflict_trace_flush_rows),
             )
-        if bool(crct_central_slot_broadcast_enabled):
-            if rank_ == world_size_ - 1:
-                crct_staging_outer_model = _crct_clone_outer_model(model)
+        if crct_enabled and rank_ == world_size_ - 1:
+            crct_staging_outer_model = _crct_clone_outer_model(model)
         crct_teacher_transport_mode = (
             "async_allgather_broadcast"
             if (
@@ -7417,8 +7372,6 @@ def train_fast_for_budget(
                     crct_enabled=bool(crct_enabled),
                     crct_payload=crct_payload,
                     crct_lambda_controller=float(crct_lambda_controller),
-                    crct_update_memory=bool(crct_payload is not None)
-                    and not bool(crct_central_slot_broadcast_enabled),
                     crct_memory_write_tokens_per_step=int(
                         crct_memory_write_tokens_per_step
                     ),
@@ -7655,7 +7608,7 @@ def train_fast_for_budget(
                     gradient_conflict_monitor=crct_gradient_conflict,
                     memory_write_outer_model=crct_staging_outer_model,
                 )
-            if bool(crct_central_slot_broadcast_enabled):
+            if crct_enabled:
                 _crct_publish_central_slots(
                     model=model,
                     staging_outer_model=crct_staging_outer_model,
@@ -7706,7 +7659,7 @@ def train_fast_for_budget(
         _cleanup_episodic_event_rings(episodic_emit_handle)
         _cleanup_episodic_event_rings(episodic_consumer)
 
-    if bool(crct_central_slot_broadcast_enabled):
+    if crct_enabled:
         _crct_publish_central_slots(
             model=model,
             staging_outer_model=crct_staging_outer_model,
@@ -8252,9 +8205,6 @@ def _warmup(
         crct_gradient_conflict_trace_flush_rows=int(
             config.get("crct_gradient_conflict_trace_flush_rows", 256)
         ),
-        crct_central_slot_broadcast_enabled=bool(
-            config.get("crct_central_slot_broadcast_enabled", False)
-        ),
         crct_slot_broadcast_interval_steps=int(
             config.get("crct_slot_broadcast_interval_steps", 1)
         ),
@@ -8742,9 +8692,6 @@ def run_condition(
         ),
         crct_gradient_conflict_trace_flush_rows=int(
             config.get("crct_gradient_conflict_trace_flush_rows", 256)
-        ),
-        crct_central_slot_broadcast_enabled=bool(
-            config.get("crct_central_slot_broadcast_enabled", False)
         ),
         crct_slot_broadcast_interval_steps=int(
             config.get("crct_slot_broadcast_interval_steps", 1)

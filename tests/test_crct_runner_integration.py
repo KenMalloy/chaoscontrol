@@ -281,7 +281,6 @@ def _worker_async_crct_train_loop(
             crct_async_teacher_payload_dtype="fp32",
             crct_memory_write_tokens_per_step=4,
             crct_gradient_conflict_enabled=True,
-            crct_central_slot_broadcast_enabled=True,
             crct_slot_broadcast_interval_steps=1,
         )
         if rank == 0:
@@ -344,7 +343,10 @@ def test_crct_train_step_uses_payload_and_trains_controller() -> None:
     grad = model.memory_controller.net[0].weight.grad
     assert grad is not None
     assert float(grad.abs().sum()) > 0.0
-    assert len(model.outer_model._slots) == inputs.numel()
+    # Central slot broadcast is the only ownership path: train ranks must
+    # never CRCT-write to outer_model. Only the rank-3 staging path (via
+    # rank3_score_batch_causal) writes; train ranks read the broadcast.
+    assert len(model.outer_model._slots) == 0
 
 
 def test_crct_teacher_payload_appends_memory_after_scoring() -> None:
