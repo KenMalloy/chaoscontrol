@@ -28,4 +28,5 @@ filterwarnings = [
     "ignore::DeprecationWarning:importlib._bootstrap",
     "ignore:builtin type Swig:DeprecationWarning",
     "ignore:`torch\\.jit\\.script_method` is not supported in Python 3\\.14\\+:DeprecationWarning:torch\\.jit\\._script",
+    "ignore:`torch\\.jit\\.script_method` is deprecated:DeprecationWarning:torch\\.jit\\._script",
 ]
