@@ -214,6 +214,28 @@ class TestChunkedDiagScan(unittest.TestCase):
             if "chaoscontrol.core" in sys.modules:
                 importlib.reload(sys.modules["chaoscontrol.core"])
 
+    def test_python314_default_backend_avoids_compile_warning(self) -> None:
+        import importlib
+        import os
+        import sys
+
+        old_env = os.environ.pop("CHAOSCONTROL_DIAG_SCAN_BACKEND", None)
+        try:
+            if "chaoscontrol.core" in sys.modules:
+                importlib.reload(sys.modules["chaoscontrol.core"])
+            import chaoscontrol.core as core
+
+            info = core.get_diag_recurrence_backend()
+            if sys.version_info >= (3, 14):
+                assert info["backend"] == "chunked", info
+            else:
+                assert info["backend"] in {"compile", "python"}, info
+        finally:
+            if old_env is not None:
+                os.environ["CHAOSCONTROL_DIAG_SCAN_BACKEND"] = old_env
+            if "chaoscontrol.core" in sys.modules:
+                importlib.reload(sys.modules["chaoscontrol.core"])
+
     def test_chunked_backend_gradients_match_loop(self) -> None:
         """Exp 18 Test 1 follow-up: backward gradients must match the Python loop.
 

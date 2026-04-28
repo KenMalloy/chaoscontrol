@@ -1447,12 +1447,12 @@ class _CrctAsyncTeacherTransport:
             if self.rank == self.memory_rank:
                 continue
             buffers = slot["buffers"]
-            meta = buffers["meta"]
-            valid = bool(float(meta[0].detach().cpu().item()) > 0.5)
+            meta_values = buffers["meta"].detach().cpu().tolist()
+            valid = bool(float(meta_values[0]) > 0.5)
             if not valid:
                 self.metrics["sentinels_received"] += 1
                 continue
-            request_step = int(float(meta[1].detach().cpu().item()))
+            request_step = int(float(meta_values[1]))
             lag = int(current_step) - request_step
             batch = self.local_batches_by_step.pop(request_step, None)
             try:

@@ -1,5 +1,12 @@
 # CRCT Distributed Implementation Plan
 
+> **Archived note (2026-04-28):** this plan produced a standalone
+> `chaoscontrol.crct_distributed` prototype. The prototype was removed before
+> public release because the live CRCT transport is implemented in
+> `experiments/23_fast_path/runner_fast_path.py`, with a different
+> matched-batch async payload contract. This document remains only as design
+> history; do not import or extend the removed module.
+
 > **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
 **Goal:** Build `src/chaoscontrol/crct_distributed.py` — the coordination layer for Cache-Reweighted Continuation Training (CRCT) on the existing 3+1 rank topology. Three process groups, two CUDA streams on rank 3, drop-don't-queue teacher mailbox, fail-open training-side wrapper.

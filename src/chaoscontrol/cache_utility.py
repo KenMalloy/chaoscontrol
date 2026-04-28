@@ -195,11 +195,6 @@ class ScarcityAwareMemoryOptimizer:
         confidence = torch.tanh(net.abs() / self.tau)
         return target.detach(), confidence.detach()
 
-    # Spec wording in the design update calls this method
-    # ``make_controller_target``; the alias keeps both names live so
-    # the wiring task can use either form.
-    make_controller_target = controller_target
-
     @torch.no_grad()
     def write_target(
         self, write_utility: torch.Tensor

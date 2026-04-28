@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import math
 import os
+import sys
 import warnings
 from contextlib import contextmanager
 from typing import Any
@@ -148,6 +149,13 @@ def _resolve_diag_recurrence_impl():
     # Legacy flag: CHAOSCONTROL_DISABLE_TORCH_COMPILE=1 forces python backend
     if os.environ.get("CHAOSCONTROL_DISABLE_TORCH_COMPILE", "").strip() == "1":
         requested = "python"
+
+    if not requested and sys.version_info >= (3, 14):
+        # PyTorch's compile stack still touches torch.jit.script_method on
+        # Python 3.14, which emits a DeprecationWarning and can fail under
+        # pytest -W error. Use the deterministic vectorized backend unless
+        # the caller explicitly asks for compile/ssm_scan/python.
+        requested = "chunked"
 
     if requested == "python":
         _diag_recurrence_impl = _diag_recurrence_inner

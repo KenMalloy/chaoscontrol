@@ -33,6 +33,20 @@ RUNNER_PATH = REPO / "experiments" / "23_fast_path" / "runner_fast_path.py"
 RUNNER21_PATH = REPO / "experiments" / "21_sgns_tokenizer" / "runner_exp21.py"
 
 
+@pytest.fixture(autouse=True)
+def _restore_fast_runner_backend_env():
+    keys = ("CHAOSCONTROL_DIAG_SCAN_BACKEND", "CHAOSCONTROL_POST_SCAN_BACKEND")
+    old = {key: os.environ.get(key) for key in keys}
+    try:
+        yield
+    finally:
+        for key, value in old.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
 def _load_module(name: str, path: Path):
     spec = importlib.util.spec_from_file_location(name, path)
     assert spec is not None and spec.loader is not None

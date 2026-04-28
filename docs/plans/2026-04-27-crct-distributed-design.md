@@ -1,5 +1,12 @@
 # CRCT Distributed — Design
 
+> **Archived note (2026-04-28):** this was the standalone
+> `chaoscontrol.crct_distributed` module design. The module was removed before
+> public release because the production CRCT runtime landed directly in
+> `experiments/23_fast_path/runner_fast_path.py` as matched-batch
+> `all_gather_into_tensor` plus dense payload broadcast. Treat this file as
+> historical design context, not an importable API or runtime contract.
+
 > **Status:** Approved. Implementation plan via `writing-plans`.
 > **Scope:** `src/chaoscontrol/crct_distributed.py` — coordination layer for
 > Cache-Reweighted Continuation Training (CRCT). Builds on the existing

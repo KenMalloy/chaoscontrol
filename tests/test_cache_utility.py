@@ -718,18 +718,6 @@ class TestScarcityAwareMemoryOptimizer:
         assert confidence[0, 0].item() == pytest.approx(0.0, abs=1e-6)
         assert confidence[0, 1].item() > 0.99
 
-    def test_make_controller_target_alias_matches(self) -> None:
-        # Spec wording uses ``make_controller_target``; the class alias
-        # must produce identical output to ``controller_target``.
-        opt = ScarcityAwareMemoryOptimizer(tau=0.10)
-        opt.read_price = 0.2
-        utility = torch.tensor([[0.0, 0.1, -0.1]])
-        t1, c1 = opt.controller_target(utility)
-        t2, c2 = opt.make_controller_target(utility)
-        assert torch.equal(t1, t2)
-        assert torch.equal(c1, c2)
-
-
 # ---------------------------------------------------------------------------
 # assign_memory_credit
 # ---------------------------------------------------------------------------
