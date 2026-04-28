@@ -17,7 +17,9 @@ memory snapshot and same-batch writes become visible only after scoring.
 from __future__ import annotations
 
 import contextlib
+import json
 import math
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -267,6 +269,10 @@ class CrctGradientConflictMonitor:
         catastrophic_threshold: float = -0.90,
         soft_gate_strength: float = 0.0,
         soft_gate_floor: float = 0.05,
+        trace_path: str | None = None,
+        trace_stride: int = 1,
+        trace_max_rows: int = 0,
+        trace_flush_rows: int = 256,
         eps: float = 1e-8,
     ) -> None:
         self.enabled = bool(enabled)
@@ -274,14 +280,29 @@ class CrctGradientConflictMonitor:
         self.catastrophic_threshold = float(catastrophic_threshold)
         self.soft_gate_strength = float(soft_gate_strength)
         self.soft_gate_floor = float(soft_gate_floor)
+        self.trace_path = None if trace_path in (None, "") else Path(str(trace_path))
+        self.trace_stride = max(1, int(trace_stride))
+        self.trace_max_rows = max(0, int(trace_max_rows))
+        self.trace_flush_rows = max(1, int(trace_flush_rows))
         self.eps = float(eps)
         self._ema: torch.Tensor | None = None
+        self._trace_buffer: list[str] = []
         self._diag: dict[str, Any] = {
             "enabled": self.enabled,
             "ema_beta": self.ema_beta,
             "catastrophic_threshold": self.catastrophic_threshold,
             "soft_gate_strength": self.soft_gate_strength,
             "soft_gate_floor": self.soft_gate_floor,
+            "trace_enabled": self.trace_path is not None,
+            "trace_path": "" if self.trace_path is None else str(self.trace_path),
+            "trace_stride": self.trace_stride,
+            "trace_max_rows": self.trace_max_rows,
+            "trace_flush_rows": self.trace_flush_rows,
+            "trace_rows_written": 0,
+            "trace_rows_dropped": 0,
+            "trace_rows_buffered": 0,
+            "trace_errors": 0,
+            "last_trace_error": "",
             "calls": 0,
             "cold_start_calls": 0,
             "candidates_seen": 0,
@@ -313,6 +334,7 @@ class CrctGradientConflictMonitor:
         utility: torch.Tensor,
         mask: torch.Tensor,
         max_tokens: int | None,
+        step: int | None = None,
     ) -> tuple[torch.Tensor, int | None]:
         """Return ``(write_score, write_token_limit)`` for memory append.
 
@@ -350,6 +372,7 @@ class CrctGradientConflictMonitor:
         write_score = utility.detach().clone()
         gate = torch.ones(n, device=utility.device, dtype=torch.float32)
         suppressed = torch.zeros(n, device=utility.device, dtype=torch.bool)
+        had_reference = self._ema is not None
 
         if self._ema is None:
             self._diag["cold_start_calls"] += 1
@@ -406,10 +429,24 @@ class CrctGradientConflictMonitor:
             self._diag["last_reason"] = "soft_gated"
         else:
             self._diag["last_reason"] = "observed"
+        self._maybe_trace_rows(
+            step=step,
+            selected=selected,
+            targets=targets,
+            utility=utility,
+            conflict=conflict,
+            gate=gate,
+            suppressed=suppressed,
+            reason=str(self._diag["last_reason"]),
+            max_tokens=max_tokens,
+            had_reference=had_reference,
+        )
         return write_score, next_limit
 
     def diagnostics(self) -> dict[str, Any]:
+        self.flush_trace()
         out = dict(self._diag)
+        out["trace_rows_buffered"] = len(self._trace_buffer)
         calls = int(out.get("calls", 0))
         compared = int(out.get("candidates_compared", 0))
         if calls:
@@ -423,6 +460,19 @@ class CrctGradientConflictMonitor:
             out["max_conflict"] = 0.0
         out["has_reference"] = self._ema is not None
         return out
+
+    def flush_trace(self) -> None:
+        if self.trace_path is None or not self._trace_buffer:
+            return
+        try:
+            self.trace_path.parent.mkdir(parents=True, exist_ok=True)
+            with self.trace_path.open("a", encoding="utf-8") as fh:
+                fh.write("".join(self._trace_buffer))
+            self._trace_buffer.clear()
+            self._diag["trace_rows_buffered"] = 0
+        except Exception as exc:  # pragma: no cover - filesystem failures are host-specific
+            self._diag["trace_errors"] += 1
+            self._diag["last_trace_error"] = f"{type(exc).__name__}: {exc}"
 
     def _select_candidate_indices(
         self,
@@ -460,6 +510,64 @@ class CrctGradientConflictMonitor:
         weight = model.lm_head.weight.detach().to(device=probs.device, dtype=torch.float32)
         sketches = probs @ weight
         return F.normalize(sketches, dim=-1, eps=self.eps)
+
+    def _maybe_trace_rows(
+        self,
+        *,
+        step: int | None,
+        selected: torch.Tensor,
+        targets: torch.Tensor,
+        utility: torch.Tensor,
+        conflict: torch.Tensor,
+        gate: torch.Tensor,
+        suppressed: torch.Tensor,
+        reason: str,
+        max_tokens: int | None,
+        had_reference: bool,
+    ) -> None:
+        if self.trace_path is None:
+            return
+        call_index = int(self._diag["calls"])
+        if (call_index - 1) % self.trace_stride != 0:
+            return
+        selected_cpu = selected.detach().cpu().tolist()
+        conflict_cpu = conflict.detach().cpu().tolist()
+        gate_cpu = gate.detach().cpu().tolist()
+        suppressed_cpu = suppressed.detach().cpu().tolist()
+        utility_flat = utility.detach().reshape(-1).float().cpu()
+        targets_flat = targets.detach().reshape(-1).long().cpu()
+        seq_len = int(targets.shape[1]) if targets.ndim >= 2 else int(targets.numel())
+        for i, flat_idx in enumerate(selected_cpu):
+            if self.trace_max_rows > 0 and int(self._diag["trace_rows_written"]) >= self.trace_max_rows:
+                self._diag["trace_rows_dropped"] += 1
+                continue
+            idx = int(flat_idx)
+            batch_idx = idx // max(1, seq_len)
+            token_pos = idx % max(1, seq_len)
+            row = {
+                "row_type": "crct_gradient_conflict_candidate",
+                "step": None if step is None else int(step),
+                "call_index": call_index,
+                "candidate_rank": int(i),
+                "candidate_flat_index": idx,
+                "batch_index": int(batch_idx),
+                "token_pos": int(token_pos),
+                "token_id": int(targets_flat[idx].item()),
+                "utility": float(utility_flat[idx].item()),
+                "conflict_cos": float(conflict_cpu[i]),
+                "gate": float(gate_cpu[i]),
+                "suppressed": bool(suppressed_cpu[i]),
+                "reason": reason if bool(suppressed_cpu[i]) else "admitted",
+                "max_tokens": None if max_tokens is None else int(max_tokens),
+                "catastrophic_threshold": self.catastrophic_threshold,
+                "soft_gate_strength": self.soft_gate_strength,
+                "has_reference": bool(had_reference),
+            }
+            self._trace_buffer.append(json.dumps(row, separators=(",", ":")) + "\n")
+            self._diag["trace_rows_written"] += 1
+        self._diag["trace_rows_buffered"] = len(self._trace_buffer)
+        if len(self._trace_buffer) >= self.trace_flush_rows:
+            self.flush_trace()
 
     def _update_ema(self, sketches: torch.Tensor) -> None:
         mean = F.normalize(sketches.float().mean(dim=0), dim=0, eps=self.eps)
@@ -547,6 +655,8 @@ def rank3_score_batch_causal(
     update_model_memory_after: bool = False,
     memory_write_tokens: int | None = None,
     gradient_conflict_monitor: CrctGradientConflictMonitor | None = None,
+    memory_write_outer_model: Any | None = None,
+    step: int | None = None,
 ) -> dict[str, torch.Tensor]:
     """Score a batch by comparing memory-on vs memory-off NLL.
 
@@ -620,6 +730,7 @@ def rank3_score_batch_causal(
                 utility=utility,
                 mask=mask,
                 max_tokens=memory_write_tokens,
+                step=step,
             )
         if write_limit is not None and int(write_limit) <= 0:
             cache.commit(txn)
@@ -640,14 +751,14 @@ def rank3_score_batch_causal(
                 int(h_off.shape[0] * h_off.shape[1]),
                 device=h_off.device,
             )
-        wrote = bool(
-            append_fn(
-                h_off.detach(),
-                score=write_score.detach(),
-                max_tokens=write_limit,
-                event_ids=event_ids,
-            )
-        )
+        append_kwargs = {
+            "score": write_score.detach(),
+            "max_tokens": write_limit,
+            "event_ids": event_ids,
+        }
+        if memory_write_outer_model is not None:
+            append_kwargs["outer_model_override"] = memory_write_outer_model
+        wrote = bool(append_fn(h_off.detach(), **append_kwargs))
         if not wrote:
             raise ValueError(
                 "rank3_score_batch_causal(update_model_memory_after=True) "

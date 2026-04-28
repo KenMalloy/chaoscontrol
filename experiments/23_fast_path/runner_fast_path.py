@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import copy
 import hashlib
 import json
 import math
@@ -956,6 +957,129 @@ def _crct_append_memory_from_hidden(
         )
 
 
+def _crct_slot_count(outer_model: Any) -> int:
+    return int(len(getattr(outer_model, "_slots", [])))
+
+
+def _crct_state_nbytes(value: Any) -> int:
+    if isinstance(value, torch.Tensor):
+        return int(value.numel() * value.element_size())
+    if isinstance(value, dict):
+        return sum(_crct_state_nbytes(v) for v in value.values())
+    if isinstance(value, (list, tuple)):
+        return sum(_crct_state_nbytes(v) for v in value)
+    return 0
+
+
+def _crct_clone_outer_model(model: torch.nn.Module) -> Any:
+    outer = getattr(model, "outer_model", None)
+    if outer is None:
+        return None
+    clone = copy.deepcopy(outer)
+    clone.train(bool(getattr(outer, "training", False)))
+    return clone
+
+
+def _crct_central_broadcast_diagnostics(metrics: dict[str, Any]) -> dict[str, Any]:
+    out = dict(metrics)
+    attempts = int(out.get("publish_attempts", 0))
+    if attempts:
+        out["publish_seconds_mean"] = (
+            float(out.get("publish_seconds_sum", 0.0)) / float(attempts)
+        )
+    else:
+        out["publish_seconds_mean"] = 0.0
+    return out
+
+
+def _crct_publish_central_slots(
+    *,
+    model: torch.nn.Module,
+    staging_outer_model: Any | None,
+    metrics: dict[str, Any],
+    rank: int,
+    world_size: int,
+    all_group: "dist.ProcessGroup | None",
+    step: int,
+    interval_steps: int,
+    force: bool = False,
+) -> None:
+    """Broadcast rank-3's staged memory as the next active generation.
+
+    This is the deliberately simple centralized-memory contract: train ranks
+    never write CRCT memory locally when this mode is enabled; they only read
+    the active generation last published by the memory rank. Rank 3 writes
+    accepted candidates into ``staging_outer_model`` and publishes that staged
+    state at a known boundary.
+    """
+    metrics["enabled"] = True
+    metrics["active_slots"] = _crct_slot_count(getattr(model, "outer_model", None))
+    metrics["staging_slots"] = _crct_slot_count(staging_outer_model)
+    if world_size < 4 or all_group is None or not dist.is_initialized():
+        metrics["publish_skips"] += 1
+        metrics["last_skip_reason"] = "not_distributed_3plus1"
+        return
+    interval = max(1, int(interval_steps))
+    if not force and int(step) % interval != 0:
+        metrics["publish_skips"] += 1
+        metrics["last_skip_reason"] = "between_boundaries"
+        return
+
+    memory_rank = int(world_size) - 1
+    obj: list[Any] = [None]
+    if int(rank) == memory_rank:
+        source = staging_outer_model if staging_outer_model is not None else getattr(model, "outer_model", None)
+        if source is None:
+            payload = None
+        else:
+            state = source.get_extra_state()
+            payload = {
+                "epoch": int(metrics.get("active_epoch", 0)) + 1,
+                "step": int(step),
+                "slots": _crct_slot_count(source),
+                "snapshot_bytes": _crct_state_nbytes(state),
+                "state": state,
+            }
+        obj[0] = payload
+
+    t0 = time.perf_counter()
+    dist.broadcast_object_list(obj, src=memory_rank, group=all_group)
+    elapsed = time.perf_counter() - t0
+    metrics["publish_attempts"] += 1
+    metrics["publish_seconds_sum"] += float(elapsed)
+    metrics["publish_seconds_max"] = max(
+        float(metrics["publish_seconds_max"]),
+        float(elapsed),
+    )
+    payload = obj[0]
+    if payload is None:
+        metrics["publish_skips"] += 1
+        metrics["last_skip_reason"] = "empty_payload"
+        return
+
+    outer = getattr(model, "outer_model", None)
+    if outer is None:
+        metrics["publish_skips"] += 1
+        metrics["last_skip_reason"] = "missing_outer_model"
+        return
+    outer.set_extra_state(payload["state"])
+    if int(rank) == memory_rank and staging_outer_model is not None:
+        # Keep staging separate from active, but aligned immediately after
+        # publication; future accepted writes mutate only staging again.
+        staging_outer_model.set_extra_state(payload["state"])
+        metrics["publishes_sent"] += 1
+        metrics["last_publish_step"] = int(step)
+    else:
+        metrics["publishes_received"] += 1
+        metrics["last_receive_step"] = int(step)
+    metrics["active_epoch"] = int(payload["epoch"])
+    metrics["snapshot_bytes"] = int(payload["snapshot_bytes"])
+    metrics["snapshot_slots"] = int(payload["slots"])
+    metrics["active_slots"] = _crct_slot_count(outer)
+    metrics["staging_slots"] = _crct_slot_count(staging_outer_model)
+    metrics["last_skip_reason"] = ""
+
+
 def _crct_payload_controller_loss(
     payload: dict[str, torch.Tensor],
     controller_logits: torch.Tensor,
@@ -1013,6 +1137,7 @@ def _crct_score_payload_inline(
     alpha_max: float,
     memory_write_tokens: int,
     gradient_conflict_monitor: CrctGradientConflictMonitor | None = None,
+    memory_write_outer_model: Any | None = None,
     update_model_memory_after: bool = False,
 ) -> dict[str, torch.Tensor]:
     input_ids = _crct_full_input_ids(inputs, targets)
@@ -1033,6 +1158,8 @@ def _crct_score_payload_inline(
         update_model_memory_after=bool(update_model_memory_after),
         memory_write_tokens=int(memory_write_tokens),
         gradient_conflict_monitor=gradient_conflict_monitor,
+        memory_write_outer_model=memory_write_outer_model,
+        step=int(step),
     )
     if scarcity_optimizer is not None:
         target = score["controller_target"]
@@ -1172,6 +1299,7 @@ class _CrctAsyncTeacherTransport:
         alpha_max: float,
         memory_write_tokens: int,
         gradient_conflict_monitor: CrctGradientConflictMonitor | None = None,
+        memory_write_outer_model: Any | None = None,
     ) -> None:
         completed = self._reap_input_gathers()
         if self.rank != self.memory_rank:
@@ -1212,6 +1340,7 @@ class _CrctAsyncTeacherTransport:
                 alpha_max=alpha_max,
                 memory_write_tokens=int(memory_write_tokens),
                 gradient_conflict_monitor=gradient_conflict_monitor,
+                memory_write_outer_model=memory_write_outer_model,
                 update_model_memory_after=True,
             )
             score_s = time.perf_counter() - t0
@@ -1548,6 +1677,7 @@ def _collect_crct_teacher_payload(
     alpha_max: float,
     memory_write_tokens: int,
     gradient_conflict_monitor: CrctGradientConflictMonitor | None = None,
+    memory_write_outer_model: Any | None = None,
 ) -> dict[str, torch.Tensor] | None:
     """Return this train rank's CRCT teacher payload.
 
@@ -1608,6 +1738,7 @@ def _collect_crct_teacher_payload(
             alpha_max=alpha_max,
             memory_write_tokens=int(memory_write_tokens),
             gradient_conflict_monitor=gradient_conflict_monitor,
+            memory_write_outer_model=memory_write_outer_model,
             update_model_memory_after=True,
         )
         target_all = scored["target"].reshape(payload_shape).contiguous()
@@ -6215,6 +6346,12 @@ def train_fast_for_budget(
     crct_gradient_conflict_catastrophic_threshold: float = -0.90,
     crct_gradient_conflict_soft_gate_strength: float = 0.0,
     crct_gradient_conflict_soft_gate_floor: float = 0.05,
+    crct_gradient_conflict_trace_path: str = "",
+    crct_gradient_conflict_trace_stride: int = 1,
+    crct_gradient_conflict_trace_max_rows: int = 0,
+    crct_gradient_conflict_trace_flush_rows: int = 256,
+    crct_central_slot_broadcast_enabled: bool = False,
+    crct_slot_broadcast_interval_steps: int = 1,
 ) -> dict[str, Any]:
     rank_ = int(rank)
     world_size_ = int(world_size)
@@ -6344,6 +6481,14 @@ def train_fast_for_budget(
         raise ValueError(
             "crct_enabled=True requires buffer_mode='append_only' so train "
             "and teacher paths can populate the same memory substrate."
+        )
+    if bool(crct_central_slot_broadcast_enabled) and (
+        not crct_enabled or world_size_ < 4
+    ):
+        raise ValueError(
+            "crct_central_slot_broadcast_enabled=True requires "
+            "crct_enabled=True and world_size>=4 so rank world_size-1 can "
+            "own the authoritative memory."
         )
     if scopt_active and grad_allreduce_mode_ != "bulk":
         raise ValueError("ScOpt currently requires grad_allreduce_mode='bulk'")
@@ -6810,6 +6955,26 @@ def train_fast_for_budget(
     crct_cache: TransactionalWakeCache | None = None
     crct_scarcity: CrctScarcityAwareMemoryOptimizer | None = None
     crct_gradient_conflict: CrctGradientConflictMonitor | None = None
+    crct_staging_outer_model: Any | None = None
+    crct_slot_broadcast_metrics: dict[str, Any] = {
+        "enabled": bool(crct_central_slot_broadcast_enabled),
+        "interval_steps": int(crct_slot_broadcast_interval_steps),
+        "active_epoch": 0,
+        "publish_attempts": 0,
+        "publishes_sent": 0,
+        "publishes_received": 0,
+        "publish_skips": 0,
+        "publish_seconds_sum": 0.0,
+        "publish_seconds_max": 0.0,
+        "publish_seconds_mean": 0.0,
+        "last_publish_step": None,
+        "last_receive_step": None,
+        "last_skip_reason": "",
+        "snapshot_bytes": 0,
+        "snapshot_slots": 0,
+        "active_slots": 0,
+        "staging_slots": 0,
+    }
     crct_teacher_requests = 0
     crct_teacher_payloads = 0
     crct_teacher_fail_open = 0
@@ -6840,7 +7005,14 @@ def train_fast_for_budget(
                     crct_gradient_conflict_soft_gate_strength
                 ),
                 soft_gate_floor=float(crct_gradient_conflict_soft_gate_floor),
+                trace_path=str(crct_gradient_conflict_trace_path or ""),
+                trace_stride=int(crct_gradient_conflict_trace_stride),
+                trace_max_rows=int(crct_gradient_conflict_trace_max_rows),
+                trace_flush_rows=int(crct_gradient_conflict_trace_flush_rows),
             )
+        if bool(crct_central_slot_broadcast_enabled):
+            if rank_ == world_size_ - 1:
+                crct_staging_outer_model = _crct_clone_outer_model(model)
         crct_teacher_transport_mode = (
             "async_allgather_broadcast"
             if (
@@ -7140,6 +7312,7 @@ def train_fast_for_budget(
                         alpha_max=float(crct_lm_weight_alpha_max),
                         memory_write_tokens=int(crct_memory_write_tokens_per_step),
                         gradient_conflict_monitor=crct_gradient_conflict,
+                        memory_write_outer_model=crct_staging_outer_model,
                     )
                 if crct_payload is None:
                     crct_teacher_fail_open += 1
@@ -7244,7 +7417,8 @@ def train_fast_for_budget(
                     crct_enabled=bool(crct_enabled),
                     crct_payload=crct_payload,
                     crct_lambda_controller=float(crct_lambda_controller),
-                    crct_update_memory=bool(crct_payload is not None),
+                    crct_update_memory=bool(crct_payload is not None)
+                    and not bool(crct_central_slot_broadcast_enabled),
                     crct_memory_write_tokens_per_step=int(
                         crct_memory_write_tokens_per_step
                     ),
@@ -7479,6 +7653,18 @@ def train_fast_for_budget(
                     alpha_max=float(crct_lm_weight_alpha_max),
                     memory_write_tokens=int(crct_memory_write_tokens_per_step),
                     gradient_conflict_monitor=crct_gradient_conflict,
+                    memory_write_outer_model=crct_staging_outer_model,
+                )
+            if bool(crct_central_slot_broadcast_enabled):
+                _crct_publish_central_slots(
+                    model=model,
+                    staging_outer_model=crct_staging_outer_model,
+                    metrics=crct_slot_broadcast_metrics,
+                    rank=rank_,
+                    world_size=world_size_,
+                    all_group=all_group,
+                    step=steps + 1,
+                    interval_steps=int(crct_slot_broadcast_interval_steps),
                 )
             # Phase B5: deferred post-step CE pair pass on the episodic
             # rank. The in-step drain stages each successful replay and
@@ -7519,6 +7705,19 @@ def train_fast_for_budget(
         _shutdown_episodic_write_drain(episodic_write_drain_handle)
         _cleanup_episodic_event_rings(episodic_emit_handle)
         _cleanup_episodic_event_rings(episodic_consumer)
+
+    if bool(crct_central_slot_broadcast_enabled):
+        _crct_publish_central_slots(
+            model=model,
+            staging_outer_model=crct_staging_outer_model,
+            metrics=crct_slot_broadcast_metrics,
+            rank=rank_,
+            world_size=world_size_,
+            all_group=all_group,
+            step=steps,
+            interval_steps=int(crct_slot_broadcast_interval_steps),
+            force=True,
+        )
 
     if ddp_active:
         dist.barrier()
@@ -7575,6 +7774,9 @@ def train_fast_for_budget(
                 if crct_gradient_conflict is not None
                 else {"enabled": False}
             ),
+            "slot_broadcast": _crct_central_broadcast_diagnostics(
+                crct_slot_broadcast_metrics
+            ),
             "transport": (
                 crct_teacher_transport.diagnostics()
                 if crct_teacher_transport is not None
@@ -7615,11 +7817,17 @@ def train_fast_for_budget(
         if crct_gradient_conflict is not None
         else {"enabled": False}
     )
+    crct_slot_broadcast_summary = _crct_central_broadcast_diagnostics(
+        crct_slot_broadcast_metrics
+    )
     if crct_rank_diagnostics:
         for diag in crct_rank_diagnostics:
             if diag is not None and bool(diag.get("is_memory_rank", False)):
                 crct_gradient_conflict_summary = dict(
                     diag.get("gradient_conflict", crct_gradient_conflict_summary)
+                )
+                crct_slot_broadcast_summary = dict(
+                    diag.get("slot_broadcast", crct_slot_broadcast_summary)
                 )
                 break
     timing = summarize_train_timing(
@@ -7824,6 +8032,7 @@ def train_fast_for_budget(
                     crct_memory_write_tokens_per_step
                 ),
                 "gradient_conflict": crct_gradient_conflict_summary,
+                "slot_broadcast": crct_slot_broadcast_summary,
                 "artifact_impact": "artifact_changes_weights_only",
             },
         },
@@ -8030,6 +8239,24 @@ def _warmup(
         ),
         crct_gradient_conflict_soft_gate_floor=float(
             config.get("crct_gradient_conflict_soft_gate_floor", 0.05)
+        ),
+        crct_gradient_conflict_trace_path=str(
+            config.get("crct_gradient_conflict_trace_path", "")
+        ),
+        crct_gradient_conflict_trace_stride=int(
+            config.get("crct_gradient_conflict_trace_stride", 1)
+        ),
+        crct_gradient_conflict_trace_max_rows=int(
+            config.get("crct_gradient_conflict_trace_max_rows", 0)
+        ),
+        crct_gradient_conflict_trace_flush_rows=int(
+            config.get("crct_gradient_conflict_trace_flush_rows", 256)
+        ),
+        crct_central_slot_broadcast_enabled=bool(
+            config.get("crct_central_slot_broadcast_enabled", False)
+        ),
+        crct_slot_broadcast_interval_steps=int(
+            config.get("crct_slot_broadcast_interval_steps", 1)
         ),
     )
 
@@ -8503,6 +8730,24 @@ def run_condition(
         ),
         crct_gradient_conflict_soft_gate_floor=float(
             config.get("crct_gradient_conflict_soft_gate_floor", 0.05)
+        ),
+        crct_gradient_conflict_trace_path=str(
+            config.get("crct_gradient_conflict_trace_path", "")
+        ),
+        crct_gradient_conflict_trace_stride=int(
+            config.get("crct_gradient_conflict_trace_stride", 1)
+        ),
+        crct_gradient_conflict_trace_max_rows=int(
+            config.get("crct_gradient_conflict_trace_max_rows", 0)
+        ),
+        crct_gradient_conflict_trace_flush_rows=int(
+            config.get("crct_gradient_conflict_trace_flush_rows", 256)
+        ),
+        crct_central_slot_broadcast_enabled=bool(
+            config.get("crct_central_slot_broadcast_enabled", False)
+        ),
+        crct_slot_broadcast_interval_steps=int(
+            config.get("crct_slot_broadcast_interval_steps", 1)
         ),
     )
     episodic_cache_payload = train_result.pop("_episodic_cache_payload", None)

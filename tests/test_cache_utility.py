@@ -12,6 +12,7 @@ regression test pins the same-batch causal cutoff end to end.
 from __future__ import annotations
 
 import math
+import json
 from dataclasses import dataclass
 from typing import Any
 
@@ -396,6 +397,44 @@ class TestCrctGradientConflictMonitor:
         assert diag["guardrail_suppressed_candidates"] == 1
         assert diag["last_reason"] == "guardrail_suppressed"
         assert diag["last_conflict_mean"] < -0.99
+
+    def test_trace_writes_bounded_candidate_rows(self, tmp_path) -> None:
+        path = tmp_path / "conflict.ndjson"
+        model = _MockModel(dim=8, vocab=32, seed=6)
+        monitor = CrctGradientConflictMonitor(
+            enabled=True,
+            trace_path=str(path),
+            trace_max_rows=2,
+            trace_flush_rows=1,
+        )
+        hidden = torch.randn(1, 4, 8)
+        targets = torch.tensor([[1, 2, 3, 4]])
+        utility = torch.tensor([[0.1, 0.5, -0.2, 0.3]])
+        mask = torch.ones_like(targets, dtype=torch.bool)
+
+        monitor.apply_to_write_scores(
+            model=model,
+            hidden=hidden,
+            targets=targets,
+            utility=utility,
+            mask=mask,
+            max_tokens=3,
+            step=17,
+        )
+        monitor.flush_trace()
+
+        rows = [json.loads(line) for line in path.read_text().splitlines()]
+        assert len(rows) == 2
+        assert rows[0]["row_type"] == "crct_gradient_conflict_candidate"
+        assert rows[0]["step"] == 17
+        assert rows[0]["candidate_rank"] == 0
+        assert "utility" in rows[0]
+        assert "conflict_cos" in rows[0]
+        assert "gate" in rows[0]
+        assert rows[0]["reason"] == "admitted"
+        diag = monitor.diagnostics()
+        assert diag["trace_rows_written"] == 2
+        assert diag["trace_rows_dropped"] == 1
 
 
 class TestRank3ScoreBatchCausal:

@@ -281,6 +281,8 @@ def _worker_async_crct_train_loop(
             crct_async_teacher_payload_dtype="fp32",
             crct_memory_write_tokens_per_step=4,
             crct_gradient_conflict_enabled=True,
+            crct_central_slot_broadcast_enabled=True,
+            crct_slot_broadcast_interval_steps=1,
         )
         if rank == 0:
             Path(result_dir, "rank0.json").write_text(
@@ -377,6 +379,36 @@ def test_crct_teacher_payload_appends_memory_after_scoring() -> None:
         h_off = model.encode(inputs, memory_mode="off")
         h_mem = model.encode(inputs, memory_mode="force_on")
     assert not torch.allclose(h_off, h_mem)
+
+
+def test_crct_central_staging_write_does_not_mutate_active_memory() -> None:
+    mod = _load_module("runner_fast_path_crct_central_staging", RUNNER_PATH)
+    model = _tiny_crct_model()
+    staging = mod._crct_clone_outer_model(model)
+    cache = TransactionalWakeCache(max_moments=0, max_hidden_buffer=0)
+    inputs = torch.randint(0, 32, (2, 5), dtype=torch.int32)
+    targets = torch.randint(0, 32, (2, 5), dtype=torch.long)
+
+    payload = mod._crct_score_payload_inline(
+        model=model,
+        cache=cache,
+        scarcity_optimizer=None,
+        inputs=inputs,
+        targets=targets,
+        step=0,
+        total_steps=10,
+        tau=0.1,
+        strength=0.1,
+        w_max=1.2,
+        alpha_max=0.15,
+        memory_write_tokens=3,
+        memory_write_outer_model=staging,
+        update_model_memory_after=True,
+    )
+
+    assert payload["target"].shape == targets.shape
+    assert len(model.outer_model._slots) == 0
+    assert len(staging._slots) == 3
 
 
 def test_crct_fail_open_keeps_controller_grad_zero_but_present() -> None:
@@ -544,11 +576,15 @@ def test_crct_async_teacher_transport_wired_into_train_loop() -> None:
     assert crct["teacher_fail_open"] >= 1
     assert crct["gradient_conflict"]["enabled"] is True
     assert crct["gradient_conflict"]["calls"] >= 1
+    assert crct["slot_broadcast"]["enabled"] is True
+    assert crct["slot_broadcast"]["publishes_sent"] >= 1
+    assert crct["slot_broadcast"]["snapshot_slots"] > 0
     ranks = crct["rank_diagnostics"]
     assert len(ranks) == 4
     train0 = ranks[0]["transport"]
     memory = ranks[3]["transport"]
     memory_conflict = ranks[3]["gradient_conflict"]
+    train0_broadcast = ranks[0]["slot_broadcast"]
     assert train0["requests_started"] == 5
     assert train0["payloads_used"] == crct["teacher_payloads"]
     assert train0["errors"] == 0
@@ -556,3 +592,5 @@ def test_crct_async_teacher_transport_wired_into_train_loop() -> None:
     assert memory["payloads_sent"] >= 1
     assert memory_conflict["calls"] == crct["gradient_conflict"]["calls"]
     assert memory_conflict["candidates_seen"] > 0
+    assert train0_broadcast["publishes_received"] >= 1
+    assert ranks[0]["memory_slots"] == crct["slot_broadcast"]["snapshot_slots"]

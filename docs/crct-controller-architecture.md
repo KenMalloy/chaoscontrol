@@ -89,17 +89,36 @@ by `cache_read_cutoff`, so both oracle encode passes see the same snapshot.
 
 ## Runtime Memory Ownership
 
-Current Exp23/24 CRCT uses rank 3 as the teacher/oracle owner and train ranks
-as local controller-memory owners. Rank 3 scores the matched train batch and
-writes its oracle memory after scoring; train ranks append their own consumed
-payload batches locally after backward. That means the controller target is a
-rank-3 oracle label, while the forward-path memory read on a train rank is from
-that rank's local append-only memory. The runner exposes per-rank
+Current Exp23/24 CRCT defaults to rank 3 as the teacher/oracle owner and train
+ranks as local controller-memory owners. Rank 3 scores the matched train batch
+and writes its oracle memory after scoring; train ranks append their own
+consumed payload batches locally after backward. That means the controller
+target is a rank-3 oracle label, while the forward-path memory read on a train
+rank is from that rank's local append-only memory. The runner exposes per-rank
 `memory_slots` plus transport counters so drift is visible in result JSON.
 
-A future "single central memory" variant would need to broadcast encoded memory
-slot deltas from rank 3 to train ranks. That is a different transport contract,
-not the one this document is claiming for the current runner.
+`crct_central_slot_broadcast_enabled=True` switches to the cleaner ownership
+contract:
+
+```text
+train ranks:
+    read only the last ACTIVE memory generation
+    never append CRCT slots locally
+
+rank 3:
+    reads ACTIVE while scoring the oracle comparison
+    writes accepted candidates into a separate STAGING outer memory
+
+publish boundary:
+    rank 3 broadcasts STAGING as the next ACTIVE generation
+    every train rank atomically swaps its local slots to that generation
+```
+
+The first implementation publishes a full snapshot via object broadcast at a
+configurable `crct_slot_broadcast_interval_steps` boundary. It records
+`mechanisms.crct.slot_broadcast` with epoch, slots, bytes, send/receive counts,
+skip reasons, and publish latency so pod data can say whether centralized memory
+was healthy before we interpret BPB.
 
 ## Gradient Conflict Sensor
 
@@ -127,8 +146,11 @@ Result JSON records `mechanisms.crct.gradient_conflict` from the memory rank
 with counters for `calls`, `candidates_seen`, `candidates_compared`,
 `admitted_candidates`, `guardrail_suppressed_candidates`,
 `soft_gated_candidates`, conflict min/max/mean, and the last write-token limit.
-That is the post-run answer to "did the memory gate suppress because it was
-protecting the trunk, or did the controller simply not find useful candidates?"
+Optional `crct_gradient_conflict_trace_path` writes sampled NDJSON rows for the
+top write candidates: `step`, `candidate_rank`, `token_id`, `utility`,
+`conflict_cos`, `gate`, `suppressed`, and `reason`. That is the post-run answer
+to "did the memory gate suppress because it was protecting the trunk, or did the
+controller simply not find useful candidates?"
 
 ## Controller Target Transform
 
