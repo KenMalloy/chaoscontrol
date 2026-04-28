@@ -934,6 +934,8 @@ EPISODIC_CONTROLLER_V1_WEIGHTS_PATH_ENV = "EPISODIC_CONTROLLER_V1_WEIGHTS_PATH"
 CRCT_V1_ARMS: tuple[str, ...] = (
     "arm_a_fastslow_control",
     "arm_b_crct_controller",
+    "arm_c_crct_replay_shadow",
+    "arm_d_crct_replay_active",
 )
 
 EPISODIC_CONTROLLER_V1_TRACE_DIR = (
@@ -1450,9 +1452,34 @@ def build_crct_v1_matrix(
         ),
         "crct_gradient_conflict_trace_max_rows": 200000,
     }
+    replay_eviction_lock = {
+        "replay_eviction_enabled": True,
+        "replay_eviction_memory_streams": 8,
+        "replay_eviction_trace_path": (
+            "experiments/24_training_time_bundle/results/traces/"
+            "crct_replay_eviction.ndjson"
+        ),
+        "replay_eviction_trace_max_rows": 200000,
+    }
     arm_specs: list[tuple[str, dict[str, Any]]] = [
         ("arm_a_fastslow_control", {}),
         ("arm_b_crct_controller", crct_lock),
+        (
+            "arm_c_crct_replay_shadow",
+            {
+                **crct_lock,
+                **replay_eviction_lock,
+                "replay_eviction_mode": "shadow",
+            },
+        ),
+        (
+            "arm_d_crct_replay_active",
+            {
+                **crct_lock,
+                **replay_eviction_lock,
+                "replay_eviction_mode": "active",
+            },
+        ),
     ]
     if arms is not None:
         allowed = set(arms)

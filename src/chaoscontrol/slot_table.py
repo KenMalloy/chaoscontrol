@@ -223,8 +223,6 @@ class SlotTable:
         cutoff = None if read_cutoff is None else int(read_cutoff)
         indices: list[int] = []
         for i in range(len(self._slots)):
-            if self._priority[i] <= 0.0:
-                continue
             if bucket_id is not None and self._slot_buckets[i] != bucket_id:
                 continue
             if cutoff is not None and self._slot_event_ids[i] > cutoff:

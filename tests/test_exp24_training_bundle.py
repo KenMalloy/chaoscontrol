@@ -1707,17 +1707,21 @@ def test_crct_v1_matrix_threads_memory_controller_and_random_sampling():
         world_size=4,
         budget_seconds=600.0,
     )
-    assert len(entries) == 6
+    assert len(entries) == 12
     by_arm = {}
     for entry in entries:
         by_arm.setdefault(entry["arm"], []).append(entry)
     assert set(by_arm) == {
         "arm_a_fastslow_control",
         "arm_b_crct_controller",
+        "arm_c_crct_replay_shadow",
+        "arm_d_crct_replay_active",
     }
 
     control = by_arm["arm_a_fastslow_control"][0]
     treatment = by_arm["arm_b_crct_controller"][0]
+    replay_shadow = by_arm["arm_c_crct_replay_shadow"][0]
+    replay_active = by_arm["arm_d_crct_replay_active"][0]
     assert not control.get("crct_enabled", False)
     assert control["train_sampling_mode"] == "random"
     assert treatment["crct_enabled"] is True
@@ -1733,6 +1737,14 @@ def test_crct_v1_matrix_threads_memory_controller_and_random_sampling():
     assert treatment["crct_async_teacher_max_lag_steps"] == 128
     assert treatment["crct_teacher_score_interval_steps"] == 64
     assert treatment["crct_teacher_param_sync_interval_steps"] == 0
+    assert replay_shadow["crct_enabled"] is True
+    assert replay_shadow["replay_eviction_enabled"] is True
+    assert replay_shadow["replay_eviction_mode"] == "shadow"
+    assert replay_shadow["replay_eviction_memory_streams"] == 8
+    assert replay_active["crct_enabled"] is True
+    assert replay_active["replay_eviction_enabled"] is True
+    assert replay_active["replay_eviction_mode"] == "active"
+    assert replay_active["replay_eviction_memory_streams"] == 8
 
 
 def test_run_exp24_cli_crct_v1_dry_run(tmp_path):
@@ -1745,7 +1757,7 @@ def test_run_exp24_cli_crct_v1_dry_run(tmp_path):
             "crct_v1",
             "--dry-run",
             "--limit",
-            "4",
+            "12",
             "--output-dir",
             str(tmp_path),
         ],
@@ -1757,6 +1769,8 @@ def test_run_exp24_cli_crct_v1_dry_run(tmp_path):
     assert "matrix=crct_v1" in stdout
     assert "exp24_phase3_crct_v1_arm_a_fastslow_control_s1337" in stdout
     assert "exp24_phase3_crct_v1_arm_b_crct_controller_s1337" in stdout
+    assert "exp24_phase3_crct_v1_arm_c_crct_replay_shadow_s1337" in stdout
+    assert "exp24_phase3_crct_v1_arm_d_crct_replay_active_s1337" in stdout
     assert '"exp24_mechanism": "crct_v1"' in stdout
 
 

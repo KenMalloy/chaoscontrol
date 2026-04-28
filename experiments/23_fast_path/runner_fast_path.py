@@ -1004,20 +1004,30 @@ def _crct_replay_cache_probe(
     loop: ReplayEvictionLoop,
     model: torch.nn.Module,
     step: int,
-) -> None:
+) -> bool:
     """Cache the most recent batch as probe data for replay-eviction."""
     outer = getattr(model, "outer_model", None)
     if outer is None or len(getattr(outer, "table", getattr(outer, "_slots", []))) == 0:
-        return
-    probe_ids = getattr(model, "_last_input_ids", None)
+        return False
+    probe_ids = getattr(model, "_last_crct_probe_input_ids", None)
     if probe_ids is None:
-        return
+        probe_ids = getattr(model, "_last_input_ids", None)
+    if probe_ids is None:
+        return False
+    probe_step = int(getattr(model, "_last_crct_probe_step", step))
+    if loop.has_probe() and int(getattr(loop, "_probe_step", -1)) == probe_step:
+        return False
+    valid_mask = getattr(model, "_last_crct_probe_valid_mask", None)
+    if valid_mask is None:
+        valid_mask = torch.ones_like(probe_ids, dtype=torch.bool)
     loop.cache_probe(
         input_ids=probe_ids,
-        valid_mask=torch.ones_like(probe_ids, dtype=torch.bool),
+        valid_mask=valid_mask,
         cache_read_cutoff=None,
-        step=step,
+        step=probe_step,
+        stream_id=probe_step,
     )
+    return True
 
 
 def _crct_score_payload_inline(
@@ -1038,6 +1048,9 @@ def _crct_score_payload_inline(
     update_model_memory_after: bool = False,
 ) -> dict[str, torch.Tensor]:
     input_ids = _crct_full_input_ids(inputs, targets)
+    setattr(model, "_last_crct_probe_input_ids", input_ids.detach())
+    setattr(model, "_last_crct_probe_valid_mask", _crct_valid_mask(input_ids).detach())
+    setattr(model, "_last_crct_probe_step", int(step))
     alpha = crct_alpha_ramp(
         int(step),
         int(total_steps or 0),
@@ -6765,6 +6778,8 @@ def train_fast_for_budget(
     crct_gradient_conflict_trace_max_rows: int = 0,
     crct_gradient_conflict_trace_flush_rows: int = 256,
     replay_eviction_enabled: bool = False,
+    replay_eviction_mode: str = "active",
+    replay_eviction_memory_streams: int = 8,
     replay_eviction_threshold: float = 0.01,
     replay_eviction_ema_beta: float = 0.9,
     replay_eviction_min_age_steps: int = 128,
@@ -7420,6 +7435,8 @@ def train_fast_for_budget(
     replay_eviction_loop: ReplayEvictionLoop | None = None
     if bool(replay_eviction_enabled) and crct_enabled:
         replay_eviction_loop = ReplayEvictionLoop(
+            action_mode=str(replay_eviction_mode),
+            memory_streams=int(replay_eviction_memory_streams),
             eviction_threshold=float(replay_eviction_threshold),
             eviction_ema_beta=float(replay_eviction_ema_beta),
             min_slot_age_steps=int(replay_eviction_min_age_steps),
@@ -8218,10 +8235,7 @@ def train_fast_for_budget(
             # Replay-eviction: rank-3 idle maintenance tick.
             # Uses the most recent teacher scoring batch as probe data.
             if replay_eviction_loop is not None and rank_ == world_size_ - 1:
-                if not replay_eviction_loop.has_probe():
-                    _crct_replay_cache_probe(
-                        replay_eviction_loop, model, steps,
-                    )
+                _crct_replay_cache_probe(replay_eviction_loop, model, steps)
                 tick_result = replay_eviction_loop.tick(model=model, step=steps)
                 if tick_result.evicted_indices:
                     replay_eviction_loop.flush_trace()
@@ -8914,6 +8928,8 @@ def _warmup(
             config.get("crct_gradient_conflict_trace_flush_rows", 256)
         ),
         replay_eviction_enabled=bool(config.get("replay_eviction_enabled", False)),
+        replay_eviction_mode=str(config.get("replay_eviction_mode", "active")),
+        replay_eviction_memory_streams=int(config.get("replay_eviction_memory_streams", 8)),
         replay_eviction_threshold=float(config.get("replay_eviction_threshold", 0.01)),
         replay_eviction_ema_beta=float(config.get("replay_eviction_ema_beta", 0.9)),
         replay_eviction_min_age_steps=int(config.get("replay_eviction_min_age_steps", 128)),
@@ -9445,6 +9461,8 @@ def run_condition(
             config.get("crct_gradient_conflict_trace_flush_rows", 256)
         ),
         replay_eviction_enabled=bool(config.get("replay_eviction_enabled", False)),
+        replay_eviction_mode=str(config.get("replay_eviction_mode", "active")),
+        replay_eviction_memory_streams=int(config.get("replay_eviction_memory_streams", 8)),
         replay_eviction_threshold=float(config.get("replay_eviction_threshold", 0.01)),
         replay_eviction_ema_beta=float(config.get("replay_eviction_ema_beta", 0.9)),
         replay_eviction_min_age_steps=int(config.get("replay_eviction_min_age_steps", 128)),

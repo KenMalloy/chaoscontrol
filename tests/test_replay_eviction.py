@@ -232,6 +232,28 @@ class TestReplayEvictionLoop:
         result = loop.tick(model=model, step=200)
         assert loop._tick_count == 1
 
+    def test_cache_probe_replaces_previous_batch(self):
+        loop = ReplayEvictionLoop()
+        first = torch.zeros(2, 17, dtype=torch.long)
+        second = torch.ones(2, 17, dtype=torch.long)
+        mask = torch.ones(2, 17)
+        loop.cache_probe(
+            input_ids=first,
+            valid_mask=mask,
+            cache_read_cutoff=None,
+            step=10,
+        )
+        loop.cache_probe(
+            input_ids=second,
+            valid_mask=mask,
+            cache_read_cutoff=None,
+            step=20,
+            stream_id=9,
+        )
+        assert loop._probe_step == 20
+        assert loop._probe_stream_id == 1
+        assert torch.equal(loop._probe_input_ids, second)
+
     def test_min_age_respected(self):
         loop = ReplayEvictionLoop(min_slot_age_steps=1000, eviction_threshold=100.0)
         model = _StubModel(n_slots=5, memory_benefit=0.0)
@@ -265,13 +287,14 @@ class TestReplayEvictionLoop:
         assert len(result.evicted_indices) > 0
 
     def test_diagnostics(self):
-        loop = ReplayEvictionLoop()
+        loop = ReplayEvictionLoop(memory_streams=8)
         diag = loop.diagnostics()
         assert "tick_count" in diag
         assert "evictions_total" in diag
         assert "slots_tracked" in diag
         assert "quarantined_count" in diag
         assert diag["tick_count"] == 0
+        assert diag["memory_streams"] == 8
 
     def test_ema_smoothing(self):
         loop = ReplayEvictionLoop(eviction_ema_beta=0.9)
@@ -294,6 +317,24 @@ class TestReplayEvictionLoop:
         assert loop._slot_utility_ema[0] == pytest.approx(0.5)
         assert loop._slot_utility_ema[1] == pytest.approx(0.8)
         assert loop._slot_utility_ema[2] == pytest.approx(0.9)
+
+    def test_refresh_score_maps_physical_index_to_probe_local_index(self):
+        loop = ReplayEvictionLoop()
+        cf = CounterfactualResult(
+            marginal_gains=torch.tensor([
+                [[1.0, 1.0]],
+                [[2.0, 2.0]],
+                [[3.0, 3.0]],
+            ]),
+            sidecar_value=torch.zeros(1, 2),
+            nll_baseline=torch.zeros(1, 2),
+            nll_no_sidecar=torch.zeros(1, 2),
+            weights_baseline=torch.zeros(1, 3),
+            mask=torch.ones(1, 2, dtype=torch.bool),
+            slot_indices=[1, 3, 5],
+        )
+        assert loop._quick_refresh_score(None, 3, cf) == pytest.approx(2.0)
+        assert loop._quick_refresh_score(None, 4, cf) == pytest.approx(0.0)
 
 
 # ---------------------------------------------------------------------------
@@ -471,6 +512,29 @@ class TestSlotTableTick:
         result = loop.tick(model=model, step=100)
         assert isinstance(result, TickResult)
         assert loop._tick_count == 1
+
+    def test_shadow_mode_classifies_without_mutating_table(self):
+        loop = ReplayEvictionLoop(
+            action_mode="shadow",
+            min_slot_age_steps=0,
+            eviction_threshold=100.0,
+        )
+        model = _StubModel(n_slots=3, memory_benefit=0.0, use_table=True)
+        before = list(model.outer_model.table.active_slot_ids())
+        input_ids = torch.randint(0, 32, (2, 17))
+        valid_mask = torch.ones(2, 17)
+        loop.cache_probe(
+            input_ids=input_ids,
+            valid_mask=valid_mask,
+            cache_read_cutoff=None,
+            step=0,
+        )
+        result = loop.tick(model=model, step=100)
+        assert result.evicted_indices == []
+        assert model.outer_model.table.active_slot_ids() == before
+        diag = loop.diagnostics()
+        assert diag["action_mode"] == "shadow"
+        assert diag["shadow_actions_total"] > 0
 
 
 class TestDistillReceipt:

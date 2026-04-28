@@ -398,6 +398,8 @@ class ReplayEvictionLoop:
     def __init__(
         self,
         *,
+        action_mode: str = "active",
+        memory_streams: int = 8,
         eviction_threshold: float = 0.01,
         eviction_ema_beta: float = 0.9,
         min_slot_age_steps: int = 128,
@@ -416,6 +418,10 @@ class ReplayEvictionLoop:
         useful_threshold: float = 0.005,
         min_score_count: int = 2,
     ) -> None:
+        if action_mode not in {"active", "shadow"}:
+            raise ValueError("action_mode must be 'active' or 'shadow'")
+        self._action_mode = str(action_mode)
+        self._memory_streams = max(1, int(memory_streams))
         self._threshold = float(eviction_threshold)
         self._ema_beta = float(eviction_ema_beta)
         self._min_age = int(min_slot_age_steps)
@@ -442,6 +448,7 @@ class ReplayEvictionLoop:
         self._probe_valid_mask: torch.Tensor | None = None
         self._probe_cache_cutoff: int | None = None
         self._probe_step: int = 0
+        self._probe_stream_id: int = 0
 
         # Counters
         self._tick_count: int = 0
@@ -452,6 +459,9 @@ class ReplayEvictionLoop:
         self._releases_total: int = 0
         self._replays_total: int = 0
         self._slots_scored_total: int = 0
+        self._last_slots_tracked: int = 0
+        self._shadow_actions_total: int = 0
+        self._shadow_action_counts: dict[str, int] = {}
 
         # Quarantine tracking (by slot_id when using SlotTable, by index otherwise)
         self._quarantined: set[int] = set()
@@ -473,11 +483,13 @@ class ReplayEvictionLoop:
         valid_mask: torch.Tensor,
         cache_read_cutoff: int | None,
         step: int,
+        stream_id: int = 0,
     ) -> None:
         self._probe_input_ids = input_ids.detach()
         self._probe_valid_mask = valid_mask.detach()
         self._probe_cache_cutoff = cache_read_cutoff
         self._probe_step = step
+        self._probe_stream_id = int(stream_id) % self._memory_streams
 
     def has_probe(self) -> bool:
         return self._probe_input_ids is not None
@@ -509,6 +521,7 @@ class ReplayEvictionLoop:
 
         self._replays_total += 1
         self._slots_scored_total += len(cf.slot_indices)
+        self._last_slots_tracked = len(cf.slot_indices)
 
         # Compute signals
         sharpness_per_slot = _compute_per_slot_sharpness(cf.marginal_gains, cf.mask)
@@ -589,12 +602,59 @@ class ReplayEvictionLoop:
         if elapsed > self._max_seconds:
             return TickResult()
 
-        # Classify and act
+        # Classify and act.  Shadow mode is the experiment-safe lane: it
+        # computes the same policy decisions and emits telemetry, but it never
+        # mutates the table.  This lets CRCT vs CRCT+maintenance be measured
+        # without conflating the first run with a new controller.
+        if self._action_mode == "shadow":
+            self._classify_shadow(outer=outer, step=step, cf=cf)
+            return TickResult()
+
         result = self._classify_and_act(
             model=model, outer=outer, step=step, cf=cf,
             slot_marginals=slot_marginals, sharpness_per_slot=sharpness_per_slot,
         )
         return result
+
+    def _classify_shadow(
+        self,
+        *,
+        outer: Any,
+        step: int,
+        cf: CounterfactualResult,
+    ) -> None:
+        table = getattr(outer, "table", None)
+        if table is None:
+            return
+        policy_kwargs = dict(
+            eviction_threshold=self._threshold,
+            useful_threshold=self._useful_threshold,
+            drift_threshold=self._drift_threshold,
+            quarantine_threshold=self._quarantine_threshold,
+            distill_peak_threshold=self._distill_peak_threshold,
+            min_age=self._min_age,
+            min_score_count=self._min_score_count,
+        )
+        for phys_idx in cf.slot_indices:
+            sid = table.physical_to_slot_id(phys_idx)
+            if sid is None:
+                continue
+            rec = table.record(sid)
+            if rec is None:
+                continue
+            action = self._policy.choose(rec, **policy_kwargs)
+            self._shadow_actions_total += 1
+            self._shadow_action_counts[action] = (
+                self._shadow_action_counts.get(action, 0) + 1
+            )
+            self._trace_event(
+                step,
+                sid,
+                action,
+                rec,
+                accepted=False,
+                reason="shadow",
+            )
 
     def _classify_and_act(
         self,
@@ -655,7 +715,7 @@ class ReplayEvictionLoop:
                 if rec is None:
                     continue
                 if action == SLOT_REFRESH:
-                    accepted = self._execute_refresh(outer, sid, cf)
+                    accepted = self._execute_refresh(model, outer, sid, cf)
                     if accepted:
                         result.refreshed.append(sid)
                         self._refreshes_total += 1
@@ -710,7 +770,7 @@ class ReplayEvictionLoop:
         return result
 
     def _execute_refresh(
-        self, outer: Any, slot_id: int, cf: CounterfactualResult
+        self, model: Any, outer: Any, slot_id: int, cf: CounterfactualResult
     ) -> bool:
         table = getattr(outer, "table", None)
         if table is None:
@@ -766,11 +826,23 @@ class ReplayEvictionLoop:
         phys = table.slot_id_to_physical(slot_id)
         if phys is None:
             return False
+        baseline_score = self._slot_mean_marginal(phys, cf)
 
         for name, tensor in candidates[1:]:
             table.replace_tensor(slot_id, tensor)
-            # Quick marginal check via the cached probe data
-            improvement = self._quick_refresh_score(outer, phys, cf)
+            if self._probe_input_ids is None or self._probe_valid_mask is None:
+                table.replace_tensor(slot_id, identity_tensor)
+                return False
+            candidate_cf = counterfactual_probe(
+                model=model,
+                outer=outer,
+                probe_input_ids=self._probe_input_ids,
+                probe_valid_mask=self._probe_valid_mask,
+                cache_read_cutoff=self._probe_cache_cutoff,
+                chunk_size=self._probe_chunk_size,
+            )
+            candidate_score = self._slot_mean_marginal(phys, candidate_cf)
+            improvement = candidate_score - baseline_score
             if improvement > best_improvement + self._refresh_margin:
                 best_name = name
                 best_tensor = tensor
@@ -784,15 +856,25 @@ class ReplayEvictionLoop:
             table.replace_tensor(slot_id, identity_tensor)
             return False
 
+    def _slot_mean_marginal(
+        self, phys_idx: int, cf: CounterfactualResult
+    ) -> float:
+        """Return mean marginal gain for a physical slot in a probe result."""
+        try:
+            local_idx = cf.slot_indices.index(int(phys_idx))
+        except ValueError:
+            return 0.0
+        if local_idx >= cf.marginal_gains.shape[0]:
+            return 0.0
+        mg = cf.marginal_gains[local_idx]
+        m = cf.mask.float()
+        return float((mg * m).sum() / m.sum().clamp(min=1))
+
     def _quick_refresh_score(
         self, outer: Any, phys_idx: int, cf: CounterfactualResult
     ) -> float:
-        """Estimate refresh improvement from cached probe data."""
-        if phys_idx >= cf.marginal_gains.shape[0]:
-            return 0.0
-        mg = cf.marginal_gains[phys_idx]
-        m = cf.mask.float()
-        return float((mg * m).sum() / m.sum().clamp(min=1))
+        """Backward-compatible mean marginal helper for older tests."""
+        return self._slot_mean_marginal(phys_idx, cf)
 
     def _execute_quarantine(self, outer: Any, slot_id: int) -> None:
         table = getattr(outer, "table", None)
@@ -957,6 +1039,9 @@ class ReplayEvictionLoop:
     def diagnostics(self) -> dict[str, Any]:
         self.flush_trace()
         return {
+            "enabled": True,
+            "action_mode": self._action_mode,
+            "memory_streams": self._memory_streams,
             "tick_count": self._tick_count,
             "replays_total": self._replays_total,
             "evictions_total": self._evictions_total,
@@ -965,11 +1050,16 @@ class ReplayEvictionLoop:
             "decays_total": self._decays_total,
             "releases_total": self._releases_total,
             "slots_scored_total": self._slots_scored_total,
-            "slots_tracked": len(self._slot_utility_ema),
+            "slots_tracked": self._last_slots_tracked
+            if self._last_slots_tracked
+            else len(self._slot_utility_ema),
+            "shadow_actions_total": self._shadow_actions_total,
+            "shadow_action_counts": dict(self._shadow_action_counts),
             "quarantined_count": len(self._quarantined),
             "eviction_threshold": self._threshold,
             "has_probe": self.has_probe(),
             "probe_step": self._probe_step,
+            "probe_stream_id": self._probe_stream_id,
         }
 
 

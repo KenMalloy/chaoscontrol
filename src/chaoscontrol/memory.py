@@ -423,7 +423,10 @@ class MultiSlotOuterModel(nn.Module):
 
         If no slots exist, returns zeros. If cue is provided (batch, model_dim),
         similarity between cue and each slot weights the decode.
-        Retrieval weights are modulated by the control plane's priority vector.
+        Slot-lifecycle priority is telemetry/control-plane state only.  The
+        CRCT oracle path must keep ``force_on`` labels grounded in the same
+        full-strength memory read, so maintenance actions retire/refresh/distill
+        slots rather than silently rescaling retrieval here.
         """
         if len(self.table) == 0:
             self._retrieval_weights = None
@@ -442,11 +445,6 @@ class MultiSlotOuterModel(nn.Module):
             cue_outer = self.cue_proj(cue)
             sim = torch.mm(cue_outer, slot_matrix.T)
             weights = F.softmax(sim, dim=-1)
-
-            # Residual injector: control plane priority modulates retrieval
-            priority = self.table.priority_vector(indices)
-            weights = weights * priority.to(device=weights.device, dtype=weights.dtype).unsqueeze(0)
-            weights = weights / weights.sum(dim=-1, keepdim=True).clamp(min=1e-8)
 
             self._retrieval_weights = weights.detach()
             self._retrieval_indices = indices

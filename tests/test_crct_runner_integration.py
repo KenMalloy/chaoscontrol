@@ -25,6 +25,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 from chaoscontrol.model import ChaosStudentLM
+from chaoscontrol.replay_eviction import ReplayEvictionLoop
 from chaoscontrol.wake_cache_txn import TransactionalWakeCache
 
 
@@ -73,6 +74,55 @@ def _tiny_crct_model() -> ChaosStudentLM:
     )
     model.train()
     return model
+
+
+def test_replay_eviction_probe_tracks_latest_rank3_teacher_batch() -> None:
+    mod = _load_module("runner_fast_path_crct_probe_test", RUNNER_PATH)
+    model = _tiny_crct_model()
+    cache = TransactionalWakeCache(max_moments=0, max_hidden_buffer=0)
+    loop = ReplayEvictionLoop()
+
+    inputs_1 = (torch.arange(16).reshape(2, 8) % 32).to(torch.int32)
+    targets_1 = ((torch.arange(16).reshape(2, 8) + 1) % 32).to(torch.long)
+    mod._crct_score_payload_inline(
+        model=model,
+        cache=cache,
+        scarcity_optimizer=None,
+        inputs=inputs_1,
+        targets=targets_1,
+        step=10,
+        total_steps=100,
+        tau=0.10,
+        strength=0.10,
+        w_max=1.20,
+        alpha_max=0.15,
+        memory_write_tokens=4,
+        update_model_memory_after=True,
+    )
+    assert mod._crct_replay_cache_probe(loop, model, 10) is True
+    assert loop._probe_step == 10
+    first_probe = loop._probe_input_ids.clone()
+
+    inputs_2 = ((torch.arange(16).reshape(2, 8) + 7) % 32).to(torch.int32)
+    targets_2 = ((torch.arange(16).reshape(2, 8) + 11) % 32).to(torch.long)
+    mod._crct_score_payload_inline(
+        model=model,
+        cache=cache,
+        scarcity_optimizer=None,
+        inputs=inputs_2,
+        targets=targets_2,
+        step=20,
+        total_steps=100,
+        tau=0.10,
+        strength=0.10,
+        w_max=1.20,
+        alpha_max=0.15,
+        memory_write_tokens=4,
+        update_model_memory_after=True,
+    )
+    assert mod._crct_replay_cache_probe(loop, model, 20) is True
+    assert loop._probe_step == 20
+    assert not torch.equal(loop._probe_input_ids, first_probe)
 
 
 def _pick_free_port_or_skip() -> int:

@@ -72,19 +72,19 @@ class TestAppendRetire:
 
 
 class TestQuarantineMask:
-    def test_quarantine_hides_from_visible(self):
+    def test_quarantine_keeps_oracle_visibility(self):
         t = SlotTable()
         s0 = t.append(torch.randn(1, 4))
         s1 = t.append(torch.randn(1, 4))
         assert len(t.visible_indices()) == 2
         t.quarantine(s0)
-        assert t.visible_indices() == [1]
+        assert t.visible_indices() == [0, 1]
 
-    def test_release_restores_visibility(self):
+    def test_release_keeps_visibility(self):
         t = SlotTable()
         s0 = t.append(torch.randn(1, 4))
         t.quarantine(s0)
-        assert t.visible_indices() == []
+        assert t.visible_indices() == [0]
         t.release(s0)
         assert t.visible_indices() == [0]
 

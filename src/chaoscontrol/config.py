@@ -162,6 +162,8 @@ class ChaosControlConfig:
 
     # Replay-eviction loop (CRCT rank-3 idle maintenance)
     replay_eviction_enabled: bool = False
+    replay_eviction_mode: str = "active"
+    replay_eviction_memory_streams: int = 8
     replay_eviction_threshold: float = 0.01
     replay_eviction_ema_beta: float = 0.9
     replay_eviction_min_age_steps: int = 128
