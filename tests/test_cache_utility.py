@@ -89,6 +89,7 @@ class _MockModel(nn.Module):
         self._dim = dim
         self._vocab = vocab
         self.encode_calls: list[dict[str, Any]] = []
+        self.append_calls: list[dict[str, Any]] = []
         # Two random hidden tensors keyed by memory_mode so utility ≠ 0.
         self._hidden_off_seed = 11
         self._hidden_mem_seed = 22
@@ -113,6 +114,22 @@ class _MockModel(nn.Module):
         return torch.randn(
             batch, seq, self._dim, generator=g, device=input_ids.device
         )
+
+    def append_memory_from_hidden(
+        self,
+        hidden: torch.Tensor,
+        *,
+        score: torch.Tensor | None = None,
+        max_tokens: int | None = None,
+    ) -> bool:
+        self.append_calls.append(
+            {
+                "hidden": hidden.detach().clone(),
+                "score": None if score is None else score.detach().clone(),
+                "max_tokens": max_tokens,
+            }
+        )
+        return True
 
 
 # ---------------------------------------------------------------------------
@@ -418,6 +435,22 @@ class TestRank3ScoreBatchCausal:
             assert math.isclose(
                 out["loss_weight"][target_mask].mean().item(), 1.0, abs_tol=1e-5
             )
+
+    def test_update_model_memory_appends_predictor_states_only(self) -> None:
+        model, cache, ids, mask = self._setup(batch=2, seq=6)
+        out = rank3_score_batch_causal(
+            model=model,
+            cache=cache,
+            input_ids=ids,
+            valid_mask=mask,
+            update_model_memory_after=True,
+            memory_write_tokens=3,
+        )
+        assert len(model.append_calls) == 1
+        call = model.append_calls[0]
+        assert call["hidden"].shape == (2, 5, model._dim)
+        assert call["score"].shape == out["utility"].shape
+        assert call["max_tokens"] == 3
 
     def test_confidence_in_unit_interval(self) -> None:
         model, cache, ids, mask = self._setup()

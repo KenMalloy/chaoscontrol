@@ -81,7 +81,8 @@ def _ssm_constructor_kwargs(config: dict[str, Any]) -> dict[str, Any]:
     affects parameter shape; defaults from ``ChaosStudentLM`` for absent
     fields stay implicit and the class supplies them on reload.
     """
-    return dict(
+    crct_enabled = bool(config.get("crct_enabled", False))
+    kwargs = dict(
         vocab_size=int(config["vocab_size"]),
         dim=int(config["model_dim"]),
         num_layers=int(config["num_layers"]),
@@ -89,15 +90,49 @@ def _ssm_constructor_kwargs(config: dict[str, Any]) -> dict[str, Any]:
         a_mode=config.get("a_mode", "diag"),
         a_full_rank=int(config.get("a_full_rank", 8)),
         a_full_gamma=float(config.get("a_full_gamma", 0.05)),
-        outer_model_dim=0,
+        outer_model_dim=(
+            int(config.get("outer_model_dim", 64)) if crct_enabled else 0
+        ),
+        outer_model_type=str(
+            config.get("outer_model_type", "multislot" if crct_enabled else "single")
+        ),
+        outer_max_slots=int(config.get("outer_max_slots", 4096 if crct_enabled else 64)),
+        outer_compress_ratio=int(config.get("outer_compress_ratio", 2)),
+        buffer_mode=str(
+            config.get("buffer_mode", "append_only" if crct_enabled else "legacy")
+        ),
+        retrieval_mode=str(config.get("retrieval_mode", "softmax_all")),
+        retrieval_k=int(config.get("retrieval_k", 16 if crct_enabled else 8)),
         wernicke_enabled=False,
         local_attn_window=int(config.get("local_attn_window", 0)),
         local_attn_heads=int(config.get("local_attn_heads", 1)),
         local_attn_dim=int(config.get("local_attn_dim", 64)),
         local_attn_topk=int(config.get("local_attn_topk", 0)),
         local_attn_topk_random=bool(config.get("local_attn_topk_random", False)),
+        enable_controller=bool(config.get("enable_controller", crct_enabled)),
+        controller_hidden_dim=(
+            int(config["controller_hidden_dim"])
+            if config.get("controller_hidden_dim") is not None
+            else int(config.get("crct_controller_hidden_dim", 0)) or None
+        ),
         activation_checkpoint=bool(config.get("activation_checkpoint", False)),
     )
+    if crct_enabled and kwargs["outer_model_dim"] <= 0:
+        raise ValueError(
+            "crct_enabled=True requires outer_model_dim > 0; otherwise "
+            "memory_mode='force_on' is identical to memory_mode='off'."
+        )
+    if crct_enabled and kwargs["buffer_mode"] != "append_only":
+        raise ValueError(
+            "crct_enabled=True requires buffer_mode='append_only' so the "
+            "fast runner can populate memory from encode() hidden states."
+        )
+    if crct_enabled and kwargs["outer_model_type"] != "multislot":
+        raise ValueError(
+            "crct_enabled=True requires outer_model_type='multislot' for "
+            "append-only memory writes."
+        )
+    return kwargs
 
 
 def _transformer_constructor_kwargs(config: dict[str, Any]) -> dict[str, Any]:

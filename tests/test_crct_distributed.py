@@ -155,9 +155,9 @@ class TestTeacherResultMailbox(unittest.TestCase):
             payload_shape=(2, 8, 16),
             broadcast_fn=lambda *a, **kw: done,
         )
-        mb._meta_buf[0] = 0.75
-        mb._meta_buf[1] = 100.0
-        mb._meta_buf[2] = 7.0
+        mb._loss_weight_buf.fill_(0.75)
+        mb._meta_buf[0] = 100.0
+        mb._meta_buf[1] = 7.0
 
         first = mb.try_get(step=100)
         payload = first if first is not None else mb.try_get(step=100)
@@ -165,9 +165,34 @@ class TestTeacherResultMailbox(unittest.TestCase):
         self.assertIsInstance(payload, crct.TeacherPayload)
         self.assertEqual(payload.step_id, 100)
         self.assertEqual(payload.target.shape, (2, 8, 16))
-        self.assertEqual(payload.conf.shape, (2, 8))
-        self.assertAlmostEqual(payload.loss_weight, 0.75)
+        self.assertEqual(payload.conf.shape, (2, 8, 16))
+        self.assertEqual(payload.loss_weight.shape, (2, 8, 16))
+        self.assertTrue(torch.allclose(
+            payload.loss_weight,
+            torch.full((2, 8, 16), 0.75, dtype=torch.float16),
+        ))
         self.assertEqual(payload.snapshot_version, 7)
+
+    def test_try_get_broadcasts_full_dense_payload(self):
+        pg = FakeProcessGroup([0, 1, 2, 3])
+        calls = []
+
+        def broadcast(tensor, src, group, async_op):
+            calls.append(tuple(tensor.shape))
+            return FakeWork(completed=True)
+
+        mb = crct.TeacherResultMailbox(
+            pg, my_rank=0, num_train_ranks=3,
+            payload_shape=(2, 8, 16),
+            broadcast_fn=broadcast,
+        )
+        mb.try_get(step=100)
+        payload = mb.try_get(step=100)
+        self.assertIsNotNone(payload)
+        self.assertEqual(
+            calls,
+            [(2, 8, 16), (2, 8, 16), (2, 8, 16), (2,)],
+        )
 
     def test_post_result_drop_when_inflight(self):
         pg = FakeProcessGroup([0, 1, 2, 3])
@@ -178,7 +203,7 @@ class TestTeacherResultMailbox(unittest.TestCase):
             broadcast_fn=lambda *a, **kw: pending,
         )
         target = torch.zeros(2, 8, 16, dtype=torch.float16)
-        conf = torch.zeros(2, 8, dtype=torch.float16)
+        conf = torch.zeros(2, 8, 16, dtype=torch.float16)
         mb.post_result(step_id=10, target=target, conf=conf, loss_weight=1.0)
         mb.post_result(step_id=11, target=target, conf=conf, loss_weight=1.0)
         self.assertEqual(mb.posts_attempted, 2)
@@ -319,8 +344,8 @@ class TestSynchronousFallback(unittest.TestCase):
             return crct.TeacherPayload(
                 step_id=step,
                 target=torch.zeros(2, 8, 16, dtype=torch.float16),
-                conf=torch.zeros(2, 8, dtype=torch.float16),
-                loss_weight=1.0,
+                confidence=torch.zeros(2, 8, 16, dtype=torch.float16),
+                loss_weight=torch.ones(2, 8, 16, dtype=torch.float16),
                 snapshot_version=0,
             )
 
@@ -345,8 +370,8 @@ class TestSynchronousFallback(unittest.TestCase):
         )
         for attr in (
             "posts_attempted", "posts_dropped", "_target_buf",
-            "_conf_buf", "_meta_buf", "_inflight", "num_train_ranks",
-            "payload_shape", "dtype",
+            "_conf_buf", "_loss_weight_buf", "_meta_buf", "_inflight",
+            "num_train_ranks", "payload_shape", "dtype",
         ):
             self.assertTrue(hasattr(mb, attr), f"missing {attr}")
         self.assertEqual(mb.posts_attempted, 0)

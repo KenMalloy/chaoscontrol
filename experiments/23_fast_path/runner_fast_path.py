@@ -57,6 +57,12 @@ def configure_exp23_fast_backend_defaults(
 configure_exp23_fast_backend_defaults()
 
 from chaoscontrol.core import verify_diag_recurrence  # noqa: E402
+from chaoscontrol.cache_utility import (  # noqa: E402
+    ScarcityAwareMemoryOptimizer as CrctScarcityAwareMemoryOptimizer,
+    alpha_ramp as crct_alpha_ramp,
+    rank3_score_batch_causal,
+)
+from chaoscontrol.controller_distillation import controller_loss  # noqa: E402
 from chaoscontrol.data import (  # noqa: E402
     load_fineweb_tokens,
     resolve_device,
@@ -113,6 +119,7 @@ from chaoscontrol.train_ssm import (  # noqa: E402
     fused_lm_head_weighted_loss_with_ce,
     full_lm_head_backward,
 )
+from chaoscontrol.wake_cache_txn import TransactionalWakeCache  # noqa: E402
 from fast_path import (  # noqa: E402
     Exp23BatchPrefetcher,
     SequentialShardedStartSampler,
@@ -401,8 +408,9 @@ def _build_optimizer(
     weight_decay = float(config.get("weight_decay", 0.01))
     grouping = str(config.get("optimizer_param_grouping", "flat")).strip()
     dynamics_lr_mul = float(config.get("optimizer_dynamics_lr_mul", 0.1))
+    named_params = list(model.named_parameters())
     params = build_optimizer_params(
-        list(model.named_parameters()),
+        named_params,
         grouping=grouping,
         base_lr=base_lr,
         weight_decay=weight_decay,
@@ -413,15 +421,31 @@ def _build_optimizer(
     if name == "lamb":
         return LAMB(params, lr=base_lr, weight_decay=weight_decay)
     if name == "muon":
+        matrix_param_names: set[str] | None = None
+        if bool(config.get("crct_enabled", False)):
+            adamw_prefixes = (
+                "embed.",
+                "lm_head.",
+                "memory_controller.",
+                "outer_model.",
+            )
+            matrix_param_names = {
+                param_name
+                for param_name, param in named_params
+                if param.requires_grad
+                and param.ndim >= 2
+                and not param_name.startswith(adamw_prefixes)
+            }
         opt = Muon(
             params,
             lr=base_lr,
             weight_decay=weight_decay,
             adamw_lr=base_lr,
             adamw_weight_decay=weight_decay,
+            matrix_param_names=matrix_param_names,
             fused=bool(config.get("fused_muon", True)),
         )
-        opt.bind_param_names(list(model.named_parameters()))
+        opt.bind_param_names(named_params)
         return opt
     if name == "semantic":
         semantic_cfg = _semantic_optimizer_config(
@@ -892,6 +916,236 @@ def _run_scopt_common_train_step(
         grad_allreduce_mode=grad_allreduce_mode,
         all_group=all_group,
     )
+
+
+def _crct_full_input_ids(inputs: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+    """Reconstruct the ``(B, T+1)`` continuation batch from fast-path slices."""
+    return torch.cat([inputs[:, :1].long(), targets.long()], dim=1)
+
+
+def _crct_valid_mask(input_ids: torch.Tensor) -> torch.Tensor:
+    """Fast-path training batches are dense continuations with no padding."""
+    return torch.ones_like(input_ids, dtype=torch.bool)
+
+
+def _crct_append_memory_from_hidden(
+    model: torch.nn.Module,
+    hidden: torch.Tensor,
+    *,
+    score: torch.Tensor | None = None,
+    max_tokens: int | None = None,
+) -> None:
+    append_fn = getattr(model, "append_memory_from_hidden", None)
+    if append_fn is None:
+        raise ValueError(
+            "crct_enabled=True requires a model with append_memory_from_hidden(...)"
+        )
+    wrote = bool(
+        append_fn(
+            hidden.detach(),
+            score=score.detach() if score is not None else None,
+            max_tokens=max_tokens,
+        )
+    )
+    if not wrote:
+        raise ValueError(
+            "crct_enabled=True requires append-only multislot memory. "
+            "Without it the CRCT teacher compares memory-off to an empty "
+            "memory path and silently produces zero utility."
+        )
+
+
+def _crct_payload_controller_loss(
+    payload: dict[str, torch.Tensor],
+    controller_logits: torch.Tensor,
+) -> torch.Tensor:
+    target = payload["target"].to(
+        device=controller_logits.device,
+        dtype=controller_logits.dtype,
+    )
+    conf = payload["confidence"].to(
+        device=controller_logits.device,
+        dtype=controller_logits.dtype,
+    )
+    return controller_loss(
+        controller_logits,
+        target,
+        confidence=conf,
+        mask=torch.ones_like(target, dtype=torch.bool),
+    )
+
+
+def _reject_unsupported_fast_step(
+    model: torch.nn.Module,
+    *,
+    crct_enabled: bool = False,
+) -> None:
+    if not crct_enabled:
+        _reject_unsupported(model)
+        return
+    unsupported = (
+        ("wernicke", "wernicke layer"),
+        ("semantic_tier", "semantic_tier bias"),
+        ("posterior", "posterior correction module"),
+        ("bucket_prototypes_module", "bucket_prototypes"),
+    )
+    for attr, label in unsupported:
+        if getattr(model, attr, None) is not None:
+            raise ValueError(
+                f"crct_enabled=True fast path does not support the {label} "
+                f"path (model.{attr} is not None)."
+            )
+
+
+def _crct_score_payload_inline(
+    *,
+    model: torch.nn.Module,
+    cache: TransactionalWakeCache,
+    scarcity_optimizer: CrctScarcityAwareMemoryOptimizer | None,
+    inputs: torch.Tensor,
+    targets: torch.Tensor,
+    step: int,
+    total_steps: int | None,
+    tau: float,
+    strength: float,
+    w_max: float,
+    alpha_max: float,
+    memory_write_tokens: int,
+    update_model_memory_after: bool = False,
+) -> dict[str, torch.Tensor]:
+    input_ids = _crct_full_input_ids(inputs, targets)
+    alpha = crct_alpha_ramp(
+        int(step),
+        int(total_steps or 0),
+        alpha_max=float(alpha_max),
+    )
+    score = rank3_score_batch_causal(
+        model=model,
+        cache=cache,
+        input_ids=input_ids,
+        valid_mask=_crct_valid_mask(input_ids),
+        scarcity_optimizer=scarcity_optimizer,
+        tau=float(tau),
+        strength=float(strength) * float(alpha),
+        w_max=float(w_max),
+        update_model_memory_after=bool(update_model_memory_after),
+        memory_write_tokens=int(memory_write_tokens),
+    )
+    if scarcity_optimizer is not None:
+        target = score["controller_target"]
+        mask = _crct_valid_mask(input_ids)[:, 1:].to(device=target.device)
+        actual_read_rate = (
+            float(target[mask].mean().detach().item()) if bool(mask.any()) else 0.0
+        )
+        scarcity_optimizer.dual_step(actual_read_rate=actual_read_rate)
+    return {
+        "step_id": torch.tensor(int(step), device=inputs.device),
+        "target": score["controller_target"].detach().clone(),
+        "confidence": score["confidence"].detach().clone(),
+        "loss_weight": score["loss_weight"].detach().clone(),
+        "utility": score["utility"].detach().clone(),
+    }
+
+
+def _collect_crct_teacher_payload(
+    *,
+    model: torch.nn.Module,
+    cache: TransactionalWakeCache,
+    scarcity_optimizer: CrctScarcityAwareMemoryOptimizer | None,
+    inputs: torch.Tensor,
+    targets: torch.Tensor,
+    rank: int,
+    world_size: int,
+    all_group: "dist.ProcessGroup | None",
+    step: int,
+    total_steps: int | None,
+    tau: float,
+    strength: float,
+    w_max: float,
+    alpha_max: float,
+    memory_write_tokens: int,
+) -> dict[str, torch.Tensor] | None:
+    """Return this train rank's CRCT teacher payload.
+
+    ``world_size < 4`` uses the design-doc synchronous fallback. At
+    ``world_size >= 4`` the final rank is a memory coprocessor: train ranks
+    synchronously fan input ids in, rank 3 scores one concatenated batch, then
+    broadcasts dense per-rank payload tensors back. This is intentionally
+    conservative and correctness-first; the async/drop-don't-queue transport
+    can replace this helper without changing the train-step loss composition.
+    """
+    rank_ = int(rank)
+    world_size_ = int(world_size)
+    memory_rank = world_size_ - 1
+    if world_size_ < 4 or all_group is None or not dist.is_initialized():
+        return _crct_score_payload_inline(
+            model=model,
+            cache=cache,
+            scarcity_optimizer=scarcity_optimizer,
+            inputs=inputs,
+            targets=targets,
+            step=step,
+            total_steps=total_steps,
+            tau=tau,
+            strength=strength,
+            w_max=w_max,
+            alpha_max=alpha_max,
+            memory_write_tokens=int(memory_write_tokens),
+            update_model_memory_after=False,
+        )
+
+    full_ids = _crct_full_input_ids(inputs, targets).contiguous()
+    gathered: list[torch.Tensor] | None = None
+    if rank_ == memory_rank:
+        gathered = [torch.empty_like(full_ids) for _ in range(world_size_)]
+    dist.gather(full_ids, gather_list=gathered, dst=memory_rank, group=all_group)
+
+    n_train = world_size_ - 1
+    bsz, seq_plus_one = int(full_ids.shape[0]), int(full_ids.shape[1])
+    seq = seq_plus_one - 1
+    payload_shape = (n_train, bsz, seq)
+    if rank_ == memory_rank:
+        assert gathered is not None
+        train_full_ids = torch.cat(gathered[:n_train], dim=0)
+        train_inputs = train_full_ids[:, :-1].to(dtype=inputs.dtype)
+        train_targets = train_full_ids[:, 1:].to(dtype=targets.dtype)
+        scored = _crct_score_payload_inline(
+            model=model,
+            cache=cache,
+            scarcity_optimizer=scarcity_optimizer,
+            inputs=train_inputs,
+            targets=train_targets,
+            step=step,
+            total_steps=total_steps,
+            tau=tau,
+            strength=strength,
+            w_max=w_max,
+            alpha_max=alpha_max,
+            memory_write_tokens=int(memory_write_tokens),
+            update_model_memory_after=True,
+        )
+        target_all = scored["target"].reshape(payload_shape).contiguous()
+        conf_all = scored["confidence"].reshape(payload_shape).contiguous()
+        weight_all = scored["loss_weight"].reshape(payload_shape).contiguous()
+        utility_all = scored["utility"].reshape(payload_shape).contiguous()
+    else:
+        target_all = torch.empty(payload_shape, device=inputs.device, dtype=torch.float32)
+        conf_all = torch.empty_like(target_all)
+        weight_all = torch.empty_like(target_all)
+        utility_all = torch.empty_like(target_all)
+
+    for tensor in (target_all, conf_all, weight_all, utility_all):
+        dist.broadcast(tensor, src=memory_rank, group=all_group)
+
+    if rank_ == memory_rank:
+        return None
+    return {
+        "step_id": torch.tensor(int(step), device=inputs.device),
+        "target": target_all[rank_].detach(),
+        "confidence": conf_all[rank_].detach(),
+        "loss_weight": weight_all[rank_].detach(),
+        "utility": utility_all[rank_].detach(),
+    }
 
 
 class LossTriggeredReplayDecision:
@@ -4546,8 +4800,13 @@ def _run_train_step(
     episodic_controller_topk_k: int = 16,
     current_step: int = 0,
     embedding_version: int = 0,
+    crct_enabled: bool = False,
+    crct_payload: dict[str, torch.Tensor] | None = None,
+    crct_lambda_controller: float = 0.01,
+    crct_update_memory: bool = True,
+    crct_memory_write_tokens_per_step: int = 256,
 ) -> torch.Tensor:
-    _reject_unsupported(model)
+    _reject_unsupported_fast_step(model, crct_enabled=bool(crct_enabled))
     # ------------------------------------------------------------------
     # Episodic rank: skip main, optionally replay, then all-reduce. WRITE_EVENT
     # ingestion happens on the background drain thread, not in this step body.
@@ -4618,9 +4877,34 @@ def _run_train_step(
     # discards per-token CE) so the cost of the ``_with_ce`` variant is
     # not paid by ``episodic_enabled=False`` runs.
     per_token_ce_for_episodic: torch.Tensor | None = None
+    crct_controller_logits: torch.Tensor | None = None
     with autocast_context(precision, device_type=inputs.device.type):
         if compile_full_path:
+            if crct_enabled:
+                raise ValueError(
+                    "crct_enabled=True is incompatible with compile_full_path=True "
+                    "because CRCT needs controller logits and memory-mode metadata "
+                    "from model.encode()."
+                )
             hidden = _compiled_step_fn()(model, inputs)
+        elif crct_enabled:
+            enc = model.encode(
+                inputs,
+                memory_mode="controller",
+                return_controller_logits=True,
+                return_memory_meta=True,
+            )
+            if not isinstance(enc, dict) or "hidden" not in enc:
+                raise ValueError(
+                    "crct_enabled=True requires model.encode(..., "
+                    "return_controller_logits=True) to return a dict"
+                )
+            hidden = enc["hidden"]
+            crct_controller_logits = enc.get("controller_logits")
+            if crct_controller_logits is None:
+                raise ValueError(
+                    "crct_enabled=True requires enable_controller=True on the model"
+                )
         else:
             hidden = model.encode(inputs)
         if (
@@ -4635,7 +4919,63 @@ def _run_train_step(
             )
             if aux is not None:
                 (float(predictive_aux_weight) * aux).backward(retain_graph=True)
-        if lm_head_backward_mode == "single":
+        crct_token_weight = (
+            crct_payload["loss_weight"].to(device=hidden.device, dtype=torch.float32)
+            if crct_enabled and crct_payload is not None
+            else None
+        )
+        if crct_enabled:
+            if crct_controller_logits is None:
+                raise ValueError("CRCT controller logits were not materialized")
+            mode = str(lm_head_backward_mode).strip().lower()
+            if mode in _FUSED_LM_HEAD_MODES:
+                backend_name = fused_lm_head_backend_for_mode(mode)
+                if crct_token_weight is None:
+                    loss, per_token_ce_for_episodic = fused_lm_head_loss_with_ce(
+                        hidden=hidden,
+                        final_norm=model.final_norm,
+                        lm_head=model.lm_head,
+                        targets=targets,
+                        backend=backend_name,
+                        tile_size=int(lm_head_tile_size),
+                    )
+                else:
+                    loss, per_token_ce_for_episodic = fused_lm_head_weighted_loss_with_ce(
+                        hidden=hidden,
+                        final_norm=model.final_norm,
+                        lm_head=model.lm_head,
+                        targets=targets,
+                        token_weight=crct_token_weight,
+                        backend=backend_name,
+                        tile_size=int(lm_head_tile_size),
+                    )
+            else:
+                logits = model.lm_head(model.final_norm(hidden))
+                vocab = logits.size(-1)
+                ce = F.cross_entropy(
+                    logits.reshape(-1, vocab).float(),
+                    targets.reshape(-1),
+                    reduction="none",
+                ).reshape_as(targets)
+                per_token_ce_for_episodic = ce.detach()
+                if crct_token_weight is None:
+                    loss = ce.mean()
+                else:
+                    loss = (
+                        ce * crct_token_weight.reshape_as(ce)
+                    ).sum() / crct_token_weight.sum().clamp_min(1.0)
+            total_loss = loss
+            if crct_payload is None:
+                total_loss = total_loss + 0.0 * crct_controller_logits.sum()
+            else:
+                total_loss = total_loss + float(crct_lambda_controller) * (
+                    _crct_payload_controller_loss(
+                        crct_payload,
+                        crct_controller_logits,
+                    )
+                )
+            total_loss.backward()
+        elif lm_head_backward_mode == "single":
             loss = full_lm_head_backward(
                 hidden=hidden,
                 final_norm=model.final_norm,
@@ -4688,6 +5028,17 @@ def _run_train_step(
                 "'fused_streaming_cached', or 'fused_norm_streaming_v2', "
                 f"got {lm_head_backward_mode!r}"
             )
+    if crct_enabled and crct_update_memory:
+        _crct_append_memory_from_hidden(
+            model,
+            hidden,
+            score=(
+                crct_payload.get("utility")
+                if crct_payload is not None and "utility" in crct_payload
+                else None
+            ),
+            max_tokens=int(crct_memory_write_tokens_per_step),
+        )
     if spectral_reg_lambda_dead > 0.0 or spectral_reg_lambda_sticky > 0.0:
         spectral_extra = spectral_regularization_loss(
             model,
@@ -5357,6 +5708,18 @@ def train_fast_for_budget(
     episodic_controller_action_learning_rate: float = 0.0,
     episodic_controller_action_reward_clip: float = 5.0,
     episodic_replay_max_replays_per_step: int = 0,
+    crct_enabled: bool = False,
+    crct_lambda_controller: float = 0.01,
+    crct_lm_weight_alpha_max: float = 0.15,
+    crct_lm_weight_strength: float = 0.10,
+    crct_lm_weight_w_max: float = 1.20,
+    crct_lm_weight_tau: float = 0.10,
+    crct_target_read_rate: float = 0.25,
+    crct_target_write_rate: float = 0.10,
+    crct_dual_lr: float = 0.01,
+    crct_ema_beta: float = 0.95,
+    crct_max_price: float = 0.50,
+    crct_memory_write_tokens_per_step: int = 256,
 ) -> dict[str, Any]:
     rank_ = int(rank)
     world_size_ = int(world_size)
@@ -5393,6 +5756,30 @@ def train_fast_for_budget(
             "Phase 1 episodic runs; the proper fix (re-shard over N-1) is "
             "tracked as a Phase 3 prerequisite."
         )
+    if crct_enabled and str(train_sampling_mode).strip().lower() in {
+        "sequential_epoch",
+        "shuffled_epoch",
+    }:
+        raise ValueError(
+            "crct_enabled=True is incompatible with "
+            f"train_sampling_mode={train_sampling_mode!r} in the current "
+            "3+1 topology: the final rank is a memory coprocessor and would "
+            "drop its shard of the epoch. Set train_sampling_mode='random' "
+            "for CRCT runs until the start sampler shards over train ranks "
+            "only."
+        )
+    grad_allreduce_mode_ = str(grad_allreduce_mode).strip().lower()
+    if grad_allreduce_mode_ not in {"bulk", "async_param"}:
+        raise ValueError(
+            "grad_allreduce_mode must be 'bulk' or 'async_param', "
+            f"got {grad_allreduce_mode!r}"
+        )
+    if crct_enabled and world_size_ >= 4 and grad_allreduce_mode_ != "bulk":
+        raise ValueError(
+            "crct_enabled=True with world_size>=4 requires "
+            "grad_allreduce_mode='bulk'; the memory rank and train ranks "
+            "must enter the same 3+1 SUM all-reduce path."
+        )
     if episodic_enabled and (
         float(dreamworld_weight) > 0.0 or int(dreamworld_cache_interval) > 0
     ):
@@ -5421,17 +5808,17 @@ def train_fast_for_budget(
     # the same single collective with no API change at the call sites.
     is_episodic_rank = False
     all_group = None
-    if episodic_enabled:
+    if episodic_enabled or (crct_enabled and world_size_ >= 4):
         if not ddp_active:
             raise ValueError(
-                "episodic_enabled=True requires world_size > 1 (need at "
-                "least 1 train rank + 1 episodic rank); got "
+                "3+1 memory topology requires world_size > 1 (need at "
+                "least 1 train rank + 1 memory rank); got "
                 f"world_size={world_size_}"
             )
         if world_size_ < 2:
             raise ValueError(
-                "episodic_enabled=True requires world_size >= 2 "
-                f"(1 train + 1 episodic), got world_size={world_size_}"
+                "3+1 memory topology requires world_size >= 2 "
+                f"(1 train + 1 memory rank), got world_size={world_size_}"
             )
         is_episodic_rank = (rank_ == world_size_ - 1)
         # ``all_group`` is the all-rank process group as an explicit
@@ -5442,13 +5829,27 @@ def train_fast_for_budget(
         # subgroup. Here all_group is the world group, so all ranks
         # participate.
         all_group = dist.new_group(list(range(world_size_)))
-    grad_allreduce_mode_ = str(grad_allreduce_mode).strip().lower()
-    if grad_allreduce_mode_ not in {"bulk", "async_param"}:
-        raise ValueError(
-            "grad_allreduce_mode must be 'bulk' or 'async_param', "
-            f"got {grad_allreduce_mode!r}"
-        )
     scopt_active = isinstance(optimizer, ScarcityAwareOptimizer)
+    if crct_enabled and scopt_active:
+        raise ValueError(
+            "crct_enabled=True is incompatible with ScOpt in this runner: "
+            "both mechanisms own per-token LM loss reweighting."
+        )
+    if crct_enabled and getattr(model, "memory_controller", None) is None:
+        raise ValueError(
+            "crct_enabled=True requires the model to be built with "
+            "enable_controller=True."
+        )
+    if crct_enabled and getattr(model, "outer_model", None) is None:
+        raise ValueError(
+            "crct_enabled=True requires an outer memory module. The Exp24 "
+            "fast constructor should set outer_model_dim > 0 for CRCT cells."
+        )
+    if crct_enabled and str(getattr(model, "buffer_mode", "")) != "append_only":
+        raise ValueError(
+            "crct_enabled=True requires buffer_mode='append_only' so train "
+            "and teacher paths can populate the same memory substrate."
+        )
     if scopt_active and grad_allreduce_mode_ != "bulk":
         raise ValueError("ScOpt currently requires grad_allreduce_mode='bulk'")
     if episodic_enabled and grad_allreduce_mode_ != "bulk":
@@ -5776,6 +6177,8 @@ def train_fast_for_budget(
         )
         if sampling_mode != "random":
             graph_rejections.append("train_sampling_mode_not_supported")
+        if crct_enabled:
+            graph_rejections.append("crct_not_supported")
         if graph_rejections:
             graph_summary = _rejected_cuda_graph_summary(
                 mode=graph_mode,
@@ -5908,6 +6311,24 @@ def train_fast_for_budget(
             num_buckets=int(scopt_baseline_buckets),
             decay=float(scopt_baseline_decay),
             device=device,
+        )
+    crct_cache: TransactionalWakeCache | None = None
+    crct_scarcity: CrctScarcityAwareMemoryOptimizer | None = None
+    crct_teacher_requests = 0
+    crct_teacher_payloads = 0
+    crct_teacher_fail_open = 0
+    if crct_enabled:
+        crct_cache = TransactionalWakeCache(
+            max_moments=0,
+            max_hidden_buffer=0,
+        )
+        crct_scarcity = CrctScarcityAwareMemoryOptimizer(
+            tau=float(crct_lm_weight_tau),
+            target_read_rate=float(crct_target_read_rate),
+            target_write_rate=float(crct_target_write_rate),
+            dual_lr=float(crct_dual_lr),
+            ema_beta=float(crct_ema_beta),
+            max_price=float(crct_max_price),
         )
 
     prefetcher = None
@@ -6138,6 +6559,32 @@ def train_fast_for_budget(
                     replay_tokens=entry.replay_tokens,
                 )
 
+            crct_payload: dict[str, torch.Tensor] | None = None
+            if crct_enabled:
+                assert crct_cache is not None
+                crct_teacher_requests += 1
+                crct_payload = _collect_crct_teacher_payload(
+                    model=model,
+                    cache=crct_cache,
+                    scarcity_optimizer=crct_scarcity,
+                    inputs=inputs,
+                    targets=targets,
+                    rank=rank_,
+                    world_size=world_size_,
+                    all_group=all_group,
+                    step=steps,
+                    total_steps=max_steps,
+                    tau=float(crct_lm_weight_tau),
+                    strength=float(crct_lm_weight_strength),
+                    w_max=float(crct_lm_weight_w_max),
+                    alpha_max=float(crct_lm_weight_alpha_max),
+                    memory_write_tokens=int(crct_memory_write_tokens_per_step),
+                )
+                if crct_payload is None:
+                    crct_teacher_fail_open += 1
+                else:
+                    crct_teacher_payloads += 1
+
             optimizer.zero_grad(set_to_none=True)
             if predictive_aux_optimizer is not None:
                 predictive_aux_optimizer.zero_grad(set_to_none=True)
@@ -6233,6 +6680,13 @@ def train_fast_for_budget(
                     episodic_controller_topk_k=int(episodic_controller_topk_k),
                     current_step=steps,
                     embedding_version=0,
+                    crct_enabled=bool(crct_enabled),
+                    crct_payload=crct_payload,
+                    crct_lambda_controller=float(crct_lambda_controller),
+                    crct_update_memory=bool(crct_payload is not None),
+                    crct_memory_write_tokens_per_step=int(
+                        crct_memory_write_tokens_per_step
+                    ),
                     dreamworld_entry=dream_entry,
                     dreamworld_weight=(
                         float(event_sleep_weight)
@@ -6530,7 +6984,8 @@ def train_fast_for_budget(
         batch_size=batch_size,
         seq_len=seq_len,
         world_size=world_size_,
-        episodic_enabled=episodic_enabled,
+        episodic_enabled=bool(episodic_enabled)
+        or (bool(crct_enabled) and world_size_ >= 4),
     )
     result = {
         "steps": steps,
@@ -6686,6 +7141,31 @@ def train_fast_for_budget(
                     getattr(episodic_consumer, "write_ring_drain_errors", 0)
                 ),
                 "artifact_impact": "artifact_training_only",
+            },
+            "crct": {
+                "enabled": bool(crct_enabled),
+                "lambda_controller": float(crct_lambda_controller),
+                "lm_weight_alpha_max": float(crct_lm_weight_alpha_max),
+                "lm_weight_strength": float(crct_lm_weight_strength),
+                "lm_weight_w_max": float(crct_lm_weight_w_max),
+                "lm_weight_tau": float(crct_lm_weight_tau),
+                "teacher_requests": int(crct_teacher_requests),
+                "teacher_payloads": int(crct_teacher_payloads),
+                "teacher_fail_open": int(crct_teacher_fail_open),
+                "read_price": (
+                    float(crct_scarcity.read_price)
+                    if crct_scarcity is not None
+                    else 0.0
+                ),
+                "read_rate_ema": (
+                    float(crct_scarcity.read_rate_ema)
+                    if crct_scarcity is not None
+                    else 0.0
+                ),
+                "memory_write_tokens_per_step": int(
+                    crct_memory_write_tokens_per_step
+                ),
+                "artifact_impact": "artifact_changes_weights_only",
             },
         },
         **timing,
@@ -6848,6 +7328,22 @@ def _warmup(
         ),
         scopt_pressure_upper_floor=float(
             config.get("scopt_pressure_upper_floor", 1.0)
+        ),
+        crct_enabled=bool(config.get("crct_enabled", False)),
+        crct_lambda_controller=float(config.get("crct_lambda_controller", 0.01)),
+        crct_lm_weight_alpha_max=float(
+            config.get("crct_lm_weight_alpha_max", 0.15)
+        ),
+        crct_lm_weight_strength=float(config.get("crct_lm_weight_strength", 0.10)),
+        crct_lm_weight_w_max=float(config.get("crct_lm_weight_w_max", 1.20)),
+        crct_lm_weight_tau=float(config.get("crct_lm_weight_tau", 0.10)),
+        crct_target_read_rate=float(config.get("crct_target_read_rate", 0.25)),
+        crct_target_write_rate=float(config.get("crct_target_write_rate", 0.10)),
+        crct_dual_lr=float(config.get("crct_dual_lr", 0.01)),
+        crct_ema_beta=float(config.get("crct_ema_beta", 0.95)),
+        crct_max_price=float(config.get("crct_max_price", 0.50)),
+        crct_memory_write_tokens_per_step=int(
+            config.get("crct_memory_write_tokens_per_step", 256)
         ),
     )
 
@@ -7278,6 +7774,22 @@ def run_condition(
         ),
         episodic_replay_max_replays_per_step=int(
             config.get("episodic_replay_max_replays_per_step", 0)
+        ),
+        crct_enabled=bool(config.get("crct_enabled", False)),
+        crct_lambda_controller=float(config.get("crct_lambda_controller", 0.01)),
+        crct_lm_weight_alpha_max=float(
+            config.get("crct_lm_weight_alpha_max", 0.15)
+        ),
+        crct_lm_weight_strength=float(config.get("crct_lm_weight_strength", 0.10)),
+        crct_lm_weight_w_max=float(config.get("crct_lm_weight_w_max", 1.20)),
+        crct_lm_weight_tau=float(config.get("crct_lm_weight_tau", 0.10)),
+        crct_target_read_rate=float(config.get("crct_target_read_rate", 0.25)),
+        crct_target_write_rate=float(config.get("crct_target_write_rate", 0.10)),
+        crct_dual_lr=float(config.get("crct_dual_lr", 0.01)),
+        crct_ema_beta=float(config.get("crct_ema_beta", 0.95)),
+        crct_max_price=float(config.get("crct_max_price", 0.50)),
+        crct_memory_write_tokens_per_step=int(
+            config.get("crct_memory_write_tokens_per_step", 256)
         ),
     )
     episodic_cache_payload = train_result.pop("_episodic_cache_payload", None)

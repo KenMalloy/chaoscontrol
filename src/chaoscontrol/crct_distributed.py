@@ -126,9 +126,14 @@ class WeightMailbox:  # noqa: D101 — fleshed out in Task 3
 class TeacherPayload:
     step_id: int
     target: torch.Tensor
-    conf: torch.Tensor
-    loss_weight: float
+    confidence: torch.Tensor
+    loss_weight: torch.Tensor
     snapshot_version: int = 0
+
+    @property
+    def conf(self) -> torch.Tensor:
+        """Compatibility alias for the earliest CRCT handoff wording."""
+        return self.confidence
 
 
 class TeacherResultMailbox:
@@ -154,9 +159,10 @@ class TeacherResultMailbox:
         self.payload_shape = tuple(payload_shape)
         self.dtype = dtype
         self._target_buf = torch.zeros(self.payload_shape, dtype=dtype)
-        self._conf_buf = torch.zeros(self.payload_shape[:2], dtype=dtype)
-        self._meta_buf = torch.zeros(3, dtype=torch.float32)
-        self._inflight: tuple[Any, TeacherPayload | None] | None = None
+        self._conf_buf = torch.zeros(self.payload_shape, dtype=dtype)
+        self._loss_weight_buf = torch.ones(self.payload_shape, dtype=dtype)
+        self._meta_buf = torch.zeros(2, dtype=torch.float32)
+        self._inflight: tuple[list[Any], TeacherPayload | None] | None = None
         self.posts_attempted = 0
         self.posts_dropped = 0
         if crct_pg is None:
@@ -168,68 +174,92 @@ class TeacherResultMailbox:
             self._inline_score = None
             self._broadcast = broadcast_fn or _dist.broadcast
 
+    @staticmethod
+    def _all_completed(works: list[Any]) -> bool:
+        return all(work.is_completed() for work in works)
+
+    def _broadcast_payload_buffers(self) -> list[Any]:
+        assert self._broadcast is not None
+        return [
+            self._broadcast(
+                self._target_buf,
+                src=3,
+                group=self.crct_pg,
+                async_op=True,
+            ),
+            self._broadcast(
+                self._conf_buf,
+                src=3,
+                group=self.crct_pg,
+                async_op=True,
+            ),
+            self._broadcast(
+                self._loss_weight_buf,
+                src=3,
+                group=self.crct_pg,
+                async_op=True,
+            ),
+            self._broadcast(
+                self._meta_buf,
+                src=3,
+                group=self.crct_pg,
+                async_op=True,
+            ),
+        ]
+
     def post_result(
         self,
         *,
         step_id: int,
         target: torch.Tensor | None,
         conf: torch.Tensor | None,
-        loss_weight: float,
+        loss_weight: torch.Tensor | float,
         snapshot_version: int = 0,
     ) -> None:
         self.posts_attempted += 1
         if self.crct_pg is None:
             return
-        if self._inflight is not None and not self._inflight[0].is_completed():
+        if self._inflight is not None and not self._all_completed(self._inflight[0]):
             self.posts_dropped += 1
             return
         if target is not None:
             self._target_buf.copy_(target.to(dtype=self.dtype))
         if conf is not None:
             self._conf_buf.copy_(conf.to(dtype=self.dtype))
-        self._meta_buf[0] = float(loss_weight)
-        self._meta_buf[1] = float(step_id)
-        self._meta_buf[2] = float(snapshot_version)
-        assert self._broadcast is not None
-        work = self._broadcast(
-            self._target_buf,
-            src=3,
-            group=self.crct_pg,
-            async_op=True,
-        )
+        if torch.is_tensor(loss_weight):
+            self._loss_weight_buf.copy_(loss_weight.to(dtype=self.dtype))
+        else:
+            self._loss_weight_buf.fill_(float(loss_weight))
+        self._meta_buf[0] = float(step_id)
+        self._meta_buf[1] = float(snapshot_version)
+        works = self._broadcast_payload_buffers()
         payload = TeacherPayload(
             step_id=int(step_id),
             target=self._target_buf,
-            conf=self._conf_buf,
-            loss_weight=float(loss_weight),
+            confidence=self._conf_buf,
+            loss_weight=self._loss_weight_buf,
             snapshot_version=int(snapshot_version),
         )
-        self._inflight = (work, payload)
+        self._inflight = (works, payload)
 
     def try_get(self, step: int) -> TeacherPayload | None:
         del step
         if self.my_rank == 3 or self.crct_pg is None:
             return None
         if self._inflight is None:
-            assert self._broadcast is not None
-            work = self._broadcast(
-                self._target_buf,
-                src=3,
-                group=self.crct_pg,
-                async_op=True,
-            )
-            self._inflight = (work, None)
+            works = self._broadcast_payload_buffers()
+            self._inflight = (works, None)
             return None
-        work, payload = self._inflight
-        if not work.is_completed():
+        works, payload = self._inflight
+        if not self._all_completed(works):
             return None
         if payload is None:
             payload = TeacherPayload(
-                step_id=int(self._meta_buf[1].item()),
+                step_id=int(self._meta_buf[0].item()),
                 target=self._target_buf.clone(),
-                conf=self._conf_buf.clone(),
-                loss_weight=float(self._meta_buf[0].item()),
-                snapshot_version=int(self._meta_buf[2].item()),
+                confidence=self._conf_buf.clone(),
+                loss_weight=self._loss_weight_buf.clone(),
+                snapshot_version=int(self._meta_buf[1].item()),
             )
         self._inflight = None
         return payload
@@ -319,8 +349,11 @@ class Rank3MemoryCoprocessor:
                 self._pending_payload = TeacherPayload(
                     step_id=int(result.get("step_id", global_step)),
                     target=result["target"],
-                    conf=result["conf"],
-                    loss_weight=float(result.get("loss_weight", 1.0)),
+                    confidence=result.get("confidence", result.get("conf")),
+                    loss_weight=result.get(
+                        "loss_weight",
+                        torch.ones_like(result["target"]),
+                    ),
                     snapshot_version=int(result.get("snapshot_version", 0)),
                 )
                 self._inflight_score = _CompletedWork(True)

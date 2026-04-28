@@ -304,6 +304,8 @@ def rank3_score_batch_causal(
     tau: float = 0.10,
     strength: float = 0.10,
     w_max: float = 1.15,
+    update_model_memory_after: bool = False,
+    memory_write_tokens: int | None = None,
 ) -> dict[str, torch.Tensor]:
     """Score a batch by comparing memory-on vs memory-off NLL.
 
@@ -359,6 +361,27 @@ def rank3_score_batch_causal(
     loss_weight = positive_only_lm_weight(
         utility, mask, tau=tau, strength=strength, w_max=w_max
     )
+
+    if update_model_memory_after:
+        append_fn = getattr(model, "append_memory_from_hidden", None)
+        if append_fn is None:
+            raise ValueError(
+                "rank3_score_batch_causal(update_model_memory_after=True) "
+                "requires model.append_memory_from_hidden(...)"
+            )
+        wrote = bool(
+            append_fn(
+                h_off.detach(),
+                score=utility.detach(),
+                max_tokens=memory_write_tokens,
+            )
+        )
+        if not wrote:
+            raise ValueError(
+                "rank3_score_batch_causal(update_model_memory_after=True) "
+                "requires append-only multislot memory; the teacher would "
+                "otherwise keep comparing against an empty memory path."
+            )
 
     cache.commit(txn)
     return {

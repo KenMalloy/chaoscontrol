@@ -1700,6 +1700,59 @@ def test_run_exp24_cli_episodic_controller_v1_dry_run(tmp_path):
     assert '"exp24_mechanism": "episodic_controller_v1"' in stdout
 
 
+def test_crct_v1_matrix_threads_memory_controller_and_random_sampling():
+    mod = _load_exp24()
+    entries = mod.build_crct_v1_matrix(
+        speed_config={"batch_size": 1024, "chunk_size": 64},
+        world_size=4,
+        budget_seconds=600.0,
+    )
+    assert len(entries) == 6
+    by_arm = {}
+    for entry in entries:
+        by_arm.setdefault(entry["arm"], []).append(entry)
+    assert set(by_arm) == {
+        "arm_a_fastslow_control",
+        "arm_b_crct_controller",
+    }
+
+    control = by_arm["arm_a_fastslow_control"][0]
+    treatment = by_arm["arm_b_crct_controller"][0]
+    assert not control.get("crct_enabled", False)
+    assert control["train_sampling_mode"] == "random"
+    assert treatment["crct_enabled"] is True
+    assert treatment["train_sampling_mode"] == "random"
+    assert treatment["outer_model_type"] == "multislot"
+    assert treatment["buffer_mode"] == "append_only"
+    assert treatment["enable_controller"] is True
+    assert treatment["crct_lm_weight_w_max"] == 1.20
+
+
+def test_run_exp24_cli_crct_v1_dry_run(tmp_path):
+    script = REPO / "experiments" / "24_training_time_bundle" / "run_exp24.py"
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(script),
+            "--matrix",
+            "crct_v1",
+            "--dry-run",
+            "--limit",
+            "4",
+            "--output-dir",
+            str(tmp_path),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    stdout = result.stdout
+    assert "matrix=crct_v1" in stdout
+    assert "exp24_phase3_crct_v1_arm_a_fastslow_control_s1337" in stdout
+    assert "exp24_phase3_crct_v1_arm_b_crct_controller_s1337" in stdout
+    assert '"exp24_mechanism": "crct_v1"' in stdout
+
+
 def _good_smoke_result(*, with_simplex_trace: Path | None = None) -> dict:
     """Synthesise a result JSON that the smoke checker should accept."""
     return {

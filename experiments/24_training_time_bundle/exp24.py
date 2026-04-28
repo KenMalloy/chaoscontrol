@@ -931,6 +931,10 @@ EPISODIC_CONTROLLER_V1_WEIGHTS_PATH = (
     "TO_BE_FILLED/episodic_controller_v1_weights.pt"
 )
 EPISODIC_CONTROLLER_V1_WEIGHTS_PATH_ENV = "EPISODIC_CONTROLLER_V1_WEIGHTS_PATH"
+CRCT_V1_ARMS: tuple[str, ...] = (
+    "arm_a_fastslow_control",
+    "arm_b_crct_controller",
+)
 
 EPISODIC_CONTROLLER_V1_TRACE_DIR = (
     "experiments/24_training_time_bundle/results/traces"
@@ -1367,6 +1371,101 @@ def build_episodic_ttt_v1_matrix(
                     phase="phase3",
                     mechanism="episodic_ttt_v1",
                     arm=f"episodic_ttt_v1_{arm_name}",
+                    seed=int(seed),
+                )
+            )
+    return entries
+
+
+def build_crct_v1_matrix(
+    *,
+    speed_config: dict[str, Any],
+    world_size: int = 4,
+    budget_seconds: float = 600.0,
+    seed_values: Sequence[int] = DEFAULT_CONTROL_SEEDS,
+    arms: Sequence[str] | None = None,
+) -> list[dict[str, Any]]:
+    """CRCT v1 headline matrix.
+
+    Holds the fast/slow trunk fixed and adds Cache-Reweighted Continuation
+    Training: controller-gated append-only memory, rank-3 teacher utility,
+    confidence-weighted controller BCE, and positive-only LM reweighting.
+    The matrix forces random sampling on every arm because CRCT's final rank
+    is a memory coprocessor in 3+1 mode; sequential epoch sharding would either
+    silently drop that shard or create a sampler confound against the control.
+    """
+    fast_slow_lock = {
+        "fast_slow_enabled": True,
+        "fast_slow_interval": 64,
+        "fast_slow_alpha": 0.25,
+        "fast_slow_eval_copy": "slow",
+        "dreamworld_enabled": False,
+        "dreamworld_cache_interval": 0,
+        "dreamworld_interval": 0,
+        "dreamworld_weight": 0.0,
+        "dreamworld_replay_batch_size": 0,
+        "train_sampling_mode": "random",
+    }
+    crct_lock = {
+        "crct_enabled": True,
+        "crct_lambda_controller": 0.01,
+        "crct_lm_weight_alpha_max": 0.15,
+        "crct_lm_weight_strength": 0.10,
+        "crct_lm_weight_w_max": 1.20,
+        "crct_lm_weight_tau": 0.10,
+        "crct_target_read_rate": 0.25,
+        "crct_target_write_rate": 0.10,
+        "crct_dual_lr": 0.01,
+        "crct_ema_beta": 0.95,
+        "crct_max_price": 0.50,
+        "crct_memory_write_tokens_per_step": 256,
+        "outer_model_dim": 64,
+        "outer_model_type": "multislot",
+        "outer_max_slots": 4096,
+        "outer_compress_ratio": 2,
+        "buffer_mode": "append_only",
+        "retrieval_mode": "softmax_all",
+        "retrieval_k": 16,
+        "enable_controller": True,
+        "controller_hidden_dim": 64,
+        "train_sampling_mode": "random",
+        "compile_full_path": False,
+        "cuda_graph_mode": "none",
+    }
+    arm_specs: list[tuple[str, dict[str, Any]]] = [
+        ("arm_a_fastslow_control", {}),
+        ("arm_b_crct_controller", crct_lock),
+    ]
+    if arms is not None:
+        allowed = set(arms)
+        unknown = allowed - set(CRCT_V1_ARMS)
+        if unknown:
+            raise ValueError(
+                f"unknown arm(s) {sorted(unknown)}; allowed: {CRCT_V1_ARMS}"
+            )
+        arm_specs = [(name, overrides) for name, overrides in arm_specs if name in allowed]
+    entries: list[dict[str, Any]] = []
+    for arm_name, arm_overrides in arm_specs:
+        arm = {
+            "arm": arm_name,
+            "exp24_mechanism": "crct_v1",
+            "artifact_impact": ARTIFACT_CHANGES_WEIGHTS_ONLY,
+            **fast_slow_lock,
+            **arm_overrides,
+        }
+        for seed in seed_values:
+            entry = _base_entry(
+                speed_config=speed_config,
+                world_size=world_size,
+                budget_seconds=budget_seconds,
+            )
+            entry.update(arm)
+            entries.append(
+                _named_entry(
+                    base=entry,
+                    phase="phase3",
+                    mechanism="crct_v1",
+                    arm=f"crct_v1_{arm_name}",
                     seed=int(seed),
                 )
             )

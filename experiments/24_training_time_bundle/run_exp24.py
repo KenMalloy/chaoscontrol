@@ -25,6 +25,7 @@ sys.path.insert(0, str(REPO / "src"))
 
 from exp24 import (  # noqa: E402
     DEFAULT_CONTROL_SEEDS,
+    build_crct_v1_matrix,
     build_criticality_distillation_first_smoke_matrix,
     build_criticality_distillation_multiseed_matrix,
     build_episodic_controller_v1_matrix,
@@ -451,6 +452,13 @@ def _build_entries(
             budget_seconds=budget_seconds,
             seed_values=seeds,
         )
+    if matrix == "crct_v1":
+        return build_crct_v1_matrix(
+            speed_config=speed_config,
+            world_size=world_size,
+            budget_seconds=budget_seconds,
+            seed_values=seeds,
+        )
     if matrix == "all":
         entries: list[dict[str, Any]] = []
         entries.extend(
@@ -505,6 +513,7 @@ def _default_world_size_for_matrix(matrix: str) -> int:
         "episodic_dw_curation_v1",
         "episodic_ttt_v1",
         "episodic_controller_v1",
+        "crct_v1",
     }:
         return 4
     return 8
@@ -549,6 +558,7 @@ def main(argv: list[str] | None = None) -> int:
             "cd_first_smoke",
             "cd_multiseed",
             "episodic_controller_v1",
+            "crct_v1",
             "all",
         ],
         default="all",

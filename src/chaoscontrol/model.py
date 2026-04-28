@@ -1000,6 +1000,81 @@ class ChaosStudentLM(nn.Module):
     def artifact_bytes(self) -> int:
         return int(sum(p.numel() for p in self.parameters()) * 2)
 
+    @torch.no_grad()
+    def append_memory_from_hidden(
+        self,
+        hidden: torch.Tensor,
+        *,
+        bucket_ids: torch.Tensor | None = None,
+        score: torch.Tensor | None = None,
+        max_tokens: int | None = None,
+    ) -> bool:
+        """Append sequence hidden states into the append-only outer memory.
+
+        ``forward(memory_write_mode='append_only')`` already owns this write
+        shape, but the throughput runner deliberately calls ``encode()`` plus
+        a fused LM-head backward instead of materializing full logits through
+        ``forward()``. CRCT needs the same cache lifecycle on that fast path,
+        so this helper factors the write side out without changing the default
+        side-effect-free ``encode()`` contract.
+
+        Returns ``True`` when a write happened. A ``False`` return means the
+        model is not configured with a multislot append-only outer memory, so
+        callers can fail loudly instead of training against a zero-utility
+        teacher by accident.
+        """
+        if (
+            self.buffer_mode != "append_only"
+            or self.outer_model is None
+            or not isinstance(self.outer_model, MultiSlotOuterModel)
+        ):
+            return False
+        batch, seq, dim = hidden.shape
+        h_flat = hidden.detach().reshape(-1, dim)
+        max_tokens_i = 0 if max_tokens is None else int(max_tokens)
+        if max_tokens_i > 0 and h_flat.shape[0] > max_tokens_i:
+            if score is not None:
+                flat_score = score.detach().reshape(-1).to(
+                    device=hidden.device,
+                    dtype=torch.float32,
+                )
+                selected = torch.topk(
+                    flat_score,
+                    k=max_tokens_i,
+                    largest=True,
+                    sorted=False,
+                ).indices
+            else:
+                selected = torch.linspace(
+                    0,
+                    h_flat.shape[0] - 1,
+                    steps=max_tokens_i,
+                    device=hidden.device,
+                ).long()
+            h_flat = h_flat.index_select(0, selected)
+        else:
+            selected = None
+        encoded_flat = torch.tanh(
+            self.outer_model.encoder(
+                h_flat.to(dtype=self.outer_model.encoder.weight.dtype)
+            )
+        )
+        if bucket_ids is None:
+            bids_flat = torch.zeros(
+                h_flat.shape[0],
+                dtype=torch.long,
+                device=hidden.device,
+            )
+        else:
+            bids_flat = bucket_ids.detach().reshape(-1).to(
+                device=hidden.device,
+                dtype=torch.long,
+            )
+            if selected is not None:
+                bids_flat = bids_flat.index_select(0, selected)
+        self.outer_model.append_kv_batch(encoded_flat, bids_flat)
+        return True
+
     def encode(
         self,
         input_ids: torch.Tensor,
@@ -1158,6 +1233,17 @@ class ChaosStudentLM(nn.Module):
         if memory_mode != "off" and self.semantic_tier is not None:
             semantic_bias = self.semantic_tier.read(x.size(0))
             x = _add_memory_bias(x, semantic_bias.unsqueeze(1))
+
+        if (
+            memory_mode == "controller"
+            and self.memory_controller is not None
+            and controller_logits is None
+        ):
+            # Empty append-only memories produce no bias yet, but CRCT still
+            # needs a controller-logit graph so the first teacher payload can
+            # train the gate rather than failing open until the cache warms.
+            controller_logits = self.memory_controller(x)
+            memory_gate = gate_from_logits(controller_logits).to(dtype=x.dtype)
 
         # Virtual-layer loop — weight-tied depth recurrence when configured;
         # otherwise list(range(num_layers)). Matches forward() exactly.
@@ -1426,28 +1512,27 @@ class ChaosStudentLM(nn.Module):
             and self.outer_model is not None
             and isinstance(self.outer_model, MultiSlotOuterModel)
         ):
-            with torch.no_grad():
+            wrote = self.append_memory_from_hidden(hidden, bucket_ids=bucket_ids)
+            if (
+                wrote
+                and self.bucket_prototypes_module is not None
+                and bucket_ids is not None
+            ):
                 batch, seq, dim = hidden.shape
-                h_flat = hidden.detach().reshape(-1, dim)  # (batch*seq, dim)
+                h_flat = hidden.detach().reshape(-1, dim)
                 encoded_flat = torch.tanh(
-                    self.outer_model.encoder(h_flat.to(dtype=self.outer_model.encoder.weight.dtype))
-                )  # (batch*seq, outer_dim)
-
-                if bucket_ids is not None:
-                    bids_flat = bucket_ids.detach().reshape(-1)  # (batch*seq,)
-                else:
-                    bids_flat = torch.zeros(batch * seq, dtype=torch.long, device=hidden.device)
-
-                self.outer_model.append_kv_batch(encoded_flat, bids_flat)
-
+                    self.outer_model.encoder(
+                        h_flat.to(dtype=self.outer_model.encoder.weight.dtype)
+                    )
+                )
+                bids_flat = bucket_ids.detach().reshape(-1)
                 # Update bucket prototypes (encoded_flat is in outer_dim, which must
                 # match prototype_dim — both default to 64 but assert to catch misconfig)
-                if self.bucket_prototypes_module is not None and bucket_ids is not None:
-                    assert encoded_flat.shape[-1] == self.bucket_prototypes_module.prototype_dim, (
-                        f"outer_dim ({encoded_flat.shape[-1]}) != prototype_dim "
-                        f"({self.bucket_prototypes_module.prototype_dim})"
-                    )
-                    self.bucket_prototypes_module.update_batch(bids_flat, encoded_flat)
+                assert encoded_flat.shape[-1] == self.bucket_prototypes_module.prototype_dim, (
+                    f"outer_dim ({encoded_flat.shape[-1]}) != prototype_dim "
+                    f"({self.bucket_prototypes_module.prototype_dim})"
+                )
+                self.bucket_prototypes_module.update_batch(bids_flat, encoded_flat)
 
         out: dict[str, Any] = {"logits": logits, "hidden": hidden}
         # Every physical block gets visited by at least one virtual-layer
