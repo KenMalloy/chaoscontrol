@@ -225,12 +225,18 @@ def _resolve_diag_recurrence_impl():
             )
         return _diag_recurrence_impl
 
-    # Default: try torch.compile, fall back to Python
+    # Default: try torch.compile, fall back to Python.
+    # Why: catch only what torch.compile actually raises when unavailable
+    # (AttributeError on torch <2, ImportError for missing inductor deps,
+    # RuntimeError from Dynamo/Inductor stack mismatches). A bare ``except
+    # Exception`` previously swallowed Warning-derived classes upgraded by
+    # ``-W error``, silently routing the entire run through the slow Python
+    # loop while pretending the compile path was active.
     try:
         _diag_recurrence_impl = torch.compile(_diag_recurrence_inner, dynamic=False)
         _diag_recurrence_backend = "compile"
         _diag_recurrence_note = "torch.compile(dynamic=False)"
-    except Exception as exc:  # pragma: no cover - only triggers on mismatched stacks
+    except (AttributeError, ImportError, RuntimeError) as exc:  # pragma: no cover - only triggers on mismatched stacks
         _diag_recurrence_impl = _diag_recurrence_inner
         _diag_recurrence_backend = "python"
         _diag_recurrence_note = f"compile unavailable: {exc.__class__.__name__}: {exc}"
