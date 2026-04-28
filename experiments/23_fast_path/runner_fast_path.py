@@ -8323,14 +8323,47 @@ def train_fast_for_budget(
         else {"enabled": False}
     )
     crct_teacher_memory_slots = 0
+    crct_transport_summary: dict[str, Any] = {}
     if crct_rank_diagnostics:
         for diag in crct_rank_diagnostics:
+            if diag is None:
+                continue
+            transport = diag.get("transport")
+            if isinstance(transport, dict) and bool(
+                diag.get("teacher_transport_participant", False)
+            ):
+                if bool(diag.get("is_memory_rank", False)):
+                    role = "memory"
+                elif int(diag.get("rank", -1)) == 0:
+                    role = "coordinator"
+                else:
+                    role = f"rank_{int(diag.get('rank', -1))}"
+                crct_transport_summary[role] = transport
             if diag is not None and bool(diag.get("is_memory_rank", False)):
                 crct_gradient_conflict_summary = dict(
                     diag.get("gradient_conflict", crct_gradient_conflict_summary)
                 )
                 crct_teacher_memory_slots = int(diag.get("memory_slots", 0))
-                break
+        if "memory" in crct_transport_summary and "coordinator" in crct_transport_summary:
+            coord = crct_transport_summary["coordinator"]
+            mem = crct_transport_summary["memory"]
+            crct_transport_summary["health"] = {
+                "mode": str(coord.get("mode", mem.get("mode", ""))),
+                "coordinator_errors": int(coord.get("errors", 0)),
+                "memory_errors": int(mem.get("errors", 0)),
+                "payloads_used": int(coord.get("payloads_used", 0)),
+                "payloads_scored": int(mem.get("payloads_scored", 0)),
+                "payload_lag_steps_max": int(coord.get("payload_lag_steps_max", 0)),
+                "score_seconds_max": float(mem.get("score_seconds_max", 0.0)),
+                "mailbox_write_seconds_max": max(
+                    float(coord.get("mailbox_write_seconds_max", 0.0)),
+                    float(mem.get("mailbox_write_seconds_max", 0.0)),
+                ),
+                "mailbox_read_seconds_max": max(
+                    float(coord.get("mailbox_read_seconds_max", 0.0)),
+                    float(mem.get("mailbox_read_seconds_max", 0.0)),
+                ),
+            }
     timing = summarize_train_timing(
         steps=steps,
         elapsed_s=elapsed_s,
@@ -8558,6 +8591,7 @@ def train_fast_for_budget(
                 "teacher_requests": int(crct_teacher_requests),
                 "teacher_payloads": int(crct_teacher_payloads),
                 "teacher_fail_open": int(crct_teacher_fail_open),
+                "transport_summary": crct_transport_summary,
                 "rank_diagnostics": crct_rank_diagnostics,
                 "read_price": (
                     float(crct_scarcity.read_price)
