@@ -14,6 +14,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from .slot_table import SlotTable
+
 
 class OuterModel(nn.Module):
     """VRAM long-term memory with lossy encode/decode and surprise-driven consolidation.
@@ -247,27 +249,69 @@ class MultiSlotOuterModel(nn.Module):
 
         self.register_buffer("loss_ema", torch.tensor([2.0]))
 
-        # Slot storage (not parameters — runtime state, persisted via extra_state)
-        self._slots: list[torch.Tensor] = []        # each (1, outer_dim)
-        self._survival: list[float] = []             # per-slot survival score
-        self._slot_buckets: list[int] = []           # per-slot bucket type from Wernicke
-        self._slot_event_ids: list[int] = []         # MVCC visibility event id per slot
-        self._retrieval_weights: torch.Tensor | None = None  # cached from last read
-        self._retrieval_indices: list[int] | None = None      # slot indices for cached weights
-        self._compression_consequences: list[tuple[int, float]] = []  # (bucket_id, quality_delta)
-        self._latent_traces: list[dict] = []  # {bucket_id: int, centroid_contrib: Tensor}
+        # SlotTable: centralized slot storage with persistent identity
+        self.table = SlotTable()
+        self._retrieval_weights: torch.Tensor | None = None
+        self._retrieval_indices: list[int] | None = None
+        self._compression_consequences: list[tuple[int, float]] = []
+        self._latent_traces: list[dict] = []
 
-        # Bucket affinity matrix: learned cross-type merge compatibility.
-        # affinity[a, b] = how safe it is to merge slots from bucket a with bucket b.
-        # Starts as identity (same-bucket = 1.0, cross-bucket = 0.0).
-        # Updated during sleep: committed merges increase affinity, rejected decrease.
-        self._bucket_affinity: torch.Tensor | None = None  # (n_buckets, n_buckets), lazy init
+        self._bucket_affinity: torch.Tensor | None = None
+
+    # Backward-compat properties — delegate to SlotTable internals
+    @property
+    def _slots(self) -> list[torch.Tensor]:
+        return self.table._slots
+
+    @_slots.setter
+    def _slots(self, value: list[torch.Tensor]) -> None:
+        self.table._slots = list(value)
+        self._rebuild_table_identity()
+
+    @property
+    def _survival(self) -> list[float]:
+        return self.table._survival
+
+    @_survival.setter
+    def _survival(self, value: list[float]) -> None:
+        self.table._survival = list(value)
+
+    @property
+    def _slot_buckets(self) -> list[int]:
+        return self.table._slot_buckets
+
+    @_slot_buckets.setter
+    def _slot_buckets(self, value: list[int]) -> None:
+        self.table._slot_buckets = list(value)
+
+    @property
+    def _slot_event_ids(self) -> list[int]:
+        return self.table._slot_event_ids
+
+    @_slot_event_ids.setter
+    def _slot_event_ids(self, value: list[int]) -> None:
+        self.table._slot_event_ids = list(value)
+
+    def _rebuild_table_identity(self) -> None:
+        """Reset table identity mappings after bulk list replacement."""
+        t = self.table
+        n = len(t._slots)
+        t._id_to_physical.clear()
+        t._physical_to_id.clear()
+        t._records.clear()
+        t._next_id = n
+        t._priority = [1.0] * n
+        for i in range(n):
+            t._id_to_physical[i] = i
+            t._physical_to_id[i] = i
 
     def _ensure_slot_event_ids(self) -> None:
-        if len(self._slot_event_ids) < len(self._slots):
-            self._slot_event_ids.extend([0] * (len(self._slots) - len(self._slot_event_ids)))
-        elif len(self._slot_event_ids) > len(self._slots):
-            self._slot_event_ids = self._slot_event_ids[:len(self._slots)]
+        n_slots = len(self.table._slots)
+        n_eids = len(self.table._slot_event_ids)
+        if n_eids < n_slots:
+            self.table._slot_event_ids.extend([0] * (n_slots - n_eids))
+        elif n_eids > n_slots:
+            self.table._slot_event_ids[:] = self.table._slot_event_ids[:n_slots]
 
     def _visible_slot_indices(
         self,
@@ -275,16 +319,7 @@ class MultiSlotOuterModel(nn.Module):
         read_cutoff: int | None = None,
         bucket_id: int | None = None,
     ) -> list[int]:
-        self._ensure_slot_event_ids()
-        cutoff = None if read_cutoff is None else int(read_cutoff)
-        indices: list[int] = []
-        for i, bucket in enumerate(self._slot_buckets):
-            if bucket_id is not None and bucket != bucket_id:
-                continue
-            if cutoff is not None and int(self._slot_event_ids[i]) > cutoff:
-                continue
-            indices.append(i)
-        return indices
+        return self.table.visible_indices(read_cutoff=read_cutoff, bucket_id=bucket_id)
 
     def append_kv_batch(self, encoded_batch: torch.Tensor, bucket_ids: torch.Tensor) -> None:
         """Append multiple KV pairs at once as a batched operation.
@@ -327,23 +362,28 @@ class MultiSlotOuterModel(nn.Module):
                 raise ValueError(
                     f"event_ids length {len(event_list)} does not match encoded batch {n}"
                 )
-        # (N, outer_dim) → N tensors of (1, outer_dim), matching existing slot format
-        self._slots.extend(encoded_batch.detach().unsqueeze(1).unbind(0))
-        self._survival.extend([1.0] * n)
-        self._slot_buckets.extend(bid_list)
-        self._slot_event_ids.extend(event_list)
+        # Append through SlotTable to maintain identity mappings
+        tensors = encoded_batch.detach().unsqueeze(1).unbind(0)
+        for i, tensor in enumerate(tensors):
+            self.table.append(
+                tensor,
+                bucket_id=bid_list[i],
+                event_id=event_list[i],
+                survival=1.0,
+            )
 
         # Compress if capped
-        if self.max_slots > 0 and len(self._slots) > self.max_slots:
+        if self.max_slots > 0 and len(self.table) > self.max_slots:
             self._compress()
 
     def get_extra_state(self) -> dict:
         """Persist slots, survival scores, bucket assignments, latent traces, and affinity."""
         state = {
-            "slots": [s.cpu() for s in self._slots],
-            "survival": list(self._survival),
-            "slot_buckets": list(self._slot_buckets),
-            "slot_event_ids": list(self._slot_event_ids),
+            "slots": [s.cpu() for s in self.table._slots],
+            "survival": list(self.table._survival),
+            "slot_buckets": list(self.table._slot_buckets),
+            "slot_event_ids": list(self.table._slot_event_ids),
+            "table_state": self.table.state_dict(),
             "latent_traces": [
                 {"bucket_id": t["bucket_id"], "centroid_contrib": t["centroid_contrib"].cpu()}
                 for t in self._latent_traces
@@ -356,11 +396,15 @@ class MultiSlotOuterModel(nn.Module):
     def set_extra_state(self, state: dict) -> None:
         """Restore slots, survival scores, bucket assignments, latent traces, and affinity."""
         device = self.decoder.weight.device
-        self._slots = [s.to(device) for s in state["slots"]]
-        self._survival = list(state["survival"])
-        self._slot_buckets = list(state.get("slot_buckets", [-1] * len(self._slots)))
-        self._slot_event_ids = list(state.get("slot_event_ids", [0] * len(self._slots)))
-        self._ensure_slot_event_ids()
+        if "table_state" in state:
+            self.table.load_state_dict(state["table_state"], device=device)
+        else:
+            self.table._slots = [s.to(device) for s in state["slots"]]
+            self.table._survival = list(state["survival"])
+            self.table._slot_buckets = list(state.get("slot_buckets", [-1] * len(self.table._slots)))
+            self.table._slot_event_ids = list(state.get("slot_event_ids", [0] * len(self.table._slots)))
+            self.table._priority = [1.0] * len(self.table._slots)
+            self._rebuild_table_identity()
         self._latent_traces = [
             {"bucket_id": t["bucket_id"], "centroid_contrib": t["centroid_contrib"].to(device)}
             for t in state.get("latent_traces", [])
@@ -379,34 +423,35 @@ class MultiSlotOuterModel(nn.Module):
 
         If no slots exist, returns zeros. If cue is provided (batch, model_dim),
         similarity between cue and each slot weights the decode.
+        Retrieval weights are modulated by the control plane's priority vector.
         """
-        if not self._slots:
+        if len(self.table) == 0:
             self._retrieval_weights = None
             self._retrieval_indices = None
             return torch.zeros(batch_size, self.model_dim, device=self.decoder.weight.device)
-        indices = self._visible_slot_indices(read_cutoff=read_cutoff)
+        indices = self.table.visible_indices(read_cutoff=read_cutoff)
         if not indices:
             self._retrieval_weights = None
             self._retrieval_indices = None
             return torch.zeros(batch_size, self.model_dim, device=self.decoder.weight.device)
 
-        # Stack slots: (num_slots, outer_dim)
-        slot_matrix = torch.cat([self._slots[i] for i in indices], dim=0)
+        slot_matrix = self.table.slot_matrix(indices)
 
         if cue is not None:
-            # Project cue to outer space for similarity
             cue = cue.to(dtype=self.cue_proj.weight.dtype)
-            cue_outer = self.cue_proj(cue)  # (batch, outer_dim)
-            # Similarity: (batch, num_slots)
+            cue_outer = self.cue_proj(cue)
             sim = torch.mm(cue_outer, slot_matrix.T)
-            weights = F.softmax(sim, dim=-1)  # (batch, num_slots)
-            # Cache for survival scoring
+            weights = F.softmax(sim, dim=-1)
+
+            # Residual injector: control plane priority modulates retrieval
+            priority = self.table.priority_vector(indices)
+            weights = weights * priority.to(device=weights.device, dtype=weights.dtype).unsqueeze(0)
+            weights = weights / weights.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+
             self._retrieval_weights = weights.detach()
             self._retrieval_indices = indices
-            # Weighted retrieval: (batch, outer_dim)
             retrieved = torch.mm(weights, slot_matrix)
         else:
-            # Uniform retrieval (no cue)
             retrieved = slot_matrix.mean(dim=0, keepdim=True).expand(batch_size, -1)
             self._retrieval_weights = None
             self._retrieval_indices = None
@@ -435,13 +480,13 @@ class MultiSlotOuterModel(nn.Module):
         else:
             slot = encoded.mean(dim=0, keepdim=True)
 
-        self._slots.append(slot.detach())
-        self._survival.append(0.0)
-        self._slot_buckets.append(bucket_id if bucket_id is not None else -1)
-        self._slot_event_ids.append(0)
+        self.table.append(
+            slot.detach(),
+            bucket_id=bucket_id if bucket_id is not None else -1,
+        )
 
         # Compress if at capacity
-        if len(self._slots) > self.max_slots:
+        if len(self.table) > self.max_slots:
             self._compress()
 
     def write_sequence(
@@ -554,12 +599,13 @@ class MultiSlotOuterModel(nn.Module):
         Used by the append_only buffer mode. Stores the pre-encoded vector
         directly (caller is responsible for encoding via self.encoder).
         """
-        self._slots.append(encoded.detach())
-        self._survival.append(1.0)
-        self._slot_buckets.append(bucket_id if bucket_id is not None else -1)
-        self._slot_event_ids.append(0)
+        self.table.append(
+            encoded.detach(),
+            bucket_id=bucket_id if bucket_id is not None else -1,
+            survival=1.0,
+        )
         # Only compress if max_slots > 0 (0 = unlimited)
-        if self.max_slots > 0 and len(self._slots) > self.max_slots:
+        if self.max_slots > 0 and len(self.table) > self.max_slots:
             self._compress()
 
     def update_survival(self, current_loss: float) -> None:
@@ -568,17 +614,15 @@ class MultiSlotOuterModel(nn.Module):
         Impact = how much better is the model when this slot fires?
         survival_score += (running_avg - actual_loss) weighted by retrieval weight.
         """
-        if self._retrieval_weights is None or not self._slots:
+        if self._retrieval_weights is None or len(self.table) == 0:
             return
         running_avg = self.loss_ema.item()
-        impact = running_avg - current_loss  # positive = model did better than avg
-        # Weight impact by how much each slot contributed to retrieval
-        # Average across batch
-        mean_weights = self._retrieval_weights.mean(dim=0)  # (num_slots,)
+        impact = running_avg - current_loss
+        mean_weights = self._retrieval_weights.mean(dim=0)
         retrieval_indices = self._retrieval_indices or list(range(mean_weights.size(0)))
         for pos, slot_idx in enumerate(retrieval_indices[:mean_weights.size(0)]):
-            if 0 <= slot_idx < len(self._survival):
-                self._survival[slot_idx] += impact * mean_weights[pos].item()
+            if 0 <= slot_idx < len(self.table._survival):
+                self.table._survival[slot_idx] += impact * mean_weights[pos].item()
 
     def _compress(self) -> None:
         """Merge the oldest slots with lowest survival scores.
@@ -586,43 +630,39 @@ class MultiSlotOuterModel(nn.Module):
         Takes the oldest half, sorts by survival, merges the bottom
         compress_ratio into one averaged slot. High-survival old slots survive.
         When bucket types are present, only merges slots sharing the same bucket.
+
+        Uses SlotTable retire/append to maintain persistent identity mappings.
         """
-        if len(self._slots) <= self.compress_ratio:
+        n = len(self.table)
+        if n <= self.compress_ratio:
             return
 
-        # Target: merge the N oldest low-survival slots into N//compress_ratio
-        n_old = len(self._slots) // 2
+        n_old = n // 2
         if n_old < self.compress_ratio:
             return
 
-        old_slots = self._slots[:n_old]
-        old_survival = self._survival[:n_old]
-        self._ensure_slot_event_ids()
-        old_buckets = self._slot_buckets[:n_old]
-        old_event_ids = self._slot_event_ids[:n_old]
-        new_slots = self._slots[n_old:]
-        new_survival = self._survival[n_old:]
-        new_buckets = self._slot_buckets[n_old:]
-        new_event_ids = self._slot_event_ids[n_old:]
+        # Get slot IDs in insertion order (oldest first)
+        all_sids = sorted(self.table.active_slot_ids())
+        old_sids = all_sids[:n_old]
 
-        # Check if we have typed slots (any bucket != -1)
+        # Snapshot old slot data before mutation
+        old_tensors = [self.table.get_tensor(sid) for sid in old_sids]
+        old_survival = [self.table._survival[self.table.slot_id_to_physical(sid)] for sid in old_sids]
+        old_buckets = [self.table._slot_buckets[self.table.slot_id_to_physical(sid)] for sid in old_sids]
+        old_event_ids = [self.table._slot_event_ids[self.table.slot_id_to_physical(sid)] for sid in old_sids]
+
         has_types = any(b != -1 for b in old_buckets)
 
+        retire_sids: list[int] = []
+        append_specs: list[tuple[torch.Tensor, float, int, int]] = []
+
         if has_types:
-            # Typed compression: only merge within same bucket
-            # Group old slots by bucket
             bucket_groups: dict[int, list[int]] = defaultdict(list)
             for i in range(n_old):
                 bucket_groups[old_buckets[i]].append(i)
 
-            kept_slots = []
-            kept_survival = []
-            kept_buckets = []
-            kept_event_ids = []
-
             for bucket_id, group_indices in bucket_groups.items():
                 if len(group_indices) >= self.compress_ratio:
-                    # Sort by survival ascending (or random for ablation), merge the lowest
                     if self.compression_selection == "random":
                         group_sorted = list(group_indices)
                         self._compress_rng.shuffle(group_sorted)
@@ -630,10 +670,8 @@ class MultiSlotOuterModel(nn.Module):
                         group_sorted = sorted(group_indices, key=lambda i: old_survival[i])
                     merge_count = min(self.compress_ratio, len(group_sorted))
                     to_merge = group_sorted[:merge_count]
-                    to_keep = group_sorted[merge_count:]
 
-                    # Merge
-                    merged_tensors = [old_slots[i] for i in to_merge]
+                    merged_tensors = [old_tensors[i] for i in to_merge]
                     merged_survivals = [old_survival[i] for i in to_merge]
                     weights = torch.tensor([max(s, 0.01) for s in merged_survivals])
                     weights = weights / weights.sum()
@@ -641,41 +679,19 @@ class MultiSlotOuterModel(nn.Module):
                     merged_score = sum(merged_survivals) / len(merged_survivals)
                     merged_event_id = max(old_event_ids[i] for i in to_merge)
 
-                    # Compression consequence: how much info was lost?
                     original_mean = sum(merged_tensors) / len(merged_tensors)
                     quality_delta = -float((merged_slot - original_mean).norm())
                     self._compression_consequences.append((bucket_id, quality_delta))
 
-                    # Record latent traces for the individual slots absorbed by the merge
                     for i in to_merge:
                         self._latent_traces.append({
                             "bucket_id": old_buckets[i],
-                            "centroid_contrib": old_slots[i].detach().clone(),
+                            "centroid_contrib": old_tensors[i].detach().clone(),
                         })
+                        retire_sids.append(old_sids[i])
 
-                    for i in sorted(to_keep):
-                        kept_slots.append(old_slots[i])
-                        kept_survival.append(old_survival[i])
-                        kept_buckets.append(old_buckets[i])
-                        kept_event_ids.append(old_event_ids[i])
-                    kept_slots.append(merged_slot)
-                    kept_survival.append(merged_score)
-                    kept_buckets.append(bucket_id)
-                    kept_event_ids.append(merged_event_id)
-                else:
-                    # Not enough slots in this bucket to merge — keep them all
-                    for i in sorted(group_indices):
-                        kept_slots.append(old_slots[i])
-                        kept_survival.append(old_survival[i])
-                        kept_buckets.append(old_buckets[i])
-                        kept_event_ids.append(old_event_ids[i])
-
-            self._slots = kept_slots + new_slots
-            self._survival = kept_survival + new_survival
-            self._slot_buckets = kept_buckets + new_buckets
-            self._slot_event_ids = kept_event_ids + new_event_ids
+                    append_specs.append((merged_slot, merged_score, bucket_id, merged_event_id))
         else:
-            # Untyped compression: sort by survival (or random for ablation)
             if self.compression_selection == "random":
                 indices = list(range(n_old))
                 self._compress_rng.shuffle(indices)
@@ -683,10 +699,9 @@ class MultiSlotOuterModel(nn.Module):
                 indices = sorted(range(n_old), key=lambda i: old_survival[i])
             merge_count = min(self.compress_ratio, n_old)
             to_merge_idx = indices[:merge_count]
-            to_keep_idx = indices[merge_count:]
 
             if to_merge_idx:
-                merged_tensors = [old_slots[i] for i in to_merge_idx]
+                merged_tensors = [old_tensors[i] for i in to_merge_idx]
                 merged_survivals = [old_survival[i] for i in to_merge_idx]
                 weights = torch.tensor([max(s, 0.01) for s in merged_survivals])
                 weights = weights / weights.sum()
@@ -694,23 +709,21 @@ class MultiSlotOuterModel(nn.Module):
                 merged_score = sum(merged_survivals) / len(merged_survivals)
                 merged_event_id = max(old_event_ids[i] for i in to_merge_idx)
 
-                # Record latent traces for the individual slots absorbed by the merge
                 for i in to_merge_idx:
                     self._latent_traces.append({
                         "bucket_id": old_buckets[i],
-                        "centroid_contrib": old_slots[i].detach().clone(),
+                        "centroid_contrib": old_tensors[i].detach().clone(),
                     })
+                    retire_sids.append(old_sids[i])
 
-                kept_old = [
-                    (old_slots[i], old_survival[i], old_buckets[i], old_event_ids[i])
-                    for i in sorted(to_keep_idx)
-                ]
-                self._slots = [s for s, _, _, _ in kept_old] + [merged_slot] + new_slots
-                self._survival = [sc for _, sc, _, _ in kept_old] + [merged_score] + new_survival
-                self._slot_buckets = [b for _, _, b, _ in kept_old] + [-1] + new_buckets
-                self._slot_event_ids = [e for _, _, _, e in kept_old] + [merged_event_id] + new_event_ids
+                append_specs.append((merged_slot, merged_score, -1, merged_event_id))
 
-        # Evict oldest latent traces if over capacity
+        # Execute through SlotTable to maintain identity mappings
+        if retire_sids:
+            self.table.retire_many(retire_sids, reason="compressed")
+        for tensor, survival, bucket, event_id in append_specs:
+            self.table.append(tensor, bucket_id=bucket, event_id=event_id, survival=survival)
+
         while len(self._latent_traces) > self.max_slots:
             self._latent_traces.pop(0)
 
@@ -728,17 +741,15 @@ class MultiSlotOuterModel(nn.Module):
             return False
         for i, trace in enumerate(self._latent_traces):
             if bucket_id is None or trace["bucket_id"] == bucket_id:
-                # Reactivate with degradation — reconstructed memories are imperfect
                 reactivated_slot = trace["centroid_contrib"].clone()
-                noise = torch.randn_like(reactivated_slot) * 0.1  # reconstruction noise
+                noise = torch.randn_like(reactivated_slot) * 0.1
                 reactivated_slot = reactivated_slot + noise
-                self._slots.append(reactivated_slot)
-                self._survival.append(0.0)
-                self._slot_buckets.append(trace["bucket_id"])
-                self._slot_event_ids.append(0)
+                self.table.append(
+                    reactivated_slot,
+                    bucket_id=trace["bucket_id"],
+                )
                 self._latent_traces.pop(i)
-                # Compress if reactivation pushed past capacity
-                if len(self._slots) > self.max_slots:
+                if len(self.table) > self.max_slots:
                     self._compress()
                 return True
         return False

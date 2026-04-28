@@ -64,6 +64,7 @@ from chaoscontrol.cache_utility import (  # noqa: E402
     rank3_score_batch_causal,
 )
 from chaoscontrol.controller_distillation import controller_loss  # noqa: E402
+from chaoscontrol.replay_eviction import ReplayEvictionLoop  # noqa: E402
 from chaoscontrol.data import (  # noqa: E402
     load_fineweb_tokens,
     resolve_device,
@@ -997,6 +998,26 @@ def _reject_unsupported_fast_step(
                 f"crct_enabled=True fast path does not support the {label} "
                 f"path (model.{attr} is not None)."
             )
+
+
+def _crct_replay_cache_probe(
+    loop: ReplayEvictionLoop,
+    model: torch.nn.Module,
+    step: int,
+) -> None:
+    """Cache the most recent batch as probe data for replay-eviction."""
+    outer = getattr(model, "outer_model", None)
+    if outer is None or len(getattr(outer, "table", getattr(outer, "_slots", []))) == 0:
+        return
+    probe_ids = getattr(model, "_last_input_ids", None)
+    if probe_ids is None:
+        return
+    loop.cache_probe(
+        input_ids=probe_ids,
+        valid_mask=torch.ones_like(probe_ids, dtype=torch.bool),
+        cache_read_cutoff=None,
+        step=step,
+    )
 
 
 def _crct_score_payload_inline(
@@ -6743,6 +6764,24 @@ def train_fast_for_budget(
     crct_gradient_conflict_trace_stride: int = 1,
     crct_gradient_conflict_trace_max_rows: int = 0,
     crct_gradient_conflict_trace_flush_rows: int = 256,
+    replay_eviction_enabled: bool = False,
+    replay_eviction_threshold: float = 0.01,
+    replay_eviction_ema_beta: float = 0.9,
+    replay_eviction_min_age_steps: int = 128,
+    replay_eviction_max_seconds: float = 0.5,
+    replay_eviction_trace_path: str = "",
+    replay_eviction_trace_max_rows: int = 0,
+    replay_eviction_probe_chunk_size: int = 16,
+    replay_eviction_drift_threshold: float = 0.3,
+    replay_eviction_repr_drift_threshold: float = 0.2,
+    replay_eviction_refresh_lr: float = 0.1,
+    replay_eviction_refresh_margin: float = 0.001,
+    replay_eviction_quarantine_threshold: float = -0.01,
+    replay_eviction_max_quarantined: int = 8,
+    replay_eviction_quarantine_release_streak: int = 2,
+    replay_eviction_distill_peak_threshold: float = 0.04,
+    replay_eviction_useful_threshold: float = 0.005,
+    replay_eviction_min_score_count: int = 2,
 ) -> dict[str, Any]:
     rank_ = int(rank)
     world_size_ = int(world_size)
@@ -7378,6 +7417,27 @@ def train_fast_for_budget(
     crct_teacher_transport: _CrctAsyncTeacherTransport | None = None
     crct_teacher_transport_mode = "disabled"
     crct_teacher_bypass_steps = 0
+    replay_eviction_loop: ReplayEvictionLoop | None = None
+    if bool(replay_eviction_enabled) and crct_enabled:
+        replay_eviction_loop = ReplayEvictionLoop(
+            eviction_threshold=float(replay_eviction_threshold),
+            eviction_ema_beta=float(replay_eviction_ema_beta),
+            min_slot_age_steps=int(replay_eviction_min_age_steps),
+            max_seconds_per_tick=float(replay_eviction_max_seconds),
+            trace_path=str(replay_eviction_trace_path) or None,
+            trace_max_rows=int(replay_eviction_trace_max_rows),
+            probe_chunk_size=int(replay_eviction_probe_chunk_size),
+            drift_threshold=float(replay_eviction_drift_threshold),
+            repr_drift_threshold=float(replay_eviction_repr_drift_threshold),
+            refresh_lr=float(replay_eviction_refresh_lr),
+            refresh_margin=float(replay_eviction_refresh_margin),
+            quarantine_threshold=float(replay_eviction_quarantine_threshold),
+            max_quarantined=int(replay_eviction_max_quarantined),
+            quarantine_release_streak=int(replay_eviction_quarantine_release_streak),
+            distill_peak_threshold=float(replay_eviction_distill_peak_threshold),
+            useful_threshold=float(replay_eviction_useful_threshold),
+            min_score_count=int(replay_eviction_min_score_count),
+        )
     crct_rank_diagnostics: list[dict[str, Any] | None] | None = None
     if crct_enabled:
         crct_cache = TransactionalWakeCache(
@@ -8155,6 +8215,16 @@ def train_fast_for_budget(
                     memory_write_tokens=int(crct_memory_write_tokens_per_step),
                     gradient_conflict_monitor=crct_gradient_conflict,
                 )
+            # Replay-eviction: rank-3 idle maintenance tick.
+            # Uses the most recent teacher scoring batch as probe data.
+            if replay_eviction_loop is not None and rank_ == world_size_ - 1:
+                if not replay_eviction_loop.has_probe():
+                    _crct_replay_cache_probe(
+                        replay_eviction_loop, model, steps,
+                    )
+                tick_result = replay_eviction_loop.tick(model=model, step=steps)
+                if tick_result.evicted_indices:
+                    replay_eviction_loop.flush_trace()
             # Phase B5: deferred post-step CE pair pass on the episodic
             # rank. The in-step drain stages each successful replay and
             # the just-emitted REPLAY_OUTCOME dict; this call runs a
@@ -8273,6 +8343,11 @@ def train_fast_for_budget(
                 else 0.0
             ),
             "memory_slots": int(len(getattr(model.outer_model, "_slots", []))),
+            "replay_eviction": (
+                replay_eviction_loop.diagnostics()
+                if replay_eviction_loop is not None
+                else {"enabled": False}
+            ),
             "gradient_conflict": (
                 crct_gradient_conflict.diagnostics()
                 if crct_gradient_conflict is not None
@@ -8838,6 +8913,24 @@ def _warmup(
         crct_gradient_conflict_trace_flush_rows=int(
             config.get("crct_gradient_conflict_trace_flush_rows", 256)
         ),
+        replay_eviction_enabled=bool(config.get("replay_eviction_enabled", False)),
+        replay_eviction_threshold=float(config.get("replay_eviction_threshold", 0.01)),
+        replay_eviction_ema_beta=float(config.get("replay_eviction_ema_beta", 0.9)),
+        replay_eviction_min_age_steps=int(config.get("replay_eviction_min_age_steps", 128)),
+        replay_eviction_max_seconds=float(config.get("replay_eviction_max_seconds", 0.5)),
+        replay_eviction_trace_path=str(config.get("replay_eviction_trace_path", "")),
+        replay_eviction_trace_max_rows=int(config.get("replay_eviction_trace_max_rows", 0)),
+        replay_eviction_probe_chunk_size=int(config.get("replay_eviction_probe_chunk_size", 16)),
+        replay_eviction_drift_threshold=float(config.get("replay_eviction_drift_threshold", 0.3)),
+        replay_eviction_repr_drift_threshold=float(config.get("replay_eviction_repr_drift_threshold", 0.2)),
+        replay_eviction_refresh_lr=float(config.get("replay_eviction_refresh_lr", 0.1)),
+        replay_eviction_refresh_margin=float(config.get("replay_eviction_refresh_margin", 0.001)),
+        replay_eviction_quarantine_threshold=float(config.get("replay_eviction_quarantine_threshold", -0.01)),
+        replay_eviction_max_quarantined=int(config.get("replay_eviction_max_quarantined", 8)),
+        replay_eviction_quarantine_release_streak=int(config.get("replay_eviction_quarantine_release_streak", 2)),
+        replay_eviction_distill_peak_threshold=float(config.get("replay_eviction_distill_peak_threshold", 0.04)),
+        replay_eviction_useful_threshold=float(config.get("replay_eviction_useful_threshold", 0.005)),
+        replay_eviction_min_score_count=int(config.get("replay_eviction_min_score_count", 2)),
     )
 
 
@@ -9351,6 +9444,24 @@ def run_condition(
         crct_gradient_conflict_trace_flush_rows=int(
             config.get("crct_gradient_conflict_trace_flush_rows", 256)
         ),
+        replay_eviction_enabled=bool(config.get("replay_eviction_enabled", False)),
+        replay_eviction_threshold=float(config.get("replay_eviction_threshold", 0.01)),
+        replay_eviction_ema_beta=float(config.get("replay_eviction_ema_beta", 0.9)),
+        replay_eviction_min_age_steps=int(config.get("replay_eviction_min_age_steps", 128)),
+        replay_eviction_max_seconds=float(config.get("replay_eviction_max_seconds", 0.5)),
+        replay_eviction_trace_path=str(config.get("replay_eviction_trace_path", "")),
+        replay_eviction_trace_max_rows=int(config.get("replay_eviction_trace_max_rows", 0)),
+        replay_eviction_probe_chunk_size=int(config.get("replay_eviction_probe_chunk_size", 16)),
+        replay_eviction_drift_threshold=float(config.get("replay_eviction_drift_threshold", 0.3)),
+        replay_eviction_repr_drift_threshold=float(config.get("replay_eviction_repr_drift_threshold", 0.2)),
+        replay_eviction_refresh_lr=float(config.get("replay_eviction_refresh_lr", 0.1)),
+        replay_eviction_refresh_margin=float(config.get("replay_eviction_refresh_margin", 0.001)),
+        replay_eviction_quarantine_threshold=float(config.get("replay_eviction_quarantine_threshold", -0.01)),
+        replay_eviction_max_quarantined=int(config.get("replay_eviction_max_quarantined", 8)),
+        replay_eviction_quarantine_release_streak=int(config.get("replay_eviction_quarantine_release_streak", 2)),
+        replay_eviction_distill_peak_threshold=float(config.get("replay_eviction_distill_peak_threshold", 0.04)),
+        replay_eviction_useful_threshold=float(config.get("replay_eviction_useful_threshold", 0.005)),
+        replay_eviction_min_score_count=int(config.get("replay_eviction_min_score_count", 2)),
     )
     episodic_cache_payload = train_result.pop("_episodic_cache_payload", None)
 
