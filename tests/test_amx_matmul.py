@@ -15,6 +15,7 @@ def test_amx_bf16_matmul_surface_imports():
     assert isinstance(_ext.amx_bf16_kernel_available(), bool)
 
 
+@pytest.mark.scalar_path_only
 def test_amx_bf16_matmul_unavailable_raises_clear_error():
     if _ext.amx_bf16_kernel_available():
         pytest.skip("AMX BF16 kernel is compiled in this extension build")

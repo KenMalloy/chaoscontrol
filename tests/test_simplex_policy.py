@@ -188,6 +188,7 @@ def test_simplex_forward_softmax_stability():
     assert math.isclose(float(p.sum()), 1.0, abs_tol=1e-5)
 
 
+@pytest.mark.scalar_path_only
 @pytest.mark.parametrize("seed", [0, 1, 2, 3, 4])
 def test_simplex_forward_matches_python_reference(seed: int):
     # Tight tolerance is the at::matmul-path contract. On hosts where the

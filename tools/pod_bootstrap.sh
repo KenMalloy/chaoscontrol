@@ -3,8 +3,9 @@
 # pod_bootstrap.sh — Bootstrap a RunPod GPU instance for ChaosControl experiments
 #
 # Legacy broad bootstrap path. It mutates the Python environment, may install
-# Torch/Mamba dependencies, and runs extra benchmarks. Prefer the narrow fresh
-# pod setup documented in experiments/23_fast_path/FRESH_POD_RUNBOOK.md.
+# Torch/Mamba dependencies, and runs extra benchmarks. Prefer the active
+# one-command setup in scripts/pod_bootstrap.sh, or the native-extension-only
+# helper in scripts/pod_build_native_extensions.sh for test pods.
 #
 # Run ON the pod only when you intentionally want the broad path:
 #   CHAOSCONTROL_ALLOW_BROAD_BOOTSTRAP=1 bash /workspace/chaoscontrol/tools/pod_bootstrap.sh
@@ -20,7 +21,8 @@ ERROR: tools/pod_bootstrap.sh is the legacy broad bootstrap path.
 
 It can create/modify the venv, install or replace Torch, install optional
 Mamba dependencies, and run extra benchmarks. For Exp23 / Parameter Golf pods,
-use the narrow setup in experiments/23_fast_path/FRESH_POD_RUNBOOK.md instead.
+use scripts/pod_bootstrap.sh instead. For already-synced test pods that only
+need native kernels, use scripts/pod_build_native_extensions.sh.
 
 If you intentionally want the broad mutating path, rerun with:
   CHAOSCONTROL_ALLOW_BROAD_BOOTSTRAP=1 bash /workspace/chaoscontrol/tools/pod_bootstrap.sh

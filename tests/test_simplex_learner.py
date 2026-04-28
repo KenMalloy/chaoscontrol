@@ -642,6 +642,7 @@ def _assert_simplex_gradient_matches_torch_autograd_reference(
         assert t.last_entropy_bonus_weight == pytest.approx(entropy_beta)
 
 
+@pytest.mark.scalar_path_only
 def test_simplex_gradient_matches_torch_autograd_reference():
     """Strict fp32 parity for the scalar/at::matmul learner path."""
     if _ext.amx_bf16_kernel_available() and _ext.has_amx_bf16():
@@ -655,6 +656,7 @@ def test_simplex_gradient_matches_torch_autograd_reference():
     )
 
 
+@pytest.mark.scalar_path_only
 def test_entropy_bonus_matches_torch_autograd_reference():
     """REINFORCE + entropy bonus matches a direct torch autograd loss."""
     if _ext.amx_bf16_kernel_available() and _ext.has_amx_bf16():

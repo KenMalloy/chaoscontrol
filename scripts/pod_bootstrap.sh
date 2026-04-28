@@ -9,11 +9,12 @@
 # Steps:
 #   1. CUDA 13 + TE 2.13 + chaoscontrol editable install (calls
 #      pod_setup_cuda13.sh which is itself idempotent)
-#   2. Install huggingface-hub + requests in the venv
-#   3. Fetch SP16384 train+val shards + tokenizer (Natooka)
-#   4. Stream first 50k docs of docs_selected.jsonl (willdepueoai)
-#   5. Build val cache for Exp 20 fast scorer
-#   6. Smoke-import everything to confirm the pod is fire-ready
+#   2. Build/smoke native extensions from the current repo checkout
+#   3. Install huggingface-hub + requests in the venv
+#   4. Fetch SP16384 train+val shards + tokenizer (Natooka)
+#   5. Stream first 50k docs of docs_selected.jsonl (willdepueoai)
+#   6. Build val cache for Exp 20 fast scorer
+#   7. Smoke-import everything to confirm the pod is fire-ready
 #
 # Total wall on a fresh pod: ~15 min (most of it pod_setup pip installs).
 #
@@ -43,16 +44,20 @@ bash scripts/pod_setup_cuda13.sh
 source "$WORKSPACE_VENV/bin/activate"
 
 echo ""
-echo "==> Step 2/6: install huggingface-hub + requests in venv"
+echo "==> Step 2/7: build/smoke native extensions"
+bash scripts/pod_build_native_extensions.sh
+
+echo ""
+echo "==> Step 3/7: install huggingface-hub + requests in venv"
 # Idempotent: pip skips if up-to-date.
 pip install --only-binary=:all: huggingface-hub requests
 
 echo ""
-echo "==> Step 3/6: fetch SP16384 train+val shards + tokenizer"
+echo "==> Step 4/7: fetch SP16384 train+val shards + tokenizer"
 python "$REPO_ROOT/scripts/fetch_sp16384_dataset.py"
 
 echo ""
-echo "==> Step 4/6: stream first 50k docs of docs_selected.jsonl"
+echo "==> Step 5/7: stream first 50k docs of docs_selected.jsonl"
 if [ -z "${HF_TOKEN:-}" ] && [ "$HF_TOKEN_REQUIRED" = "1" ]; then
     echo "ERROR: HF_TOKEN env var required (willdepueoai/parameter-golf is auth-only)" >&2
     echo "  HF_TOKEN=hf_... bash scripts/pod_bootstrap.sh" >&2
@@ -61,7 +66,7 @@ fi
 python "$REPO_ROOT/scripts/stream_docs_selected.py"
 
 echo ""
-echo "==> Step 5/6: build val cache (50k docs, SP16384 tokenizer)"
+echo "==> Step 6/7: build val cache (50k docs, SP16384 tokenizer)"
 DOCS_JSONL="$REPO_ROOT/baselines/parameter_golf/datasets/docs_selected.jsonl"
 SP_MODEL="$REPO_ROOT/baselines/parameter_golf/tokenizers/fineweb_16384_bpe.model"
 if [ -f "$VAL_CACHE_DIR/manifest.json" ]; then
@@ -75,10 +80,11 @@ else
 fi
 
 echo ""
-echo "==> Step 6/6: smoke check"
+echo "==> Step 7/7: smoke check"
 python - <<'PY'
 import torch
 from chaoscontrol.kernels import _cpu_ssm_controller as cpu_ext
+from chaoscontrol.kernels._lm_head_loss import _C as lm_head_C  # noqa: F401
 from chaoscontrol.kernels._cublaslt import _C as cublaslt_C  # noqa: F401
 from chaoscontrol.kernels._ssm_scan import _C as ssm_scan_C  # noqa: F401
 print(f"torch {torch.__version__}  cuda={torch.cuda.is_available()}  GPUs={torch.cuda.device_count()}")
