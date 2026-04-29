@@ -5,8 +5,9 @@ passive cache. Each memory slot is continuously scored relative to
 the current model via counterfactual probes and classified into one
 of six actions: PRESERVE, DECAY, EVICT, REFRESH, QUARANTINE, DISTILL.
 
-The probe engine runs 1 SSM encode + vectorized masked NLL to score
-all slots every tick. Working set ~700KB, fully L2-resident on H100.
+The probe engine runs 1 SSM encode + vectorized masked NLL over the
+hide-one variants. The exact proxy is intentionally bounded by the
+maintenance tick budget/oracle confirmation path, not by the trunk path.
 """
 from __future__ import annotations
 
@@ -120,6 +121,7 @@ def counterfactual_probe(
     probe_cue: torch.Tensor | None = None,
     cache_read_cutoff: int | None = None,
     chunk_size: int = 16,
+    score_slot_indices: list[int] | None = None,
 ) -> CounterfactualResult:
     """Score all slots via vectorized counterfactual masking.
 
@@ -177,6 +179,29 @@ def counterfactual_probe(
         slot_mat = torch.cat(slots_list, dim=0).to(dev)
 
     N = slot_mat.shape[0]
+    if score_slot_indices is None:
+        score_local = list(range(N))
+        score_indices = list(vis)
+    else:
+        visible_pos = {int(phys): local for local, phys in enumerate(vis)}
+        score_pairs = [
+            (visible_pos[int(phys)], int(phys))
+            for phys in dict.fromkeys(score_slot_indices)
+            if int(phys) in visible_pos
+        ]
+        if not score_pairs:
+            return CounterfactualResult(
+                marginal_gains=torch.zeros(0, B, T, device=dev),
+                sidecar_value=torch.zeros(B, T, device=dev),
+                nll_baseline=torch.zeros(B, T, device=dev),
+                nll_no_sidecar=torch.zeros(B, T, device=dev),
+                weights_baseline=torch.zeros(B, 0, device=dev),
+                mask=mask,
+                slot_indices=[],
+            )
+        score_local = [local for local, _phys in score_pairs]
+        score_indices = [phys for _local, phys in score_pairs]
+    score_local_t = torch.tensor(score_local, device=dev, dtype=torch.long)
 
     # Phase 3: Cue + similarity
     cue_proj = getattr(outer, "cue_proj", None)
@@ -195,65 +220,63 @@ def counterfactual_probe(
     with ac:
         cue = probe_cue.to(device=dev) if probe_cue is not None else h_base.detach().mean(dim=1)
         cue_outer = cue_proj(cue.to(dtype=cue_proj.weight.dtype))
-        sim = cue_outer @ slot_mat.to(dtype=cue_outer.dtype).T
+        slot_mat_work = slot_mat.to(dtype=cue_outer.dtype)
+        sim = cue_outer @ slot_mat_work.T
+        weights_baseline = F.softmax(sim, dim=-1)
+        retrieved_baseline = weights_baseline @ slot_mat_work
 
-    # Phase 4: Build masks — baseline + sidecar_off + N hide-one
-    N_var = N + 2
-    masks = torch.ones(N_var, N, device=dev)
-    masks[1, :] = 0
-    for i in range(N):
-        masks[i + 2, i] = 0
+    # Phase 4: baseline + sidecar_off + selected hide-one variants.
+    # Hide-one softmax can be computed exactly by renormalizing the
+    # baseline weights after removing a slot:
+    #   r_hide_i = (r_base - w_i * slot_i) / (1 - w_i)
+    # This avoids a masked softmax+bmm over all slots for every variant.
+    N_var = len(score_local) + 2
 
     # Phase 5: Vectorized probe in chunks
-    nll_baseline = None
-    nll_no_sidecar = None
-    nll_hide = []
-    weights_baseline = None
+    nll_all = torch.empty(N_var, B, T, device=dev, dtype=torch.float32)
 
     cs = chunk_size if chunk_size > 0 else N_var
     for start in range(0, N_var, cs):
         end = min(start + cs, N_var)
-        chunk_masks = masks[start:end]
-        C = chunk_masks.shape[0]
+        C = end - start
 
         with ac:
-            sim_exp = sim.unsqueeze(0).expand(C, -1, -1)
-            sim_masked = sim_exp.masked_fill(chunk_masks.unsqueeze(1) == 0, float("-inf"))
-
-            all_neg_inf = (sim_masked == float("-inf")).all(dim=-1, keepdim=True)
-            w = torch.where(
-                all_neg_inf.expand_as(sim_masked),
-                torch.zeros_like(sim_masked),
-                F.softmax(sim_masked, dim=-1),
+            retrieved = torch.zeros(
+                C, B, slot_mat_work.shape[-1],
+                device=dev,
+                dtype=slot_mat_work.dtype,
             )
+            if start == 0:
+                retrieved[0] = retrieved_baseline
 
-            retrieved = torch.bmm(w, slot_mat.unsqueeze(0).expand(C, -1, -1).to(w.dtype))
-            biases = F.linear(retrieved, decoder.weight.to(w.dtype))
+            hide_start = max(start, 2)
+            if hide_start < end:
+                local_start = hide_start - start
+                hide_offsets = torch.arange(hide_start - 2, end - 2, device=dev)
+                hide_slots = score_local_t[hide_offsets]
+                w_i = weights_baseline[:, hide_slots].T.unsqueeze(-1)
+                slot_i = slot_mat_work[hide_slots].unsqueeze(1)
+                denom = 1.0 - w_i
+                hide_retrieved = torch.where(
+                    denom > 1e-7,
+                    (retrieved_baseline.unsqueeze(0) - w_i * slot_i)
+                    / denom.clamp_min(1e-7),
+                    torch.zeros_like(slot_i).expand(-1, B, -1),
+                )
+                retrieved[local_start:] = hide_retrieved
+
+            biases = F.linear(retrieved, decoder.weight.to(retrieved.dtype))
             h_variants = h_base.unsqueeze(0).expand(C, -1, -1, -1) + biases.unsqueeze(2)
 
         h_flat = h_variants.reshape(C * B, T, D).float()
         y_flat = y.unsqueeze(0).expand(C, -1, -1).reshape(C * B, -1)
         nll_chunk = chunked_nll_from_hidden(model, h_flat, y_flat)
         nll_shaped = nll_chunk.reshape(C, B, T)
+        nll_all[start:end] = nll_shaped
 
-        for ci in range(C):
-            global_idx = start + ci
-            if global_idx == 0:
-                nll_baseline = nll_shaped[ci]
-                weights_baseline = w[ci]
-            elif global_idx == 1:
-                nll_no_sidecar = nll_shaped[ci]
-            else:
-                nll_hide.append(nll_shaped[ci])
-
-    if nll_baseline is None:
-        nll_baseline = torch.zeros(B, T, device=dev)
-    if nll_no_sidecar is None:
-        nll_no_sidecar = torch.zeros(B, T, device=dev)
-    if weights_baseline is None:
-        weights_baseline = torch.zeros(B, N, device=dev)
-
-    marginal_gains = torch.stack(nll_hide, dim=0) - nll_baseline.unsqueeze(0) if nll_hide else torch.zeros(0, B, T, device=dev)
+    nll_baseline = nll_all[0]
+    nll_no_sidecar = nll_all[1]
+    marginal_gains = nll_all[2:] - nll_baseline.unsqueeze(0)
     sidecar_value = nll_no_sidecar - nll_baseline
 
     return CounterfactualResult(
@@ -261,9 +284,9 @@ def counterfactual_probe(
         sidecar_value=sidecar_value.cpu(),
         nll_baseline=nll_baseline.cpu(),
         nll_no_sidecar=nll_no_sidecar.cpu(),
-        weights_baseline=weights_baseline.cpu(),
+        weights_baseline=weights_baseline[:, score_local_t].cpu(),
         mask=mask.cpu(),
-        slot_indices=vis,
+        slot_indices=score_indices,
     )
 
 
@@ -311,8 +334,9 @@ def oracle_confirm_slots(
     variants = len(candidates) + 2
     slot_masks = torch.ones(variants, n_slots, device=dev, dtype=torch.bool)
     slot_masks[1, :] = False
-    for row, phys_idx in enumerate(candidates, start=2):
-        slot_masks[row, phys_idx] = False
+    rows = torch.arange(2, variants, device=dev)
+    cols = torch.tensor(candidates, device=dev, dtype=torch.long)
+    slot_masks[rows, cols] = False
 
     x_exp = x.unsqueeze(0).expand(variants, -1, -1).reshape(variants * B, T)
     y_exp = y.unsqueeze(0).expand(variants, -1, -1).reshape(variants * B, T)
@@ -396,8 +420,8 @@ def _compute_per_slot_sharpness(
     n_valid = m.sum().clamp(min=1)
 
     means = masked.sum(dim=(1, 2)) / n_valid
-    diffs = (masked - means.view(N, 1, 1) * m.unsqueeze(0))
-    variance = (diffs ** 2 * m.unsqueeze(0)).sum(dim=(1, 2)) / n_valid
+    mean_sq = ((marginal_gains ** 2) * m.unsqueeze(0)).sum(dim=(1, 2)) / n_valid
+    variance = (mean_sq - means ** 2).clamp_min(0)
     return variance
 
 
@@ -596,6 +620,9 @@ class ReplayEvictionLoop:
         self._last_proxy_oracle_sign_match_rate: float = 0.0
         self._last_proxy_oracle_abs_error: float = 0.0
         self._last_oracle_candidates: int = 0
+        self._probe_seconds_total: float = 0.0
+        self._last_probe_seconds: float = 0.0
+        self._probe_over_budget_total: int = 0
 
         # Quarantine tracking (by slot_id when using SlotTable, by index otherwise)
         self._quarantined: set[int] = set()
@@ -650,6 +677,7 @@ class ReplayEvictionLoop:
             return TickResult()
 
         # Run counterfactual probe
+        probe_t0 = time.monotonic()
         cf = counterfactual_probe(
             model=model,
             outer=outer,
@@ -659,6 +687,10 @@ class ReplayEvictionLoop:
             cache_read_cutoff=self._probe_cache_cutoff,
             chunk_size=self._probe_chunk_size,
         )
+        self._last_probe_seconds = time.monotonic() - probe_t0
+        self._probe_seconds_total += self._last_probe_seconds
+        if self._last_probe_seconds > self._max_seconds:
+            self._probe_over_budget_total += 1
 
         if len(cf.slot_indices) == 0:
             return TickResult()
@@ -673,22 +705,24 @@ class ReplayEvictionLoop:
         n_valid = mask_f.sum().clamp(min=1)
 
         # Per-slot marginal gain (mean over tokens and batch)
-        slot_marginals = []
-        for i in range(len(cf.slot_indices)):
-            if i < cf.marginal_gains.shape[0]:
-                mg = (cf.marginal_gains[i] * mask_f).sum() / n_valid
-                slot_marginals.append(float(mg.item()))
-            else:
-                slot_marginals.append(0.0)
+        if cf.marginal_gains.shape[0] > 0:
+            slot_marginals = (
+                (cf.marginal_gains * mask_f.unsqueeze(0)).sum(dim=(1, 2)) / n_valid
+            ).float().tolist()
+        else:
+            slot_marginals = []
+        if len(slot_marginals) < len(cf.slot_indices):
+            slot_marginals.extend([0.0] * (len(cf.slot_indices) - len(slot_marginals)))
 
         # Per-slot retrieval mass
-        slot_retrieval_mass = []
-        for i in range(len(cf.slot_indices)):
-            if i < cf.weights_baseline.shape[-1]:
-                rm = cf.weights_baseline[:, i].mean()
-                slot_retrieval_mass.append(float(rm.item()))
-            else:
-                slot_retrieval_mass.append(0.0)
+        if cf.weights_baseline.numel() > 0:
+            slot_retrieval_mass = cf.weights_baseline.mean(dim=0).float().tolist()
+        else:
+            slot_retrieval_mass = []
+        if len(slot_retrieval_mass) < len(cf.slot_indices):
+            slot_retrieval_mass.extend(
+                [0.0] * (len(cf.slot_indices) - len(slot_retrieval_mass))
+            )
 
         # Update SlotRecords (or legacy dicts)
         table = getattr(outer, "table", None)
@@ -696,7 +730,7 @@ class ReplayEvictionLoop:
 
         for i, phys_idx in enumerate(cf.slot_indices):
             mg = slot_marginals[i]
-            sharp = float(sharpness_per_slot[i].item()) if i < len(sharpness_per_slot) else 0.0
+            sharp = float(sharpness_per_slot[i]) if i < len(sharpness_per_slot) else 0.0
             rm = slot_retrieval_mass[i]
 
             if has_table:
@@ -1180,6 +1214,7 @@ class ReplayEvictionLoop:
                 probe_valid_mask=self._probe_valid_mask,
                 cache_read_cutoff=self._probe_cache_cutoff,
                 chunk_size=self._probe_chunk_size,
+                score_slot_indices=[phys],
             )
             candidate_score = self._slot_mean_marginal(phys, candidate_cf)
             improvement = candidate_score - baseline_score
@@ -1459,6 +1494,14 @@ class ReplayEvictionLoop:
                 if self._proxy_oracle_pairs_total
                 else 0.0
             ),
+            "probe_seconds_total": self._probe_seconds_total,
+            "probe_seconds_mean": (
+                self._probe_seconds_total / self._tick_count
+                if self._tick_count
+                else 0.0
+            ),
+            "last_probe_seconds": self._last_probe_seconds,
+            "probe_over_budget_total": self._probe_over_budget_total,
             "last_proxy_oracle_sign_match_rate": self._last_proxy_oracle_sign_match_rate,
             "last_proxy_oracle_abs_error": self._last_proxy_oracle_abs_error,
             "last_oracle_candidates": self._last_oracle_candidates,

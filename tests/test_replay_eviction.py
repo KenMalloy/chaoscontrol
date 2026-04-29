@@ -307,6 +307,8 @@ class TestReplayEvictionLoop:
         assert diag["memory_streams_active"] is False
         assert "oracle_confirmations_total" in diag
         assert "proxy_oracle_abs_error_mean" in diag
+        assert "last_probe_seconds" in diag
+        assert "probe_over_budget_total" in diag
 
     def test_ema_smoothing(self):
         loop = ReplayEvictionLoop(eviction_ema_beta=0.9)
@@ -392,6 +394,63 @@ class TestCounterfactualProbe:
             probe_input_ids=input_ids, probe_valid_mask=valid_mask,
         )
         assert len(result.slot_indices) == 0
+
+    def test_chunking_does_not_change_probe_values(self):
+        torch.manual_seed(123)
+        model = _StubModel(n_slots=4, memory_benefit=1.0)
+        outer = model.outer_model
+        input_ids = torch.randint(0, 32, (2, 17))
+        valid_mask = torch.ones(2, 17)
+
+        torch.manual_seed(999)
+        one_at_a_time = counterfactual_probe(
+            model=model,
+            outer=outer,
+            probe_input_ids=input_ids,
+            probe_valid_mask=valid_mask,
+            chunk_size=1,
+        )
+        torch.manual_seed(999)
+        all_at_once = counterfactual_probe(
+            model=model,
+            outer=outer,
+            probe_input_ids=input_ids,
+            probe_valid_mask=valid_mask,
+            chunk_size=99,
+        )
+
+        assert one_at_a_time.slot_indices == all_at_once.slot_indices
+        assert torch.allclose(one_at_a_time.marginal_gains, all_at_once.marginal_gains)
+        assert torch.allclose(one_at_a_time.sidecar_value, all_at_once.sidecar_value)
+        assert torch.allclose(one_at_a_time.weights_baseline, all_at_once.weights_baseline)
+
+    def test_subset_probe_matches_full_probe_for_selected_slot(self):
+        torch.manual_seed(123)
+        model = _StubModel(n_slots=4, memory_benefit=1.0)
+        outer = model.outer_model
+        input_ids = torch.randint(0, 32, (2, 17))
+        valid_mask = torch.ones(2, 17)
+
+        torch.manual_seed(999)
+        full = counterfactual_probe(
+            model=model,
+            outer=outer,
+            probe_input_ids=input_ids,
+            probe_valid_mask=valid_mask,
+        )
+        torch.manual_seed(999)
+        subset = counterfactual_probe(
+            model=model,
+            outer=outer,
+            probe_input_ids=input_ids,
+            probe_valid_mask=valid_mask,
+            score_slot_indices=[2],
+        )
+
+        assert subset.slot_indices == [2]
+        assert torch.allclose(subset.marginal_gains[0], full.marginal_gains[2])
+        assert torch.allclose(subset.sidecar_value, full.sidecar_value)
+        assert torch.allclose(subset.weights_baseline[:, 0], full.weights_baseline[:, 2])
 
 
 class TestOracleConfirmation:
