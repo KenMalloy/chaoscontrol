@@ -902,6 +902,22 @@ class TestFullAControllerState:
         assert diag["controller"]["recurrence_mode"] == "full_a"
         assert diag["controller"]["steps"] == 1
 
+    def test_refresh_proposal_cache_tracks_teacher_mirror_version(self):
+        outer = _StubOuterModel(outer_dim=8, n_slots=2)
+        model = CpuRefreshProposalModel(k=4)
+        slot = torch.randn(1, 8)
+
+        model.sample_k(outer=outer, slot=slot, context={"step": 1})
+        first_syncs = model.diagnostics()["weight_syncs_total"]
+        model.sample_k(outer=outer, slot=slot, context={"step": 2})
+        assert model.diagnostics()["weight_syncs_total"] == first_syncs
+
+        model.mark_weight_version(7)
+        model.sample_k(outer=outer, slot=slot, context={"step": 3})
+        diag = model.diagnostics()
+        assert diag["weight_version"] == 7
+        assert diag["weight_syncs_total"] > first_syncs
+
 
 # ---------------------------------------------------------------------------
 # Tests for signal decomposition

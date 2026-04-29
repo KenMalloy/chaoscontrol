@@ -900,7 +900,6 @@ class CpuRefreshProposalModel:
         lr: float = 0.1,
         noise_scale: float = 0.04,
         momentum: float = 0.9,
-        weight_sync_interval_steps: int = 64,
         seed: int = 1729,
         controller_state_dim: int = 32,
         controller_rank: int = 8,
@@ -917,13 +916,13 @@ class CpuRefreshProposalModel:
         self.lr = float(lr)
         self.noise_scale = float(noise_scale)
         self.momentum = float(momentum)
-        self.weight_sync_interval_steps = max(1, int(weight_sync_interval_steps))
         self._seed = int(seed)
         self._generator = torch.Generator(device="cpu")
         self._generator.manual_seed(self._seed)
         self._basis: torch.Tensor | None = None
         self._learned_direction: torch.Tensor | None = None
         self._weight_cache: dict[tuple[int, int], tuple[torch.Tensor, torch.Tensor | None]] = {}
+        self._weight_version = 0
         self._active_step = 0
         self._dim: int = 0
         self.samples_total = 0
@@ -965,8 +964,7 @@ class CpuRefreshProposalModel:
         if weight is None:
             return None
         bias = getattr(module, "bias", None)
-        bucket = int(self._active_step) // self.weight_sync_interval_steps
-        key = (id(module), bucket)
+        key = (id(module), int(self._weight_version))
         cached = self._weight_cache.get(key)
         if cached is None:
             stale_keys = [old_key for old_key in self._weight_cache if old_key[0] == id(module)]
@@ -983,6 +981,14 @@ class CpuRefreshProposalModel:
         else:
             weight_cpu, bias_cpu = cached
         return F.linear(x, weight_cpu, bias_cpu)
+
+    def mark_weight_version(self, version: int) -> None:
+        """Invalidate copied proposal weights when the teacher mirror advances."""
+        version_i = int(version)
+        if version_i == int(self._weight_version):
+            return
+        self._weight_version = version_i
+        self._weight_cache.clear()
 
     def _roundtrip(self, outer: Any, slot_cpu: torch.Tensor) -> torch.Tensor | None:
         encoder = getattr(outer, "encoder", None)
@@ -1203,7 +1209,7 @@ class CpuRefreshProposalModel:
             "lr": self.lr,
             "noise_scale": self.noise_scale,
             "momentum": self.momentum,
-            "weight_sync_interval_steps": self.weight_sync_interval_steps,
+            "weight_version": self._weight_version,
             "samples_total": self.samples_total,
             "updates_total": self.updates_total,
             "positive_updates_total": self.positive_updates_total,
@@ -1228,7 +1234,7 @@ class CpuRefreshProposalModel:
             "lr": self.lr,
             "noise_scale": self.noise_scale,
             "momentum": self.momentum,
-            "weight_sync_interval_steps": self.weight_sync_interval_steps,
+            "weight_version": self._weight_version,
             "seed": self._seed,
             "generator_state": self._generator.get_state(),
             "basis": None if self._basis is None else self._basis.detach().cpu(),
@@ -1261,9 +1267,7 @@ class CpuRefreshProposalModel:
         self.lr = float(state.get("lr", self.lr))
         self.noise_scale = float(state.get("noise_scale", self.noise_scale))
         self.momentum = float(state.get("momentum", self.momentum))
-        self.weight_sync_interval_steps = int(
-            state.get("weight_sync_interval_steps", self.weight_sync_interval_steps)
-        )
+        self._weight_version = int(state.get("weight_version", self._weight_version))
         self._seed = int(state.get("seed", self._seed))
         generator_state = state.get("generator_state")
         if isinstance(generator_state, torch.Tensor):
@@ -1774,7 +1778,6 @@ class ReplayEvictionLoop:
         refresh_proposal_rank: int = 8,
         refresh_proposal_noise_scale: float = 0.04,
         refresh_proposal_momentum: float = 0.9,
-        refresh_proposal_weight_sync_interval_steps: int = 64,
         refresh_candidate_variant_chunk_size: int = 16,
         refresh_proposal_seed: int = 1729,
         controller_state_dim: int = 32,
@@ -1846,7 +1849,6 @@ class ReplayEvictionLoop:
             lr=self._refresh_lr,
             noise_scale=float(refresh_proposal_noise_scale),
             momentum=float(refresh_proposal_momentum),
-            weight_sync_interval_steps=int(refresh_proposal_weight_sync_interval_steps),
             seed=int(refresh_proposal_seed),
             controller_state_dim=int(controller_state_dim),
             controller_rank=int(controller_rank),
@@ -2268,6 +2270,7 @@ class ReplayEvictionLoop:
             head_t = head_cpu.t().contiguous()
             head_vnni = _ext.amx_pack_b_vnni(head_t).contiguous()
             self._evidence_engine.set_lm_head(norm_cpu, head_vnni)
+            self._refresh_proposal_model.mark_weight_version(int(step))
             self._evidence_lm_head_refreshes_total += 1
             self._evidence_last_lm_head_refresh_step = int(step)
             self._evidence_last_lm_head_refresh_error = ""

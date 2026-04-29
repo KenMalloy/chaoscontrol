@@ -7009,7 +7009,7 @@ def train_fast_for_budget(
     crct_async_teacher_pending_batches: int = 64,
     crct_async_teacher_max_lag_steps: int = 128,
     crct_async_teacher_payload_dtype: str = "auto",
-    crct_teacher_score_interval_steps: int = 64,
+    crct_teacher_score_interval_steps: int = 1,
     crct_teacher_param_sync_interval_steps: int | None = None,
     crct_gradient_conflict_enabled: bool = False,
     crct_gradient_conflict_ema_beta: float = 0.95,
@@ -7041,7 +7041,6 @@ def train_fast_for_budget(
     replay_eviction_refresh_proposal_rank: int = 8,
     replay_eviction_refresh_proposal_noise_scale: float = 0.04,
     replay_eviction_refresh_proposal_momentum: float = 0.9,
-    replay_eviction_refresh_proposal_weight_sync_interval_steps: int = 64,
     replay_eviction_refresh_candidate_variant_chunk_size: int = 16,
     replay_eviction_refresh_proposal_seed: int = 1729,
     replay_eviction_controller_state_dim: int = 32,
@@ -7696,11 +7695,17 @@ def train_fast_for_budget(
     crct_teacher_param_syncs = 0
     crct_teacher_param_sync_seconds_sum = 0.0
     crct_teacher_param_sync_seconds_max = 0.0
-    crct_teacher_param_sync_interval = (
-        int(crct_teacher_score_interval_steps)
-        if crct_teacher_param_sync_interval_steps is None
-        else int(crct_teacher_param_sync_interval_steps)
-    )
+    if str(crct_async_teacher_transport_backend).strip().lower() == "mailbox":
+        # Mailbox mode uses a latest-complete mirror opportunity every step.
+        # There is no independent teacher-weight cadence in the final ARM
+        # path; one in-flight mirror write naturally drops extra attempts.
+        crct_teacher_param_sync_interval = 1
+    else:
+        crct_teacher_param_sync_interval = (
+            int(crct_teacher_score_interval_steps)
+            if crct_teacher_param_sync_interval_steps is None
+            else int(crct_teacher_param_sync_interval_steps)
+        )
     crct_teacher_transport: _CrctAsyncTeacherTransport | None = None
     crct_teacher_transport_mode = "disabled"
     crct_teacher_bypass_steps = 0
@@ -7731,9 +7736,6 @@ def train_fast_for_budget(
             ),
             refresh_proposal_momentum=float(
                 replay_eviction_refresh_proposal_momentum
-            ),
-            refresh_proposal_weight_sync_interval_steps=int(
-                replay_eviction_refresh_proposal_weight_sync_interval_steps
             ),
             refresh_candidate_variant_chunk_size=int(
                 replay_eviction_refresh_candidate_variant_chunk_size
@@ -8527,8 +8529,6 @@ def train_fast_for_budget(
                 crct_teacher_transport is not None
                 and crct_teacher_transport_mode == "async_rank0_memory_mailbox"
                 and not bool(memory_rank_joins_grad)
-                and int(crct_teacher_param_sync_interval) > 0
-                and steps % int(crct_teacher_param_sync_interval) == 0
             ):
                 publish = getattr(
                     crct_teacher_transport,
@@ -9300,12 +9300,12 @@ def _warmup(
             config.get("crct_async_teacher_payload_dtype", "auto")
         ),
         crct_teacher_score_interval_steps=int(
-            config.get("crct_teacher_score_interval_steps", 64)
+            config.get("crct_teacher_score_interval_steps", 1)
         ),
         crct_teacher_param_sync_interval_steps=(
             None
             if config.get("crct_teacher_param_sync_interval_steps") is None
-            else int(config.get("crct_teacher_param_sync_interval_steps", 64))
+            else int(config.get("crct_teacher_param_sync_interval_steps", 1))
         ),
         crct_gradient_conflict_enabled=bool(
             config.get("crct_gradient_conflict_enabled", False)
@@ -9366,9 +9366,6 @@ def _warmup(
         ),
         replay_eviction_refresh_proposal_momentum=float(
             config.get("replay_eviction_refresh_proposal_momentum", 0.9)
-        ),
-        replay_eviction_refresh_proposal_weight_sync_interval_steps=int(
-            config.get("replay_eviction_refresh_proposal_weight_sync_interval_steps", 64)
         ),
         replay_eviction_refresh_candidate_variant_chunk_size=int(
             config.get("replay_eviction_refresh_candidate_variant_chunk_size", 16)
@@ -9910,12 +9907,12 @@ def run_condition(
             config.get("crct_async_teacher_payload_dtype", "auto")
         ),
         crct_teacher_score_interval_steps=int(
-            config.get("crct_teacher_score_interval_steps", 64)
+            config.get("crct_teacher_score_interval_steps", 1)
         ),
         crct_teacher_param_sync_interval_steps=(
             None
             if config.get("crct_teacher_param_sync_interval_steps") is None
-            else int(config.get("crct_teacher_param_sync_interval_steps", 64))
+            else int(config.get("crct_teacher_param_sync_interval_steps", 1))
         ),
         crct_gradient_conflict_enabled=bool(
             config.get("crct_gradient_conflict_enabled", False)
@@ -9976,9 +9973,6 @@ def run_condition(
         ),
         replay_eviction_refresh_proposal_momentum=float(
             config.get("replay_eviction_refresh_proposal_momentum", 0.9)
-        ),
-        replay_eviction_refresh_proposal_weight_sync_interval_steps=int(
-            config.get("replay_eviction_refresh_proposal_weight_sync_interval_steps", 64)
         ),
         replay_eviction_refresh_candidate_variant_chunk_size=int(
             config.get("replay_eviction_refresh_candidate_variant_chunk_size", 16)

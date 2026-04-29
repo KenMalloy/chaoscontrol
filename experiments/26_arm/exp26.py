@@ -106,8 +106,9 @@ def _crct_lock() -> dict[str, Any]:
         "crct_async_teacher_pending_batches": 64,
         "crct_async_teacher_max_lag_steps": 128,
         "crct_async_teacher_payload_dtype": "auto",
-        "crct_teacher_score_interval_steps": 64,
-        "crct_teacher_param_sync_interval_steps": 64,
+        # The memory plane gets an every-step opportunity. Backpressure and
+        # latest-only mailbox semantics decide what GPU3 actually scores.
+        "crct_teacher_score_interval_steps": 1,
         "outer_model_dim": 64,
         "outer_model_type": "multislot",
         "outer_max_slots": 4096,
@@ -153,7 +154,6 @@ def _replay_eviction_pipeline_lock() -> dict[str, Any]:
         "replay_eviction_refresh_proposal_rank": 8,
         "replay_eviction_refresh_proposal_noise_scale": 0.04,
         "replay_eviction_refresh_proposal_momentum": 0.9,
-        "replay_eviction_refresh_proposal_weight_sync_interval_steps": 64,
         "replay_eviction_refresh_candidate_variant_chunk_size": 16,
         "replay_eviction_refresh_proposal_seed": 1729,
         "replay_eviction_controller_state_dim": 32,

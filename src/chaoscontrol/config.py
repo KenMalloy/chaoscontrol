@@ -181,7 +181,6 @@ class ChaosControlConfig:
     replay_eviction_refresh_proposal_rank: int = 8
     replay_eviction_refresh_proposal_noise_scale: float = 0.04
     replay_eviction_refresh_proposal_momentum: float = 0.9
-    replay_eviction_refresh_proposal_weight_sync_interval_steps: int = 64
     replay_eviction_refresh_candidate_variant_chunk_size: int = 16
     replay_eviction_refresh_proposal_seed: int = 1729
     replay_eviction_controller_state_dim: int = 32
