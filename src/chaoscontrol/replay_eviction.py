@@ -586,6 +586,7 @@ class ReplayEvictionLoop:
         max_seconds_per_tick: float = 0.5,
         trace_path: str | None = None,
         trace_max_rows: int = 0,
+        trace_flush_rows: int = 256,
         probe_chunk_size: int = 16,
         oracle_confirm_top_k: int = 32,
         oracle_variant_chunk_size: int = 1,
@@ -728,6 +729,7 @@ class ReplayEvictionLoop:
         # Trace
         self._trace_path = None if trace_path in (None, "") else Path(str(trace_path))
         self._trace_max_rows = max(0, int(trace_max_rows))
+        self._trace_flush_rows = max(0, int(trace_flush_rows))
         self._trace_rows_written = 0
         self._trace_buffer: list[str] = []
 
@@ -2011,6 +2013,7 @@ class ReplayEvictionLoop:
             event.update(extra)
         self._trace_buffer.append(json.dumps(event, separators=(",", ":")) + "\n")
         self._trace_rows_written += 1
+        self._flush_trace_if_needed()
 
     def _trace_oracle_event(
         self,
@@ -2071,6 +2074,7 @@ class ReplayEvictionLoop:
             )
         self._trace_buffer.append(json.dumps(event, separators=(",", ":")) + "\n")
         self._trace_rows_written += 1
+        self._flush_trace_if_needed()
 
     def _trace_frame_event(
         self,
@@ -2102,6 +2106,13 @@ class ReplayEvictionLoop:
         }
         self._trace_buffer.append(json.dumps(event, separators=(",", ":")) + "\n")
         self._trace_rows_written += 1
+        self._flush_trace_if_needed()
+
+    def _flush_trace_if_needed(self) -> None:
+        if self._trace_flush_rows <= 0:
+            return
+        if len(self._trace_buffer) >= self._trace_flush_rows:
+            self.flush_trace()
 
     def flush_trace(self) -> None:
         if self._trace_path is None or not self._trace_buffer:
@@ -2166,6 +2177,7 @@ class ReplayEvictionLoop:
             else len(self._slot_utility_ema),
             "shadow_actions_total": self._shadow_actions_total,
             "shadow_action_counts": dict(self._shadow_action_counts),
+            "trace_flush_rows": self._trace_flush_rows,
             "oracle_confirm_top_k": self._oracle_confirm_top_k,
             "oracle_variant_chunk_size": self._oracle_variant_chunk_size,
             "oracle_confirmations_total": self._oracle_confirmations_total,

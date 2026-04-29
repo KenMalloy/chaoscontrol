@@ -165,6 +165,7 @@ def _replay_eviction_pipeline_lock() -> dict[str, Any]:
         "replay_eviction_frame_ttl_steps": 256,
         "replay_eviction_slot_work_chunk_size": 16,
         "replay_eviction_trace_max_rows": 200000,
+        "replay_eviction_trace_flush_rows": 256,
     }
 
 

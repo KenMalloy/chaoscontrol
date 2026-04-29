@@ -490,6 +490,44 @@ class TestReplayEvictionLoop:
         assert '"action_value_preserve"' in action_row
         assert '"counterfactual_action_threshold_x0p5"' in action_row
 
+    def test_trace_flush_rows_persists_live_trace(self, monkeypatch, tmp_path):
+        trace_path = tmp_path / "replay_trace.ndjson"
+        loop = ReplayEvictionLoop(
+            action_mode="shadow",
+            trace_path=str(trace_path),
+            trace_max_rows=100,
+            trace_flush_rows=1,
+            oracle_confirm_top_k=0,
+        )
+        model = _StubModel(n_slots=1, use_table=True)
+
+        def fake_probe(**kwargs):
+            slot_indices = list(kwargs["score_slot_indices"])
+            return CounterfactualResult(
+                marginal_gains=torch.ones(len(slot_indices), 1, 2),
+                sidecar_value=torch.zeros(1, 2),
+                nll_baseline=torch.zeros(1, 2),
+                nll_no_sidecar=torch.zeros(1, 2),
+                weights_baseline=torch.ones(1, len(slot_indices)),
+                mask=torch.ones(1, 2, dtype=torch.bool),
+                slot_indices=slot_indices,
+            )
+
+        monkeypatch.setattr(replay_eviction_mod, "counterfactual_probe", fake_probe)
+        loop.cache_probe(
+            input_ids=torch.zeros(1, 3, dtype=torch.long),
+            valid_mask=torch.ones(1, 3),
+            cache_read_cutoff=None,
+            step=5,
+        )
+        assert trace_path.exists()
+        assert '"row_type":"frame_ingest"' in trace_path.read_text()
+
+        loop.tick(model=model, step=7)
+        rows = trace_path.read_text().splitlines()
+        assert any('"row_type":"frame_dispatch"' in row for row in rows)
+        assert any('"row_type":"replay_' in row for row in rows)
+
 
 # ---------------------------------------------------------------------------
 # Tests for counterfactual probe

@@ -157,6 +157,7 @@ def test_calibration_matrix_uses_full_arm_pipeline(exp26, speed_config):
     assert e["replay_eviction_probe_buffer_size"] == 32
     assert e["replay_eviction_frame_ttl_steps"] == 256
     assert e["replay_eviction_max_seconds"] == 8.0
+    assert e["replay_eviction_trace_flush_rows"] == 256
     # Mode is shadow, not active.
     assert e["replay_eviction_mode"] == "shadow"
 

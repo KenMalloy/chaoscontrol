@@ -6812,6 +6812,7 @@ def train_fast_for_budget(
     replay_eviction_max_seconds: float = 0.5,
     replay_eviction_trace_path: str = "",
     replay_eviction_trace_max_rows: int = 0,
+    replay_eviction_trace_flush_rows: int = 256,
     replay_eviction_probe_chunk_size: int = 16,
     replay_eviction_oracle_confirm_top_k: int = 32,
     replay_eviction_oracle_variant_chunk_size: int = 1,
@@ -7477,6 +7478,7 @@ def train_fast_for_budget(
             max_seconds_per_tick=float(replay_eviction_max_seconds),
             trace_path=str(replay_eviction_trace_path) or None,
             trace_max_rows=int(replay_eviction_trace_max_rows),
+            trace_flush_rows=int(replay_eviction_trace_flush_rows),
             probe_chunk_size=int(replay_eviction_probe_chunk_size),
             oracle_confirm_top_k=int(replay_eviction_oracle_confirm_top_k),
             oracle_variant_chunk_size=int(replay_eviction_oracle_variant_chunk_size),
@@ -8989,6 +8991,7 @@ def _warmup(
         replay_eviction_max_seconds=float(config.get("replay_eviction_max_seconds", 0.5)),
         replay_eviction_trace_path=str(config.get("replay_eviction_trace_path", "")),
         replay_eviction_trace_max_rows=int(config.get("replay_eviction_trace_max_rows", 0)),
+        replay_eviction_trace_flush_rows=int(config.get("replay_eviction_trace_flush_rows", 256)),
         replay_eviction_probe_chunk_size=int(config.get("replay_eviction_probe_chunk_size", 16)),
         replay_eviction_oracle_confirm_top_k=int(
             config.get("replay_eviction_oracle_confirm_top_k", 32)
@@ -9538,6 +9541,7 @@ def run_condition(
         replay_eviction_max_seconds=float(config.get("replay_eviction_max_seconds", 0.5)),
         replay_eviction_trace_path=str(config.get("replay_eviction_trace_path", "")),
         replay_eviction_trace_max_rows=int(config.get("replay_eviction_trace_max_rows", 0)),
+        replay_eviction_trace_flush_rows=int(config.get("replay_eviction_trace_flush_rows", 256)),
         replay_eviction_probe_chunk_size=int(config.get("replay_eviction_probe_chunk_size", 16)),
         replay_eviction_oracle_confirm_top_k=int(
             config.get("replay_eviction_oracle_confirm_top_k", 32)
