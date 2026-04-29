@@ -7,6 +7,8 @@
 #include <pybind11/stl.h>
 
 #include <algorithm>
+#include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <deque>
@@ -1465,8 +1467,99 @@ class CpuEvidenceEngine {
     last_stream_id_ = stream_id;
     lane_tile_advances_[lane] += 1;
     lane_work_items_emitted_[lane] += kEvidenceKTile;
+
+    if (lm_head_set_ && chaoscontrol::amx::amx_bf16_kernel_available()) {
+      const auto t0 = std::chrono::steady_clock::now();
+      try {
+        // amx_bf16_nll wants f32 [B,T,D] hidden + i64 [B,T] targets;
+        // the engine's binding contract is bf16 [T,D] + i32 [T], so we
+        // upcast and add the leading batch dim here. The cue is small
+        // (T_PROBE_MAX rows) so the conversion cost is negligible.
+        const auto hidden_f32 =
+            cue_hidden.to(at::kFloat).unsqueeze(0).contiguous();
+        const auto targets_i64 =
+            cue_targets.to(at::kLong).unsqueeze(0).contiguous();
+        at::Tensor nll = chaoscontrol::amx::amx_bf16_nll(
+            hidden_f32,
+            targets_i64,
+            norm_weight_,
+            lm_head_vnni_,
+            /*eps=*/1.0e-6,
+            /*row_chunk_size=*/8192,
+            /*lanes=*/1);
+        const auto nll_flat = nll.flatten();
+        const float* p = nll_flat.const_data_ptr<float>();
+        const int64_t n = nll_flat.numel();
+        double sum = 0.0;
+        double max_v = -std::numeric_limits<double>::infinity();
+        int64_t finite_n = 0;
+        for (int64_t i = 0; i < n; ++i) {
+          const float v = p[i];
+          if (std::isfinite(v)) {
+            sum += static_cast<double>(v);
+            if (v > max_v) max_v = static_cast<double>(v);
+            ++finite_n;
+          }
+        }
+        last_cue_nll_mean_ = finite_n > 0 ? sum / static_cast<double>(finite_n) : 0.0;
+        last_cue_nll_max_ = finite_n > 0 ? max_v : 0.0;
+        last_cue_nll_finite_fraction_ =
+            n > 0 ? static_cast<double>(finite_n) / static_cast<double>(n) : 0.0;
+        if (cue_nll_calls_ == 0) {
+          cue_nll_mean_ema_ = last_cue_nll_mean_;
+          cue_nll_finite_fraction_ema_ = last_cue_nll_finite_fraction_;
+        } else {
+          cue_nll_mean_ema_ =
+              0.95 * cue_nll_mean_ema_ + 0.05 * last_cue_nll_mean_;
+          cue_nll_finite_fraction_ema_ =
+              0.95 * cue_nll_finite_fraction_ema_ +
+              0.05 * last_cue_nll_finite_fraction_;
+        }
+        cue_nll_calls_ += 1;
+        const auto t1 = std::chrono::steady_clock::now();
+        const double elapsed =
+            std::chrono::duration<double>(t1 - t0).count();
+        lane_cue_nll_seconds_[lane] += elapsed;
+        cue_nll_seconds_total_ += elapsed;
+        last_cue_nll_seconds_ = elapsed;
+      } catch (const std::exception& exc) {
+        cue_nll_errors_ += 1;
+        last_cue_nll_error_ = exc.what();
+      }
+    }
+
     starvation_reason_ = "ok";
     gpu3_idle_seconds_by_reason_["ok"] += 0.0;
+  }
+
+  void set_lm_head(const at::Tensor& norm_weight,
+                   const at::Tensor& lm_head_vnni) {
+    TORCH_CHECK(!shutdown_,
+                "CpuEvidenceEngine.set_lm_head called after shutdown");
+    TORCH_CHECK(norm_weight.device().is_cpu(),
+                "CpuEvidenceEngine.set_lm_head norm_weight must be a CPU tensor");
+    TORCH_CHECK(lm_head_vnni.device().is_cpu(),
+                "CpuEvidenceEngine.set_lm_head lm_head_vnni must be a CPU tensor");
+    TORCH_CHECK(norm_weight.scalar_type() == at::kFloat,
+                "CpuEvidenceEngine.set_lm_head norm_weight must be float32");
+    TORCH_CHECK(lm_head_vnni.scalar_type() == at::kBFloat16,
+                "CpuEvidenceEngine.set_lm_head lm_head_vnni must be bf16");
+    TORCH_CHECK(
+        norm_weight.dim() == 1 &&
+            norm_weight.size(0) == static_cast<int64_t>(d_model_),
+        "CpuEvidenceEngine.set_lm_head norm_weight shape mismatch: expected [",
+        d_model_, "], got [", norm_weight.size(0), "]");
+    TORCH_CHECK(lm_head_vnni.dim() == 2,
+                "CpuEvidenceEngine.set_lm_head lm_head_vnni must be 2D "
+                "[K/2, 2V] (VNNI-packed)");
+    TORCH_CHECK(norm_weight.is_contiguous(),
+                "CpuEvidenceEngine.set_lm_head norm_weight must be contiguous");
+    TORCH_CHECK(lm_head_vnni.is_contiguous(),
+                "CpuEvidenceEngine.set_lm_head lm_head_vnni must be contiguous");
+    norm_weight_ = norm_weight;
+    lm_head_vnni_ = lm_head_vnni;
+    lm_head_set_ = true;
+    lm_head_set_count_ += 1;
   }
 
   pybind11::dict slot_state(uint32_t slot_id) const {
@@ -1523,6 +1616,20 @@ class CpuEvidenceEngine {
     d["lane_tile_drops_total"] = drops;
     d["lane_work_items_emitted_total"] = work;
     d["lane_cue_nll_seconds_total"] = cue_nll;
+    d["lm_head_set"] = pybind11::bool_(lm_head_set_);
+    d["lm_head_set_count"] = pybind11::int_(lm_head_set_count_);
+    d["cue_nll_calls_total"] = pybind11::int_(cue_nll_calls_);
+    d["cue_nll_errors_total"] = pybind11::int_(cue_nll_errors_);
+    d["cue_nll_seconds_total"] = pybind11::float_(cue_nll_seconds_total_);
+    d["cue_nll_mean_ema"] = pybind11::float_(cue_nll_mean_ema_);
+    d["cue_nll_finite_fraction_ema"] =
+        pybind11::float_(cue_nll_finite_fraction_ema_);
+    d["last_cue_nll_mean"] = pybind11::float_(last_cue_nll_mean_);
+    d["last_cue_nll_max"] = pybind11::float_(last_cue_nll_max_);
+    d["last_cue_nll_finite_fraction"] =
+        pybind11::float_(last_cue_nll_finite_fraction_);
+    d["last_cue_nll_seconds"] = pybind11::float_(last_cue_nll_seconds_);
+    d["last_cue_nll_error"] = pybind11::str(last_cue_nll_error_);
     return d;
   }
 
@@ -1545,6 +1652,27 @@ class CpuEvidenceEngine {
   std::vector<uint64_t> lane_tile_drops_;
   std::vector<uint64_t> lane_work_items_emitted_;
   std::vector<double> lane_cue_nll_seconds_;
+
+  // LM-head snapshot used for cue NLL refresh on each ingest. The engine
+  // holds these as plain refcounted handles; refresh cadence is owned by
+  // the Python caller (matched to the GPU3 teacher-snapshot cadence).
+  bool lm_head_set_ = false;
+  uint64_t lm_head_set_count_ = 0;
+  at::Tensor norm_weight_;
+  at::Tensor lm_head_vnni_;
+
+  // Cue NLL stats. Populated only when lm_head is set and AMX is
+  // available; otherwise ingest_frame just bumps frame counters.
+  uint64_t cue_nll_calls_ = 0;
+  uint64_t cue_nll_errors_ = 0;
+  double cue_nll_seconds_total_ = 0.0;
+  double last_cue_nll_seconds_ = 0.0;
+  double cue_nll_mean_ema_ = 0.0;
+  double cue_nll_finite_fraction_ema_ = 0.0;
+  double last_cue_nll_mean_ = 0.0;
+  double last_cue_nll_max_ = 0.0;
+  double last_cue_nll_finite_fraction_ = 0.0;
+  std::string last_cue_nll_error_;
 };
 
 template <typename T>
@@ -2473,6 +2601,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
            pybind11::arg("step"),
            pybind11::arg("stream_id") = 0,
            "Ingest one fixed-shape CPU evidence cue frame.")
+      .def("set_lm_head", &CpuEvidenceEngine::set_lm_head,
+           pybind11::arg("norm_weight"),
+           pybind11::arg("lm_head_vnni"),
+           "Set the trunk RMSNorm + VNNI-packed LM-head used for cue NLL "
+           "refresh on every ingest. Refresh cadence is owned by the caller.")
       .def("slot_state", &CpuEvidenceEngine::slot_state,
            pybind11::arg("slot_id"),
            "Return a copy-by-value slot evidence state dict.")

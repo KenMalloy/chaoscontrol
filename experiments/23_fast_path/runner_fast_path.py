@@ -1276,7 +1276,12 @@ class _CrctAsyncTeacherTransport:
         alpha_max: float,
         memory_write_tokens: int,
         gradient_conflict_monitor: CrctGradientConflictMonitor | None = None,
+        replay_eviction_loop: ReplayEvictionLoop | None = None,
     ) -> None:
+        # The non-mailbox transport does not own a teacher-snapshot apply
+        # path, so it does not refresh the evidence engine LM head here.
+        # Accept the parameter so the polymorphic call site is uniform.
+        del replay_eviction_loop
         completed = self._reap_input_requests()
         if self.rank != self.memory_rank:
             return
@@ -1809,9 +1814,14 @@ class _CrctMailboxTeacherTransport:
         alpha_max: float,
         memory_write_tokens: int,
         gradient_conflict_monitor: CrctGradientConflictMonitor | None = None,
+        replay_eviction_loop: ReplayEvictionLoop | None = None,
     ) -> None:
         if self.rank == self.memory_rank:
-            self.poll_weight_snapshot(model=model, step=int(step))
+            self.poll_weight_snapshot(
+                model=model,
+                step=int(step),
+                replay_eviction_loop=replay_eviction_loop,
+            )
         if self.rank != self.memory_rank or not self.pending_input_requests:
             return
         if len(self.pending_input_requests) > 1:
@@ -2014,8 +2024,15 @@ class _CrctMailboxTeacherTransport:
         *,
         model: torch.nn.Module,
         step: int,
+        replay_eviction_loop: ReplayEvictionLoop | None = None,
     ) -> None:
-        """Apply the latest rank0 snapshot on the memory rank if available."""
+        """Apply the latest rank0 snapshot on the memory rank if available.
+
+        When a fresh snapshot lands and a replay_eviction_loop is given,
+        also pushes the now-current LM head + final_norm into the loop's
+        CPU evidence engine. This couples the engine's cue NLL to the same
+        teacher-freshness contract the trunk oracle on GPU3 already obeys.
+        """
         if self.rank != self.memory_rank:
             return
         path = self._weight_path()
@@ -2062,6 +2079,20 @@ class _CrctMailboxTeacherTransport:
                 float(self.metrics["weight_snapshot_apply_seconds_max"]),
                 float(elapsed),
             )
+            if replay_eviction_loop is not None:
+                try:
+                    replay_eviction_loop.refresh_evidence_weights(
+                        norm_weight=model.final_norm.weight,
+                        lm_head_weight=model.lm_head.weight,
+                        step=version_step,
+                    )
+                except Exception as exc:  # pragma: no cover - telemetry only
+                    self.metrics["last_drop_reason"] = (
+                        "evidence_engine_lm_head_refresh_error"
+                    )
+                    self.metrics["last_error"] = "".join(
+                        traceback.format_exception_only(type(exc), exc)
+                    ).strip()
         except FileNotFoundError:
             return
         except Exception as exc:
@@ -8542,6 +8573,7 @@ def train_fast_for_budget(
                     alpha_max=float(crct_lm_weight_alpha_max),
                     memory_write_tokens=int(crct_memory_write_tokens_per_step),
                     gradient_conflict_monitor=crct_gradient_conflict,
+                    replay_eviction_loop=replay_eviction_loop,
                 )
             # Replay-eviction: rank-3 streaming maintenance. Fresh teacher
             # score batches are ingested as probe frames; ticks consume

@@ -1889,6 +1889,10 @@ class ReplayEvictionLoop:
         self._evidence_targets_buffer: torch.Tensor | None = None
         self._evidence_frames_ingested = 0
         self._evidence_ingest_errors_total = 0
+        self._evidence_lm_head_refreshes_total = 0
+        self._evidence_lm_head_refresh_errors_total = 0
+        self._evidence_last_lm_head_refresh_step: int = -1
+        self._evidence_last_lm_head_refresh_error = ""
         if self._evidence_engine_enabled_requested:
             self._init_evidence_engine()
 
@@ -2181,6 +2185,46 @@ class ReplayEvictionLoop:
                 "CpuEvidenceEngine requested but failed to initialize: "
                 f"{self._evidence_engine_error}"
             ) from exc
+
+    def refresh_evidence_weights(
+        self,
+        *,
+        norm_weight: torch.Tensor,
+        lm_head_weight: torch.Tensor,
+        step: int = -1,
+    ) -> bool:
+        """Push the trunk's RMSNorm + LM head into the CPU evidence engine.
+
+        Caller owns cadence — pair this with the GPU3 teacher-snapshot
+        refresh so the cue NLL the engine computes matches the trunk
+        weights GPU3 just adopted. ``norm_weight`` is the RMSNorm scale
+        ([d_model] f32) and ``lm_head_weight`` is the raw lm_head matrix
+        ([V, D] in any dtype/device). The engine wants the VNNI-packed
+        bf16 form, so we convert here.
+
+        Returns True if the refresh actually landed; False if the engine
+        is disabled or AMX is unavailable.
+        """
+        if self._evidence_engine is None:
+            return False
+        try:
+            norm_cpu = (
+                norm_weight.detach().to(device="cpu", dtype=torch.float32).contiguous()
+            )
+            head_cpu = lm_head_weight.detach().to(device="cpu", dtype=torch.bfloat16)
+            head_t = head_cpu.t().contiguous()
+            head_vnni = _ext.amx_pack_b_vnni(head_t).contiguous()
+            self._evidence_engine.set_lm_head(norm_cpu, head_vnni)
+            self._evidence_lm_head_refreshes_total += 1
+            self._evidence_last_lm_head_refresh_step = int(step)
+            self._evidence_last_lm_head_refresh_error = ""
+            return True
+        except Exception as exc:
+            self._evidence_lm_head_refresh_errors_total += 1
+            self._evidence_last_lm_head_refresh_error = (
+                f"{exc.__class__.__name__}: {exc}"
+            )
+            raise
 
     def close(self) -> None:
         """Best-effort cleanup for ARM runtime shm names."""
@@ -4419,6 +4463,10 @@ class ReplayEvictionLoop:
             "lanes": self._evidence_engine_lanes,
             "frames_ingested": self._evidence_frames_ingested,
             "ingest_errors_total": self._evidence_ingest_errors_total,
+            "lm_head_refreshes_total": self._evidence_lm_head_refreshes_total,
+            "lm_head_refresh_errors_total": self._evidence_lm_head_refresh_errors_total,
+            "last_lm_head_refresh_step": self._evidence_last_lm_head_refresh_step,
+            "last_lm_head_refresh_error": self._evidence_last_lm_head_refresh_error,
             "native": evidence_engine_native_diag,
         }
         starvation_reasons = (
