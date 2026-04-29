@@ -6814,8 +6814,15 @@ def train_fast_for_budget(
     replay_eviction_trace_max_rows: int = 0,
     replay_eviction_trace_flush_rows: int = 256,
     replay_eviction_probe_chunk_size: int = 16,
+    replay_eviction_scoring_mode: str = "proxy",
     replay_eviction_oracle_confirm_top_k: int = 32,
     replay_eviction_oracle_variant_chunk_size: int = 1,
+    replay_eviction_cpu_scorer_backend: str = "off",
+    replay_eviction_cpu_scorer_lanes: int = 8,
+    replay_eviction_cpu_scorer_vocab_tile_size: int = 512,
+    replay_eviction_cpu_scorer_row_chunk_size: int = 8192,
+    replay_eviction_cpu_scorer_parallel_threshold_rows: int = 2048,
+    replay_eviction_cpu_scorer_weight_sync_interval_steps: int = 64,
     replay_eviction_drift_threshold: float = 0.3,
     replay_eviction_repr_drift_threshold: float = 0.2,
     replay_eviction_refresh_lr: float = 0.1,
@@ -6832,6 +6839,8 @@ def train_fast_for_budget(
     replay_eviction_frame_ttl_steps: int = 256,
     replay_eviction_slot_work_chunk_size: int = 64,
     replay_eviction_action_agreement_count: int = 2,
+    replay_eviction_arm_runtime_enabled: bool = False,
+    replay_eviction_arm_runtime_namespace: str = "",
 ) -> dict[str, Any]:
     rank_ = int(rank)
     world_size_ = int(world_size)
@@ -7480,8 +7489,23 @@ def train_fast_for_budget(
             trace_max_rows=int(replay_eviction_trace_max_rows),
             trace_flush_rows=int(replay_eviction_trace_flush_rows),
             probe_chunk_size=int(replay_eviction_probe_chunk_size),
+            scoring_mode=str(replay_eviction_scoring_mode),
             oracle_confirm_top_k=int(replay_eviction_oracle_confirm_top_k),
             oracle_variant_chunk_size=int(replay_eviction_oracle_variant_chunk_size),
+            cpu_scorer_backend=str(replay_eviction_cpu_scorer_backend),
+            cpu_scorer_lanes=int(replay_eviction_cpu_scorer_lanes),
+            cpu_scorer_vocab_tile_size=int(
+                replay_eviction_cpu_scorer_vocab_tile_size
+            ),
+            cpu_scorer_row_chunk_size=int(
+                replay_eviction_cpu_scorer_row_chunk_size
+            ),
+            cpu_scorer_parallel_threshold_rows=int(
+                replay_eviction_cpu_scorer_parallel_threshold_rows
+            ),
+            cpu_scorer_weight_sync_interval_steps=int(
+                replay_eviction_cpu_scorer_weight_sync_interval_steps
+            ),
             drift_threshold=float(replay_eviction_drift_threshold),
             repr_drift_threshold=float(replay_eviction_repr_drift_threshold),
             refresh_lr=float(replay_eviction_refresh_lr),
@@ -7502,6 +7526,13 @@ def train_fast_for_budget(
             frame_ttl_steps=int(replay_eviction_frame_ttl_steps),
             slot_work_chunk_size=int(replay_eviction_slot_work_chunk_size),
             action_agreement_count=int(replay_eviction_action_agreement_count),
+            arm_runtime_enabled=(
+                bool(replay_eviction_arm_runtime_enabled)
+                and int(rank_) == int(world_size_) - 1
+            ),
+            arm_runtime_namespace=(
+                str(replay_eviction_arm_runtime_namespace) or None
+            ),
         )
     crct_rank_diagnostics: list[dict[str, Any] | None] | None = None
     if crct_enabled:
@@ -8993,11 +9024,30 @@ def _warmup(
         replay_eviction_trace_max_rows=int(config.get("replay_eviction_trace_max_rows", 0)),
         replay_eviction_trace_flush_rows=int(config.get("replay_eviction_trace_flush_rows", 256)),
         replay_eviction_probe_chunk_size=int(config.get("replay_eviction_probe_chunk_size", 16)),
+        replay_eviction_scoring_mode=str(config.get("replay_eviction_scoring_mode", "proxy")),
         replay_eviction_oracle_confirm_top_k=int(
             config.get("replay_eviction_oracle_confirm_top_k", 32)
         ),
         replay_eviction_oracle_variant_chunk_size=int(
             config.get("replay_eviction_oracle_variant_chunk_size", 1)
+        ),
+        replay_eviction_cpu_scorer_backend=str(
+            config.get("replay_eviction_cpu_scorer_backend", "off")
+        ),
+        replay_eviction_cpu_scorer_lanes=int(
+            config.get("replay_eviction_cpu_scorer_lanes", 8)
+        ),
+        replay_eviction_cpu_scorer_vocab_tile_size=int(
+            config.get("replay_eviction_cpu_scorer_vocab_tile_size", 512)
+        ),
+        replay_eviction_cpu_scorer_row_chunk_size=int(
+            config.get("replay_eviction_cpu_scorer_row_chunk_size", 8192)
+        ),
+        replay_eviction_cpu_scorer_parallel_threshold_rows=int(
+            config.get("replay_eviction_cpu_scorer_parallel_threshold_rows", 2048)
+        ),
+        replay_eviction_cpu_scorer_weight_sync_interval_steps=int(
+            config.get("replay_eviction_cpu_scorer_weight_sync_interval_steps", 64)
         ),
         replay_eviction_drift_threshold=float(config.get("replay_eviction_drift_threshold", 0.3)),
         replay_eviction_repr_drift_threshold=float(config.get("replay_eviction_repr_drift_threshold", 0.2)),
@@ -9019,6 +9069,12 @@ def _warmup(
         replay_eviction_frame_ttl_steps=int(config.get("replay_eviction_frame_ttl_steps", 256)),
         replay_eviction_slot_work_chunk_size=int(config.get("replay_eviction_slot_work_chunk_size", 64)),
         replay_eviction_action_agreement_count=int(config.get("replay_eviction_action_agreement_count", 2)),
+        replay_eviction_arm_runtime_enabled=bool(
+            config.get("replay_eviction_arm_runtime_enabled", False)
+        ),
+        replay_eviction_arm_runtime_namespace=str(
+            config.get("replay_eviction_arm_runtime_namespace", "")
+        ),
     )
 
 
@@ -9543,11 +9599,30 @@ def run_condition(
         replay_eviction_trace_max_rows=int(config.get("replay_eviction_trace_max_rows", 0)),
         replay_eviction_trace_flush_rows=int(config.get("replay_eviction_trace_flush_rows", 256)),
         replay_eviction_probe_chunk_size=int(config.get("replay_eviction_probe_chunk_size", 16)),
+        replay_eviction_scoring_mode=str(config.get("replay_eviction_scoring_mode", "proxy")),
         replay_eviction_oracle_confirm_top_k=int(
             config.get("replay_eviction_oracle_confirm_top_k", 32)
         ),
         replay_eviction_oracle_variant_chunk_size=int(
             config.get("replay_eviction_oracle_variant_chunk_size", 1)
+        ),
+        replay_eviction_cpu_scorer_backend=str(
+            config.get("replay_eviction_cpu_scorer_backend", "off")
+        ),
+        replay_eviction_cpu_scorer_lanes=int(
+            config.get("replay_eviction_cpu_scorer_lanes", 8)
+        ),
+        replay_eviction_cpu_scorer_vocab_tile_size=int(
+            config.get("replay_eviction_cpu_scorer_vocab_tile_size", 512)
+        ),
+        replay_eviction_cpu_scorer_row_chunk_size=int(
+            config.get("replay_eviction_cpu_scorer_row_chunk_size", 8192)
+        ),
+        replay_eviction_cpu_scorer_parallel_threshold_rows=int(
+            config.get("replay_eviction_cpu_scorer_parallel_threshold_rows", 2048)
+        ),
+        replay_eviction_cpu_scorer_weight_sync_interval_steps=int(
+            config.get("replay_eviction_cpu_scorer_weight_sync_interval_steps", 64)
         ),
         replay_eviction_drift_threshold=float(config.get("replay_eviction_drift_threshold", 0.3)),
         replay_eviction_repr_drift_threshold=float(config.get("replay_eviction_repr_drift_threshold", 0.2)),
@@ -9569,6 +9644,12 @@ def run_condition(
         replay_eviction_frame_ttl_steps=int(config.get("replay_eviction_frame_ttl_steps", 256)),
         replay_eviction_slot_work_chunk_size=int(config.get("replay_eviction_slot_work_chunk_size", 64)),
         replay_eviction_action_agreement_count=int(config.get("replay_eviction_action_agreement_count", 2)),
+        replay_eviction_arm_runtime_enabled=bool(
+            config.get("replay_eviction_arm_runtime_enabled", False)
+        ),
+        replay_eviction_arm_runtime_namespace=str(
+            config.get("replay_eviction_arm_runtime_namespace", "")
+        ),
     )
     episodic_cache_payload = train_result.pop("_episodic_cache_payload", None)
 

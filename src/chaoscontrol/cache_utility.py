@@ -19,6 +19,10 @@ from __future__ import annotations
 import contextlib
 import json
 import math
+import os
+import time
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -30,6 +34,9 @@ __all__ = [
     "alpha_ramp",
     "assign_memory_credit",
     "chunked_nll_from_hidden",
+    "CpuMemoryScorer",
+    "CpuMemoryScorerLanePool",
+    "CpuMemoryScorerWeights",
     "positive_only_lm_weight",
     "rank3_score_batch_causal",
     "ScarcityAwareMemoryOptimizer",
@@ -84,6 +91,580 @@ def positive_only_lm_weight(
 _NLL_CHUNK_BUDGET_BYTES = 1 << 30  # 1 GiB peak per-chunk logits
 
 
+@dataclass
+class CpuMemoryScorerTelemetry:
+    """Runtime counters for the CPU-resident memory scorer."""
+
+    backend_requested: str
+    backend_active: str
+    fallback_reason: str = ""
+    calls: int = 0
+    rows_scored: int = 0
+    tokens_scored: int = 0
+    seconds_total: float = 0.0
+    seconds_last: float = 0.0
+    vocab_tile_size: int = 0
+    row_chunk_size: int = 0
+    weights_version: int = 0
+    weights_shared: bool = False
+
+    def as_dict(self) -> dict[str, Any]:
+        rows_per_second = (
+            self.rows_scored / self.seconds_total
+            if self.seconds_total > 0.0
+            else 0.0
+        )
+        return {
+            "backend_requested": self.backend_requested,
+            "backend_active": self.backend_active,
+            "fallback_reason": self.fallback_reason,
+            "calls": int(self.calls),
+            "rows_scored": int(self.rows_scored),
+            "tokens_scored": int(self.tokens_scored),
+            "seconds_total": float(self.seconds_total),
+            "seconds_last": float(self.seconds_last),
+            "rows_per_second": float(rows_per_second),
+            "vocab_tile_size": int(self.vocab_tile_size),
+            "row_chunk_size": int(self.row_chunk_size),
+            "weights_version": int(self.weights_version),
+            "weights_shared": bool(self.weights_shared),
+        }
+
+
+@dataclass
+class CpuMemoryScorerWeights:
+    """Shared CPU-resident scorer weights for all memory lanes.
+
+    This is the controller-plane weight bank: one CPU snapshot, many worker
+    views. ``share_memory=True`` promotes the CPU tensors into torch shared
+    memory so forked/scoring worker processes can read the same storage instead
+    of cloning the LM head per lane.
+    """
+
+    norm_weight: torch.Tensor
+    lm_head_weight: torch.Tensor
+    eps: float = 1e-6
+    version: int = 0
+    shared: bool = False
+
+    def __post_init__(self) -> None:
+        self.norm_weight = self.norm_weight.detach().cpu().contiguous().clone()
+        self.lm_head_weight = self.lm_head_weight.detach().cpu().contiguous().clone()
+        self.eps = float(self.eps)
+        self.version = int(self.version)
+        self.shared = bool(self.shared)
+        self._amx_packed_head: torch.Tensor | None = None
+        self._amx_tile_version: int | None = None
+        self._validate()
+        if self.shared:
+            self.share_memory_()
+
+    def _validate(self) -> None:
+        if self.norm_weight.dim() != 1:
+            raise ValueError("CpuMemoryScorerWeights norm_weight must be 1D")
+        if self.lm_head_weight.dim() != 2:
+            raise ValueError("CpuMemoryScorerWeights lm_head_weight must be 2D")
+        if self.lm_head_weight.shape[1] != self.norm_weight.shape[0]:
+            raise ValueError(
+                "CpuMemoryScorerWeights dim mismatch: lm_head_weight.shape[1] "
+                f"({self.lm_head_weight.shape[1]}) != norm_weight.shape[0] "
+                f"({self.norm_weight.shape[0]})"
+            )
+
+    @classmethod
+    def from_model(
+        cls,
+        model: Any,
+        *,
+        version: int = 0,
+        share_memory: bool = True,
+    ) -> "CpuMemoryScorerWeights":
+        final_norm = getattr(model, "final_norm", None)
+        lm_head = getattr(model, "lm_head", None)
+        if final_norm is None or lm_head is None:
+            raise ValueError(
+                "CpuMemoryScorerWeights.from_model requires final_norm and lm_head"
+            )
+        norm_weight = getattr(final_norm, "weight", None)
+        lm_head_weight = getattr(lm_head, "weight", None)
+        if norm_weight is None or lm_head_weight is None:
+            raise ValueError(
+                "CpuMemoryScorerWeights.from_model requires final_norm.weight "
+                "and lm_head.weight"
+            )
+        return cls(
+            norm_weight=norm_weight,
+            lm_head_weight=lm_head_weight,
+            eps=float(getattr(final_norm, "eps", 1e-6)),
+            version=int(version),
+            shared=bool(share_memory),
+        )
+
+    def share_memory_(self) -> "CpuMemoryScorerWeights":
+        self.norm_weight.share_memory_()
+        self.lm_head_weight.share_memory_()
+        self.shared = True
+        return self
+
+    @torch.inference_mode()
+    def refresh_from_model(self, model: Any, *, version: int | None = None) -> None:
+        """Refresh the shared CPU snapshot in place from a live model."""
+        final_norm = getattr(model, "final_norm", None)
+        lm_head = getattr(model, "lm_head", None)
+        if final_norm is None or lm_head is None:
+            raise ValueError("refresh_from_model requires final_norm and lm_head")
+        self.norm_weight.copy_(final_norm.weight.detach().cpu())
+        self.lm_head_weight.copy_(lm_head.weight.detach().cpu())
+        self.eps = float(getattr(final_norm, "eps", self.eps))
+        self.version = int(self.version + 1 if version is None else version)
+        self._amx_packed_head = None
+        self._amx_tile_version = None
+
+    def amx_packed_head(self) -> torch.Tensor:
+        """Return one VNNI-packed shared LM-head snapshot.
+
+        The C++ scorer consumes the whole head as a single
+        ``[D_pad/2, 2*V]`` BF16 VNNI matrix, so every scorer lane reads the
+        same CPU storage and the hot path never repacks per vocabulary tile.
+        """
+        if (
+            self._amx_packed_head is not None
+            and self._amx_tile_version == self.version
+        ):
+            return self._amx_packed_head
+        from chaoscontrol.kernels import _cpu_ssm_controller as _ext
+
+        weight_t = self.lm_head_weight.to(dtype=torch.bfloat16).t().contiguous()
+        dim = int(weight_t.shape[0])
+        k_pad = ((dim + 31) // 32) * 32
+        if k_pad != dim:
+            padded = torch.zeros(
+                (k_pad, int(weight_t.shape[1])),
+                dtype=torch.bfloat16,
+                device=weight_t.device,
+            )
+            padded[:dim, :] = weight_t
+            weight_t = padded
+        self._amx_packed_head = _ext.amx_pack_b_vnni(weight_t).contiguous()
+        if self.shared:
+            self._amx_packed_head.share_memory_()
+        self._amx_tile_version = self.version
+        return self._amx_packed_head
+
+    def diagnostics(self) -> dict[str, Any]:
+        return {
+            "version": int(self.version),
+            "shared": bool(self.shared),
+            "dim": int(self.norm_weight.numel()),
+            "vocab": int(self.lm_head_weight.shape[0]),
+            "dtype": str(self.lm_head_weight.dtype).replace("torch.", ""),
+            "amx_head_prepacked": self._amx_packed_head is not None,
+            "amx_packed_shape": (
+                []
+                if self._amx_packed_head is None
+                else [int(x) for x in self._amx_packed_head.shape]
+            ),
+        }
+
+
+class CpuMemoryScorer:
+    """CPU-resident ``final_norm -> lm_head -> per-token NLL`` scorer.
+
+    The scorer is a lightweight worker view over ``CpuMemoryScorerWeights``.
+    The weight bank is the shared CPU snapshot; scorer lanes must not clone the
+    LM head privately unless a unit test explicitly constructs private weights.
+    ``backend='amx_bf16'`` is fail-loud: if the extension was not built with
+    AMX BF16 support or the runtime OS state is unavailable, construction
+    raises instead of silently falling back to PyTorch. ``backend='auto'`` is
+    explicit telemetry mode: it uses AMX when available and records the reason
+    when it must fall back to ``torch_cpu``.
+    """
+
+    _VALID_BACKENDS = {"auto", "torch_cpu", "amx_bf16"}
+
+    def __init__(
+        self,
+        *,
+        weights: CpuMemoryScorerWeights | None = None,
+        norm_weight: torch.Tensor | None = None,
+        lm_head_weight: torch.Tensor | None = None,
+        eps: float = 1e-6,
+        backend: str = "auto",
+        vocab_tile_size: int = 512,
+        row_chunk_size: int = 8192,
+    ) -> None:
+        backend = str(backend)
+        if backend not in self._VALID_BACKENDS:
+            raise ValueError(
+                "CpuMemoryScorer backend must be one of "
+                f"{sorted(self._VALID_BACKENDS)}, got {backend!r}"
+            )
+        if weights is None:
+            if norm_weight is None or lm_head_weight is None:
+                raise ValueError(
+                    "CpuMemoryScorer requires either weights=... or both "
+                    "norm_weight=... and lm_head_weight=..."
+                )
+            weights = CpuMemoryScorerWeights(
+                norm_weight=norm_weight,
+                lm_head_weight=lm_head_weight,
+                eps=float(eps),
+                shared=False,
+            )
+        self.weights = weights
+        self.vocab_tile_size = max(1, int(vocab_tile_size))
+        self.row_chunk_size = max(1, int(row_chunk_size))
+
+        active, reason = self._resolve_backend(backend)
+        self.backend_requested = backend
+        self.backend_active = active
+        self.telemetry = CpuMemoryScorerTelemetry(
+            backend_requested=backend,
+            backend_active=active,
+            fallback_reason=reason,
+            vocab_tile_size=self.vocab_tile_size,
+            row_chunk_size=self.row_chunk_size,
+            weights_version=int(self.weights.version),
+            weights_shared=bool(self.weights.shared),
+        )
+
+    @property
+    def norm_weight(self) -> torch.Tensor:
+        return self.weights.norm_weight
+
+    @property
+    def lm_head_weight(self) -> torch.Tensor:
+        return self.weights.lm_head_weight
+
+    @property
+    def eps(self) -> float:
+        return self.weights.eps
+
+    @classmethod
+    def from_model(
+        cls,
+        model: Any,
+        *,
+        backend: str = "auto",
+        vocab_tile_size: int = 512,
+        row_chunk_size: int = 8192,
+    ) -> "CpuMemoryScorer":
+        weights = CpuMemoryScorerWeights.from_model(model, share_memory=True)
+        return cls(
+            weights=weights,
+            backend=backend,
+            vocab_tile_size=vocab_tile_size,
+            row_chunk_size=row_chunk_size,
+        )
+
+    @staticmethod
+    def _amx_status() -> tuple[bool, str, Any | None]:
+        try:
+            from chaoscontrol.kernels import _cpu_ssm_controller as _ext
+        except Exception as exc:
+            return False, f"extension import failed: {exc.__class__.__name__}: {exc}", None
+        try:
+            compiled = bool(_ext.amx_bf16_kernel_available())
+        except Exception as exc:
+            return False, f"AMX availability query failed: {exc}", _ext
+        if not compiled:
+            return False, "AMX BF16 kernel not compiled into extension", _ext
+        try:
+            runtime = bool(_ext.has_amx_bf16())
+        except Exception as exc:
+            return False, f"AMX runtime query failed: {exc}", _ext
+        if not runtime:
+            return False, "AMX BF16 hardware/OS state unavailable", _ext
+        return True, "", _ext
+
+    def _resolve_backend(self, requested: str) -> tuple[str, str]:
+        if requested == "torch_cpu":
+            return "torch_cpu", ""
+        available, reason, _ext = self._amx_status()
+        if requested == "amx_bf16":
+            if not available:
+                raise RuntimeError(
+                    "CpuMemoryScorer backend='amx_bf16' requested but AMX is "
+                    f"unavailable: {reason}"
+                )
+            if self.lm_head_weight.shape[1] % 2 != 0:
+                raise RuntimeError(
+                    "CpuMemoryScorer AMX backend requires even hidden dim for "
+                    "BF16 dot pairs"
+                )
+            return "amx_bf16", ""
+        if available and self.lm_head_weight.shape[1] % 2 == 0:
+            return "amx_bf16", ""
+        fallback = reason or "hidden dim is odd"
+        return "torch_cpu", fallback
+
+    def diagnostics(self) -> dict[str, Any]:
+        self.telemetry.weights_version = int(self.weights.version)
+        self.telemetry.weights_shared = bool(self.weights.shared)
+        out = self.telemetry.as_dict()
+        out["weights"] = self.weights.diagnostics()
+        return out
+
+    @torch.inference_mode()
+    def score_hidden(
+        self,
+        hidden_states: torch.Tensor,
+        targets: torch.Tensor,
+    ) -> torch.Tensor:
+        """Return per-token NLL for CPU hidden states.
+
+        This method intentionally rejects CUDA tensors. Moving data across the
+        PCIe boundary is a scheduler decision, not a hidden side effect inside
+        the scorer.
+        """
+        if hidden_states.device.type != "cpu" or targets.device.type != "cpu":
+            raise ValueError(
+                "CpuMemoryScorer.score_hidden expects CPU tensors; move/copy "
+                "at the caller boundary so transport cost is visible"
+            )
+        if hidden_states.dim() != 3:
+            raise ValueError("CpuMemoryScorer hidden_states must be (B, T, D)")
+        if targets.shape != hidden_states.shape[:2]:
+            raise ValueError(
+                "CpuMemoryScorer targets must have shape matching hidden_states[:2]"
+            )
+        if hidden_states.shape[-1] != self.lm_head_weight.shape[1]:
+            raise ValueError(
+                "CpuMemoryScorer hidden dim mismatch: "
+                f"{hidden_states.shape[-1]} != {self.lm_head_weight.shape[1]}"
+            )
+
+        t0 = time.perf_counter()
+        if self.backend_active == "amx_bf16":
+            out = self._score_hidden_amx(hidden_states, targets)
+        else:
+            out = self._score_hidden_torch(hidden_states, targets)
+        elapsed = time.perf_counter() - t0
+
+        rows = int(hidden_states.shape[0] * hidden_states.shape[1])
+        self.telemetry.calls += 1
+        self.telemetry.rows_scored += rows
+        self.telemetry.tokens_scored += rows
+        self.telemetry.seconds_total += float(elapsed)
+        self.telemetry.seconds_last = float(elapsed)
+        return out
+
+    def _score_hidden_torch(
+        self,
+        hidden_states: torch.Tensor,
+        targets: torch.Tensor,
+    ) -> torch.Tensor:
+        batch, seq, dim = hidden_states.shape
+        vocab = self.lm_head_weight.shape[0]
+        budget_chunk = max(
+            1,
+            _NLL_CHUNK_BUDGET_BYTES // max(1, int(batch) * int(vocab) * 4),
+        )
+        effective_chunk = min(int(seq), int(budget_chunk))
+        out = torch.empty((batch, seq), dtype=torch.float32)
+        weight = self.lm_head_weight
+        norm_weight = self.norm_weight
+        start = 0
+        while start < seq:
+            end = min(start + effective_chunk, seq)
+            h_chunk = hidden_states[:, start:end, :].to(dtype=weight.dtype)
+            normed = F.rms_norm(h_chunk.float(), (dim,), eps=self.eps).to(
+                h_chunk.dtype
+            )
+            normed = normed * norm_weight.to(dtype=normed.dtype)
+            if normed.dtype != weight.dtype:
+                normed = normed.to(dtype=weight.dtype)
+            logits = F.linear(normed, weight).float()
+            nll = F.cross_entropy(
+                logits.reshape(-1, vocab),
+                targets[:, start:end].reshape(-1).long(),
+                reduction="none",
+            )
+            out[:, start:end] = nll.reshape(batch, end - start)
+            start = end
+        return out
+
+    def _score_hidden_amx(
+        self,
+        hidden_states: torch.Tensor,
+        targets: torch.Tensor,
+        *,
+        lanes: int = 1,
+    ) -> torch.Tensor:
+        from chaoscontrol.kernels import _cpu_ssm_controller as _ext
+
+        return _ext.amx_bf16_nll(
+            hidden_states.float().contiguous(),
+            targets.long().contiguous(),
+            self.norm_weight.float().contiguous(),
+            self.weights.amx_packed_head(),
+            float(self.eps),
+            int(self.row_chunk_size),
+            int(max(1, lanes)),
+        )
+
+
+class CpuMemoryScorerLanePool:
+    """Parallel CPU scorer lanes over one shared scorer weight snapshot."""
+
+    def __init__(
+        self,
+        *,
+        weights: CpuMemoryScorerWeights,
+        lanes: int = 8,
+        backend: str = "auto",
+        vocab_tile_size: int = 512,
+        row_chunk_size: int = 8192,
+        parallel_threshold_rows: int = 2048,
+    ) -> None:
+        self.weights = weights
+        self.lanes = max(1, int(lanes))
+        self.parallel_threshold_rows = max(1, int(parallel_threshold_rows))
+        self.scorers = [
+            CpuMemoryScorer(
+                weights=weights,
+                backend=backend,
+                vocab_tile_size=vocab_tile_size,
+                row_chunk_size=row_chunk_size,
+            )
+            for _ in range(self.lanes)
+        ]
+        self._executor: ThreadPoolExecutor | None = (
+            ThreadPoolExecutor(max_workers=self.lanes, thread_name_prefix="cc-cpu-scorer")
+            if self.lanes > 1
+            else None
+        )
+        self.calls = 0
+        self.parallel_calls = 0
+        self.seconds_total = 0.0
+        self.seconds_last = 0.0
+        self.rows_scored = 0
+
+    @classmethod
+    def from_model(
+        cls,
+        model: Any,
+        *,
+        lanes: int = 8,
+        backend: str = "auto",
+        vocab_tile_size: int = 512,
+        row_chunk_size: int = 8192,
+        parallel_threshold_rows: int = 2048,
+    ) -> "CpuMemoryScorerLanePool":
+        return cls(
+            weights=CpuMemoryScorerWeights.from_model(model, share_memory=True),
+            lanes=lanes,
+            backend=backend,
+            vocab_tile_size=vocab_tile_size,
+            row_chunk_size=row_chunk_size,
+            parallel_threshold_rows=parallel_threshold_rows,
+        )
+
+    def close(self) -> None:
+        if self._executor is not None:
+            self._executor.shutdown(wait=True)
+            self._executor = None
+
+    def __enter__(self) -> "CpuMemoryScorerLanePool":
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        self.close()
+
+    @torch.inference_mode()
+    def score_hidden(
+        self,
+        hidden_states: torch.Tensor,
+        targets: torch.Tensor,
+    ) -> torch.Tensor:
+        if hidden_states.device.type != "cpu" or targets.device.type != "cpu":
+            raise ValueError("CpuMemoryScorerLanePool expects CPU tensors")
+        if hidden_states.dim() != 3:
+            raise ValueError("CpuMemoryScorerLanePool hidden_states must be (B, T, D)")
+        if targets.shape != hidden_states.shape[:2]:
+            raise ValueError("CpuMemoryScorerLanePool targets shape mismatch")
+
+        t0 = time.perf_counter()
+        batch, seq, dim = hidden_states.shape
+        rows = int(batch * seq)
+        self.calls += 1
+        self.rows_scored += rows
+        if self.scorers[0].backend_active == "amx_bf16":
+            out = self.scorers[0]._score_hidden_amx(
+                hidden_states,
+                targets,
+                lanes=self.lanes,
+            )
+            self.parallel_calls += int(self.lanes > 1 and rows >= self.parallel_threshold_rows)
+            rows_by_lane = [0 for _ in range(self.lanes)]
+            chunk = (rows + self.lanes - 1) // self.lanes
+            for lane_idx in range(self.lanes):
+                start = lane_idx * chunk
+                end = min(rows, start + chunk)
+                if start < rows:
+                    rows_by_lane[lane_idx] = end - start
+            for scorer, lane_rows in zip(self.scorers, rows_by_lane, strict=False):
+                scorer.telemetry.calls += 1 if lane_rows > 0 else 0
+                scorer.telemetry.rows_scored += int(lane_rows)
+                scorer.telemetry.tokens_scored += int(lane_rows)
+        elif (
+            self._executor is None
+            or rows < self.parallel_threshold_rows
+            or self.lanes <= 1
+        ):
+            out = self.scorers[0].score_hidden(hidden_states, targets)
+        else:
+            hidden_flat = hidden_states.reshape(rows, dim)
+            target_flat = targets.reshape(rows)
+            ranges: list[tuple[int, int]] = []
+            chunk = (rows + self.lanes - 1) // self.lanes
+            for start in range(0, rows, chunk):
+                ranges.append((start, min(start + chunk, rows)))
+
+            def _score_range(args: tuple[int, int, int]) -> tuple[int, torch.Tensor]:
+                lane_idx, start, end = args
+                h = hidden_flat[start:end].reshape(end - start, 1, dim)
+                y = target_flat[start:end].reshape(end - start, 1)
+                return start, self.scorers[lane_idx].score_hidden(h, y).reshape(-1)
+
+            futures = [
+                self._executor.submit(_score_range, (i, start, end))
+                for i, (start, end) in enumerate(ranges)
+            ]
+            out_flat = torch.empty(rows, dtype=torch.float32)
+            for fut in futures:
+                start, values = fut.result()
+                out_flat[start : start + values.numel()] = values
+            out = out_flat.reshape(batch, seq)
+            self.parallel_calls += 1
+        elapsed = time.perf_counter() - t0
+        self.seconds_last = float(elapsed)
+        self.seconds_total += float(elapsed)
+        return out
+
+    def diagnostics(self) -> dict[str, Any]:
+        lane_diags = [scorer.diagnostics() for scorer in self.scorers]
+        pin_raw = os.environ.get("CHAOSCONTROL_AMX_SCORER_PIN_THREADS", "1")
+        return {
+            "lanes": int(self.lanes),
+            "amx_thread_pinning_enabled": pin_raw not in {"0", "false", "False", "off"},
+            "parallel_threshold_rows": int(self.parallel_threshold_rows),
+            "calls": int(self.calls),
+            "parallel_calls": int(self.parallel_calls),
+            "rows_scored": int(self.rows_scored),
+            "seconds_total": float(self.seconds_total),
+            "seconds_last": float(self.seconds_last),
+            "rows_per_second": (
+                float(self.rows_scored / self.seconds_total)
+                if self.seconds_total > 0.0
+                else 0.0
+            ),
+            "weights": self.weights.diagnostics(),
+            "lane_backends": sorted({d["backend_active"] for d in lane_diags}),
+            "lane_rows_scored": [int(d["rows_scored"]) for d in lane_diags],
+        }
+
+
 @torch.inference_mode()
 def chunked_nll_from_hidden(
     model: Any,
@@ -91,6 +672,7 @@ def chunked_nll_from_hidden(
     targets: torch.Tensor,
     *,
     chunk_size: int = 1024,
+    cpu_scorer: CpuMemoryScorer | CpuMemoryScorerLanePool | None = None,
 ) -> torch.Tensor:
     """Per-token negative log-likelihood ``(B, T)`` from encoder hidden
     states, computed in time-axis chunks to bound peak memory.
@@ -111,6 +693,8 @@ def chunked_nll_from_hidden(
         raise ValueError(
             f"chunked_nll_from_hidden: chunk_size must be positive, got {chunk_size}"
         )
+    if cpu_scorer is not None:
+        return cpu_scorer.score_hidden(hidden_states, targets)
     batch, seq, _ = hidden_states.shape
     final_norm = model.final_norm
     lm_head = model.lm_head

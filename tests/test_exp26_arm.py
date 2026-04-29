@@ -111,6 +111,14 @@ def test_smoke_matrix_two_entries_and_isolated_outputs(exp26, speed_config):
     assert active["crct_enabled"] is True
     assert active["replay_eviction_enabled"] is True
     assert active["replay_eviction_mode"] == "active"
+    assert active["replay_eviction_scoring_mode"] == "oracle"
+    assert active["replay_eviction_arm_runtime_enabled"] is True
+    assert (
+        active["replay_eviction_arm_runtime_namespace"]
+        == "exp26_smoke_smoke_crct_replay_active_s42"
+    )
+    assert active["replay_eviction_cpu_scorer_backend"] == "amx_bf16"
+    assert active["replay_eviction_cpu_scorer_lanes"] == 56
     assert active["bucket_prototypes"] is True
     assert active["prototype_dim"] == 64
     assert active["replay_eviction_action_agreement_count"] == 1
@@ -135,7 +143,7 @@ def test_calibration_matrix_single_entry(exp26, speed_config):
     assert e["fast_slow_enabled"] is True
     assert "exp26_calibration_shadow_s42" in e["name"]
     assert e["replay_eviction_action_agreement_count"] == 1
-    assert e["replay_eviction_max_seconds"] == 12.0
+    assert e["replay_eviction_max_seconds"] == 8.0
     # Trace path lives in the calibration directory.
     assert "calibration" in str(e["replay_eviction_trace_path"])
 
@@ -152,13 +160,20 @@ def test_calibration_matrix_uses_full_arm_pipeline(exp26, speed_config):
     # Pipeline knobs identical to headline lock.
     assert e["model_dim"] == 384
     assert e["replay_eviction_memory_streams"] == 8
+    assert e["replay_eviction_arm_runtime_enabled"] is True
+    assert (
+        e["replay_eviction_arm_runtime_namespace"]
+        == "exp26_calibration_shadow_s1337"
+    )
+    assert e["replay_eviction_scoring_mode"] == "oracle"
+    assert e["replay_eviction_cpu_scorer_backend"] == "amx_bf16"
+    assert e["replay_eviction_cpu_scorer_lanes"] == 56
+    assert e["replay_eviction_cpu_scorer_weight_sync_interval_steps"] == 64
     assert e["replay_eviction_oracle_confirm_top_k"] == 32
     assert e["replay_eviction_oracle_variant_chunk_size"] == 1
     assert e["replay_eviction_probe_buffer_size"] == 32
     assert e["replay_eviction_frame_ttl_steps"] == 256
-    assert e["replay_eviction_slot_work_chunk_size"] == 64
-    assert e["replay_eviction_oracle_confirm_top_k"] < e["replay_eviction_slot_work_chunk_size"]
-    assert e["replay_eviction_max_seconds"] == 12.0
+    assert e["replay_eviction_max_seconds"] == 8.0
     assert e["replay_eviction_trace_flush_rows"] == 256
     # Mode is shadow, not active.
     assert e["replay_eviction_mode"] == "shadow"
@@ -345,11 +360,8 @@ def test_arm_v1_aggressive_uses_aggressive_thresholds(tmp_path, exp26, speed_con
     assert e["replay_eviction_threshold"] == 0.04
     assert e["replay_eviction_peak_preserve_utility_threshold"] == 0.005
     assert e["replay_eviction_peak_preserve_sharpness_threshold"] == 0.003
-    # Aggressive policy: act on first observation, but keep the coverage-first
-    # oracle cap from the pipeline lock so GPU3 sweeps more slots instead of
-    # spending the cell on deeper confirmation of a narrow slice.
+    # Aggressive policy: act on first observation; oracle chunk shape stays fixed.
     assert e["replay_eviction_action_agreement_count"] == 1
-    assert e["replay_eviction_slot_work_chunk_size"] == 64
     assert e["replay_eviction_oracle_confirm_top_k"] == 32
     assert e["replay_eviction_mode"] == "active"
 

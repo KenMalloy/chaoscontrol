@@ -317,6 +317,7 @@ class TestReplayEvictionLoop:
         assert "slots_tracked" in diag
         assert "quarantined_count" in diag
         assert diag["tick_count"] == 0
+        assert diag["scoring_mode"] == "proxy"
         assert diag["memory_streams"] == 8
         assert diag["memory_streams_requested"] == 8
         assert diag["memory_streams_active"] is False
@@ -331,9 +332,64 @@ class TestReplayEvictionLoop:
         assert "slot_coverage_ratio" in diag
         assert "slot_scored_sweeps" in diag
         assert "oracle_confirmations_total" in diag
+        assert "oracle_direct_confirmations_total" in diag
+        assert "oracle_scored_slots_total" in diag
+        assert "last_oracle_scoring_seconds" in diag
         assert "proxy_oracle_abs_error_mean" in diag
         assert "last_probe_seconds" in diag
         assert "probe_over_budget_total" in diag
+
+    def test_oracle_scoring_mode_uses_gpu3_force_on_oracle_without_proxy(self, monkeypatch):
+        loop = ReplayEvictionLoop(
+            action_mode="shadow",
+            scoring_mode="oracle",
+            min_slot_age_steps=0,
+            min_score_count=1,
+            eviction_threshold=100.0,
+            slot_work_chunk_size=2,
+        )
+        model = _StubModel(n_slots=3, memory_benefit=0.0, use_table=True)
+        input_ids = torch.randint(0, 32, (2, 5))
+        valid_mask = torch.ones(2, 5)
+        seen: dict[str, object] = {}
+
+        def fail_proxy(**_kwargs):
+            raise AssertionError("oracle scoring mode must not use cheap proxy")
+
+        def fake_oracle(**kwargs):
+            slots = list(kwargs["slot_indices"])
+            seen["slot_indices"] = slots
+            seen["variant_chunk_size"] = kwargs["variant_chunk_size"]
+            mask = kwargs["probe_valid_mask"][:, 1:].bool()
+            bsz, seq = mask.shape
+            return replay_eviction_mod.OracleConfirmationResult(
+                slot_indices=slots,
+                oracle_deltas=torch.full((len(slots), bsz, seq), 1.0),
+                nll_baseline=torch.zeros(bsz, seq),
+                nll_no_sidecar=torch.ones(bsz, seq),
+                mask=mask,
+            )
+
+        monkeypatch.setattr(replay_eviction_mod, "counterfactual_probe", fail_proxy)
+        monkeypatch.setattr(replay_eviction_mod, "oracle_confirm_slots", fake_oracle)
+
+        loop.cache_probe(
+            input_ids=input_ids,
+            valid_mask=valid_mask,
+            cache_read_cutoff=None,
+            step=7,
+        )
+        result = loop.tick(model=model, step=7)
+
+        assert result.evicted_indices == []
+        assert seen["slot_indices"] == [0, 1]
+        assert seen["variant_chunk_size"] == 1
+        diag = loop.diagnostics()
+        assert diag["scoring_mode"] == "oracle"
+        assert diag["oracle_scored_slots_total"] == 2
+        assert diag["oracle_direct_confirmations_total"] == 2
+        assert diag["oracle_confirmations_total"] == 2
+        assert diag["proxy_oracle_pairs_total"] == 0
 
     def test_ema_smoothing(self):
         loop = ReplayEvictionLoop(eviction_ema_beta=0.9)
@@ -450,6 +506,60 @@ class TestReplayEvictionLoop:
         assert diag["probe_frames_buffered"] == 0
         assert diag["last_visible_slots"] == 3
         assert diag["slots_untouched_past_ttl"] == 0
+
+    def test_arm_runtime_scheduler_ring_drives_slot_work(self, monkeypatch):
+        loop = ReplayEvictionLoop(
+            action_mode="shadow",
+            slot_work_chunk_size=2,
+            oracle_confirm_top_k=0,
+            arm_runtime_enabled=True,
+            arm_runtime_namespace="testarmrt",
+        )
+        model = _StubModel(n_slots=3, use_table=True)
+        seen: list[int] = []
+
+        def fake_probe(**kwargs):
+            slot_indices = list(kwargs["score_slot_indices"])
+            seen.extend(slot_indices)
+            n = len(slot_indices)
+            return CounterfactualResult(
+                marginal_gains=torch.ones(n, 1, 2),
+                sidecar_value=torch.zeros(1, 2),
+                nll_baseline=torch.zeros(1, 2),
+                nll_no_sidecar=torch.zeros(1, 2),
+                weights_baseline=torch.ones(1, n) / max(n, 1),
+                mask=torch.ones(1, 2, dtype=torch.bool),
+                slot_indices=slot_indices,
+            )
+
+        monkeypatch.setattr(replay_eviction_mod, "counterfactual_probe", fake_probe)
+        loop.cache_probe(
+            input_ids=torch.zeros(1, 3, dtype=torch.long),
+            valid_mask=torch.ones(1, 3),
+            cache_read_cutoff=None,
+            step=5,
+            stream_id=10,
+        )
+        loop.tick(model=model, step=5)
+        loop.tick(model=model, step=6)
+        diag = loop.diagnostics()
+        loop.close()
+
+        assert sorted(seen) == [0, 1, 2]
+        assert diag["memory_streams_active"] is True
+        assert (
+            diag["memory_stream_execution_mode"]
+            == "native_cpu_scheduler_inline_gpu3_worker"
+        )
+        assert (
+            diag["arm_runtime"]["transport_mode"]
+            == "inline_worker_attached_shm_endpoints"
+        )
+        assert diag["arm_runtime"]["jobs_pushed"] == 2
+        assert diag["arm_runtime"]["jobs_popped"] == 2
+        assert diag["arm_runtime"]["result_ring_pushes"] == 2
+        assert diag["arm_runtime"]["native_scheduler"]["jobs_emitted"] == 2
+        assert diag["arm_runtime"]["native_scheduler"]["results_recorded"] == 2
 
     def test_trace_rows_capture_stream_and_decision_context(self, monkeypatch, tmp_path):
         trace_path = tmp_path / "replay_trace.ndjson"
@@ -656,6 +766,39 @@ class TestOracleConfirmation:
         assert hide2_mask.shape == (2, 4)
         assert not hide2_mask[:, 2].any()
         assert hide2_mask[:, [0, 1, 3]].all()
+
+    def test_oracle_can_send_lm_head_scoring_to_cpu_scorer(self):
+        model = _StubModel(n_slots=3, memory_benefit=0.25, use_table=True)
+        input_ids = torch.randint(0, 32, (2, 9))
+        valid_mask = torch.ones(2, 9)
+
+        class _CountingCpuScorer:
+            def __init__(self) -> None:
+                self.calls = 0
+                self.rows = 0
+
+            def score_hidden(self, hidden_states: torch.Tensor, targets: torch.Tensor):
+                assert hidden_states.device.type == "cpu"
+                assert targets.device.type == "cpu"
+                self.calls += 1
+                self.rows += int(hidden_states.shape[0] * hidden_states.shape[1])
+                return torch.zeros(hidden_states.shape[:2], dtype=torch.float32)
+
+        scorer = _CountingCpuScorer()
+        result = oracle_confirm_slots(
+            model=model,
+            outer=model.outer_model,
+            probe_input_ids=input_ids,
+            probe_valid_mask=valid_mask,
+            slot_indices=[0, 1],
+            variant_chunk_size=1,
+            cpu_scorer=scorer,
+        )
+
+        assert result.slot_indices == [0, 1]
+        assert scorer.calls == 3  # baseline/off plus one call per hide variant.
+        assert scorer.rows == (2 + 1 + 1) * 2 * 8
+        assert result.oracle_deltas.device.type == "cpu"
 
 
 # ---------------------------------------------------------------------------

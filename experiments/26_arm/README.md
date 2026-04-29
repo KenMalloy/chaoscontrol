@@ -51,10 +51,18 @@ calibrated thresholds into the active arms.
 | `arm_e_crct_replay_active_aggressive` | active maintenance at aggressive thresholds | active | aggressive |
 
 `agreement_count` differs across arms: `arm_d=2` (consensus across two fresh
-frames), `arm_e=1` (act on first observation). Both active arms keep the same
-coverage-first maintenance budget: GPU3 scores 64 slots per tick and caps exact
-oracle confirmation at 32 candidates so the massage pass sweeps the sidecar
-population instead of over-confirming a narrow slice.
+frames), `arm_e=1` (act on first observation).
+
+Replay maintenance uses `replay_eviction_scoring_mode=oracle`: GPU3 is the
+memory/massage worker and scores scheduled slots with the real
+`force_on` / no-sidecar / hide-slot path. The dense LM-head NLL part of that
+oracle is assigned to a 56-lane CPU AMX scorer
+(`replay_eviction_cpu_scorer_backend=amx_bf16`) over one shared CPU weight
+snapshot, so GPU3 stays focused on memory physics while the CPU controller
+plane produces action evidence at line rate. The CPU conductor is the native
+`ArmMaintenanceScheduler`; each run cell gets its own shared-memory job/result
+ring namespace so scheduled slot work and GPU3 completion evidence remain
+separate under parallel launches.
 
 ## Reading the matrix
 

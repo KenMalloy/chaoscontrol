@@ -32,6 +32,7 @@ constexpr int SPAN_LENGTH_DEFAULT = 4;
 // per-slot. 16 matches the AMX `M=16` tile shape so a single tile load
 // covers the whole simplex on the SPR forward path.
 constexpr int SIMPLEX_CANDIDATES_DEFAULT = 16;
+constexpr int ARM_MAINTENANCE_SLOT_CAPACITY = 16;
 
 // Sentinel values for unpopulated simplex candidate slots. Heuristic-only
 // (V0) producers fill the entire candidate arrays with sentinels so the
@@ -128,6 +129,47 @@ struct ReplayOutcome {
     uint8_t  _pad1[2];                            // body 94 → 96 (8-byte boundary)
 };
 
+// 168 bytes total: header(8) + 4*u64(32) + slot_ids[16]*u64(128).
+// CPU -> GPU3 maintenance job descriptor. Tensor payloads stay in the
+// GPU3 executor's frame store; this wire record only schedules which
+// frame/slots/mode the memory worker should process.
+struct ArmMaintenanceJob {
+    uint8_t  event_type;                          // = 4
+    uint8_t  job_type;                            // 1=oracle_slot_work
+    uint8_t  stream_id;
+    uint8_t  flags;
+    uint32_t slot_count;
+    uint64_t job_id;
+    uint64_t frame_id;
+    uint64_t step;
+    uint64_t cache_read_cutoff;                   // UINT64_MAX = None
+    uint64_t slot_ids[ARM_MAINTENANCE_SLOT_CAPACITY];
+};
+
+// 192 bytes total: header(8) + 3*u64(24) + 4*u32(16) + 4*f32(16) +
+// slot_ids[16]*u64(128). GPU3 -> CPU result descriptor carrying timing
+// and compact completion/evidence counters; full tensors remain in the
+// executor-local path and the trace sink.
+struct ArmMaintenanceResult {
+    uint8_t  event_type;                          // = 5
+    uint8_t  job_type;
+    uint8_t  stream_id;
+    uint8_t  status;                              // 0=ok, nonzero=executor failure/drop
+    uint32_t slot_count;
+    uint64_t job_id;
+    uint64_t frame_id;
+    uint64_t step;
+    uint32_t slots_scored;
+    uint32_t actions_confirmed;
+    uint32_t actions_rejected;
+    uint32_t _pad0;
+    float    probe_seconds;
+    float    oracle_seconds;
+    float    cpu_seconds;
+    float    frame_age_seconds;
+    uint64_t slot_ids[ARM_MAINTENANCE_SLOT_CAPACITY];
+};
+
 #pragma pack(pop)
 
 static_assert(sizeof(WriteEvent) == 568,
@@ -136,3 +178,7 @@ static_assert(sizeof(QueryEvent) == 736,
               "QueryEvent must be exactly 736 bytes on the wire");
 static_assert(sizeof(ReplayOutcome) == 96,
               "ReplayOutcome must be exactly 96 bytes on the wire");
+static_assert(sizeof(ArmMaintenanceJob) == 168,
+              "ArmMaintenanceJob must be exactly 168 bytes on the wire");
+static_assert(sizeof(ArmMaintenanceResult) == 192,
+              "ArmMaintenanceResult must be exactly 192 bytes on the wire");

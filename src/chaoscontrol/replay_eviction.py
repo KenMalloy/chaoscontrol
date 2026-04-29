@@ -12,7 +12,9 @@ confirmation pass measures active mutations under real SSM dynamics.
 """
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 import time
 from collections import deque
 from dataclasses import dataclass, field
@@ -22,7 +24,8 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 
-from .cache_utility import chunked_nll_from_hidden
+from .cache_utility import CpuMemoryScorerLanePool, chunked_nll_from_hidden
+from .kernels import _cpu_ssm_controller as _ext
 from .slot_table import SlotTable, SlotRecord, SlotId
 from .slot_table import SLOT_WARMING, SLOT_ACTIVE, SLOT_SHARP
 from .slot_table import SLOT_DECAYING, SLOT_QUARANTINED, SLOT_RETIRED
@@ -69,6 +72,7 @@ class CounterfactualResult:
     weights_baseline: torch.Tensor
     mask: torch.Tensor
     slot_indices: list[int]
+    scoring_mode: str = "proxy"
 
 
 @dataclass
@@ -321,6 +325,7 @@ def oracle_confirm_slots(
     slot_indices: list[int],
     cache_read_cutoff: int | None = None,
     variant_chunk_size: int = 1,
+    cpu_scorer: Any | None = None,
 ) -> OracleConfirmationResult:
     """Confirm candidate slots with real memory-injected SSM dynamics.
 
@@ -375,6 +380,13 @@ def oracle_confirm_slots(
                 cache_read_cutoff=cache_read_cutoff,
                 memory_slot_mask=slot_masks_exp,
             )
+        if cpu_scorer is not None:
+            return chunked_nll_from_hidden(
+                model,
+                hidden.detach().cpu(),
+                y_exp.detach().cpu(),
+                cpu_scorer=cpu_scorer,
+            ).reshape(variants, B, T)
         return chunked_nll_from_hidden(model, hidden, y_exp).reshape(variants, B, T)
 
     base_masks = torch.ones(2, n_slots, device=dev, dtype=torch.bool)
@@ -382,9 +394,12 @@ def oracle_confirm_slots(
     base_nll = _score_masks(base_masks)
     nll_baseline = base_nll[0]
     nll_no_sidecar = base_nll[1]
+    score_device = base_nll.device
 
     candidate_chunk = max(1, int(variant_chunk_size))
-    oracle_deltas = torch.empty(len(candidates), B, T, device=dev, dtype=torch.float32)
+    oracle_deltas = torch.empty(
+        len(candidates), B, T, device=score_device, dtype=torch.float32
+    )
     for start in range(0, len(candidates), candidate_chunk):
         chunk = candidates[start : start + candidate_chunk]
         slot_masks = torch.ones(len(chunk), n_slots, device=dev, dtype=torch.bool)
@@ -588,6 +603,7 @@ class ReplayEvictionLoop:
         trace_max_rows: int = 0,
         trace_flush_rows: int = 256,
         probe_chunk_size: int = 16,
+        scoring_mode: str = "proxy",
         oracle_confirm_top_k: int = 32,
         oracle_variant_chunk_size: int = 1,
         drift_threshold: float = 0.3,
@@ -606,10 +622,21 @@ class ReplayEvictionLoop:
         frame_ttl_steps: int = 256,
         slot_work_chunk_size: int = 64,
         action_agreement_count: int = 2,
+        cpu_scorer_backend: str = "off",
+        cpu_scorer_lanes: int = 8,
+        cpu_scorer_vocab_tile_size: int = 512,
+        cpu_scorer_row_chunk_size: int = 8192,
+        cpu_scorer_parallel_threshold_rows: int = 2048,
+        cpu_scorer_weight_sync_interval_steps: int = 64,
+        arm_runtime_enabled: bool = False,
+        arm_runtime_namespace: str | None = None,
     ) -> None:
         if action_mode not in {"active", "shadow"}:
             raise ValueError("action_mode must be 'active' or 'shadow'")
+        if scoring_mode not in {"proxy", "oracle"}:
+            raise ValueError("scoring_mode must be 'proxy' or 'oracle'")
         self._action_mode = str(action_mode)
+        self._scoring_mode = str(scoring_mode)
         self._memory_streams = max(1, int(memory_streams))
         self._threshold = float(eviction_threshold)
         self._ema_beta = float(eviction_ema_beta)
@@ -634,6 +661,45 @@ class ReplayEvictionLoop:
         self._frame_ttl_steps = max(0, int(frame_ttl_steps))
         self._slot_work_chunk_size = max(1, int(slot_work_chunk_size))
         self._action_agreement_count = max(1, int(action_agreement_count))
+        self._cpu_scorer_backend = str(cpu_scorer_backend)
+        if self._cpu_scorer_backend not in {"off", "auto", "torch_cpu", "amx_bf16"}:
+            raise ValueError(
+                "cpu_scorer_backend must be 'off', 'auto', 'torch_cpu', or "
+                f"'amx_bf16', got {self._cpu_scorer_backend!r}"
+            )
+        self._cpu_scorer_lanes = max(1, int(cpu_scorer_lanes))
+        self._cpu_scorer_vocab_tile_size = max(1, int(cpu_scorer_vocab_tile_size))
+        self._cpu_scorer_row_chunk_size = max(1, int(cpu_scorer_row_chunk_size))
+        self._cpu_scorer_parallel_threshold_rows = max(
+            1, int(cpu_scorer_parallel_threshold_rows)
+        )
+        self._cpu_scorer_weight_sync_interval_steps = max(
+            1, int(cpu_scorer_weight_sync_interval_steps)
+        )
+        self._cpu_scorer: CpuMemoryScorerLanePool | None = None
+        self._cpu_scorer_weight_syncs: int = 0
+        self._cpu_scorer_last_sync_step: int = -1
+        self._cpu_scorer_errors_total: int = 0
+        self._cpu_scorer_last_error: str = ""
+        self._arm_runtime_enabled_requested = bool(arm_runtime_enabled)
+        self._arm_runtime_active = False
+        self._arm_runtime_error = ""
+        self._arm_scheduler: Any | None = None
+        self._arm_job_ring: Any | None = None
+        self._arm_job_worker_ring: Any | None = None
+        self._arm_result_ring: Any | None = None
+        self._arm_result_worker_ring: Any | None = None
+        self._arm_job_ring_name = ""
+        self._arm_result_ring_name = ""
+        self._arm_jobs_pushed = 0
+        self._arm_jobs_popped = 0
+        self._arm_job_ring_drops = 0
+        self._arm_result_ring_pushes = 0
+        self._arm_result_ring_pops = 0
+        self._arm_result_ring_drops = 0
+        self._active_arm_job: dict[str, Any] | None = None
+        if self._arm_runtime_enabled_requested:
+            self._init_arm_runtime(arm_runtime_namespace)
 
         # Legacy per-index tracking (kept for backward compat in tests)
         self._slot_utility_ema: dict[int, float] = {}
@@ -711,11 +777,16 @@ class ReplayEvictionLoop:
             "probe": 0.0,
             "ema": 0.0,
             "oracle": 0.0,
+            "oracle_score": 0.0,
             "action": 0.0,
         }
         self._stage_seconds_total: dict[str, float] = dict(self._last_stage_seconds)
         self._oracle_seconds_total: float = 0.0
         self._last_oracle_seconds: float = 0.0
+        self._oracle_scored_slots_total: int = 0
+        self._oracle_direct_confirmations_total: int = 0
+        self._oracle_scoring_seconds_total: float = 0.0
+        self._last_oracle_scoring_seconds: float = 0.0
         self._slot_last_scored_step: dict[int, int] = {}
         self._last_visible_slots: int = 0
         self._last_untouched_slots: int = 0
@@ -735,6 +806,80 @@ class ReplayEvictionLoop:
 
         # Policy
         self._policy = MaintenancePolicy()
+
+    def _init_arm_runtime(self, namespace: str | None) -> None:
+        """Create the native CPU conductor and its local shm ring boundary."""
+        try:
+            ns_raw = namespace or f"{os.getpid()}_{id(self) & 0xFFFF:x}"
+            ns_text = str(ns_raw)
+            ns_clean = "".join(ch for ch in ns_text if ch.isalnum())[:16] or "arm"
+            ns_digest = hashlib.blake2s(
+                ns_text.encode("utf-8"), digest_size=4
+            ).hexdigest()
+            ns = f"{ns_clean}{ns_digest}"
+            self._arm_job_ring_name = f"/ccarmj_{ns}"
+            self._arm_result_ring_name = f"/ccarmr_{ns}"
+            try:
+                _ext.ShmRingArmMaintenanceJob.unlink(self._arm_job_ring_name)
+            except Exception:
+                pass
+            try:
+                _ext.ShmRingArmMaintenanceResult.unlink(self._arm_result_ring_name)
+            except Exception:
+                pass
+            self._arm_scheduler = _ext.ArmMaintenanceScheduler(
+                int(self._memory_streams),
+                int(self._slot_work_chunk_size),
+                int(self._frame_ttl_steps),
+                int(self._probe_buffer_size),
+            )
+            self._arm_job_ring = _ext.ShmRingArmMaintenanceJob.create(
+                self._arm_job_ring_name
+            )
+            self._arm_job_worker_ring = _ext.ShmRingArmMaintenanceJob.attach(
+                self._arm_job_ring_name
+            )
+            self._arm_result_ring = _ext.ShmRingArmMaintenanceResult.create(
+                self._arm_result_ring_name
+            )
+            self._arm_result_worker_ring = _ext.ShmRingArmMaintenanceResult.attach(
+                self._arm_result_ring_name
+            )
+            self._arm_runtime_active = True
+        except Exception as exc:
+            self._arm_runtime_active = False
+            self._arm_runtime_error = f"{exc.__class__.__name__}: {exc}"
+            self._arm_scheduler = None
+            self._arm_job_ring = None
+            self._arm_job_worker_ring = None
+            self._arm_result_ring = None
+            self._arm_result_worker_ring = None
+            raise RuntimeError(
+                f"ARM runtime requested but failed to initialize: {self._arm_runtime_error}"
+            ) from exc
+
+    def close(self) -> None:
+        """Best-effort cleanup for ARM runtime shm names."""
+        for cls_name, name in (
+            ("ShmRingArmMaintenanceJob", self._arm_job_ring_name),
+            ("ShmRingArmMaintenanceResult", self._arm_result_ring_name),
+        ):
+            if not name:
+                continue
+            try:
+                getattr(_ext, cls_name).unlink(name)
+            except Exception:
+                pass
+        self._arm_job_ring = None
+        self._arm_job_worker_ring = None
+        self._arm_result_ring = None
+        self._arm_result_worker_ring = None
+
+    def __del__(self) -> None:  # pragma: no cover - destructor best effort
+        try:
+            self.close()
+        except Exception:
+            pass
 
     def cache_probe(
         self,
@@ -764,6 +909,24 @@ class ReplayEvictionLoop:
         self._next_frame_id += 1
         self._probe_frames.append(frame)
         self._probe_frames_ingested += 1
+        if self._arm_runtime_active and self._arm_scheduler is not None:
+            try:
+                self._arm_scheduler.ingest_frame(
+                    int(frame.frame_id),
+                    int(frame.step),
+                    int(frame.stream_id),
+                    (
+                        (1 << 64) - 1
+                        if frame.cache_read_cutoff is None
+                        else int(frame.cache_read_cutoff)
+                    ),
+                )
+            except Exception as exc:
+                self._arm_runtime_active = False
+                self._arm_runtime_error = f"{exc.__class__.__name__}: {exc}"
+                raise RuntimeError(
+                    f"ARM runtime requested but frame ingest failed: {self._arm_runtime_error}"
+                ) from exc
         self._last_queue_depth = len(self._probe_frames)
         self._queue_depth_sum += self._last_queue_depth
         self._queue_depth_samples += 1
@@ -800,12 +963,97 @@ class ReplayEvictionLoop:
             return table.visible_indices(read_cutoff=None)
         return list(range(len(getattr(outer, "_slots", []))))
 
+    def _frame_by_id(self, frame_id: int) -> ProbeFrame | None:
+        for frame in self._probe_frames:
+            if int(frame.frame_id) == int(frame_id):
+                return frame
+        return None
+
+    def _select_native_job(
+        self,
+        *,
+        outer: Any,
+        step: int,
+    ) -> tuple[ProbeFrame | None, list[int]]:
+        if (
+            not self._arm_runtime_active
+            or self._arm_scheduler is None
+            or self._arm_job_ring is None
+            or self._arm_job_worker_ring is None
+        ):
+            return None, []
+        visible = [int(x) for x in self._visible_slot_indices(outer)]
+        job = self._arm_scheduler.next_job(int(step), visible)
+        if job is None:
+            return None, []
+        job_d = dict(job)
+        if not bool(self._arm_job_ring.push(job_d)):
+            self._arm_job_ring_drops += 1
+            self._record_arm_runtime_result(
+                job=job_d,
+                step=step,
+                slots_scored=0,
+                confirmed_delta=0,
+                rejected_delta=0,
+                frame_age_seconds=0.0,
+                status=1,
+                through_ring=False,
+            )
+            return None, []
+        self._arm_jobs_pushed += 1
+        popped = self._arm_job_worker_ring.pop()
+        if popped is None:
+            self._record_arm_runtime_result(
+                job=job_d,
+                step=step,
+                slots_scored=0,
+                confirmed_delta=0,
+                rejected_delta=0,
+                frame_age_seconds=0.0,
+                status=2,
+                through_ring=False,
+            )
+            return None, []
+        self._arm_jobs_popped += 1
+        job_d = dict(popped)
+        frame = self._frame_by_id(int(job_d["frame_id"]))
+        if frame is None:
+            self._record_arm_runtime_result(
+                job=job_d,
+                step=step,
+                slots_scored=0,
+                confirmed_delta=0,
+                rejected_delta=0,
+                frame_age_seconds=0.0,
+                status=3,
+                through_ring=False,
+            )
+            return None, []
+        slot_count = min(
+            int(job_d["slot_count"]),
+            int(_ext.wire_event_constants()["ARM_MAINTENANCE_SLOT_CAPACITY"]),
+        )
+        slot_work = [int(x) for x in list(job_d["slot_ids"])[:slot_count]]
+        slot_work = [x for x in slot_work if x != (1 << 64) - 1]
+        self._active_arm_job = job_d
+        return frame, slot_work
+
     def _select_frame_and_slot_work(
         self,
         *,
         outer: Any,
         step: int,
     ) -> tuple[ProbeFrame | None, list[int]]:
+        if self._arm_runtime_active:
+            frame, work = self._select_native_job(outer=outer, step=step)
+            if frame is not None or work:
+                return frame, work
+            # If native scheduling is enabled and simply has no job ready, do
+            # not fall through to the legacy Python scheduler — that would hide
+            # a conductor/worker bug in telemetry.
+            return None, []
+        if self._arm_runtime_enabled_requested:
+            raise RuntimeError("ARM runtime was requested but is not active")
         self._drop_stale_frames(step)
         visible = self._visible_slot_indices(outer)
         if not visible:
@@ -899,18 +1147,30 @@ class ReplayEvictionLoop:
             frame_age_seconds=frame_age_seconds,
         )
 
-        # Run counterfactual probe
+        # Run GPU3 maintenance scoring.  In ``proxy`` mode this is the cheap
+        # saliency map plus later oracle confirmation.  In ``oracle`` mode
+        # GPU3 does the real force_on/no-sidecar/hide-slot physics for the
+        # scheduled slot work immediately; the CPU-side loop remains the
+        # scheduler/telemetry/action-evidence plane.
         probe_t0 = time.monotonic()
-        cf = counterfactual_probe(
-            model=model,
-            outer=outer,
-            probe_input_ids=frame.input_ids,
-            probe_valid_mask=frame.valid_mask,
-            probe_cue=frame.cue,
-            cache_read_cutoff=frame.cache_read_cutoff,
-            chunk_size=self._probe_chunk_size,
-            score_slot_indices=slot_work,
-        )
+        if self._scoring_mode == "oracle":
+            cf = self._oracle_counterfactual_probe(
+                model=model,
+                outer=outer,
+                frame=frame,
+                slot_work=slot_work,
+            )
+        else:
+            cf = counterfactual_probe(
+                model=model,
+                outer=outer,
+                probe_input_ids=frame.input_ids,
+                probe_valid_mask=frame.valid_mask,
+                probe_cue=frame.cue,
+                cache_read_cutoff=frame.cache_read_cutoff,
+                chunk_size=self._probe_chunk_size,
+                score_slot_indices=slot_work,
+            )
         self._last_probe_seconds = time.monotonic() - probe_t0
         self._probe_seconds_total += self._last_probe_seconds
         self._last_stage_seconds["probe"] = self._last_probe_seconds
@@ -923,6 +1183,11 @@ class ReplayEvictionLoop:
             self._probe_over_budget_total += 1
 
         if len(cf.slot_indices) == 0:
+            self._complete_arm_runtime_job(
+                step=step,
+                cf=cf,
+                frame_age_seconds=frame_age_seconds,
+            )
             return TickResult()
         self._mark_frame_slots_processed(frame=frame, outer=outer, slot_indices=cf.slot_indices)
         for phys_idx in cf.slot_indices:
@@ -1162,6 +1427,12 @@ class ReplayEvictionLoop:
 
         elapsed = time.monotonic() - t0
         if elapsed > self._max_seconds:
+            self._complete_arm_runtime_job(
+                step=step,
+                cf=cf,
+                frame_age_seconds=frame_age_seconds,
+                status=1,
+            )
             return TickResult()
 
         # Classify and act.  Shadow mode is the experiment-safe lane: it
@@ -1170,12 +1441,27 @@ class ReplayEvictionLoop:
         # without conflating the first run with a new controller.
         if self._action_mode == "shadow":
             action_t0 = time.monotonic()
+            confirmed_before = self._oracle_confirmed_actions_total
+            rejected_before = self._oracle_rejected_actions_total
             self._classify_shadow(model=model, outer=outer, step=step, cf=cf, t0=t0)
             self._last_stage_seconds["action"] = time.monotonic() - action_t0
             self._stage_seconds_total["action"] += self._last_stage_seconds["action"]
+            self._complete_arm_runtime_job(
+                step=step,
+                cf=cf,
+                frame_age_seconds=frame_age_seconds,
+                confirmed_delta=(
+                    self._oracle_confirmed_actions_total - confirmed_before
+                ),
+                rejected_delta=(
+                    self._oracle_rejected_actions_total - rejected_before
+                ),
+            )
             return TickResult()
 
         action_t0 = time.monotonic()
+        confirmed_before = self._oracle_confirmed_actions_total
+        rejected_before = self._oracle_rejected_actions_total
         result = self._classify_and_act(
             model=model, outer=outer, step=step, cf=cf,
             slot_marginals=slot_marginals, sharpness_per_slot=sharpness_per_slot,
@@ -1183,6 +1469,13 @@ class ReplayEvictionLoop:
         )
         self._last_stage_seconds["action"] = time.monotonic() - action_t0
         self._stage_seconds_total["action"] += self._last_stage_seconds["action"]
+        self._complete_arm_runtime_job(
+            step=step,
+            cf=cf,
+            frame_age_seconds=frame_age_seconds,
+            confirmed_delta=self._oracle_confirmed_actions_total - confirmed_before,
+            rejected_delta=self._oracle_rejected_actions_total - rejected_before,
+        )
         return result
 
     def _classify_shadow(
@@ -1244,6 +1537,123 @@ class ReplayEvictionLoop:
     def _budget_exhausted(self, t0: float) -> bool:
         return (time.monotonic() - t0) > self._max_seconds
 
+    def _record_arm_runtime_result(
+        self,
+        *,
+        job: dict[str, Any],
+        step: int,
+        slots_scored: int,
+        confirmed_delta: int,
+        rejected_delta: int,
+        frame_age_seconds: float,
+        status: int,
+        through_ring: bool,
+    ) -> None:
+        if not self._arm_runtime_active or self._arm_scheduler is None:
+            return
+        slot_ids = [int(x) for x in list(job["slot_ids"])]
+        cap = int(_ext.wire_event_constants()["ARM_MAINTENANCE_SLOT_CAPACITY"])
+        if len(slot_ids) < cap:
+            slot_ids.extend([(1 << 64) - 1] * (cap - len(slot_ids)))
+        result = {
+            "event_type": 5,
+            "job_type": int(job["job_type"]),
+            "stream_id": int(job["stream_id"]),
+            "status": int(status),
+            "slot_count": int(job["slot_count"]),
+            "job_id": int(job["job_id"]),
+            "frame_id": int(job["frame_id"]),
+            "step": int(step),
+            "slots_scored": int(max(0, slots_scored)),
+            "actions_confirmed": int(max(0, confirmed_delta)),
+            "actions_rejected": int(max(0, rejected_delta)),
+            "probe_seconds": float(self._last_probe_seconds),
+            "oracle_seconds": float(self._last_oracle_scoring_seconds),
+            "cpu_seconds": float(
+                self._last_stage_seconds.get("select", 0.0)
+                + self._last_stage_seconds.get("ema", 0.0)
+                + self._last_stage_seconds.get("action", 0.0)
+            ),
+            "frame_age_seconds": float(frame_age_seconds),
+            "slot_ids": slot_ids[:cap],
+        }
+        if not through_ring:
+            self._arm_scheduler.record_result(result)
+            return
+        if self._arm_result_worker_ring is None or self._arm_result_ring is None:
+            self._arm_scheduler.record_result(result)
+            return
+        if not bool(self._arm_result_worker_ring.push(result)):
+            self._arm_result_ring_drops += 1
+            self._arm_scheduler.record_result({**result, "status": max(1, int(status))})
+            return
+        self._arm_result_ring_pushes += 1
+        popped = self._arm_result_ring.pop()
+        if popped is None:
+            self._arm_scheduler.record_result({**result, "status": max(1, int(status))})
+            return
+        self._arm_result_ring_pops += 1
+        self._arm_scheduler.record_result(dict(popped))
+
+    def _complete_arm_runtime_job(
+        self,
+        *,
+        step: int,
+        cf: CounterfactualResult,
+        frame_age_seconds: float,
+        confirmed_delta: int = 0,
+        rejected_delta: int = 0,
+        status: int = 0,
+    ) -> None:
+        if (
+            not self._arm_runtime_active
+            or self._arm_scheduler is None
+            or self._arm_result_ring is None
+            or self._active_arm_job is None
+        ):
+            self._active_arm_job = None
+            return
+        job = self._active_arm_job
+        self._active_arm_job = None
+        self._record_arm_runtime_result(
+            job=job,
+            step=step,
+            slots_scored=len(cf.slot_indices),
+            confirmed_delta=confirmed_delta,
+            rejected_delta=rejected_delta,
+            frame_age_seconds=frame_age_seconds,
+            status=status,
+            through_ring=True,
+        )
+
+    def _cpu_scorer_for(self, *, model: Any, step: int) -> CpuMemoryScorerLanePool | None:
+        if self._cpu_scorer_backend == "off":
+            return None
+        try:
+            if self._cpu_scorer is None:
+                self._cpu_scorer = CpuMemoryScorerLanePool.from_model(
+                    model,
+                    lanes=self._cpu_scorer_lanes,
+                    backend=self._cpu_scorer_backend,
+                    vocab_tile_size=self._cpu_scorer_vocab_tile_size,
+                    row_chunk_size=self._cpu_scorer_row_chunk_size,
+                    parallel_threshold_rows=self._cpu_scorer_parallel_threshold_rows,
+                )
+                self._cpu_scorer_weight_syncs += 1
+                self._cpu_scorer_last_sync_step = int(step)
+            elif (
+                int(step) - int(self._cpu_scorer_last_sync_step)
+                >= self._cpu_scorer_weight_sync_interval_steps
+            ):
+                self._cpu_scorer.weights.refresh_from_model(model, version=int(step))
+                self._cpu_scorer_weight_syncs += 1
+                self._cpu_scorer_last_sync_step = int(step)
+            return self._cpu_scorer
+        except Exception as exc:
+            self._cpu_scorer_errors_total += 1
+            self._cpu_scorer_last_error = f"{exc.__class__.__name__}: {exc}"
+            raise
+
     def _confirm_actions_with_oracle(
         self,
         *,
@@ -1289,6 +1699,38 @@ class ReplayEvictionLoop:
             return {}
 
         candidate_pairs.sort(key=lambda row: abs(row[3]), reverse=True)
+        if cf.scoring_mode == "oracle":
+            confirmations: dict[int, bool] = {}
+            n_pairs = 0
+            for sid, phys, action, oracle_score in candidate_pairs:
+                confirmed = self._action_confirmed(
+                    action=action,
+                    proxy_score=oracle_score,
+                    oracle_score=oracle_score,
+                )
+                confirmations[sid] = confirmed
+                n_pairs += 1
+                if confirmed:
+                    self._oracle_confirmed_actions_total += 1
+                else:
+                    self._oracle_rejected_actions_total += 1
+                rec = table.record(sid)
+                self._trace_oracle_event(
+                    step=self._probe_step,
+                    slot_id=sid,
+                    action=action,
+                    rec=rec,
+                    proxy_score=oracle_score,
+                    oracle_score=oracle_score,
+                    confirmed=confirmed,
+                )
+            self._oracle_direct_confirmations_total += n_pairs
+            self._oracle_confirmations_total += n_pairs
+            self._last_oracle_candidates = n_pairs
+            self._last_proxy_oracle_sign_match_rate = 1.0 if n_pairs else 0.0
+            self._last_proxy_oracle_abs_error = 0.0
+            return confirmations
+
         candidate_pairs = candidate_pairs[: self._oracle_confirm_top_k]
         oracle_t0 = time.monotonic()
         oracle = oracle_confirm_slots(
@@ -1299,6 +1741,7 @@ class ReplayEvictionLoop:
             slot_indices=[phys for _sid, phys, _action, _proxy in candidate_pairs],
             cache_read_cutoff=self._probe_cache_cutoff,
             variant_chunk_size=self._oracle_variant_chunk_size,
+            cpu_scorer=self._cpu_scorer_for(model=model, step=self._probe_step),
         )
         self._last_oracle_seconds = time.monotonic() - oracle_t0
         self._oracle_seconds_total += self._last_oracle_seconds
@@ -1615,6 +2058,55 @@ class ReplayEvictionLoop:
             result = self._apply_evictions_legacy(model=model, step=step)
 
         return result
+
+    def _oracle_counterfactual_probe(
+        self,
+        *,
+        model: Any,
+        outer: Any,
+        frame: ProbeFrame,
+        slot_work: list[int],
+    ) -> CounterfactualResult:
+        """Score scheduled slots with exact GPU3 memory physics.
+
+        This is the non-cheap path: one real no-sidecar/baseline pass plus
+        hide-one variants through ``model.encode(memory_mode='force_on')``.
+        The surrounding loop is still CPU-side scheduling and evidence
+        bookkeeping; only the tensor physics lives on GPU3.
+        """
+        oracle_t0 = time.monotonic()
+        oracle = oracle_confirm_slots(
+            model=model,
+            outer=outer,
+            probe_input_ids=frame.input_ids,
+            probe_valid_mask=frame.valid_mask,
+            slot_indices=slot_work,
+            cache_read_cutoff=frame.cache_read_cutoff,
+            variant_chunk_size=self._oracle_variant_chunk_size,
+            cpu_scorer=self._cpu_scorer_for(model=model, step=frame.step),
+        )
+        elapsed = time.monotonic() - oracle_t0
+        self._last_oracle_scoring_seconds = elapsed
+        self._oracle_scoring_seconds_total += elapsed
+        self._last_stage_seconds["oracle_score"] = elapsed
+        self._stage_seconds_total["oracle_score"] += elapsed
+        self._oracle_scored_slots_total += len(oracle.slot_indices)
+        sidecar_value = oracle.nll_no_sidecar - oracle.nll_baseline
+        weights = torch.zeros(
+            sidecar_value.shape[0],
+            len(oracle.slot_indices),
+            dtype=torch.float32,
+        )
+        return CounterfactualResult(
+            marginal_gains=oracle.oracle_deltas,
+            sidecar_value=sidecar_value,
+            nll_baseline=oracle.nll_baseline,
+            nll_no_sidecar=oracle.nll_no_sidecar,
+            weights_baseline=weights,
+            mask=oracle.mask,
+            slot_indices=oracle.slot_indices,
+            scoring_mode="oracle",
+        )
 
     def _execute_refresh(
         self,
@@ -2158,19 +2650,65 @@ class ReplayEvictionLoop:
             str(i): self._stream_probe_seconds.get(i, 0.0) / elapsed_wall
             for i in range(self._memory_streams)
         }
+        arm_native_diag = (
+            self._arm_scheduler.diagnostics()
+            if self._arm_scheduler is not None
+            else None
+        )
+        arm_runtime_diag = {
+            "enabled_requested": self._arm_runtime_enabled_requested,
+            "active": self._arm_runtime_active,
+            "error": self._arm_runtime_error,
+            "job_ring_name": self._arm_job_ring_name,
+            "result_ring_name": self._arm_result_ring_name,
+            "jobs_pushed": self._arm_jobs_pushed,
+            "jobs_popped": self._arm_jobs_popped,
+            "job_ring_drops": self._arm_job_ring_drops,
+            "result_ring_pushes": self._arm_result_ring_pushes,
+            "result_ring_pops": self._arm_result_ring_pops,
+            "result_ring_drops": self._arm_result_ring_drops,
+            "native_scheduler": arm_native_diag,
+            "transport_mode": (
+                "inline_worker_attached_shm_endpoints"
+                if self._arm_runtime_active
+                else "inactive"
+            ),
+        }
         return {
             "enabled": True,
             "action_mode": self._action_mode,
+            "scoring_mode": self._scoring_mode,
+            "cpu_scorer_backend_requested": self._cpu_scorer_backend,
+            "cpu_scorer_enabled": self._cpu_scorer_backend != "off",
+            "cpu_scorer_lanes": self._cpu_scorer_lanes,
+            "cpu_scorer_weight_syncs": self._cpu_scorer_weight_syncs,
+            "cpu_scorer_last_sync_step": self._cpu_scorer_last_sync_step,
+            "cpu_scorer_errors_total": self._cpu_scorer_errors_total,
+            "cpu_scorer_last_error": self._cpu_scorer_last_error,
+            "cpu_scorer": (
+                self._cpu_scorer.diagnostics()
+                if self._cpu_scorer is not None
+                else None
+            ),
             "memory_streams": self._memory_streams,
             "memory_streams_requested": self._memory_streams,
-            "memory_streams_active": False,
-            "memory_stream_execution_mode": "single_threaded_time_sliced",
-            "memory_streams_note": (
-                "stream_id partitions replay-maintenance telemetry and work "
-                "ownership, but this Python control plane executes one probe "
-                "chunk at a time; literal CPU memory-lane fanout would need "
-                "a native structure-of-arrays worker plane"
+            "memory_streams_active": self._arm_runtime_active,
+            "memory_stream_execution_mode": (
+                "native_cpu_scheduler_inline_gpu3_worker"
+                if self._arm_runtime_active
+                else "single_threaded_time_sliced"
             ),
+            "memory_streams_note": (
+                "native CPU conductor owns frame TTL, slot coverage, stream "
+                "assignment, and attached shm job/result endpoints; the rank-3 "
+                "GPU3 worker consumes those jobs inline and executes Torch oracle "
+                "physics"
+                if self._arm_runtime_active
+                else "stream_id partitions replay-maintenance telemetry and work "
+                "ownership, but this Python control plane executes one probe "
+                "chunk at a time"
+            ),
+            "arm_runtime": arm_runtime_diag,
             "tick_count": self._tick_count,
             "replays_total": self._replays_total,
             "evictions_total": self._evictions_total,
@@ -2194,6 +2732,10 @@ class ReplayEvictionLoop:
             "oracle_confirmations_total": self._oracle_confirmations_total,
             "oracle_confirmed_actions_total": self._oracle_confirmed_actions_total,
             "oracle_rejected_actions_total": self._oracle_rejected_actions_total,
+            "oracle_direct_confirmations_total": self._oracle_direct_confirmations_total,
+            "oracle_scored_slots_total": self._oracle_scored_slots_total,
+            "oracle_scoring_seconds_total": self._oracle_scoring_seconds_total,
+            "last_oracle_scoring_seconds": self._last_oracle_scoring_seconds,
             "proxy_oracle_pairs_total": self._proxy_oracle_pairs_total,
             "proxy_oracle_sign_match_rate_total": (
                 self._proxy_oracle_sign_matches / self._proxy_oracle_pairs_total

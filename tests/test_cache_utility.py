@@ -23,6 +23,9 @@ import torch.nn.functional as F
 
 from chaoscontrol.cache_utility import (
     CrctGradientConflictMonitor,
+    CpuMemoryScorer,
+    CpuMemoryScorerLanePool,
+    CpuMemoryScorerWeights,
     ScarcityAwareMemoryOptimizer,
     alpha_ramp,
     assign_memory_credit,
@@ -30,6 +33,7 @@ from chaoscontrol.cache_utility import (
     positive_only_lm_weight,
     rank3_score_batch_causal,
 )
+from chaoscontrol.core import RMSNorm
 from chaoscontrol.model import ChaosStudentLM
 from chaoscontrol.wake_cache_txn import TransactionalWakeCache
 
@@ -331,6 +335,129 @@ class TestChunkedNllFromHidden:
         assert nll.shape == (2, 5)
         assert nll.dtype == torch.float32
         assert torch.isfinite(nll).all()
+
+    def test_cpu_memory_scorer_matches_reference_cross_entropy(self) -> None:
+        torch.manual_seed(123)
+        model = self._build_model(dim=6, vocab=19)
+        model.final_norm = RMSNorm(6)
+        hidden = torch.randn(3, 7, 6)
+        targets = torch.randint(0, 19, (3, 7))
+        weights = CpuMemoryScorerWeights.from_model(model, share_memory=True)
+        scorer = CpuMemoryScorer(weights=weights, backend="torch_cpu")
+
+        out = chunked_nll_from_hidden(
+            model,
+            hidden,
+            targets,
+            cpu_scorer=scorer,
+        )
+
+        ref = chunked_nll_from_hidden(model, hidden, targets, chunk_size=2)
+        torch.testing.assert_close(out, ref, rtol=0, atol=1e-6)
+        diag = scorer.diagnostics()
+        assert diag["backend_active"] == "torch_cpu"
+        assert diag["weights_shared"] is True
+        assert diag["rows_scored"] == hidden.shape[0] * hidden.shape[1]
+        assert diag["rows_per_second"] > 0.0
+
+    def test_cpu_memory_scorer_lanes_share_one_weight_bank(self) -> None:
+        model = self._build_model(dim=4, vocab=11)
+        weights = CpuMemoryScorerWeights(
+            norm_weight=torch.ones(4),
+            lm_head_weight=model.lm_head.weight,
+            shared=True,
+        )
+        lane_a = CpuMemoryScorer(weights=weights, backend="torch_cpu")
+        lane_b = CpuMemoryScorer(weights=weights, backend="torch_cpu")
+
+        assert lane_a.weights is lane_b.weights
+        assert lane_a.lm_head_weight.data_ptr() == lane_b.lm_head_weight.data_ptr()
+        assert lane_a.norm_weight.data_ptr() == lane_b.norm_weight.data_ptr()
+        assert lane_a.diagnostics()["weights_shared"] is True
+        assert lane_b.diagnostics()["weights_shared"] is True
+
+    def test_cpu_memory_scorer_requested_amx_fails_loud_when_unavailable(
+        self, monkeypatch
+    ) -> None:
+        model = self._build_model(dim=4, vocab=11)
+        weights = CpuMemoryScorerWeights(
+            norm_weight=torch.ones(4),
+            lm_head_weight=model.lm_head.weight,
+            shared=True,
+        )
+        monkeypatch.setattr(
+            CpuMemoryScorer,
+            "_amx_status",
+            staticmethod(lambda: (False, "test unavailable", None)),
+        )
+
+        with pytest.raises(RuntimeError, match="amx_bf16.*test unavailable"):
+            CpuMemoryScorer(weights=weights, backend="amx_bf16")
+
+        auto = CpuMemoryScorer(weights=weights, backend="auto")
+        diag = auto.diagnostics()
+        assert diag["backend_active"] == "torch_cpu"
+        assert diag["fallback_reason"] == "test unavailable"
+
+    def test_cpu_memory_scorer_lane_pool_shares_weights_and_scores_parallel(self) -> None:
+        torch.manual_seed(321)
+        model = self._build_model(dim=8, vocab=17)
+        model.final_norm = RMSNorm(8)
+        weights = CpuMemoryScorerWeights.from_model(model, share_memory=True)
+        hidden = torch.randn(4, 9, 8)
+        targets = torch.randint(0, 17, (4, 9))
+
+        with CpuMemoryScorerLanePool(
+            weights=weights,
+            lanes=4,
+            backend="torch_cpu",
+            parallel_threshold_rows=1,
+        ) as pool:
+            out = pool.score_hidden(hidden, targets)
+            diag = pool.diagnostics()
+
+        ref = chunked_nll_from_hidden(model, hidden, targets, chunk_size=3)
+        torch.testing.assert_close(out, ref, rtol=0, atol=1e-6)
+        assert diag["lanes"] == 4
+        assert diag["parallel_calls"] == 1
+        assert diag["weights"]["shared"] is True
+        assert diag["lane_backends"] == ["torch_cpu"]
+        assert sum(diag["lane_rows_scored"]) == hidden.shape[0] * hidden.shape[1]
+
+    def test_amx_cpu_memory_scorer_matches_reference_when_available(self) -> None:
+        try:
+            from chaoscontrol.kernels import _cpu_ssm_controller as _ext
+        except Exception:
+            pytest.skip("cpu_ssm_controller extension not built")
+        if not (
+            bool(_ext.amx_bf16_kernel_available())
+            and bool(_ext.has_amx_bf16())
+            and hasattr(_ext, "amx_bf16_nll")
+        ):
+            pytest.skip("AMX BF16 scorer is not available on this host")
+
+        torch.manual_seed(654)
+        model = self._build_model(dim=64, vocab=97)
+        model.final_norm = RMSNorm(64)
+        weights = CpuMemoryScorerWeights.from_model(model, share_memory=True)
+        hidden = torch.randn(5, 11, 64)
+        targets = torch.randint(0, 97, (5, 11))
+
+        with CpuMemoryScorerLanePool(
+            weights=weights,
+            lanes=4,
+            backend="amx_bf16",
+            parallel_threshold_rows=1,
+        ) as pool:
+            out = pool.score_hidden(hidden, targets)
+            diag = pool.diagnostics()
+
+        ref = chunked_nll_from_hidden(model, hidden, targets, chunk_size=4)
+        torch.testing.assert_close(out, ref, rtol=0, atol=8e-3)
+        assert diag["lane_backends"] == ["amx_bf16"]
+        assert diag["weights"]["amx_head_prepacked"] is True
+        assert diag["weights"]["amx_packed_shape"] == [32, 194]
+        assert sum(diag["lane_rows_scored"]) == hidden.shape[0] * hidden.shape[1]
 
 
 # ---------------------------------------------------------------------------

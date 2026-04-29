@@ -70,6 +70,8 @@ def _named_entry(
             "exp26_mechanism": "arm_v1",
         }
     )
+    if entry.get("replay_eviction_arm_runtime_enabled"):
+        entry["replay_eviction_arm_runtime_namespace"] = name
     return entry
 
 
@@ -155,15 +157,23 @@ def _replay_eviction_pipeline_lock() -> dict[str, Any]:
         "bucket_prototypes": True,
         "prototype_dim": 64,
         "replay_eviction_memory_streams": 8,
+        "replay_eviction_arm_runtime_enabled": True,
         # Rank-3 maintenance runs off the trunk critical path. The generic
         # 0.5s default was a scaffold-era placeholder and suppresses action
         # telemetry at Exp26's real 16k-vocab probe cost.
-        "replay_eviction_max_seconds": 12.0,
+        "replay_eviction_max_seconds": 8.0,
+        "replay_eviction_scoring_mode": "oracle",
+        "replay_eviction_cpu_scorer_backend": "amx_bf16",
+        "replay_eviction_cpu_scorer_lanes": 56,
+        "replay_eviction_cpu_scorer_vocab_tile_size": 512,
+        "replay_eviction_cpu_scorer_row_chunk_size": 8192,
+        "replay_eviction_cpu_scorer_parallel_threshold_rows": 2048,
+        "replay_eviction_cpu_scorer_weight_sync_interval_steps": 64,
         "replay_eviction_oracle_confirm_top_k": 32,
         "replay_eviction_oracle_variant_chunk_size": 1,
         "replay_eviction_probe_buffer_size": 32,
         "replay_eviction_frame_ttl_steps": 256,
-        "replay_eviction_slot_work_chunk_size": 64,
+        "replay_eviction_slot_work_chunk_size": 16,
         "replay_eviction_trace_max_rows": 200000,
         "replay_eviction_trace_flush_rows": 256,
     }

@@ -9,10 +9,13 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
+#include <deque>
 #include <fstream>
 #include <limits>
 #include <string>
 #include <tuple>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "action_history.h"
@@ -566,6 +569,9 @@ pybind11::dict wire_event_sizes() {
   d["WriteEvent"] = static_cast<int64_t>(sizeof(WriteEvent));
   d["QueryEvent"] = static_cast<int64_t>(sizeof(QueryEvent));
   d["ReplayOutcome"] = static_cast<int64_t>(sizeof(ReplayOutcome));
+  d["ArmMaintenanceJob"] = static_cast<int64_t>(sizeof(ArmMaintenanceJob));
+  d["ArmMaintenanceResult"] =
+      static_cast<int64_t>(sizeof(ArmMaintenanceResult));
   return d;
 }
 
@@ -586,6 +592,8 @@ pybind11::dict wire_event_constants() {
   d["SPAN_LENGTH_DEFAULT"] = static_cast<int64_t>(SPAN_LENGTH_DEFAULT);
   d["SIMPLEX_CANDIDATES_DEFAULT"] =
       static_cast<int64_t>(SIMPLEX_CANDIDATES_DEFAULT);
+  d["ARM_MAINTENANCE_SLOT_CAPACITY"] =
+      static_cast<int64_t>(ARM_MAINTENANCE_SLOT_CAPACITY);
   return d;
 }
 
@@ -616,6 +624,8 @@ using TestShmRing = ShmRing<uint64_t, 1024>;
 using ShmRingWriteEventT = ShmRing<WriteEvent, 16384>;
 using ShmRingQueryEventT = ShmRing<QueryEvent, 16384>;
 using ShmRingReplayOutcomeT = ShmRing<ReplayOutcome, 8192>;
+using ShmRingArmMaintenanceJobT = ShmRing<ArmMaintenanceJob, 1024>;
+using ShmRingArmMaintenanceResultT = ShmRing<ArmMaintenanceResult, 1024>;
 
 bool write_event_cuda_pack_available() {
 #ifdef CHAOSCONTROL_CPU_SSM_CUDA_WRITE_EVENT_KERNEL
@@ -1053,6 +1063,343 @@ pybind11::dict replay_outcome_to_dict(const ReplayOutcome& ev) {
   return d;
 }
 
+// --- ARM maintenance job/result dict <-> struct ---
+constexpr const char* kArmMaintenanceJobKeys[] = {
+    "event_type", "job_type", "stream_id", "flags", "slot_count",
+    "job_id", "frame_id", "step", "cache_read_cutoff", "slot_ids",
+};
+constexpr std::size_t kArmMaintenanceJobKeyCount =
+    sizeof(kArmMaintenanceJobKeys) / sizeof(kArmMaintenanceJobKeys[0]);
+
+ArmMaintenanceJob dict_to_arm_maintenance_job(const pybind11::dict& d) {
+  check_dict_keys(d, kArmMaintenanceJobKeys, kArmMaintenanceJobKeyCount,
+                  "ArmMaintenanceJob");
+  ArmMaintenanceJob ev{};
+  ev.event_type = d["event_type"].cast<uint8_t>();
+  ev.job_type = d["job_type"].cast<uint8_t>();
+  ev.stream_id = d["stream_id"].cast<uint8_t>();
+  ev.flags = d["flags"].cast<uint8_t>();
+  ev.slot_count = d["slot_count"].cast<uint32_t>();
+  ev.job_id = d["job_id"].cast<uint64_t>();
+  ev.frame_id = d["frame_id"].cast<uint64_t>();
+  ev.step = d["step"].cast<uint64_t>();
+  ev.cache_read_cutoff = d["cache_read_cutoff"].cast<uint64_t>();
+  copy_u64_array(d["slot_ids"], ev.slot_ids, ARM_MAINTENANCE_SLOT_CAPACITY,
+                 "slot_ids");
+  return ev;
+}
+
+pybind11::dict arm_maintenance_job_to_dict(const ArmMaintenanceJob& ev) {
+  pybind11::dict d;
+  d["event_type"] = pybind11::int_(ev.event_type);
+  d["job_type"] = pybind11::int_(ev.job_type);
+  d["stream_id"] = pybind11::int_(ev.stream_id);
+  d["flags"] = pybind11::int_(ev.flags);
+  d["slot_count"] = pybind11::int_(ev.slot_count);
+  d["job_id"] = pybind11::int_(ev.job_id);
+  d["frame_id"] = pybind11::int_(ev.frame_id);
+  d["step"] = pybind11::int_(ev.step);
+  d["cache_read_cutoff"] = pybind11::int_(ev.cache_read_cutoff);
+  d["slot_ids"] = u64_array_to_list(
+      ev.slot_ids, ARM_MAINTENANCE_SLOT_CAPACITY);
+  return d;
+}
+
+constexpr const char* kArmMaintenanceResultKeys[] = {
+    "event_type", "job_type", "stream_id", "status", "slot_count",
+    "job_id", "frame_id", "step", "slots_scored",
+    "actions_confirmed", "actions_rejected", "probe_seconds",
+    "oracle_seconds", "cpu_seconds", "frame_age_seconds", "slot_ids",
+};
+constexpr std::size_t kArmMaintenanceResultKeyCount =
+    sizeof(kArmMaintenanceResultKeys) / sizeof(kArmMaintenanceResultKeys[0]);
+
+ArmMaintenanceResult dict_to_arm_maintenance_result(const pybind11::dict& d) {
+  check_dict_keys(d, kArmMaintenanceResultKeys, kArmMaintenanceResultKeyCount,
+                  "ArmMaintenanceResult");
+  ArmMaintenanceResult ev{};
+  ev.event_type = d["event_type"].cast<uint8_t>();
+  ev.job_type = d["job_type"].cast<uint8_t>();
+  ev.stream_id = d["stream_id"].cast<uint8_t>();
+  ev.status = d["status"].cast<uint8_t>();
+  ev.slot_count = d["slot_count"].cast<uint32_t>();
+  ev.job_id = d["job_id"].cast<uint64_t>();
+  ev.frame_id = d["frame_id"].cast<uint64_t>();
+  ev.step = d["step"].cast<uint64_t>();
+  ev.slots_scored = d["slots_scored"].cast<uint32_t>();
+  ev.actions_confirmed = d["actions_confirmed"].cast<uint32_t>();
+  ev.actions_rejected = d["actions_rejected"].cast<uint32_t>();
+  ev.probe_seconds = d["probe_seconds"].cast<float>();
+  ev.oracle_seconds = d["oracle_seconds"].cast<float>();
+  ev.cpu_seconds = d["cpu_seconds"].cast<float>();
+  ev.frame_age_seconds = d["frame_age_seconds"].cast<float>();
+  copy_u64_array(d["slot_ids"], ev.slot_ids, ARM_MAINTENANCE_SLOT_CAPACITY,
+                 "slot_ids");
+  return ev;
+}
+
+pybind11::dict arm_maintenance_result_to_dict(
+    const ArmMaintenanceResult& ev) {
+  pybind11::dict d;
+  d["event_type"] = pybind11::int_(ev.event_type);
+  d["job_type"] = pybind11::int_(ev.job_type);
+  d["stream_id"] = pybind11::int_(ev.stream_id);
+  d["status"] = pybind11::int_(ev.status);
+  d["slot_count"] = pybind11::int_(ev.slot_count);
+  d["job_id"] = pybind11::int_(ev.job_id);
+  d["frame_id"] = pybind11::int_(ev.frame_id);
+  d["step"] = pybind11::int_(ev.step);
+  d["slots_scored"] = pybind11::int_(ev.slots_scored);
+  d["actions_confirmed"] = pybind11::int_(ev.actions_confirmed);
+  d["actions_rejected"] = pybind11::int_(ev.actions_rejected);
+  d["probe_seconds"] = pybind11::float_(ev.probe_seconds);
+  d["oracle_seconds"] = pybind11::float_(ev.oracle_seconds);
+  d["cpu_seconds"] = pybind11::float_(ev.cpu_seconds);
+  d["frame_age_seconds"] = pybind11::float_(ev.frame_age_seconds);
+  d["slot_ids"] = u64_array_to_list(
+      ev.slot_ids, ARM_MAINTENANCE_SLOT_CAPACITY);
+  return d;
+}
+
+struct ArmFrameState {
+  uint64_t frame_id = 0;
+  uint64_t step = 0;
+  uint64_t cache_read_cutoff = std::numeric_limits<uint64_t>::max();
+  uint8_t stream_id = 0;
+  std::unordered_set<uint64_t> processed;
+  std::unordered_set<uint64_t> reserved;
+};
+
+struct ArmInFlightJob {
+  uint64_t frame_id = 0;
+  std::vector<uint64_t> slots;
+};
+
+class ArmMaintenanceScheduler {
+ public:
+  ArmMaintenanceScheduler(uint32_t memory_streams,
+                          uint32_t slot_work_chunk_size,
+                          uint32_t frame_ttl_steps,
+                          uint32_t max_frames)
+      : memory_streams_(std::max<uint32_t>(1, memory_streams)),
+        chunk_size_(std::min<uint32_t>(
+            std::max<uint32_t>(1, slot_work_chunk_size),
+            ARM_MAINTENANCE_SLOT_CAPACITY)),
+        frame_ttl_steps_(frame_ttl_steps),
+        max_frames_(std::max<uint32_t>(1, max_frames)),
+        stream_ticks_(memory_streams_, 0),
+        stream_work_items_(memory_streams_, 0) {}
+
+  bool ingest_frame(uint64_t frame_id, uint64_t step, uint32_t stream_id,
+                    uint64_t cache_read_cutoff) {
+    for (const auto& frame : frames_) {
+      if (frame.frame_id == frame_id) {
+        duplicate_frames_ += 1;
+        return false;
+      }
+    }
+    if (frames_.size() >= max_frames_) {
+      frames_.pop_front();
+      frames_dropped_overflow_ += 1;
+    }
+    ArmFrameState frame;
+    frame.frame_id = frame_id;
+    frame.step = step;
+    frame.cache_read_cutoff = cache_read_cutoff;
+    frame.stream_id = static_cast<uint8_t>(stream_id % memory_streams_);
+    frames_.push_back(std::move(frame));
+    frames_ingested_ += 1;
+    queue_depth_max_ = std::max<uint64_t>(queue_depth_max_, frames_.size());
+    return true;
+  }
+
+  pybind11::object next_job(
+      uint64_t step,
+      const std::vector<uint64_t>& visible_slots,
+      uint64_t cache_read_cutoff) {
+    drop_stale(step);
+    if (visible_slots.empty()) {
+      skipped_no_slots_ += 1;
+      return pybind11::none();
+    }
+    while (!frames_.empty()) {
+      ArmFrameState& frame = frames_.front();
+      std::vector<uint64_t> unprocessed;
+      std::vector<uint64_t> remaining;
+      unprocessed.reserve(visible_slots.size());
+      remaining.reserve(visible_slots.size());
+      for (uint64_t slot : visible_slots) {
+        if (frame.processed.find(slot) == frame.processed.end()) {
+          unprocessed.push_back(slot);
+          if (frame.reserved.find(slot) == frame.reserved.end()) {
+            remaining.push_back(slot);
+          }
+        }
+      }
+      if (unprocessed.empty()) {
+        frames_.pop_front();
+        frames_completed_ += 1;
+        continue;
+      }
+      if (remaining.empty()) {
+        skipped_inflight_ += 1;
+        return pybind11::none();
+      }
+
+      const std::size_t start =
+          remaining.empty() ? 0 : (rr_cursor_ % remaining.size());
+      const std::size_t count =
+          std::min<std::size_t>(chunk_size_, remaining.size());
+      ArmMaintenanceJob job{};
+      job.event_type = 4;
+      job.job_type = 1;
+      job.stream_id = frame.stream_id;
+      job.flags = 0;
+      job.slot_count = static_cast<uint32_t>(count);
+      job.job_id = next_job_id_++;
+      job.frame_id = frame.frame_id;
+      job.step = frame.step;
+      job.cache_read_cutoff = frame.cache_read_cutoff;
+      for (std::size_t i = 0; i < ARM_MAINTENANCE_SLOT_CAPACITY; ++i) {
+        job.slot_ids[i] = std::numeric_limits<uint64_t>::max();
+      }
+      for (std::size_t i = 0; i < count; ++i) {
+        const uint64_t slot = remaining[(start + i) % remaining.size()];
+        job.slot_ids[i] = slot;
+        frame.reserved.insert(slot);
+        in_flight_[job.job_id].frame_id = frame.frame_id;
+        in_flight_[job.job_id].slots.push_back(slot);
+      }
+      rr_cursor_ += count;
+      jobs_emitted_ += 1;
+      slots_scheduled_total_ += count;
+      stream_ticks_[job.stream_id] += 1;
+      stream_work_items_[job.stream_id] += count;
+      return arm_maintenance_job_to_dict(job);
+    }
+    skipped_no_frame_ += 1;
+    return pybind11::none();
+  }
+
+  void record_result(const pybind11::dict& d) {
+    const ArmMaintenanceResult result = dict_to_arm_maintenance_result(d);
+    auto inflight_it = in_flight_.find(result.job_id);
+    if (inflight_it != in_flight_.end()) {
+      for (auto& frame : frames_) {
+        if (frame.frame_id != inflight_it->second.frame_id) {
+          continue;
+        }
+        for (uint64_t slot : inflight_it->second.slots) {
+          frame.reserved.erase(slot);
+          if (result.status == 0) {
+            frame.processed.insert(slot);
+            slot_last_scored_[slot] = result.step;
+          }
+        }
+        break;
+      }
+      in_flight_.erase(inflight_it);
+    }
+    results_recorded_ += 1;
+    slots_scored_total_ += result.slots_scored;
+    actions_confirmed_total_ += result.actions_confirmed;
+    actions_rejected_total_ += result.actions_rejected;
+    probe_seconds_total_ += static_cast<double>(result.probe_seconds);
+    oracle_seconds_total_ += static_cast<double>(result.oracle_seconds);
+    cpu_seconds_total_ += static_cast<double>(result.cpu_seconds);
+    frame_age_seconds_max_ = std::max<double>(
+        frame_age_seconds_max_, static_cast<double>(result.frame_age_seconds));
+    if (result.status != 0) {
+      result_errors_ += 1;
+    }
+  }
+
+  pybind11::dict diagnostics() const {
+    pybind11::dict d;
+    d["enabled"] = true;
+    d["memory_streams"] = pybind11::int_(memory_streams_);
+    d["slot_work_chunk_size"] = pybind11::int_(chunk_size_);
+    d["frame_ttl_steps"] = pybind11::int_(frame_ttl_steps_);
+    d["max_frames"] = pybind11::int_(max_frames_);
+    d["queue_depth"] = pybind11::int_(frames_.size());
+    d["queue_depth_max"] = pybind11::int_(queue_depth_max_);
+    d["frames_ingested"] = pybind11::int_(frames_ingested_);
+    d["frames_completed"] = pybind11::int_(frames_completed_);
+    d["frames_dropped_stale"] = pybind11::int_(frames_dropped_stale_);
+    d["frames_dropped_overflow"] = pybind11::int_(frames_dropped_overflow_);
+    d["duplicate_frames"] = pybind11::int_(duplicate_frames_);
+    d["jobs_emitted"] = pybind11::int_(jobs_emitted_);
+    d["results_recorded"] = pybind11::int_(results_recorded_);
+    d["slots_scheduled_total"] = pybind11::int_(slots_scheduled_total_);
+    d["slots_scored_total"] = pybind11::int_(slots_scored_total_);
+    d["actions_confirmed_total"] = pybind11::int_(actions_confirmed_total_);
+    d["actions_rejected_total"] = pybind11::int_(actions_rejected_total_);
+    d["result_errors"] = pybind11::int_(result_errors_);
+    d["skipped_no_frame"] = pybind11::int_(skipped_no_frame_);
+    d["skipped_no_slots"] = pybind11::int_(skipped_no_slots_);
+    d["skipped_inflight"] = pybind11::int_(skipped_inflight_);
+    d["probe_seconds_total"] = pybind11::float_(probe_seconds_total_);
+    d["oracle_seconds_total"] = pybind11::float_(oracle_seconds_total_);
+    d["cpu_seconds_total"] = pybind11::float_(cpu_seconds_total_);
+    d["frame_age_seconds_max"] = pybind11::float_(frame_age_seconds_max_);
+    pybind11::dict stream_ticks;
+    pybind11::dict stream_work;
+    for (uint32_t i = 0; i < memory_streams_; ++i) {
+      stream_ticks[pybind11::str(std::to_string(i))] =
+          pybind11::int_(stream_ticks_[i]);
+      stream_work[pybind11::str(std::to_string(i))] =
+          pybind11::int_(stream_work_items_[i]);
+    }
+    d["stream_ticks"] = stream_ticks;
+    d["stream_work_items"] = stream_work;
+    return d;
+  }
+
+ private:
+  void drop_stale(uint64_t step) {
+    if (frame_ttl_steps_ == 0) {
+      return;
+    }
+    while (!frames_.empty() && step > frames_.front().step &&
+           step - frames_.front().step > frame_ttl_steps_) {
+      frames_.pop_front();
+      frames_dropped_stale_ += 1;
+    }
+  }
+
+  uint32_t memory_streams_;
+  uint32_t chunk_size_;
+  uint32_t frame_ttl_steps_;
+  uint32_t max_frames_;
+  uint64_t next_job_id_ = 1;
+  std::size_t rr_cursor_ = 0;
+  std::deque<ArmFrameState> frames_;
+  std::vector<uint64_t> stream_ticks_;
+  std::vector<uint64_t> stream_work_items_;
+  std::unordered_map<uint64_t, uint64_t> slot_last_scored_;
+  std::unordered_map<uint64_t, ArmInFlightJob> in_flight_;
+  uint64_t frames_ingested_ = 0;
+  uint64_t frames_completed_ = 0;
+  uint64_t frames_dropped_stale_ = 0;
+  uint64_t frames_dropped_overflow_ = 0;
+  uint64_t duplicate_frames_ = 0;
+  uint64_t jobs_emitted_ = 0;
+  uint64_t results_recorded_ = 0;
+  uint64_t slots_scheduled_total_ = 0;
+  uint64_t slots_scored_total_ = 0;
+  uint64_t actions_confirmed_total_ = 0;
+  uint64_t actions_rejected_total_ = 0;
+  uint64_t result_errors_ = 0;
+  uint64_t skipped_no_frame_ = 0;
+  uint64_t skipped_no_slots_ = 0;
+  uint64_t skipped_inflight_ = 0;
+  uint64_t queue_depth_max_ = 0;
+  double probe_seconds_total_ = 0.0;
+  double oracle_seconds_total_ = 0.0;
+  double cpu_seconds_total_ = 0.0;
+  double frame_age_seconds_max_ = 0.0;
+};
+
 template <typename T>
 T require_outcome_key(const pybind11::dict& outcome, const char* key) {
   if (!outcome.contains(key)) {
@@ -1198,7 +1545,16 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "Whether this extension build includes the opt-in AMX BF16 matmul kernel");
   m.def("amx_bf16_matmul", &chaoscontrol::amx::amx_bf16_matmul,
         pybind11::arg("a"), pybind11::arg("b"),
+        pybind11::call_guard<pybind11::gil_scoped_release>(),
         "Single-tile AMX BF16 matmul: bfloat16 CPU [M,K] x [K,N] -> float32 [M,N]");
+  m.def("amx_bf16_nll", &chaoscontrol::amx::amx_bf16_nll,
+        pybind11::arg("hidden_states"), pybind11::arg("targets"),
+        pybind11::arg("norm_weight"), pybind11::arg("lm_head_vnni"),
+        pybind11::arg("eps") = 1.0e-6,
+        pybind11::arg("row_chunk_size") = 8192,
+        pybind11::arg("lanes") = 1,
+        pybind11::call_guard<pybind11::gil_scoped_release>(),
+        "AMX BF16 CPU scorer: RMSNorm + LM head + streaming CE NLL");
   m.def("amx_pack_b_vnni", &chaoscontrol::amx::pack_b_vnni,
         pybind11::arg("b"),
         "VNNI-rearrange B (K x N bf16) into (K/2 x 2N bf16) for TDPBF16PS. "
@@ -1876,4 +2232,94 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "REGION_BYTES",
           [](pybind11::object) { return ShmRingReplayOutcomeT::REGION_BYTES; },
           "Static byte size of SpscRing<ReplayOutcome, 8192>.");
+
+  pybind11::class_<ShmRingArmMaintenanceJobT>(m, "ShmRingArmMaintenanceJob")
+      .def_static("create", &ShmRingArmMaintenanceJobT::create, pybind11::arg("name"),
+                  "Creator-side factory for CPU->GPU3 ARM maintenance jobs.")
+      .def_static("attach", &ShmRingArmMaintenanceJobT::attach, pybind11::arg("name"),
+                  "Attacher-side factory for CPU->GPU3 ARM maintenance jobs.")
+      .def("push",
+           [](ShmRingArmMaintenanceJobT& self, const pybind11::dict& d) {
+             return self.push(dict_to_arm_maintenance_job(d));
+           },
+           pybind11::arg("event"),
+           "Push an ArmMaintenanceJob dict; returns False if full.")
+      .def("pop",
+           [](ShmRingArmMaintenanceJobT& self) -> pybind11::object {
+             auto opt = self.pop();
+             if (!opt.has_value()) {
+               return pybind11::none();
+             }
+             return arm_maintenance_job_to_dict(*opt);
+           },
+           "Pop an ArmMaintenanceJob dict, or None if empty.")
+      .def("size", &ShmRingArmMaintenanceJobT::size)
+      .def("name", &ShmRingArmMaintenanceJobT::name)
+      .def_static("unlink", &ShmRingArmMaintenanceJobT::unlink, pybind11::arg("name"))
+      .def_property_readonly_static(
+          "capacity",
+          [](pybind11::object) { return ShmRingArmMaintenanceJobT::capacity(); })
+      .def_property_readonly_static(
+          "REGION_BYTES",
+          [](pybind11::object) { return ShmRingArmMaintenanceJobT::REGION_BYTES; });
+
+  pybind11::class_<ShmRingArmMaintenanceResultT>(m, "ShmRingArmMaintenanceResult")
+      .def_static("create", &ShmRingArmMaintenanceResultT::create,
+                  pybind11::arg("name"),
+                  "Creator-side factory for GPU3->CPU ARM maintenance results.")
+      .def_static("attach", &ShmRingArmMaintenanceResultT::attach,
+                  pybind11::arg("name"),
+                  "Attacher-side factory for GPU3->CPU ARM maintenance results.")
+      .def("push",
+           [](ShmRingArmMaintenanceResultT& self, const pybind11::dict& d) {
+             return self.push(dict_to_arm_maintenance_result(d));
+           },
+           pybind11::arg("event"),
+           "Push an ArmMaintenanceResult dict; returns False if full.")
+      .def("pop",
+           [](ShmRingArmMaintenanceResultT& self) -> pybind11::object {
+             auto opt = self.pop();
+             if (!opt.has_value()) {
+               return pybind11::none();
+             }
+             return arm_maintenance_result_to_dict(*opt);
+           },
+           "Pop an ArmMaintenanceResult dict, or None if empty.")
+      .def("size", &ShmRingArmMaintenanceResultT::size)
+      .def("name", &ShmRingArmMaintenanceResultT::name)
+      .def_static("unlink", &ShmRingArmMaintenanceResultT::unlink,
+                  pybind11::arg("name"))
+      .def_property_readonly_static(
+          "capacity",
+          [](pybind11::object) { return ShmRingArmMaintenanceResultT::capacity(); })
+      .def_property_readonly_static(
+          "REGION_BYTES",
+          [](pybind11::object) {
+            return ShmRingArmMaintenanceResultT::REGION_BYTES;
+          });
+
+  pybind11::class_<ArmMaintenanceScheduler>(m, "ArmMaintenanceScheduler")
+      .def(pybind11::init<uint32_t, uint32_t, uint32_t, uint32_t>(),
+           pybind11::arg("memory_streams") = 8,
+           pybind11::arg("slot_work_chunk_size") = 16,
+           pybind11::arg("frame_ttl_steps") = 256,
+           pybind11::arg("max_frames") = 32)
+      .def("ingest_frame", &ArmMaintenanceScheduler::ingest_frame,
+           pybind11::arg("frame_id"),
+           pybind11::arg("step"),
+           pybind11::arg("stream_id") = 0,
+           pybind11::arg("cache_read_cutoff") =
+               std::numeric_limits<uint64_t>::max(),
+           "Ingest one replay-maintenance frame into the native CPU scheduler.")
+      .def("next_job", &ArmMaintenanceScheduler::next_job,
+           pybind11::arg("step"),
+           pybind11::arg("visible_slots"),
+           pybind11::arg("cache_read_cutoff") =
+               std::numeric_limits<uint64_t>::max(),
+           "Return the next bounded ARM maintenance job dict, or None.")
+      .def("record_result", &ArmMaintenanceScheduler::record_result,
+           pybind11::arg("result"),
+           "Record one GPU3 worker result into native scheduler telemetry.")
+      .def("diagnostics", &ArmMaintenanceScheduler::diagnostics,
+           "Return native ARM scheduler counters.");
 }

@@ -103,6 +103,42 @@ def _sample_replay_outcome() -> dict:
     }
 
 
+def _sample_arm_job() -> dict:
+    return {
+        "event_type": 4,
+        "job_type": 1,
+        "stream_id": 3,
+        "flags": 0,
+        "slot_count": 3,
+        "job_id": 99,
+        "frame_id": 123,
+        "step": 456,
+        "cache_read_cutoff": (1 << 64) - 1,
+        "slot_ids": [10, 20, 30] + [(1 << 64) - 1] * 13,
+    }
+
+
+def _sample_arm_result() -> dict:
+    return {
+        "event_type": 5,
+        "job_type": 1,
+        "stream_id": 3,
+        "status": 0,
+        "slot_count": 3,
+        "job_id": 99,
+        "frame_id": 123,
+        "step": 456,
+        "slots_scored": 3,
+        "actions_confirmed": 2,
+        "actions_rejected": 1,
+        "probe_seconds": 0.25,
+        "oracle_seconds": 0.2,
+        "cpu_seconds": 0.05,
+        "frame_age_seconds": 1.5,
+        "slot_ids": [10, 20, 30] + [(1 << 64) - 1] * 13,
+    }
+
+
 # ---------------------------------------------------------------------------
 # WriteEvent
 # ---------------------------------------------------------------------------
@@ -189,6 +225,196 @@ def test_shm_ring_write_event_push_batch_tensor_skips_invalid_rows():
         assert ring.pop() is None
     finally:
         _ext.ShmRingWriteEvent.unlink(name)
+
+
+# ---------------------------------------------------------------------------
+# ARM maintenance job/result rings
+# ---------------------------------------------------------------------------
+
+
+def test_shm_ring_arm_maintenance_job_round_trip():
+    name = "/cc_test_arm_job"
+    _force_unlink(_ext.ShmRingArmMaintenanceJob, name)
+    ring = _ext.ShmRingArmMaintenanceJob.create(name)
+    try:
+        ev = _sample_arm_job()
+        assert ring.push(ev)
+        popped = ring.pop()
+        assert popped is not None
+        assert popped["event_type"] == 4
+        assert popped["job_type"] == 1
+        assert popped["stream_id"] == 3
+        assert popped["slot_count"] == 3
+        assert popped["job_id"] == 99
+        assert popped["frame_id"] == 123
+        assert popped["slot_ids"][:3] == [10, 20, 30]
+        assert ring.pop() is None
+    finally:
+        _ext.ShmRingArmMaintenanceJob.unlink(name)
+
+
+def test_shm_ring_arm_maintenance_result_round_trip():
+    name = "/cc_test_arm_result"
+    _force_unlink(_ext.ShmRingArmMaintenanceResult, name)
+    ring = _ext.ShmRingArmMaintenanceResult.create(name)
+    try:
+        ev = _sample_arm_result()
+        assert ring.push(ev)
+        popped = ring.pop()
+        assert popped is not None
+        assert popped["event_type"] == 5
+        assert popped["slots_scored"] == 3
+        assert popped["actions_confirmed"] == 2
+        assert popped["actions_rejected"] == 1
+        assert popped["probe_seconds"] == pytest.approx(0.25)
+        assert popped["slot_ids"][:3] == [10, 20, 30]
+        assert ring.pop() is None
+    finally:
+        _ext.ShmRingArmMaintenanceResult.unlink(name)
+
+
+def test_arm_maintenance_scheduler_covers_slots_and_records_results():
+    scheduler = _ext.ArmMaintenanceScheduler(
+        memory_streams=8,
+        slot_work_chunk_size=2,
+        frame_ttl_steps=10,
+        max_frames=4,
+    )
+    assert scheduler.ingest_frame(
+        frame_id=1,
+        step=100,
+        stream_id=9,
+        cache_read_cutoff=777,
+    )
+    job0 = scheduler.next_job(100, [0, 1, 2], (1 << 64) - 1)
+    assert job0 is not None
+    assert job0["stream_id"] == 1
+    assert job0["cache_read_cutoff"] == 777
+    assert job0["slot_ids"][:2] == [0, 1]
+    job1 = scheduler.next_job(101, [0, 1, 2], (1 << 64) - 1)
+    assert job1 is not None
+    assert job1["slot_ids"][:1] == [2]
+    assert scheduler.next_job(102, [0, 1, 2], (1 << 64) - 1) is None
+
+    result = _sample_arm_result()
+    result["job_id"] = job0["job_id"]
+    result["frame_id"] = job0["frame_id"]
+    result["slot_count"] = job0["slot_count"]
+    result["slots_scored"] = job0["slot_count"]
+    result["slot_ids"] = job0["slot_ids"]
+    scheduler.record_result(result)
+    result1 = _sample_arm_result()
+    result1["job_id"] = job1["job_id"]
+    result1["frame_id"] = job1["frame_id"]
+    result1["slot_count"] = job1["slot_count"]
+    result1["slots_scored"] = job1["slot_count"]
+    result1["slot_ids"] = job1["slot_ids"]
+    scheduler.record_result(result1)
+    assert scheduler.next_job(103, [0, 1, 2], (1 << 64) - 1) is None
+    diag = scheduler.diagnostics()
+    assert diag["jobs_emitted"] == 2
+    assert diag["frames_completed"] == 1
+    assert diag["results_recorded"] == 2
+    assert diag["slots_scheduled_total"] == 3
+    assert diag["stream_ticks"]["1"] == 2
+
+
+def test_arm_maintenance_scheduler_reschedules_failed_job_slots():
+    scheduler = _ext.ArmMaintenanceScheduler(
+        memory_streams=8,
+        slot_work_chunk_size=2,
+        frame_ttl_steps=10,
+        max_frames=4,
+    )
+    assert scheduler.ingest_frame(
+        frame_id=11,
+        step=100,
+        stream_id=0,
+        cache_read_cutoff=(1 << 64) - 1,
+    )
+    job = scheduler.next_job(100, [7, 8], (1 << 64) - 1)
+    assert job is not None
+    failed = _sample_arm_result()
+    failed["status"] = 1
+    failed["job_id"] = job["job_id"]
+    failed["frame_id"] = job["frame_id"]
+    failed["slot_count"] = job["slot_count"]
+    failed["slots_scored"] = 0
+    failed["slot_ids"] = job["slot_ids"]
+    scheduler.record_result(failed)
+
+    retry = scheduler.next_job(101, [7, 8], (1 << 64) - 1)
+    assert retry is not None
+    assert retry["slot_ids"][:2] == [7, 8]
+    diag = scheduler.diagnostics()
+    assert diag["result_errors"] == 1
+
+
+def test_arm_maintenance_scheduler_does_not_complete_reserved_only_frame():
+    scheduler = _ext.ArmMaintenanceScheduler(
+        memory_streams=8,
+        slot_work_chunk_size=1,
+        frame_ttl_steps=10,
+        max_frames=4,
+    )
+    assert scheduler.ingest_frame(
+        frame_id=12,
+        step=100,
+        stream_id=0,
+        cache_read_cutoff=(1 << 64) - 1,
+    )
+    job0 = scheduler.next_job(100, [7, 8], (1 << 64) - 1)
+    job1 = scheduler.next_job(100, [7, 8], (1 << 64) - 1)
+    assert job0 is not None and job0["slot_ids"][:1] == [7]
+    assert job1 is not None and job1["slot_ids"][:1] == [8]
+    assert scheduler.next_job(100, [7, 8], (1 << 64) - 1) is None
+    failed = _sample_arm_result()
+    failed["status"] = 1
+    failed["job_id"] = job0["job_id"]
+    failed["frame_id"] = job0["frame_id"]
+    failed["slot_count"] = job0["slot_count"]
+    failed["slots_scored"] = 0
+    failed["slot_ids"] = job0["slot_ids"]
+    scheduler.record_result(failed)
+
+    retry = scheduler.next_job(101, [7, 8], (1 << 64) - 1)
+    assert retry is not None
+    assert retry["slot_ids"][:1] == [7]
+    diag = scheduler.diagnostics()
+    assert diag["queue_depth"] == 1
+    assert diag["frames_completed"] == 0
+    assert diag["skipped_inflight"] == 1
+
+
+def test_arm_maintenance_scheduler_preserves_frame_cutoff():
+    scheduler = _ext.ArmMaintenanceScheduler(
+        memory_streams=8,
+        slot_work_chunk_size=1,
+        frame_ttl_steps=10,
+        max_frames=4,
+    )
+    assert scheduler.ingest_frame(
+        frame_id=21, step=100, stream_id=0, cache_read_cutoff=111
+    )
+    assert scheduler.ingest_frame(
+        frame_id=22, step=101, stream_id=0, cache_read_cutoff=222
+    )
+    job0 = scheduler.next_job(102, [5], (1 << 64) - 1)
+    assert job0 is not None
+    assert job0["frame_id"] == 21
+    assert job0["cache_read_cutoff"] == 111
+    done = _sample_arm_result()
+    done["job_id"] = job0["job_id"]
+    done["frame_id"] = job0["frame_id"]
+    done["slot_count"] = job0["slot_count"]
+    done["slots_scored"] = job0["slot_count"]
+    done["slot_ids"] = job0["slot_ids"]
+    scheduler.record_result(done)
+
+    job1 = scheduler.next_job(103, [5], (1 << 64) - 1)
+    assert job1 is not None
+    assert job1["frame_id"] == 22
+    assert job1["cache_read_cutoff"] == 222
 
 
 # ---------------------------------------------------------------------------

@@ -117,6 +117,10 @@ amx_bf16_matmul = (
     getattr(_C, "amx_bf16_matmul", _missing_extension)
     if _C is not None else _missing_extension
 )
+amx_bf16_nll = (
+    getattr(_C, "amx_bf16_nll", _missing_extension)
+    if _C is not None else _missing_extension
+)
 amx_pack_b_vnni = (
     getattr(_C, "amx_pack_b_vnni", _missing_extension)
     if _C is not None else _missing_extension
@@ -224,6 +228,18 @@ ShmRingQueryEvent = (
 ShmRingReplayOutcome = (
     _C.ShmRingReplayOutcome if _C is not None else _missing_extension
 )
+ShmRingArmMaintenanceJob = (
+    getattr(_C, "ShmRingArmMaintenanceJob", _missing_extension)
+    if _C is not None else _missing_extension
+)
+ShmRingArmMaintenanceResult = (
+    getattr(_C, "ShmRingArmMaintenanceResult", _missing_extension)
+    if _C is not None else _missing_extension
+)
+ArmMaintenanceScheduler = (
+    getattr(_C, "ArmMaintenanceScheduler", _missing_extension)
+    if _C is not None else _missing_extension
+)
 
 __all__ = [
     "_C",
@@ -249,6 +265,7 @@ __all__ = [
     "has_amx_bf16",
     "amx_bf16_kernel_available",
     "amx_bf16_matmul",
+    "amx_bf16_nll",
     "amx_pack_b_vnni",
     "avx512_recurrence_kernel_available",
     "avx512_diagonal_recurrence",
@@ -268,4 +285,7 @@ __all__ = [
     "ShmRingWriteEvent",
     "ShmRingQueryEvent",
     "ShmRingReplayOutcome",
+    "ShmRingArmMaintenanceJob",
+    "ShmRingArmMaintenanceResult",
+    "ArmMaintenanceScheduler",
 ]
