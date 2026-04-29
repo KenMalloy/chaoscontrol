@@ -17,6 +17,7 @@ import os
 import socket
 import sys
 import tempfile
+import threading
 from pathlib import Path
 
 import pytest
@@ -588,6 +589,90 @@ def test_crct_mailbox_transport_matches_stored_batch(tmp_path) -> None:
     assert diag0["mode"] == "async_rank0_memory_mailbox"
     assert diag0["payloads_used"] == 1
     assert diag3["payloads_scored"] == 1
+
+
+def test_crct_mailbox_weight_snapshot_applies_latest_model(tmp_path) -> None:
+    mod = _load_module("runner_fast_path_crct_mailbox_weights", RUNNER_PATH)
+    kwargs = {
+        "world_size": 4,
+        "mailbox_dir": str(tmp_path),
+        "payload_shape": (1, 2, 5),
+        "full_ids_shape": (2, 6),
+        "device": torch.device("cpu"),
+        "payload_dtype": torch.float32,
+        "max_local_batches": 8,
+        "max_payload_lag_steps": 8,
+        "score_interval_steps": 1,
+    }
+    rank0 = mod._CrctMailboxTeacherTransport(rank=0, **kwargs)
+    rank3 = mod._CrctMailboxTeacherTransport(rank=3, **kwargs)
+    model0 = torch.nn.Sequential(torch.nn.Linear(4, 4), torch.nn.LayerNorm(4))
+    model3 = torch.nn.Sequential(torch.nn.Linear(4, 4), torch.nn.LayerNorm(4))
+    with torch.no_grad():
+        for param in model0.parameters():
+            param.fill_(0.25)
+        for param in model3.parameters():
+            param.fill_(-0.5)
+
+    before = {
+        name: tensor.detach().clone()
+        for name, tensor in model3.state_dict().items()
+    }
+    rank0.maybe_publish_weight_snapshot(model=model0, step=7)
+    assert rank0._weight_publish_thread is not None
+    rank0._weight_publish_thread.join(timeout=5.0)
+    assert not rank0._weight_publish_thread.is_alive()
+
+    rank3.poll_weight_snapshot(model=model3, step=11)
+
+    for name, tensor in model3.state_dict().items():
+        assert not torch.equal(tensor, before[name])
+        assert torch.equal(tensor, model0.state_dict()[name])
+    diag0 = rank0.diagnostics()
+    diag3 = rank3.diagnostics()
+    assert diag0["weight_snapshot_published"] == 1
+    assert diag0["mailbox_write_seconds_max"] == 0.0
+    assert diag3["weight_snapshot_applied"] == 1
+    assert diag3["weight_snapshot_last_applied_step"] == 7
+    assert diag3["weight_snapshot_version_lag_steps"] == 4
+    rank3.poll_weight_snapshot(model=model3, step=12)
+    diag3_after = rank3.diagnostics()
+    assert diag3_after["weight_snapshot_applied"] == 1
+    assert diag3_after["weight_snapshot_stat_skips"] == 1
+
+
+def test_crct_mailbox_weight_snapshot_drops_when_writer_busy(tmp_path) -> None:
+    mod = _load_module("runner_fast_path_crct_mailbox_weights_busy", RUNNER_PATH)
+    rank0 = mod._CrctMailboxTeacherTransport(
+        rank=0,
+        world_size=4,
+        mailbox_dir=str(tmp_path),
+        payload_shape=(1, 2, 5),
+        full_ids_shape=(2, 6),
+        device=torch.device("cpu"),
+        payload_dtype=torch.float32,
+        max_local_batches=8,
+        max_payload_lag_steps=8,
+        score_interval_steps=1,
+    )
+    blocker_started = threading.Event()
+    blocker_release = threading.Event()
+
+    def _block_writer() -> None:
+        blocker_started.set()
+        blocker_release.wait(timeout=5.0)
+
+    rank0._weight_publish_thread = threading.Thread(target=_block_writer)
+    rank0._weight_publish_thread.start()
+    assert blocker_started.wait(timeout=1.0)
+    rank0.maybe_publish_weight_snapshot(model=torch.nn.Linear(2, 2), step=1)
+    blocker_release.set()
+    rank0._weight_publish_thread.join(timeout=1.0)
+
+    diag = rank0.diagnostics()
+    assert diag["weight_snapshot_attempts"] == 1
+    assert diag["weight_snapshot_publish_skipped_busy"] == 1
+    assert diag["weight_snapshot_published"] == 0
 
 
 def test_crct_teacher_payload_appends_memory_after_scoring() -> None:

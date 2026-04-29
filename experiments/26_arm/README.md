@@ -9,6 +9,7 @@ locked fast/slow trunk
 + streaming Adaptive Residual Memory maintenance
 + learned Full-A commit authority
 + GPU3 physics confirmation
++ latest-only GPU0->GPU3 teacher-weight snapshots
 ```
 
 CRCT-only, shadow-mode, calibration, and headline-arm switches were removed.
@@ -41,6 +42,9 @@ shape gives `384 -> 13.71 MB`, `416 -> 15.19 MB`, `448 -> 16.73 MB`, and
 - `replay_eviction_arm_runtime_enabled` is true and the runtime namespace is
   per-cell.
 - GPU3 oracle/maintenance telemetry is non-empty.
+- `transport_summary.health.weight_snapshot_published` and
+  `weight_snapshot_applied` are non-zero in the ARM cell; snapshot copy/save/apply
+  timing and version lag are visible.
 - Learned commit feedback updates are non-zero once oracle confirmations land.
 - Fail-open/stale/drop counters are visible and bounded.
 - Train-rank throughput is not catastrophically coupled to memory work.

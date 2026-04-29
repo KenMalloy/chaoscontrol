@@ -107,7 +107,7 @@ def _crct_lock() -> dict[str, Any]:
         "crct_async_teacher_max_lag_steps": 128,
         "crct_async_teacher_payload_dtype": "auto",
         "crct_teacher_score_interval_steps": 64,
-        "crct_teacher_param_sync_interval_steps": 0,
+        "crct_teacher_param_sync_interval_steps": 64,
         "outer_model_dim": 64,
         "outer_model_type": "multislot",
         "outer_max_slots": 4096,

@@ -74,6 +74,7 @@ def test_validation_active_is_full_arm_not_crct_only_or_shadow():
     assert active["replay_eviction_mode"] == "active"
     assert active["replay_eviction_commit_policy"] == "learned"
     assert active["replay_eviction_scoring_mode"] == "oracle"
+    assert active["crct_teacher_param_sync_interval_steps"] == 64
     assert active["replay_eviction_arm_runtime_enabled"] is True
     assert active["replay_eviction_action_agreement_count"] == 1
     assert active["bucket_prototypes"] is True

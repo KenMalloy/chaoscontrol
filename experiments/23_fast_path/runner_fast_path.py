@@ -1688,6 +1688,9 @@ class _CrctMailboxTeacherTransport:
         self.pending_input_requests: deque[dict[str, Any]] = deque()
         self.local_batches_by_step: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
         self.local_batch_order: deque[int] = deque()
+        self._weight_publish_thread: threading.Thread | None = None
+        self._last_applied_weight_step = -1
+        self._last_seen_weight_snapshot_stat: tuple[int, int] | None = None
         self.metrics: dict[str, Any] = {
             "mode": "async_rank0_memory_mailbox",
             "transport_group": "rank0_memory_mailbox",
@@ -1750,6 +1753,27 @@ class _CrctMailboxTeacherTransport:
             "mailbox_write_seconds_max": 0.0,
             "mailbox_read_seconds_sum": 0.0,
             "mailbox_read_seconds_max": 0.0,
+            "weight_snapshot_attempts": 0,
+            "weight_snapshot_copy_started": 0,
+            "weight_snapshot_copy_seconds_sum": 0.0,
+            "weight_snapshot_copy_seconds_max": 0.0,
+            "weight_snapshot_publish_started": 0,
+            "weight_snapshot_published": 0,
+            "weight_snapshot_publish_skipped_busy": 0,
+            "weight_snapshot_publish_errors": 0,
+            "weight_snapshot_save_seconds_sum": 0.0,
+            "weight_snapshot_save_seconds_max": 0.0,
+            "weight_snapshot_apply_attempts": 0,
+            "weight_snapshot_applied": 0,
+            "weight_snapshot_apply_stale": 0,
+            "weight_snapshot_apply_errors": 0,
+            "weight_snapshot_stat_skips": 0,
+            "weight_snapshot_apply_seconds_sum": 0.0,
+            "weight_snapshot_apply_seconds_max": 0.0,
+            "weight_snapshot_last_published_step": -1,
+            "weight_snapshot_last_applied_step": -1,
+            "weight_snapshot_version_lag_steps": 0,
+            "weight_snapshot_publisher_busy": False,
         }
 
     def begin_step(
@@ -1786,6 +1810,8 @@ class _CrctMailboxTeacherTransport:
         memory_write_tokens: int,
         gradient_conflict_monitor: CrctGradientConflictMonitor | None = None,
     ) -> None:
+        if self.rank == self.memory_rank:
+            self.poll_weight_snapshot(model=model, step=int(step))
         if self.rank != self.memory_rank or not self.pending_input_requests:
             return
         if len(self.pending_input_requests) > 1:
@@ -1835,6 +1861,11 @@ class _CrctMailboxTeacherTransport:
 
     def diagnostics(self) -> dict[str, Any]:
         out = dict(self.metrics)
+        busy = (
+            self._weight_publish_thread is not None
+            and self._weight_publish_thread.is_alive()
+        )
+        out["weight_snapshot_publisher_busy"] = bool(busy)
         out.update(
             {
                 "pending_result_broadcasts": 0,
@@ -1858,6 +1889,8 @@ class _CrctMailboxTeacherTransport:
         return
 
     def close(self) -> None:
+        if self._weight_publish_thread is not None:
+            self._weight_publish_thread.join(timeout=0.01)
         return
 
     def _request_path(self, step: int) -> Path:
@@ -1866,17 +1899,27 @@ class _CrctMailboxTeacherTransport:
     def _result_path(self, step: int) -> Path:
         return self.mailbox_dir / f"result_{int(step):012d}.pt"
 
-    def _atomic_save(self, obj: dict[str, Any], path: Path) -> None:
+    def _weight_path(self) -> Path:
+        return self.mailbox_dir / "weights_latest.pt"
+
+    def _atomic_save(
+        self,
+        obj: dict[str, Any],
+        path: Path,
+        *,
+        record_mailbox_metrics: bool = True,
+    ) -> None:
         t0 = time.perf_counter()
         tmp = path.with_name(f"{path.name}.rank{self.rank}.tmp")
         torch.save(obj, tmp)
         tmp.replace(path)
         elapsed = time.perf_counter() - t0
-        self.metrics["mailbox_write_seconds_sum"] += float(elapsed)
-        self.metrics["mailbox_write_seconds_max"] = max(
-            float(self.metrics["mailbox_write_seconds_max"]),
-            float(elapsed),
-        )
+        if record_mailbox_metrics:
+            self.metrics["mailbox_write_seconds_sum"] += float(elapsed)
+            self.metrics["mailbox_write_seconds_max"] = max(
+                float(self.metrics["mailbox_write_seconds_max"]),
+                float(elapsed),
+            )
 
     def _safe_unlink(self, path: Path) -> None:
         try:
@@ -1884,6 +1927,149 @@ class _CrctMailboxTeacherTransport:
             self.metrics["mailbox_unlinks"] += 1
         except FileNotFoundError:
             pass
+
+    def maybe_publish_weight_snapshot(
+        self,
+        *,
+        model: torch.nn.Module,
+        step: int,
+    ) -> None:
+        """Publish a latest-only teacher snapshot without a rank-3 rendezvous.
+
+        Rank 0 performs the unavoidable model->CPU copy only when no previous
+        snapshot writer is still alive. The slower serialization/rename happens
+        on a daemon thread. If the writer is busy, this drops the refresh rather
+        than queuing, preserving the trunk throughput contract.
+        """
+        if self.rank != self.coordinator_rank:
+            return
+        self.metrics["weight_snapshot_attempts"] += 1
+        if (
+            self._weight_publish_thread is not None
+            and self._weight_publish_thread.is_alive()
+        ):
+            self.metrics["weight_snapshot_publish_skipped_busy"] += 1
+            self.metrics["weight_snapshot_publisher_busy"] = True
+            return
+        copy_t0 = time.perf_counter()
+        try:
+            state_cpu = {
+                name: value.detach().to(device="cpu", copy=True)
+                if torch.is_tensor(value)
+                else value
+                for name, value in model.state_dict().items()
+            }
+        except Exception as exc:
+            self.metrics["weight_snapshot_publish_errors"] += 1
+            self.metrics["last_error"] = "".join(
+                traceback.format_exception_only(type(exc), exc)
+            ).strip()
+            self.metrics["last_drop_reason"] = "weight_snapshot_copy_error"
+            return
+        copy_s = time.perf_counter() - copy_t0
+        self.metrics["weight_snapshot_copy_started"] += 1
+        self.metrics["weight_snapshot_copy_seconds_sum"] += float(copy_s)
+        self.metrics["weight_snapshot_copy_seconds_max"] = max(
+            float(self.metrics["weight_snapshot_copy_seconds_max"]),
+            float(copy_s),
+        )
+        self.metrics["weight_snapshot_publish_started"] += 1
+        self.metrics["weight_snapshot_publisher_busy"] = True
+        version_step = int(step)
+
+        def _writer() -> None:
+            save_t0 = time.perf_counter()
+            try:
+                self._atomic_save(
+                    {"step": version_step, "state_dict": state_cpu},
+                    self._weight_path(),
+                    record_mailbox_metrics=False,
+                )
+                save_s = time.perf_counter() - save_t0
+                self.metrics["weight_snapshot_published"] += 1
+                self.metrics["weight_snapshot_last_published_step"] = version_step
+                self.metrics["weight_snapshot_save_seconds_sum"] += float(save_s)
+                self.metrics["weight_snapshot_save_seconds_max"] = max(
+                    float(self.metrics["weight_snapshot_save_seconds_max"]),
+                    float(save_s),
+                )
+            except Exception as exc:
+                self.metrics["weight_snapshot_publish_errors"] += 1
+                self.metrics["last_error"] = "".join(
+                    traceback.format_exception_only(type(exc), exc)
+                ).strip()
+                self.metrics["last_drop_reason"] = "weight_snapshot_save_error"
+            finally:
+                self.metrics["weight_snapshot_publisher_busy"] = False
+
+        self._weight_publish_thread = threading.Thread(
+            target=_writer,
+            name="crct-weight-snapshot-writer",
+            daemon=True,
+        )
+        self._weight_publish_thread.start()
+
+    def poll_weight_snapshot(
+        self,
+        *,
+        model: torch.nn.Module,
+        step: int,
+    ) -> None:
+        """Apply the latest rank0 snapshot on the memory rank if available."""
+        if self.rank != self.memory_rank:
+            return
+        path = self._weight_path()
+        try:
+            stat = path.stat()
+        except FileNotFoundError:
+            return
+        stat_id = (int(getattr(stat, "st_ino", 0)), int(stat.st_mtime_ns))
+        if stat_id == self._last_seen_weight_snapshot_stat:
+            self.metrics["weight_snapshot_stat_skips"] += 1
+            self.metrics["weight_snapshot_version_lag_steps"] = max(
+                0, int(step) - int(self._last_applied_weight_step)
+            )
+            return
+        self.metrics["weight_snapshot_apply_attempts"] += 1
+        apply_t0 = time.perf_counter()
+        try:
+            payload = torch.load(path, map_location="cpu", weights_only=True)
+            self._last_seen_weight_snapshot_stat = stat_id
+            version_step = int(payload.get("step", -1))
+            if version_step <= self._last_applied_weight_step:
+                self.metrics["weight_snapshot_apply_stale"] += 1
+                self.metrics["weight_snapshot_version_lag_steps"] = max(
+                    0, int(step) - int(self._last_applied_weight_step)
+                )
+                return
+            load_result = model.load_state_dict(
+                payload["state_dict"],
+                strict=False,
+            )
+            missing = getattr(load_result, "missing_keys", [])
+            unexpected = getattr(load_result, "unexpected_keys", [])
+            if missing or unexpected:
+                self.metrics["last_drop_reason"] = "weight_snapshot_partial_load"
+            elapsed = time.perf_counter() - apply_t0
+            self._last_applied_weight_step = version_step
+            self.metrics["weight_snapshot_applied"] += 1
+            self.metrics["weight_snapshot_last_applied_step"] = version_step
+            self.metrics["weight_snapshot_version_lag_steps"] = max(
+                0, int(step) - version_step
+            )
+            self.metrics["weight_snapshot_apply_seconds_sum"] += float(elapsed)
+            self.metrics["weight_snapshot_apply_seconds_max"] = max(
+                float(self.metrics["weight_snapshot_apply_seconds_max"]),
+                float(elapsed),
+            )
+        except FileNotFoundError:
+            return
+        except Exception as exc:
+            self.metrics["weight_snapshot_apply_errors"] += 1
+            self.metrics["last_error"] = "".join(
+                traceback.format_exception_only(type(exc), exc)
+            ).strip()
+            self.metrics["last_drop_reason"] = "weight_snapshot_apply_error"
 
     def _write_request(
         self,
@@ -8308,6 +8494,20 @@ def train_fast_for_budget(
             fast_slow.after_optimizer_step(model, step=steps + 1)
             if (
                 crct_teacher_transport is not None
+                and crct_teacher_transport_mode == "async_rank0_memory_mailbox"
+                and not bool(memory_rank_joins_grad)
+                and int(crct_teacher_param_sync_interval) > 0
+                and steps % int(crct_teacher_param_sync_interval) == 0
+            ):
+                publish = getattr(
+                    crct_teacher_transport,
+                    "maybe_publish_weight_snapshot",
+                    None,
+                )
+                if callable(publish):
+                    publish(model=model, step=steps)
+            if (
+                crct_teacher_transport is not None
                 and crct_teacher_transport_mode == "async_rank0_memory_broadcast"
                 and not bool(memory_rank_joins_grad)
                 and teacher_group is not None
@@ -8591,6 +8791,39 @@ def train_fast_for_budget(
                 "mailbox_read_seconds_max": max(
                     float(coord.get("mailbox_read_seconds_max", 0.0)),
                     float(mem.get("mailbox_read_seconds_max", 0.0)),
+                ),
+                "weight_snapshot_published": int(
+                    coord.get("weight_snapshot_published", 0)
+                ),
+                "weight_snapshot_applied": int(
+                    mem.get("weight_snapshot_applied", 0)
+                ),
+                "weight_snapshot_publish_skipped_busy": int(
+                    coord.get("weight_snapshot_publish_skipped_busy", 0)
+                ),
+                "weight_snapshot_publish_errors": int(
+                    coord.get("weight_snapshot_publish_errors", 0)
+                ),
+                "weight_snapshot_apply_errors": int(
+                    mem.get("weight_snapshot_apply_errors", 0)
+                ),
+                "weight_snapshot_stat_skips": int(
+                    mem.get("weight_snapshot_stat_skips", 0)
+                ),
+                "weight_snapshot_version_lag_steps": int(
+                    mem.get("weight_snapshot_version_lag_steps", 0)
+                ),
+                "weight_snapshot_copy_seconds_max": float(
+                    coord.get("weight_snapshot_copy_seconds_max", 0.0)
+                ),
+                "weight_snapshot_save_seconds_max": float(
+                    coord.get("weight_snapshot_save_seconds_max", 0.0)
+                ),
+                "weight_snapshot_apply_seconds_max": float(
+                    mem.get("weight_snapshot_apply_seconds_max", 0.0)
+                ),
+                "weight_snapshot_publisher_busy": bool(
+                    coord.get("weight_snapshot_publisher_busy", False)
                 ),
             }
     timing = summarize_train_timing(
