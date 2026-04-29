@@ -327,6 +327,9 @@ class TestReplayEvictionLoop:
         assert "stream_probe_duty_cycle" in diag
         assert "stage_seconds_last" in diag
         assert "slot_coverage_per_minute" in diag
+        assert "unique_slots_scored" in diag
+        assert "slot_coverage_ratio" in diag
+        assert "slot_scored_sweeps" in diag
         assert "oracle_confirmations_total" in diag
         assert "proxy_oracle_abs_error_mean" in diag
         assert "last_probe_seconds" in diag

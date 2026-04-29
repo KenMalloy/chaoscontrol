@@ -158,12 +158,12 @@ def _replay_eviction_pipeline_lock() -> dict[str, Any]:
         # Rank-3 maintenance runs off the trunk critical path. The generic
         # 0.5s default was a scaffold-era placeholder and suppresses action
         # telemetry at Exp26's real 16k-vocab probe cost.
-        "replay_eviction_max_seconds": 8.0,
+        "replay_eviction_max_seconds": 12.0,
         "replay_eviction_oracle_confirm_top_k": 32,
         "replay_eviction_oracle_variant_chunk_size": 1,
         "replay_eviction_probe_buffer_size": 32,
         "replay_eviction_frame_ttl_steps": 256,
-        "replay_eviction_slot_work_chunk_size": 16,
+        "replay_eviction_slot_work_chunk_size": 64,
         "replay_eviction_trace_max_rows": 200000,
         "replay_eviction_trace_flush_rows": 256,
     }
@@ -341,12 +341,11 @@ def _balanced_arm_overrides(manifest: dict[str, Any]) -> dict[str, Any]:
 
 
 def _aggressive_arm_overrides(manifest: dict[str, Any]) -> dict[str, Any]:
-    """arm_e: aggressive thresholds + agreement_count=1 + higher oracle top-k."""
+    """arm_e: aggressive thresholds + agreement_count=1."""
     aggressive = manifest["thresholds_aggressive"]
     overrides = {
         "replay_eviction_mode": "active",
         "replay_eviction_action_agreement_count": 1,
-        "replay_eviction_oracle_confirm_top_k": 96,
         **{
             f"replay_eviction_{key}": float(value)
             for key, value in aggressive.items()

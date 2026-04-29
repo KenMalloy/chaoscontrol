@@ -51,8 +51,10 @@ calibrated thresholds into the active arms.
 | `arm_e_crct_replay_active_aggressive` | active maintenance at aggressive thresholds | active | aggressive |
 
 `agreement_count` differs across arms: `arm_d=2` (consensus across two fresh
-frames), `arm_e=1` (act on first observation). `oracle_confirm_top_k` is
-higher for `arm_e` (96 vs 32 default).
+frames), `arm_e=1` (act on first observation). Both active arms keep the same
+coverage-first maintenance budget: GPU3 scores 64 slots per tick and caps exact
+oracle confirmation at 32 candidates so the massage pass sweeps the sidecar
+population instead of over-confirming a narrow slice.
 
 ## Reading the matrix
 

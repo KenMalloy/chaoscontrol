@@ -2128,6 +2128,17 @@ class ReplayEvictionLoop:
     def diagnostics(self) -> dict[str, Any]:
         self.flush_trace()
         elapsed_wall = max(1e-9, time.monotonic() - self._started_at)
+        unique_slots_scored = len(self._slot_last_scored_step)
+        slot_coverage_ratio = (
+            min(1.0, unique_slots_scored / self._last_visible_slots)
+            if self._last_visible_slots
+            else 0.0
+        )
+        slot_scored_sweeps = (
+            self._slots_scored_total / self._last_visible_slots
+            if self._last_visible_slots
+            else 0.0
+        )
         queue_depth_mean = (
             self._queue_depth_sum / self._queue_depth_samples
             if self._queue_depth_samples
@@ -2229,6 +2240,9 @@ class ReplayEvictionLoop:
                 else 0.0
             ),
             "last_visible_slots": self._last_visible_slots,
+            "unique_slots_scored": unique_slots_scored,
+            "slot_coverage_ratio": slot_coverage_ratio,
+            "slot_scored_sweeps": slot_scored_sweeps,
             "slots_untouched_past_ttl": self._last_untouched_slots,
             "max_untouched_slot_steps": self._last_max_untouched_steps,
             "slot_coverage_per_minute": (
