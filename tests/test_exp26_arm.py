@@ -209,13 +209,10 @@ def test_analyzer_writes_manifest(tmp_path, calibrate):
     loaded = json.loads(manifest.read_text())
     assert loaded["n_decisions_observed"] == 300
     assert "thresholds_balanced" in loaded
-    assert "thresholds_aggressive" in loaded
     assert "signal_summary" in loaded
-    # Balanced and aggressive should be different in at least one threshold.
     bal = loaded["thresholds_balanced"]
-    agg = loaded["thresholds_aggressive"]
-    assert bal["threshold"] != agg["threshold"]
-    assert bal["min_age_steps"] != agg["min_age_steps"]
+    assert bal["threshold"] > 0.0
+    assert bal["min_age_steps"] == 128
 
 
 def test_analyzer_raises_on_empty_trace(tmp_path, calibrate):
@@ -259,24 +256,6 @@ def test_analyzer_balanced_uses_p50_thresholds(tmp_path, calibrate):
     )
 
 
-def test_analyzer_aggressive_uses_p75_p25_thresholds(tmp_path, calibrate):
-    trace = tmp_path / "trace.ndjson"
-    _write_synthetic_trace(trace, n_decisions=400)
-    manifest = calibrate.analyze(
-        trace_path=trace,
-        manifest_path=tmp_path / "manifest.json",
-    )
-    summary = manifest["signal_summary"]
-    agg = manifest["thresholds_aggressive"]
-    assert agg["threshold"] == pytest.approx(summary["utility_ema"]["p75"])
-    assert agg["peak_preserve_utility_threshold"] == pytest.approx(
-        summary["peak_utility"]["p25"]
-    )
-    assert agg["peak_preserve_sharpness_threshold"] == pytest.approx(
-        summary["peak_sharpness"]["p25"]
-    )
-
-
 # ---- build_arm_v1_matrix ----------------------------------------------------
 
 
@@ -305,18 +284,6 @@ def _write_realistic_manifest(path: Path) -> None:
             "peak_preserve_sharpness_threshold": 0.03,
             "min_age_steps": 128,
             "min_score_count": 2,
-        },
-        "thresholds_aggressive": {
-            "threshold": 0.04,
-            "useful_threshold": 0.001,
-            "drift_threshold": 0.005,
-            "repr_drift_threshold": 0.005,
-            "quarantine_threshold": -0.001,
-            "distill_peak_threshold": 0.02,
-            "peak_preserve_utility_threshold": 0.005,
-            "peak_preserve_sharpness_threshold": 0.003,
-            "min_age_steps": 64,
-            "min_score_count": 1,
         },
     }
     path.write_text(json.dumps(manifest, indent=2))
@@ -356,15 +323,15 @@ def test_arm_v1_active_uses_learned_commit_authority(tmp_path, exp26, speed_conf
     )
     assert len(entries) == 1
     e = entries[0]
-    # Manifest thresholds land only as rule-prior features/counterfactual
-    # telemetry. The active owner is the learned Full-A action simplex.
-    assert e["replay_eviction_threshold"] == 0.01
-    assert e["replay_eviction_peak_preserve_utility_threshold"] == 0.05
-    assert e["replay_eviction_peak_preserve_sharpness_threshold"] == 0.03
+    # Manifest thresholds are post-hoc counterfactuals only. The active
+    # owner is the learned Full-A action simplex plus GPU3 physics.
+    assert "replay_eviction_threshold" not in e
+    assert "replay_eviction_peak_preserve_utility_threshold" not in e
+    assert "replay_eviction_peak_preserve_sharpness_threshold" not in e
     assert e["replay_eviction_action_agreement_count"] == 1
     assert e["replay_eviction_commit_policy"] == "learned"
     assert e["replay_eviction_commit_online_lr"] == 0.05
-    assert e["replay_eviction_commit_rule_prior_scale"] == 1.0
+    assert "replay_eviction_commit_rule_prior_scale" not in e
     assert e["replay_eviction_mode"] == "active"
 
 
@@ -410,21 +377,19 @@ def test_arm_v1_unknown_arm_raises(tmp_path, exp26, speed_config):
         )
 
 
-def test_arm_v1_malformed_manifest_raises(tmp_path, exp26, speed_config):
+def test_arm_v1_headline_ignores_malformed_manifest(tmp_path, exp26, speed_config):
     manifest_path = tmp_path / "manifest.json"
     manifest_path.write_text("{not valid json")
-    with pytest.raises(ValueError, match="malformed"):
-        exp26.build_arm_v1_matrix(
-            speed_config=speed_config,
-            calibration_manifest_path=manifest_path,
-        )
+    entries = exp26.build_arm_v1_matrix(
+        speed_config=speed_config,
+        calibration_manifest_path=manifest_path,
+        seed_values=[1337],
+    )
+    assert {entry["arm"] for entry in entries} == set(exp26.ARM_V1_ARMS)
 
 
-def test_arm_v1_manifest_missing_required_keys_raises(tmp_path, exp26, speed_config):
+def test_load_manifest_missing_required_keys_raises(tmp_path, exp26):
     manifest_path = tmp_path / "manifest.json"
     manifest_path.write_text(json.dumps({"calibrated_at": "2026-04-28"}))
     with pytest.raises(ValueError, match="missing required keys"):
-        exp26.build_arm_v1_matrix(
-            speed_config=speed_config,
-            calibration_manifest_path=manifest_path,
-        )
+        exp26.load_manifest(manifest_path)

@@ -3,9 +3,8 @@
 
 Reads a shadow-mode replay-maintenance trace (NDJSON), pulls per-decision
 EMAs out of the action rows, and writes a manifest of percentile-anchored
-threshold counterfactuals. These values seed rule-prior features and trace
-what a threshold policy would have done; they no longer define active arms
-or own the commit decision.
+threshold counterfactuals. These values support post-hoc rule replay; they
+do not feed active arms or own the commit decision.
 """
 
 from __future__ import annotations
@@ -127,7 +126,7 @@ def _summarize(signals: dict[str, list[float]]) -> dict[str, dict[str, float]]:
 
 
 def _balanced_thresholds(summary: dict[str, dict[str, float]]) -> dict[str, float]:
-    """Balanced threshold counterfactual. Mid-aggressive percentile anchors."""
+    """Balanced threshold counterfactual for post-hoc rule replay."""
     return {
         "threshold": summary["utility_ema"]["p50"],
         "useful_threshold": summary["utility_ema"]["p25"],
@@ -139,27 +138,6 @@ def _balanced_thresholds(summary: dict[str, dict[str, float]]) -> dict[str, floa
         "peak_preserve_sharpness_threshold": summary["peak_sharpness"]["p75"],
         "min_age_steps": 128,
         "min_score_count": 2,
-    }
-
-
-def _aggressive_thresholds(summary: dict[str, dict[str, float]]) -> dict[str, float]:
-    """Aggressive threshold counterfactual. Pushes the shadow policy harder.
-
-    More slots above eviction floor, less preservation force, distill
-    fires earlier, refresh fires earlier. This remains useful for post-hoc
-    threshold replay, not as a live Exp26 arm.
-    """
-    return {
-        "threshold": summary["utility_ema"]["p75"],
-        "useful_threshold": summary["utility_ema"]["p25"],
-        "drift_threshold": summary["max_drift"]["p25"],
-        "repr_drift_threshold": summary["representation_drift"]["p25"],
-        "quarantine_threshold": -abs(summary["contradiction_ema"]["p50"]),
-        "distill_peak_threshold": summary["peak_utility"]["p50"],
-        "peak_preserve_utility_threshold": summary["peak_utility"]["p25"],
-        "peak_preserve_sharpness_threshold": summary["peak_sharpness"]["p25"],
-        "min_age_steps": 64,
-        "min_score_count": 1,
     }
 
 
@@ -185,7 +163,6 @@ def analyze(
         "n_decisions_observed": n_decisions,
         "signal_summary": summary,
         "thresholds_balanced": _balanced_thresholds(summary),
-        "thresholds_aggressive": _aggressive_thresholds(summary),
     }
     manifest_path.parent.mkdir(parents=True, exist_ok=True)
     manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True))

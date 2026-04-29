@@ -29,18 +29,17 @@ records `utility_ema`, `peak_utility`, `peak_sharpness`, `marginal_gain_ema`,
 
 **Stage 2 — analysis.** `calibrate.analyze` reads the trace, computes
 percentile summaries per signal, and writes `calibration/manifest.json`
-with two threshold-counterfactual sets:
+with one threshold-counterfactual set:
 
 - `thresholds_balanced` — anchored to p50 utility, p75 peak, p75 drift.
-- `thresholds_aggressive` — anchored to p75 utility, p25 peak, p25 drift.
 
-Both ride on the same observed distributions; they differ only in where on
-the percentile scale each threshold sits. They are not active commit regimes.
+It rides on the observed distributions for post-hoc rule replay. It is not
+an active commit regime.
 
-**Stage 3 — headline.** `build_arm_v1_matrix` reads the manifest when present
-and folds balanced thresholds into the rule-prior features and trace
-counterfactuals. The active commit decision is owned by the learned Full-A
-action simplex; thresholds no longer create balanced/aggressive active arms.
+**Stage 3 — headline.** `build_arm_v1_matrix` accepts the manifest path for
+CLI continuity, but the active arm does not consume threshold manifests. The
+active commit decision is owned by the learned Full-A action simplex plus
+GPU3 physics confirmation.
 
 ## Arms
 
@@ -49,12 +48,12 @@ action simplex; thresholds no longer create balanced/aggressive active arms.
 | `arm_a_fastslow_control` | locked Phase-0 trunk, no CRCT, no maintenance | — | — |
 | `arm_b_crct_controller` | CRCT alone (no maintenance) | — | — |
 | `arm_c_crct_replay_shadow` | maintenance signal only, no mutation | shadow | permissive |
-| `arm_d_crct_replay_active_learned` | active maintenance with learned Full-A commit authority | active | rule-prior only |
+| `arm_d_crct_replay_active_learned` | active maintenance with learned Full-A commit authority | active | none |
 
-The older balanced/aggressive split was removed because it put hand-set
-thresholds in charge of the commit decision. `agreement_count` remains only
-for the legacy rule mode; the learned active arm acts from controller
-confidence plus GPU3 physics confirmation.
+The older hand-threshold split was removed because it put fixed thresholds in
+charge of the commit decision. `agreement_count` remains only for the legacy
+rule mode; the learned active arm acts from controller confidence plus GPU3
+physics confirmation.
 
 Replay maintenance uses `replay_eviction_scoring_mode=oracle`: GPU3 is the
 memory/massage worker and scores scheduled slots with the real

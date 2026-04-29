@@ -10,8 +10,8 @@ Three-stage discipline plus a phase-0 runtime smoke:
   Stage 2 (analyze)     : Read trace, percentile-anchor threshold
                           counterfactuals, write calibration/manifest.json.
   Stage 3 (headline)    : 4 arms x 3 seeds, 600s each. The active ARM cell
-                          uses learned Full-A commit authority; manifest
-                          thresholds are rule-prior telemetry only.
+                          uses learned Full-A commit authority; threshold
+                          manifests are not runtime inputs.
 
 Usage:
 
@@ -24,7 +24,7 @@ Usage:
   # calibrate-only (writes manifest then stops)
   python experiments/26_arm/run_exp26.py --stage calibrate
 
-  # headline only (uses manifest when present, but does not require it)
+  # headline only (does not consume threshold manifests)
   python experiments/26_arm/run_exp26.py --stage headline
 
   # dry-run any stage to print entries without launching
@@ -205,10 +205,9 @@ def _run_analysis(
             flush=True,
         )
     bal = manifest.get("thresholds_balanced", {})
-    agg = manifest.get("thresholds_aggressive", {})
     print(
-        f"[exp26]   balanced eviction_threshold={bal.get('threshold'):.4g}  "
-        f"aggressive eviction_threshold={agg.get('threshold'):.4g}",
+        f"[exp26]   threshold_counterfactual eviction_threshold="
+        f"{bal.get('threshold'):.4g}",
         flush=True,
     )
 

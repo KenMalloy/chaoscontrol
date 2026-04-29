@@ -146,9 +146,9 @@ def _crct_lock() -> dict[str, Any]:
 def _replay_eviction_pipeline_lock() -> dict[str, Any]:
     """Streaming pipeline knobs. Same across calibration and headline arms.
 
-    Threshold knobs are NOT here; those are arm-specific (calibration uses
-    permissive defaults; headline arms use percentile-anchored values from
-    the calibration manifest).
+    Threshold knobs are NOT here. Calibration/shadow can still emit
+    threshold counterfactual telemetry, but the headline learned arm owns
+    its commit decision without percentile-threshold priors.
     """
     return {
         "replay_eviction_enabled": True,
@@ -180,7 +180,6 @@ def _replay_eviction_pipeline_lock() -> dict[str, Any]:
         "replay_eviction_controller_feedback_lr": 0.05,
         "replay_eviction_commit_policy": "learned",
         "replay_eviction_commit_online_lr": 0.05,
-        "replay_eviction_commit_rule_prior_scale": 1.0,
         "replay_eviction_commit_temperature": 0.75,
         "replay_eviction_probe_buffer_size": 32,
         "replay_eviction_frame_ttl_steps": 256,
@@ -338,7 +337,7 @@ def load_manifest(manifest_path: str | Path = DEFAULT_MANIFEST_PATH) -> dict[str
         manifest = json.loads(p.read_text())
     except Exception as exc:
         raise ValueError(f"manifest at {p} is malformed: {exc!r}") from exc
-    required = {"thresholds_balanced", "thresholds_aggressive"}
+    required = {"thresholds_balanced"}
     missing = required - set(manifest.keys())
     if missing:
         raise ValueError(
@@ -347,29 +346,18 @@ def load_manifest(manifest_path: str | Path = DEFAULT_MANIFEST_PATH) -> dict[str
     return manifest
 
 
-def _learned_active_arm_overrides(
-    manifest: dict[str, Any] | None = None,
-) -> dict[str, Any]:
+def _learned_active_arm_overrides() -> dict[str, Any]:
     """arm_d: learned Full-A action-simplex commit authority.
 
-    The optional manifest seeds the rule-prior feature scale only; it no
-    longer owns the commit decision or creates balanced/aggressive arms.
+    Threshold calibration is intentionally not folded into the active arm.
+    The GPU3 oracle supplies physics confirmation, and the Full-A controller
+    learns commit authority from that feedback.
     """
-    balanced = (manifest or {}).get("thresholds_balanced", _calibration_thresholds())
-    normalized = {
-        key.replace("replay_eviction_", ""): value
-        for key, value in balanced.items()
-    }
-    overrides = {
+    return {
         "replay_eviction_mode": "active",
         "replay_eviction_commit_policy": "learned",
         "replay_eviction_action_agreement_count": 1,
-        **{
-            f"replay_eviction_{key}": float(value)
-            for key, value in normalized.items()
-        },
     }
-    return overrides
 
 
 def build_arm_v1_matrix(
@@ -389,14 +377,12 @@ def build_arm_v1_matrix(
     arm_d: CRCT + maintenance active with learned Full-A action-simplex
         commit authority.
 
-    If a calibration manifest exists, its balanced thresholds are folded in
-    as rule-prior features and counterfactual telemetry. Missing manifests no
-    longer block the active learned arm.
+    ``calibration_manifest_path`` is accepted for CLI compatibility with the
+    analyze/headline flow, but the headline learned arm does not consume
+    threshold manifests. Calibration output is for post-hoc counterfactual
+    analysis, not runtime commit authority.
     """
-    try:
-        manifest = load_manifest(calibration_manifest_path)
-    except FileNotFoundError:
-        manifest = None
+    _ = calibration_manifest_path
     size_lock = _artifact_size_lock()
     fast_slow = _fast_slow_lock()
     crct = _crct_lock()
@@ -413,7 +399,7 @@ def build_arm_v1_matrix(
         ("arm_c_crct_replay_shadow", shadow_overrides),
         (
             "arm_d_crct_replay_active_learned",
-            {**crct, **pipeline, **_learned_active_arm_overrides(manifest)},
+            {**crct, **pipeline, **_learned_active_arm_overrides()},
         ),
     ]
     if arms is not None:

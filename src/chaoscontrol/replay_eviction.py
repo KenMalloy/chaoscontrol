@@ -1290,11 +1290,12 @@ class CpuRefreshProposalModel:
 
 
 class MaintenancePolicy:
-    """Rule prior for the learned commit controller.
+    """Legacy rule policy and counterfactual trace baseline.
 
     This is no longer the active owner of maintenance mutations in Exp26. The
-    learned Full-A action simplex consumes these values as one feature family
-    and trace rows keep the rule winner as a counterfactual shadow.
+    learned Full-A action simplex chooses from learned logits; trace rows keep
+    the rule winner as a counterfactual shadow, and tests can still exercise
+    the old rule mode explicitly.
     """
 
     def action_values(
@@ -1411,13 +1412,11 @@ class LearnedCommitPolicy:
         controller_perturbation_scale: float = 0.25,
         controller_feedback_lr: float = 0.05,
         online_lr: float = 0.05,
-        rule_prior_scale: float = 1.0,
         temperature: float = 0.75,
         seed: int = 2718,
     ) -> None:
         self.actions = tuple(SLOT_ACTION_ORDER)
         self.online_lr = max(0.0, float(online_lr))
-        self.rule_prior_scale = max(0.0, float(rule_prior_scale))
         self.temperature = max(1.0e-4, float(temperature))
         self._controller = FullAControllerState(
             state_dim=int(controller_state_dim),
@@ -1449,12 +1448,13 @@ class LearnedCommitPolicy:
         self.last_rule_action = SLOT_PRESERVE
         self.last_confidence = 0.0
         self.last_entropy = 0.0
+        self.oracle_score_abs_ema = 0.0
+        self.oracle_score_scale_updates = 0
 
     def _features(
         self,
         rec: SlotRecord,
         *,
-        rule_values: dict[str, float],
         capacity_pressure: bool,
         frame_age_steps: int,
         queue_depth: int,
@@ -1482,20 +1482,11 @@ class LearnedCommitPolicy:
                 1.0 if capacity_pressure else 0.0,
                 math.tanh(float(frame_age_steps) / 256.0),
                 math.tanh(float(queue_depth) / 32.0),
-                self._rule_gap(rule_values),
+                math.tanh(float(rec.refresh_count + rec.quarantine_count) / 4.0),
             ],
             dtype=torch.float32,
         )
         return torch.nan_to_num(values, nan=0.0, posinf=1.0, neginf=-1.0)
-
-    @staticmethod
-    def _rule_gap(rule_values: dict[str, float]) -> float:
-        vals = sorted((float(v) for v in rule_values.values()), reverse=True)
-        if not vals:
-            return 0.0
-        if len(vals) == 1:
-            return math.tanh(vals[0])
-        return math.tanh(vals[0] - vals[1])
 
     def choose(
         self,
@@ -1508,7 +1499,6 @@ class LearnedCommitPolicy:
     ) -> CommitDecision:
         features = self._features(
             rec,
-            rule_values=rule_values,
             capacity_pressure=capacity_pressure,
             frame_age_steps=frame_age_steps,
             queue_depth=queue_depth,
@@ -1523,8 +1513,7 @@ class LearnedCommitPolicy:
             + (hidden @ self._readout_lr).reshape(-1)
             + self._bias
         )
-        rule_prior = self._normalized_rule_prior(rule_values)
-        logits = learned_logits + self.rule_prior_scale * rule_prior
+        logits = learned_logits
         action, vetoed, reason = self._select_legal_action(
             rec=rec,
             logits=logits,
@@ -1562,15 +1551,6 @@ class LearnedCommitPolicy:
             vetoed_action=vetoed,
             veto_reason=reason,
         )
-
-    def _normalized_rule_prior(self, rule_values: dict[str, float]) -> torch.Tensor:
-        vals = torch.tensor(
-            [float(rule_values.get(action, 0.0)) for action in self.actions],
-            dtype=torch.float32,
-        )
-        vals = torch.nan_to_num(vals, nan=0.0, posinf=0.0, neginf=0.0)
-        scale = vals.abs().max().clamp_min(1.0e-6)
-        return vals / scale
 
     def _select_legal_action(
         self,
@@ -1629,7 +1609,16 @@ class LearnedCommitPolicy:
         )
         one_hot = torch.zeros_like(p)
         one_hot[action_idx] = 1.0
-        score_mag = min(1.0, abs(float(oracle_score)) * 1000.0)
+        abs_score = abs(float(oracle_score))
+        if self.oracle_score_scale_updates == 0:
+            self.oracle_score_abs_ema = abs_score
+        else:
+            self.oracle_score_abs_ema = (
+                0.95 * self.oracle_score_abs_ema + 0.05 * abs_score
+            )
+        self.oracle_score_scale_updates += 1
+        scale = max(self.oracle_score_abs_ema, 1.0e-8)
+        score_mag = min(1.0, abs_score / scale)
         advantage = score_mag if accepted else -score_mag
         grad = (one_hot - p) * float(advantage) * self.online_lr
         self._bias = torch.clamp(self._bias + grad, -4.0, 4.0)
@@ -1659,7 +1648,6 @@ class LearnedCommitPolicy:
             "mode": "full_a_action_simplex",
             "actions": list(self.actions),
             "online_lr": self.online_lr,
-            "rule_prior_scale": self.rule_prior_scale,
             "temperature": self.temperature,
             "decisions_total": self.decisions_total,
             "feedback_updates": self.feedback_updates,
@@ -1671,6 +1659,8 @@ class LearnedCommitPolicy:
             "last_rule_action": self.last_rule_action,
             "last_confidence": self.last_confidence,
             "last_entropy": self.last_entropy,
+            "oracle_score_abs_ema": self.oracle_score_abs_ema,
+            "oracle_score_scale_updates": self.oracle_score_scale_updates,
             "controller": self._controller.diagnostics(),
         }
 
@@ -1678,7 +1668,6 @@ class LearnedCommitPolicy:
         return {
             "schema_version": 1,
             "online_lr": self.online_lr,
-            "rule_prior_scale": self.rule_prior_scale,
             "temperature": self.temperature,
             "bias": self._bias.detach().cpu(),
             "readout_lr": self._readout_lr.detach().cpu(),
@@ -1693,13 +1682,12 @@ class LearnedCommitPolicy:
             "last_rule_action": self.last_rule_action,
             "last_confidence": self.last_confidence,
             "last_entropy": self.last_entropy,
+            "oracle_score_abs_ema": self.oracle_score_abs_ema,
+            "oracle_score_scale_updates": self.oracle_score_scale_updates,
         }
 
     def load_state_dict(self, state: dict[str, Any]) -> None:
         self.online_lr = float(state.get("online_lr", self.online_lr))
-        self.rule_prior_scale = float(
-            state.get("rule_prior_scale", self.rule_prior_scale)
-        )
         self.temperature = float(state.get("temperature", self.temperature))
         bias = state.get("bias")
         if torch.is_tensor(bias) and bias.numel() == len(self.actions):
@@ -1726,6 +1714,12 @@ class LearnedCommitPolicy:
         )
         self.last_confidence = float(state.get("last_confidence", self.last_confidence))
         self.last_entropy = float(state.get("last_entropy", self.last_entropy))
+        self.oracle_score_abs_ema = float(
+            state.get("oracle_score_abs_ema", self.oracle_score_abs_ema)
+        )
+        self.oracle_score_scale_updates = int(
+            state.get("oracle_score_scale_updates", self.oracle_score_scale_updates)
+        )
 
 
 class ReplayEvictionLoop:
@@ -1784,7 +1778,6 @@ class ReplayEvictionLoop:
         action_agreement_count: int = 2,
         commit_policy: str = "learned",
         commit_online_lr: float = 0.05,
-        commit_rule_prior_scale: float = 1.0,
         commit_temperature: float = 0.75,
         arm_runtime_enabled: bool = False,
         arm_runtime_namespace: str | None = None,
@@ -1827,7 +1820,6 @@ class ReplayEvictionLoop:
         self._slot_work_chunk_size = max(1, int(slot_work_chunk_size))
         self._action_agreement_count = max(1, int(action_agreement_count))
         self._commit_online_lr = max(0.0, float(commit_online_lr))
-        self._commit_rule_prior_scale = max(0.0, float(commit_rule_prior_scale))
         self._commit_temperature = max(1.0e-4, float(commit_temperature))
         self._refresh_proposal_model = CpuRefreshProposalModel(
             k=self._refresh_candidate_count,
@@ -1998,7 +1990,6 @@ class ReplayEvictionLoop:
             controller_perturbation_scale=float(controller_perturbation_scale),
             controller_feedback_lr=float(controller_feedback_lr),
             online_lr=self._commit_online_lr,
-            rule_prior_scale=self._commit_rule_prior_scale,
             temperature=self._commit_temperature,
             seed=int(refresh_proposal_seed) + 313,
         )
@@ -4107,7 +4098,6 @@ class ReplayEvictionLoop:
             "action_agreement_count": self._action_agreement_count,
             "commit_policy": self._commit_policy_mode,
             "commit_online_lr": self._commit_online_lr,
-            "commit_rule_prior_scale": self._commit_rule_prior_scale,
             "commit_temperature": self._commit_temperature,
             "commit_policy_state": self._commit_policy.state_dict(),
             "refresh_proposal_model": self._refresh_proposal_model.state_dict(),
@@ -4210,9 +4200,6 @@ class ReplayEvictionLoop:
         )
         self._commit_online_lr = float(
             state.get("commit_online_lr", self._commit_online_lr)
-        )
-        self._commit_rule_prior_scale = float(
-            state.get("commit_rule_prior_scale", self._commit_rule_prior_scale)
         )
         self._commit_temperature = float(
             state.get("commit_temperature", self._commit_temperature)
@@ -4573,7 +4560,6 @@ class ReplayEvictionLoop:
             "commit_rule_disagreements_total": self._commit_rule_disagreements_total,
             "commit_feedback_updates_total": self._commit_feedback_updates_total,
             "commit_online_lr": self._commit_online_lr,
-            "commit_rule_prior_scale": self._commit_rule_prior_scale,
             "commit_temperature": self._commit_temperature,
             "action_agreement_count": self._action_agreement_count,
             "action_agreements_total": self._action_agreements_total,
