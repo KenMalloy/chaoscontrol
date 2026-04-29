@@ -6850,6 +6850,8 @@ def train_fast_for_budget(
     replay_eviction_commit_temperature: float = 0.75,
     replay_eviction_arm_runtime_enabled: bool = False,
     replay_eviction_arm_runtime_namespace: str = "",
+    replay_eviction_evidence_engine_enabled: bool = False,
+    replay_eviction_evidence_engine_d_model: int = 384,
 ) -> dict[str, Any]:
     rank_ = int(rank)
     world_size_ = int(world_size)
@@ -7558,6 +7560,11 @@ def train_fast_for_budget(
             arm_runtime_namespace=(
                 str(replay_eviction_arm_runtime_namespace) or None
             ),
+            evidence_engine_enabled=(
+                bool(replay_eviction_evidence_engine_enabled)
+                and int(rank_) == int(world_size_) - 1
+            ),
+            evidence_engine_d_model=int(replay_eviction_evidence_engine_d_model),
         )
     crct_rank_diagnostics: list[dict[str, Any] | None] | None = None
     if crct_enabled:
@@ -9153,6 +9160,12 @@ def _warmup(
         replay_eviction_arm_runtime_namespace=str(
             config.get("replay_eviction_arm_runtime_namespace", "")
         ),
+        replay_eviction_evidence_engine_enabled=bool(
+            config.get("replay_eviction_evidence_engine_enabled", False)
+        ),
+        replay_eviction_evidence_engine_d_model=int(
+            config.get("replay_eviction_evidence_engine_d_model", 384)
+        ),
     )
 
 
@@ -9756,6 +9769,12 @@ def run_condition(
         ),
         replay_eviction_arm_runtime_namespace=str(
             config.get("replay_eviction_arm_runtime_namespace", "")
+        ),
+        replay_eviction_evidence_engine_enabled=bool(
+            config.get("replay_eviction_evidence_engine_enabled", False)
+        ),
+        replay_eviction_evidence_engine_d_model=int(
+            config.get("replay_eviction_evidence_engine_d_model", 384)
         ),
     )
     episodic_cache_payload = train_result.pop("_episodic_cache_payload", None)

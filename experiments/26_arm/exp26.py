@@ -1,24 +1,17 @@
 #!/usr/bin/env python3
-"""Exp26 Adaptive Residual Memory headline matrix builders.
+"""Exp26 Adaptive Residual Memory validation matrix builder.
 
-Two-stage discipline. Stage 1 can run a shadow-mode cell to observe the
-actual distributions of ``utility_ema``, ``peak_utility``,
-``peak_sharpness``, ``contradiction_ema``, and drift signals at our scale.
-Stage 2 can still write a manifest for post-hoc threshold counterfactuals.
-Stage 3 launches the headline matrix with the learned Full-A action simplex
-owning the active commit decision.
-
-The architecture under test is CRCT + streaming Adaptive Residual Memory.
-The same fast/slow trunk and CRCT contract land from exp24 unchanged; the
-active ARM cell adds learned maintenance authority, not a threshold ablation.
+Exp26 is no longer a headline ablation matrix. It is a fixed systems canary:
+one locked fast/slow control and one full Adaptive Residual Memory cell. The
+ARM cell includes CRCT evidence, GPU3 oracle scoring, streaming maintenance,
+learned Full-A commit authority, traces, and the native CPU/GPU3 maintenance
+runtime. There is intentionally no CRCT-only or shadow-mode switch here.
 """
 
 from __future__ import annotations
 
 import copy
-import json
 import sys
-from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
@@ -28,24 +21,17 @@ sys.path.insert(0, str(EXP24))
 
 from exp24 import (  # noqa: E402
     ARTIFACT_CHANGES_WEIGHTS_ONLY,
-    DEFAULT_CONTROL_SEEDS,
     _base_entry,
 )
 
 
 EXP26_DIR = Path(__file__).resolve().parent
-DEFAULT_TRACE_DIR = EXP26_DIR / "results" / "traces"
-DEFAULT_CALIBRATION_DIR = EXP26_DIR / "calibration"
-DEFAULT_SMOKE_DIR = EXP26_DIR / "smoke"
-DEFAULT_SMOKE_TRACE_DIR = DEFAULT_SMOKE_DIR / "traces"
-DEFAULT_MANIFEST_PATH = DEFAULT_CALIBRATION_DIR / "manifest.json"
-DEFAULT_CALIBRATION_TRACE = DEFAULT_CALIBRATION_DIR / "trace.ndjson"
+DEFAULT_VALIDATION_DIR = EXP26_DIR / "validation"
+DEFAULT_VALIDATION_TRACE_DIR = DEFAULT_VALIDATION_DIR / "traces"
 
-ARM_V1_ARMS: tuple[str, ...] = (
-    "arm_a_fastslow_control",
-    "arm_b_crct_controller",
-    "arm_c_crct_replay_shadow",
-    "arm_d_crct_replay_active_learned",
+VALIDATION_ARMS: tuple[str, ...] = (
+    "validation_fastslow_control",
+    "validation_adaptive_residual_memory",
 )
 
 EXP26_MODEL_DIM = 384
@@ -74,7 +60,7 @@ def _named_entry(
 
 
 def _artifact_size_lock() -> dict[str, Any]:
-    """Artifact-safe trunk size for the 16k-vocab Exp26 headline.
+    """Artifact-safe trunk size for the 16k-vocab Exp26 validation run.
 
     Local artifact-pipeline sizing on the CRCT+bucket-prototype shape:
     dim=384 -> 13.71 MB int6/LZMA-preset0; dim=416 -> 15.19 MB; dim=448
@@ -101,7 +87,7 @@ def _fast_slow_lock() -> dict[str, Any]:
 
 
 def _crct_lock() -> dict[str, Any]:
-    """Locked CRCT v1 configuration. Identical to exp24's headline lock."""
+    """Locked CRCT evidence/oracle substrate configuration."""
     return {
         "crct_enabled": True,
         "crct_lambda_controller": 0.01,
@@ -137,18 +123,18 @@ def _crct_lock() -> dict[str, Any]:
         "crct_gradient_conflict_enabled": True,
         "crct_gradient_conflict_soft_gate_strength": 0.0,
         "crct_gradient_conflict_trace_path": str(
-            DEFAULT_TRACE_DIR / "crct_conflict.ndjson"
+            DEFAULT_VALIDATION_TRACE_DIR / "crct_conflict.ndjson"
         ),
         "crct_gradient_conflict_trace_max_rows": 200000,
     }
 
 
 def _replay_eviction_pipeline_lock() -> dict[str, Any]:
-    """Streaming pipeline knobs. Same across calibration and headline arms.
+    """Streaming ARM pipeline knobs for the fixed validation cell.
 
-    Threshold knobs are NOT here. Calibration/shadow can still emit
-    threshold counterfactual telemetry, but the headline learned arm owns
-    its commit decision without percentile-threshold priors.
+    Threshold priors and shadow/headline splits are intentionally absent. The
+    learned controller owns commit authority and GPU3 supplies physics
+    confirmation.
     """
     return {
         "replay_eviction_enabled": True,
@@ -181,6 +167,8 @@ def _replay_eviction_pipeline_lock() -> dict[str, Any]:
         "replay_eviction_commit_policy": "learned",
         "replay_eviction_commit_online_lr": 0.05,
         "replay_eviction_commit_temperature": 0.75,
+        "replay_eviction_evidence_engine_enabled": True,
+        "replay_eviction_evidence_engine_d_model": EXP26_MODEL_DIM,
         "replay_eviction_probe_buffer_size": 32,
         "replay_eviction_frame_ttl_steps": 256,
         "replay_eviction_slot_work_chunk_size": 16,
@@ -189,61 +177,38 @@ def _replay_eviction_pipeline_lock() -> dict[str, Any]:
     }
 
 
-def _calibration_thresholds() -> dict[str, Any]:
-    """Permissive thresholds for calibration. Shadow mode means no
-    mutations regardless; these values just drive *which* action the
-    policy would have proposed. The trace records the EMAs themselves
-    (utility, peak, sharpness, drift, contradiction), and those are what
-    the analyzer percentile-anchors.
-    """
-    return {
-        "replay_eviction_threshold": 0.001,
-        "replay_eviction_useful_threshold": 0.0005,
-        "replay_eviction_drift_threshold": 0.05,
-        "replay_eviction_repr_drift_threshold": 0.05,
-        "replay_eviction_quarantine_threshold": -0.001,
-        "replay_eviction_distill_peak_threshold": 0.005,
-        "replay_eviction_peak_preserve_utility_threshold": 0.005,
-        "replay_eviction_peak_preserve_sharpness_threshold": 0.005,
-        "replay_eviction_action_agreement_count": 1,
-        "replay_eviction_min_age_steps": 32,
-    }
-
-
-def build_smoke_matrix(
+def build_validation_matrix(
     *,
     speed_config: dict[str, Any],
     world_size: int = 4,
-    budget_seconds: float = 30.0,
+    budget_seconds: float = 45.0,
     seed: int = 1337,
 ) -> list[dict[str, Any]]:
-    """Phase 0: short runtime smoke before calibration/headline spend.
+    """Short runtime validation for the architecture we actually mean.
 
-    This is deliberately not a dry-run: it launches the real runner briefly
-    to catch DDP, tokenizer/data, CRCT mailbox, replay-maintenance, prototype,
-    and trace-writing breakage. Outputs are isolated under ``smoke/`` so a
-    sanity check cannot contaminate calibration thresholds or headline results.
+    The second cell is not "CRCT only"; it is the full Adaptive Residual
+    Memory path. CRCT is the evidence/oracle substrate inside ARM, not a
+    standalone architecture switch.
     """
     size_lock = _artifact_size_lock()
     fast_slow = _fast_slow_lock()
     crct = _crct_lock()
     pipeline = _replay_eviction_pipeline_lock()
-    smoke_thresholds = _calibration_thresholds()
     arm_specs: list[tuple[str, dict[str, Any]]] = [
-        ("smoke_fastslow_control", {}),
+        ("validation_fastslow_control", {}),
         (
-            "smoke_crct_replay_active",
+            "validation_adaptive_residual_memory",
             {
                 **crct,
                 **pipeline,
-                **smoke_thresholds,
                 "replay_eviction_mode": "active",
                 "replay_eviction_action_agreement_count": 1,
                 "replay_eviction_trace_path": str(
-                    DEFAULT_SMOKE_TRACE_DIR / f"arm_smoke_crct_replay_active_s{int(seed)}.ndjson"
+                    DEFAULT_VALIDATION_TRACE_DIR
+                    / f"arm_validation_adaptive_residual_memory_s{int(seed)}.ndjson"
                 ),
                 "crct_gradient_conflict_trace_path": str(
-                    DEFAULT_SMOKE_TRACE_DIR / "crct_conflict.ndjson"
+                    DEFAULT_VALIDATION_TRACE_DIR / "crct_conflict.ndjson"
                 ),
             },
         ),
@@ -252,7 +217,7 @@ def build_smoke_matrix(
     for arm_name, arm_overrides in arm_specs:
         arm = {
             "arm": arm_name,
-            "exp26_mechanism": "arm_v1_smoke",
+            "exp26_mechanism": "arm_v1_validation",
             "artifact_impact": ARTIFACT_CHANGES_WEIGHTS_ONLY,
             **size_lock,
             **fast_slow,
@@ -267,177 +232,9 @@ def build_smoke_matrix(
         entries.append(
             _named_entry(
                 base=entry,
-                phase="smoke",
+                phase="validation",
                 arm=arm_name,
                 seed=int(seed),
             )
         )
-    return entries
-
-
-def build_calibration_matrix(
-    *,
-    speed_config: dict[str, Any],
-    world_size: int = 4,
-    budget_seconds: float = 180.0,
-    seed: int = 1337,
-) -> list[dict[str, Any]]:
-    """Stage 1: single shadow-mode cell. Observes signal distributions.
-
-    Runs the full ARM streaming pipeline (CRCT + maintenance) but with
-    ``replay_eviction_mode='shadow'`` so no slot mutations fire. The
-    per-decision trace captures EMAs at every shadow-policy decision; the
-    analyzer reads those rows and percentile-anchors the headline
-    thresholds.
-    """
-    size_lock = _artifact_size_lock()
-    fast_slow = _fast_slow_lock()
-    crct = _crct_lock()
-    pipeline = _replay_eviction_pipeline_lock()
-    permissive = _calibration_thresholds()
-    arm_overrides: dict[str, Any] = {
-        "arm": "calibration",
-        "exp26_mechanism": "arm_v1_calibration",
-        "artifact_impact": ARTIFACT_CHANGES_WEIGHTS_ONLY,
-        **size_lock,
-        **fast_slow,
-        **crct,
-        **pipeline,
-        **permissive,
-        "replay_eviction_mode": "shadow",
-        "replay_eviction_trace_path": str(DEFAULT_CALIBRATION_TRACE),
-    }
-    base = _base_entry(
-        speed_config=speed_config,
-        world_size=world_size,
-        budget_seconds=budget_seconds,
-    )
-    base.update(arm_overrides)
-    return [
-        _named_entry(
-            base=base,
-            phase="calibration",
-            arm="shadow",
-            seed=int(seed),
-        )
-    ]
-
-
-def load_manifest(manifest_path: str | Path = DEFAULT_MANIFEST_PATH) -> dict[str, Any]:
-    """Load a calibration manifest. Raises if missing or malformed."""
-    p = Path(manifest_path)
-    if not p.exists():
-        raise FileNotFoundError(
-            f"calibration manifest missing at {p}; "
-            f"run stage 1 (build_calibration_matrix) and stage 2 "
-            f"(calibrate.analyze) first"
-        )
-    try:
-        manifest = json.loads(p.read_text())
-    except Exception as exc:
-        raise ValueError(f"manifest at {p} is malformed: {exc!r}") from exc
-    required = {"thresholds_balanced"}
-    missing = required - set(manifest.keys())
-    if missing:
-        raise ValueError(
-            f"manifest at {p} missing required keys: {sorted(missing)}"
-        )
-    return manifest
-
-
-def _learned_active_arm_overrides() -> dict[str, Any]:
-    """arm_d: learned Full-A action-simplex commit authority.
-
-    Threshold calibration is intentionally not folded into the active arm.
-    The GPU3 oracle supplies physics confirmation, and the Full-A controller
-    learns commit authority from that feedback.
-    """
-    return {
-        "replay_eviction_mode": "active",
-        "replay_eviction_commit_policy": "learned",
-        "replay_eviction_action_agreement_count": 1,
-    }
-
-
-def build_arm_v1_matrix(
-    *,
-    speed_config: dict[str, Any],
-    calibration_manifest_path: str | Path = DEFAULT_MANIFEST_PATH,
-    world_size: int = 4,
-    budget_seconds: float = 600.0,
-    seed_values: Sequence[int] = DEFAULT_CONTROL_SEEDS,
-    arms: Sequence[str] | None = None,
-) -> list[dict[str, Any]]:
-    """Stage 3: headline 4-arm × N-seed matrix.
-
-    arm_a: locked fast/slow control (no CRCT, no maintenance).
-    arm_b: CRCT only (no maintenance).
-    arm_c: CRCT + maintenance shadow (telemetry, no mutation).
-    arm_d: CRCT + maintenance active with learned Full-A action-simplex
-        commit authority.
-
-    ``calibration_manifest_path`` is accepted for CLI compatibility with the
-    analyze/headline flow, but the headline learned arm does not consume
-    threshold manifests. Calibration output is for post-hoc counterfactual
-    analysis, not runtime commit authority.
-    """
-    _ = calibration_manifest_path
-    size_lock = _artifact_size_lock()
-    fast_slow = _fast_slow_lock()
-    crct = _crct_lock()
-    pipeline = _replay_eviction_pipeline_lock()
-    shadow_overrides = {
-        **crct,
-        **pipeline,
-        **_calibration_thresholds(),
-        "replay_eviction_mode": "shadow",
-    }
-    arm_specs: list[tuple[str, dict[str, Any]]] = [
-        ("arm_a_fastslow_control", {}),
-        ("arm_b_crct_controller", crct),
-        ("arm_c_crct_replay_shadow", shadow_overrides),
-        (
-            "arm_d_crct_replay_active_learned",
-            {**crct, **pipeline, **_learned_active_arm_overrides()},
-        ),
-    ]
-    if arms is not None:
-        allowed = set(arms)
-        unknown = allowed - set(ARM_V1_ARMS)
-        if unknown:
-            raise ValueError(
-                f"unknown arm(s) {sorted(unknown)}; allowed: {ARM_V1_ARMS}"
-            )
-        arm_specs = [
-            (name, overrides) for name, overrides in arm_specs if name in allowed
-        ]
-    entries: list[dict[str, Any]] = []
-    for arm_name, arm_overrides in arm_specs:
-        arm = {
-            "arm": arm_name,
-            "exp26_mechanism": "arm_v1",
-            "artifact_impact": ARTIFACT_CHANGES_WEIGHTS_ONLY,
-            **size_lock,
-            **fast_slow,
-            **arm_overrides,
-        }
-        for seed in seed_values:
-            entry = _base_entry(
-                speed_config=speed_config,
-                world_size=world_size,
-                budget_seconds=budget_seconds,
-            )
-            entry.update(arm)
-            named = _named_entry(
-                base=entry,
-                phase="phase3",
-                arm=arm_name,
-                seed=int(seed),
-            )
-            if named.get("replay_eviction_enabled"):
-                named["replay_eviction_trace_path"] = str(
-                    DEFAULT_TRACE_DIR
-                    / f"arm_v1_{arm_name}_s{int(seed)}.ndjson"
-                )
-            entries.append(named)
     return entries

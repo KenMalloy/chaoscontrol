@@ -205,6 +205,8 @@ class ChaosControlConfig:
     replay_eviction_commit_policy: str = "learned"
     replay_eviction_commit_online_lr: float = 0.05
     replay_eviction_commit_temperature: float = 0.75
+    replay_eviction_evidence_engine_enabled: bool = False
+    replay_eviction_evidence_engine_d_model: int = 384
 
     def __post_init__(self) -> None:
         if self.buffer_mode not in _VALID_BUFFER_MODES:

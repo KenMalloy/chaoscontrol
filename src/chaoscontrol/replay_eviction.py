@@ -1800,6 +1800,9 @@ class ReplayEvictionLoop:
         commit_temperature: float = 0.75,
         arm_runtime_enabled: bool = False,
         arm_runtime_namespace: str | None = None,
+        evidence_engine_enabled: bool = False,
+        evidence_engine_d_model: int = 384,
+        evidence_engine_lanes: int = 8,
     ) -> None:
         if action_mode not in {"active", "shadow"}:
             raise ValueError("action_mode must be 'active' or 'shadow'")
@@ -1874,6 +1877,20 @@ class ReplayEvictionLoop:
         self._active_arm_job: dict[str, Any] | None = None
         if self._arm_runtime_enabled_requested:
             self._init_arm_runtime(arm_runtime_namespace)
+
+        # CPU evidence engine (typed firewall around CPU-side cue ingest)
+        self._evidence_engine_enabled_requested = bool(evidence_engine_enabled)
+        self._evidence_engine_active = False
+        self._evidence_engine_error = ""
+        self._evidence_engine_d_model = max(1, int(evidence_engine_d_model))
+        self._evidence_engine_lanes = max(1, int(evidence_engine_lanes))
+        self._evidence_engine: Any | None = None
+        self._evidence_cue_buffer: torch.Tensor | None = None
+        self._evidence_targets_buffer: torch.Tensor | None = None
+        self._evidence_frames_ingested = 0
+        self._evidence_ingest_errors_total = 0
+        if self._evidence_engine_enabled_requested:
+            self._init_evidence_engine()
 
         # Probe cache
         self._probe_input_ids: torch.Tensor | None = None
@@ -2132,8 +2149,50 @@ class ReplayEvictionLoop:
                 f"ARM runtime requested but failed to initialize: {self._arm_runtime_error}"
             ) from exc
 
+    def _init_evidence_engine(self) -> None:
+        """Construct the CPU evidence engine and its pinned cue buffers.
+
+        Mirrors the ARM-runtime init pattern: opt-in via the
+        ``evidence_engine_enabled`` flag, fail-loud if requested but
+        unavailable. The engine is a typed firewall — the only Python
+        surface accepts a fixed-shape pinned bf16 cue digest, by design.
+        """
+        try:
+            engine = _ext.CpuEvidenceEngine(
+                lanes=int(self._evidence_engine_lanes),
+                d_model=int(self._evidence_engine_d_model),
+            )
+            cue_buffer = torch.zeros(
+                (32, int(self._evidence_engine_d_model)),
+                dtype=torch.bfloat16,
+            ).pin_memory()
+            targets_buffer = torch.zeros(32, dtype=torch.int32).pin_memory()
+            self._evidence_engine = engine
+            self._evidence_cue_buffer = cue_buffer
+            self._evidence_targets_buffer = targets_buffer
+            self._evidence_engine_active = True
+        except Exception as exc:
+            self._evidence_engine_active = False
+            self._evidence_engine_error = f"{exc.__class__.__name__}: {exc}"
+            self._evidence_engine = None
+            self._evidence_cue_buffer = None
+            self._evidence_targets_buffer = None
+            raise RuntimeError(
+                "CpuEvidenceEngine requested but failed to initialize: "
+                f"{self._evidence_engine_error}"
+            ) from exc
+
     def close(self) -> None:
         """Best-effort cleanup for ARM runtime shm names."""
+        if self._evidence_engine is not None:
+            try:
+                self._evidence_engine.shutdown()
+            except Exception:
+                pass
+            self._evidence_engine = None
+            self._evidence_cue_buffer = None
+            self._evidence_targets_buffer = None
+            self._evidence_engine_active = False
         for cls_name, name in (
             ("ShmRingArmMaintenanceJob", self._arm_job_ring_name),
             ("ShmRingArmMaintenanceResult", self._arm_result_ring_name),
@@ -2205,6 +2264,25 @@ class ReplayEvictionLoop:
         self._queue_depth_sum += self._last_queue_depth
         self._queue_depth_samples += 1
         self._queue_depth_max = max(self._queue_depth_max, self._last_queue_depth)
+
+        if (
+            self._evidence_engine is not None
+            and self._evidence_cue_buffer is not None
+            and self._evidence_targets_buffer is not None
+        ):
+            try:
+                self._evidence_engine.ingest_frame(
+                    self._evidence_cue_buffer,
+                    self._evidence_targets_buffer,
+                    frame_id=int(frame.frame_id),
+                    step=int(frame.step),
+                    stream_id=int(frame.stream_id),
+                )
+                self._evidence_frames_ingested += 1
+            except Exception as exc:
+                self._evidence_ingest_errors_total += 1
+                self._evidence_engine_error = f"{exc.__class__.__name__}: {exc}"
+                raise
 
         self._probe_input_ids = input_ids_d
         self._probe_valid_mask = valid_mask_d
@@ -4325,6 +4403,24 @@ class ReplayEvictionLoop:
                 else "inactive"
             ),
         }
+        evidence_engine_native_diag: dict[str, Any] | None = None
+        if self._evidence_engine is not None:
+            try:
+                evidence_engine_native_diag = self._evidence_engine.diagnostics()
+            except Exception as exc:
+                evidence_engine_native_diag = {
+                    "error": f"{exc.__class__.__name__}: {exc}",
+                }
+        evidence_engine_diag = {
+            "enabled_requested": self._evidence_engine_enabled_requested,
+            "active": self._evidence_engine_active,
+            "error": self._evidence_engine_error,
+            "d_model": self._evidence_engine_d_model,
+            "lanes": self._evidence_engine_lanes,
+            "frames_ingested": self._evidence_frames_ingested,
+            "ingest_errors_total": self._evidence_ingest_errors_total,
+            "native": evidence_engine_native_diag,
+        }
         starvation_reasons = (
             "ok",
             "no_slots",
@@ -4381,6 +4477,7 @@ class ReplayEvictionLoop:
                 "chunk at a time"
             ),
             "arm_runtime": arm_runtime_diag,
+            "cpu_evidence_engine": evidence_engine_diag,
             "tick_count": self._tick_count,
             "replays_total": self._replays_total,
             "evictions_total": self._evictions_total,
