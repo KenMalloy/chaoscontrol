@@ -188,12 +188,18 @@ class SlotTable:
             self._records[slot_id].state = SLOT_ACTIVE
         return True
 
-    def replace_tensor(self, slot_id: SlotId, tensor: torch.Tensor) -> bool:
+    def replace_tensor(
+        self,
+        slot_id: SlotId,
+        tensor: torch.Tensor,
+        *,
+        bump_generation: bool = True,
+    ) -> bool:
         if slot_id not in self._id_to_physical:
             return False
         phys = self._id_to_physical[slot_id]
         self._slots[phys] = tensor.detach()
-        if slot_id in self._records:
+        if bump_generation and slot_id in self._records:
             self._records[slot_id].write_generation += 1
         return True
 

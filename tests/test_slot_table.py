@@ -170,6 +170,13 @@ class TestReplaceTensor:
         assert (got == new).all()
         assert t.record(s0).write_generation == before + 1
 
+    def test_replace_can_skip_generation_bump_for_probe_swap(self):
+        t = SlotTable()
+        s0 = t.append(torch.zeros(1, 4))
+        before = t.record(s0).write_generation
+        assert t.replace_tensor(s0, torch.ones(1, 4), bump_generation=False)
+        assert t.record(s0).write_generation == before
+
     def test_replace_nonexistent(self):
         t = SlotTable()
         assert t.replace_tensor(999, torch.randn(1, 4)) is False

@@ -1622,11 +1622,11 @@ class ReplayEvictionLoop:
             if torch.isfinite(preserved).all():
                 candidates.append(("sharp_preserving", preserved.detach()))
 
-        # Score candidates: use identity as baseline
+        # Score candidates: use identity as real-physics oracle baseline.
         if len(candidates) <= 1:
             return False
 
-        identity_tensor = candidates[0][1]
+        identity_tensor = candidates[0][1].detach().clone()
         best_name = "identity"
         best_tensor = identity_tensor
         best_improvement = 0.0
@@ -1634,38 +1634,72 @@ class ReplayEvictionLoop:
         phys = table.slot_id_to_physical(slot_id)
         if phys is None:
             return False
-        baseline_score = self._slot_mean_marginal(phys, cf)
-
-        for name, tensor in candidates[1:]:
-            if self._budget_exhausted(t0):
-                break
-            table.replace_tensor(slot_id, tensor)
-            if self._probe_input_ids is None or self._probe_valid_mask is None:
-                table.replace_tensor(slot_id, identity_tensor)
-                return False
-            candidate_cf = counterfactual_probe(
-                model=model,
-                outer=outer,
-                probe_input_ids=self._probe_input_ids,
-                probe_valid_mask=self._probe_valid_mask,
-                cache_read_cutoff=self._probe_cache_cutoff,
-                chunk_size=self._probe_chunk_size,
-                score_slot_indices=[phys],
-            )
-            candidate_score = self._slot_mean_marginal(phys, candidate_cf)
-            improvement = candidate_score - baseline_score
-            if improvement > best_improvement + self._refresh_margin:
-                best_name = name
-                best_tensor = tensor
-                best_improvement = improvement
-
-        # Apply best or revert to identity
-        if best_name != "identity":
-            table.replace_tensor(slot_id, best_tensor)
-            return True
-        else:
-            table.replace_tensor(slot_id, identity_tensor)
+        baseline_score = self._oracle_slot_score(model=model, outer=outer, phys=phys, t0=t0)
+        if baseline_score is None:
             return False
+
+        accepted = False
+        try:
+            for name, tensor in candidates[1:]:
+                if self._budget_exhausted(t0):
+                    break
+                table.replace_tensor(slot_id, tensor, bump_generation=False)
+                candidate_score = self._oracle_slot_score(
+                    model=model, outer=outer, phys=phys, t0=t0
+                )
+                if candidate_score is None:
+                    break
+                improvement = candidate_score - baseline_score
+                if improvement > best_improvement + self._refresh_margin:
+                    best_name = name
+                    best_tensor = tensor.detach().clone()
+                    best_improvement = improvement
+
+            # Apply best or revert to identity.  Candidate probes are not
+            # writes; only the accepted refresh bumps write_generation.
+            if best_name != "identity":
+                table.replace_tensor(slot_id, best_tensor)
+                accepted = True
+                return True
+            return False
+        finally:
+            if not accepted:
+                table.replace_tensor(slot_id, identity_tensor, bump_generation=False)
+
+    def _oracle_slot_score(
+        self,
+        *,
+        model: Any,
+        outer: Any,
+        phys: int,
+        t0: float,
+    ) -> float | None:
+        if (
+            self._probe_input_ids is None
+            or self._probe_valid_mask is None
+            or self._budget_exhausted(t0)
+        ):
+            return None
+        oracle_t0 = time.monotonic()
+        oracle = oracle_confirm_slots(
+            model=model,
+            outer=outer,
+            probe_input_ids=self._probe_input_ids,
+            probe_valid_mask=self._probe_valid_mask,
+            slot_indices=[phys],
+            cache_read_cutoff=self._probe_cache_cutoff,
+        )
+        elapsed = time.monotonic() - oracle_t0
+        self._last_oracle_seconds = elapsed
+        self._oracle_seconds_total += elapsed
+        self._last_stage_seconds["oracle"] = elapsed
+        self._stage_seconds_total["oracle"] += elapsed
+        self._last_oracle_candidates = len(oracle.slot_indices)
+        if not oracle.slot_indices or oracle.oracle_deltas.shape[0] == 0:
+            return None
+        mask_f = oracle.mask.float()
+        denom = mask_f.sum().clamp(min=1.0)
+        return float((oracle.oracle_deltas[0] * mask_f).sum() / denom)
 
     def _slot_mean_marginal(
         self, phys_idx: int, cf: CounterfactualResult

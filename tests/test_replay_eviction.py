@@ -1013,6 +1013,102 @@ class TestSlotTableTick:
         assert table.record(sid).state != SLOT_QUARANTINED
         assert loop.diagnostics()["action_agreements_total"] == 0
 
+    def test_refresh_ranks_candidates_with_oracle_not_proxy(self, monkeypatch):
+        loop = ReplayEvictionLoop(action_mode="active", refresh_margin=0.001)
+        model = _StubModel(n_slots=1, use_table=True)
+        table = model.outer_model.table
+        sid = table.active_slot_ids()[0]
+        rec = table.record(sid)
+        before_generation = rec.write_generation
+        loop.cache_probe(
+            input_ids=torch.zeros(1, 3, dtype=torch.long),
+            valid_mask=torch.ones(1, 3),
+            cache_read_cutoff=None,
+            step=1,
+        )
+        cf = CounterfactualResult(
+            marginal_gains=torch.zeros(1, 1, 2),
+            sidecar_value=torch.zeros(1, 2),
+            nll_baseline=torch.zeros(1, 2),
+            nll_no_sidecar=torch.zeros(1, 2),
+            weights_baseline=torch.ones(1, 1),
+            mask=torch.ones(1, 2, dtype=torch.bool),
+            slot_indices=[0],
+        )
+        scores = iter([0.0, 1.0, 0.25, 0.1])
+        oracle_calls = 0
+
+        def fake_counterfactual_probe(**_kwargs):
+            raise AssertionError("refresh acceptance must not use cheap proxy")
+
+        def fake_oracle(**_kwargs):
+            nonlocal oracle_calls
+            oracle_calls += 1
+            score = next(scores)
+            return replay_eviction_mod.OracleConfirmationResult(
+                slot_indices=[0],
+                oracle_deltas=torch.full((1, 1, 2), score),
+                nll_baseline=torch.zeros(1, 2),
+                nll_no_sidecar=torch.zeros(1, 2),
+                mask=torch.ones(1, 2, dtype=torch.bool),
+            )
+
+        monkeypatch.setattr(
+            replay_eviction_mod, "counterfactual_probe", fake_counterfactual_probe
+        )
+        monkeypatch.setattr(replay_eviction_mod, "oracle_confirm_slots", fake_oracle)
+
+        accepted = loop._execute_refresh(
+            model, model.outer_model, sid, cf, t0=time.monotonic()
+        )
+
+        assert accepted is True
+        assert oracle_calls >= 2
+        assert rec.write_generation == before_generation + 1
+
+    def test_rejected_refresh_probe_swaps_do_not_bump_generation(self, monkeypatch):
+        loop = ReplayEvictionLoop(action_mode="active", refresh_margin=0.001)
+        model = _StubModel(n_slots=1, use_table=True)
+        table = model.outer_model.table
+        sid = table.active_slot_ids()[0]
+        rec = table.record(sid)
+        before_generation = rec.write_generation
+        before_tensor = table.get_tensor(sid).detach().clone()
+        loop.cache_probe(
+            input_ids=torch.zeros(1, 3, dtype=torch.long),
+            valid_mask=torch.ones(1, 3),
+            cache_read_cutoff=None,
+            step=1,
+        )
+        cf = CounterfactualResult(
+            marginal_gains=torch.zeros(1, 1, 2),
+            sidecar_value=torch.zeros(1, 2),
+            nll_baseline=torch.zeros(1, 2),
+            nll_no_sidecar=torch.zeros(1, 2),
+            weights_baseline=torch.ones(1, 1),
+            mask=torch.ones(1, 2, dtype=torch.bool),
+            slot_indices=[0],
+        )
+
+        def fake_oracle(**_kwargs):
+            return replay_eviction_mod.OracleConfirmationResult(
+                slot_indices=[0],
+                oracle_deltas=torch.zeros(1, 1, 2),
+                nll_baseline=torch.zeros(1, 2),
+                nll_no_sidecar=torch.zeros(1, 2),
+                mask=torch.ones(1, 2, dtype=torch.bool),
+            )
+
+        monkeypatch.setattr(replay_eviction_mod, "oracle_confirm_slots", fake_oracle)
+
+        accepted = loop._execute_refresh(
+            model, model.outer_model, sid, cf, t0=time.monotonic()
+        )
+
+        assert accepted is False
+        assert rec.write_generation == before_generation
+        assert torch.allclose(table.get_tensor(sid), before_tensor)
+
     def test_distill_requires_sink_before_retiring_slot(self):
         loop = ReplayEvictionLoop(action_mode="active")
         model = _StubModel(n_slots=1, use_table=True)
