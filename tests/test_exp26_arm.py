@@ -85,6 +85,37 @@ def _write_synthetic_trace(path: Path, n_decisions: int = 200) -> None:
 # ---- build_calibration_matrix ----------------------------------------------
 
 
+def test_smoke_matrix_two_entries_and_isolated_outputs(exp26, speed_config):
+    entries = exp26.build_smoke_matrix(
+        speed_config=speed_config,
+        world_size=4,
+        budget_seconds=30.0,
+        seed=42,
+    )
+    assert len(entries) == 2
+    by_arm = {entry["arm"]: entry for entry in entries}
+    assert set(by_arm) == {
+        "smoke_fastslow_control",
+        "smoke_crct_replay_active",
+    }
+
+    control = by_arm["smoke_fastslow_control"]
+    active = by_arm["smoke_crct_replay_active"]
+    assert control["budget_seconds"] == 30.0
+    assert control.get("crct_enabled") is not True
+    assert control.get("replay_eviction_enabled") is not True
+    assert active["budget_seconds"] == 30.0
+    assert active["crct_enabled"] is True
+    assert active["replay_eviction_enabled"] is True
+    assert active["replay_eviction_mode"] == "active"
+    assert active["bucket_prototypes"] is True
+    assert active["prototype_dim"] == 64
+    assert active["replay_eviction_action_agreement_count"] == 1
+    assert "smoke" in active["replay_eviction_trace_path"]
+    assert "calibration" not in active["replay_eviction_trace_path"]
+    assert "results" not in active["replay_eviction_trace_path"]
+
+
 def test_calibration_matrix_single_entry(exp26, speed_config):
     entries = exp26.build_calibration_matrix(
         speed_config=speed_config,

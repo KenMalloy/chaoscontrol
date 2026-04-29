@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Run Exp26 Adaptive Residual Memory matrices.
 
-Two-stage discipline:
+Three-stage discipline plus a phase-0 runtime smoke:
 
+  Phase 0 (smoke)       : 2 cells, one short control and one short active
+                          CRCT+ARM cell, isolated under smoke/.
   Stage 1 (calibrate)   : 1 cell, 1 seed, ~180s, shadow mode, full ARM pipeline.
                           Trace at calibration/trace.ndjson.
   Stage 2 (analyze)     : Read trace, percentile-anchor thresholds, write
@@ -13,8 +15,11 @@ Two-stage discipline:
 
 Usage:
 
-  # one-shot run all three stages on 4xH100
+  # one-shot run smoke + all three experiment stages on 4xH100
   python experiments/26_arm/run_exp26.py --stage all
+
+  # smoke-only: launches briefly, writes only to smoke/
+  python experiments/26_arm/run_exp26.py --stage smoke
 
   # calibrate-only (writes manifest then stops)
   python experiments/26_arm/run_exp26.py --stage calibrate
@@ -54,8 +59,11 @@ sys.path.insert(0, str(REPO / "src"))
 from exp26 import (  # noqa: E402
     DEFAULT_CALIBRATION_TRACE,
     DEFAULT_MANIFEST_PATH,
+    DEFAULT_SMOKE_DIR,
+    DEFAULT_SMOKE_TRACE_DIR,
     build_arm_v1_matrix,
     build_calibration_matrix,
+    build_smoke_matrix,
 )
 from calibrate import analyze as analyze_calibration  # noqa: E402
 from fast_path import read_speed_config, write_matrix  # noqa: E402
@@ -64,6 +72,7 @@ from launch import run_matrix_entries  # noqa: E402
 
 CALIBRATION_RESULTS_DIR = EXP26 / "calibration"
 HEADLINE_RESULTS_DIR = EXP26 / "results"
+SMOKE_RESULTS_DIR = DEFAULT_SMOKE_DIR
 
 
 def _print_entries(entries: list[dict[str, Any]]) -> None:
@@ -82,6 +91,48 @@ def _prebuild_cache(data_path: str) -> None:
         "[exp26] data cache ready "
         f"train={int(train_tokens.numel()):,} val={int(val_tokens.numel()):,}",
         flush=True,
+    )
+
+
+def _run_smoke(
+    *,
+    speed_config: dict[str, Any],
+    world_size: int,
+    seed: int,
+    budget_seconds: float,
+    data_path: Path,
+    sp_model_path_16384: Path,
+    dry_run: bool,
+) -> None:
+    entries = build_smoke_matrix(
+        speed_config=speed_config,
+        world_size=world_size,
+        budget_seconds=budget_seconds,
+        seed=seed,
+    )
+    print(
+        f"[exp26] stage=smoke entries={len(entries)} world_size={world_size} "
+        f"budget={budget_seconds}s dry_run={dry_run}",
+        flush=True,
+    )
+    if dry_run:
+        _print_entries(entries)
+        return
+    SMOKE_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    DEFAULT_SMOKE_TRACE_DIR.mkdir(parents=True, exist_ok=True)
+    write_matrix(SMOKE_RESULTS_DIR / "matrix.json", entries)
+    _prebuild_cache(str(data_path))
+    run_matrix_entries(
+        entries=entries,
+        runner_path=EXP23 / "runner_fast_path.py",
+        data_path=str(data_path),
+        sp_model_paths={16384: str(sp_model_path_16384)},
+        results_dir=SMOKE_RESULTS_DIR,
+        world_size=world_size,
+        limit=None,
+        dry_run=False,
+        skip_existing=False,
+        checkpoint_dir=None,
     )
 
 
@@ -214,7 +265,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--stage",
-        choices=["calibrate", "analyze", "headline", "all"],
+        choices=["smoke", "calibrate", "analyze", "headline", "all"],
         default="all",
     )
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
@@ -223,6 +274,13 @@ def main(argv: list[str] | None = None) -> int:
         "--sp-model-path-16384", type=Path, default=DEFAULT_SP_MODEL_16384
     )
     parser.add_argument("--world-size", type=int, default=4)
+    parser.add_argument(
+        "--smoke-budget", type=float, default=30.0,
+        help="Wall budget per smoke cell (seconds)",
+    )
+    parser.add_argument(
+        "--smoke-seed", type=int, default=1337,
+    )
     parser.add_argument(
         "--calibration-budget", type=float, default=180.0,
         help="Wall budget for the calibration cell (seconds)",
@@ -256,6 +314,17 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     speed_config = read_speed_config(args.config)
+
+    if args.stage in ("smoke", "all"):
+        _run_smoke(
+            speed_config=speed_config,
+            world_size=int(args.world_size),
+            seed=int(args.smoke_seed),
+            budget_seconds=float(args.smoke_budget),
+            data_path=args.data_path,
+            sp_model_path_16384=args.sp_model_path_16384,
+            dry_run=bool(args.dry_run),
+        )
 
     if args.stage in ("calibrate", "all"):
         _run_calibration(

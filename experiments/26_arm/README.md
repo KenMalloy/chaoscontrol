@@ -2,11 +2,17 @@
 
 Headline measurement of the streaming Adaptive Residual Memory architecture
 on top of CRCT. Replaces exp24's training-time-bundle umbrella with a
-focused two-stage experiment: observe signal distributions in shadow mode,
-calibrate thresholds from observed percentiles, then run the 5-arm headline
-matrix.
+focused staged experiment: first run a short runtime smoke, observe signal
+distributions in shadow mode, calibrate thresholds from observed percentiles,
+then run the 5-arm headline matrix.
 
 ## Two-stage discipline
+
+**Phase 0 — smoke.** Two short cells, isolated under `smoke/`: locked
+fast/slow control plus active CRCT+ARM. This is not a matrix result and does
+not write calibration/headline artifacts; it exists to catch runner, DDP,
+data/tokenizer, mailbox, replay-maintenance, prototype, and trace-path bugs
+before spending on calibration or 600s headline cells.
 
 **Stage 1 — calibration.** One cell, single seed, ~180s, full ARM streaming
 pipeline in shadow mode (`replay_eviction_mode="shadow"`). The policy proposes
@@ -57,6 +63,9 @@ experiments/26_arm/
   exp26.py               # matrix builders (calibration + headline)
   calibrate.py           # trace analyzer + manifest writer
   run_exp26.py           # three-stage orchestrator
+  smoke/
+    matrix.json          # populated by phase 0
+    exp26_smoke_*        # short sanity-run results
   calibration/
     trace.ndjson         # populated by stage 1
     manifest.json        # populated by stage 2
@@ -71,8 +80,11 @@ experiments/26_arm/
 ## Usage
 
 ```bash
-# Full run on 4xH100 (calibrate -> analyze -> headline).
+# Full run on 4xH100 (smoke -> calibrate -> analyze -> headline).
 python experiments/26_arm/run_exp26.py --stage all
+
+# Phase-0 runtime smoke only.
+python experiments/26_arm/run_exp26.py --stage smoke --smoke-budget 30
 
 # Calibrate only (writes manifest, then stops).
 python experiments/26_arm/run_exp26.py --stage calibrate

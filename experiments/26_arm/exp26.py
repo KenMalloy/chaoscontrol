@@ -37,6 +37,8 @@ from exp24 import (  # noqa: E402
 EXP26_DIR = Path(__file__).resolve().parent
 DEFAULT_TRACE_DIR = EXP26_DIR / "results" / "traces"
 DEFAULT_CALIBRATION_DIR = EXP26_DIR / "calibration"
+DEFAULT_SMOKE_DIR = EXP26_DIR / "smoke"
+DEFAULT_SMOKE_TRACE_DIR = DEFAULT_SMOKE_DIR / "traces"
 DEFAULT_MANIFEST_PATH = DEFAULT_CALIBRATION_DIR / "manifest.json"
 DEFAULT_CALIBRATION_TRACE = DEFAULT_CALIBRATION_DIR / "trace.ndjson"
 
@@ -168,6 +170,69 @@ def _calibration_thresholds() -> dict[str, Any]:
         "replay_eviction_min_age_steps": 32,
         "replay_eviction_min_score_count": 2,
     }
+
+
+def build_smoke_matrix(
+    *,
+    speed_config: dict[str, Any],
+    world_size: int = 4,
+    budget_seconds: float = 30.0,
+    seed: int = 1337,
+) -> list[dict[str, Any]]:
+    """Phase 0: short runtime smoke before calibration/headline spend.
+
+    This is deliberately not a dry-run: it launches the real runner briefly
+    to catch DDP, tokenizer/data, CRCT mailbox, replay-maintenance, prototype,
+    and trace-writing breakage. Outputs are isolated under ``smoke/`` so a
+    sanity check cannot contaminate calibration thresholds or headline results.
+    """
+    fast_slow = _fast_slow_lock()
+    crct = _crct_lock()
+    pipeline = _replay_eviction_pipeline_lock()
+    smoke_thresholds = _calibration_thresholds()
+    arm_specs: list[tuple[str, dict[str, Any]]] = [
+        ("smoke_fastslow_control", {}),
+        (
+            "smoke_crct_replay_active",
+            {
+                **crct,
+                **pipeline,
+                **smoke_thresholds,
+                "replay_eviction_mode": "active",
+                "replay_eviction_action_agreement_count": 1,
+                "replay_eviction_trace_path": str(
+                    DEFAULT_SMOKE_TRACE_DIR / f"arm_smoke_crct_replay_active_s{int(seed)}.ndjson"
+                ),
+                "crct_gradient_conflict_trace_path": str(
+                    DEFAULT_SMOKE_TRACE_DIR / "crct_conflict.ndjson"
+                ),
+            },
+        ),
+    ]
+    entries: list[dict[str, Any]] = []
+    for arm_name, arm_overrides in arm_specs:
+        arm = {
+            "arm": arm_name,
+            "exp26_mechanism": "arm_v1_smoke",
+            "artifact_impact": ARTIFACT_CHANGES_WEIGHTS_ONLY,
+            **fast_slow,
+            **arm_overrides,
+        }
+        entry = _base_entry(
+            speed_config=speed_config,
+            world_size=world_size,
+            budget_seconds=budget_seconds,
+        )
+        entry.update(arm)
+        entries.append(
+            _named_entry(
+                base=entry,
+                phase="smoke",
+                arm=arm_name,
+                seed=int(seed),
+            )
+        )
+    return entries
 
 
 def build_calibration_matrix(
