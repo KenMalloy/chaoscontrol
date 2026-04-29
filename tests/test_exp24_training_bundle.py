@@ -1742,6 +1742,10 @@ def test_crct_v1_matrix_threads_memory_controller_and_random_sampling():
     assert replay_shadow["replay_eviction_mode"] == "shadow"
     assert replay_shadow["replay_eviction_memory_streams"] == 8
     assert replay_shadow["replay_eviction_oracle_confirm_top_k"] == 32
+    assert replay_shadow["replay_eviction_probe_buffer_size"] == 32
+    assert replay_shadow["replay_eviction_frame_ttl_steps"] == 256
+    assert replay_shadow["replay_eviction_slot_work_chunk_size"] == 64
+    assert replay_shadow["replay_eviction_action_agreement_count"] == 2
     assert replay_shadow["replay_eviction_peak_preserve_utility_threshold"] == 0.20
     assert replay_shadow["replay_eviction_peak_preserve_sharpness_threshold"] == 0.20
     assert "arm_c_crct_replay_shadow_s1337" in replay_shadow["replay_eviction_trace_path"]
@@ -1750,6 +1754,10 @@ def test_crct_v1_matrix_threads_memory_controller_and_random_sampling():
     assert replay_active["replay_eviction_mode"] == "active"
     assert replay_active["replay_eviction_memory_streams"] == 8
     assert replay_active["replay_eviction_oracle_confirm_top_k"] == 32
+    assert replay_active["replay_eviction_probe_buffer_size"] == 32
+    assert replay_active["replay_eviction_frame_ttl_steps"] == 256
+    assert replay_active["replay_eviction_slot_work_chunk_size"] == 64
+    assert replay_active["replay_eviction_action_agreement_count"] == 2
     assert replay_active["replay_eviction_peak_preserve_utility_threshold"] == 0.20
     assert replay_active["replay_eviction_peak_preserve_sharpness_threshold"] == 0.20
     assert "arm_d_crct_replay_active_s1337" in replay_active["replay_eviction_trace_path"]

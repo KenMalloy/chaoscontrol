@@ -184,6 +184,10 @@ class ChaosControlConfig:
     replay_eviction_peak_preserve_sharpness_threshold: float = 0.20
     replay_eviction_useful_threshold: float = 0.005
     replay_eviction_min_score_count: int = 2
+    replay_eviction_probe_buffer_size: int = 32
+    replay_eviction_frame_ttl_steps: int = 256
+    replay_eviction_slot_work_chunk_size: int = 64
+    replay_eviction_action_agreement_count: int = 2
 
     def __post_init__(self) -> None:
         if self.buffer_mode not in _VALID_BUFFER_MODES:

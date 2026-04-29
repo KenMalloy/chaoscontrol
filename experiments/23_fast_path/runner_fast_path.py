@@ -1013,7 +1013,7 @@ def _crct_replay_cache_probe(
     if probe_ids is None:
         return False
     probe_step = int(getattr(model, "_last_crct_probe_step", step))
-    if loop.has_probe() and int(getattr(loop, "_probe_step", -1)) == probe_step:
+    if int(getattr(loop, "_last_ingested_probe_step", -1)) == probe_step:
         return False
     valid_mask = getattr(model, "_last_crct_probe_valid_mask", None)
     if valid_mask is None:
@@ -6803,6 +6803,10 @@ def train_fast_for_budget(
     replay_eviction_peak_preserve_sharpness_threshold: float = 0.20,
     replay_eviction_useful_threshold: float = 0.005,
     replay_eviction_min_score_count: int = 2,
+    replay_eviction_probe_buffer_size: int = 32,
+    replay_eviction_frame_ttl_steps: int = 256,
+    replay_eviction_slot_work_chunk_size: int = 64,
+    replay_eviction_action_agreement_count: int = 2,
 ) -> dict[str, Any]:
     rank_ = int(rank)
     world_size_ = int(world_size)
@@ -7467,6 +7471,10 @@ def train_fast_for_budget(
             ),
             useful_threshold=float(replay_eviction_useful_threshold),
             min_score_count=int(replay_eviction_min_score_count),
+            probe_buffer_size=int(replay_eviction_probe_buffer_size),
+            frame_ttl_steps=int(replay_eviction_frame_ttl_steps),
+            slot_work_chunk_size=int(replay_eviction_slot_work_chunk_size),
+            action_agreement_count=int(replay_eviction_action_agreement_count),
         )
     crct_rank_diagnostics: list[dict[str, Any] | None] | None = None
     if crct_enabled:
@@ -8245,13 +8253,14 @@ def train_fast_for_budget(
                     memory_write_tokens=int(crct_memory_write_tokens_per_step),
                     gradient_conflict_monitor=crct_gradient_conflict,
                 )
-            # Replay-eviction: rank-3 idle maintenance tick.
-            # Uses the most recent teacher scoring batch as probe data.
+            # Replay-eviction: rank-3 streaming maintenance. Fresh teacher
+            # score batches are ingested as probe frames; ticks consume
+            # bounded slot-work chunks from the rolling frame stream.
             if replay_eviction_loop is not None and rank_ == world_size_ - 1:
-                if _crct_replay_cache_probe(replay_eviction_loop, model, steps):
-                    tick_result = replay_eviction_loop.tick(model=model, step=steps)
-                    if tick_result.evicted_indices:
-                        replay_eviction_loop.flush_trace()
+                _crct_replay_cache_probe(replay_eviction_loop, model, steps)
+                tick_result = replay_eviction_loop.tick(model=model, step=steps)
+                if tick_result.evicted_indices:
+                    replay_eviction_loop.flush_trace()
             # Phase B5: deferred post-step CE pair pass on the episodic
             # rank. The in-step drain stages each successful replay and
             # the just-emitted REPLAY_OUTCOME dict; this call runs a
@@ -8969,6 +8978,10 @@ def _warmup(
         ),
         replay_eviction_useful_threshold=float(config.get("replay_eviction_useful_threshold", 0.005)),
         replay_eviction_min_score_count=int(config.get("replay_eviction_min_score_count", 2)),
+        replay_eviction_probe_buffer_size=int(config.get("replay_eviction_probe_buffer_size", 32)),
+        replay_eviction_frame_ttl_steps=int(config.get("replay_eviction_frame_ttl_steps", 256)),
+        replay_eviction_slot_work_chunk_size=int(config.get("replay_eviction_slot_work_chunk_size", 64)),
+        replay_eviction_action_agreement_count=int(config.get("replay_eviction_action_agreement_count", 2)),
     )
 
 
@@ -9511,6 +9524,10 @@ def run_condition(
         ),
         replay_eviction_useful_threshold=float(config.get("replay_eviction_useful_threshold", 0.005)),
         replay_eviction_min_score_count=int(config.get("replay_eviction_min_score_count", 2)),
+        replay_eviction_probe_buffer_size=int(config.get("replay_eviction_probe_buffer_size", 32)),
+        replay_eviction_frame_ttl_steps=int(config.get("replay_eviction_frame_ttl_steps", 256)),
+        replay_eviction_slot_work_chunk_size=int(config.get("replay_eviction_slot_work_chunk_size", 64)),
+        replay_eviction_action_agreement_count=int(config.get("replay_eviction_action_agreement_count", 2)),
     )
     episodic_cache_payload = train_result.pop("_episodic_cache_payload", None)
 

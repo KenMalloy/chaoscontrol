@@ -227,7 +227,12 @@ class TestReplayEvictionLoop:
         assert result.evicted_indices == []
 
     def test_cache_probe_enables_tick(self):
-        loop = ReplayEvictionLoop(min_slot_age_steps=0, eviction_threshold=100.0)
+        loop = ReplayEvictionLoop(
+            min_slot_age_steps=0,
+            eviction_threshold=100.0,
+            max_seconds_per_tick=999.0,
+            frame_ttl_steps=1000,
+        )
         model = _StubModel(n_slots=5)
         input_ids = torch.randint(0, 32, (2, 33))
         valid_mask = torch.ones(2, 33)
@@ -285,13 +290,20 @@ class TestReplayEvictionLoop:
         assert result.evicted_indices == []
 
     def test_eviction_after_multiple_ticks(self):
-        loop = ReplayEvictionLoop(min_slot_age_steps=0, eviction_threshold=100.0)
+        loop = ReplayEvictionLoop(
+            min_slot_age_steps=0,
+            eviction_threshold=100.0,
+            max_seconds_per_tick=999.0,
+            frame_ttl_steps=1000,
+        )
         model = _StubModel(n_slots=5, memory_benefit=0.0)
         input_ids = torch.randint(0, 32, (2, 33))
         valid_mask = torch.ones(2, 33)
         loop.cache_probe(input_ids=input_ids, valid_mask=valid_mask,
                          cache_read_cutoff=None, step=0)
         loop.tick(model=model, step=200)
+        loop.cache_probe(input_ids=input_ids, valid_mask=valid_mask,
+                         cache_read_cutoff=None, step=1)
         result = loop.tick(model=model, step=300)
         assert len(result.evicted_indices) > 0
 
@@ -305,7 +317,13 @@ class TestReplayEvictionLoop:
         assert diag["tick_count"] == 0
         assert diag["memory_streams"] == 8
         assert diag["memory_streams_requested"] == 8
-        assert diag["memory_streams_active"] is False
+        assert diag["memory_streams_active"] is True
+        assert diag["probe_buffer_size"] == 32
+        assert diag["queue_depth_last"] == 0
+        assert diag["slot_work_chunk_size"] == 64
+        assert "stream_probe_duty_cycle" in diag
+        assert "stage_seconds_last" in diag
+        assert "slot_coverage_per_minute" in diag
         assert "oracle_confirmations_total" in diag
         assert "proxy_oracle_abs_error_mean" in diag
         assert "last_probe_seconds" in diag
@@ -364,6 +382,110 @@ class TestReplayEvictionLoop:
             step=7,
         )
         assert torch.equal(loop._probe_cue, cue)
+
+    def test_stream_frame_ttl_drops_stale_work(self):
+        loop = ReplayEvictionLoop(frame_ttl_steps=1)
+        model = _StubModel(n_slots=2, use_table=True)
+        ids = torch.zeros(1, 5, dtype=torch.long)
+        mask = torch.ones(1, 5)
+        loop.cache_probe(
+            input_ids=ids,
+            valid_mask=mask,
+            cache_read_cutoff=None,
+            step=1,
+        )
+
+        result = loop.tick(model=model, step=3)
+
+        assert result.evicted_indices == []
+        diag = loop.diagnostics()
+        assert diag["probe_frames_dropped_stale"] == 1
+        assert diag["probe_ticks_skipped_no_frame"] == 1
+        assert diag["has_probe"] is False
+
+    def test_stream_slot_work_covers_frame_before_completion(self, monkeypatch):
+        loop = ReplayEvictionLoop(
+            action_mode="shadow",
+            slot_work_chunk_size=1,
+            oracle_confirm_top_k=0,
+        )
+        model = _StubModel(n_slots=3, use_table=True)
+        seen: list[int] = []
+
+        def fake_probe(**kwargs):
+            slot_indices = list(kwargs["score_slot_indices"])
+            seen.extend(slot_indices)
+            n = len(slot_indices)
+            return CounterfactualResult(
+                marginal_gains=torch.ones(n, 1, 2),
+                sidecar_value=torch.zeros(1, 2),
+                nll_baseline=torch.zeros(1, 2),
+                nll_no_sidecar=torch.zeros(1, 2),
+                weights_baseline=torch.ones(1, n) / max(n, 1),
+                mask=torch.ones(1, 2, dtype=torch.bool),
+                slot_indices=slot_indices,
+            )
+
+        monkeypatch.setattr(replay_eviction_mod, "counterfactual_probe", fake_probe)
+        loop.cache_probe(
+            input_ids=torch.zeros(1, 3, dtype=torch.long),
+            valid_mask=torch.ones(1, 3),
+            cache_read_cutoff=None,
+            step=0,
+        )
+
+        loop.tick(model=model, step=0)
+        loop.tick(model=model, step=1)
+        loop.tick(model=model, step=2)
+
+        assert sorted(seen) == [0, 1, 2]
+        diag = loop.diagnostics()
+        assert diag["probe_frames_completed"] == 1
+        assert diag["probe_frames_buffered"] == 0
+        assert diag["last_visible_slots"] == 3
+        assert diag["slots_untouched_past_ttl"] == 0
+
+    def test_trace_rows_capture_stream_and_decision_context(self, monkeypatch, tmp_path):
+        trace_path = tmp_path / "replay_trace.ndjson"
+        loop = ReplayEvictionLoop(
+            action_mode="shadow",
+            trace_path=str(trace_path),
+            trace_max_rows=100,
+            oracle_confirm_top_k=0,
+        )
+        model = _StubModel(n_slots=1, use_table=True)
+
+        def fake_probe(**kwargs):
+            slot_indices = list(kwargs["score_slot_indices"])
+            return CounterfactualResult(
+                marginal_gains=torch.ones(len(slot_indices), 1, 2),
+                sidecar_value=torch.zeros(1, 2),
+                nll_baseline=torch.zeros(1, 2),
+                nll_no_sidecar=torch.zeros(1, 2),
+                weights_baseline=torch.ones(1, len(slot_indices)),
+                mask=torch.ones(1, 2, dtype=torch.bool),
+                slot_indices=slot_indices,
+            )
+
+        monkeypatch.setattr(replay_eviction_mod, "counterfactual_probe", fake_probe)
+        loop.cache_probe(
+            input_ids=torch.zeros(1, 3, dtype=torch.long),
+            valid_mask=torch.ones(1, 3),
+            cache_read_cutoff=None,
+            step=5,
+            stream_id=3,
+        )
+        loop.tick(model=model, step=7)
+        loop.flush_trace()
+
+        rows = [line for line in trace_path.read_text().splitlines() if line]
+        assert any('"row_type":"frame_ingest"' in row for row in rows)
+        assert any('"row_type":"frame_dispatch"' in row for row in rows)
+        action_row = next(row for row in rows if '"row_type":"replay_' in row)
+        assert '"frame_age_steps":2' in action_row
+        assert '"stream_id":3' in action_row
+        assert '"action_value_preserve"' in action_row
+        assert '"counterfactual_action_threshold_x0p5"' in action_row
 
 
 # ---------------------------------------------------------------------------
@@ -798,6 +920,98 @@ class TestSlotTableTick:
         assert rec1.score_count == 1
         assert rec1.positive_streak == 0
         assert rec1.negative_streak == 1
+
+    def test_action_requires_repeated_frame_agreement_before_mutation(self, monkeypatch):
+        loop = ReplayEvictionLoop(
+            action_mode="active",
+            eviction_ema_beta=0.0,
+            min_slot_age_steps=0,
+            min_score_count=1,
+            action_agreement_count=2,
+        )
+        model = _StubModel(n_slots=1, memory_benefit=0.0, use_table=True)
+        table = model.outer_model.table
+        sid = table.active_slot_ids()[0]
+
+        def fake_probe(**kwargs):
+            slot_indices = list(kwargs["score_slot_indices"])
+            return CounterfactualResult(
+                marginal_gains=-torch.ones(len(slot_indices), 1, 2),
+                sidecar_value=torch.zeros(1, 2),
+                nll_baseline=torch.zeros(1, 2),
+                nll_no_sidecar=torch.zeros(1, 2),
+                weights_baseline=torch.ones(1, len(slot_indices)),
+                mask=torch.ones(1, 2, dtype=torch.bool),
+                slot_indices=slot_indices,
+            )
+
+        monkeypatch.setattr(replay_eviction_mod, "counterfactual_probe", fake_probe)
+        loop._confirm_actions_with_oracle = lambda **_kwargs: {sid: True}  # type: ignore[method-assign]
+
+        for step in (1, 2):
+            loop.cache_probe(
+                input_ids=torch.zeros(1, 3, dtype=torch.long),
+                valid_mask=torch.ones(1, 3),
+                cache_read_cutoff=None,
+                step=step,
+            )
+            result = loop.tick(model=model, step=step)
+            if step == 1:
+                assert result.quarantined == []
+                assert table.record(sid).state != SLOT_QUARANTINED
+
+        assert result.quarantined == [sid]
+        assert table.record(sid).state == SLOT_QUARANTINED
+        assert loop.diagnostics()["action_agreements_total"] == 1
+
+    def test_action_agreement_resets_when_slot_generation_changes(self, monkeypatch):
+        loop = ReplayEvictionLoop(
+            action_mode="active",
+            eviction_ema_beta=0.0,
+            min_slot_age_steps=0,
+            min_score_count=1,
+            action_agreement_count=2,
+        )
+        model = _StubModel(n_slots=1, memory_benefit=0.0, use_table=True)
+        table = model.outer_model.table
+        sid = table.active_slot_ids()[0]
+
+        def fake_probe(**kwargs):
+            slot_indices = list(kwargs["score_slot_indices"])
+            return CounterfactualResult(
+                marginal_gains=-torch.ones(len(slot_indices), 1, 2),
+                sidecar_value=torch.zeros(1, 2),
+                nll_baseline=torch.zeros(1, 2),
+                nll_no_sidecar=torch.zeros(1, 2),
+                weights_baseline=torch.ones(1, len(slot_indices)),
+                mask=torch.ones(1, 2, dtype=torch.bool),
+                slot_indices=slot_indices,
+            )
+
+        monkeypatch.setattr(replay_eviction_mod, "counterfactual_probe", fake_probe)
+        loop._confirm_actions_with_oracle = lambda **_kwargs: {sid: True}  # type: ignore[method-assign]
+
+        loop.cache_probe(
+            input_ids=torch.zeros(1, 3, dtype=torch.long),
+            valid_mask=torch.ones(1, 3),
+            cache_read_cutoff=None,
+            step=1,
+        )
+        first = loop.tick(model=model, step=1)
+        assert first.quarantined == []
+
+        assert table.scale_survival(sid, 1.0) is True
+        loop.cache_probe(
+            input_ids=torch.zeros(1, 3, dtype=torch.long),
+            valid_mask=torch.ones(1, 3),
+            cache_read_cutoff=None,
+            step=2,
+        )
+        second = loop.tick(model=model, step=2)
+
+        assert second.quarantined == []
+        assert table.record(sid).state != SLOT_QUARANTINED
+        assert loop.diagnostics()["action_agreements_total"] == 0
 
     def test_oracle_rejection_blocks_active_mutation(self):
         loop = ReplayEvictionLoop(action_mode="active", min_slot_age_steps=0)

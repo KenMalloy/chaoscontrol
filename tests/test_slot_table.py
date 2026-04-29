@@ -164,9 +164,11 @@ class TestReplaceTensor:
         t = SlotTable()
         s0 = t.append(torch.zeros(1, 4))
         new = torch.ones(1, 4)
+        before = t.record(s0).write_generation
         t.replace_tensor(s0, new)
         got = t.get_tensor(s0)
         assert (got == new).all()
+        assert t.record(s0).write_generation == before + 1
 
     def test_replace_nonexistent(self):
         t = SlotTable()
@@ -175,9 +177,23 @@ class TestReplaceTensor:
     def test_scale_survival(self):
         t = SlotTable()
         s0 = t.append(torch.zeros(1, 4), survival=1.0)
+        before = t.record(s0).write_generation
         assert t.scale_survival(s0, 0.25) is True
         assert t._survival[0] == pytest.approx(0.25)
+        assert t.record(s0).write_generation == before + 1
         assert t.scale_survival(999, 0.5) is False
+
+    def test_lifecycle_mutations_bump_write_generation(self):
+        t = SlotTable()
+        s0 = t.append(torch.zeros(1, 4))
+        rec = t.record(s0)
+        assert rec.write_generation == 0
+        assert t.quarantine(s0) is True
+        assert rec.write_generation == 1
+        assert t.release(s0) is True
+        assert rec.write_generation == 2
+        assert t.retire(s0, reason="test") is True
+        assert rec.write_generation == 3
 
 
 class TestPurgeRetired:

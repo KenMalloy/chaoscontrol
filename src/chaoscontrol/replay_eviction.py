@@ -5,14 +5,16 @@ passive cache. Each memory slot is continuously scored relative to
 the current model via counterfactual probes and classified into one
 of six actions: PRESERVE, DECAY, EVICT, REFRESH, QUARANTINE, DISTILL.
 
-The probe engine runs 1 SSM encode + vectorized masked NLL over the
-hide-one variants. The exact proxy is intentionally bounded by the
-maintenance tick budget/oracle confirmation path, not by the trunk path.
+The probe engine consumes a rolling stream of probe frames and bounded
+slot-work microbatches. Each microbatch runs 1 SSM encode + vectorized
+masked NLL over the selected hide-one variants, then a smaller oracle
+confirmation pass measures active mutations under real SSM dynamics.
 """
 from __future__ import annotations
 
 import json
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -32,6 +34,7 @@ __all__ = [
     "oracle_confirm_slots",
     "replay_score_slots",
     "MaintenancePolicy",
+    "ProbeFrame",
     "_evict_slots",
 ]
 
@@ -111,6 +114,21 @@ class MemoryEvent:
     refresh_candidate: str = ""
 
 
+@dataclass
+class ProbeFrame:
+    """One replay-maintenance frame in the rank-3 stream."""
+
+    frame_id: int
+    step: int
+    input_ids: torch.Tensor
+    valid_mask: torch.Tensor
+    cue: torch.Tensor | None
+    cache_read_cutoff: int | None
+    stream_id: int
+    ingested_at: float
+    processed_slots: set[int] = field(default_factory=set)
+
+
 @torch.inference_mode()
 def counterfactual_probe(
     *,
@@ -123,10 +141,11 @@ def counterfactual_probe(
     chunk_size: int = 16,
     score_slot_indices: list[int] | None = None,
 ) -> CounterfactualResult:
-    """Score all slots via vectorized counterfactual masking.
+    """Score selected slots via vectorized counterfactual masking.
 
-    1 SSM encode + batched masked NLL. All slots scored every tick.
-    Working set ~700KB — fully L2-resident on H100 SXM.
+    1 SSM encode + batched masked NLL. ``score_slot_indices`` bounds
+    maintenance work without touching the trunk path; omitted means score
+    every visible slot for compatibility with older tests/helpers.
     """
     x = probe_input_ids[:, :-1]
     y = probe_input_ids[:, 1:]
@@ -212,9 +231,9 @@ def counterfactual_probe(
             sidecar_value=torch.zeros(B, T, device=dev),
             nll_baseline=torch.zeros(B, T, device=dev),
             nll_no_sidecar=torch.zeros(B, T, device=dev),
-            weights_baseline=torch.zeros(B, 0, device=dev),
+            weights_baseline=torch.zeros(B, len(score_indices), device=dev),
             mask=mask,
-            slot_indices=vis,
+            slot_indices=score_indices,
         )
 
     with ac:
@@ -562,6 +581,10 @@ class ReplayEvictionLoop:
         peak_preserve_sharpness_threshold: float = 0.20,
         useful_threshold: float = 0.005,
         min_score_count: int = 2,
+        probe_buffer_size: int = 32,
+        frame_ttl_steps: int = 256,
+        slot_work_chunk_size: int = 64,
+        action_agreement_count: int = 2,
     ) -> None:
         if action_mode not in {"active", "shadow"}:
             raise ValueError("action_mode must be 'active' or 'shadow'")
@@ -585,6 +608,10 @@ class ReplayEvictionLoop:
         self._peak_preserve_sharpness_threshold = float(peak_preserve_sharpness_threshold)
         self._useful_threshold = float(useful_threshold)
         self._min_score_count = int(min_score_count)
+        self._probe_buffer_size = max(1, int(probe_buffer_size))
+        self._frame_ttl_steps = max(0, int(frame_ttl_steps))
+        self._slot_work_chunk_size = max(1, int(slot_work_chunk_size))
+        self._action_agreement_count = max(1, int(action_agreement_count))
 
         # Legacy per-index tracking (kept for backward compat in tests)
         self._slot_utility_ema: dict[int, float] = {}
@@ -598,6 +625,13 @@ class ReplayEvictionLoop:
         self._probe_cache_cutoff: int | None = None
         self._probe_step: int = 0
         self._probe_stream_id: int = 0
+        self._last_ingested_probe_step: int = -1
+        self._probe_frames: deque[ProbeFrame] = deque(maxlen=self._probe_buffer_size)
+        self._next_frame_id: int = 0
+        self._slot_rr_cursor: int = 0
+        self._active_frame_id: int = -1
+        self._active_frame_step: int = 0
+        self._started_at: float = time.monotonic()
 
         # Counters
         self._tick_count: int = 0
@@ -623,10 +657,48 @@ class ReplayEvictionLoop:
         self._probe_seconds_total: float = 0.0
         self._last_probe_seconds: float = 0.0
         self._probe_over_budget_total: int = 0
+        self._probe_frames_ingested: int = 0
+        self._probe_frames_dropped_overflow: int = 0
+        self._probe_frames_dropped_stale: int = 0
+        self._probe_frames_completed: int = 0
+        self._probe_ticks_skipped_no_frame: int = 0
+        self._probe_ticks_skipped_no_slot_work: int = 0
+        self._slot_work_items_total: int = 0
+        self._last_slot_work_items: int = 0
+        self._action_agreements_total: int = 0
+        self._action_agreements_reset_total: int = 0
+        self._last_queue_depth: int = 0
+        self._queue_depth_sum: int = 0
+        self._queue_depth_samples: int = 0
+        self._queue_depth_max: int = 0
+        self._last_frame_age_steps: int = 0
+        self._frame_age_steps_sum: int = 0
+        self._frame_age_steps_max: int = 0
+        self._last_frame_age_seconds: float = 0.0
+        self._frame_age_seconds_sum: float = 0.0
+        self._frame_age_seconds_max: float = 0.0
+        self._stream_ticks: dict[int, int] = {i: 0 for i in range(self._memory_streams)}
+        self._stream_work_items: dict[int, int] = {i: 0 for i in range(self._memory_streams)}
+        self._stream_probe_seconds: dict[int, float] = {i: 0.0 for i in range(self._memory_streams)}
+        self._last_stage_seconds: dict[str, float] = {
+            "select": 0.0,
+            "probe": 0.0,
+            "ema": 0.0,
+            "oracle": 0.0,
+            "action": 0.0,
+        }
+        self._stage_seconds_total: dict[str, float] = dict(self._last_stage_seconds)
+        self._oracle_seconds_total: float = 0.0
+        self._last_oracle_seconds: float = 0.0
+        self._slot_last_scored_step: dict[int, int] = {}
+        self._last_visible_slots: int = 0
+        self._last_untouched_slots: int = 0
+        self._last_max_untouched_steps: int = 0
 
         # Quarantine tracking (by slot_id when using SlotTable, by index otherwise)
         self._quarantined: set[int] = set()
         self._quarantine_positive_streak: dict[int, int] = {}
+        self._action_evidence: dict[int, tuple[str, int, int, int]] = {}
 
         # Trace
         self._trace_path = None if trace_path in (None, "") else Path(str(trace_path))
@@ -647,15 +719,92 @@ class ReplayEvictionLoop:
         step: int,
         stream_id: int = 0,
     ) -> None:
-        self._probe_input_ids = input_ids.detach()
-        self._probe_valid_mask = valid_mask.detach()
-        self._probe_cue = None if cue is None else cue.detach()
+        input_ids_d = input_ids.detach()
+        valid_mask_d = valid_mask.detach()
+        cue_d = None if cue is None else cue.detach()
+        if len(self._probe_frames) == self._probe_frames.maxlen:
+            self._probe_frames_dropped_overflow += 1
+        frame = ProbeFrame(
+            frame_id=self._next_frame_id,
+            step=int(step),
+            input_ids=input_ids_d,
+            valid_mask=valid_mask_d,
+            cue=cue_d,
+            cache_read_cutoff=cache_read_cutoff,
+            stream_id=int(stream_id) % self._memory_streams,
+            ingested_at=time.monotonic(),
+        )
+        self._next_frame_id += 1
+        self._probe_frames.append(frame)
+        self._probe_frames_ingested += 1
+        self._last_queue_depth = len(self._probe_frames)
+        self._queue_depth_sum += self._last_queue_depth
+        self._queue_depth_samples += 1
+        self._queue_depth_max = max(self._queue_depth_max, self._last_queue_depth)
+
+        self._probe_input_ids = input_ids_d
+        self._probe_valid_mask = valid_mask_d
+        self._probe_cue = cue_d
         self._probe_cache_cutoff = cache_read_cutoff
-        self._probe_step = step
-        self._probe_stream_id = int(stream_id) % self._memory_streams
+        self._probe_step = int(step)
+        self._last_ingested_probe_step = int(step)
+        self._probe_stream_id = frame.stream_id
+        self._trace_frame_event("frame_ingest", frame, queue_depth=len(self._probe_frames))
 
     def has_probe(self) -> bool:
-        return self._probe_input_ids is not None
+        return bool(self._probe_frames)
+
+    def _drop_stale_frames(self, step: int) -> None:
+        if self._frame_ttl_steps <= 0:
+            return
+        while self._probe_frames and (int(step) - self._probe_frames[0].step) > self._frame_ttl_steps:
+            self._probe_frames.popleft()
+            self._probe_frames_dropped_stale += 1
+
+    def _visible_slot_indices(self, outer: Any) -> list[int]:
+        table = getattr(outer, "table", None)
+        if table is not None:
+            return table.visible_indices(read_cutoff=None)
+        return list(range(len(getattr(outer, "_slots", []))))
+
+    def _select_frame_and_slot_work(
+        self,
+        *,
+        outer: Any,
+        step: int,
+    ) -> tuple[ProbeFrame | None, list[int]]:
+        self._drop_stale_frames(step)
+        visible = self._visible_slot_indices(outer)
+        if not visible:
+            return None, []
+        for frame in list(self._probe_frames):
+            remaining = [idx for idx in visible if idx not in frame.processed_slots]
+            if not remaining:
+                continue
+            start = self._slot_rr_cursor % len(remaining)
+            ordered = remaining[start:] + remaining[:start]
+            work = ordered[: self._slot_work_chunk_size]
+            self._slot_rr_cursor = (self._slot_rr_cursor + len(work)) % max(1, len(remaining))
+            return frame, work
+        return None, []
+
+    def _mark_frame_slots_processed(
+        self,
+        *,
+        frame: ProbeFrame,
+        outer: Any,
+        slot_indices: list[int],
+    ) -> None:
+        visible = self._visible_slot_indices(outer)
+        visible_set = set(int(i) for i in visible)
+        frame.processed_slots.update(int(i) for i in slot_indices)
+        frame.processed_slots.intersection_update(visible_set)
+        if visible_set and len(frame.processed_slots) >= len(visible_set):
+            self._probe_frames_completed += 1
+            try:
+                self._probe_frames.remove(frame)
+            except ValueError:
+                pass
 
     def _capacity_pressure(self, outer: Any) -> bool:
         table = getattr(outer, "table", None)
@@ -666,40 +815,101 @@ class ReplayEvictionLoop:
 
     def tick(self, *, model: Any, step: int) -> TickResult:
         """One maintenance tick. Probe, classify, act."""
-        if self._probe_input_ids is None:
-            return TickResult()
-
         t0 = time.monotonic()
         self._tick_count += 1
 
         outer = getattr(model, "outer_model", None)
         if outer is None:
             return TickResult()
+        select_t0 = time.monotonic()
+        frame, slot_work = self._select_frame_and_slot_work(outer=outer, step=step)
+        self._last_stage_seconds["select"] = time.monotonic() - select_t0
+        self._stage_seconds_total["select"] += self._last_stage_seconds["select"]
+        self._last_queue_depth = len(self._probe_frames)
+        self._queue_depth_sum += self._last_queue_depth
+        self._queue_depth_samples += 1
+        self._queue_depth_max = max(self._queue_depth_max, self._last_queue_depth)
+        if frame is None:
+            self._probe_ticks_skipped_no_frame += 1
+            return TickResult()
+        if not slot_work:
+            self._probe_ticks_skipped_no_slot_work += 1
+            return TickResult()
+        frame_age_steps = max(0, int(step) - int(frame.step))
+        frame_age_seconds = max(0.0, time.monotonic() - frame.ingested_at)
+        self._last_frame_age_steps = frame_age_steps
+        self._frame_age_steps_sum += frame_age_steps
+        self._frame_age_steps_max = max(self._frame_age_steps_max, frame_age_steps)
+        self._last_frame_age_seconds = frame_age_seconds
+        self._frame_age_seconds_sum += frame_age_seconds
+        self._frame_age_seconds_max = max(self._frame_age_seconds_max, frame_age_seconds)
+        self._active_frame_id = frame.frame_id
+        self._active_frame_step = frame.step
+        self._probe_input_ids = frame.input_ids
+        self._probe_valid_mask = frame.valid_mask
+        self._probe_cue = frame.cue
+        self._probe_cache_cutoff = frame.cache_read_cutoff
+        self._probe_step = frame.step
+        self._probe_stream_id = frame.stream_id
+        self._last_slot_work_items = len(slot_work)
+        self._slot_work_items_total += len(slot_work)
+        self._stream_ticks[frame.stream_id] = self._stream_ticks.get(frame.stream_id, 0) + 1
+        self._stream_work_items[frame.stream_id] = (
+            self._stream_work_items.get(frame.stream_id, 0) + len(slot_work)
+        )
+        self._trace_frame_event(
+            "frame_dispatch",
+            frame,
+            queue_depth=len(self._probe_frames),
+            slot_work_items=len(slot_work),
+            frame_age_steps=frame_age_steps,
+            frame_age_seconds=frame_age_seconds,
+        )
 
         # Run counterfactual probe
         probe_t0 = time.monotonic()
         cf = counterfactual_probe(
             model=model,
             outer=outer,
-            probe_input_ids=self._probe_input_ids,
-            probe_valid_mask=self._probe_valid_mask,
-            probe_cue=self._probe_cue,
-            cache_read_cutoff=self._probe_cache_cutoff,
+            probe_input_ids=frame.input_ids,
+            probe_valid_mask=frame.valid_mask,
+            probe_cue=frame.cue,
+            cache_read_cutoff=frame.cache_read_cutoff,
             chunk_size=self._probe_chunk_size,
+            score_slot_indices=slot_work,
         )
         self._last_probe_seconds = time.monotonic() - probe_t0
         self._probe_seconds_total += self._last_probe_seconds
+        self._last_stage_seconds["probe"] = self._last_probe_seconds
+        self._stage_seconds_total["probe"] += self._last_probe_seconds
+        self._stream_probe_seconds[frame.stream_id] = (
+            self._stream_probe_seconds.get(frame.stream_id, 0.0)
+            + self._last_probe_seconds
+        )
         if self._last_probe_seconds > self._max_seconds:
             self._probe_over_budget_total += 1
 
         if len(cf.slot_indices) == 0:
             return TickResult()
+        self._mark_frame_slots_processed(frame=frame, outer=outer, slot_indices=cf.slot_indices)
+        for phys_idx in cf.slot_indices:
+            self._slot_last_scored_step[int(phys_idx)] = int(step)
+        self._last_visible_slots = len(self._visible_slot_indices(outer))
+        untouched_ages = [
+            max(0, int(step) - self._slot_last_scored_step.get(int(phys_idx), int(step)))
+            for phys_idx in self._visible_slot_indices(outer)
+        ]
+        self._last_untouched_slots = sum(
+            1 for age in untouched_ages if age > self._frame_ttl_steps
+        )
+        self._last_max_untouched_steps = max(untouched_ages, default=0)
 
         self._replays_total += 1
         self._slots_scored_total += len(cf.slot_indices)
         self._last_slots_tracked = len(cf.slot_indices)
 
         # Compute signals
+        ema_t0 = time.monotonic()
         sharpness_per_slot = _compute_per_slot_sharpness(cf.marginal_gains, cf.mask)
         mask_f = cf.mask.float()
         n_valid = mask_f.sum().clamp(min=1)
@@ -914,6 +1124,8 @@ class ReplayEvictionLoop:
                     old = self._slot_utility_ema.get(phys_idx, mg)
                     self._slot_utility_ema[phys_idx] = self._ema_beta * old + (1 - self._ema_beta) * mg
                     self._slot_score_count[phys_idx] = self._slot_score_count.get(phys_idx, 0) + 1
+        self._last_stage_seconds["ema"] = time.monotonic() - ema_t0
+        self._stage_seconds_total["ema"] += self._last_stage_seconds["ema"]
 
         elapsed = time.monotonic() - t0
         if elapsed > self._max_seconds:
@@ -924,14 +1136,20 @@ class ReplayEvictionLoop:
         # mutates the table.  This lets CRCT vs CRCT+maintenance be measured
         # without conflating the first run with a new controller.
         if self._action_mode == "shadow":
+            action_t0 = time.monotonic()
             self._classify_shadow(model=model, outer=outer, step=step, cf=cf, t0=t0)
+            self._last_stage_seconds["action"] = time.monotonic() - action_t0
+            self._stage_seconds_total["action"] += self._last_stage_seconds["action"]
             return TickResult()
 
+        action_t0 = time.monotonic()
         result = self._classify_and_act(
             model=model, outer=outer, step=step, cf=cf,
             slot_marginals=slot_marginals, sharpness_per_slot=sharpness_per_slot,
             t0=t0,
         )
+        self._last_stage_seconds["action"] = time.monotonic() - action_t0
+        self._stage_seconds_total["action"] += self._last_stage_seconds["action"]
         return result
 
     def _classify_shadow(
@@ -987,6 +1205,7 @@ class ReplayEvictionLoop:
                 rec,
                 accepted=confirmed,
                 reason="shadow_confirmed" if confirmed else "shadow_oracle_rejected",
+                extra=self._decision_trace_extra(rec, policy_kwargs),
             )
 
     def _budget_exhausted(self, t0: float) -> bool:
@@ -1038,6 +1257,7 @@ class ReplayEvictionLoop:
 
         candidate_pairs.sort(key=lambda row: abs(row[3]), reverse=True)
         candidate_pairs = candidate_pairs[: self._oracle_confirm_top_k]
+        oracle_t0 = time.monotonic()
         oracle = oracle_confirm_slots(
             model=model,
             outer=outer,
@@ -1046,6 +1266,10 @@ class ReplayEvictionLoop:
             slot_indices=[phys for _sid, phys, _action, _proxy in candidate_pairs],
             cache_read_cutoff=self._probe_cache_cutoff,
         )
+        self._last_oracle_seconds = time.monotonic() - oracle_t0
+        self._oracle_seconds_total += self._last_oracle_seconds
+        self._last_stage_seconds["oracle"] = self._last_oracle_seconds
+        self._stage_seconds_total["oracle"] += self._last_oracle_seconds
         self._last_oracle_candidates = len(oracle.slot_indices)
         if not oracle.slot_indices:
             return {}
@@ -1122,6 +1346,42 @@ class ReplayEvictionLoop:
             return oracle_score > self._useful_threshold
         return True
 
+    def _has_action_agreement(
+        self,
+        slot_id: int,
+        action: str,
+        rec: SlotRecord | None = None,
+    ) -> bool:
+        """Require repeated fresh-frame agreement before structural mutation."""
+        if self._action_agreement_count <= 1:
+            return True
+        generation = int(rec.write_generation) if rec is not None else 0
+        last_action, count, last_frame_id, last_generation = self._action_evidence.get(
+            int(slot_id),
+            ("", 0, -1, generation),
+        )
+        if (
+            last_action == action
+            and last_generation == generation
+            and last_frame_id != self._active_frame_id
+        ):
+            count += 1
+        elif last_action == action and last_generation == generation:
+            count = max(1, count)
+        else:
+            count = 1
+            self._action_agreements_reset_total += 1
+        self._action_evidence[int(slot_id)] = (
+            action,
+            count,
+            self._active_frame_id,
+            generation,
+        )
+        if count >= self._action_agreement_count:
+            self._action_agreements_total += 1
+            return True
+        return False
+
     def _classify_and_act(
         self,
         *,
@@ -1190,10 +1450,12 @@ class ReplayEvictionLoop:
                 rec = table.record(sid)
                 if rec is None:
                     continue
+                extra = self._decision_trace_extra(rec, policy_kwargs)
                 confirmed = confirmations.get(sid, action == SLOT_PRESERVE)
                 if action == SLOT_REFRESH:
                     accepted = False
-                    if confirmed:
+                    agreed = confirmed and self._has_action_agreement(sid, action, rec)
+                    if agreed:
                         accepted = self._execute_refresh(model, outer, sid, cf, t0=t0)
                     if accepted:
                         result.refreshed.append(sid)
@@ -1201,26 +1463,40 @@ class ReplayEvictionLoop:
                         rec.refresh_count += 1
                         rec.state = SLOT_ACTIVE
                     rec.last_action = action
-                    reason = "" if confirmed else "oracle_rejected"
-                    self._trace_event(step, sid, action, rec, accepted=accepted, reason=reason)
+                    reason = (
+                        ""
+                        if agreed
+                        else "oracle_rejected" if not confirmed else "awaiting_agreement"
+                    )
+                    self._trace_event(
+                        step, sid, action, rec,
+                        accepted=accepted, reason=reason, extra=extra,
+                    )
                 elif action == SLOT_QUARANTINE:
                     if not confirmed:
                         rec.last_action = action
                         self._trace_event(
                             step, sid, action, rec,
-                            accepted=False, reason="oracle_rejected",
+                            accepted=False, reason="oracle_rejected", extra=extra,
+                        )
+                        continue
+                    if not self._has_action_agreement(sid, action, rec):
+                        rec.last_action = action
+                        self._trace_event(
+                            step, sid, action, rec,
+                            accepted=False, reason="awaiting_agreement", extra=extra,
                         )
                         continue
                     self._execute_quarantine(outer, sid)
                     result.quarantined.append(sid)
                     rec.last_action = action
-                    self._trace_event(step, sid, action, rec)
+                    self._trace_event(step, sid, action, rec, extra=extra)
                 elif action == SLOT_DECAY:
                     if not confirmed:
                         rec.last_action = action
                         self._trace_event(
                             step, sid, action, rec,
-                            accepted=False, reason="oracle_rejected",
+                            accepted=False, reason="oracle_rejected", extra=extra,
                         )
                         continue
                     self._execute_decay(outer, sid)
@@ -1228,13 +1504,14 @@ class ReplayEvictionLoop:
                     self._decays_total += 1
                     rec.state = SLOT_DECAYING
                     rec.last_action = action
-                    self._trace_event(step, sid, action, rec)
+                    self._trace_event(step, sid, action, rec, extra=extra)
                 elif action == SLOT_PRESERVE:
                     if rec.sharpness_ema > self._useful_threshold:
                         rec.state = SLOT_SHARP
                     elif rec.state == SLOT_WARMING and rec.score_count >= self._min_score_count:
                         rec.state = SLOT_ACTIVE
                     rec.last_action = action
+                    self._trace_event(step, sid, action, rec, extra=extra)
 
             # Execute structural actions (evict, distill) — descending physical order
             retire_ids = []
@@ -1246,10 +1523,19 @@ class ReplayEvictionLoop:
                 if self._budget_exhausted(t0):
                     break
                 rec = table.record(sid)
+                extra = self._decision_trace_extra(rec, policy_kwargs)
                 if not confirmations.get(sid, False):
                     self._trace_event(
                         step, sid, action, rec,
-                        accepted=False, reason="oracle_rejected",
+                        accepted=False, reason="oracle_rejected", extra=extra,
+                    )
+                    if rec:
+                        rec.last_action = action
+                    continue
+                if not self._has_action_agreement(sid, action, rec):
+                    self._trace_event(
+                        step, sid, action, rec,
+                        accepted=False, reason="awaiting_agreement", extra=extra,
                     )
                     if rec:
                         rec.last_action = action
@@ -1258,12 +1544,16 @@ class ReplayEvictionLoop:
                     receipt = self._execute_distill(outer, sid, step)
                     result.distilled.append(sid)
                     self._distills_total += 1
-                    self._trace_event(step, sid, action, rec, reason="distilled")
+                    self._trace_event(
+                        step, sid, action, rec, reason="distilled", extra=extra
+                    )
                 else:
                     table.retire(sid, reason="evicted")
                     result.evicted.append(sid)
                     self._evictions_total += 1
-                    self._trace_event(step, sid, action, rec, reason="evicted")
+                    self._trace_event(
+                        step, sid, action, rec, reason="evicted", extra=extra
+                    )
                 if rec:
                     rec.last_action = action
 
@@ -1447,6 +1737,31 @@ class ReplayEvictionLoop:
 
         return receipt
 
+    def _decision_trace_extra(
+        self,
+        rec: SlotRecord | None,
+        policy_kwargs: dict[str, Any],
+    ) -> dict[str, Any]:
+        if rec is None:
+            return {}
+        values = self._policy.action_values(rec, **policy_kwargs)
+        extra: dict[str, Any] = {
+            f"action_value_{action.lower()}": float(value)
+            for action, value in values.items()
+        }
+        for factor in (0.5, 2.0):
+            kwargs = dict(policy_kwargs)
+            kwargs["eviction_threshold"] = float(kwargs["eviction_threshold"]) * factor
+            kwargs["useful_threshold"] = float(kwargs["useful_threshold"]) * factor
+            kwargs["quarantine_threshold"] = (
+                float(kwargs["quarantine_threshold"]) * factor
+            )
+            label = str(factor).replace(".", "p")
+            extra[f"counterfactual_action_threshold_x{label}"] = self._policy.choose(
+                rec, **kwargs
+            )
+        return extra
+
     def _apply_evictions_legacy(self, *, model: Any, step: int) -> TickResult:
         """Legacy eviction path for models without SlotTable."""
         outer = getattr(model, "outer_model", None)
@@ -1506,6 +1821,7 @@ class ReplayEvictionLoop:
         *,
         accepted: bool = True,
         reason: str = "",
+        extra: dict[str, Any] | None = None,
     ) -> None:
         if self._trace_path is None:
             return
@@ -1519,9 +1835,28 @@ class ReplayEvictionLoop:
             "action": action,
             "accepted": accepted,
             "reason": reason,
+            "frame_id": self._active_frame_id,
+            "frame_step": self._active_frame_step,
+            "frame_age_steps": self._last_frame_age_steps,
+            "frame_age_seconds": self._last_frame_age_seconds,
+            "stream_id": self._probe_stream_id,
+            "queue_depth": self._last_queue_depth,
+            "slot_work_items": self._last_slot_work_items,
+            "probe_seconds": self._last_probe_seconds,
+            "probe_budget_seconds": self._max_seconds,
+            "probe_budget_utilization": (
+                self._last_probe_seconds / self._max_seconds
+                if self._max_seconds > 0.0
+                else 0.0
+            ),
         }
         if rec is not None:
             event.update({
+                "slot_write_generation": rec.write_generation,
+                "slot_created_step": rec.created_step,
+                "slot_age_steps": step - rec.created_step,
+                "slot_bucket_id": rec.bucket_id,
+                "slot_event_id": rec.event_id,
                 "marginal_gain": rec.marginal_gain_ema,
                 "sharpness": rec.sharpness_ema,
                 "activation_drift": rec.activation_drift_ema,
@@ -1534,6 +1869,8 @@ class ReplayEvictionLoop:
                 "score_count": rec.score_count,
                 "state": rec.state,
             })
+        if extra:
+            event.update(extra)
         self._trace_buffer.append(json.dumps(event, separators=(",", ":")) + "\n")
         self._trace_rows_written += 1
 
@@ -1558,6 +1895,13 @@ class ReplayEvictionLoop:
             "tick": self._tick_count,
             "slot_id": int(slot_id),
             "action": action,
+            "frame_id": self._active_frame_id,
+            "frame_step": self._active_frame_step,
+            "frame_age_steps": self._last_frame_age_steps,
+            "frame_age_seconds": self._last_frame_age_seconds,
+            "stream_id": self._probe_stream_id,
+            "queue_depth": self._last_queue_depth,
+            "slot_work_items": self._last_slot_work_items,
             "proxy_score": float(proxy_score),
             "oracle_score": float(oracle_score),
             "proxy_oracle_abs_error": float(abs(proxy_score - oracle_score)),
@@ -1565,10 +1909,16 @@ class ReplayEvictionLoop:
                 (proxy_score >= 0.0) == (oracle_score >= 0.0)
             ),
             "oracle_confirmed": bool(confirmed),
+            "oracle_seconds": self._last_oracle_seconds,
         }
         if rec is not None:
             event.update(
                 {
+                    "slot_write_generation": rec.write_generation,
+                    "slot_created_step": rec.created_step,
+                    "slot_age_steps": int(step) - rec.created_step,
+                    "slot_bucket_id": rec.bucket_id,
+                    "slot_event_id": rec.event_id,
                     "marginal_gain": rec.marginal_gain_ema,
                     "sharpness": rec.sharpness_ema,
                     "activation_drift": rec.activation_drift_ema,
@@ -1581,6 +1931,37 @@ class ReplayEvictionLoop:
                     "state": rec.state,
                 }
             )
+        self._trace_buffer.append(json.dumps(event, separators=(",", ":")) + "\n")
+        self._trace_rows_written += 1
+
+    def _trace_frame_event(
+        self,
+        row_type: str,
+        frame: ProbeFrame,
+        *,
+        queue_depth: int,
+        slot_work_items: int = 0,
+        frame_age_steps: int = 0,
+        frame_age_seconds: float = 0.0,
+    ) -> None:
+        if self._trace_path is None:
+            return
+        if self._trace_max_rows > 0 and self._trace_rows_written >= self._trace_max_rows:
+            return
+        event = {
+            "row_type": row_type,
+            "step": int(frame.step),
+            "tick": self._tick_count,
+            "frame_id": int(frame.frame_id),
+            "frame_step": int(frame.step),
+            "stream_id": int(frame.stream_id),
+            "queue_depth": int(queue_depth),
+            "slot_work_items": int(slot_work_items),
+            "frame_age_steps": int(frame_age_steps),
+            "frame_age_seconds": float(frame_age_seconds),
+            "processed_slots": len(frame.processed_slots),
+            "probe_buffer_size": self._probe_buffer_size,
+        }
         self._trace_buffer.append(json.dumps(event, separators=(",", ":")) + "\n")
         self._trace_rows_written += 1
 
@@ -1597,13 +1978,33 @@ class ReplayEvictionLoop:
 
     def diagnostics(self) -> dict[str, Any]:
         self.flush_trace()
+        elapsed_wall = max(1e-9, time.monotonic() - self._started_at)
+        queue_depth_mean = (
+            self._queue_depth_sum / self._queue_depth_samples
+            if self._queue_depth_samples
+            else 0.0
+        )
+        frame_age_steps_mean = (
+            self._frame_age_steps_sum / self._replays_total
+            if self._replays_total
+            else 0.0
+        )
+        frame_age_seconds_mean = (
+            self._frame_age_seconds_sum / self._replays_total
+            if self._replays_total
+            else 0.0
+        )
+        stream_duty = {
+            str(i): self._stream_probe_seconds.get(i, 0.0) / elapsed_wall
+            for i in range(self._memory_streams)
+        }
         return {
             "enabled": True,
             "action_mode": self._action_mode,
             "memory_streams": self._memory_streams,
             "memory_streams_requested": self._memory_streams,
-            "memory_streams_active": False,
-            "memory_streams_note": "logical stream ids only; parallel stream fanout is not active",
+            "memory_streams_active": True,
+            "memory_streams_note": "probe-frame stream ids actively partition replay-maintenance work on rank 3",
             "tick_count": self._tick_count,
             "replays_total": self._replays_total,
             "evictions_total": self._evictions_total,
@@ -1640,6 +2041,55 @@ class ReplayEvictionLoop:
             ),
             "last_probe_seconds": self._last_probe_seconds,
             "probe_over_budget_total": self._probe_over_budget_total,
+            "probe_buffer_size": self._probe_buffer_size,
+            "probe_frames_buffered": len(self._probe_frames),
+            "probe_frames_ingested": self._probe_frames_ingested,
+            "probe_frames_dropped_overflow": self._probe_frames_dropped_overflow,
+            "probe_frames_dropped_stale": self._probe_frames_dropped_stale,
+            "probe_frames_completed": self._probe_frames_completed,
+            "probe_ticks_skipped_no_frame": self._probe_ticks_skipped_no_frame,
+            "probe_ticks_skipped_no_slot_work": self._probe_ticks_skipped_no_slot_work,
+            "queue_depth_last": self._last_queue_depth,
+            "queue_depth_mean": queue_depth_mean,
+            "queue_depth_max": self._queue_depth_max,
+            "frame_ttl_steps": self._frame_ttl_steps,
+            "frame_age_steps_last": self._last_frame_age_steps,
+            "frame_age_steps_mean": frame_age_steps_mean,
+            "frame_age_steps_max": self._frame_age_steps_max,
+            "frame_age_seconds_last": self._last_frame_age_seconds,
+            "frame_age_seconds_mean": frame_age_seconds_mean,
+            "frame_age_seconds_max": self._frame_age_seconds_max,
+            "slot_work_chunk_size": self._slot_work_chunk_size,
+            "slot_work_items_total": self._slot_work_items_total,
+            "last_slot_work_items": self._last_slot_work_items,
+            "slot_work_items_mean": (
+                self._slot_work_items_total / self._replays_total
+                if self._replays_total
+                else 0.0
+            ),
+            "last_visible_slots": self._last_visible_slots,
+            "slots_untouched_past_ttl": self._last_untouched_slots,
+            "max_untouched_slot_steps": self._last_max_untouched_steps,
+            "slot_coverage_per_minute": (
+                self._slots_scored_total / (elapsed_wall / 60.0)
+                if elapsed_wall > 0.0
+                else 0.0
+            ),
+            "action_agreement_count": self._action_agreement_count,
+            "action_agreements_total": self._action_agreements_total,
+            "action_agreements_reset_total": self._action_agreements_reset_total,
+            "active_frame_id": self._active_frame_id,
+            "active_frame_step": self._active_frame_step,
+            "stage_seconds_last": dict(self._last_stage_seconds),
+            "stage_seconds_total": dict(self._stage_seconds_total),
+            "stream_ticks": {str(k): v for k, v in self._stream_ticks.items()},
+            "stream_work_items": {str(k): v for k, v in self._stream_work_items.items()},
+            "stream_probe_seconds": {
+                str(k): v for k, v in self._stream_probe_seconds.items()
+            },
+            "stream_probe_duty_cycle": stream_duty,
+            "oracle_seconds_total": self._oracle_seconds_total,
+            "last_oracle_seconds": self._last_oracle_seconds,
             "last_proxy_oracle_sign_match_rate": self._last_proxy_oracle_sign_match_rate,
             "last_proxy_oracle_abs_error": self._last_proxy_oracle_abs_error,
             "last_oracle_candidates": self._last_oracle_candidates,

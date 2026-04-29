@@ -129,6 +129,7 @@ class SlotTable:
         self._rebuild_physical_maps()
 
         if slot_id in self._records:
+            self._records[slot_id].write_generation += 1
             self._records[slot_id].state = SLOT_RETIRED
             self._records[slot_id].retire_reason = reason
 
@@ -151,6 +152,7 @@ class SlotTable:
                 del self._priority[phys]
             del self._id_to_physical[sid]
             if sid in self._records:
+                self._records[sid].write_generation += 1
                 self._records[sid].state = SLOT_RETIRED
                 self._records[sid].retire_reason = reason
 
@@ -171,6 +173,7 @@ class SlotTable:
         phys = self._id_to_physical[slot_id]
         self._priority[phys] = 0.0
         if slot_id in self._records:
+            self._records[slot_id].write_generation += 1
             self._records[slot_id].state = SLOT_QUARANTINED
             self._records[slot_id].quarantine_count += 1
         return True
@@ -181,6 +184,7 @@ class SlotTable:
         phys = self._id_to_physical[slot_id]
         self._priority[phys] = 1.0
         if slot_id in self._records:
+            self._records[slot_id].write_generation += 1
             self._records[slot_id].state = SLOT_ACTIVE
         return True
 
@@ -189,6 +193,8 @@ class SlotTable:
             return False
         phys = self._id_to_physical[slot_id]
         self._slots[phys] = tensor.detach()
+        if slot_id in self._records:
+            self._records[slot_id].write_generation += 1
         return True
 
     def scale_survival(self, slot_id: SlotId, factor: float) -> bool:
@@ -197,6 +203,8 @@ class SlotTable:
             return False
         phys = self._id_to_physical[slot_id]
         self._survival[phys] *= float(factor)
+        if slot_id in self._records:
+            self._records[slot_id].write_generation += 1
         return True
 
     def get_tensor(self, slot_id: SlotId) -> torch.Tensor | None:
