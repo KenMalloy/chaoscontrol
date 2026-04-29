@@ -101,9 +101,6 @@ def _run_calibration(
         budget_seconds=budget_seconds,
         seed=seed,
     )
-    CALIBRATION_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-    DEFAULT_CALIBRATION_TRACE.parent.mkdir(parents=True, exist_ok=True)
-    write_matrix(CALIBRATION_RESULTS_DIR / "matrix.json", entries)
     print(
         f"[exp26] stage=calibrate entries={len(entries)} world_size={world_size} "
         f"budget={budget_seconds}s dry_run={dry_run}",
@@ -112,6 +109,9 @@ def _run_calibration(
     if dry_run:
         _print_entries(entries)
         return
+    CALIBRATION_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    DEFAULT_CALIBRATION_TRACE.parent.mkdir(parents=True, exist_ok=True)
+    write_matrix(CALIBRATION_RESULTS_DIR / "matrix.json", entries)
     _prebuild_cache(str(data_path))
     run_matrix_entries(
         entries=entries,
@@ -185,8 +185,6 @@ def _run_headline(
         seed_values=seeds,
         arms=arms,
     )
-    output_dir.mkdir(parents=True, exist_ok=True)
-    write_matrix(output_dir / "matrix.json", entries)
     print(
         f"[exp26] stage=headline entries={len(entries)} world_size={world_size} "
         f"budget={budget_seconds}s dry_run={dry_run}",
@@ -195,6 +193,8 @@ def _run_headline(
     if dry_run:
         _print_entries(entries)
         return
+    output_dir.mkdir(parents=True, exist_ok=True)
+    write_matrix(output_dir / "matrix.json", entries)
     _prebuild_cache(str(data_path))
     run_matrix_entries(
         entries=entries,
