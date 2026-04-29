@@ -801,9 +801,13 @@ def test_scopt_optimizer_config_matches_real_chaos_ssm_core():
     }
 
 
-def test_scopt_realistic_core_hooks_fire_on_real_projections():
+def test_scopt_realistic_core_hooks_fire_on_real_projections(monkeypatch):
     """Every mapped submodule's pre+post hooks must actually capture
     tensors during the real ChaosSSMCore forward pass."""
+    monkeypatch.setenv("CHAOSCONTROL_DIAG_SCAN_BACKEND", "chunked")
+    monkeypatch.setenv("CHAOSCONTROL_POST_SCAN_BACKEND", "eager")
+    _reload_backend_modules()
+
     mod = _load_runner_module()
     from chaoscontrol.core import ChaosSSMCore
     from chaoscontrol.optim.scopt import ScarcityAwareOptimizer
@@ -1953,7 +1957,7 @@ def test_train_fast_for_budget_syncs_predictive_aux_projection_in_ddp(monkeypatc
         "allreduce_grads",
         lambda module, world_size: allreduces.append((type(module).__name__, world_size)),
     )
-    monkeypatch.setattr(mod, "should_stop_now", lambda local, *_args: local)
+    monkeypatch.setattr(mod, "should_stop_now", lambda local, *_args, **_kwargs: local)
     monkeypatch.setattr(mod.dist, "barrier", lambda: None)
 
     model = _TinyTokenTrainModel()
@@ -2359,7 +2363,7 @@ def test_train_fast_for_budget_can_use_async_param_allreduce(monkeypatch):
         raise AssertionError("async_param mode must not call bulk allreduce")
 
     monkeypatch.setattr(mod, "broadcast_params", lambda _model: None)
-    monkeypatch.setattr(mod, "should_stop_now", lambda local, *_args: local)
+    monkeypatch.setattr(mod, "should_stop_now", lambda local, *_args, **_kwargs: local)
     monkeypatch.setattr(mod.dist, "barrier", lambda: None)
     monkeypatch.setattr(mod, "allreduce_grads", fail_bulk_allreduce)
     monkeypatch.setattr(mod, "AsyncGradAllReducer", FakeAsyncReducer)

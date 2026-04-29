@@ -65,6 +65,9 @@ def _load_via_run_exp20_eval_pattern(ckpt_path: Path):
     cfg = blob["config"]
     model = ChaosStudentLM(**cfg)
     model.load_state_dict(blob["model"], strict=True)
+    online_eval_state = blob.get("online_eval_state")
+    if isinstance(online_eval_state, dict):
+        model._online_eval_state = online_eval_state
     return model, cfg, blob
 
 
@@ -123,6 +126,40 @@ def test_save_output_ckpt_can_include_episodic_cache_payload(tmp_path):
     assert entry.pressure_at_write == pytest.approx(1.5)
     assert entry.source_write_id == 123
     assert entry.write_bucket == 2
+
+
+def test_save_output_ckpt_can_include_online_eval_state(tmp_path):
+    """Online eval must inherit train-time controller state, not cold-start."""
+    config = _tiny_ssm_config()
+    model = build_model(config, torch.device("cpu"), torch.float32)
+    online_state = {
+        "replay_eviction": {
+            "schema_version": 1,
+            "refresh_proposal_model": {
+                "learned_direction": torch.ones(1, 4),
+                "updates_total": 3,
+            },
+        }
+    }
+    ckpt_path = tmp_path / "ckpt.pt"
+
+    _save_output_ckpt(
+        str(ckpt_path),
+        model,
+        config,
+        online_eval_state=online_state,
+    )
+
+    restored_model, _cfg, blob = _load_via_run_exp20_eval_pattern(ckpt_path)
+    assert set(blob.keys()) == {"model", "config", "online_eval_state"}
+    restored_state = blob["online_eval_state"]
+    assert torch.equal(
+        restored_state["replay_eviction"]["refresh_proposal_model"][
+            "learned_direction"
+        ],
+        torch.ones(1, 4),
+    )
+    assert restored_model._online_eval_state["replay_eviction"]["schema_version"] == 1
 
 
 def test_ssm_arm_round_trips_through_run_exp20_eval_loader(tmp_path):

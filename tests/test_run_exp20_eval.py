@@ -3,9 +3,10 @@ import sys
 import json
 import numpy as np
 from pathlib import Path
+import pytest
 import torch
 
-from scripts.run_exp20_eval import _build_optimizer
+from scripts.run_exp20_eval import _build_model, _build_optimizer
 
 
 def test_build_optimizer_uses_fused_muon_for_eval_ttt():
@@ -14,6 +15,37 @@ def test_build_optimizer_uses_fused_muon_for_eval_ttt():
 
     assert len(optimizers) == 1
     assert getattr(optimizers[0], "_fused") is True
+
+
+def test_eval_loader_rejects_online_replay_eviction_checkpoint(tmp_path):
+    from chaoscontrol.model import ChaosStudentLM
+
+    model = ChaosStudentLM(
+        vocab_size=32,
+        dim=8,
+        num_layers=1,
+        block_type="ssm",
+        a_mode="diag",
+    )
+    ckpt_path = tmp_path / "online.pt"
+    torch.save(
+        {
+            "model": model.state_dict(),
+            "config": {
+                "vocab_size": 32,
+                "dim": 8,
+                "num_layers": 1,
+                "block_type": "ssm",
+                "a_mode": "diag",
+                "replay_eviction_enabled": True,
+            },
+            "online_eval_state": {"replay_eviction": {"schema_version": 1}},
+        },
+        ckpt_path,
+    )
+
+    with pytest.raises(RuntimeError, match="CPU control plane"):
+        _build_model(ckpt_path)
 
 
 def test_driver_runs_tiny_stream(tmp_path):

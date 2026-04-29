@@ -6817,12 +6817,6 @@ def train_fast_for_budget(
     replay_eviction_scoring_mode: str = "proxy",
     replay_eviction_oracle_confirm_top_k: int = 32,
     replay_eviction_oracle_variant_chunk_size: int = 1,
-    replay_eviction_cpu_scorer_backend: str = "off",
-    replay_eviction_cpu_scorer_lanes: int = 8,
-    replay_eviction_cpu_scorer_vocab_tile_size: int = 512,
-    replay_eviction_cpu_scorer_row_chunk_size: int = 8192,
-    replay_eviction_cpu_scorer_parallel_threshold_rows: int = 2048,
-    replay_eviction_cpu_scorer_weight_sync_interval_steps: int = 64,
     replay_eviction_drift_threshold: float = 0.3,
     replay_eviction_repr_drift_threshold: float = 0.2,
     replay_eviction_refresh_lr: float = 0.1,
@@ -6834,6 +6828,14 @@ def train_fast_for_budget(
     replay_eviction_refresh_proposal_weight_sync_interval_steps: int = 64,
     replay_eviction_refresh_candidate_variant_chunk_size: int = 16,
     replay_eviction_refresh_proposal_seed: int = 1729,
+    replay_eviction_controller_state_dim: int = 32,
+    replay_eviction_controller_rank: int = 8,
+    replay_eviction_controller_dt: float = 1.0,
+    replay_eviction_controller_gamma: float = 0.08,
+    replay_eviction_controller_target_log_sv: float = -0.05,
+    replay_eviction_controller_max_state_norm: float = 8.0,
+    replay_eviction_controller_perturbation_scale: float = 0.25,
+    replay_eviction_controller_feedback_lr: float = 0.05,
     replay_eviction_quarantine_threshold: float = -0.01,
     replay_eviction_max_quarantined: int = 8,
     replay_eviction_quarantine_release_streak: int = 2,
@@ -7484,6 +7486,7 @@ def train_fast_for_budget(
     crct_teacher_transport_mode = "disabled"
     crct_teacher_bypass_steps = 0
     replay_eviction_loop: ReplayEvictionLoop | None = None
+    online_eval_state_payload: dict[str, Any] = {}
     if bool(replay_eviction_enabled) and crct_enabled:
         replay_eviction_loop = ReplayEvictionLoop(
             action_mode=str(replay_eviction_mode),
@@ -7499,20 +7502,6 @@ def train_fast_for_budget(
             scoring_mode=str(replay_eviction_scoring_mode),
             oracle_confirm_top_k=int(replay_eviction_oracle_confirm_top_k),
             oracle_variant_chunk_size=int(replay_eviction_oracle_variant_chunk_size),
-            cpu_scorer_backend=str(replay_eviction_cpu_scorer_backend),
-            cpu_scorer_lanes=int(replay_eviction_cpu_scorer_lanes),
-            cpu_scorer_vocab_tile_size=int(
-                replay_eviction_cpu_scorer_vocab_tile_size
-            ),
-            cpu_scorer_row_chunk_size=int(
-                replay_eviction_cpu_scorer_row_chunk_size
-            ),
-            cpu_scorer_parallel_threshold_rows=int(
-                replay_eviction_cpu_scorer_parallel_threshold_rows
-            ),
-            cpu_scorer_weight_sync_interval_steps=int(
-                replay_eviction_cpu_scorer_weight_sync_interval_steps
-            ),
             drift_threshold=float(replay_eviction_drift_threshold),
             repr_drift_threshold=float(replay_eviction_repr_drift_threshold),
             refresh_lr=float(replay_eviction_refresh_lr),
@@ -7532,6 +7521,20 @@ def train_fast_for_budget(
                 replay_eviction_refresh_candidate_variant_chunk_size
             ),
             refresh_proposal_seed=int(replay_eviction_refresh_proposal_seed),
+            controller_state_dim=int(replay_eviction_controller_state_dim),
+            controller_rank=int(replay_eviction_controller_rank),
+            controller_dt=float(replay_eviction_controller_dt),
+            controller_gamma=float(replay_eviction_controller_gamma),
+            controller_target_log_sv=float(
+                replay_eviction_controller_target_log_sv
+            ),
+            controller_max_state_norm=float(
+                replay_eviction_controller_max_state_norm
+            ),
+            controller_perturbation_scale=float(
+                replay_eviction_controller_perturbation_scale
+            ),
+            controller_feedback_lr=float(replay_eviction_controller_feedback_lr),
             quarantine_threshold=float(replay_eviction_quarantine_threshold),
             max_quarantined=int(replay_eviction_max_quarantined),
             quarantine_release_streak=int(replay_eviction_quarantine_release_streak),
@@ -8508,6 +8511,28 @@ def train_fast_for_budget(
                 crct_rank_diagnostics = gathered_crct
         else:
             crct_rank_diagnostics = [crct_local_diagnostics]
+        local_online_state: dict[str, Any] | None = None
+        if replay_eviction_loop is not None and rank_ == world_size_ - 1:
+            local_online_state = {
+                "replay_eviction": replay_eviction_loop.state_dict()
+            }
+        if ddp_active and dist.is_initialized() and all_group is not None:
+            gathered_online: list[dict[str, Any] | None] | None = (
+                [None for _ in range(world_size_)] if rank_ == 0 else None
+            )
+            dist.gather_object(
+                local_online_state,
+                object_gather_list=gathered_online,
+                dst=0,
+                group=all_group,
+            )
+            if rank_ == 0 and gathered_online is not None:
+                online_eval_state_payload = next(
+                    (p for p in gathered_online if p),
+                    {},
+                )
+        elif local_online_state:
+            online_eval_state_payload = local_online_state
 
     elapsed_s = time.perf_counter() - start_time
     loss_cpu = torch.stack(losses).cpu() if losses else torch.empty(0)
@@ -8861,6 +8886,8 @@ def train_fast_for_budget(
         result["topology_snapshot"] = topology_snapshot
     if episodic_cache_payload is not None:
         result["_episodic_cache_payload"] = episodic_cache_payload
+    if online_eval_state_payload:
+        result["_online_eval_state"] = online_eval_state_payload
     return result
 
 
@@ -9053,24 +9080,6 @@ def _warmup(
         replay_eviction_oracle_variant_chunk_size=int(
             config.get("replay_eviction_oracle_variant_chunk_size", 1)
         ),
-        replay_eviction_cpu_scorer_backend=str(
-            config.get("replay_eviction_cpu_scorer_backend", "off")
-        ),
-        replay_eviction_cpu_scorer_lanes=int(
-            config.get("replay_eviction_cpu_scorer_lanes", 8)
-        ),
-        replay_eviction_cpu_scorer_vocab_tile_size=int(
-            config.get("replay_eviction_cpu_scorer_vocab_tile_size", 512)
-        ),
-        replay_eviction_cpu_scorer_row_chunk_size=int(
-            config.get("replay_eviction_cpu_scorer_row_chunk_size", 8192)
-        ),
-        replay_eviction_cpu_scorer_parallel_threshold_rows=int(
-            config.get("replay_eviction_cpu_scorer_parallel_threshold_rows", 2048)
-        ),
-        replay_eviction_cpu_scorer_weight_sync_interval_steps=int(
-            config.get("replay_eviction_cpu_scorer_weight_sync_interval_steps", 64)
-        ),
         replay_eviction_drift_threshold=float(config.get("replay_eviction_drift_threshold", 0.3)),
         replay_eviction_repr_drift_threshold=float(config.get("replay_eviction_repr_drift_threshold", 0.2)),
         replay_eviction_refresh_lr=float(config.get("replay_eviction_refresh_lr", 0.1)),
@@ -9095,6 +9104,30 @@ def _warmup(
         ),
         replay_eviction_refresh_proposal_seed=int(
             config.get("replay_eviction_refresh_proposal_seed", 1729)
+        ),
+        replay_eviction_controller_state_dim=int(
+            config.get("replay_eviction_controller_state_dim", 32)
+        ),
+        replay_eviction_controller_rank=int(
+            config.get("replay_eviction_controller_rank", 8)
+        ),
+        replay_eviction_controller_dt=float(
+            config.get("replay_eviction_controller_dt", 1.0)
+        ),
+        replay_eviction_controller_gamma=float(
+            config.get("replay_eviction_controller_gamma", 0.08)
+        ),
+        replay_eviction_controller_target_log_sv=float(
+            config.get("replay_eviction_controller_target_log_sv", -0.05)
+        ),
+        replay_eviction_controller_max_state_norm=float(
+            config.get("replay_eviction_controller_max_state_norm", 8.0)
+        ),
+        replay_eviction_controller_perturbation_scale=float(
+            config.get("replay_eviction_controller_perturbation_scale", 0.25)
+        ),
+        replay_eviction_controller_feedback_lr=float(
+            config.get("replay_eviction_controller_feedback_lr", 0.05)
         ),
         replay_eviction_quarantine_threshold=float(config.get("replay_eviction_quarantine_threshold", -0.01)),
         replay_eviction_max_quarantined=int(config.get("replay_eviction_max_quarantined", 8)),
@@ -9649,24 +9682,6 @@ def run_condition(
         replay_eviction_oracle_variant_chunk_size=int(
             config.get("replay_eviction_oracle_variant_chunk_size", 1)
         ),
-        replay_eviction_cpu_scorer_backend=str(
-            config.get("replay_eviction_cpu_scorer_backend", "off")
-        ),
-        replay_eviction_cpu_scorer_lanes=int(
-            config.get("replay_eviction_cpu_scorer_lanes", 8)
-        ),
-        replay_eviction_cpu_scorer_vocab_tile_size=int(
-            config.get("replay_eviction_cpu_scorer_vocab_tile_size", 512)
-        ),
-        replay_eviction_cpu_scorer_row_chunk_size=int(
-            config.get("replay_eviction_cpu_scorer_row_chunk_size", 8192)
-        ),
-        replay_eviction_cpu_scorer_parallel_threshold_rows=int(
-            config.get("replay_eviction_cpu_scorer_parallel_threshold_rows", 2048)
-        ),
-        replay_eviction_cpu_scorer_weight_sync_interval_steps=int(
-            config.get("replay_eviction_cpu_scorer_weight_sync_interval_steps", 64)
-        ),
         replay_eviction_drift_threshold=float(config.get("replay_eviction_drift_threshold", 0.3)),
         replay_eviction_repr_drift_threshold=float(config.get("replay_eviction_repr_drift_threshold", 0.2)),
         replay_eviction_refresh_lr=float(config.get("replay_eviction_refresh_lr", 0.1)),
@@ -9692,6 +9707,30 @@ def run_condition(
         replay_eviction_refresh_proposal_seed=int(
             config.get("replay_eviction_refresh_proposal_seed", 1729)
         ),
+        replay_eviction_controller_state_dim=int(
+            config.get("replay_eviction_controller_state_dim", 32)
+        ),
+        replay_eviction_controller_rank=int(
+            config.get("replay_eviction_controller_rank", 8)
+        ),
+        replay_eviction_controller_dt=float(
+            config.get("replay_eviction_controller_dt", 1.0)
+        ),
+        replay_eviction_controller_gamma=float(
+            config.get("replay_eviction_controller_gamma", 0.08)
+        ),
+        replay_eviction_controller_target_log_sv=float(
+            config.get("replay_eviction_controller_target_log_sv", -0.05)
+        ),
+        replay_eviction_controller_max_state_norm=float(
+            config.get("replay_eviction_controller_max_state_norm", 8.0)
+        ),
+        replay_eviction_controller_perturbation_scale=float(
+            config.get("replay_eviction_controller_perturbation_scale", 0.25)
+        ),
+        replay_eviction_controller_feedback_lr=float(
+            config.get("replay_eviction_controller_feedback_lr", 0.05)
+        ),
         replay_eviction_quarantine_threshold=float(config.get("replay_eviction_quarantine_threshold", -0.01)),
         replay_eviction_max_quarantined=int(config.get("replay_eviction_max_quarantined", 8)),
         replay_eviction_quarantine_release_streak=int(config.get("replay_eviction_quarantine_release_streak", 2)),
@@ -9716,6 +9755,9 @@ def run_condition(
         ),
     )
     episodic_cache_payload = train_result.pop("_episodic_cache_payload", None)
+    online_eval_state_payload = train_result.pop("_online_eval_state", None)
+    if isinstance(online_eval_state_payload, dict) and online_eval_state_payload:
+        model._online_eval_state = online_eval_state_payload
 
     if ddp_active:
         dist.barrier()
@@ -9785,6 +9827,7 @@ def run_condition(
                 model,
                 config,
                 episodic_cache=episodic_cache_payload,
+                online_eval_state=online_eval_state_payload,
             )
         print(
             f"[rank 0/{world_size}] done steps={train_result['steps']} "

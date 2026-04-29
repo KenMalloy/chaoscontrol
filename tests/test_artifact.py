@@ -13,6 +13,7 @@ from chaoscontrol.config import ChaosControlConfig
 from chaoscontrol.model import ChaosStudentLM
 from chaoscontrol.memory import MultiSlotOuterModel
 from chaoscontrol.artifact import serialize_artifact, load_artifact
+from chaoscontrol.replay_eviction import ReplayEvictionLoop
 
 
 def _make_tiny_config(**overrides) -> ChaosControlConfig:
@@ -197,6 +198,112 @@ class TestEpisodicSlotsSurviveRoundtrip(unittest.TestCase):
             for orig, loaded in zip(ref_slots, loaded_om._slots):
                 max_diff = (orig - loaded).abs().max().item()
                 self.assertLess(max_diff, 0.5, f"Slot difference {max_diff} too large")
+
+    def test_slot_table_records_survive_roundtrip(self):
+        torch.manual_seed(42)
+        config = _make_tiny_config(
+            outer_model_dim=8,
+            outer_model_type="multislot",
+            outer_max_slots=16,
+        )
+        model = _build_tiny_model(config)
+        om = model.outer_model
+        self.assertIsInstance(om, MultiSlotOuterModel)
+
+        slot_id = om.table.append(
+            torch.randn(1, config.outer_model_dim),
+            bucket_id=3,
+            event_id=17,
+            step=11,
+            survival=0.75,
+        )
+        rec = om.table.record(slot_id)
+        self.assertIsNotNone(rec)
+        rec.utility_ema = 0.125
+        rec.marginal_gain_ema = 0.25
+        rec.sharpness_ema = 0.5
+        rec.score_count = 7
+        rec.last_action = "REFRESH"
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            artifact_path = Path(tmpdir) / "test.artifact"
+            serialize_artifact(model, None, config, artifact_path)
+            loaded_model, _, _ = load_artifact(artifact_path, "cpu")
+
+        loaded_om = loaded_model.outer_model
+        self.assertIsInstance(loaded_om, MultiSlotOuterModel)
+        loaded_rec = loaded_om.table.record(slot_id)
+        self.assertIsNotNone(loaded_rec)
+        self.assertEqual(loaded_rec.bucket_id, 3)
+        self.assertEqual(loaded_rec.event_id, 17)
+        self.assertEqual(loaded_rec.created_step, 11)
+        self.assertEqual(loaded_rec.score_count, 7)
+        self.assertEqual(loaded_rec.last_action, "REFRESH")
+        self.assertAlmostEqual(loaded_rec.utility_ema, 0.125)
+        self.assertAlmostEqual(loaded_rec.marginal_gain_ema, 0.25)
+        self.assertAlmostEqual(loaded_rec.sharpness_ema, 0.5)
+
+    def test_online_replay_eviction_state_survives_artifact_roundtrip(self):
+        torch.manual_seed(42)
+        config = _make_tiny_config(
+            outer_model_dim=8,
+            outer_model_type="multislot",
+            outer_max_slots=16,
+            replay_eviction_enabled=True,
+        )
+        model = _build_tiny_model(config)
+        loop = ReplayEvictionLoop(
+            refresh_candidate_count=4,
+            refresh_proposal_rank=2,
+            controller_state_dim=8,
+            controller_rank=2,
+            arm_runtime_enabled=False,
+        )
+        slot = torch.randn(1, config.outer_model_dim)
+        candidates = loop._refresh_proposal_model.sample_k(
+            outer=model.outer_model,
+            slot=slot,
+            context={"marginal_gain": 0.1, "utility_ema": 0.1, "step": 5},
+        )
+        scores = torch.tensor([0.0, 0.4, 0.1, -0.1])
+        loop._refresh_proposal_model.update(
+            candidates=candidates,
+            scores=scores,
+            accepted_index=1,
+            structural_accepted=True,
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            artifact_path = Path(tmpdir) / "test.artifact"
+            serialize_artifact(
+                model,
+                None,
+                config,
+                artifact_path,
+                replay_eviction_loop=loop,
+            )
+            loaded_model, _, _ = load_artifact(artifact_path, "cpu")
+
+        online_state = loaded_model._online_eval_state
+        self.assertIn("replay_eviction", online_state)
+        restored = ReplayEvictionLoop(
+            refresh_candidate_count=4,
+            refresh_proposal_rank=2,
+            controller_state_dim=8,
+            controller_rank=2,
+            arm_runtime_enabled=False,
+        )
+        restored.load_state_dict(online_state["replay_eviction"])
+        diag = restored.diagnostics()["refresh_proposal_model"]
+        self.assertEqual(diag["updates_total"], 1)
+        self.assertEqual(diag["positive_updates_total"], 1)
+        self.assertGreater(diag["controller"]["feedback_updates"], 0)
+
+        learned = online_state["replay_eviction"]["refresh_proposal_model"][
+            "learned_direction"
+        ]
+        self.assertIsInstance(learned, torch.Tensor)
+        self.assertGreater(float(learned.norm().item()), 0.0)
 
     def test_semantic_tier_survives_roundtrip(self):
         torch.manual_seed(42)

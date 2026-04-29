@@ -117,10 +117,6 @@ amx_bf16_matmul = (
     getattr(_C, "amx_bf16_matmul", _missing_extension)
     if _C is not None else _missing_extension
 )
-amx_bf16_nll = (
-    getattr(_C, "amx_bf16_nll", _missing_extension)
-    if _C is not None else _missing_extension
-)
 amx_pack_b_vnni = (
     getattr(_C, "amx_pack_b_vnni", _missing_extension)
     if _C is not None else _missing_extension
@@ -240,6 +236,10 @@ ArmMaintenanceScheduler = (
     getattr(_C, "ArmMaintenanceScheduler", _missing_extension)
     if _C is not None else _missing_extension
 )
+CpuEvidenceEngine = (
+    getattr(_C, "CpuEvidenceEngine", _missing_extension)
+    if _C is not None else _missing_extension
+)
 
 __all__ = [
     "_C",
@@ -265,7 +265,6 @@ __all__ = [
     "has_amx_bf16",
     "amx_bf16_kernel_available",
     "amx_bf16_matmul",
-    "amx_bf16_nll",
     "amx_pack_b_vnni",
     "avx512_recurrence_kernel_available",
     "avx512_diagonal_recurrence",
@@ -288,4 +287,5 @@ __all__ = [
     "ShmRingArmMaintenanceJob",
     "ShmRingArmMaintenanceResult",
     "ArmMaintenanceScheduler",
+    "CpuEvidenceEngine",
 ]

@@ -31,10 +31,24 @@ from chaoscontrol.eval_stream.metrics import MetricsCollector
 from chaoscontrol.eval_stream.budget import BudgetTracker, EvalDeadline
 from chaoscontrol.evaluation import compute_bpb
 
+_ONLINE_REPLAY_EVAL_ERROR = (
+    "This checkpoint carries CRCT replay-eviction online state, but "
+    "run_exp20_eval.py does not run the CPU control plane + GPU3 memory "
+    "oracle. Use the distributed fast-path eval/runner for this artifact."
+)
+
 
 def _ce(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
     return F.cross_entropy(logits.reshape(-1, logits.size(-1)),
                            targets.reshape(-1), reduction="sum")
+
+
+def _requires_online_replay_eval(blob: dict, cfg: dict) -> bool:
+    online_eval_state = blob.get("online_eval_state")
+    return bool(cfg.get("replay_eviction_enabled", False)) or (
+        isinstance(online_eval_state, dict)
+        and isinstance(online_eval_state.get("replay_eviction"), dict)
+    )
 
 
 def _build_model(ckpt_path: Path) -> tuple[torch.nn.Module, dict, dict]:
@@ -43,11 +57,16 @@ def _build_model(ckpt_path: Path) -> tuple[torch.nn.Module, dict, dict]:
     # {model, config, ...}, not a pure tensor. We trust our own checkpoints.
     blob = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     cfg = blob["config"]
+    if _requires_online_replay_eval(blob, cfg):
+        raise RuntimeError(_ONLINE_REPLAY_EVAL_ERROR)
     model = ChaosStudentLM(**cfg)
     # strict=True: any unexpected / missing key is a checkpoint mismatch we
     # want to surface, not paper over. attach_trainable_h0 runs AFTER this
     # (see run() below) so eval-only params never need a loose load.
     model.load_state_dict(blob["model"], strict=True)
+    online_eval_state = blob.get("online_eval_state")
+    if isinstance(online_eval_state, dict):
+        model._online_eval_state = online_eval_state
     return model, cfg, blob
 
 

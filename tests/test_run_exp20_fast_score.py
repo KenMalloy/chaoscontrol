@@ -352,6 +352,37 @@ def test_batched_boundary_targets_match_direct_chunked_model_score(
         assert score.ce_nats == pytest.approx(direct_ce, rel=0.0, abs=1e-4)
 
 
+def test_fast_score_rejects_online_replay_eviction_checkpoint(tmp_path: Path) -> None:
+    from chaoscontrol.model import ChaosStudentLM
+
+    model = ChaosStudentLM(
+        vocab_size=32,
+        dim=8,
+        num_layers=1,
+        block_type="ssm",
+        a_mode="diag",
+    )
+    ckpt_path = tmp_path / "online.pt"
+    torch.save(
+        {
+            "model": model.state_dict(),
+            "config": {
+                "vocab_size": 32,
+                "dim": 8,
+                "num_layers": 1,
+                "block_type": "ssm",
+                "a_mode": "diag",
+                "replay_eviction_enabled": True,
+            },
+            "online_eval_state": {"replay_eviction": {"schema_version": 1}},
+        },
+        ckpt_path,
+    )
+
+    with pytest.raises(RuntimeError, match="GPU3 memory oracle"):
+        fast_score._build_model_with_blob(ckpt_path)
+
+
 def test_fake_graph_path_matches_eager_and_replays_zero_initial_chunks(
     tiny_fixture: dict[str, Path],
 ) -> None:

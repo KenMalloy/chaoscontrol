@@ -294,6 +294,7 @@ def _save_output_ckpt(
     model: torch.nn.Module,
     config: dict[str, Any],
     episodic_cache: Any | None = None,
+    online_eval_state: dict[str, Any] | None = None,
 ) -> None:
     """Write a downstream-loadable checkpoint to ``output_ckpt``.
 
@@ -329,6 +330,8 @@ def _save_output_ckpt(
                     "passed to _save_output_ckpt"
                 )
             blob["episodic_cache"] = to_dict()
+    if isinstance(online_eval_state, dict) and online_eval_state:
+        blob["online_eval_state"] = online_eval_state
     out_path = Path(output_ckpt)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = out_path.with_suffix(out_path.suffix + ".tmp")

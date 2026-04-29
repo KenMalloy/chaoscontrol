@@ -93,6 +93,19 @@ def _dequantize_slots(entries: list[dict[str, Any]]) -> list[torch.Tensor]:
     return [_dequantize(e) for e in entries]
 
 
+def _cpu_copy_tree(obj: Any) -> Any:
+    """Detach tensors in a nested artifact payload and move them to CPU."""
+    if isinstance(obj, torch.Tensor):
+        return obj.detach().cpu()
+    if isinstance(obj, dict):
+        return {k: _cpu_copy_tree(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_cpu_copy_tree(v) for v in obj]
+    if isinstance(obj, tuple):
+        return tuple(_cpu_copy_tree(v) for v in obj)
+    return obj
+
+
 # ---------------------------------------------------------------------------
 # Serialize
 # ---------------------------------------------------------------------------
@@ -107,6 +120,8 @@ def serialize_artifact(
     regret_table: RegretTable | None = None,
     lzma_preset: int = 6,
     force_quantization: str | None = None,
+    online_eval_state: dict[str, Any] | None = None,
+    replay_eviction_loop: Any | None = None,
 ) -> dict[str, Any]:
     """Quantize, compress, and write a ChaosControl model to a single file.
 
@@ -119,6 +134,7 @@ def serialize_artifact(
     state["model"] = {
         k: v.detach().cpu() if isinstance(v, torch.Tensor) else v
         for k, v in model.state_dict().items()
+        if not str(k).endswith("._extra_state")
     }
     if tokenizer is not None:
         state["tokenizer"] = {
@@ -138,6 +154,15 @@ def serialize_artifact(
         state["episodic_slots"] = [s.detach().cpu() for s in om._slots]
         state["episodic_survival"] = list(om._survival)
         state["episodic_buckets"] = list(om._slot_buckets)
+        state["episodic_slot_event_ids"] = list(om._slot_event_ids)
+        table = getattr(om, "table", None)
+        if table is not None:
+            table_state = table.state_dict()
+            state["episodic_table_state"] = {
+                k: v for k, v in table_state.items() if k != "slots"
+            }
+        else:
+            state["episodic_table_state"] = None
         state["latent_traces"] = [
             {"bucket_id": t["bucket_id"], "centroid_contrib": t["centroid_contrib"].detach().cpu()}
             for t in om._latent_traces
@@ -147,6 +172,8 @@ def serialize_artifact(
         state["episodic_slots"] = []
         state["episodic_survival"] = []
         state["episodic_buckets"] = []
+        state["episodic_slot_event_ids"] = []
+        state["episodic_table_state"] = None
         state["latent_traces"] = []
 
     # Semantic tier bases
@@ -161,6 +188,18 @@ def serialize_artifact(
         state["regret_table"] = regret_table.cumulative_regret.detach().cpu()
     else:
         state["regret_table"] = None
+
+    online_state: dict[str, Any] = {}
+    restored_online = getattr(model, "_online_eval_state", None)
+    if isinstance(restored_online, dict):
+        online_state.update(_cpu_copy_tree(restored_online))
+    if isinstance(online_eval_state, dict):
+        online_state.update(_cpu_copy_tree(online_eval_state))
+    if replay_eviction_loop is not None and hasattr(replay_eviction_loop, "state_dict"):
+        online_state["replay_eviction"] = _cpu_copy_tree(
+            replay_eviction_loop.state_dict()
+        )
+    state["online_eval_state"] = online_state
 
     # 2. Quantize weights ----------------------------------------------------
     def _try_pack(state_dict: dict[str, Any], quantization: str, slots_to_keep: int | None = None) -> tuple[bytes, str, int, int]:
@@ -183,6 +222,13 @@ def serialize_artifact(
                 sd["episodic_slots"] = [sd["episodic_slots"][i] for i in keep_indices]
                 sd["episodic_survival"] = [sd["episodic_survival"][i] for i in keep_indices]
                 sd["episodic_buckets"] = [sd["episodic_buckets"][i] for i in keep_indices]
+                sd["episodic_slot_event_ids"] = [
+                    sd.get("episodic_slot_event_ids", [0] * len(survival))[i]
+                    for i in keep_indices
+                ]
+                # Once physical slots are pruned, the original SlotId mapping
+                # and per-slot action evidence are no longer bijective.
+                sd["episodic_table_state"] = None
             sd["episodic_slots"] = _quantize_slots(sd["episodic_slots"], use_int6=use_int6)
 
         # Quantize latent traces
@@ -255,6 +301,7 @@ def serialize_artifact(
         "quantization": quant,
         "slots_kept": kept,
         "slots_pruned": pruned,
+        "online_eval_state": sorted(state["online_eval_state"].keys()),
     }
 
 
@@ -321,13 +368,21 @@ def load_artifact(
     # 6. Restore episodic memory ---------------------------------------------
     om = getattr(model, "outer_model", None)
     if om is not None and isinstance(om, MultiSlotOuterModel):
+        restored_slots = []
         if state["episodic_slots"]:
-            om._slots = _dequantize_slots(state["episodic_slots"])
-            om._slots = [s.to(device) for s in om._slots]
+            restored_slots = [s.to(device) for s in _dequantize_slots(state["episodic_slots"])]
+        table_meta = state.get("episodic_table_state")
+        if isinstance(table_meta, dict) and restored_slots:
+            table_state = dict(table_meta)
+            table_state["slots"] = restored_slots
+            om.table.load_state_dict(table_state, device=device)
         else:
-            om._slots = []
-        om._survival = list(state.get("episodic_survival", []))
-        om._slot_buckets = list(state.get("episodic_buckets", []))
+            om._slots = restored_slots
+            om._survival = list(state.get("episodic_survival", []))
+            om._slot_buckets = list(state.get("episodic_buckets", []))
+            om._slot_event_ids = list(
+                state.get("episodic_slot_event_ids", [0] * len(restored_slots))
+            )
 
         # Restore latent traces
         raw_traces = state.get("latent_traces", [])
@@ -352,6 +407,8 @@ def load_artifact(
     if state.get("regret_table") is not None:
         rt = state["regret_table"].float()
         model._restored_regret_table = rt.to(device)
+
+    model._online_eval_state = _cpu_copy_tree(state.get("online_eval_state", {}))
 
     return model, tokenizer, config
 
@@ -394,6 +451,12 @@ def eval_artifact(
     # Load artifact
     model, tokenizer, config = load_artifact(path, device)
     bs = batch_size or config.batch_size
+    if bool(getattr(config, "replay_eviction_enabled", False)):
+        raise RuntimeError(
+            "eval_artifact() does not run the CRCT replay-eviction online "
+            "regimen. Use the distributed fast-path eval/runner so the CPU "
+            "control plane and GPU3 oracle are active during scoring."
+        )
 
     val_starts = build_lm_starts(int(val_tokens.numel()), config.seq_len, config.seq_len)
     eval_starts = choose_eval_starts(

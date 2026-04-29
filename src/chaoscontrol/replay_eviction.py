@@ -24,7 +24,7 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 
-from .cache_utility import CpuMemoryScorerLanePool, chunked_nll_from_hidden
+from .cache_utility import chunked_nll_from_hidden
 from .kernels import _cpu_ssm_controller as _ext
 from .slot_table import SlotTable, SlotRecord, SlotId
 from .slot_table import SLOT_WARMING, SLOT_ACTIVE, SLOT_SHARP
@@ -38,6 +38,7 @@ __all__ = [
     "oracle_confirm_refresh_candidates",
     "replay_score_slots",
     "MaintenancePolicy",
+    "FullAControllerState",
     "CpuRefreshProposalModel",
     "ProbeFrame",
     "_evict_slots",
@@ -342,7 +343,6 @@ def oracle_confirm_slots(
     slot_indices: list[int],
     cache_read_cutoff: int | None = None,
     variant_chunk_size: int = 1,
-    cpu_scorer: Any | None = None,
 ) -> OracleConfirmationResult:
     """Confirm candidate slots with real memory-injected SSM dynamics.
 
@@ -397,13 +397,6 @@ def oracle_confirm_slots(
                 cache_read_cutoff=cache_read_cutoff,
                 memory_slot_mask=slot_masks_exp,
             )
-        if cpu_scorer is not None:
-            return chunked_nll_from_hidden(
-                model,
-                hidden.detach().cpu(),
-                y_exp.detach().cpu(),
-                cpu_scorer=cpu_scorer,
-            ).reshape(variants, B, T)
         return chunked_nll_from_hidden(model, hidden, y_exp).reshape(variants, B, T)
 
     base_masks = torch.ones(2, n_slots, device=dev, dtype=torch.bool)
@@ -447,7 +440,6 @@ def oracle_confirm_refresh_candidates(
     candidate_tensors: list[tuple[str, torch.Tensor]],
     cache_read_cutoff: int | None = None,
     variant_chunk_size: int = 16,
-    cpu_scorer: Any | None = None,
 ) -> RefreshCandidateOracleResult:
     """Verify candidate slot tensors under the real force-on read path.
 
@@ -501,13 +493,6 @@ def oracle_confirm_refresh_candidates(
     )
 
     def _score_hidden(hidden: torch.Tensor, targets: torch.Tensor, variants: int) -> torch.Tensor:
-        if cpu_scorer is not None:
-            return chunked_nll_from_hidden(
-                model,
-                hidden.detach().cpu(),
-                targets.detach().cpu(),
-                cpu_scorer=cpu_scorer,
-            ).reshape(variants, B, T)
         return chunked_nll_from_hidden(model, hidden, targets).reshape(variants, B, T)
 
     off_mask = torch.zeros(1, n_slots, device=dev, dtype=torch.bool)
@@ -645,6 +630,243 @@ def _compute_representation_drift(
     return float(1.0 - cos.item())
 
 
+class FullAControllerState:
+    """Small full-A recurrent state for CPU-owned memory maintenance.
+
+    This is the controller's temporal substrate, not the AMX scorer and not the
+    trunk SSM. It tracks maintenance-cycle evidence with coupled, rotational
+    dynamics and emits a slot-space proposal direction. The dynamics are
+    hard-projected to a near-critical stable envelope so a bad proposal stream
+    cannot turn the controller into an unbounded oscillator.
+    """
+
+    input_dim = 16
+
+    def __init__(
+        self,
+        *,
+        state_dim: int = 32,
+        rank: int = 8,
+        dt: float = 1.0,
+        gamma: float = 0.08,
+        max_top_log_sv: float = -0.05,
+        max_state_norm: float = 8.0,
+        perturbation_scale: float = 0.25,
+        feedback_lr: float = 0.05,
+        seed: int = 1729,
+    ) -> None:
+        self.state_dim = max(2, int(state_dim))
+        self.rank = max(1, min(int(rank), self.state_dim))
+        self.dt = max(1.0e-4, float(dt))
+        self.gamma = max(1.0e-4, float(gamma))
+        self.max_top_log_sv = float(max_top_log_sv)
+        self.max_state_norm = max(1.0e-4, float(max_state_norm))
+        self.perturbation_scale = max(0.0, float(perturbation_scale))
+        self.feedback_lr = max(0.0, float(feedback_lr))
+        self._generator = torch.Generator(device="cpu")
+        self._generator.manual_seed(int(seed))
+        self._state = torch.zeros(1, self.state_dim, dtype=torch.float32)
+        self._slot_dim = 0
+        self._readout: torch.Tensor | None = None
+        self.steps = 0
+        self.feedback_updates = 0
+        self.projection_count = 0
+        self.state_clamp_count = 0
+        self.finite_state = True
+        self.top_log_sv = 0.0
+        self.sv_log_var = 0.0
+        self.state_norm_last = 0.0
+        self.state_norm_max = 0.0
+        self._input_proj = self._make_input_projection()
+        self._A_d = self._make_projected_dynamics()
+
+    def _make_input_projection(self) -> torch.Tensor:
+        proj = torch.randn(
+            self.input_dim, self.state_dim, generator=self._generator
+        )
+        return F.normalize(proj, dim=0, eps=1e-8) * 0.25
+
+    def _make_projected_dynamics(self) -> torch.Tensor:
+        S = torch.zeros(self.state_dim, self.state_dim, dtype=torch.float32)
+        n_pairs = self.state_dim // 2
+        if n_pairs:
+            freqs = torch.linspace(0.08, 0.55, n_pairs)
+            for pair_idx, omega in enumerate(freqs.tolist()):
+                a = 2 * pair_idx
+                b = a + 1
+                S[a, b] = -omega
+                S[b, a] = omega
+        U = torch.randn(self.state_dim, self.rank, generator=self._generator)
+        V = torch.randn(self.state_dim, self.rank, generator=self._generator)
+        U = F.normalize(U, dim=0, eps=1e-8)
+        V = F.normalize(V, dim=0, eps=1e-8)
+        low_rank = U @ V.T
+        low_rank_norm = torch.linalg.matrix_norm(low_rank, ord=2).clamp_min(1e-8)
+        low_rank = low_rank * (self.perturbation_scale / low_rank_norm)
+        A_c = S - self.gamma * torch.eye(self.state_dim) + low_rank
+        A_d = torch.matrix_exp(self.dt * A_c)
+        return self._project_discrete_dynamics(A_d)
+
+    def _project_discrete_dynamics(self, A_d: torch.Tensor) -> torch.Tensor:
+        svs = torch.linalg.svdvals(A_d.float()).clamp_min(1e-8)
+        logs = torch.log(svs)
+        top = float(logs.max().item())
+        if top > self.max_top_log_sv:
+            A_d = A_d * float(torch.exp(torch.tensor(self.max_top_log_sv - top)))
+            self.projection_count += 1
+            svs = torch.linalg.svdvals(A_d.float()).clamp_min(1e-8)
+            logs = torch.log(svs)
+        self.top_log_sv = float(logs.max().item())
+        self.sv_log_var = float(logs.var(unbiased=False).item())
+        return A_d.contiguous()
+
+    def _ensure_slot_dim(self, slot_dim: int) -> None:
+        slot_dim = int(slot_dim)
+        if self._readout is not None and self._slot_dim == slot_dim:
+            return
+        self._slot_dim = slot_dim
+        readout = torch.randn(
+            self.state_dim, slot_dim, generator=self._generator, dtype=torch.float32
+        )
+        self._readout = F.normalize(readout, dim=0, eps=1e-8) * 0.05
+
+    def step(self, features: torch.Tensor, *, slot_dim: int) -> torch.Tensor:
+        self._ensure_slot_dim(slot_dim)
+        x = features.detach().to(device="cpu", dtype=torch.float32).reshape(1, -1)
+        if x.shape[-1] != self.input_dim:
+            padded = torch.zeros(1, self.input_dim, dtype=torch.float32)
+            n = min(self.input_dim, x.shape[-1])
+            padded[:, :n] = x[:, :n]
+            x = padded
+        drive = torch.tanh(x @ self._input_proj)
+        self._state = self._state @ self._A_d.T + drive
+        self.finite_state = bool(torch.isfinite(self._state).all().item())
+        if not self.finite_state:
+            self._state.zero_()
+        norm = float(self._state.norm().item())
+        if norm > self.max_state_norm:
+            self._state.mul_(self.max_state_norm / max(norm, 1e-8))
+            self.state_clamp_count += 1
+            norm = self.max_state_norm
+        self.state_norm_last = norm
+        self.state_norm_max = max(self.state_norm_max, norm)
+        self.steps += 1
+        assert self._readout is not None
+        proposal = self._state @ self._readout
+        if not torch.isfinite(proposal).all() or proposal.norm().item() <= 1e-8:
+            return torch.zeros(1, int(slot_dim), dtype=torch.float32)
+        return F.normalize(proposal, dim=-1, eps=1e-8)
+
+    def update_feedback(
+        self,
+        *,
+        identity: torch.Tensor,
+        best: torch.Tensor,
+        improvement: float,
+        structural_accepted: bool,
+    ) -> None:
+        if self._readout is None or self.feedback_lr <= 0.0:
+            return
+        delta = best.detach().to(device="cpu", dtype=torch.float32) - identity.detach().to(
+            device="cpu", dtype=torch.float32
+        )
+        if not torch.isfinite(delta).all() or delta.norm().item() <= 1e-8:
+            return
+        trust = 1.0 if structural_accepted else 0.25
+        gain = float(torch.tanh(torch.tensor(max(0.0, float(improvement)) / 0.01)))
+        if gain <= 0.0:
+            return
+        h = F.normalize(self._state.detach(), dim=-1, eps=1e-8)
+        d = F.normalize(delta.reshape(1, -1), dim=-1, eps=1e-8)
+        self._readout = self._readout + self.feedback_lr * trust * gain * (h.T @ d)
+        col_norm = self._readout.norm(dim=0, keepdim=True).clamp_min(1e-8)
+        self._readout = self._readout * torch.clamp(1.0 / col_norm, max=1.0)
+        self.feedback_updates += 1
+
+    def diagnostics(self) -> dict[str, Any]:
+        return {
+            "recurrence_mode": "full_a",
+            "state_dim": self.state_dim,
+            "rank": self.rank,
+            "dt": self.dt,
+            "gamma": self.gamma,
+            "target_log_sv": self.max_top_log_sv,
+            "top_log_sv": self.top_log_sv,
+            "sv_log_var": self.sv_log_var,
+            "state_norm_last": self.state_norm_last,
+            "state_norm_max": self.state_norm_max,
+            "finite_state": self.finite_state,
+            "projection_count": self.projection_count,
+            "state_clamp_count": self.state_clamp_count,
+            "steps": self.steps,
+            "feedback_updates": self.feedback_updates,
+        }
+
+    def state_dict(self) -> dict[str, Any]:
+        """Persist the learned full-A proposal dynamics.
+
+        This is eval-time state, not trace telemetry.  The state is small
+        enough to keep in fp32 so reload does not perturb the controller.
+        """
+        return {
+            "state_dim": self.state_dim,
+            "rank": self.rank,
+            "dt": self.dt,
+            "gamma": self.gamma,
+            "max_top_log_sv": self.max_top_log_sv,
+            "max_state_norm": self.max_state_norm,
+            "perturbation_scale": self.perturbation_scale,
+            "feedback_lr": self.feedback_lr,
+            "state": self._state.detach().cpu(),
+            "slot_dim": self._slot_dim,
+            "readout": None if self._readout is None else self._readout.detach().cpu(),
+            "input_proj": self._input_proj.detach().cpu(),
+            "A_d": self._A_d.detach().cpu(),
+            "generator_state": self._generator.get_state(),
+            "steps": self.steps,
+            "feedback_updates": self.feedback_updates,
+            "projection_count": self.projection_count,
+            "state_clamp_count": self.state_clamp_count,
+            "finite_state": self.finite_state,
+            "top_log_sv": self.top_log_sv,
+            "sv_log_var": self.sv_log_var,
+            "state_norm_last": self.state_norm_last,
+            "state_norm_max": self.state_norm_max,
+        }
+
+    def load_state_dict(self, state: dict[str, Any]) -> None:
+        self.state_dim = int(state.get("state_dim", self.state_dim))
+        self.rank = int(state.get("rank", self.rank))
+        self.dt = float(state.get("dt", self.dt))
+        self.gamma = float(state.get("gamma", self.gamma))
+        self.max_top_log_sv = float(state.get("max_top_log_sv", self.max_top_log_sv))
+        self.max_state_norm = float(state.get("max_state_norm", self.max_state_norm))
+        self.perturbation_scale = float(
+            state.get("perturbation_scale", self.perturbation_scale)
+        )
+        self.feedback_lr = float(state.get("feedback_lr", self.feedback_lr))
+        self._state = state.get("state", self._state).detach().cpu().float()
+        self._slot_dim = int(state.get("slot_dim", self._slot_dim))
+        readout = state.get("readout")
+        self._readout = None if readout is None else readout.detach().cpu().float()
+        self._input_proj = state.get("input_proj", self._input_proj).detach().cpu().float()
+        self._A_d = state.get("A_d", self._A_d).detach().cpu().float().contiguous()
+        generator_state = state.get("generator_state")
+        if isinstance(generator_state, torch.Tensor):
+            self._generator.set_state(generator_state.cpu())
+        self.steps = int(state.get("steps", self.steps))
+        self.feedback_updates = int(state.get("feedback_updates", self.feedback_updates))
+        self.projection_count = int(state.get("projection_count", self.projection_count))
+        self.state_clamp_count = int(
+            state.get("state_clamp_count", self.state_clamp_count)
+        )
+        self.finite_state = bool(state.get("finite_state", self.finite_state))
+        self.top_log_sv = float(state.get("top_log_sv", self.top_log_sv))
+        self.sv_log_var = float(state.get("sv_log_var", self.sv_log_var))
+        self.state_norm_last = float(state.get("state_norm_last", self.state_norm_last))
+        self.state_norm_max = float(state.get("state_norm_max", self.state_norm_max))
+
+
 class CpuRefreshProposalModel:
     """CPU-side proposal model for refresh candidates.
 
@@ -664,6 +886,15 @@ class CpuRefreshProposalModel:
         momentum: float = 0.9,
         weight_sync_interval_steps: int = 64,
         seed: int = 1729,
+        controller_state_dim: int = 32,
+        controller_rank: int = 8,
+        controller_dt: float = 1.0,
+        controller_gamma: float = 0.08,
+        controller_target_log_sv: float = -0.05,
+        controller_max_state_norm: float = 8.0,
+        controller_perturbation_scale: float = 0.25,
+        controller_feedback_lr: float = 0.05,
+        controller_seed: int | None = None,
     ) -> None:
         self.k = max(2, int(k))
         self.rank = max(1, int(rank))
@@ -690,6 +921,17 @@ class CpuRefreshProposalModel:
         self.last_best_index = 0
         self.last_best_name = "identity"
         self.last_best_improvement = 0.0
+        self._controller = FullAControllerState(
+            state_dim=int(controller_state_dim),
+            rank=int(controller_rank),
+            dt=float(controller_dt),
+            gamma=float(controller_gamma),
+            max_top_log_sv=float(controller_target_log_sv),
+            max_state_norm=float(controller_max_state_norm),
+            perturbation_scale=float(controller_perturbation_scale),
+            feedback_lr=float(controller_feedback_lr),
+            seed=int(self._seed + 97 if controller_seed is None else controller_seed),
+        )
 
     def _ensure_dim(self, dim: int) -> None:
         if self._basis is not None and self._dim == int(dim):
@@ -770,6 +1012,38 @@ class CpuRefreshProposalModel:
             return None
         return F.normalize(delta, dim=-1, eps=1e-8)
 
+    def _controller_features(
+        self,
+        slot_cpu: torch.Tensor,
+        context: dict[str, Any] | None,
+    ) -> torch.Tensor:
+        context = context or {}
+        slot_norm = slot_cpu.norm().item() / max(1.0, float(slot_cpu.numel()) ** 0.5)
+        def f(name: str, default: float = 0.0) -> float:
+            try:
+                return float(context.get(name, default))
+            except Exception:
+                return default
+        features = [
+            f("marginal_gain"),
+            f("utility_ema"),
+            f("sharpness"),
+            f("activation_drift"),
+            f("representation_drift"),
+            f("semantic_drift"),
+            f("contradiction"),
+            f("retrieval_mass"),
+            f("peak_utility"),
+            f("peak_sharpness"),
+            min(8.0, max(0.0, f("frame_age_steps")) / 256.0),
+            min(8.0, max(0.0, f("frame_age_seconds")) / 60.0),
+            min(8.0, max(0.0, f("stream_id")) / 8.0),
+            min(8.0, max(0.0, f("score_count")) / 32.0),
+            self.last_best_improvement,
+            slot_norm,
+        ]
+        return torch.tensor(features, dtype=torch.float32).reshape(1, -1)
+
     def sample_k(
         self,
         *,
@@ -787,6 +1061,13 @@ class CpuRefreshProposalModel:
         candidates: list[tuple[str, torch.Tensor]] = [("identity", slot_cpu)]
         rt = self._roundtrip(outer, slot_cpu)
         directions: list[tuple[str, torch.Tensor]] = []
+        controller_dir = self._controller.step(
+            self._controller_features(slot_cpu, context),
+            slot_dim=slot_cpu.shape[-1],
+        )
+        if controller_dir.norm().item() > 1e-8:
+            directions.append(("controller_full_a", controller_dir))
+            directions.append(("controller_full_a_anti", -controller_dir))
         if rt is not None:
             rt_delta = rt - slot_cpu
             if rt_delta.norm().item() > 1e-8:
@@ -874,6 +1155,12 @@ class CpuRefreshProposalModel:
                 self.momentum * self._learned_direction
                 + (1.0 - self.momentum) * delta
             )
+            self._controller.update_feedback(
+                identity=identity,
+                best=best,
+                improvement=improvement,
+                structural_accepted=structural_accepted,
+            )
             self.positive_updates_total += 1
             if not structural_accepted:
                 self.below_margin_positive_updates_total += 1
@@ -900,7 +1187,93 @@ class CpuRefreshProposalModel:
             "last_best_index": self.last_best_index,
             "last_best_name": self.last_best_name,
             "last_best_improvement": self.last_best_improvement,
+            "controller": self._controller.diagnostics(),
         }
+
+    def state_dict(self) -> dict[str, Any]:
+        """Persist learned CPU proposal state for online eval."""
+        return {
+            "k": self.k,
+            "rank": self.rank,
+            "lr": self.lr,
+            "noise_scale": self.noise_scale,
+            "momentum": self.momentum,
+            "weight_sync_interval_steps": self.weight_sync_interval_steps,
+            "seed": self._seed,
+            "generator_state": self._generator.get_state(),
+            "basis": None if self._basis is None else self._basis.detach().cpu(),
+            "learned_direction": (
+                None
+                if self._learned_direction is None
+                else self._learned_direction.detach().cpu()
+            ),
+            "active_step": self._active_step,
+            "dim": self._dim,
+            "samples_total": self.samples_total,
+            "updates_total": self.updates_total,
+            "positive_updates_total": self.positive_updates_total,
+            "structural_accepts_total": self.structural_accepts_total,
+            "structural_rejects_total": self.structural_rejects_total,
+            "below_margin_positive_updates_total": (
+                self.below_margin_positive_updates_total
+            ),
+            "weight_syncs_total": self.weight_syncs_total,
+            "improvement_sum": self.improvement_sum,
+            "last_best_index": self.last_best_index,
+            "last_best_name": self.last_best_name,
+            "last_best_improvement": self.last_best_improvement,
+            "controller": self._controller.state_dict(),
+        }
+
+    def load_state_dict(self, state: dict[str, Any]) -> None:
+        self.k = int(state.get("k", self.k))
+        self.rank = int(state.get("rank", self.rank))
+        self.lr = float(state.get("lr", self.lr))
+        self.noise_scale = float(state.get("noise_scale", self.noise_scale))
+        self.momentum = float(state.get("momentum", self.momentum))
+        self.weight_sync_interval_steps = int(
+            state.get("weight_sync_interval_steps", self.weight_sync_interval_steps)
+        )
+        self._seed = int(state.get("seed", self._seed))
+        generator_state = state.get("generator_state")
+        if isinstance(generator_state, torch.Tensor):
+            self._generator.set_state(generator_state.cpu())
+        basis = state.get("basis")
+        self._basis = None if basis is None else basis.detach().cpu().float()
+        learned = state.get("learned_direction")
+        self._learned_direction = None if learned is None else learned.detach().cpu().float()
+        self._active_step = int(state.get("active_step", self._active_step))
+        self._dim = int(state.get("dim", self._dim))
+        self._weight_cache.clear()
+        self.samples_total = int(state.get("samples_total", self.samples_total))
+        self.updates_total = int(state.get("updates_total", self.updates_total))
+        self.positive_updates_total = int(
+            state.get("positive_updates_total", self.positive_updates_total)
+        )
+        self.structural_accepts_total = int(
+            state.get("structural_accepts_total", self.structural_accepts_total)
+        )
+        self.structural_rejects_total = int(
+            state.get("structural_rejects_total", self.structural_rejects_total)
+        )
+        self.below_margin_positive_updates_total = int(
+            state.get(
+                "below_margin_positive_updates_total",
+                self.below_margin_positive_updates_total,
+            )
+        )
+        self.weight_syncs_total = int(
+            state.get("weight_syncs_total", self.weight_syncs_total)
+        )
+        self.improvement_sum = float(state.get("improvement_sum", self.improvement_sum))
+        self.last_best_index = int(state.get("last_best_index", self.last_best_index))
+        self.last_best_name = str(state.get("last_best_name", self.last_best_name))
+        self.last_best_improvement = float(
+            state.get("last_best_improvement", self.last_best_improvement)
+        )
+        controller_state = state.get("controller")
+        if isinstance(controller_state, dict):
+            self._controller.load_state_dict(controller_state)
 
 
 class MaintenancePolicy:
@@ -1023,6 +1396,14 @@ class ReplayEvictionLoop:
         refresh_proposal_weight_sync_interval_steps: int = 64,
         refresh_candidate_variant_chunk_size: int = 16,
         refresh_proposal_seed: int = 1729,
+        controller_state_dim: int = 32,
+        controller_rank: int = 8,
+        controller_dt: float = 1.0,
+        controller_gamma: float = 0.08,
+        controller_target_log_sv: float = -0.05,
+        controller_max_state_norm: float = 8.0,
+        controller_perturbation_scale: float = 0.25,
+        controller_feedback_lr: float = 0.05,
         quarantine_threshold: float = -0.01,
         max_quarantined: int = 8,
         quarantine_release_streak: int = 2,
@@ -1035,12 +1416,6 @@ class ReplayEvictionLoop:
         frame_ttl_steps: int = 256,
         slot_work_chunk_size: int = 64,
         action_agreement_count: int = 2,
-        cpu_scorer_backend: str = "off",
-        cpu_scorer_lanes: int = 8,
-        cpu_scorer_vocab_tile_size: int = 512,
-        cpu_scorer_row_chunk_size: int = 8192,
-        cpu_scorer_parallel_threshold_rows: int = 2048,
-        cpu_scorer_weight_sync_interval_steps: int = 64,
         arm_runtime_enabled: bool = False,
         arm_runtime_namespace: str | None = None,
     ) -> None:
@@ -1078,26 +1453,6 @@ class ReplayEvictionLoop:
         self._frame_ttl_steps = max(0, int(frame_ttl_steps))
         self._slot_work_chunk_size = max(1, int(slot_work_chunk_size))
         self._action_agreement_count = max(1, int(action_agreement_count))
-        self._cpu_scorer_backend = str(cpu_scorer_backend)
-        if self._cpu_scorer_backend not in {"off", "auto", "torch_cpu", "amx_bf16"}:
-            raise ValueError(
-                "cpu_scorer_backend must be 'off', 'auto', 'torch_cpu', or "
-                f"'amx_bf16', got {self._cpu_scorer_backend!r}"
-            )
-        self._cpu_scorer_lanes = max(1, int(cpu_scorer_lanes))
-        self._cpu_scorer_vocab_tile_size = max(1, int(cpu_scorer_vocab_tile_size))
-        self._cpu_scorer_row_chunk_size = max(1, int(cpu_scorer_row_chunk_size))
-        self._cpu_scorer_parallel_threshold_rows = max(
-            1, int(cpu_scorer_parallel_threshold_rows)
-        )
-        self._cpu_scorer_weight_sync_interval_steps = max(
-            1, int(cpu_scorer_weight_sync_interval_steps)
-        )
-        self._cpu_scorer: CpuMemoryScorerLanePool | None = None
-        self._cpu_scorer_weight_syncs: int = 0
-        self._cpu_scorer_last_sync_step: int = -1
-        self._cpu_scorer_errors_total: int = 0
-        self._cpu_scorer_last_error: str = ""
         self._refresh_proposal_model = CpuRefreshProposalModel(
             k=self._refresh_candidate_count,
             rank=max(1, int(refresh_proposal_rank)),
@@ -1106,6 +1461,15 @@ class ReplayEvictionLoop:
             momentum=float(refresh_proposal_momentum),
             weight_sync_interval_steps=int(refresh_proposal_weight_sync_interval_steps),
             seed=int(refresh_proposal_seed),
+            controller_state_dim=int(controller_state_dim),
+            controller_rank=int(controller_rank),
+            controller_dt=float(controller_dt),
+            controller_gamma=float(controller_gamma),
+            controller_target_log_sv=float(controller_target_log_sv),
+            controller_max_state_norm=float(controller_max_state_norm),
+            controller_perturbation_scale=float(controller_perturbation_scale),
+            controller_feedback_lr=float(controller_feedback_lr),
+            controller_seed=int(refresh_proposal_seed) + 97,
         )
         self._arm_runtime_enabled_requested = bool(arm_runtime_enabled)
         self._arm_runtime_active = False
@@ -2067,34 +2431,6 @@ class ReplayEvictionLoop:
             through_ring=True,
         )
 
-    def _cpu_scorer_for(self, *, model: Any, step: int) -> CpuMemoryScorerLanePool | None:
-        if self._cpu_scorer_backend == "off":
-            return None
-        try:
-            if self._cpu_scorer is None:
-                self._cpu_scorer = CpuMemoryScorerLanePool.from_model(
-                    model,
-                    lanes=self._cpu_scorer_lanes,
-                    backend=self._cpu_scorer_backend,
-                    vocab_tile_size=self._cpu_scorer_vocab_tile_size,
-                    row_chunk_size=self._cpu_scorer_row_chunk_size,
-                    parallel_threshold_rows=self._cpu_scorer_parallel_threshold_rows,
-                )
-                self._cpu_scorer_weight_syncs += 1
-                self._cpu_scorer_last_sync_step = int(step)
-            elif (
-                int(step) - int(self._cpu_scorer_last_sync_step)
-                >= self._cpu_scorer_weight_sync_interval_steps
-            ):
-                self._cpu_scorer.weights.refresh_from_model(model, version=int(step))
-                self._cpu_scorer_weight_syncs += 1
-                self._cpu_scorer_last_sync_step = int(step)
-            return self._cpu_scorer
-        except Exception as exc:
-            self._cpu_scorer_errors_total += 1
-            self._cpu_scorer_last_error = f"{exc.__class__.__name__}: {exc}"
-            raise
-
     def _confirm_actions_with_oracle(
         self,
         *,
@@ -2182,7 +2518,6 @@ class ReplayEvictionLoop:
             slot_indices=[phys for _sid, phys, _action, _proxy in candidate_pairs],
             cache_read_cutoff=self._probe_cache_cutoff,
             variant_chunk_size=self._oracle_variant_chunk_size,
-            cpu_scorer=self._cpu_scorer_for(model=model, step=self._probe_step),
         )
         self._last_oracle_seconds = time.monotonic() - oracle_t0
         self._oracle_seconds_total += self._last_oracle_seconds
@@ -2524,7 +2859,6 @@ class ReplayEvictionLoop:
             slot_indices=slot_work,
             cache_read_cutoff=frame.cache_read_cutoff,
             variant_chunk_size=self._oracle_variant_chunk_size,
-            cpu_scorer=self._cpu_scorer_for(model=model, step=frame.step),
         )
         elapsed = time.monotonic() - oracle_t0
         self._last_oracle_scoring_seconds = elapsed
@@ -2565,7 +2899,12 @@ class ReplayEvictionLoop:
         if slot is None:
             return False
 
-        candidates = self._propose_refresh_candidates_cpu(outer=outer, slot=slot)
+        rec = table.record(slot_id)
+        candidates = self._propose_refresh_candidates_cpu(
+            outer=outer,
+            slot=slot,
+            rec=rec,
+        )
         if len(candidates) <= 1:
             return False
 
@@ -2589,7 +2928,6 @@ class ReplayEvictionLoop:
             candidate_tensors=candidates,
             cache_read_cutoff=self._probe_cache_cutoff,
             variant_chunk_size=self._refresh_candidate_variant_chunk_size,
-            cpu_scorer=self._cpu_scorer_for(model=model, step=self._probe_step),
         )
         elapsed = time.monotonic() - oracle_t0
         self._last_oracle_seconds = elapsed
@@ -2644,20 +2982,38 @@ class ReplayEvictionLoop:
         *,
         outer: Any,
         slot: torch.Tensor,
+        rec: SlotRecord | None = None,
     ) -> list[tuple[str, torch.Tensor]]:
         """Generate learned refresh candidates on CPU; GPU3 verifies physics."""
         proposal_t0 = time.monotonic()
         self._last_refresh_candidate_device = "cpu"
         with torch.inference_mode():
+            context = {
+                "stream_id": self._probe_stream_id,
+                "frame_id": self._active_frame_id,
+                "step": self._probe_step,
+                "frame_age_steps": self._last_frame_age_steps,
+                "frame_age_seconds": self._last_frame_age_seconds,
+                "probe_cue": self._probe_cue,
+            }
+            if rec is not None:
+                context.update({
+                    "marginal_gain": rec.marginal_gain_ema,
+                    "utility_ema": rec.utility_ema,
+                    "sharpness": rec.sharpness_ema,
+                    "activation_drift": rec.activation_drift_ema,
+                    "representation_drift": rec.representation_drift_ema,
+                    "semantic_drift": rec.semantic_drift_ema,
+                    "contradiction": rec.contradiction_ema,
+                    "retrieval_mass": rec.retrieval_mass_ema,
+                    "peak_utility": rec.peak_utility,
+                    "peak_sharpness": rec.peak_sharpness,
+                    "score_count": rec.score_count,
+                })
             candidates = self._refresh_proposal_model.sample_k(
                 outer=outer,
                 slot=slot,
-                context={
-                    "stream_id": self._probe_stream_id,
-                    "frame_id": self._active_frame_id,
-                    "step": self._probe_step,
-                    "probe_cue": self._probe_cue,
-                },
+                context=context,
             )
         self._last_refresh_candidate_count = len(candidates)
         self._refresh_candidate_proposals_total += max(0, len(candidates) - 1)
@@ -3129,6 +3485,255 @@ class ReplayEvictionLoop:
         except Exception:
             pass
 
+    def state_dict(self) -> dict[str, Any]:
+        """Persist learned online-maintenance state.
+
+        Probe frames, shm ring names, trace buffers, and active runtime jobs are
+        intentionally omitted.  They are transport/runtime state.  The learned
+        proposal model, action evidence, quarantines, EMAs, and coverage clocks
+        are kept so eval can continue the same maintenance policy instead of
+        cold-starting it.
+        """
+        return {
+            "schema_version": 1,
+            "action_mode": self._action_mode,
+            "scoring_mode": self._scoring_mode,
+            "memory_streams": self._memory_streams,
+            "threshold": self._threshold,
+            "ema_beta": self._ema_beta,
+            "min_age": self._min_age,
+            "max_seconds": self._max_seconds,
+            "probe_chunk_size": self._probe_chunk_size,
+            "oracle_confirm_top_k": self._oracle_confirm_top_k,
+            "oracle_variant_chunk_size": self._oracle_variant_chunk_size,
+            "drift_threshold": self._drift_threshold,
+            "repr_drift_threshold": self._repr_drift_threshold,
+            "refresh_lr": self._refresh_lr,
+            "refresh_margin": self._refresh_margin,
+            "refresh_candidate_count": self._refresh_candidate_count,
+            "refresh_candidate_variant_chunk_size": (
+                self._refresh_candidate_variant_chunk_size
+            ),
+            "quarantine_threshold": self._quarantine_threshold,
+            "max_quarantined": self._max_quarantined,
+            "quarantine_release_streak": self._quarantine_release_streak,
+            "distill_peak_threshold": self._distill_peak_threshold,
+            "peak_preserve_utility_threshold": (
+                self._peak_preserve_utility_threshold
+            ),
+            "peak_preserve_sharpness_threshold": (
+                self._peak_preserve_sharpness_threshold
+            ),
+            "useful_threshold": self._useful_threshold,
+            "min_score_count": self._min_score_count,
+            "probe_buffer_size": self._probe_buffer_size,
+            "frame_ttl_steps": self._frame_ttl_steps,
+            "slot_work_chunk_size": self._slot_work_chunk_size,
+            "action_agreement_count": self._action_agreement_count,
+            "refresh_proposal_model": self._refresh_proposal_model.state_dict(),
+            "legacy_slot_utility_ema": dict(self._slot_utility_ema),
+            "legacy_slot_first_seen_step": dict(self._slot_first_seen_step),
+            "legacy_slot_score_count": dict(self._slot_score_count),
+            "slot_last_scored_step": dict(self._slot_last_scored_step),
+            "quarantined": sorted(self._quarantined),
+            "quarantine_positive_streak": dict(self._quarantine_positive_streak),
+            "action_evidence": {
+                int(k): (str(v[0]), int(v[1]), int(v[2]), int(v[3]))
+                for k, v in self._action_evidence.items()
+            },
+            "tick_count": self._tick_count,
+            "evictions_total": self._evictions_total,
+            "refreshes_total": self._refreshes_total,
+            "refresh_candidate_proposals_total": (
+                self._refresh_candidate_proposals_total
+            ),
+            "refresh_candidate_proposal_seconds_total": (
+                self._refresh_candidate_proposal_seconds_total
+            ),
+            "refresh_candidate_oracle_batches_total": (
+                self._refresh_candidate_oracle_batches_total
+            ),
+            "refresh_candidate_oracle_chunks_total": (
+                self._refresh_candidate_oracle_chunks_total
+            ),
+            "refresh_candidate_oracle_variants_total": (
+                self._refresh_candidate_oracle_variants_total
+            ),
+            "refresh_candidate_oracle_seconds_total": (
+                self._refresh_candidate_oracle_seconds_total
+            ),
+            "refresh_candidate_accepts_total": (
+                self._refresh_candidate_accepts_total
+            ),
+            "refresh_candidate_rejects_total": (
+                self._refresh_candidate_rejects_total
+            ),
+            "distills_total": self._distills_total,
+            "prototype_distills_total": self._prototype_distills_total,
+            "prototype_distill_skips_total": self._prototype_distill_skips_total,
+            "decays_total": self._decays_total,
+            "releases_total": self._releases_total,
+            "replays_total": self._replays_total,
+            "slots_scored_total": self._slots_scored_total,
+            "shadow_actions_total": self._shadow_actions_total,
+            "shadow_action_counts": dict(self._shadow_action_counts),
+            "oracle_confirmations_total": self._oracle_confirmations_total,
+            "oracle_confirmed_actions_total": self._oracle_confirmed_actions_total,
+            "oracle_rejected_actions_total": self._oracle_rejected_actions_total,
+            "proxy_oracle_sign_matches": self._proxy_oracle_sign_matches,
+            "proxy_oracle_pairs_total": self._proxy_oracle_pairs_total,
+            "proxy_oracle_abs_error_sum": self._proxy_oracle_abs_error_sum,
+            "probe_seconds_total": self._probe_seconds_total,
+            "probe_over_budget_total": self._probe_over_budget_total,
+            "probe_frames_ingested": self._probe_frames_ingested,
+            "probe_frames_dropped_overflow": self._probe_frames_dropped_overflow,
+            "probe_frames_dropped_stale": self._probe_frames_dropped_stale,
+            "probe_frames_completed": self._probe_frames_completed,
+            "probe_ticks_skipped_no_frame": self._probe_ticks_skipped_no_frame,
+            "probe_ticks_skipped_no_slot_work": (
+                self._probe_ticks_skipped_no_slot_work
+            ),
+            "slot_work_items_total": self._slot_work_items_total,
+            "action_agreements_total": self._action_agreements_total,
+            "action_agreements_reset_total": self._action_agreements_reset_total,
+            "queue_depth_sum": self._queue_depth_sum,
+            "queue_depth_samples": self._queue_depth_samples,
+            "queue_depth_max": self._queue_depth_max,
+            "frame_age_steps_sum": self._frame_age_steps_sum,
+            "frame_age_steps_max": self._frame_age_steps_max,
+            "frame_age_seconds_sum": self._frame_age_seconds_sum,
+            "frame_age_seconds_max": self._frame_age_seconds_max,
+            "stream_ticks": dict(self._stream_ticks),
+            "stream_work_items": dict(self._stream_work_items),
+            "stream_probe_seconds": dict(self._stream_probe_seconds),
+            "stage_seconds_total": dict(self._stage_seconds_total),
+            "oracle_seconds_total": self._oracle_seconds_total,
+            "oracle_scored_slots_total": self._oracle_scored_slots_total,
+            "oracle_direct_confirmations_total": (
+                self._oracle_direct_confirmations_total
+            ),
+            "oracle_scoring_seconds_total": self._oracle_scoring_seconds_total,
+        }
+
+    def load_state_dict(self, state: dict[str, Any]) -> None:
+        proposal_state = state.get("refresh_proposal_model")
+        if isinstance(proposal_state, dict):
+            self._refresh_proposal_model.load_state_dict(proposal_state)
+        self._slot_utility_ema = {
+            int(k): float(v)
+            for k, v in state.get("legacy_slot_utility_ema", {}).items()
+        }
+        self._slot_first_seen_step = {
+            int(k): int(v)
+            for k, v in state.get("legacy_slot_first_seen_step", {}).items()
+        }
+        self._slot_score_count = {
+            int(k): int(v)
+            for k, v in state.get("legacy_slot_score_count", {}).items()
+        }
+        self._slot_last_scored_step = {
+            int(k): int(v)
+            for k, v in state.get("slot_last_scored_step", {}).items()
+        }
+        self._quarantined = {int(x) for x in state.get("quarantined", [])}
+        self._quarantine_positive_streak = {
+            int(k): int(v)
+            for k, v in state.get("quarantine_positive_streak", {}).items()
+        }
+        self._action_evidence = {
+            int(k): (str(v[0]), int(v[1]), int(v[2]), int(v[3]))
+            for k, v in state.get("action_evidence", {}).items()
+        }
+
+        int_fields = {
+            "_tick_count": "tick_count",
+            "_evictions_total": "evictions_total",
+            "_refreshes_total": "refreshes_total",
+            "_refresh_candidate_proposals_total": "refresh_candidate_proposals_total",
+            "_refresh_candidate_oracle_batches_total": (
+                "refresh_candidate_oracle_batches_total"
+            ),
+            "_refresh_candidate_oracle_chunks_total": (
+                "refresh_candidate_oracle_chunks_total"
+            ),
+            "_refresh_candidate_oracle_variants_total": (
+                "refresh_candidate_oracle_variants_total"
+            ),
+            "_refresh_candidate_accepts_total": "refresh_candidate_accepts_total",
+            "_refresh_candidate_rejects_total": "refresh_candidate_rejects_total",
+            "_distills_total": "distills_total",
+            "_prototype_distills_total": "prototype_distills_total",
+            "_prototype_distill_skips_total": "prototype_distill_skips_total",
+            "_decays_total": "decays_total",
+            "_releases_total": "releases_total",
+            "_replays_total": "replays_total",
+            "_slots_scored_total": "slots_scored_total",
+            "_shadow_actions_total": "shadow_actions_total",
+            "_oracle_confirmations_total": "oracle_confirmations_total",
+            "_oracle_confirmed_actions_total": "oracle_confirmed_actions_total",
+            "_oracle_rejected_actions_total": "oracle_rejected_actions_total",
+            "_proxy_oracle_sign_matches": "proxy_oracle_sign_matches",
+            "_proxy_oracle_pairs_total": "proxy_oracle_pairs_total",
+            "_probe_over_budget_total": "probe_over_budget_total",
+            "_probe_frames_ingested": "probe_frames_ingested",
+            "_probe_frames_dropped_overflow": "probe_frames_dropped_overflow",
+            "_probe_frames_dropped_stale": "probe_frames_dropped_stale",
+            "_probe_frames_completed": "probe_frames_completed",
+            "_probe_ticks_skipped_no_frame": "probe_ticks_skipped_no_frame",
+            "_probe_ticks_skipped_no_slot_work": "probe_ticks_skipped_no_slot_work",
+            "_slot_work_items_total": "slot_work_items_total",
+            "_action_agreements_total": "action_agreements_total",
+            "_action_agreements_reset_total": "action_agreements_reset_total",
+            "_queue_depth_sum": "queue_depth_sum",
+            "_queue_depth_samples": "queue_depth_samples",
+            "_queue_depth_max": "queue_depth_max",
+            "_frame_age_steps_sum": "frame_age_steps_sum",
+            "_frame_age_steps_max": "frame_age_steps_max",
+            "_oracle_scored_slots_total": "oracle_scored_slots_total",
+            "_oracle_direct_confirmations_total": "oracle_direct_confirmations_total",
+        }
+        for attr, key in int_fields.items():
+            if key in state:
+                setattr(self, attr, int(state[key]))
+
+        float_fields = {
+            "_refresh_candidate_proposal_seconds_total": (
+                "refresh_candidate_proposal_seconds_total"
+            ),
+            "_refresh_candidate_oracle_seconds_total": (
+                "refresh_candidate_oracle_seconds_total"
+            ),
+            "_proxy_oracle_abs_error_sum": "proxy_oracle_abs_error_sum",
+            "_probe_seconds_total": "probe_seconds_total",
+            "_frame_age_seconds_sum": "frame_age_seconds_sum",
+            "_frame_age_seconds_max": "frame_age_seconds_max",
+            "_oracle_seconds_total": "oracle_seconds_total",
+            "_oracle_scoring_seconds_total": "oracle_scoring_seconds_total",
+        }
+        for attr, key in float_fields.items():
+            if key in state:
+                setattr(self, attr, float(state[key]))
+
+        self._shadow_action_counts = {
+            str(k): int(v) for k, v in state.get("shadow_action_counts", {}).items()
+        }
+        self._stream_ticks = {
+            int(k): int(v) for k, v in state.get("stream_ticks", {}).items()
+        } or {i: 0 for i in range(self._memory_streams)}
+        self._stream_work_items = {
+            int(k): int(v)
+            for k, v in state.get("stream_work_items", {}).items()
+        } or {i: 0 for i in range(self._memory_streams)}
+        self._stream_probe_seconds = {
+            int(k): float(v)
+            for k, v in state.get("stream_probe_seconds", {}).items()
+        } or {i: 0.0 for i in range(self._memory_streams)}
+        stage_totals = state.get("stage_seconds_total")
+        if isinstance(stage_totals, dict):
+            for key, value in stage_totals.items():
+                self._stage_seconds_total[str(key)] = float(value)
+        self._started_at = time.monotonic()
+
     def diagnostics(self) -> dict[str, Any]:
         self.flush_trace()
         elapsed_wall = max(1e-9, time.monotonic() - self._started_at)
@@ -3186,22 +3791,43 @@ class ReplayEvictionLoop:
                 else "inactive"
             ),
         }
+        starvation_reasons = (
+            "ok",
+            "no_slots",
+            "confidence_gate",
+            "frame_stale",
+            "scheduler_behind",
+            "job_ring_empty",
+            "result_ring_full",
+            "oracle_saturated",
+        )
+        gpu3_starvation_reason = "ok"
+        if self._arm_result_ring_drops > 0:
+            gpu3_starvation_reason = "result_ring_full"
+        elif self._probe_over_budget_total > 0:
+            gpu3_starvation_reason = "oracle_saturated"
+        elif self._probe_frames_dropped_stale > 0:
+            gpu3_starvation_reason = "frame_stale"
+        elif self._probe_ticks_skipped_no_slot_work > 0 and self._replays_total == 0:
+            gpu3_starvation_reason = "no_slots"
+        elif self._arm_runtime_enabled_requested and not self._arm_runtime_active:
+            gpu3_starvation_reason = "scheduler_behind"
+        elif self._arm_runtime_active and self._arm_jobs_pushed == self._arm_jobs_popped:
+            gpu3_starvation_reason = "job_ring_empty"
+        gpu3_idle_seconds_by_reason = {reason: 0.0 for reason in starvation_reasons}
+        gpu3_idle_seconds_by_reason[gpu3_starvation_reason] = (
+            max(0.0, elapsed_wall - self._oracle_seconds_total)
+            if gpu3_starvation_reason != "ok"
+            else 0.0
+        )
         return {
             "enabled": True,
             "action_mode": self._action_mode,
             "scoring_mode": self._scoring_mode,
-            "cpu_scorer_backend_requested": self._cpu_scorer_backend,
-            "cpu_scorer_enabled": self._cpu_scorer_backend != "off",
-            "cpu_scorer_lanes": self._cpu_scorer_lanes,
-            "cpu_scorer_weight_syncs": self._cpu_scorer_weight_syncs,
-            "cpu_scorer_last_sync_step": self._cpu_scorer_last_sync_step,
-            "cpu_scorer_errors_total": self._cpu_scorer_errors_total,
-            "cpu_scorer_last_error": self._cpu_scorer_last_error,
-            "cpu_scorer": (
-                self._cpu_scorer.diagnostics()
-                if self._cpu_scorer is not None
-                else None
-            ),
+            "exact_oracle_backend": "gpu3_torch",
+            "cpu_exact_scorer_enabled": False,
+            "gpu3_starvation_reason": gpu3_starvation_reason,
+            "gpu3_idle_seconds_by_reason": gpu3_idle_seconds_by_reason,
             "memory_streams": self._memory_streams,
             "memory_streams_requested": self._memory_streams,
             "memory_streams_active": self._arm_runtime_active,

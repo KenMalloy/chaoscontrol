@@ -279,13 +279,33 @@ def _fast_score_ce(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
     )
 
 
+_ONLINE_REPLAY_EVAL_ERROR = (
+    "This checkpoint carries CRCT replay-eviction online state, but "
+    "run_exp20_fast_score.py does not run the CPU control plane + GPU3 memory "
+    "oracle. Use the distributed fast-path eval/runner for this artifact."
+)
+
+
+def _requires_online_replay_eval(blob: dict, cfg: dict) -> bool:
+    online_eval_state = blob.get("online_eval_state")
+    return bool(cfg.get("replay_eviction_enabled", False)) or (
+        isinstance(online_eval_state, dict)
+        and isinstance(online_eval_state.get("replay_eviction"), dict)
+    )
+
+
 def _build_model_with_blob(ckpt_path: Path) -> tuple[torch.nn.Module, dict, dict]:
     from chaoscontrol.model import ChaosStudentLM
 
     blob = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     cfg = blob["config"]
+    if _requires_online_replay_eval(blob, cfg):
+        raise RuntimeError(_ONLINE_REPLAY_EVAL_ERROR)
     model = ChaosStudentLM(**cfg)
     model.load_state_dict(blob["model"], strict=True)
+    online_eval_state = blob.get("online_eval_state")
+    if isinstance(online_eval_state, dict):
+        model._online_eval_state = online_eval_state
     return model, cfg, blob
 
 

@@ -185,6 +185,14 @@ class ChaosControlConfig:
     replay_eviction_refresh_proposal_weight_sync_interval_steps: int = 64
     replay_eviction_refresh_candidate_variant_chunk_size: int = 16
     replay_eviction_refresh_proposal_seed: int = 1729
+    replay_eviction_controller_state_dim: int = 32
+    replay_eviction_controller_rank: int = 8
+    replay_eviction_controller_dt: float = 1.0
+    replay_eviction_controller_gamma: float = 0.08
+    replay_eviction_controller_target_log_sv: float = -0.05
+    replay_eviction_controller_max_state_norm: float = 8.0
+    replay_eviction_controller_perturbation_scale: float = 0.25
+    replay_eviction_controller_feedback_lr: float = 0.05
     replay_eviction_quarantine_threshold: float = -0.01
     replay_eviction_max_quarantined: int = 8
     replay_eviction_quarantine_release_streak: int = 2

@@ -16,6 +16,7 @@ from chaoscontrol.replay_eviction import (
     replay_score_slots, _evict_slots,
     _compute_per_slot_sharpness, _compute_representation_drift,
     CounterfactualResult, DistillReceipt, MemoryEvent,
+    FullAControllerState, CpuRefreshProposalModel,
     SLOT_PRESERVE, SLOT_DECAY, SLOT_EVICT, SLOT_REFRESH,
     SLOT_QUARANTINE, SLOT_DISTILL,
 )
@@ -344,6 +345,19 @@ class TestReplayEvictionLoop:
         assert "proxy_oracle_abs_error_mean" in diag
         assert "last_probe_seconds" in diag
         assert "probe_over_budget_total" in diag
+        assert diag["cpu_exact_scorer_enabled"] is False
+        assert diag["exact_oracle_backend"] == "gpu3_torch"
+        assert diag["gpu3_starvation_reason"] in {
+            "ok",
+            "no_slots",
+            "confidence_gate",
+            "frame_stale",
+            "scheduler_behind",
+            "job_ring_empty",
+            "result_ring_full",
+            "oracle_saturated",
+        }
+        assert "gpu3_idle_seconds_by_reason" in diag
 
     def test_oracle_scoring_mode_uses_gpu3_force_on_oracle_without_proxy(self, monkeypatch):
         loop = ReplayEvictionLoop(
@@ -773,38 +787,14 @@ class TestOracleConfirmation:
         assert not hide2_mask[:, 2].any()
         assert hide2_mask[:, [0, 1, 3]].all()
 
-    def test_oracle_can_send_lm_head_scoring_to_cpu_scorer(self):
-        model = _StubModel(n_slots=3, memory_benefit=0.25, use_table=True)
-        input_ids = torch.randint(0, 32, (2, 9))
-        valid_mask = torch.ones(2, 9)
+    def test_oracle_confirmation_apis_have_no_cpu_scorer_escape_hatch(self):
+        import inspect
 
-        class _CountingCpuScorer:
-            def __init__(self) -> None:
-                self.calls = 0
-                self.rows = 0
-
-            def score_hidden(self, hidden_states: torch.Tensor, targets: torch.Tensor):
-                assert hidden_states.device.type == "cpu"
-                assert targets.device.type == "cpu"
-                self.calls += 1
-                self.rows += int(hidden_states.shape[0] * hidden_states.shape[1])
-                return torch.zeros(hidden_states.shape[:2], dtype=torch.float32)
-
-        scorer = _CountingCpuScorer()
-        result = oracle_confirm_slots(
-            model=model,
-            outer=model.outer_model,
-            probe_input_ids=input_ids,
-            probe_valid_mask=valid_mask,
-            slot_indices=[0, 1],
-            variant_chunk_size=1,
-            cpu_scorer=scorer,
+        assert "cpu_scorer" not in inspect.signature(oracle_confirm_slots).parameters
+        assert (
+            "cpu_scorer"
+            not in inspect.signature(oracle_confirm_refresh_candidates).parameters
         )
-
-        assert result.slot_indices == [0, 1]
-        assert scorer.calls == 3  # baseline/off plus one call per hide variant.
-        assert scorer.rows == (2 + 1 + 1) * 2 * 8
-        assert result.oracle_deltas.device.type == "cpu"
 
     def test_refresh_oracle_uses_sparse_slot_override_batch(self):
         model = _StubModel(n_slots=3, memory_benefit=0.25, use_table=True)
@@ -896,6 +886,69 @@ class TestMemorySlotOverride:
 
         assert torch.allclose(override, replaced, atol=1e-6)
         assert torch.allclose(outer.table.get_tensor(1), original)
+
+
+# ---------------------------------------------------------------------------
+# Tests for CPU full-A controller recurrence
+# ---------------------------------------------------------------------------
+
+
+class TestFullAControllerState:
+    def test_full_a_state_is_bounded_and_not_diagonal_decay(self):
+        controller = FullAControllerState(
+            state_dim=8,
+            rank=4,
+            dt=1.0,
+            gamma=0.04,
+            max_top_log_sv=-0.01,
+            max_state_norm=2.0,
+            seed=123,
+        )
+        x = torch.zeros(1, controller.input_dim)
+        x[0, 0] = 1.0
+
+        first = controller.step(x, slot_dim=8)
+        second = controller.step(torch.zeros_like(x), slot_dim=8)
+        diag = controller.diagnostics()
+
+        assert diag["recurrence_mode"] == "full_a"
+        assert diag["finite_state"] is True
+        assert diag["top_log_sv"] <= -0.01 + 1e-5
+        assert diag["state_norm_max"] <= 2.0 + 1e-5
+        # Full-A has coupled orbital dynamics; a zero-input step should rotate
+        # the existing state, not merely apply per-dimension decay.
+        ratios = second.flatten() / first.flatten().clamp_min(1e-6)
+        finite = ratios[torch.isfinite(ratios)]
+        assert finite.numel() > 2
+        assert finite.std().item() > 1e-3
+
+    def test_refresh_proposal_model_emits_full_a_controller_candidates(self):
+        outer = _StubOuterModel(outer_dim=8, n_slots=2)
+        model = CpuRefreshProposalModel(
+            k=8,
+            controller_state_dim=8,
+            controller_rank=4,
+            controller_seed=123,
+        )
+        candidates = model.sample_k(
+            outer=outer,
+            slot=torch.randn(1, 8),
+            context={
+                "step": 10,
+                "frame_age_steps": 2,
+                "marginal_gain": 0.1,
+                "sharpness": 0.2,
+                "activation_drift": 0.3,
+                "semantic_drift": 0.1,
+                "contradiction": 0.0,
+                "retrieval_mass": 0.4,
+            },
+        )
+        names = [name for name, _tensor in candidates]
+        assert any(name.startswith("controller_full_a") for name in names)
+        diag = model.diagnostics()
+        assert diag["controller"]["recurrence_mode"] == "full_a"
+        assert diag["controller"]["steps"] == 1
 
 
 # ---------------------------------------------------------------------------

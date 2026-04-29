@@ -55,11 +55,10 @@ frames), `arm_e=1` (act on first observation).
 
 Replay maintenance uses `replay_eviction_scoring_mode=oracle`: GPU3 is the
 memory/massage worker and scores scheduled slots with the real
-`force_on` / no-sidecar / hide-slot path. The dense LM-head NLL part of that
-oracle is assigned to a 56-lane CPU AMX scorer
-(`replay_eviction_cpu_scorer_backend=amx_bf16`) over one shared CPU weight
-snapshot, so GPU3 stays focused on memory physics while the CPU controller
-plane produces action evidence at line rate. The CPU conductor is the native
+`force_on` / no-sidecar / hide-slot path. CPU is the evidence/control plane:
+it schedules bounded slot work, owns starvation telemetry, and keeps the
+shared-memory job/result rings moving. It does not own exact oracle truth and
+there is no `cpu_scorer` path in the oracle. The CPU conductor is the native
 `ArmMaintenanceScheduler`; each run cell gets its own shared-memory job/result
 ring namespace so scheduled slot work and GPU3 completion evidence remain
 separate under parallel launches.

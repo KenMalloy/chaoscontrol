@@ -1400,6 +1400,153 @@ class ArmMaintenanceScheduler {
   double frame_age_seconds_max_ = 0.0;
 };
 
+constexpr int64_t kEvidenceTProbeMax = 32;
+constexpr uint32_t kEvidenceKTile = 64;
+
+class CpuEvidenceEngine {
+ public:
+  CpuEvidenceEngine(uint32_t lanes, uint32_t d_model)
+      : lanes_(std::max<uint32_t>(1, lanes)),
+        d_model_(std::max<uint32_t>(1, d_model)),
+        lane_tile_advances_(lanes_, 0),
+        lane_tile_drops_(lanes_, 0),
+        lane_work_items_emitted_(lanes_, 0),
+        lane_cue_nll_seconds_(lanes_, 0.0) {}
+
+  void ingest_frame(const at::Tensor& cue_hidden,
+                    const at::Tensor& cue_targets,
+                    uint64_t frame_id,
+                    uint64_t step,
+                    uint32_t stream_id) {
+    TORCH_CHECK(!shutdown_, "CpuEvidenceEngine.ingest_frame called after shutdown");
+    TORCH_CHECK(
+        cue_hidden.device().is_cpu(),
+        "CpuEvidenceEngine.ingest_frame cue_hidden must be a CPU tensor");
+    TORCH_CHECK(
+        cue_targets.device().is_cpu(),
+        "CpuEvidenceEngine.ingest_frame cue_targets must be a CPU tensor");
+    TORCH_CHECK(
+        cue_hidden.scalar_type() == at::kBFloat16,
+        "CpuEvidenceEngine.ingest_frame cue_hidden must be bf16");
+    TORCH_CHECK(
+        cue_targets.scalar_type() == at::kInt,
+        "CpuEvidenceEngine.ingest_frame cue_targets must be int32");
+    TORCH_CHECK(
+        cue_hidden.dim() == 2,
+        "CpuEvidenceEngine.ingest_frame cue_hidden must have shape ",
+        "[T_PROBE_MAX,D]");
+    TORCH_CHECK(
+        cue_hidden.size(0) == kEvidenceTProbeMax &&
+            cue_hidden.size(1) == static_cast<int64_t>(d_model_),
+        "CpuEvidenceEngine.ingest_frame cue_hidden shape mismatch: expected [",
+        kEvidenceTProbeMax, ",", d_model_, "], got [",
+        cue_hidden.size(0), ",", cue_hidden.size(1), "]");
+    TORCH_CHECK(
+        cue_targets.dim() == 1 && cue_targets.size(0) == kEvidenceTProbeMax,
+        "CpuEvidenceEngine.ingest_frame cue_targets shape mismatch: expected [",
+        kEvidenceTProbeMax, "]");
+    TORCH_CHECK(
+        cue_hidden.is_contiguous(),
+        "CpuEvidenceEngine.ingest_frame cue_hidden must be contiguous");
+    TORCH_CHECK(
+        cue_targets.is_contiguous(),
+        "CpuEvidenceEngine.ingest_frame cue_targets must be contiguous");
+    TORCH_CHECK(
+        cue_hidden.is_pinned(),
+        "CpuEvidenceEngine.ingest_frame cue_hidden must be pinned CPU memory");
+    TORCH_CHECK(
+        cue_targets.is_pinned(),
+        "CpuEvidenceEngine.ingest_frame cue_targets must be pinned CPU memory");
+
+    const uint32_t lane = stream_id % lanes_;
+    frames_ingested_ += 1;
+    last_frame_id_ = frame_id;
+    last_step_ = step;
+    last_stream_id_ = stream_id;
+    lane_tile_advances_[lane] += 1;
+    lane_work_items_emitted_[lane] += kEvidenceKTile;
+    starvation_reason_ = "ok";
+    gpu3_idle_seconds_by_reason_["ok"] += 0.0;
+  }
+
+  pybind11::dict slot_state(uint32_t slot_id) const {
+    pybind11::dict d;
+    d["slot_id"] = pybind11::int_(slot_id);
+    d["source"] = pybind11::str("cpu_estimate");
+    d["prefilter_score"] = pybind11::float_(0.0);
+    d["confidence"] = pybind11::float_(0.0);
+    d["last_frame_id"] = pybind11::int_(last_frame_id_);
+    d["last_step"] = pybind11::int_(last_step_);
+    d["stale"] = pybind11::bool_(frames_ingested_ == 0);
+    return d;
+  }
+
+  pybind11::dict diagnostics() const {
+    pybind11::dict d;
+    d["enabled"] = pybind11::bool_(!shutdown_);
+    d["lanes"] = pybind11::int_(lanes_);
+    d["t_probe_max"] = pybind11::int_(kEvidenceTProbeMax);
+    d["k_tile"] = pybind11::int_(kEvidenceKTile);
+    d["d_model"] = pybind11::int_(d_model_);
+    d["frames_ingested"] = pybind11::int_(frames_ingested_);
+    d["last_frame_id"] = pybind11::int_(last_frame_id_);
+    d["last_step"] = pybind11::int_(last_step_);
+    d["last_stream_id"] = pybind11::int_(last_stream_id_);
+    d["gpu3_starvation_reason"] = pybind11::str(starvation_reason_);
+
+    pybind11::dict idle;
+    for (const auto& kv : gpu3_idle_seconds_by_reason_) {
+      idle[pybind11::str(kv.first)] = pybind11::float_(kv.second);
+    }
+    for (const char* reason : {"ok", "no_slots", "confidence_gate",
+                               "frame_stale", "scheduler_behind",
+                               "job_ring_empty", "result_ring_full",
+                               "oracle_saturated"}) {
+      if (!idle.contains(pybind11::str(reason))) {
+        idle[pybind11::str(reason)] = pybind11::float_(0.0);
+      }
+    }
+    d["gpu3_idle_seconds_by_reason"] = idle;
+
+    pybind11::dict advances;
+    pybind11::dict drops;
+    pybind11::dict work;
+    pybind11::dict cue_nll;
+    for (uint32_t i = 0; i < lanes_; ++i) {
+      const auto key = pybind11::str(std::to_string(i));
+      advances[key] = pybind11::int_(lane_tile_advances_[i]);
+      drops[key] = pybind11::int_(lane_tile_drops_[i]);
+      work[key] = pybind11::int_(lane_work_items_emitted_[i]);
+      cue_nll[key] = pybind11::float_(lane_cue_nll_seconds_[i]);
+    }
+    d["lane_tile_advances_total"] = advances;
+    d["lane_tile_drops_total"] = drops;
+    d["lane_work_items_emitted_total"] = work;
+    d["lane_cue_nll_seconds_total"] = cue_nll;
+    return d;
+  }
+
+  void shutdown() {
+    shutdown_ = true;
+    starvation_reason_ = "job_ring_empty";
+  }
+
+ private:
+  uint32_t lanes_;
+  uint32_t d_model_;
+  bool shutdown_ = false;
+  uint64_t frames_ingested_ = 0;
+  uint64_t last_frame_id_ = 0;
+  uint64_t last_step_ = 0;
+  uint32_t last_stream_id_ = 0;
+  std::string starvation_reason_ = "job_ring_empty";
+  std::unordered_map<std::string, double> gpu3_idle_seconds_by_reason_;
+  std::vector<uint64_t> lane_tile_advances_;
+  std::vector<uint64_t> lane_tile_drops_;
+  std::vector<uint64_t> lane_work_items_emitted_;
+  std::vector<double> lane_cue_nll_seconds_;
+};
+
 template <typename T>
 T require_outcome_key(const pybind11::dict& outcome, const char* key) {
   if (!outcome.contains(key)) {
@@ -1547,14 +1694,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         pybind11::arg("a"), pybind11::arg("b"),
         pybind11::call_guard<pybind11::gil_scoped_release>(),
         "Single-tile AMX BF16 matmul: bfloat16 CPU [M,K] x [K,N] -> float32 [M,N]");
-  m.def("amx_bf16_nll", &chaoscontrol::amx::amx_bf16_nll,
-        pybind11::arg("hidden_states"), pybind11::arg("targets"),
-        pybind11::arg("norm_weight"), pybind11::arg("lm_head_vnni"),
-        pybind11::arg("eps") = 1.0e-6,
-        pybind11::arg("row_chunk_size") = 8192,
-        pybind11::arg("lanes") = 1,
-        pybind11::call_guard<pybind11::gil_scoped_release>(),
-        "AMX BF16 CPU scorer: RMSNorm + LM head + streaming CE NLL");
   m.def("amx_pack_b_vnni", &chaoscontrol::amx::pack_b_vnni,
         pybind11::arg("b"),
         "VNNI-rearrange B (K x N bf16) into (K/2 x 2N bf16) for TDPBF16PS. "
@@ -2322,4 +2461,23 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
            "Record one GPU3 worker result into native scheduler telemetry.")
       .def("diagnostics", &ArmMaintenanceScheduler::diagnostics,
            "Return native ARM scheduler counters.");
+
+  pybind11::class_<CpuEvidenceEngine>(m, "CpuEvidenceEngine")
+      .def(pybind11::init<uint32_t, uint32_t>(),
+           pybind11::arg("lanes") = 8,
+           pybind11::arg("d_model") = 384)
+      .def("ingest_frame", &CpuEvidenceEngine::ingest_frame,
+           pybind11::arg("cue_hidden"),
+           pybind11::arg("cue_targets"),
+           pybind11::arg("frame_id"),
+           pybind11::arg("step"),
+           pybind11::arg("stream_id") = 0,
+           "Ingest one fixed-shape CPU evidence cue frame.")
+      .def("slot_state", &CpuEvidenceEngine::slot_state,
+           pybind11::arg("slot_id"),
+           "Return a copy-by-value slot evidence state dict.")
+      .def("diagnostics", &CpuEvidenceEngine::diagnostics,
+           "Return evidence-engine counters and starvation attribution.")
+      .def("shutdown", &CpuEvidenceEngine::shutdown,
+           "Stop the native CPU evidence engine.");
 }
