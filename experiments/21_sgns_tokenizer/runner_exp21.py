@@ -109,12 +109,6 @@ def _ssm_constructor_kwargs(config: dict[str, Any]) -> dict[str, Any]:
         local_attn_dim=int(config.get("local_attn_dim", 64)),
         local_attn_topk=int(config.get("local_attn_topk", 0)),
         local_attn_topk_random=bool(config.get("local_attn_topk_random", False)),
-        enable_controller=bool(config.get("enable_controller", crct_enabled)),
-        controller_hidden_dim=(
-            int(config["controller_hidden_dim"])
-            if config.get("controller_hidden_dim") is not None
-            else int(config.get("crct_controller_hidden_dim", 0)) or None
-        ),
         activation_checkpoint=bool(config.get("activation_checkpoint", False)),
     )
     if crct_enabled and kwargs["outer_model_dim"] <= 0:

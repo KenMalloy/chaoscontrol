@@ -1,27 +1,37 @@
-# Codex Architecture Review Part 2: Controller as Distillation Target
+# CRCT Evidence Substrate And Packet Lane
+
+> **Status note (2026-04-29):** This document describes the CRCT
+> teacher/oracle substrate and the Exp26 trunk packet contract. Earlier
+> drafts included a trunk-local `ControllerMLP`; that path has been removed.
+> Exp26 uses an always-present async episodic residual lane: GPU3 emits
+> `{memory_residual, memory_gate}` packets, train ranks consume them with
+> `memory_mode="packet"`, and `memory_mode="off"` is retained only as a GPU3
+> counterfactual/oracle mode. See `experiments/26_arm/README.md`.
 
 ## Core Conceptual Correction
 
-The controller is NOT unnecessary. It is a distilled utility predictor, but it
-does not put cache reads in the timed train-rank trunk path and it must not
-define the utility label.
+The trunk should build semantic gist and cue locally, but the targeted
+episodic choice happens off the trunk hot path. The utility label is defined by
+GPU3 physics, not by a train-rank gate head.
 
 ### The Clean Split
 
 ```
 rank-3 oracle:
     asks: "If memory were forcibly injected here, would it help this token?"
-    bypasses controller
     computes dense signed utility
+    exports latest-complete residual packets
 
-controller:
-    asks: "Can I cheaply predict that utility before seeing the target?"
-    learns the dense utility/readiness target
+CPU / maintenance controller:
+    maintains evidence and schedules which memory work GPU3 should verify
+    learns commit/maintenance choices from oracle feedback
+    does not run on the trunk hot path
 
 training ranks:
     use oracle utility as:
         1. token loss weights (mild, positive-only initially)
-        2. controller distillation targets
+        2. residual packet gates from the teacher payload
+    consume packet residuals before recurrence
     do not read CRCT memory during trunk encode
 ```
 
@@ -32,32 +42,33 @@ The exact teacher should compare semantic stream with memory disabled vs memory 
 ### encode() API Used By CRCT
 
 ```python
-def encode(self, input_ids, *, memory_mode="off",
-           cache_read_cutoff=None, teacher_gate=None,
-           return_controller_logits=False, return_memory_meta=False):
+def encode(self, input_ids, *, memory_mode="packet",
+           cache_read_cutoff=None,
+           episodic_residual=None, episodic_gate=None,
+           return_memory_meta=False):
     """
     CRCT uses:
-        "off"      -> train-rank trunk encode and oracle no-memory side
-        "force_on" -> rank-3 oracle memory side
+        "packet"   -> train-rank trunk encode with latest-complete residual
+        "off"      -> rank-3 oracle no-memory side
+        "force_on" -> rank-3 oracle memory side and packet source
     cache_read_cutoff:
         optional MVCC event-id cutoff for append-only multislot memory reads
     """
 ```
 
-## Controller Design
+## Packet Design
 
-Continuous gate, not binary:
+The gate is continuous, but it is supplied by the off-path memory plane rather
+than computed by a trunk-local MLP:
 
 ```python
-p_help = torch.sigmoid(controller_logits)
-gate = torch.clamp((p_help - 0.5) * 2.0, 0.0, 1.0)
-x = x + gate[..., None] * mem_delta
+x = x + episodic_gate[..., None] * episodic_residual
 ```
 
-- p_help <= 0.50 → no memory injection
-- p_help = 0.75 → half-strength
-- p_help = 1.00 → full injection
-- Never use negative gate (anti-memory is a different mechanism)
+- missing packet → zero-residual no-op
+- stale-but-safe packet → same fixed tensor lane, no trunk wait
+- latest-complete packet → targeted episodic residual enters before recurrence
+- negative/anti-memory residuals should be named as a separate mechanism
 
 ## Rank-3 Teacher Scoring
 
@@ -78,7 +89,8 @@ def score_memory_teacher(model, input_ids, valid_mask, *, head_chunk_size=128):
     
     return {
         "loss_weights": utility_to_loss_weight(utility, mask),
-        "controller_targets": sigmoid(utility / tau),  # dense calibrated signal
+        "memory_residual": force_on_memory_meta["memory_residual"],
+        "memory_gate": utility_to_packet_gate(utility, mask),
         "utility": utility,
     }
 ```
@@ -90,12 +102,13 @@ by `cache_read_cutoff`, so both oracle encode passes see the same snapshot.
 
 ## Runtime Memory Ownership
 
-Current Exp23/24 CRCT uses rank 3 as the teacher/oracle memory owner. Train
-ranks do **not** read CRCT slots on the trunk forward path; they run the normal
-pre-memory encoder, consume small async teacher tensors
-(`target`/`confidence`/`loss_weight`/`utility`) when available, and distill the
-controller head from that pre-memory hidden stream. If the teacher falls behind,
-the train rank fails open for that step rather than waiting on memory.
+Current Exp26 ARM uses rank 3 as the teacher/oracle memory owner. Train ranks
+do **not** read CRCT slots on the trunk forward path; they run the fixed packet
+encoder, consume async teacher tensors
+(`target`/`confidence`/`loss_weight`/`utility` plus optional
+`memory_residual`/`memory_gate`) when available, and treat a missing packet as a
+zero-residual no-op. If the teacher falls behind, the train rank fails open for
+that step rather than waiting on memory.
 
 The teacher-memory contract is:
 
@@ -110,27 +123,22 @@ rank 3:
     writes accepted candidates after scoring
 ```
 
-There is no train-rank memory snapshot mode in the CRCT matrix. The only data
-flowing back from the teacher path is the small async per-token payload:
-`target`, `confidence`, `loss_weight`, and `utility`. Result JSON records
+There is no train-rank memory snapshot mode in the CRCT matrix. The data
+flowing back from the teacher path is the async per-token/per-batch payload:
+`target`, `confidence`, `loss_weight`, `utility`, `memory_residual`, and
+`memory_gate`. Result JSON records
 `mechanisms.crct.memory_owner="rank3_teacher_only"`,
-`trunk_memory_mode="off"`, zero train-rank slot reads/writes, and rank-3
+`trunk_memory_mode="packet"`, zero train-rank slot reads/writes, and rank-3
 `teacher_memory_slots` so a run that accidentally re-couples trunk and memory
 is visible immediately.
 
-Rank 3 scores opportunistically rather than every train step. The default
-`crct_teacher_score_interval_steps=64` keeps the teacher useful without making
-oracle scoring the cadence of the trunk all-reduce. Transport is sparse and
-two-rank only: rank 0 broadcasts one matched batch to rank 3 on score
-boundaries, and rank 3 broadcasts the small teacher payload back to rank 0 on
-the score boundary plus the next sparse publish slot. Ranks 1 and 2 never enter
-teacher collectives; they stay purely on the train-rank gradient clock. Result
-JSON records `teacher_transport_participant`, `teacher_bypass_steps`,
-`request_interval_skips`, `broadcast_interval_skips`, payload lag, stale drops,
-and score timings so a no-teacher, stale-teacher, or accidentally all-rank run
-is visible from the data. The Exp24 CRCT cell writes 128 memory candidates per
-teacher score; at the default cadence this still fills the 4096-slot teacher
-cache during a 600s run without overfeeding the memory side.
+Rank 3 scores opportunistically on the memory plane. Exp26 gives the teacher an
+every-step opportunity and relies on the latest-only mailbox/backpressure to
+decide what actually gets scored. Ranks 1 and 2 never enter teacher traffic;
+they stay purely on the train-rank gradient clock. Result JSON records payload
+lag, stale drops, packet counts/bytes, score timings, and train-rank slot
+read/write counts so a no-teacher, stale-teacher, no-packet, or accidentally
+all-rank run is visible from the data.
 
 CRCT-only training syncs trunk gradients over the train-rank subgroup. Rank 3
 does not join the gradient all-reduce; it receives a coalesced rank0->rank3
@@ -185,8 +193,7 @@ Scale: utility +0.20 nats → target ≈ 0.88, 0.00 → 0.50, -0.20 → 0.12
 
 ```python
 lm_loss = weighted_chunked_lm_loss(hidden, targets, token_weights=loss_weights)
-ctrl_loss = BCE(controller_logits, controller_targets)
-loss = lm_loss + lambda_controller * ctrl_loss  # lambda = 0.01
+loss = lm_loss
 ```
 
 ## KEY INSIGHT: Don't Downweight Hard Tokens

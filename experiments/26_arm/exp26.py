@@ -71,12 +71,26 @@ def _artifact_size_lock() -> dict[str, Any]:
 
 
 def _fast_slow_lock() -> dict[str, Any]:
-    """Locked Phase-0 fast/slow trunk recipe inherited from exp24."""
+    """Locked trunk recipe: controller-judged slow-weight consolidation."""
     return {
         "fast_slow_enabled": True,
-        "fast_slow_interval": 64,
         "fast_slow_alpha": 0.25,
         "fast_slow_eval_copy": "slow",
+        "episodic_controller_action_space_enabled": True,
+        "episodic_controller_shared_event_ssm_enabled": True,
+        "episodic_controller_ssm_hidden_dim": 16,
+        "episodic_controller_head_readiness": {
+            "consolidation": 0.05,
+            "ema_alpha": 1.0,
+        },
+        "episodic_controller_head_max_delta": {
+            "consolidation": 1.0,
+            "ema_alpha": 0.5,
+        },
+        "episodic_controller_action_learning_rate": 0.01,
+        "episodic_controller_action_trace_path": str(
+            DEFAULT_VALIDATION_TRACE_DIR / "fast_slow_action_space.ndjson"
+        ),
         "dreamworld_enabled": False,
         "dreamworld_cache_interval": 0,
         "dreamworld_interval": 0,
@@ -90,7 +104,6 @@ def _crct_lock() -> dict[str, Any]:
     """Locked CRCT evidence/oracle substrate configuration."""
     return {
         "crct_enabled": True,
-        "crct_lambda_controller": 0.01,
         "crct_lm_weight_alpha_max": 0.15,
         "crct_lm_weight_strength": 0.10,
         "crct_lm_weight_w_max": 1.20,
@@ -116,8 +129,6 @@ def _crct_lock() -> dict[str, Any]:
         "buffer_mode": "append_only",
         "retrieval_mode": "softmax_all",
         "retrieval_k": 16,
-        "enable_controller": True,
-        "controller_hidden_dim": 64,
         "train_sampling_mode": "random",
         "compile_full_path": False,
         "cuda_graph_mode": "none",
@@ -229,6 +240,7 @@ def build_validation_matrix(
             budget_seconds=budget_seconds,
         )
         entry.update(arm)
+        entry.pop("fast_slow_interval", None)
         entries.append(
             _named_entry(
                 base=entry,

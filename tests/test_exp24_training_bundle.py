@@ -1700,7 +1700,7 @@ def test_run_exp24_cli_episodic_controller_v1_dry_run(tmp_path):
     assert '"exp24_mechanism": "episodic_controller_v1"' in stdout
 
 
-def test_crct_v1_matrix_threads_memory_controller_and_random_sampling():
+def test_crct_v1_matrix_threads_packet_memory_and_random_sampling():
     mod = _load_exp24()
     entries = mod.build_crct_v1_matrix(
         speed_config={"batch_size": 1024, "chunk_size": 64},
@@ -1728,7 +1728,9 @@ def test_crct_v1_matrix_threads_memory_controller_and_random_sampling():
     assert treatment["train_sampling_mode"] == "random"
     assert treatment["outer_model_type"] == "multislot"
     assert treatment["buffer_mode"] == "append_only"
-    assert treatment["enable_controller"] is True
+    assert "enable_controller" not in treatment
+    assert "controller_hidden_dim" not in treatment
+    assert "crct_lambda_controller" not in treatment
     assert treatment["crct_lm_weight_w_max"] == 1.20
     assert treatment["crct_memory_write_tokens_per_step"] == 128
     assert treatment["crct_async_teacher_transport"] is True

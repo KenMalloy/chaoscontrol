@@ -139,6 +139,22 @@ def test_shared_event_ssm_is_deterministic_for_same_stream():
     assert out_a == out_b
 
 
+def test_shared_event_ssm_is_full_a_and_tiny_vs_bare_trunk_work():
+    ssm = SharedEventSsm(hidden_dim=16, seed=7)
+
+    diag = ssm.diagnostics()
+    ratio = ssm.work_ratio_vs_bare_ssm(
+        batch=1024,
+        seq=512,
+        dim=384,
+        layers=4,
+    )
+
+    assert diag["recurrence_mode"] == "full_a_event_ssm"
+    assert diag["top_log_sv"] <= ssm.target_log_sv + 1.0e-5
+    assert ratio < 1.0e-5
+
+
 def test_scalar_head_blends_from_fallback_by_readiness():
     trace: list[dict] = []
     action_space = ConstrainedActionSpace(
@@ -159,6 +175,23 @@ def test_scalar_head_blends_from_fallback_by_readiness():
     assert 1.0 < value < 4.0
     assert trace[-1]["head_name"] == "temperature"
     assert trace[-1]["event_type"] == "action_space_scalar"
+
+
+def test_consolidation_scalar_head_is_available_for_fast_slow_judge():
+    action_space = ConstrainedActionSpace(
+        head_readiness={"consolidation": 1.0},
+    )
+
+    gate = action_space.scalar_value(
+        head_name="consolidation",
+        raw_value=0.0,
+        gpu_step=7,
+        fallback=0.0,
+        reward_context={"steps_since_slow_sync": 3.0},
+    )
+
+    assert 0.0 <= gate <= 1.0
+    assert gate == pytest.approx(0.5)
 
 
 def test_shared_event_ssm_head_updates_from_recorded_reward():

@@ -60,6 +60,12 @@ def test_validation_control_has_no_memory_sidecar():
     assert control.get("crct_enabled") is not True
     assert control.get("replay_eviction_enabled") is not True
     assert control["fast_slow_enabled"] is True
+    assert "fast_slow_interval" not in control
+    assert control["episodic_controller_action_space_enabled"] is True
+    assert control["episodic_controller_shared_event_ssm_enabled"] is True
+    assert control["episodic_controller_head_readiness"]["consolidation"] > 0.0
+    assert control["episodic_controller_head_readiness"]["ema_alpha"] > 0.0
+    assert "fast_slow_action_space" in control["episodic_controller_action_trace_path"]
 
 
 def test_validation_active_is_full_arm_not_crct_only_or_shadow():
@@ -75,6 +81,9 @@ def test_validation_active_is_full_arm_not_crct_only_or_shadow():
     assert active["replay_eviction_commit_policy"] == "learned"
     assert active["replay_eviction_scoring_mode"] == "oracle"
     assert active["crct_teacher_score_interval_steps"] == 1
+    assert "enable_controller" not in active
+    assert "crct_lambda_controller" not in active
+    assert "controller_hidden_dim" not in active
     assert "crct_teacher_param_sync_interval_steps" not in active
     assert "replay_eviction_refresh_proposal_weight_sync_interval_steps" not in active
     assert active["replay_eviction_arm_runtime_enabled"] is True

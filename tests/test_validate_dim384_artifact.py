@@ -19,7 +19,7 @@ def _load_script():
     return mod
 
 
-def test_estimate_headroom_reports_controller_params_and_margin():
+def test_estimate_headroom_reports_no_trunk_controller_params_and_margin():
     mod = _load_script()
 
     result = mod.estimate_artifact_headroom(
@@ -32,7 +32,7 @@ def test_estimate_headroom_reports_controller_params_and_margin():
 
     assert result.raw_bf16_bytes > 0
     assert result.baseline_dim256_raw_bf16_bytes > result.raw_bf16_bytes
-    assert result.controller_params > 0
+    assert result.controller_params == 0
     assert result.margin_bytes > 0
     assert result.under_budget is True
 

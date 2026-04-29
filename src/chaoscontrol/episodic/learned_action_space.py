@@ -21,6 +21,9 @@ import math
 import random
 from typing import Any, Mapping, Sequence
 
+import torch
+import torch.nn.functional as F
+
 
 TraceSink = list[dict[str, Any]]
 
@@ -39,6 +42,10 @@ DEFAULT_EVENT_FEATURES: tuple[str, ...] = (
     "finite_reward",
     "cache_fill",
     "wall_pressure",
+    "steps_since_slow_sync",
+    "fast_slow_sync_count",
+    "fast_slow_last_reward",
+    "loss",
 )
 
 DEFAULT_HEADS: tuple[str, ...] = (
@@ -108,11 +115,13 @@ class BoundedScalarSpec:
 
 @dataclass
 class SharedEventSsm:
-    """Tiny diagonal recurrent state shared by the learned action heads.
+    """Tiny full-A Chaos-style recurrent state shared by action heads.
 
-    This is intentionally CPU/Python and deterministic. It is not the final AMX
-    runtime; it is the shape-compatible substrate that lets the runner consume
-    one learned recurrent state for write, eviction, replay, and meta heads.
+    This is the CPU/controller temporal substrate, not the trunk SSM. It keeps
+    a tiny stable full-A state with coupled rotational dynamics, then emits all
+    learned action heads from that one state. The state is intentionally far
+    smaller than the trunk and runs as one tensorized step so the memory plane
+    can produce evidence faster than a bare training SSM encode.
     """
 
     hidden_dim: int = 16
@@ -122,6 +131,11 @@ class SharedEventSsm:
     decay: float = 0.95
     input_scale: float = 0.05
     head_scale: float = 0.05
+    rank: int = 4
+    gamma: float = 0.08
+    perturbation_scale: float = 0.20
+    target_log_sv: float = -0.02
+    max_state_norm: float = 8.0
     hidden: list[float] = field(init=False)
     input_weights: list[list[float]] = field(init=False)
     head_weights: dict[str, list[float]] = field(init=False)
@@ -132,6 +146,10 @@ class SharedEventSsm:
             raise ValueError("SharedEventSsm.hidden_dim must be positive")
         if not 0.0 <= float(self.decay) <= 1.0:
             raise ValueError("SharedEventSsm.decay must be in [0, 1]")
+        self.rank = max(1, min(int(self.rank), int(self.hidden_dim)))
+        self.gamma = max(1.0e-4, float(self.gamma))
+        self.perturbation_scale = max(0.0, float(self.perturbation_scale))
+        self.max_state_norm = max(1.0e-4, float(self.max_state_norm))
         rng = random.Random(int(self.seed))
         self.hidden = [0.0] * int(self.hidden_dim)
         self.feature_names = tuple(str(x) for x in self.feature_names)
@@ -151,29 +169,85 @@ class SharedEventSsm:
             for head in self.head_names
         }
         self.head_bias = {head: 0.0 for head in self.head_names}
+        self._head_index = {head: idx for idx, head in enumerate(self.head_names)}
+        self._hidden_t = torch.zeros(1, int(self.hidden_dim), dtype=torch.float32)
+        self._input_weights_t = torch.tensor(
+            self.input_weights,
+            dtype=torch.float32,
+        ).T.contiguous()
+        self._head_weights_t = torch.tensor(
+            [self.head_weights[head] for head in self.head_names],
+            dtype=torch.float32,
+        ).T.contiguous()
+        self._head_bias_t = torch.zeros(len(self.head_names), dtype=torch.float32)
+        self._top_log_sv = 0.0
+        self._A_t = self._make_projected_dynamics()
+        self._state_clamp_count = 0
+
+    def _make_projected_dynamics(self) -> torch.Tensor:
+        dim = int(self.hidden_dim)
+        gen = torch.Generator(device="cpu")
+        gen.manual_seed(int(self.seed) + 101)
+        S = torch.zeros(dim, dim, dtype=torch.float32)
+        n_pairs = dim // 2
+        if n_pairs:
+            freqs = torch.linspace(0.08, 0.55, n_pairs)
+            for pair_idx, omega in enumerate(freqs.tolist()):
+                a = 2 * pair_idx
+                b = a + 1
+                S[a, b] = -omega
+                S[b, a] = omega
+        U = torch.randn(dim, int(self.rank), generator=gen)
+        V = torch.randn(dim, int(self.rank), generator=gen)
+        U = F.normalize(U, dim=0, eps=1e-8)
+        V = F.normalize(V, dim=0, eps=1e-8)
+        low_rank = U @ V.T
+        low_rank_norm = torch.linalg.matrix_norm(low_rank, ord=2).clamp_min(1e-8)
+        low_rank = low_rank * (self.perturbation_scale / low_rank_norm)
+        A_c = S - self.gamma * torch.eye(dim, dtype=torch.float32) + low_rank
+        A_d = torch.matrix_exp(A_c)
+        svs = torch.linalg.svdvals(A_d).clamp_min(1e-8)
+        logs = torch.log(svs)
+        top = float(logs.max().item())
+        target = float(self.target_log_sv)
+        if top > target:
+            A_d = A_d * float(torch.exp(torch.tensor(target - top)))
+            svs = torch.linalg.svdvals(A_d).clamp_min(1e-8)
+            logs = torch.log(svs)
+        self._top_log_sv = float(logs.max().item())
+        return A_d.contiguous()
 
     def observe(
         self,
         features: Mapping[str, float] | None = None,
     ) -> dict[str, float]:
-        x = self._feature_vector(features or {})
-        keep = float(self.decay)
-        for i in range(int(self.hidden_dim)):
-            drive = 0.0
-            weights = self.input_weights[i]
-            for j, value in enumerate(x):
-                drive += weights[j] * value
-            self.hidden[i] = keep * self.hidden[i] + math.tanh(drive)
+        x = torch.tensor(
+            self._feature_vector(features or {}),
+            dtype=torch.float32,
+        ).reshape(1, -1)
+        with torch.inference_mode():
+            drive = torch.tanh(x @ self._input_weights_t)
+            # ``decay`` remains a public compatibility knob. In full-A mode it
+            # damps the carried state while the projected A matrix supplies
+            # the coupled orbital dynamics.
+            carried = float(self.decay) * (self._hidden_t @ self._A_t.T)
+            self._hidden_t = carried + drive
+            if not torch.isfinite(self._hidden_t).all():
+                self._hidden_t.zero_()
+            norm = float(self._hidden_t.norm().item())
+            if norm > self.max_state_norm:
+                self._hidden_t.mul_(self.max_state_norm / max(norm, 1e-8))
+                self._state_clamp_count += 1
+            self.hidden = [float(x) for x in self._hidden_t.flatten().tolist()]
         return self.head_outputs()
 
     def head_outputs(self) -> dict[str, float]:
-        out: dict[str, float] = {}
-        for head, weights in self.head_weights.items():
-            raw = float(self.head_bias.get(head, 0.0))
-            for h, w in zip(self.hidden, weights, strict=True):
-                raw += h * w
-            out[head] = raw
-        return out
+        with torch.inference_mode():
+            raw = (self._hidden_t @ self._head_weights_t).flatten() + self._head_bias_t
+        return {
+            head: float(raw[idx].item())
+            for idx, head in enumerate(self.head_names)
+        }
 
     def head_output(self, head_name: str) -> float:
         return float(self.head_outputs().get(str(head_name), 0.0))
@@ -210,6 +284,45 @@ class SharedEventSsm:
             weights[i] = max(-limit, min(limit, w)) if limit > 0.0 else w
         b = float(self.head_bias.get(head, 0.0)) + update
         self.head_bias[head] = max(-limit, min(limit, b)) if limit > 0.0 else b
+        idx = self._head_index.get(head)
+        if idx is not None:
+            self._head_weights_t[:, idx] = torch.tensor(weights, dtype=torch.float32)
+            self._head_bias_t[idx] = float(self.head_bias[head])
+
+    def diagnostics(self) -> dict[str, Any]:
+        return {
+            "recurrence_mode": "full_a_event_ssm",
+            "hidden_dim": int(self.hidden_dim),
+            "rank": int(self.rank),
+            "feature_dim": len(self.feature_names),
+            "head_count": len(self.head_names),
+            "top_log_sv": float(self._top_log_sv),
+            "state_norm": float(self._hidden_t.norm().item()),
+            "state_clamp_count": int(self._state_clamp_count),
+            "controller_work_units": int(
+                len(self.feature_names) * int(self.hidden_dim)
+                + int(self.hidden_dim) * int(self.hidden_dim)
+                + int(self.hidden_dim) * len(self.head_names)
+            ),
+        }
+
+    def work_ratio_vs_bare_ssm(
+        self,
+        *,
+        batch: int = 1024,
+        seq: int = 512,
+        dim: int = 384,
+        layers: int = 4,
+    ) -> float:
+        """Deterministic work proxy against the Exp26 bare trunk SSM.
+
+        It intentionally ignores LM-head cost; this compares only recurrent
+        substrate work. Values << 1 mean the controller can produce packets
+        faster than a bare trunk encode.
+        """
+        controller = float(self.diagnostics()["controller_work_units"])
+        bare = float(max(1, int(batch) * int(seq) * int(dim) * int(layers)))
+        return controller / bare
 
     def _feature_vector(self, features: Mapping[str, float]) -> list[float]:
         out: list[float] = []
@@ -285,6 +398,9 @@ class ConstrainedActionSpace:
                 ),
                 "eviction": BoundedScalarSpec(
                     "eviction", 0.0, 1.0, transform="sigmoid"
+                ),
+                "consolidation": BoundedScalarSpec(
+                    "consolidation", 0.0, 1.0, transform="sigmoid"
                 ),
             }
         if self.online_learning_rate < 0.0:

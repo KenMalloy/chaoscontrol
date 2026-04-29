@@ -55,7 +55,6 @@ def build_crct_model(
         a_mode="diag",
         rich_b_mode="none",
         outer_model_dim=0,
-        enable_controller=True,
     )
 
 
@@ -84,9 +83,6 @@ def estimate_artifact_headroom(
     ratio = MEASURED_DIM256_COMPRESSED_BYTES / float(baseline_raw)
     compressed = int(round(raw * ratio))
     total = compressed + int(overhead_bytes)
-    ctrl_params = 0
-    if model.memory_controller is not None:
-        ctrl_params = sum(p.numel() for p in model.memory_controller.parameters())
     return ArtifactHeadroom(
         dim=int(dim),
         vocab_size=int(vocab_size),
@@ -97,7 +93,7 @@ def estimate_artifact_headroom(
         overhead_bytes=int(overhead_bytes),
         estimated_total_bytes=total,
         margin_bytes=ARTIFACT_LIMIT_BYTES - total,
-        controller_params=int(ctrl_params),
+        controller_params=0,
         under_budget=total < ARTIFACT_LIMIT_BYTES,
     )
 

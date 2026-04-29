@@ -9,6 +9,7 @@ fused Muon/grad-clip knobs, amortized stop checks, and compact timing JSON.
 from __future__ import annotations
 
 import argparse
+import copy
 import contextlib
 import hashlib
 import json
@@ -61,9 +62,9 @@ from chaoscontrol.cache_utility import (  # noqa: E402
     CrctGradientConflictMonitor,
     ScarcityAwareMemoryOptimizer as CrctScarcityAwareMemoryOptimizer,
     alpha_ramp as crct_alpha_ramp,
+    chunked_nll_from_hidden,
     rank3_score_batch_causal,
 )
-from chaoscontrol.controller_distillation import controller_loss  # noqa: E402
 from chaoscontrol.replay_eviction import ReplayEvictionLoop  # noqa: E402
 from chaoscontrol.data import (  # noqa: E402
     load_fineweb_tokens,
@@ -141,6 +142,9 @@ from fast_path import (  # noqa: E402
 )
 from training_hooks import (  # noqa: E402
     FastSlowConsolidator,
+    FastSlowDecision,
+    fast_slow_decision_from_dict,
+    fast_slow_decision_to_dict,
     predictive_auxiliary_loss,
     spectral_regularization_loss,
     spectral_summary,
@@ -428,7 +432,6 @@ def _build_optimizer(
             adamw_prefixes = (
                 "embed.",
                 "lm_head.",
-                "memory_controller.",
                 "outer_model.",
             )
             matrix_param_names = {
@@ -958,26 +961,6 @@ def _crct_valid_mask(input_ids: torch.Tensor) -> torch.Tensor:
     return torch.ones_like(input_ids, dtype=torch.bool)
 
 
-def _crct_payload_controller_loss(
-    payload: dict[str, torch.Tensor],
-    controller_logits: torch.Tensor,
-) -> torch.Tensor:
-    target = payload["target"].to(
-        device=controller_logits.device,
-        dtype=controller_logits.dtype,
-    )
-    conf = payload["confidence"].to(
-        device=controller_logits.device,
-        dtype=controller_logits.dtype,
-    )
-    return controller_loss(
-        controller_logits,
-        target,
-        confidence=conf,
-        mask=torch.ones_like(target, dtype=torch.bool),
-    )
-
-
 def _reject_unsupported_fast_step(
     model: torch.nn.Module,
     *,
@@ -1103,13 +1086,189 @@ def _crct_score_payload_inline(
             float(target[mask].mean().detach().item()) if bool(mask.any()) else 0.0
         )
         scarcity_optimizer.dual_step(actual_read_rate=actual_read_rate)
-    return {
+    payload = {
         "step_id": torch.tensor(int(step), device=inputs.device),
         "target": score["controller_target"].detach().clone(),
         "confidence": score["confidence"].detach().clone(),
         "loss_weight": score["loss_weight"].detach().clone(),
         "utility": score["utility"].detach().clone(),
     }
+    if "memory_residual" in score and "memory_gate" in score:
+        payload["memory_residual"] = score["memory_residual"].detach().clone()
+        payload["memory_gate"] = score["memory_gate"].detach().clone()
+    return payload
+
+
+@torch.inference_mode()
+def _score_fast_slow_readiness_inline(
+    *,
+    model: torch.nn.Module,
+    slow_model: torch.nn.Module | None,
+    fast_slow: FastSlowConsolidator | None,
+    input_ids: torch.Tensor,
+    step: int,
+    chunk_size: int,
+) -> dict[str, float | int] | None:
+    """Exact rank-3 fast-vs-slow copy evidence on the current probe frame.
+
+    Positive ``delta_nll`` means the slow EMA copy was better on this frame.
+    This intentionally runs only where the CRCT oracle already runs: off the
+    train-rank hot path, under ``torch.inference_mode()``, and against the
+    latest-complete rank-3 weight mirror.
+    """
+    if fast_slow is None or not fast_slow.enabled or not fast_slow.slow_state:
+        return None
+    if slow_model is None:
+        return None
+    if input_ids.ndim != 2 or input_ids.shape[1] < 2:
+        return None
+    x = input_ids[:, :-1].to(dtype=torch.int32)
+    y = input_ids[:, 1:].to(dtype=torch.long)
+    mask = _crct_valid_mask(input_ids)[:, 1:].to(device=input_ids.device).bool()
+    valid_tokens = int(mask.sum().detach().item())
+    if valid_tokens <= 0:
+        return None
+
+    def _nll_for(scored_model: torch.nn.Module) -> torch.Tensor:
+        try:
+            hidden = scored_model.encode(x, memory_mode="off")
+        except TypeError:
+            hidden = scored_model.encode(x)
+        return chunked_nll_from_hidden(
+            scored_model,
+            hidden,
+            y,
+            chunk_size=int(chunk_size),
+        )
+
+    score_t0 = time.perf_counter()
+    nll_fast = _nll_for(model)
+    nll_slow = _nll_for(slow_model)
+
+    mask_f = mask.to(device=nll_fast.device, dtype=torch.float32)
+    denom = mask_f.sum().clamp_min(1.0)
+    fast_mean = float((nll_fast.float() * mask_f).sum().detach().item() / denom.item())
+    slow_mean = float((nll_slow.float() * mask_f).sum().detach().item() / denom.item())
+    elapsed = time.perf_counter() - score_t0
+    credit_key = (
+        int(fast_slow.last_decision.step)
+        if fast_slow.last_decision is not None
+        else -1
+    )
+    return {
+        "step": int(step),
+        "credit_key": credit_key,
+        "nll_fast": fast_mean,
+        "nll_slow": slow_mean,
+        "delta_nll": fast_mean - slow_mean,
+        "valid_tokens": int(valid_tokens),
+        "score_seconds": float(elapsed),
+        "sync_count": int(fast_slow.sync_count),
+        "last_sync_step": int(fast_slow.last_sync_step),
+    }
+
+
+def _decide_fast_slow_from_oracle_evidence(
+    *,
+    fast_slow: FastSlowConsolidator | None,
+    action_space: ConstrainedActionSpace | None,
+    evidence: dict[str, Any] | None,
+    model: torch.nn.Module,
+    step: int,
+) -> FastSlowDecision | None:
+    """Advance the learned consolidation head on the memory plane.
+
+    This is intentionally called from the teacher/memory rank after exact
+    fast-vs-slow evidence is available. The train ranks do not run the scalar
+    action-space head every optimizer step.
+    """
+    if fast_slow is None or not fast_slow.enabled or action_space is None:
+        return None
+    if not isinstance(evidence, dict):
+        return None
+
+    _apply_fast_slow_oracle_feedback(
+        fast_slow=fast_slow,
+        action_space=action_space,
+        payload={"fast_slow_readiness": evidence},
+        step=int(step),
+    )
+    reward_context = {
+        "rank": -1.0,
+        "world_size": 0.0,
+        "ddp_active": 1.0,
+        "fast_slow_alpha": float(fast_slow.alpha),
+        "oracle_delta_nll": float(evidence.get("delta_nll", 0.0)),
+        "oracle_nll_fast": float(evidence.get("nll_fast", 0.0)),
+        "oracle_nll_slow": float(evidence.get("nll_slow", 0.0)),
+        "oracle_valid_tokens": float(evidence.get("valid_tokens", 0)),
+        "oracle_score_seconds": float(evidence.get("score_seconds", 0.0)),
+        "weight_snapshot_version_lag_steps": float(
+            evidence.get("weight_snapshot_version_lag_steps", 0)
+        ),
+    }
+    decision = fast_slow.decide(
+        step=int(step) + 1,
+        action_space=action_space,
+        reward_context=reward_context,
+    )
+    fast_slow.apply_decision(model, decision)
+    return decision
+
+
+def _apply_fast_slow_oracle_feedback(
+    *,
+    fast_slow: FastSlowConsolidator,
+    action_space: ConstrainedActionSpace | None,
+    payload: dict[str, Any] | None,
+    step: int,
+) -> None:
+    if action_space is None or not isinstance(payload, dict):
+        return
+    evidence = payload.get("fast_slow_readiness")
+    if not isinstance(evidence, dict):
+        return
+    try:
+        reward = float(evidence["delta_nll"])
+        key = int(evidence["credit_key"])
+    except Exception:
+        return
+    if key < 0:
+        return
+    fast_slow.apply_external_reward(
+        action_space=action_space,
+        key=key,
+        reward=reward,
+        step=int(step),
+        reward_context={
+            "source": "gpu3_fast_slow_readiness_oracle",
+            "nll_fast": float(evidence.get("nll_fast", 0.0)),
+            "nll_slow": float(evidence.get("nll_slow", 0.0)),
+            "valid_tokens": float(evidence.get("valid_tokens", 0)),
+            "score_seconds": float(evidence.get("score_seconds", 0.0)),
+            "oracle_step": float(evidence.get("step", key - 1)),
+        },
+    )
+
+
+def _apply_fast_slow_result_payload(
+    *,
+    model: torch.nn.Module,
+    fast_slow: FastSlowConsolidator,
+    payload: dict[str, Any] | None,
+    metrics: dict[str, Any] | None = None,
+) -> FastSlowDecision | None:
+    if not isinstance(payload, dict):
+        return None
+    decision = fast_slow_decision_from_dict(payload.get("fast_slow_decision"))
+    if decision is None:
+        return None
+    fast_slow.apply_decision(model, decision)
+    if metrics is not None:
+        metrics["fast_slow_result_decisions_applied"] = int(
+            metrics.get("fast_slow_result_decisions_applied", 0)
+        ) + 1
+    return decision
 
 
 def _dist_work_done(work: Any) -> bool:
@@ -1192,12 +1351,18 @@ class _CrctAsyncTeacherTransport:
             "request_interval_skips": 0,
             "broadcast_interval_skips": 0,
             "requests_stored": 0,
+            "local_batch_gpu_clones": 0,
             "local_request_evictions": 0,
             "payloads_scored": 0,
             "score_interval_skips": 0,
             "payloads_sent": 0,
             "payloads_received": 0,
             "payloads_used": 0,
+            "memory_packets_sent": 0,
+            "memory_packets_received": 0,
+            "memory_packet_bytes_sent": 0,
+            "memory_packet_bytes_received": 0,
+            "memory_packet_missing_payloads": 0,
             "sentinel_broadcasts": 0,
             "sentinels_received": 0,
             "stale_payloads_dropped": 0,
@@ -1277,11 +1442,20 @@ class _CrctAsyncTeacherTransport:
         memory_write_tokens: int,
         gradient_conflict_monitor: CrctGradientConflictMonitor | None = None,
         replay_eviction_loop: ReplayEvictionLoop | None = None,
+        fast_slow: FastSlowConsolidator | None = None,
+        fast_slow_action_space: ConstrainedActionSpace | None = None,
+        fast_slow_nll_chunk_size: int = 1024,
     ) -> None:
         # The non-mailbox transport does not own a teacher-snapshot apply
-        # path, so it does not refresh the evidence engine LM head here.
+        # path, so it does not refresh the evidence engine LM head or score
+        # fast/slow readiness here.
         # Accept the parameter so the polymorphic call site is uniform.
-        del replay_eviction_loop
+        del (
+            replay_eviction_loop,
+            fast_slow,
+            fast_slow_action_space,
+            fast_slow_nll_chunk_size,
+        )
         completed = self._reap_input_requests()
         if self.rank != self.memory_rank:
             return
@@ -1534,7 +1708,9 @@ class _CrctAsyncTeacherTransport:
         targets: torch.Tensor,
         step: int,
     ) -> None:
-        full_ids = _crct_full_input_ids(inputs, targets).contiguous()
+        full_ids = _crct_full_input_ids(inputs, targets).to(
+            dtype=torch.int32
+        ).contiguous()
         if tuple(full_ids.shape) != self.full_ids_shape:
             raise ValueError(
                 "CRCT async transport saw a dynamic batch shape: "
@@ -1545,6 +1721,7 @@ class _CrctAsyncTeacherTransport:
                 inputs.detach().clone(),
                 targets.detach().clone(),
             )
+            self.metrics["local_batch_gpu_clones"] += 1
             self.local_batch_order.append(int(step))
             self.metrics["requests_stored"] += 1
             while len(self.local_batch_order) > self.max_local_batches:
@@ -1693,9 +1870,14 @@ class _CrctMailboxTeacherTransport:
         self.pending_input_requests: deque[dict[str, Any]] = deque()
         self.local_batches_by_step: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
         self.local_batch_order: deque[int] = deque()
+        self._request_write_thread: threading.Thread | None = None
         self._weight_publish_thread: threading.Thread | None = None
         self._last_applied_weight_step = -1
         self._last_seen_weight_snapshot_stat: tuple[int, int] | None = None
+        self._fast_slow_slow_model: torch.nn.Module | None = None
+        self._weight_snapshot_staging: dict[str, torch.Tensor] = {}
+        self._weight_snapshot_host_staging: dict[str, torch.Tensor] = {}
+        self._request_host_staging: torch.Tensor | None = None
         self.metrics: dict[str, Any] = {
             "mode": "async_rank0_memory_mailbox",
             "transport_group": "rank0_memory_mailbox",
@@ -1715,14 +1897,29 @@ class _CrctMailboxTeacherTransport:
             "request_broadcasts_started": 0,
             "request_broadcasts_completed": 0,
             "request_interval_skips": 0,
+            "request_write_skipped_busy": 0,
+            "request_write_publisher_busy": False,
+            "request_stage_started": 0,
+            "request_stage_seconds_sum": 0.0,
+            "request_stage_seconds_max": 0.0,
+            "request_writer_cpu_copy_seconds_sum": 0.0,
+            "request_writer_cpu_copy_seconds_max": 0.0,
+            "request_host_pinned": False,
+            "request_host_stage_bytes": 0,
             "broadcast_interval_skips": 0,
             "requests_stored": 0,
+            "local_batch_gpu_clones": 0,
             "local_request_evictions": 0,
             "payloads_scored": 0,
             "score_interval_skips": 0,
             "payloads_sent": 0,
             "payloads_received": 0,
             "payloads_used": 0,
+            "memory_packets_sent": 0,
+            "memory_packets_received": 0,
+            "memory_packet_bytes_sent": 0,
+            "memory_packet_bytes_received": 0,
+            "memory_packet_missing_payloads": 0,
             "sentinel_broadcasts": 0,
             "sentinels_received": 0,
             "stale_payloads_dropped": 0,
@@ -1762,6 +1959,24 @@ class _CrctMailboxTeacherTransport:
             "weight_snapshot_copy_started": 0,
             "weight_snapshot_copy_seconds_sum": 0.0,
             "weight_snapshot_copy_seconds_max": 0.0,
+            "weight_snapshot_hotpath_cpu_copies": 0,
+            "weight_snapshot_stage_started": 0,
+            "weight_snapshot_stage_enqueue_seconds_sum": 0.0,
+            "weight_snapshot_stage_enqueue_seconds_max": 0.0,
+            "weight_snapshot_stage_gpu_seconds_sum": 0.0,
+            "weight_snapshot_stage_gpu_seconds_max": 0.0,
+            "weight_snapshot_stage_tensor_count": 0,
+            "weight_snapshot_stage_bytes": 0,
+            "weight_snapshot_stage_wait_seconds_sum": 0.0,
+            "weight_snapshot_stage_wait_seconds_max": 0.0,
+            "weight_snapshot_writer_cpu_copy_seconds_sum": 0.0,
+            "weight_snapshot_writer_cpu_copy_seconds_max": 0.0,
+            "weight_snapshot_host_pinned_buffers": 0,
+            "weight_snapshot_host_pinned_bytes": 0,
+            "weight_snapshot_host_pageable_buffers": 0,
+            "weight_snapshot_host_pageable_bytes": 0,
+            "weight_snapshot_pin_memory_failures": 0,
+            "host_pin_memory_failures": 0,
             "weight_snapshot_publish_started": 0,
             "weight_snapshot_published": 0,
             "weight_snapshot_publish_skipped_busy": 0,
@@ -1779,6 +1994,34 @@ class _CrctMailboxTeacherTransport:
             "weight_snapshot_last_applied_step": -1,
             "weight_snapshot_version_lag_steps": 0,
             "weight_snapshot_publisher_busy": False,
+            "fast_slow_snapshot_decisions_published": 0,
+            "fast_slow_snapshot_decisions_applied": 0,
+            "fast_slow_readiness_scores": 0,
+            "fast_slow_readiness_skips_no_slow_mirror": 0,
+            "fast_slow_readiness_skips_no_valid_tokens": 0,
+            "fast_slow_readiness_errors": 0,
+            "fast_slow_readiness_seconds_sum": 0.0,
+            "fast_slow_readiness_seconds_max": 0.0,
+            "fast_slow_readiness_delta_sum": 0.0,
+            "fast_slow_readiness_delta_abs_sum": 0.0,
+            "fast_slow_readiness_delta_last": 0.0,
+            "fast_slow_readiness_delta_positive": 0,
+            "fast_slow_readiness_delta_negative": 0,
+            "fast_slow_readiness_delta_zero": 0,
+            "fast_slow_readiness_valid_tokens_sum": 0,
+            "fast_slow_readiness_last_step": -1,
+            "fast_slow_readiness_result_payloads": 0,
+            "fast_slow_decisions_issued": 0,
+            "fast_slow_decisions_result_payloads": 0,
+            "fast_slow_result_decisions_applied": 0,
+            "fast_slow_slow_mirror_creations": 0,
+            "fast_slow_slow_mirror_create_seconds_sum": 0.0,
+            "fast_slow_slow_mirror_create_seconds_max": 0.0,
+            "fast_slow_slow_mirror_apply_seconds_sum": 0.0,
+            "fast_slow_slow_mirror_apply_seconds_max": 0.0,
+            "fast_slow_slow_mirror_last_step": -1,
+            "fast_slow_slow_mirror_version_lag_steps": 0,
+            "fast_slow_slow_mirror_last_error": "",
         }
 
     def begin_step(
@@ -1815,12 +2058,16 @@ class _CrctMailboxTeacherTransport:
         memory_write_tokens: int,
         gradient_conflict_monitor: CrctGradientConflictMonitor | None = None,
         replay_eviction_loop: ReplayEvictionLoop | None = None,
+        fast_slow: FastSlowConsolidator | None = None,
+        fast_slow_action_space: ConstrainedActionSpace | None = None,
+        fast_slow_nll_chunk_size: int = 1024,
     ) -> None:
         if self.rank == self.memory_rank:
             self.poll_weight_snapshot(
                 model=model,
                 step=int(step),
                 replay_eviction_loop=replay_eviction_loop,
+                fast_slow=fast_slow,
             )
         if self.rank != self.memory_rank or not self.pending_input_requests:
             return
@@ -1853,6 +2100,74 @@ class _CrctMailboxTeacherTransport:
                 gradient_conflict_monitor=gradient_conflict_monitor,
                 update_model_memory_after=True,
             )
+            slow_model = self._refresh_fast_slow_slow_model(
+                model=model,
+                fast_slow=fast_slow,
+                step=request_step,
+            )
+            fast_slow_evidence = _score_fast_slow_readiness_inline(
+                model=model,
+                slow_model=slow_model,
+                fast_slow=fast_slow,
+                input_ids=request_full_ids,
+                step=request_step,
+                chunk_size=int(fast_slow_nll_chunk_size),
+            )
+            if fast_slow_evidence is not None:
+                fast_slow_evidence["weight_snapshot_version_lag_steps"] = int(
+                    self.metrics.get("weight_snapshot_version_lag_steps", 0)
+                )
+                scored["fast_slow_readiness"] = fast_slow_evidence
+                self.metrics["fast_slow_readiness_scores"] += 1
+                self.metrics["fast_slow_readiness_seconds_sum"] += float(
+                    fast_slow_evidence["score_seconds"]
+                )
+                self.metrics["fast_slow_readiness_seconds_max"] = max(
+                    float(self.metrics["fast_slow_readiness_seconds_max"]),
+                    float(fast_slow_evidence["score_seconds"]),
+                )
+                self.metrics["fast_slow_readiness_delta_sum"] += float(
+                    fast_slow_evidence["delta_nll"]
+                )
+                self.metrics["fast_slow_readiness_delta_abs_sum"] += abs(
+                    float(fast_slow_evidence["delta_nll"])
+                )
+                self.metrics["fast_slow_readiness_delta_last"] = float(
+                    fast_slow_evidence["delta_nll"]
+                )
+                delta = float(fast_slow_evidence["delta_nll"])
+                if delta > 0.0:
+                    self.metrics["fast_slow_readiness_delta_positive"] += 1
+                elif delta < 0.0:
+                    self.metrics["fast_slow_readiness_delta_negative"] += 1
+                else:
+                    self.metrics["fast_slow_readiness_delta_zero"] += 1
+                self.metrics["fast_slow_readiness_valid_tokens_sum"] += int(
+                    fast_slow_evidence["valid_tokens"]
+                )
+                self.metrics["fast_slow_readiness_last_step"] = int(request_step)
+                decision = _decide_fast_slow_from_oracle_evidence(
+                    fast_slow=fast_slow,
+                    action_space=fast_slow_action_space,
+                    evidence=fast_slow_evidence,
+                    model=model,
+                    step=request_step,
+                )
+                if decision is not None:
+                    scored["fast_slow_decision"] = fast_slow_decision_to_dict(
+                        decision
+                    )
+                    self.metrics["fast_slow_decisions_issued"] += 1
+                    self._refresh_fast_slow_slow_model(
+                        model=model,
+                        fast_slow=fast_slow,
+                        step=request_step,
+                    )
+            elif fast_slow is not None and fast_slow.enabled:
+                if slow_model is None:
+                    self.metrics["fast_slow_readiness_skips_no_slow_mirror"] += 1
+                else:
+                    self.metrics["fast_slow_readiness_skips_no_valid_tokens"] += 1
             score_s = time.perf_counter() - t0
             self.metrics["score_seconds_sum"] += float(score_s)
             self.metrics["score_seconds_max"] = max(
@@ -1876,6 +2191,11 @@ class _CrctMailboxTeacherTransport:
             and self._weight_publish_thread.is_alive()
         )
         out["weight_snapshot_publisher_busy"] = bool(busy)
+        request_busy = (
+            self._request_write_thread is not None
+            and self._request_write_thread.is_alive()
+        )
+        out["request_write_publisher_busy"] = bool(request_busy)
         out.update(
             {
                 "pending_result_broadcasts": 0,
@@ -1895,10 +2215,64 @@ class _CrctMailboxTeacherTransport:
         )
         return out
 
+    def _refresh_fast_slow_slow_model(
+        self,
+        *,
+        model: torch.nn.Module,
+        fast_slow: FastSlowConsolidator | None,
+        step: int,
+    ) -> torch.nn.Module | None:
+        """Keep a rank-local slow-model mirror for exact fast-vs-slow scoring."""
+        if fast_slow is None or not fast_slow.enabled or not fast_slow.slow_state:
+            return None
+        if self._fast_slow_slow_model is None:
+            t0 = time.perf_counter()
+            try:
+                self._fast_slow_slow_model = copy.deepcopy(model)
+                self._fast_slow_slow_model.requires_grad_(False)
+            except Exception as exc:
+                self._fast_slow_slow_model = None
+                self.metrics["fast_slow_slow_mirror_last_error"] = "".join(
+                    traceback.format_exception_only(type(exc), exc)
+                ).strip()
+                self.metrics["last_drop_reason"] = "fast_slow_slow_mirror_create_error"
+                return None
+            elapsed = time.perf_counter() - t0
+            self.metrics["fast_slow_slow_mirror_creations"] += 1
+            self.metrics["fast_slow_slow_mirror_create_seconds_sum"] += float(elapsed)
+            self.metrics["fast_slow_slow_mirror_create_seconds_max"] = max(
+                float(self.metrics["fast_slow_slow_mirror_create_seconds_max"]),
+                float(elapsed),
+            )
+
+        t0 = time.perf_counter()
+        try:
+            self._fast_slow_slow_model.train(bool(model.training))
+            fast_slow.copy_slow_to_model(self._fast_slow_slow_model)
+        except Exception as exc:
+            self.metrics["fast_slow_slow_mirror_last_error"] = "".join(
+                traceback.format_exception_only(type(exc), exc)
+            ).strip()
+            self.metrics["last_drop_reason"] = "fast_slow_slow_mirror_apply_error"
+            return None
+        elapsed = time.perf_counter() - t0
+        self.metrics["fast_slow_slow_mirror_apply_seconds_sum"] += float(elapsed)
+        self.metrics["fast_slow_slow_mirror_apply_seconds_max"] = max(
+            float(self.metrics["fast_slow_slow_mirror_apply_seconds_max"]),
+            float(elapsed),
+        )
+        self.metrics["fast_slow_slow_mirror_last_step"] = int(step)
+        self.metrics["fast_slow_slow_mirror_version_lag_steps"] = max(
+            0, int(step) - int(self._last_applied_weight_step)
+        )
+        return self._fast_slow_slow_model
+
     def wait_for_pending_collectives(self) -> None:
         return
 
     def close(self) -> None:
+        if self._request_write_thread is not None:
+            self._request_write_thread.join(timeout=0.01)
         if self._weight_publish_thread is not None:
             self._weight_publish_thread.join(timeout=0.01)
         return
@@ -1938,18 +2312,41 @@ class _CrctMailboxTeacherTransport:
         except FileNotFoundError:
             pass
 
+    def _host_staging_like(self, src: torch.Tensor) -> torch.Tensor:
+        want_pinned = bool(torch.cuda.is_available() and src.device.type == "cuda")
+        try:
+            return torch.empty_strided(
+                tuple(src.shape),
+                tuple(src.stride()),
+                dtype=src.dtype,
+                device="cpu",
+                pin_memory=want_pinned,
+            )
+        except Exception:
+            if want_pinned:
+                self.metrics["host_pin_memory_failures"] += 1
+                self.metrics["weight_snapshot_pin_memory_failures"] += 1
+            return torch.empty_strided(
+                tuple(src.shape),
+                tuple(src.stride()),
+                dtype=src.dtype,
+                device="cpu",
+            )
+
     def maybe_publish_weight_snapshot(
         self,
         *,
         model: torch.nn.Module,
         step: int,
+        fast_slow_decision: FastSlowDecision | None = None,
     ) -> None:
         """Publish a latest-only teacher snapshot without a rank-3 rendezvous.
 
-        Rank 0 performs the unavoidable model->CPU copy only when no previous
-        snapshot writer is still alive. The slower serialization/rename happens
-        on a daemon thread. If the writer is busy, this drops the refresh rather
-        than queuing, preserving the trunk throughput contract.
+        Rank 0 performs only a vectorized device-local staging copy in the step
+        body. The expensive model->CPU copy and serialization happen on a
+        daemon thread from that stable staging buffer. If the writer is busy,
+        this drops the refresh rather than queuing, preserving latest-only
+        semantics.
         """
         if self.rank != self.coordinator_rank:
             return
@@ -1961,37 +2358,175 @@ class _CrctMailboxTeacherTransport:
             self.metrics["weight_snapshot_publish_skipped_busy"] += 1
             self.metrics["weight_snapshot_publisher_busy"] = True
             return
-        copy_t0 = time.perf_counter()
+        stage_t0 = time.perf_counter()
         try:
-            state_cpu = {
-                name: value.detach().to(device="cpu", copy=True)
-                if torch.is_tensor(value)
-                else value
-                for name, value in model.state_dict().items()
-            }
+            staged_tensors: dict[str, torch.Tensor] = {}
+            passthrough: dict[str, Any] = {}
+            src_tensors: list[torch.Tensor] = []
+            dst_tensors: list[torch.Tensor] = []
+            stage_bytes = 0
+            for name, value in model.state_dict().items():
+                if not torch.is_tensor(value):
+                    passthrough[name] = value
+                    continue
+                src = value.detach()
+                dst = self._weight_snapshot_staging.get(name)
+                if (
+                    dst is None
+                    or tuple(dst.shape) != tuple(src.shape)
+                    or dst.dtype != src.dtype
+                    or dst.device != src.device
+                ):
+                    dst = torch.empty_like(src)
+                    self._weight_snapshot_staging[name] = dst
+                src_tensors.append(src)
+                dst_tensors.append(dst)
+                staged_tensors[name] = dst
+                stage_bytes += int(src.numel() * src.element_size())
+            if dst_tensors:
+                first_tensor = dst_tensors[0]
+                stage_start_event = None
+                stage_event = None
+                if (
+                    first_tensor.device.type == "cuda"
+                    and torch.cuda.is_available()
+                ):
+                    stream = torch.cuda.current_stream(first_tensor.device)
+                    stage_start_event = torch.cuda.Event(enable_timing=True)
+                    stage_event = torch.cuda.Event(enable_timing=True)
+                    stage_start_event.record(stream)
+                torch._foreach_copy_(dst_tensors, src_tensors)
+                if stage_event is not None:
+                    stage_event.record(torch.cuda.current_stream(first_tensor.device))
+            else:
+                stage_start_event = None
+                stage_event = None
         except Exception as exc:
             self.metrics["weight_snapshot_publish_errors"] += 1
             self.metrics["last_error"] = "".join(
                 traceback.format_exception_only(type(exc), exc)
             ).strip()
-            self.metrics["last_drop_reason"] = "weight_snapshot_copy_error"
+            self.metrics["last_drop_reason"] = "weight_snapshot_stage_error"
             return
-        copy_s = time.perf_counter() - copy_t0
-        self.metrics["weight_snapshot_copy_started"] += 1
-        self.metrics["weight_snapshot_copy_seconds_sum"] += float(copy_s)
-        self.metrics["weight_snapshot_copy_seconds_max"] = max(
-            float(self.metrics["weight_snapshot_copy_seconds_max"]),
-            float(copy_s),
+        stage_s = time.perf_counter() - stage_t0
+        self.metrics["weight_snapshot_stage_started"] += 1
+        self.metrics["weight_snapshot_stage_enqueue_seconds_sum"] += float(stage_s)
+        self.metrics["weight_snapshot_stage_enqueue_seconds_max"] = max(
+            float(self.metrics["weight_snapshot_stage_enqueue_seconds_max"]),
+            float(stage_s),
         )
+        self.metrics["weight_snapshot_stage_tensor_count"] = len(staged_tensors)
+        self.metrics["weight_snapshot_stage_bytes"] = int(stage_bytes)
         self.metrics["weight_snapshot_publish_started"] += 1
         self.metrics["weight_snapshot_publisher_busy"] = True
         version_step = int(step)
+        decision_payload = fast_slow_decision_to_dict(fast_slow_decision)
+        if decision_payload is not None:
+            self.metrics["fast_slow_snapshot_decisions_published"] += 1
 
         def _writer() -> None:
+            wait_t0 = time.perf_counter()
+            if stage_event is not None:
+                try:
+                    stage_event.synchronize()
+                    if stage_start_event is not None:
+                        stage_gpu_s = float(
+                            stage_start_event.elapsed_time(stage_event)
+                        ) / 1000.0
+                        self.metrics["weight_snapshot_stage_gpu_seconds_sum"] += (
+                            stage_gpu_s
+                        )
+                        self.metrics["weight_snapshot_stage_gpu_seconds_max"] = max(
+                            float(
+                                self.metrics[
+                                    "weight_snapshot_stage_gpu_seconds_max"
+                                ]
+                            ),
+                            stage_gpu_s,
+                        )
+                except Exception as exc:
+                    self.metrics["weight_snapshot_publish_errors"] += 1
+                    self.metrics["last_error"] = "".join(
+                        traceback.format_exception_only(type(exc), exc)
+                    ).strip()
+                    self.metrics["last_drop_reason"] = "weight_snapshot_stage_wait_error"
+                    self.metrics["weight_snapshot_publisher_busy"] = False
+                    return
+            wait_s = time.perf_counter() - wait_t0
+            self.metrics["weight_snapshot_stage_wait_seconds_sum"] += float(wait_s)
+            self.metrics["weight_snapshot_stage_wait_seconds_max"] = max(
+                float(self.metrics["weight_snapshot_stage_wait_seconds_max"]),
+                float(wait_s),
+            )
+            copy_t0 = time.perf_counter()
+            try:
+                state_cpu: dict[str, Any] = {}
+                pinned_buffers = 0
+                pinned_bytes = 0
+                pageable_buffers = 0
+                pageable_bytes = 0
+                for name, tensor in staged_tensors.items():
+                    host = self._weight_snapshot_host_staging.get(name)
+                    if (
+                        host is None
+                        or tuple(host.shape) != tuple(tensor.shape)
+                        or tuple(host.stride()) != tuple(tensor.stride())
+                        or host.dtype != tensor.dtype
+                    ):
+                        host = self._host_staging_like(tensor)
+                        self._weight_snapshot_host_staging[name] = host
+                    host.copy_(tensor.detach(), non_blocking=False)
+                    nbytes = int(host.numel() * host.element_size())
+                    if bool(host.is_pinned()):
+                        pinned_buffers += 1
+                        pinned_bytes += nbytes
+                    else:
+                        pageable_buffers += 1
+                        pageable_bytes += nbytes
+                    state_cpu[name] = host
+                state_cpu.update(passthrough)
+                self.metrics["weight_snapshot_host_pinned_buffers"] = int(
+                    pinned_buffers
+                )
+                self.metrics["weight_snapshot_host_pinned_bytes"] = int(
+                    pinned_bytes
+                )
+                self.metrics["weight_snapshot_host_pageable_buffers"] = int(
+                    pageable_buffers
+                )
+                self.metrics["weight_snapshot_host_pageable_bytes"] = int(
+                    pageable_bytes
+                )
+            except Exception as exc:
+                self.metrics["weight_snapshot_publish_errors"] += 1
+                self.metrics["last_error"] = "".join(
+                    traceback.format_exception_only(type(exc), exc)
+                ).strip()
+                self.metrics["last_drop_reason"] = "weight_snapshot_writer_cpu_copy_error"
+                self.metrics["weight_snapshot_publisher_busy"] = False
+                return
+            copy_s = time.perf_counter() - copy_t0
+            self.metrics["weight_snapshot_copy_started"] += 1
+            self.metrics["weight_snapshot_copy_seconds_sum"] += float(copy_s)
+            self.metrics["weight_snapshot_copy_seconds_max"] = max(
+                float(self.metrics["weight_snapshot_copy_seconds_max"]),
+                float(copy_s),
+            )
+            self.metrics["weight_snapshot_writer_cpu_copy_seconds_sum"] += float(
+                copy_s
+            )
+            self.metrics["weight_snapshot_writer_cpu_copy_seconds_max"] = max(
+                float(self.metrics["weight_snapshot_writer_cpu_copy_seconds_max"]),
+                float(copy_s),
+            )
             save_t0 = time.perf_counter()
             try:
                 self._atomic_save(
-                    {"step": version_step, "state_dict": state_cpu},
+                    {
+                        "step": version_step,
+                        "state_dict": state_cpu,
+                        "fast_slow_decision": decision_payload,
+                    },
                     self._weight_path(),
                     record_mailbox_metrics=False,
                 )
@@ -2025,6 +2560,7 @@ class _CrctMailboxTeacherTransport:
         model: torch.nn.Module,
         step: int,
         replay_eviction_loop: ReplayEvictionLoop | None = None,
+        fast_slow: FastSlowConsolidator | None = None,
     ) -> None:
         """Apply the latest rank0 snapshot on the memory rank if available.
 
@@ -2067,6 +2603,13 @@ class _CrctMailboxTeacherTransport:
             unexpected = getattr(load_result, "unexpected_keys", [])
             if missing or unexpected:
                 self.metrics["last_drop_reason"] = "weight_snapshot_partial_load"
+            if fast_slow is not None:
+                decision = fast_slow_decision_from_dict(
+                    payload.get("fast_slow_decision")
+                )
+                if decision is not None:
+                    fast_slow.apply_decision(model, decision)
+                    self.metrics["fast_slow_snapshot_decisions_applied"] += 1
             elapsed = time.perf_counter() - apply_t0
             self._last_applied_weight_step = version_step
             self.metrics["weight_snapshot_applied"] += 1
@@ -2109,15 +2652,37 @@ class _CrctMailboxTeacherTransport:
         targets: torch.Tensor,
         step: int,
     ) -> None:
-        full_ids = _crct_full_input_ids(inputs, targets).contiguous()
+        if (
+            self._request_write_thread is not None
+            and self._request_write_thread.is_alive()
+        ):
+            self.metrics["request_write_skipped_busy"] += 1
+            self.metrics["request_write_publisher_busy"] = True
+            self.metrics["last_drop_reason"] = "request_writer_busy"
+            return
+        stage_t0 = time.perf_counter()
+        full_ids = _crct_full_input_ids(inputs, targets).to(
+            dtype=torch.int32
+        ).contiguous()
         if tuple(full_ids.shape) != self.full_ids_shape:
             raise ValueError(
                 "CRCT mailbox transport saw a dynamic batch shape: "
                 f"{tuple(full_ids.shape)} != {self.full_ids_shape}"
             )
+        full_ids_staged = full_ids.detach()
+        stage_s = time.perf_counter() - stage_t0
+        self.metrics["request_stage_started"] += 1
+        self.metrics["request_stage_seconds_sum"] += float(stage_s)
+        self.metrics["request_stage_seconds_max"] = max(
+            float(self.metrics["request_stage_seconds_max"]),
+            float(stage_s),
+        )
+        # Inputs/targets are immutable batch tensors for this step. Keep
+        # references for matched-label replay instead of cloning a second
+        # GPU batch on rank0's hot path.
         self.local_batches_by_step[int(step)] = (
-            inputs.detach().clone(),
-            targets.detach().clone(),
+            inputs.detach(),
+            targets.detach(),
         )
         self.local_batch_order.append(int(step))
         self.metrics["requests_stored"] += 1
@@ -2126,20 +2691,64 @@ class _CrctMailboxTeacherTransport:
             if self.local_batches_by_step.pop(old_step, None) is not None:
                 self.metrics["local_request_evictions"] += 1
                 self.metrics["last_drop_reason"] = "local_request_evicted"
-        self._atomic_save(
-            {
-                "step": int(step),
-                "full_ids": full_ids.detach().to(device="cpu", dtype=torch.int32),
-            },
-            self._request_path(int(step)),
-        )
         self.metrics["requests_started"] += 1
         self.metrics["request_broadcasts_started"] += 1
-        self.metrics["mailbox_request_writes"] += 1
         self.metrics["max_local_pending_batches"] = max(
             int(self.metrics["max_local_pending_batches"]),
             len(self.local_batches_by_step),
         )
+        request_step = int(step)
+        self.metrics["request_write_publisher_busy"] = True
+
+        def _writer() -> None:
+            try:
+                copy_t0 = time.perf_counter()
+                host = self._request_host_staging
+                if (
+                    host is None
+                    or tuple(host.shape) != tuple(full_ids_staged.shape)
+                    or tuple(host.stride()) != tuple(full_ids_staged.stride())
+                    or host.dtype != full_ids_staged.dtype
+                ):
+                    self._request_host_staging = self._host_staging_like(
+                        full_ids_staged
+                    )
+                    host = self._request_host_staging
+                host.copy_(full_ids_staged, non_blocking=False)
+                full_ids_cpu = host
+                copy_s = time.perf_counter() - copy_t0
+                self.metrics["request_writer_cpu_copy_seconds_sum"] += float(copy_s)
+                self.metrics["request_writer_cpu_copy_seconds_max"] = max(
+                    float(self.metrics["request_writer_cpu_copy_seconds_max"]),
+                    float(copy_s),
+                )
+                self.metrics["request_host_pinned"] = bool(full_ids_cpu.is_pinned())
+                self.metrics["request_host_stage_bytes"] = int(
+                    full_ids_cpu.numel() * full_ids_cpu.element_size()
+                )
+                self._atomic_save(
+                    {
+                        "step": request_step,
+                        "full_ids": full_ids_cpu,
+                    },
+                    self._request_path(request_step),
+                )
+                self.metrics["mailbox_request_writes"] += 1
+            except Exception as exc:
+                self.metrics["errors"] += 1
+                self.metrics["last_error"] = "".join(
+                    traceback.format_exception_only(type(exc), exc)
+                ).strip()
+                self.metrics["last_drop_reason"] = "request_mailbox_write_error"
+            finally:
+                self.metrics["request_write_publisher_busy"] = False
+
+        self._request_write_thread = threading.Thread(
+            target=_writer,
+            name="crct-request-writer",
+            daemon=True,
+        )
+        self._request_write_thread.start()
 
     def _poll_requests(self) -> None:
         paths = sorted(self.mailbox_dir.glob("request_*.pt"))
@@ -2194,6 +2803,32 @@ class _CrctMailboxTeacherTransport:
                 device="cpu", dtype=self.payload_dtype
             ),
         }
+        readiness = scored.get("fast_slow_readiness")
+        if isinstance(readiness, dict):
+            payload["fast_slow_readiness"] = dict(readiness)
+            self.metrics["fast_slow_readiness_result_payloads"] += 1
+        decision = fast_slow_decision_from_dict(scored.get("fast_slow_decision"))
+        if decision is not None:
+            payload["fast_slow_decision"] = fast_slow_decision_to_dict(decision)
+            self.metrics["fast_slow_decisions_result_payloads"] += 1
+        memory_residual = scored.get("memory_residual")
+        memory_gate = scored.get("memory_gate")
+        if isinstance(memory_residual, torch.Tensor) and isinstance(memory_gate, torch.Tensor):
+            payload["memory_residual"] = memory_residual.detach().to(
+                device="cpu", dtype=self.payload_dtype
+            )
+            payload["memory_gate"] = memory_gate.detach().to(
+                device="cpu", dtype=self.payload_dtype
+            )
+            self.metrics["memory_packets_sent"] += 1
+            self.metrics["memory_packet_bytes_sent"] += int(
+                payload["memory_residual"].numel()
+                * payload["memory_residual"].element_size()
+                + payload["memory_gate"].numel()
+                * payload["memory_gate"].element_size()
+            )
+        else:
+            self.metrics["memory_packet_missing_payloads"] += 1
         self._atomic_save(payload, self._result_path(int(request_step)))
         self.metrics["payloads_sent"] += 1
         self.metrics["payloads_received"] += 0
@@ -2260,6 +2895,28 @@ class _CrctMailboxTeacherTransport:
                     device=self.device, dtype=torch.float32
                 ),
             }
+            readiness = payload_cpu.get("fast_slow_readiness")
+            if isinstance(readiness, dict):
+                payload["fast_slow_readiness"] = dict(readiness)
+            decision = fast_slow_decision_from_dict(
+                payload_cpu.get("fast_slow_decision")
+            )
+            if decision is not None:
+                payload["fast_slow_decision"] = fast_slow_decision_to_dict(decision)
+            memory_residual = payload_cpu.get("memory_residual")
+            memory_gate = payload_cpu.get("memory_gate")
+            if isinstance(memory_residual, torch.Tensor) and isinstance(memory_gate, torch.Tensor):
+                payload["memory_residual"] = memory_residual.to(
+                    device=self.device, dtype=torch.float32
+                )
+                payload["memory_gate"] = memory_gate.to(
+                    device=self.device, dtype=torch.float32
+                )
+                self.metrics["memory_packets_received"] += 1
+                self.metrics["memory_packet_bytes_received"] += int(
+                    memory_residual.numel() * memory_residual.element_size()
+                    + memory_gate.numel() * memory_gate.element_size()
+                )
             inputs, targets = batch
             ready = (payload, inputs, targets)
             self.metrics["payloads_received"] += 1
@@ -6057,7 +6714,6 @@ def _run_train_step(
     embedding_version: int = 0,
     crct_enabled: bool = False,
     crct_payload: dict[str, torch.Tensor] | None = None,
-    crct_lambda_controller: float = 0.01,
     crct_memory_write_tokens_per_step: int = 256,
 ) -> torch.Tensor:
     _reject_unsupported_fast_step(model, crct_enabled=bool(crct_enabled))
@@ -6142,31 +6798,37 @@ def _run_train_step(
     # discards per-token CE) so the cost of the ``_with_ce`` variant is
     # not paid by ``episodic_enabled=False`` runs.
     per_token_ce_for_episodic: torch.Tensor | None = None
-    crct_controller_logits: torch.Tensor | None = None
     with autocast_context(precision, device_type=inputs.device.type):
         if compile_full_path:
             if crct_enabled:
                 raise ValueError(
                     "crct_enabled=True is incompatible with compile_full_path=True "
-                    "because CRCT needs controller logits and memory-mode metadata "
-                    "from model.encode()."
+                    "because CRCT trains through the explicit episodic packet "
+                    "lane rather than the compiled bare-trunk closure."
                 )
             hidden = _compiled_step_fn()(model, inputs)
         elif crct_enabled:
-            # CRCT's teacher/oracle can lag or fail open; the trunk SSM cannot.
-            # Train ranks therefore run the ordinary no-memory encoder and
-            # distill the tiny controller head from that pre-memory stream.
-            # Rank 3 owns central memory reads/writes off the train-rank hot
-            # path. This preserves the "memory may help when ready, but never
-            # stalls trunk throughput" contract.
-            hidden = model.encode(inputs, memory_mode="off")
-            if crct_payload is not None:
-                memory_controller = getattr(model, "memory_controller", None)
-                if memory_controller is None:
-                    raise ValueError(
-                        "crct_enabled=True requires enable_controller=True on the model"
-                    )
-                crct_controller_logits = memory_controller(hidden)
+            # GPU3/CPU own the episodic memory decision plane. Train ranks
+            # consume only the latest-complete residual packet through a fixed
+            # pre-recurrence lane; when the teacher lags, ``packet`` is a
+            # bit-identical zero-residual no-op. No local slot reads and no
+            # token-wise controller MLP run on the trunk hot path.
+            packet_residual = (
+                crct_payload.get("memory_residual")
+                if crct_payload is not None
+                else None
+            )
+            packet_gate = (
+                crct_payload.get("memory_gate")
+                if crct_payload is not None
+                else None
+            )
+            hidden = model.encode(
+                inputs,
+                memory_mode="packet",
+                episodic_residual=packet_residual,
+                episodic_gate=packet_gate,
+            )
         else:
             hidden = model.encode(inputs)
         if (
@@ -6187,8 +6849,6 @@ def _run_train_step(
             else None
         )
         if crct_enabled:
-            if crct_payload is not None and crct_controller_logits is None:
-                raise ValueError("CRCT controller logits were not materialized")
             mode = str(lm_head_backward_mode).strip().lower()
             loss_backward_done = False
             if mode in _FUSED_LM_HEAD_MODES:
@@ -6232,14 +6892,7 @@ def _run_train_step(
                 if not loss_backward_done:
                     loss.backward()
             else:
-                total_loss = loss
-                total_loss = total_loss + float(crct_lambda_controller) * (
-                    _crct_payload_controller_loss(
-                        crct_payload,
-                        crct_controller_logits,
-                    )
-                )
-                total_loss.backward()
+                loss.backward()
         elif lm_head_backward_mode == "single":
             loss = full_lm_head_backward(
                 hidden=hidden,
@@ -6338,12 +6991,12 @@ def _run_train_step(
                         if grad_world_size is not None
                         else world_size - 1
                     )
-                    # Rank0-only CRCT labels mean rank0 may produce
-                    # controller-head grads on payload steps while ranks 1/2
-                    # correctly skip that head. Materialize zeros inside the
-                    # train subgroup so the flattened grad buffer is identical
-                    # across train ranks without asking the memory rank to
-                    # join the trunk collective.
+                    # Rank0-only CRCT labels/packets mean rank0 may see
+                    # payload-conditioned loss weights while ranks 1/2 fail
+                    # open. Materialize zeros inside the train subgroup so
+                    # the flattened grad buffer is identical across train
+                    # ranks without asking the memory rank to join the trunk
+                    # collective.
                     materialize_zeros = bool(crct_enabled)
                 if n_train < 1:
                     raise ValueError(
@@ -6992,7 +7645,6 @@ def train_fast_for_budget(
     episodic_controller_action_reward_clip: float = 5.0,
     episodic_replay_max_replays_per_step: int = 0,
     crct_enabled: bool = False,
-    crct_lambda_controller: float = 0.01,
     crct_lm_weight_alpha_max: float = 0.15,
     crct_lm_weight_strength: float = 0.10,
     crct_lm_weight_w_max: float = 1.20,
@@ -7202,11 +7854,6 @@ def train_fast_for_budget(
         raise ValueError(
             "crct_enabled=True is incompatible with ScOpt in this runner: "
             "both mechanisms own per-token LM loss reweighting."
-        )
-    if crct_enabled and getattr(model, "memory_controller", None) is None:
-        raise ValueError(
-            "crct_enabled=True requires the model to be built with "
-            "enable_controller=True."
         )
     if crct_enabled and getattr(model, "outer_model", None) is None:
         raise ValueError(
@@ -7616,6 +8263,27 @@ def train_fast_for_budget(
             "fast_slow_alpha": fast_slow_alpha,
         },
     )
+    fast_slow_action_trace_log = None
+    fast_slow_action_space = None
+    fast_slow_action_space_owner = (
+        not bool(ddp_active)
+        or int(rank_) == int(world_size_) - 1
+    )
+    if fast_slow.enabled and bool(
+        _action_space_config.get("episodic_controller_action_space_enabled", False)
+    ) and bool(
+        fast_slow_action_space_owner
+    ):
+        fast_slow_action_trace_log = _action_trace_logger_from_config(
+            _action_space_config,
+            rank=f"fastslow{rank_}",
+        )
+        if fast_slow_action_trace_log is None:
+            fast_slow_action_trace_log = []
+        fast_slow_action_space = _build_action_space_from_config(
+            _action_space_config,
+            trace_log=fast_slow_action_trace_log,
+        )
     predictive_aux_projection = None
     predictive_aux_optimizer = None
     if predictive_aux_weight > 0.0 and predictive_aux_horizon > 0:
@@ -8178,6 +8846,12 @@ def train_fast_for_budget(
                         )
                         if ready is not None:
                             crct_payload, train_inputs, train_targets = ready
+                            _apply_fast_slow_result_payload(
+                                model=model,
+                                fast_slow=fast_slow,
+                                payload=crct_payload,
+                                metrics=crct_teacher_transport.metrics,
+                            )
                 else:
                     crct_teacher_requests += 1
                     crct_payload = _collect_crct_teacher_payload(
@@ -8304,7 +8978,6 @@ def train_fast_for_budget(
                     embedding_version=0,
                     crct_enabled=bool(crct_enabled),
                     crct_payload=crct_payload,
-                    crct_lambda_controller=float(crct_lambda_controller),
                     crct_memory_write_tokens_per_step=int(
                         crct_memory_write_tokens_per_step
                     ),
@@ -8524,7 +9197,25 @@ def train_fast_for_budget(
             optimizer.step()
             if predictive_aux_optimizer is not None:
                 predictive_aux_optimizer.step()
-            fast_slow.after_optimizer_step(model, step=steps + 1)
+            fast_slow_decision_for_snapshot: FastSlowDecision | None = None
+            if (
+                fast_slow.enabled
+                and int(fast_slow.interval) > 0
+                and not (
+                    bool(is_episodic_rank) and not bool(memory_rank_joins_grad)
+                )
+            ):
+                # Legacy fixed-interval mode only. The final learned path owns
+                # consolidation decisions on the memory/oracle rank and mirrors
+                # commands back through the mailbox result, avoiding per-step
+                # Python policy orchestration on the trunk ranks.
+                fast_slow_decision = fast_slow.decide(
+                    step=int(steps + 1),
+                    action_space=None,
+                    reward_context=None,
+                )
+                fast_slow.apply_decision(model, fast_slow_decision)
+                fast_slow_decision_for_snapshot = fast_slow_decision
             if (
                 crct_teacher_transport is not None
                 and crct_teacher_transport_mode == "async_rank0_memory_mailbox"
@@ -8536,7 +9227,11 @@ def train_fast_for_budget(
                     None,
                 )
                 if callable(publish):
-                    publish(model=model, step=steps)
+                    publish(
+                        model=model,
+                        step=steps,
+                        fast_slow_decision=fast_slow_decision_for_snapshot,
+                    )
             if (
                 crct_teacher_transport is not None
                 and crct_teacher_transport_mode == "async_rank0_memory_broadcast"
@@ -8574,6 +9269,9 @@ def train_fast_for_budget(
                     memory_write_tokens=int(crct_memory_write_tokens_per_step),
                     gradient_conflict_monitor=crct_gradient_conflict,
                     replay_eviction_loop=replay_eviction_loop,
+                    fast_slow=fast_slow,
+                    fast_slow_action_space=fast_slow_action_space,
+                    fast_slow_nll_chunk_size=int(chunk_size),
                 )
             # Replay-eviction: rank-3 streaming maintenance. Fresh teacher
             # score batches are ingested as probe frames; ticks consume
@@ -8628,11 +9326,20 @@ def train_fast_for_budget(
         _shutdown_episodic_write_drain(episodic_write_drain_handle)
         _cleanup_episodic_event_rings(episodic_emit_handle)
         _cleanup_episodic_event_rings(episodic_consumer)
+        if hasattr(fast_slow_action_trace_log, "close"):
+            try:
+                fast_slow_action_trace_log.close()
+            except Exception:
+                pass
 
     if ddp_active:
         dist.barrier()
 
-    if fast_slow.enabled and str(fast_slow_eval_copy).strip().lower() == "slow":
+    if (
+        fast_slow.enabled
+        and str(fast_slow_eval_copy).strip().lower() == "slow"
+        and fast_slow.should_copy_slow_to_model_for_eval()
+    ):
         fast_slow.copy_slow_to_model(model)
 
     episodic_cache_payload: dict[str, Any] | None = None
@@ -8824,6 +9531,19 @@ def train_fast_for_budget(
                     float(coord.get("mailbox_read_seconds_max", 0.0)),
                     float(mem.get("mailbox_read_seconds_max", 0.0)),
                 ),
+                "request_write_skipped_busy": int(
+                    coord.get("request_write_skipped_busy", 0)
+                ),
+                "request_stage_seconds_max": float(
+                    coord.get("request_stage_seconds_max", 0.0)
+                ),
+                "request_writer_cpu_copy_seconds_max": float(
+                    coord.get("request_writer_cpu_copy_seconds_max", 0.0)
+                ),
+                "request_host_pinned": bool(coord.get("request_host_pinned", False)),
+                "request_host_stage_bytes": int(
+                    coord.get("request_host_stage_bytes", 0)
+                ),
                 "weight_snapshot_published": int(
                     coord.get("weight_snapshot_published", 0)
                 ),
@@ -8848,6 +9568,39 @@ def train_fast_for_budget(
                 "weight_snapshot_copy_seconds_max": float(
                     coord.get("weight_snapshot_copy_seconds_max", 0.0)
                 ),
+                "weight_snapshot_hotpath_cpu_copies": int(
+                    coord.get("weight_snapshot_hotpath_cpu_copies", 0)
+                ),
+                "weight_snapshot_stage_enqueue_seconds_max": float(
+                    coord.get("weight_snapshot_stage_enqueue_seconds_max", 0.0)
+                ),
+                "weight_snapshot_stage_gpu_seconds_max": float(
+                    coord.get("weight_snapshot_stage_gpu_seconds_max", 0.0)
+                ),
+                "weight_snapshot_stage_wait_seconds_max": float(
+                    coord.get("weight_snapshot_stage_wait_seconds_max", 0.0)
+                ),
+                "weight_snapshot_writer_cpu_copy_seconds_max": float(
+                    coord.get("weight_snapshot_writer_cpu_copy_seconds_max", 0.0)
+                ),
+                "weight_snapshot_stage_bytes": int(
+                    coord.get("weight_snapshot_stage_bytes", 0)
+                ),
+                "weight_snapshot_host_pinned_buffers": int(
+                    coord.get("weight_snapshot_host_pinned_buffers", 0)
+                ),
+                "weight_snapshot_host_pinned_bytes": int(
+                    coord.get("weight_snapshot_host_pinned_bytes", 0)
+                ),
+                "weight_snapshot_host_pageable_buffers": int(
+                    coord.get("weight_snapshot_host_pageable_buffers", 0)
+                ),
+                "weight_snapshot_host_pageable_bytes": int(
+                    coord.get("weight_snapshot_host_pageable_bytes", 0)
+                ),
+                "host_pin_memory_failures": int(
+                    coord.get("host_pin_memory_failures", 0)
+                ),
                 "weight_snapshot_save_seconds_max": float(
                     coord.get("weight_snapshot_save_seconds_max", 0.0)
                 ),
@@ -8856,6 +9609,27 @@ def train_fast_for_budget(
                 ),
                 "weight_snapshot_publisher_busy": bool(
                     coord.get("weight_snapshot_publisher_busy", False)
+                ),
+                "fast_slow_readiness_scores": int(
+                    mem.get("fast_slow_readiness_scores", 0)
+                ),
+                "fast_slow_readiness_seconds_max": float(
+                    mem.get("fast_slow_readiness_seconds_max", 0.0)
+                ),
+                "fast_slow_readiness_delta_last": float(
+                    mem.get("fast_slow_readiness_delta_last", 0.0)
+                ),
+                "fast_slow_decisions_issued": int(
+                    mem.get("fast_slow_decisions_issued", 0)
+                ),
+                "fast_slow_decisions_result_payloads": int(
+                    mem.get("fast_slow_decisions_result_payloads", 0)
+                ),
+                "fast_slow_result_decisions_applied": int(
+                    coord.get("fast_slow_result_decisions_applied", 0)
+                ),
+                "fast_slow_slow_mirror_version_lag_steps": int(
+                    mem.get("fast_slow_slow_mirror_version_lag_steps", 0)
                 ),
             }
     timing = summarize_train_timing(
@@ -9024,11 +9798,10 @@ def train_fast_for_budget(
             },
             "crct": {
                 "enabled": bool(crct_enabled),
-                "lambda_controller": float(crct_lambda_controller),
                 "memory_owner": (
                     "rank3_teacher_only" if bool(crct_enabled) else "disabled"
                 ),
-                "trunk_memory_mode": "off" if bool(crct_enabled) else "disabled",
+                "trunk_memory_mode": "packet" if bool(crct_enabled) else "disabled",
                 "grad_sync_group": (
                     "all_ranks"
                     if bool(memory_rank_joins_grad)
@@ -9268,7 +10041,6 @@ def _warmup(
             config.get("scopt_pressure_upper_floor", 1.0)
         ),
         crct_enabled=bool(config.get("crct_enabled", False)),
-        crct_lambda_controller=float(config.get("crct_lambda_controller", 0.01)),
         crct_lm_weight_alpha_max=float(
             config.get("crct_lm_weight_alpha_max", 0.15)
         ),
@@ -9875,7 +10647,6 @@ def run_condition(
             config.get("episodic_replay_max_replays_per_step", 0)
         ),
         crct_enabled=bool(config.get("crct_enabled", False)),
-        crct_lambda_controller=float(config.get("crct_lambda_controller", 0.01)),
         crct_lm_weight_alpha_max=float(
             config.get("crct_lm_weight_alpha_max", 0.15)
         ),

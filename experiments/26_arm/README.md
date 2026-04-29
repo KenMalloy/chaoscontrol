@@ -17,6 +17,53 @@ They made it too easy to run a diagnostic scaffold and mistake it for the
 architecture. CRCT is the evidence substrate inside ARM here, not a standalone
 mechanism.
 
+## Runtime Contract
+
+The thesis is not "sometimes run with memory." The trunk should always expose
+an episodic residual input lane, and that lane must never make the trunk wait.
+
+Target steady-state shape:
+
+```text
+GPU0-2 trunk ranks
+  train the SSM at full speed
+  consume fixed-shape latest-complete episodic residual buffers
+  never synchronously read the cache
+  never wait for GPU3 or the CPU controller
+
+GPU3 memory/oracle rank
+  owns the populated episodic sidecar
+  runs memory_off / force_on / hide-slot / refresh-candidate physics
+  may warm or capture its own fixed-shape oracle and maintenance CUDA graphs
+  cannot warm or capture GPU0-2's graphs for them
+
+CPU controller plane
+  schedules work, maintains evidence, proposes bounded actions, and logs traces
+  does not own exact oracle truth
+  does not sit in the train-rank hot path
+```
+
+GPU0-2 graph compatibility comes from stable tensor addresses and shapes:
+the recurrent stream always has a residual input buffer and gate buffer. The
+contents may be zero, stale-but-safe, or latest-complete, but the trunk graph
+does not change shape and does not block waiting for a fresher packet.
+
+`memory_mode="off"` remains valid only as an oracle/counterfactual mode: GPU3
+uses it to measure marginal memory value. It is not the final product path.
+Likewise, `force_on` and hide-slot modes are physics probes owned by GPU3, not
+ablation knobs for normal trunk training.
+
+The CPU/maintenance controller is the off-path evidence and scheduling plane;
+learned Full-A authority lives there for maintenance/commit decisions. There is
+no trunk-local `memory_controller` head in this path: semantic framing and cue
+construction happen in the trunk, targeted episodic retrieval happens on the
+memory plane, and the result returns only as a residual packet.
+
+The current memory injection point is a gated residual added to the recurrent
+stream before the SSM layers. It is not direct A-matrix modulation. If we add
+A-modulation later, it should be named as a separate mechanism rather than
+quietly overloading the residual lane.
+
 ## Validation Cells
 
 | Cell | Purpose |
@@ -50,6 +97,8 @@ shape gives `384 -> 13.71 MB`, `416 -> 15.19 MB`, `448 -> 16.73 MB`, and
 - Learned commit feedback updates are non-zero once oracle confirmations land.
 - Fail-open/stale/drop counters are visible and bounded.
 - Train-rank throughput is not catastrophically coupled to memory work.
+- Treat any train-rank synchronous cache read, rank-3 wait, or memory-owned
+  collective in the trunk step as a thesis violation.
 
 ## Usage
 

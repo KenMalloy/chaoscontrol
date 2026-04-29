@@ -698,13 +698,29 @@ def rank3_score_batch_causal(
     y = input_ids[:, 1:]
     mask = valid_mask[:, 1:].bool()
 
+    memory_meta: dict[str, Any] | None = None
     with _autocast_for(input_ids.device.type):
         h_off = model.encode(
             x, memory_mode="off", cache_read_cutoff=txn.read_cutoff
         )
-        h_mem = model.encode(
-            x, memory_mode="force_on", cache_read_cutoff=txn.read_cutoff
-        )
+        try:
+            h_mem_out = model.encode(
+                x,
+                memory_mode="force_on",
+                cache_read_cutoff=txn.read_cutoff,
+                return_memory_meta=True,
+            )
+        except TypeError:
+            h_mem_out = model.encode(
+                x, memory_mode="force_on", cache_read_cutoff=txn.read_cutoff
+            )
+        if isinstance(h_mem_out, dict):
+            h_mem = h_mem_out["hidden"]
+            meta = h_mem_out.get("memory_meta")
+            if isinstance(meta, dict):
+                memory_meta = meta
+        else:
+            h_mem = h_mem_out
 
     nll_off = chunked_nll_from_hidden(model, h_off, y)
     nll_mem = chunked_nll_from_hidden(model, h_mem, y)
@@ -730,6 +746,12 @@ def rank3_score_batch_causal(
     loss_weight = positive_only_lm_weight(
         utility, mask, tau=tau, strength=strength, w_max=w_max
     )
+
+    memory_residual = None
+    if memory_meta is not None:
+        maybe_residual = memory_meta.get("memory_residual")
+        if isinstance(maybe_residual, torch.Tensor):
+            memory_residual = maybe_residual.detach()
 
     if update_model_memory_after:
         append_fn = getattr(model, "append_memory_from_hidden", None)
@@ -758,6 +780,9 @@ def rank3_score_batch_causal(
                 "confidence": confidence,
                 "loss_weight": loss_weight,
             }
+            if memory_residual is not None:
+                out["memory_residual"] = memory_residual
+                out["memory_gate"] = controller_target.detach()
             if gradient_conflict_monitor is not None:
                 out["gradient_conflict"] = torch.zeros_like(utility)
                 out["write_score"] = write_score.detach()
@@ -783,7 +808,7 @@ def rank3_score_batch_causal(
             )
 
     cache.commit(txn)
-    return {
+    out = {
         "utility": utility,
         "controller_target": controller_target,
         "confidence": confidence,
@@ -798,3 +823,7 @@ def rank3_score_batch_causal(
             else {}
         ),
     }
+    if memory_residual is not None:
+        out["memory_residual"] = memory_residual
+        out["memory_gate"] = controller_target.detach()
+    return out

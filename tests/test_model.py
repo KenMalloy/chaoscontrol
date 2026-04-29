@@ -4,6 +4,7 @@ from __future__ import annotations
 import unittest
 from unittest import mock
 
+import pytest
 import torch
 import torch.nn.functional as F
 
@@ -148,7 +149,7 @@ class TestChaosStudentLM(unittest.TestCase):
 
         assert not torch.allclose(h_off, h_on)
 
-    def test_encode_default_controller_mode_is_force_on_without_controller(self) -> None:
+    def test_encode_default_packet_mode_matches_memory_off(self) -> None:
         torch.manual_seed(1)
         model = ChaosStudentLM(
             vocab_size=64, dim=8, num_layers=1, ff_mult=2,
@@ -157,12 +158,75 @@ class TestChaosStudentLM(unittest.TestCase):
         ids = torch.randint(0, 64, (2, 6))
 
         h_default = model.encode(ids)
-        h_force = model.encode(ids, memory_mode="force_on")
+        h_off = model.encode(ids, memory_mode="off")
 
-        assert torch.allclose(h_default, h_force, atol=0.0, rtol=0.0)
+        assert torch.allclose(h_default, h_off, atol=0.0, rtol=0.0)
 
-    def test_encode_teacher_gate_zero_matches_memory_off(self) -> None:
+    def test_encode_rejects_removed_controller_modes(self) -> None:
         torch.manual_seed(2)
+        model = ChaosStudentLM(
+            vocab_size=64, dim=8, num_layers=1, ff_mult=2,
+            a_mode="diag", rich_b_mode="none", outer_model_dim=8,
+        )
+        ids = torch.randint(0, 64, (2, 6))
+
+        with pytest.raises(ValueError, match="memory_mode"):
+            model.encode(ids, memory_mode="controller")
+
+        with pytest.raises(ValueError, match="memory_mode"):
+            model.encode(ids, memory_mode="teacher_gate")
+
+    def test_model_has_no_trunk_local_memory_controller(self) -> None:
+        torch.manual_seed(3)
+        model = ChaosStudentLM(
+            vocab_size=64, dim=8, num_layers=1, ff_mult=2,
+            a_mode="diag", rich_b_mode="none", outer_model_dim=8,
+        )
+
+        assert not hasattr(model, "memory_controller")
+
+    def test_encode_packet_mode_zero_payload_matches_memory_off(self) -> None:
+        torch.manual_seed(33)
+        model = ChaosStudentLM(
+            vocab_size=64, dim=8, num_layers=1, ff_mult=2,
+            a_mode="diag", rich_b_mode="none", outer_model_dim=8,
+        )
+        assert model.outer_model is not None
+        model.outer_model.state.fill_(3.0)
+        ids = torch.randint(0, 64, (2, 6))
+
+        h_off = model.encode(ids, memory_mode="off")
+        h_packet = model.encode(ids, memory_mode="packet")
+
+        assert torch.allclose(h_off, h_packet, atol=0.0, rtol=0.0)
+
+    def test_encode_packet_mode_injects_residual_without_controller_head(self) -> None:
+        torch.manual_seed(34)
+        model = ChaosStudentLM(
+            vocab_size=64, dim=8, num_layers=1, ff_mult=2,
+            a_mode="diag", rich_b_mode="none", outer_model_dim=8,
+        )
+        ids = torch.randint(0, 64, (2, 6))
+        residual = torch.randn(2, 1, 8)
+        gate = torch.ones(2, 6)
+
+        h_off = model.encode(ids, memory_mode="off")
+        out = model.encode(
+            ids,
+            memory_mode="packet",
+            episodic_residual=residual,
+            episodic_gate=gate,
+            return_memory_meta=True,
+        )
+
+        assert isinstance(out, dict)
+        assert out["hidden"].shape == h_off.shape
+        assert not torch.allclose(h_off, out["hidden"])
+        assert out["memory_meta"]["memory_gate"].shape == (2, 6)
+        assert out["memory_meta"]["memory_residual"].shape == (2, 1, 8)
+
+    def test_force_on_memory_residual_can_replay_as_packet(self) -> None:
+        torch.manual_seed(35)
         model = ChaosStudentLM(
             vocab_size=64, dim=8, num_layers=1, ff_mult=2,
             a_mode="diag", rich_b_mode="none", outer_model_dim=8,
@@ -170,37 +234,36 @@ class TestChaosStudentLM(unittest.TestCase):
         assert model.outer_model is not None
         model.outer_model.state.fill_(2.0)
         ids = torch.randint(0, 64, (2, 6))
-        zero_gate = torch.zeros(2, 6)
 
-        h_off = model.encode(ids, memory_mode="off")
-        h_gate0 = model.encode(
-            ids, memory_mode="teacher_gate", teacher_gate=zero_gate
-        )
-
-        assert torch.allclose(h_off, h_gate0, atol=0.0, rtol=0.0)
-
-    def test_encode_controller_mode_can_return_logits_and_meta(self) -> None:
-        torch.manual_seed(3)
-        model = ChaosStudentLM(
-            vocab_size=64, dim=8, num_layers=1, ff_mult=2,
-            a_mode="diag", rich_b_mode="none", outer_model_dim=8,
-            enable_controller=True,
-        )
-        ids = torch.randint(0, 64, (2, 6))
-
-        out = model.encode(
+        force = model.encode(
             ids,
-            memory_mode="controller",
-            cache_read_cutoff=123,
-            return_controller_logits=True,
+            memory_mode="force_on",
             return_memory_meta=True,
         )
+        assert isinstance(force, dict)
+        residual = force["memory_meta"]["memory_residual"]
+        gate = force["memory_meta"]["memory_gate"]
+        assert residual is not None
+        assert gate is not None
+        assert residual.abs().sum() > 0
 
-        assert isinstance(out, dict)
-        assert out["hidden"].shape == (2, 6, 8)
-        assert out["controller_logits"].shape == (2, 6)
-        assert out["memory_meta"]["cache_read_cutoff"] == 123
-        assert out["memory_meta"]["memory_gate"].shape == (2, 6)
+        packet = model.encode(
+            ids,
+            memory_mode="packet",
+            episodic_residual=residual,
+            episodic_gate=gate,
+        )
+        off = model.encode(ids, memory_mode="off")
+        zero_gate = torch.zeros_like(gate)
+        packet_zero = model.encode(
+            ids,
+            memory_mode="packet",
+            episodic_residual=residual,
+            episodic_gate=zero_gate,
+        )
+
+        assert torch.allclose(packet, force["hidden"], atol=0.0, rtol=0.0)
+        assert torch.allclose(packet_zero, off, atol=0.0, rtol=0.0)
 
     def test_encode_cache_read_cutoff_filters_append_only_multislot_reads(self) -> None:
         torch.manual_seed(4)

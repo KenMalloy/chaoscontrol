@@ -1410,7 +1410,6 @@ def build_crct_v1_matrix(
     }
     crct_lock = {
         "crct_enabled": True,
-        "crct_lambda_controller": 0.01,
         "crct_lm_weight_alpha_max": 0.15,
         "crct_lm_weight_strength": 0.10,
         "crct_lm_weight_w_max": 1.20,
@@ -1440,8 +1439,6 @@ def build_crct_v1_matrix(
         "buffer_mode": "append_only",
         "retrieval_mode": "softmax_all",
         "retrieval_k": 16,
-        "enable_controller": True,
-        "controller_hidden_dim": 64,
         "train_sampling_mode": "random",
         "compile_full_path": False,
         "cuda_graph_mode": "none",

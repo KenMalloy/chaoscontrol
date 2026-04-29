@@ -4,14 +4,15 @@ These tests pin the seams that can silently invalidate CRCT:
 
 * Exp24's imported model builder must stop hardcoding a bare SSM when
   ``crct_enabled=True``.
-* The fast runner must compose weighted LM CE plus controller BCE from a
-  dense teacher payload.
+* The fast runner must compose weighted LM CE plus residual packet injection
+  from a dense teacher payload without putting slot reads on the trunk path.
 * The oracle path must append real memory so ``force_on`` can differ from
   ``off`` after one scored batch.
 """
 from __future__ import annotations
 
 import importlib.util
+import copy
 import json
 import os
 import socket
@@ -72,8 +73,6 @@ def _tiny_crct_model() -> ChaosStudentLM:
         outer_model_type="multislot",
         outer_max_slots=64,
         buffer_mode="append_only",
-        enable_controller=True,
-        controller_hidden_dim=4,
     )
     model.train()
     return model
@@ -91,8 +90,6 @@ def test_crct_fast_path_allows_bucket_prototypes_as_sidecar_prior() -> None:
         outer_model_type="multislot",
         outer_max_slots=64,
         buffer_mode="append_only",
-        enable_controller=True,
-        controller_hidden_dim=4,
         bucket_prototypes=True,
         prototype_dim=4,
     )
@@ -440,7 +437,7 @@ def _worker_async_crct_train_loop(
         dist.destroy_process_group()
 
 
-def test_exp24_model_builder_threads_crct_memory_and_controller() -> None:
+def test_exp24_model_builder_threads_crct_memory_without_trunk_controller() -> None:
     mod = _load_module("runner_exp21_crct_test", RUNNER21_PATH)
     cfg = {
         "vocab_size": 32,
@@ -450,18 +447,17 @@ def test_exp24_model_builder_threads_crct_memory_and_controller() -> None:
         "crct_enabled": True,
         "outer_model_dim": 4,
         "outer_max_slots": 128,
-        "controller_hidden_dim": 4,
     }
 
     model = mod.build_model(cfg, torch.device("cpu"), torch.float32)
 
-    assert model.memory_controller is not None
+    assert not hasattr(model, "memory_controller")
     assert model.outer_model is not None
     assert model.outer_model.max_slots == 128
     assert model.buffer_mode == "append_only"
 
 
-def test_crct_train_step_uses_payload_and_trains_controller() -> None:
+def test_crct_train_step_uses_payload_packet_without_controller_hot_path() -> None:
     mod = _load_module("runner_fast_path_crct_train_step", RUNNER_PATH)
     model = _tiny_crct_model()
     inputs = torch.randint(0, 32, (2, 5), dtype=torch.int32)
@@ -470,6 +466,8 @@ def test_crct_train_step_uses_payload_and_trains_controller() -> None:
         "target": torch.full((2, 5), 0.85),
         "confidence": torch.ones(2, 5),
         "loss_weight": torch.linspace(0.9, 1.1, 10).reshape(2, 5),
+        "memory_residual": torch.randn(2, 1, 8),
+        "memory_gate": torch.ones(2, 5),
     }
 
     loss = mod._run_train_step(
@@ -483,16 +481,12 @@ def test_crct_train_step_uses_payload_and_trains_controller() -> None:
         lm_head_backward_mode="single",
         crct_enabled=True,
         crct_payload=payload,
-        crct_lambda_controller=0.1,
     )
 
     assert torch.isfinite(loss)
-    assert model.memory_controller is not None
-    grad = model.memory_controller.net[0].weight.grad
-    assert grad is not None
-    assert float(grad.abs().sum()) > 0.0
-    # Rank 3 is the only CRCT memory writer. Train ranks can distill the
-    # controller from async payloads, but must not mutate local memory.
+    assert not hasattr(model, "memory_controller")
+    # Rank 3 is the only CRCT memory writer. Train ranks consume a residual
+    # packet from async payloads, but must not mutate local memory.
     assert len(model.outer_model._slots) == 0
 
 
@@ -517,6 +511,8 @@ def test_crct_train_step_does_not_read_slots_on_trunk_path() -> None:
         "target": torch.full((2, 5), 0.85),
         "confidence": torch.ones(2, 5),
         "loss_weight": torch.ones(2, 5),
+        "memory_residual": torch.randn(2, 1, 8),
+        "memory_gate": torch.ones(2, 5),
     }
 
     loss = mod._run_train_step(
@@ -530,14 +526,10 @@ def test_crct_train_step_does_not_read_slots_on_trunk_path() -> None:
         lm_head_backward_mode="single",
         crct_enabled=True,
         crct_payload=payload,
-        crct_lambda_controller=0.1,
     )
 
     assert torch.isfinite(loss)
-    assert model.memory_controller is not None
-    grad = model.memory_controller.net[0].weight.grad
-    assert grad is not None
-    assert float(grad.abs().sum()) > 0.0
+    assert not hasattr(model, "memory_controller")
 
 
 def test_crct_mailbox_transport_matches_stored_batch(tmp_path) -> None:
@@ -563,6 +555,9 @@ def test_crct_mailbox_transport_matches_stored_batch(tmp_path) -> None:
     targets = ((base + 1) % 32).to(dtype=torch.long)
 
     assert rank0.begin_step(inputs=inputs, targets=targets, step=0) is None
+    assert rank0._request_write_thread is not None
+    rank0._request_write_thread.join(timeout=5.0)
+    assert not rank0._request_write_thread.is_alive()
     assert rank3.begin_step(inputs=inputs, targets=targets, step=0) is None
     rank3.after_optimizer_step(
         model=model,
@@ -578,6 +573,9 @@ def test_crct_mailbox_transport_matches_stored_batch(tmp_path) -> None:
     )
 
     ready = rank0.begin_step(inputs=inputs + 3, targets=targets + 3, step=1)
+    assert rank0._request_write_thread is not None
+    rank0._request_write_thread.join(timeout=5.0)
+    assert not rank0._request_write_thread.is_alive()
     assert ready is not None
     payload, train_inputs, train_targets = ready
     assert int(payload["step_id"].item()) == 0
@@ -588,7 +586,57 @@ def test_crct_mailbox_transport_matches_stored_batch(tmp_path) -> None:
     diag3 = rank3.diagnostics()
     assert diag0["mode"] == "async_rank0_memory_mailbox"
     assert diag0["payloads_used"] == 1
+    assert diag0["request_stage_started"] == 2
+    assert diag0["request_writer_cpu_copy_seconds_max"] >= 0.0
+    assert diag0["request_host_stage_bytes"] == (
+        inputs.shape[0] * (inputs.shape[1] + 1) * 4
+    )
+    assert isinstance(diag0["request_host_pinned"], bool)
+    assert diag0["local_batch_gpu_clones"] == 0
     assert diag3["payloads_scored"] == 1
+
+
+def test_crct_mailbox_transport_round_trips_memory_packet(tmp_path) -> None:
+    mod = _load_module("runner_fast_path_crct_mailbox_packet", RUNNER_PATH)
+    kwargs = {
+        "world_size": 4,
+        "mailbox_dir": str(tmp_path),
+        "payload_shape": (1, 2, 5),
+        "full_ids_shape": (2, 6),
+        "device": torch.device("cpu"),
+        "payload_dtype": torch.float32,
+        "max_local_batches": 8,
+        "max_payload_lag_steps": 8,
+        "score_interval_steps": 1,
+    }
+    rank0 = mod._CrctMailboxTeacherTransport(rank=0, **kwargs)
+    rank3 = mod._CrctMailboxTeacherTransport(rank=3, **kwargs)
+    inputs = torch.randint(0, 32, (2, 5), dtype=torch.int32)
+    targets = torch.randint(0, 32, (2, 5), dtype=torch.long)
+    rank0.local_batches_by_step[0] = (inputs, targets)
+    rank0.local_batch_order.append(0)
+    residual = torch.randn(2, 1, 8)
+    gate = torch.full((2, 5), 0.75)
+
+    rank3._write_result(
+        request_step=0,
+        scored={
+            "target": torch.full((2, 5), 0.85),
+            "confidence": torch.ones(2, 5),
+            "loss_weight": torch.ones(2, 5),
+            "utility": torch.zeros(2, 5),
+            "memory_residual": residual,
+            "memory_gate": gate,
+        },
+    )
+
+    ready = rank0._poll_results(current_step=1)
+    assert ready is not None
+    payload, _inputs, _targets = ready
+    assert torch.allclose(payload["memory_residual"], residual)
+    assert torch.allclose(payload["memory_gate"], gate)
+    assert rank3.diagnostics()["memory_packets_sent"] == 1
+    assert rank0.diagnostics()["memory_packets_received"] == 1
 
 
 def test_crct_mailbox_weight_snapshot_applies_latest_model(tmp_path) -> None:
@@ -619,6 +667,13 @@ def test_crct_mailbox_weight_snapshot_applies_latest_model(tmp_path) -> None:
         for name, tensor in model3.state_dict().items()
     }
     rank0.maybe_publish_weight_snapshot(model=model0, step=7)
+    staged_expected = {
+        name: tensor.detach().clone()
+        for name, tensor in model0.state_dict().items()
+    }
+    with torch.no_grad():
+        for param in model0.parameters():
+            param.fill_(0.75)
     assert rank0._weight_publish_thread is not None
     rank0._weight_publish_thread.join(timeout=5.0)
     assert not rank0._weight_publish_thread.is_alive()
@@ -627,10 +682,19 @@ def test_crct_mailbox_weight_snapshot_applies_latest_model(tmp_path) -> None:
 
     for name, tensor in model3.state_dict().items():
         assert not torch.equal(tensor, before[name])
-        assert torch.equal(tensor, model0.state_dict()[name])
+        assert torch.equal(tensor, staged_expected[name])
     diag0 = rank0.diagnostics()
     diag3 = rank3.diagnostics()
     assert diag0["weight_snapshot_published"] == 1
+    assert diag0["weight_snapshot_stage_started"] == 1
+    assert diag0["weight_snapshot_hotpath_cpu_copies"] == 0
+    assert diag0["weight_snapshot_stage_gpu_seconds_max"] >= 0.0
+    assert diag0["weight_snapshot_writer_cpu_copy_seconds_max"] >= 0.0
+    host_bytes = (
+        diag0["weight_snapshot_host_pinned_bytes"]
+        + diag0["weight_snapshot_host_pageable_bytes"]
+    )
+    assert host_bytes == diag0["weight_snapshot_stage_bytes"]
     assert diag0["mailbox_write_seconds_max"] == 0.0
     assert diag3["weight_snapshot_applied"] == 1
     assert diag3["weight_snapshot_last_applied_step"] == 7
@@ -639,6 +703,104 @@ def test_crct_mailbox_weight_snapshot_applies_latest_model(tmp_path) -> None:
     diag3_after = rank3.diagnostics()
     assert diag3_after["weight_snapshot_applied"] == 1
     assert diag3_after["weight_snapshot_stat_skips"] == 1
+
+
+def test_crct_mailbox_weight_snapshot_applies_fastslow_decision(tmp_path) -> None:
+    mod = _load_module("runner_fast_path_crct_mailbox_fastslow", RUNNER_PATH)
+    kwargs = {
+        "world_size": 4,
+        "mailbox_dir": str(tmp_path),
+        "payload_shape": (1, 2, 5),
+        "full_ids_shape": (2, 6),
+        "device": torch.device("cpu"),
+        "payload_dtype": torch.float32,
+        "max_local_batches": 8,
+        "max_payload_lag_steps": 8,
+        "score_interval_steps": 1,
+    }
+    rank0 = mod._CrctMailboxTeacherTransport(rank=0, **kwargs)
+    rank3 = mod._CrctMailboxTeacherTransport(rank=3, **kwargs)
+    model0 = torch.nn.Sequential(torch.nn.Linear(4, 4, bias=False))
+    model3 = torch.nn.Sequential(torch.nn.Linear(4, 4, bias=False))
+    with torch.no_grad():
+        model0[0].weight.fill_(0.25)
+        model3[0].weight.fill_(-0.5)
+    fast_slow = mod.FastSlowConsolidator.from_config(
+        model3,
+        {
+            "fast_slow_enabled": True,
+            "fast_slow_interval": 0,
+            "fast_slow_alpha": 0.25,
+        },
+    )
+    decision = mod.FastSlowDecision(
+        mode="learned",
+        accepted=True,
+        alpha=0.5,
+        gate=1.0,
+        effective_alpha=0.5,
+        step=8,
+        reason="test",
+    )
+
+    rank0.maybe_publish_weight_snapshot(
+        model=model0,
+        step=7,
+        fast_slow_decision=decision,
+    )
+    assert rank0._weight_publish_thread is not None
+    rank0._weight_publish_thread.join(timeout=5.0)
+    assert not rank0._weight_publish_thread.is_alive()
+
+    rank3.poll_weight_snapshot(model=model3, step=11, fast_slow=fast_slow)
+
+    assert torch.equal(model3.state_dict()["0.weight"], model0.state_dict()["0.weight"])
+    expected_slow = torch.full_like(model3[0].weight, -0.125)
+    torch.testing.assert_close(fast_slow.slow_state["0.weight"], expected_slow)
+    assert rank0.diagnostics()["fast_slow_snapshot_decisions_published"] == 1
+    assert rank3.diagnostics()["fast_slow_snapshot_decisions_applied"] == 1
+
+
+def test_fastslow_result_payload_applies_memory_rank_decision() -> None:
+    mod = _load_module("runner_fast_path_fastslow_result_decision", RUNNER_PATH)
+    model = torch.nn.Sequential(torch.nn.Linear(4, 4, bias=False))
+    with torch.no_grad():
+        model[0].weight.fill_(1.0)
+    fast_slow = mod.FastSlowConsolidator.from_config(
+        model,
+        {
+            "fast_slow_enabled": True,
+            "fast_slow_interval": 0,
+            "fast_slow_alpha": 0.25,
+        },
+    )
+    with torch.no_grad():
+        model[0].weight.fill_(3.0)
+    decision = mod.FastSlowDecision(
+        mode="learned",
+        accepted=True,
+        alpha=0.5,
+        gate=1.0,
+        effective_alpha=0.5,
+        step=12,
+        reason="memory_rank_oracle",
+    )
+
+    metrics = {}
+    applied = mod._apply_fast_slow_result_payload(
+        model=model,
+        fast_slow=fast_slow,
+        payload={"fast_slow_decision": mod.fast_slow_decision_to_dict(decision)},
+        metrics=metrics,
+    )
+
+    assert applied is not None
+    assert applied.reason == "memory_rank_oracle"
+    assert metrics["fast_slow_result_decisions_applied"] == 1
+    torch.testing.assert_close(
+        fast_slow.slow_state["0.weight"],
+        torch.full_like(model[0].weight, 2.0),
+    )
 
 
 def test_crct_mailbox_weight_snapshot_drops_when_writer_busy(tmp_path) -> None:
@@ -675,6 +837,86 @@ def test_crct_mailbox_weight_snapshot_drops_when_writer_busy(tmp_path) -> None:
     assert diag["weight_snapshot_published"] == 0
 
 
+def test_crct_mailbox_request_drops_when_writer_busy(tmp_path) -> None:
+    mod = _load_module("runner_fast_path_crct_mailbox_request_busy", RUNNER_PATH)
+    rank0 = mod._CrctMailboxTeacherTransport(
+        rank=0,
+        world_size=4,
+        mailbox_dir=str(tmp_path),
+        payload_shape=(1, 2, 5),
+        full_ids_shape=(2, 6),
+        device=torch.device("cpu"),
+        payload_dtype=torch.float32,
+        max_local_batches=8,
+        max_payload_lag_steps=8,
+        score_interval_steps=1,
+    )
+    blocker_started = threading.Event()
+    blocker_release = threading.Event()
+
+    def _block_writer() -> None:
+        blocker_started.set()
+        blocker_release.wait(timeout=5.0)
+
+    rank0._request_write_thread = threading.Thread(target=_block_writer)
+    rank0._request_write_thread.start()
+    assert blocker_started.wait(timeout=1.0)
+    base = torch.arange(10, dtype=torch.long).reshape(2, 5)
+    rank0.begin_step(
+        inputs=(base % 32).to(dtype=torch.int32),
+        targets=((base + 1) % 32).to(dtype=torch.long),
+        step=0,
+    )
+    blocker_release.set()
+    rank0._request_write_thread.join(timeout=1.0)
+
+    diag = rank0.diagnostics()
+    assert diag["request_write_skipped_busy"] == 1
+    assert diag["requests_started"] == 0
+
+
+def test_fastslow_readiness_oracle_scores_against_slow_mirror_without_mutating_fast_model() -> None:
+    mod = _load_module("runner_fast_path_fastslow_readiness", RUNNER_PATH)
+    model = _tiny_crct_model()
+    fast_slow = mod.FastSlowConsolidator.from_config(
+        model,
+        {
+            "fast_slow_enabled": True,
+            "fast_slow_interval": 0,
+            "fast_slow_alpha": 0.25,
+        },
+    )
+    with torch.no_grad():
+        for param in model.parameters():
+            param.add_(torch.randn_like(param) * 0.01)
+    slow_model = copy.deepcopy(model)
+    fast_slow.copy_slow_to_model(slow_model)
+    fast_state = {
+        name: tensor.detach().clone()
+        for name, tensor in model.state_dict().items()
+        if torch.is_tensor(tensor)
+    }
+    full_ids = (torch.arange(24).reshape(3, 8) % 32).to(torch.int32)
+
+    evidence = mod._score_fast_slow_readiness_inline(
+        model=model,
+        slow_model=slow_model,
+        fast_slow=fast_slow,
+        input_ids=full_ids,
+        step=9,
+        chunk_size=4,
+    )
+
+    assert evidence is not None
+    assert evidence["credit_key"] == -1
+    assert evidence["valid_tokens"] > 0
+    assert evidence["score_seconds"] >= 0.0
+    assert torch.isfinite(torch.tensor(float(evidence["delta_nll"])))
+    for name, tensor in model.state_dict().items():
+        if torch.is_tensor(tensor):
+            torch.testing.assert_close(tensor, fast_state[name])
+
+
 def test_crct_teacher_payload_appends_memory_after_scoring() -> None:
     mod = _load_module("runner_fast_path_crct_payload", RUNNER_PATH)
     model = _tiny_crct_model()
@@ -708,6 +950,24 @@ def test_crct_teacher_payload_appends_memory_after_scoring() -> None:
         h_mem = model.encode(inputs, memory_mode="force_on")
     assert not torch.allclose(h_off, h_mem)
 
+    second = mod._crct_score_payload_inline(
+        model=model,
+        cache=cache,
+        scarcity_optimizer=None,
+        inputs=inputs,
+        targets=targets,
+        step=1,
+        total_steps=10,
+        tau=0.1,
+        strength=0.1,
+        w_max=1.2,
+        alpha_max=0.15,
+        memory_write_tokens=3,
+        update_model_memory_after=True,
+    )
+    assert second["memory_residual"].shape == (2, 1, model.dim)
+    assert second["memory_gate"].shape == targets.shape
+
 
 def test_crct_fail_open_skips_controller_hot_path() -> None:
     mod = _load_module("runner_fast_path_crct_fail_open", RUNNER_PATH)
@@ -728,11 +988,7 @@ def test_crct_fail_open_skips_controller_hot_path() -> None:
         crct_payload=None,
     )
 
-    assert model.memory_controller is not None
-    # Fail-open steps are hot-path trunk steps. With no teacher payload, the
-    # controller head is intentionally skipped rather than run for a formal
-    # zero gradient.
-    assert model.memory_controller.net[0].weight.grad is None
+    assert not hasattr(model, "memory_controller")
 
 
 def test_crct_rejects_async_grad_reducer_before_collectives() -> None:
@@ -789,7 +1045,6 @@ def test_crct_optimizer_routes_aux_matrices_to_adamw_fallback() -> None:
     assert matrix_names is not None
     assert "embed.weight" not in matrix_names
     assert "lm_head.weight" not in matrix_names
-    assert "memory_controller.net.0.weight" not in matrix_names
     assert "outer_model.encoder.weight" not in matrix_names
     assert any(name.startswith("layers.") for name in matrix_names)
 
@@ -889,7 +1144,7 @@ def test_crct_async_teacher_transport_wired_into_train_loop() -> None:
     assert crct["teacher_param_sync_interval_steps"] == 1
     assert crct["teacher_param_syncs"] >= 1
     assert crct["memory_owner"] == "rank3_teacher_only"
-    assert crct["trunk_memory_mode"] == "off"
+    assert crct["trunk_memory_mode"] == "packet"
     assert crct["grad_sync_group"] == "train_ranks"
     assert crct["memory_rank_joins_grad"] is False
     assert crct["stop_sync_group"] == "train_ranks"
