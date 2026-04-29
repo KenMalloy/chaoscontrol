@@ -683,6 +683,12 @@ class ReplayEvictionLoop:
         self._last_frame_age_seconds: float = 0.0
         self._frame_age_seconds_sum: float = 0.0
         self._frame_age_seconds_max: float = 0.0
+        self._last_stream_parallelism: int = 0
+        self._stream_parallelism_sum: int = 0
+        self._stream_parallelism_samples: int = 0
+        self._stream_parallelism_max: int = 0
+        self._last_active_stream_ids: list[int] = []
+        self._active_slot_stream_ids: dict[int, int] = {}
         self._stream_ticks: dict[int, int] = {i: 0 for i in range(self._memory_streams)}
         self._stream_work_items: dict[int, int] = {i: 0 for i in range(self._memory_streams)}
         self._stream_probe_seconds: dict[int, float] = {i: 0.0 for i in range(self._memory_streams)}
@@ -773,12 +779,12 @@ class ReplayEvictionLoop:
             return table.visible_indices(read_cutoff=None)
         return list(range(len(getattr(outer, "_slots", []))))
 
-    def _select_frame_and_slot_work(
+    def _select_frame_and_stream_work(
         self,
         *,
         outer: Any,
         step: int,
-    ) -> tuple[ProbeFrame | None, list[int]]:
+    ) -> tuple[ProbeFrame | None, list[tuple[int, list[int]]]]:
         self._drop_stale_frames(step)
         visible = self._visible_slot_indices(outer)
         if not visible:
@@ -789,9 +795,17 @@ class ReplayEvictionLoop:
                 continue
             start = self._slot_rr_cursor % len(remaining)
             ordered = remaining[start:] + remaining[:start]
-            work = ordered[: self._slot_work_chunk_size]
-            self._slot_rr_cursor = (self._slot_rr_cursor + len(work)) % max(1, len(remaining))
-            return frame, work
+            max_work = self._slot_work_chunk_size * self._memory_streams
+            selected = ordered[:max_work]
+            self._slot_rr_cursor = (self._slot_rr_cursor + len(selected)) % max(1, len(remaining))
+            stream_work: list[tuple[int, list[int]]] = []
+            for lane, offset in enumerate(range(0, len(selected), self._slot_work_chunk_size)):
+                work = selected[offset: offset + self._slot_work_chunk_size]
+                if not work:
+                    continue
+                stream_id = (int(frame.stream_id) + lane) % self._memory_streams
+                stream_work.append((stream_id, work))
+            return frame, stream_work
         return None, []
 
     def _mark_frame_slots_processed(
@@ -827,8 +841,9 @@ class ReplayEvictionLoop:
         outer = getattr(model, "outer_model", None)
         if outer is None:
             return TickResult()
+        self._active_slot_stream_ids = {}
         select_t0 = time.monotonic()
-        frame, slot_work = self._select_frame_and_slot_work(outer=outer, step=step)
+        frame, stream_work = self._select_frame_and_stream_work(outer=outer, step=step)
         self._last_stage_seconds["select"] = time.monotonic() - select_t0
         self._stage_seconds_total["select"] += self._last_stage_seconds["select"]
         self._last_queue_depth = len(self._probe_frames)
@@ -838,9 +853,21 @@ class ReplayEvictionLoop:
         if frame is None:
             self._probe_ticks_skipped_no_frame += 1
             return TickResult()
+        slot_work = [
+            int(phys_idx)
+            for _stream_id, work in stream_work
+            for phys_idx in work
+        ]
         if not slot_work:
             self._probe_ticks_skipped_no_slot_work += 1
             return TickResult()
+        active_stream_ids = [int(stream_id) for stream_id, _work in stream_work]
+        stream_parallelism = len(active_stream_ids)
+        self._last_stream_parallelism = stream_parallelism
+        self._stream_parallelism_sum += stream_parallelism
+        self._stream_parallelism_samples += 1
+        self._stream_parallelism_max = max(self._stream_parallelism_max, stream_parallelism)
+        self._last_active_stream_ids = list(active_stream_ids)
         frame_age_steps = max(0, int(step) - int(frame.step))
         frame_age_seconds = max(0.0, time.monotonic() - frame.ingested_at)
         self._last_frame_age_steps = frame_age_steps
@@ -856,13 +883,22 @@ class ReplayEvictionLoop:
         self._probe_cue = frame.cue
         self._probe_cache_cutoff = frame.cache_read_cutoff
         self._probe_step = frame.step
-        self._probe_stream_id = frame.stream_id
+        self._probe_stream_id = active_stream_ids[0] if active_stream_ids else frame.stream_id
         self._last_slot_work_items = len(slot_work)
         self._slot_work_items_total += len(slot_work)
-        self._stream_ticks[frame.stream_id] = self._stream_ticks.get(frame.stream_id, 0) + 1
-        self._stream_work_items[frame.stream_id] = (
-            self._stream_work_items.get(frame.stream_id, 0) + len(slot_work)
-        )
+        table_for_streams = getattr(outer, "table", None)
+        for stream_id, work in stream_work:
+            self._stream_ticks[stream_id] = self._stream_ticks.get(stream_id, 0) + 1
+            self._stream_work_items[stream_id] = (
+                self._stream_work_items.get(stream_id, 0) + len(work)
+            )
+            for phys_idx in work:
+                if table_for_streams is not None:
+                    sid = table_for_streams.physical_to_slot_id(phys_idx)
+                else:
+                    sid = int(phys_idx)
+                if sid is not None:
+                    self._active_slot_stream_ids[int(sid)] = int(stream_id)
         self._trace_frame_event(
             "frame_dispatch",
             frame,
@@ -870,6 +906,8 @@ class ReplayEvictionLoop:
             slot_work_items=len(slot_work),
             frame_age_steps=frame_age_steps,
             frame_age_seconds=frame_age_seconds,
+            stream_ids=active_stream_ids,
+            stream_parallelism=stream_parallelism,
         )
 
         # Run counterfactual probe
@@ -888,10 +926,11 @@ class ReplayEvictionLoop:
         self._probe_seconds_total += self._last_probe_seconds
         self._last_stage_seconds["probe"] = self._last_probe_seconds
         self._stage_seconds_total["probe"] += self._last_probe_seconds
-        self._stream_probe_seconds[frame.stream_id] = (
-            self._stream_probe_seconds.get(frame.stream_id, 0.0)
-            + self._last_probe_seconds
-        )
+        for stream_id in active_stream_ids:
+            self._stream_probe_seconds[stream_id] = (
+                self._stream_probe_seconds.get(stream_id, 0.0)
+                + self._last_probe_seconds
+            )
         if self._last_probe_seconds > self._max_seconds:
             self._probe_over_budget_total += 1
 
@@ -1951,7 +1990,11 @@ class ReplayEvictionLoop:
             "frame_step": self._active_frame_step,
             "frame_age_steps": self._last_frame_age_steps,
             "frame_age_seconds": self._last_frame_age_seconds,
-            "stream_id": self._probe_stream_id,
+            "stream_id": self._active_slot_stream_ids.get(
+                int(slot_id), self._probe_stream_id
+            ),
+            "active_stream_ids": list(self._last_active_stream_ids),
+            "stream_parallelism": self._last_stream_parallelism,
             "queue_depth": self._last_queue_depth,
             "slot_work_items": self._last_slot_work_items,
             "probe_seconds": self._last_probe_seconds,
@@ -2011,7 +2054,11 @@ class ReplayEvictionLoop:
             "frame_step": self._active_frame_step,
             "frame_age_steps": self._last_frame_age_steps,
             "frame_age_seconds": self._last_frame_age_seconds,
-            "stream_id": self._probe_stream_id,
+            "stream_id": self._active_slot_stream_ids.get(
+                int(slot_id), self._probe_stream_id
+            ),
+            "active_stream_ids": list(self._last_active_stream_ids),
+            "stream_parallelism": self._last_stream_parallelism,
             "queue_depth": self._last_queue_depth,
             "slot_work_items": self._last_slot_work_items,
             "proxy_score": float(proxy_score),
@@ -2055,6 +2102,8 @@ class ReplayEvictionLoop:
         slot_work_items: int = 0,
         frame_age_steps: int = 0,
         frame_age_seconds: float = 0.0,
+        stream_ids: list[int] | None = None,
+        stream_parallelism: int = 1,
     ) -> None:
         if self._trace_path is None:
             return
@@ -2067,6 +2116,12 @@ class ReplayEvictionLoop:
             "frame_id": int(frame.frame_id),
             "frame_step": int(frame.step),
             "stream_id": int(frame.stream_id),
+            "active_stream_ids": (
+                [int(sid) for sid in stream_ids]
+                if stream_ids is not None
+                else [int(frame.stream_id)]
+            ),
+            "stream_parallelism": int(stream_parallelism),
             "queue_depth": int(queue_depth),
             "slot_work_items": int(slot_work_items),
             "frame_age_steps": int(frame_age_steps),
@@ -2096,6 +2151,11 @@ class ReplayEvictionLoop:
             if self._queue_depth_samples
             else 0.0
         )
+        stream_parallelism_mean = (
+            self._stream_parallelism_sum / self._stream_parallelism_samples
+            if self._stream_parallelism_samples
+            else 0.0
+        )
         frame_age_steps_mean = (
             self._frame_age_steps_sum / self._replays_total
             if self._replays_total
@@ -2116,7 +2176,15 @@ class ReplayEvictionLoop:
             "memory_streams": self._memory_streams,
             "memory_streams_requested": self._memory_streams,
             "memory_streams_active": True,
-            "memory_streams_note": "probe-frame stream ids actively partition replay-maintenance work on rank 3",
+            "memory_stream_execution_mode": "vectorized_fanout_serial_sink",
+            "memory_stream_parallelism_last": self._last_stream_parallelism,
+            "memory_stream_parallelism_mean": stream_parallelism_mean,
+            "memory_stream_parallelism_max": self._stream_parallelism_max,
+            "memory_streams_note": (
+                "one replay frame is partitioned into disjoint stream lanes, "
+                "scored as a single vectorized probe, then structural "
+                "mutations are serialized through the action sink"
+            ),
             "tick_count": self._tick_count,
             "replays_total": self._replays_total,
             "evictions_total": self._evictions_total,

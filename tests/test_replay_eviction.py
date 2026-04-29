@@ -319,6 +319,10 @@ class TestReplayEvictionLoop:
         assert diag["memory_streams"] == 8
         assert diag["memory_streams_requested"] == 8
         assert diag["memory_streams_active"] is True
+        assert diag["memory_stream_execution_mode"] == "vectorized_fanout_serial_sink"
+        assert diag["memory_stream_parallelism_last"] == 0
+        assert diag["memory_stream_parallelism_mean"] == 0.0
+        assert diag["memory_stream_parallelism_max"] == 0
         assert diag["probe_buffer_size"] == 32
         assert diag["queue_depth_last"] == 0
         assert diag["slot_work_chunk_size"] == 64
@@ -445,6 +449,50 @@ class TestReplayEvictionLoop:
         assert diag["probe_frames_buffered"] == 0
         assert diag["last_visible_slots"] == 3
         assert diag["slots_untouched_past_ttl"] == 0
+
+    def test_stream_fanout_scores_multiple_chunks_in_one_tick(self, monkeypatch):
+        loop = ReplayEvictionLoop(
+            action_mode="shadow",
+            memory_streams=3,
+            slot_work_chunk_size=1,
+            oracle_confirm_top_k=0,
+        )
+        model = _StubModel(n_slots=5, use_table=True)
+        seen: list[int] = []
+
+        def fake_probe(**kwargs):
+            slot_indices = list(kwargs["score_slot_indices"])
+            seen.extend(slot_indices)
+            n = len(slot_indices)
+            return CounterfactualResult(
+                marginal_gains=torch.ones(n, 1, 2),
+                sidecar_value=torch.zeros(1, 2),
+                nll_baseline=torch.zeros(1, 2),
+                nll_no_sidecar=torch.zeros(1, 2),
+                weights_baseline=torch.ones(1, n) / max(n, 1),
+                mask=torch.ones(1, 2, dtype=torch.bool),
+                slot_indices=slot_indices,
+            )
+
+        monkeypatch.setattr(replay_eviction_mod, "counterfactual_probe", fake_probe)
+        loop.cache_probe(
+            input_ids=torch.zeros(1, 3, dtype=torch.long),
+            valid_mask=torch.ones(1, 3),
+            cache_read_cutoff=None,
+            step=0,
+        )
+
+        loop.tick(model=model, step=0)
+
+        assert seen == [0, 1, 2]
+        diag = loop.diagnostics()
+        assert diag["memory_stream_parallelism_last"] == 3
+        assert diag["memory_stream_parallelism_mean"] == 3.0
+        assert diag["memory_stream_parallelism_max"] == 3
+        assert diag["last_slot_work_items"] == 3
+        assert diag["stream_work_items"]["0"] == 1
+        assert diag["stream_work_items"]["1"] == 1
+        assert diag["stream_work_items"]["2"] == 1
 
     def test_trace_rows_capture_stream_and_decision_context(self, monkeypatch, tmp_path):
         trace_path = tmp_path / "replay_trace.ndjson"
