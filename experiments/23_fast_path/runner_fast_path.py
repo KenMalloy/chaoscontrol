@@ -1047,8 +1047,9 @@ def _crct_replay_tick_step(
     probe_step = getattr(model, "_last_crct_probe_step", None)
     if probe_step is not None:
         return int(probe_step)
-    if loop.has_probe():
-        return int(getattr(loop, "_probe_step", fallback_step))
+    loop_probe_step = loop.latest_probe_step()
+    if loop_probe_step is not None:
+        return int(loop_probe_step)
     return int(fallback_step)
 
 

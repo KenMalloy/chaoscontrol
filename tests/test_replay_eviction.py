@@ -268,6 +268,7 @@ class TestReplayEvictionLoop:
         assert loop._probe_step == 20
         assert loop._probe_stream_id == 1
         assert torch.equal(loop._probe_input_ids, second)
+        assert loop.latest_probe_step() == 20
 
     def test_min_age_respected(self):
         loop = ReplayEvictionLoop(min_slot_age_steps=1000, eviction_threshold=100.0)

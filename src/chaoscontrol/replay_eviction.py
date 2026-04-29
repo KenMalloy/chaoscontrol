@@ -760,6 +760,12 @@ class ReplayEvictionLoop:
     def has_probe(self) -> bool:
         return bool(self._probe_frames)
 
+    def latest_probe_step(self) -> int | None:
+        """Return the newest cached probe frame's train-step timestamp."""
+        if not self._probe_frames:
+            return None
+        return int(self._probe_step)
+
     def _drop_stale_frames(self, step: int) -> None:
         if self._frame_ttl_steps <= 0:
             return
