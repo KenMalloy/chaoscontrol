@@ -6848,6 +6848,10 @@ def train_fast_for_budget(
     replay_eviction_frame_ttl_steps: int = 256,
     replay_eviction_slot_work_chunk_size: int = 64,
     replay_eviction_action_agreement_count: int = 2,
+    replay_eviction_commit_policy: str = "learned",
+    replay_eviction_commit_online_lr: float = 0.05,
+    replay_eviction_commit_rule_prior_scale: float = 1.0,
+    replay_eviction_commit_temperature: float = 0.75,
     replay_eviction_arm_runtime_enabled: bool = False,
     replay_eviction_arm_runtime_namespace: str = "",
 ) -> dict[str, Any]:
@@ -7551,6 +7555,10 @@ def train_fast_for_budget(
             frame_ttl_steps=int(replay_eviction_frame_ttl_steps),
             slot_work_chunk_size=int(replay_eviction_slot_work_chunk_size),
             action_agreement_count=int(replay_eviction_action_agreement_count),
+            commit_policy=str(replay_eviction_commit_policy),
+            commit_online_lr=float(replay_eviction_commit_online_lr),
+            commit_rule_prior_scale=float(replay_eviction_commit_rule_prior_scale),
+            commit_temperature=float(replay_eviction_commit_temperature),
             arm_runtime_enabled=(
                 bool(replay_eviction_arm_runtime_enabled)
                 and int(rank_) == int(world_size_) - 1
@@ -9145,6 +9153,14 @@ def _warmup(
         replay_eviction_frame_ttl_steps=int(config.get("replay_eviction_frame_ttl_steps", 256)),
         replay_eviction_slot_work_chunk_size=int(config.get("replay_eviction_slot_work_chunk_size", 64)),
         replay_eviction_action_agreement_count=int(config.get("replay_eviction_action_agreement_count", 2)),
+        replay_eviction_commit_policy=str(config.get("replay_eviction_commit_policy", "learned")),
+        replay_eviction_commit_online_lr=float(config.get("replay_eviction_commit_online_lr", 0.05)),
+        replay_eviction_commit_rule_prior_scale=float(
+            config.get("replay_eviction_commit_rule_prior_scale", 1.0)
+        ),
+        replay_eviction_commit_temperature=float(
+            config.get("replay_eviction_commit_temperature", 0.75)
+        ),
         replay_eviction_arm_runtime_enabled=bool(
             config.get("replay_eviction_arm_runtime_enabled", False)
         ),
@@ -9747,6 +9763,14 @@ def run_condition(
         replay_eviction_frame_ttl_steps=int(config.get("replay_eviction_frame_ttl_steps", 256)),
         replay_eviction_slot_work_chunk_size=int(config.get("replay_eviction_slot_work_chunk_size", 64)),
         replay_eviction_action_agreement_count=int(config.get("replay_eviction_action_agreement_count", 2)),
+        replay_eviction_commit_policy=str(config.get("replay_eviction_commit_policy", "learned")),
+        replay_eviction_commit_online_lr=float(config.get("replay_eviction_commit_online_lr", 0.05)),
+        replay_eviction_commit_rule_prior_scale=float(
+            config.get("replay_eviction_commit_rule_prior_scale", 1.0)
+        ),
+        replay_eviction_commit_temperature=float(
+            config.get("replay_eviction_commit_temperature", 0.75)
+        ),
         replay_eviction_arm_runtime_enabled=bool(
             config.get("replay_eviction_arm_runtime_enabled", False)
         ),

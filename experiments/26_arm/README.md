@@ -3,8 +3,8 @@
 Headline measurement of the streaming Adaptive Residual Memory architecture
 on top of CRCT. Replaces exp24's training-time-bundle umbrella with a
 focused staged experiment: first run a short runtime smoke, observe signal
-distributions in shadow mode, calibrate thresholds from observed percentiles,
-then run the 5-arm headline matrix.
+distributions in shadow mode, calibrate threshold counterfactuals from
+observed percentiles, then run the 4-arm headline matrix.
 
 Exp26 locks the trunk at `model_dim=384`. That is the largest comfortable
 increase over the exp24 `256` lock under the 16 MB artifact budget with the
@@ -29,16 +29,18 @@ records `utility_ema`, `peak_utility`, `peak_sharpness`, `marginal_gain_ema`,
 
 **Stage 2 — analysis.** `calibrate.analyze` reads the trace, computes
 percentile summaries per signal, and writes `calibration/manifest.json`
-with two threshold sets:
+with two threshold-counterfactual sets:
 
 - `thresholds_balanced` — anchored to p50 utility, p75 peak, p75 drift.
 - `thresholds_aggressive` — anchored to p75 utility, p25 peak, p25 drift.
 
 Both ride on the same observed distributions; they differ only in where on
-the percentile scale each threshold sits.
+the percentile scale each threshold sits. They are not active commit regimes.
 
-**Stage 3 — headline.** `build_arm_v1_matrix` reads the manifest and folds
-calibrated thresholds into the active arms.
+**Stage 3 — headline.** `build_arm_v1_matrix` reads the manifest when present
+and folds balanced thresholds into the rule-prior features and trace
+counterfactuals. The active commit decision is owned by the learned Full-A
+action simplex; thresholds no longer create balanced/aggressive active arms.
 
 ## Arms
 
@@ -47,11 +49,12 @@ calibrated thresholds into the active arms.
 | `arm_a_fastslow_control` | locked Phase-0 trunk, no CRCT, no maintenance | — | — |
 | `arm_b_crct_controller` | CRCT alone (no maintenance) | — | — |
 | `arm_c_crct_replay_shadow` | maintenance signal only, no mutation | shadow | permissive |
-| `arm_d_crct_replay_active_balanced` | active maintenance at calibrated defaults | active | balanced |
-| `arm_e_crct_replay_active_aggressive` | active maintenance at aggressive thresholds | active | aggressive |
+| `arm_d_crct_replay_active_learned` | active maintenance with learned Full-A commit authority | active | rule-prior only |
 
-`agreement_count` differs across arms: `arm_d=2` (consensus across two fresh
-frames), `arm_e=1` (act on first observation).
+The older balanced/aggressive split was removed because it put hand-set
+thresholds in charge of the commit decision. `agreement_count` remains only
+for the legacy rule mode; the learned active arm acts from controller
+confidence plus GPU3 physics confirmation.
 
 Replay maintenance uses `replay_eviction_scoring_mode=oracle`: GPU3 is the
 memory/massage worker and scores scheduled slots with the real
@@ -67,9 +70,7 @@ separate under parallel launches.
 
 - arm_a vs arm_b: does CRCT alone help over the locked trunk?
 - arm_b vs arm_c: does the maintenance *signal* correlate with anything useful?
-- arm_c vs arm_d: does *acting* on the calibrated maintenance signal help?
-- arm_d vs arm_e: are the calibrated defaults under-tuned (arm_e wins) or at
-  the ceiling (arm_e collapses)?
+- arm_c vs arm_d: does learned controller authority over maintenance commits help?
 
 ## Layout
 
@@ -106,12 +107,12 @@ python experiments/26_arm/run_exp26.py --stage smoke --smoke-budget 30
 python experiments/26_arm/run_exp26.py --stage calibrate
 python experiments/26_arm/run_exp26.py --stage analyze
 
-# Headline only (requires prior calibration).
+# Headline only (uses prior calibration if present).
 python experiments/26_arm/run_exp26.py --stage headline
 
 # Restrict headline to a subset of arms.
 python experiments/26_arm/run_exp26.py --stage headline \
-    --arms arm_a_fastslow_control arm_d_crct_replay_active_balanced
+    --arms arm_a_fastslow_control arm_d_crct_replay_active_learned
 
 # Dry-run any stage to inspect entries without launching.
 python experiments/26_arm/run_exp26.py --stage all --dry-run
@@ -123,7 +124,7 @@ Exp24's framing was "training-time bundle" — many candidate mechanisms
 under one umbrella. Exp26's framing is "Adaptive Residual Memory headline" —
 one focused architecture. The fast/slow trunk lock and CRCT contract carry
 over unchanged from exp24; what's new here is the calibration discipline
-and the aggressive-policy contrast arm.
+and learned controller authority over memory maintenance commits.
 
 If you want the legacy CRCT v1 matrix (4 arms, hard-coded thresholds), use
 `experiments/24_training_time_bundle/run_exp24.py --matrix crct_v1`.

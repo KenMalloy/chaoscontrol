@@ -205,6 +205,10 @@ class ChaosControlConfig:
     replay_eviction_frame_ttl_steps: int = 256
     replay_eviction_slot_work_chunk_size: int = 64
     replay_eviction_action_agreement_count: int = 2
+    replay_eviction_commit_policy: str = "learned"
+    replay_eviction_commit_online_lr: float = 0.05
+    replay_eviction_commit_rule_prior_scale: float = 1.0
+    replay_eviction_commit_temperature: float = 0.75
 
     def __post_init__(self) -> None:
         if self.buffer_mode not in _VALID_BUFFER_MODES:

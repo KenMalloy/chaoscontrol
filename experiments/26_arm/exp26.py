@@ -1,17 +1,16 @@
 #!/usr/bin/env python3
 """Exp26 Adaptive Residual Memory headline matrix builders.
 
-Two-stage discipline. Stage 1 runs a single shadow-mode cell to observe
-the actual distributions of ``utility_ema``, ``peak_utility``,
+Two-stage discipline. Stage 1 can run a shadow-mode cell to observe the
+actual distributions of ``utility_ema``, ``peak_utility``,
 ``peak_sharpness``, ``contradiction_ema``, and drift signals at our scale.
-Stage 2 reads those distributions out of the trace and writes a manifest
-of percentile-anchored thresholds. Stage 3 launches the 5-arm headline
-matrix with calibrated thresholds folded into the active arms.
+Stage 2 can still write a manifest for post-hoc threshold counterfactuals.
+Stage 3 launches the headline matrix with the learned Full-A action simplex
+owning the active commit decision.
 
 The architecture under test is CRCT + streaming Adaptive Residual Memory.
 The same fast/slow trunk and CRCT contract land from exp24 unchanged; the
-only thing exp26 adds is calibrated maintenance thresholds and the
-aggressive-policy contrast arm.
+active ARM cell adds learned maintenance authority, not a threshold ablation.
 """
 
 from __future__ import annotations
@@ -46,8 +45,7 @@ ARM_V1_ARMS: tuple[str, ...] = (
     "arm_a_fastslow_control",
     "arm_b_crct_controller",
     "arm_c_crct_replay_shadow",
-    "arm_d_crct_replay_active_balanced",
-    "arm_e_crct_replay_active_aggressive",
+    "arm_d_crct_replay_active_learned",
 )
 
 EXP26_MODEL_DIM = 384
@@ -180,6 +178,10 @@ def _replay_eviction_pipeline_lock() -> dict[str, Any]:
         "replay_eviction_controller_max_state_norm": 8.0,
         "replay_eviction_controller_perturbation_scale": 0.25,
         "replay_eviction_controller_feedback_lr": 0.05,
+        "replay_eviction_commit_policy": "learned",
+        "replay_eviction_commit_online_lr": 0.05,
+        "replay_eviction_commit_rule_prior_scale": 1.0,
+        "replay_eviction_commit_temperature": 0.75,
         "replay_eviction_probe_buffer_size": 32,
         "replay_eviction_frame_ttl_steps": 256,
         "replay_eviction_slot_work_chunk_size": 16,
@@ -345,29 +347,26 @@ def load_manifest(manifest_path: str | Path = DEFAULT_MANIFEST_PATH) -> dict[str
     return manifest
 
 
-def _balanced_arm_overrides(manifest: dict[str, Any]) -> dict[str, Any]:
-    """arm_d: balanced calibrated thresholds + agreement_count=2."""
-    balanced = manifest["thresholds_balanced"]
-    overrides = {
-        "replay_eviction_mode": "active",
-        "replay_eviction_action_agreement_count": 2,
-        **{
-            f"replay_eviction_{key}": float(value)
-            for key, value in balanced.items()
-        },
+def _learned_active_arm_overrides(
+    manifest: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """arm_d: learned Full-A action-simplex commit authority.
+
+    The optional manifest seeds the rule-prior feature scale only; it no
+    longer owns the commit decision or creates balanced/aggressive arms.
+    """
+    balanced = (manifest or {}).get("thresholds_balanced", _calibration_thresholds())
+    normalized = {
+        key.replace("replay_eviction_", ""): value
+        for key, value in balanced.items()
     }
-    return overrides
-
-
-def _aggressive_arm_overrides(manifest: dict[str, Any]) -> dict[str, Any]:
-    """arm_e: aggressive thresholds + agreement_count=1."""
-    aggressive = manifest["thresholds_aggressive"]
     overrides = {
         "replay_eviction_mode": "active",
+        "replay_eviction_commit_policy": "learned",
         "replay_eviction_action_agreement_count": 1,
         **{
             f"replay_eviction_{key}": float(value)
-            for key, value in aggressive.items()
+            for key, value in normalized.items()
         },
     }
     return overrides
@@ -382,21 +381,22 @@ def build_arm_v1_matrix(
     seed_values: Sequence[int] = DEFAULT_CONTROL_SEEDS,
     arms: Sequence[str] | None = None,
 ) -> list[dict[str, Any]]:
-    """Stage 3: headline 5-arm × N-seed matrix.
+    """Stage 3: headline 4-arm × N-seed matrix.
 
     arm_a: locked fast/slow control (no CRCT, no maintenance).
     arm_b: CRCT only (no maintenance).
     arm_c: CRCT + maintenance shadow (telemetry, no mutation).
-    arm_d: CRCT + maintenance active at balanced calibrated thresholds.
-    arm_e: CRCT + maintenance active at aggressive thresholds (push the
-        policy hard; tests whether the calibrated defaults left signal on
-        the table or whether they were already at the ceiling).
+    arm_d: CRCT + maintenance active with learned Full-A action-simplex
+        commit authority.
 
-    Reads the calibration manifest at construction time and folds
-    calibrated thresholds into arm_d and arm_e. Fails loudly if the
-    manifest is missing.
+    If a calibration manifest exists, its balanced thresholds are folded in
+    as rule-prior features and counterfactual telemetry. Missing manifests no
+    longer block the active learned arm.
     """
-    manifest = load_manifest(calibration_manifest_path)
+    try:
+        manifest = load_manifest(calibration_manifest_path)
+    except FileNotFoundError:
+        manifest = None
     size_lock = _artifact_size_lock()
     fast_slow = _fast_slow_lock()
     crct = _crct_lock()
@@ -412,12 +412,8 @@ def build_arm_v1_matrix(
         ("arm_b_crct_controller", crct),
         ("arm_c_crct_replay_shadow", shadow_overrides),
         (
-            "arm_d_crct_replay_active_balanced",
-            {**crct, **pipeline, **_balanced_arm_overrides(manifest)},
-        ),
-        (
-            "arm_e_crct_replay_active_aggressive",
-            {**crct, **pipeline, **_aggressive_arm_overrides(manifest)},
+            "arm_d_crct_replay_active_learned",
+            {**crct, **pipeline, **_learned_active_arm_overrides(manifest)},
         ),
     ]
     if arms is not None:

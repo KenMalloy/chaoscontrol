@@ -1265,6 +1265,7 @@ class TestSlotTableTick:
     def test_action_requires_repeated_frame_agreement_before_mutation(self, monkeypatch):
         loop = ReplayEvictionLoop(
             action_mode="active",
+            commit_policy="rule",
             eviction_ema_beta=0.0,
             min_slot_age_steps=0,
             min_score_count=1,
@@ -1308,6 +1309,7 @@ class TestSlotTableTick:
     def test_action_agreement_resets_when_slot_generation_changes(self, monkeypatch):
         loop = ReplayEvictionLoop(
             action_mode="active",
+            commit_policy="rule",
             eviction_ema_beta=0.0,
             min_slot_age_steps=0,
             min_score_count=1,
@@ -1353,6 +1355,151 @@ class TestSlotTableTick:
         assert second.quarantined == []
         assert table.record(sid).state != SLOT_QUARANTINED
         assert loop.diagnostics()["action_agreements_total"] == 0
+
+    def test_learned_commit_policy_overrides_threshold_rule_prior(self):
+        loop = ReplayEvictionLoop(
+            action_mode="active",
+            commit_policy="learned",
+            commit_rule_prior_scale=0.0,
+            commit_online_lr=0.0,
+        )
+        model = _StubModel(n_slots=1, use_table=True)
+        rec = model.outer_model.table.record(0)
+        rec.score_count = 4
+        rec.last_scored_step = 300
+        rec.utility_ema = 1.0
+        rec.marginal_gain_ema = 1.0
+        rule_kwargs = loop._policy_kwargs(model.outer_model)
+        rule_action = loop._policy.choose(rec, **rule_kwargs)
+        assert rule_action == SLOT_PRESERVE
+
+        loop._commit_policy._bias.zero_()
+        loop._commit_policy._bias[
+            loop._commit_policy.actions.index(SLOT_DECAY)
+        ] = 8.0
+        decision = loop._choose_commit_decision(rec, rule_kwargs)
+
+        assert decision.rule_action == SLOT_PRESERVE
+        assert decision.action == SLOT_DECAY
+        assert decision.probability > 0.99
+
+    def test_learned_commit_active_does_not_wait_for_threshold_agreement(self, monkeypatch):
+        loop = ReplayEvictionLoop(
+            action_mode="active",
+            commit_policy="learned",
+            action_agreement_count=99,
+            commit_rule_prior_scale=0.0,
+            commit_online_lr=0.1,
+        )
+        model = _StubModel(n_slots=1, use_table=True)
+        table = model.outer_model.table
+        sid = table.active_slot_ids()[0]
+        rec = table.record(sid)
+        rec.state = SLOT_ACTIVE
+        rec.score_count = 4
+        rec.last_scored_step = 300
+        rec.contradiction_ema = 1.0
+        rec.negative_streak = 4
+        loop._commit_policy._bias.zero_()
+        loop._commit_policy._bias[
+            loop._commit_policy.actions.index(SLOT_QUARANTINE)
+        ] = 8.0
+        loop._confirm_actions_with_oracle = lambda **_kwargs: {sid: True}  # type: ignore[method-assign]
+        cf = CounterfactualResult(
+            marginal_gains=-torch.ones(1, 1, 2),
+            sidecar_value=torch.zeros(1, 2),
+            nll_baseline=torch.zeros(1, 2),
+            nll_no_sidecar=torch.zeros(1, 2),
+            weights_baseline=torch.ones(1, 1),
+            mask=torch.ones(1, 2, dtype=torch.bool),
+            slot_indices=[0],
+        )
+
+        result = loop._classify_and_act(
+            model=model,
+            outer=model.outer_model,
+            step=300,
+            cf=cf,
+            slot_marginals=[-1.0],
+            sharpness_per_slot=torch.zeros(1),
+            t0=time.monotonic(),
+        )
+
+        assert result.quarantined == [sid]
+        assert table.record(sid).state == SLOT_QUARANTINED
+        diag = loop.diagnostics()
+        assert diag["action_agreements_total"] == 0
+        assert diag["commit_policy"] == "learned"
+
+    def test_learned_commit_oracle_gate_uses_physics_not_thresholds(self):
+        learned = ReplayEvictionLoop(
+            commit_policy="learned",
+            eviction_threshold=-1.0,
+            useful_threshold=-1.0,
+        )
+        rule = ReplayEvictionLoop(
+            commit_policy="rule",
+            eviction_threshold=-1.0,
+            useful_threshold=-1.0,
+        )
+
+        assert learned._action_confirmed(
+            action=SLOT_EVICT,
+            proxy_score=0.0,
+            oracle_score=0.0,
+        ) is True
+        assert rule._action_confirmed(
+            action=SLOT_EVICT,
+            proxy_score=0.0,
+            oracle_score=0.0,
+        ) is False
+
+    def test_preserve_without_oracle_score_does_not_reinforce_learned_commit(self):
+        loop = ReplayEvictionLoop(commit_policy="learned", commit_online_lr=0.5)
+        model = _StubModel(n_slots=1, use_table=True)
+        rec = model.outer_model.table.record(0)
+        rec.score_count = 3
+        rec.last_scored_step = 200
+        loop._commit_policy._bias.zero_()
+        loop._commit_policy._bias[
+            loop._commit_policy.actions.index(SLOT_PRESERVE)
+        ] = 8.0
+        decision = loop._choose_commit_decision(rec, loop._policy_kwargs(model.outer_model))
+        assert decision.action == SLOT_PRESERVE
+
+        loop._record_commit_feedback(
+            decision,
+            accepted=True,
+            structural=False,
+            slot_id=0,
+        )
+
+        diag = loop.diagnostics()
+        assert diag["commit_feedback_updates_total"] == 0
+        assert diag["learned_commit_policy"]["feedback_updates"] == 0
+
+    def test_learned_commit_state_round_trip(self):
+        loop = ReplayEvictionLoop(commit_policy="learned", commit_online_lr=0.07)
+        model = _StubModel(n_slots=1, use_table=True)
+        rec = model.outer_model.table.record(0)
+        rec.score_count = 3
+        rec.last_scored_step = 200
+        decision = loop._choose_commit_decision(rec, loop._policy_kwargs(model.outer_model))
+        loop._last_oracle_score_by_slot[0] = 0.01
+        loop._record_commit_feedback(
+            decision,
+            accepted=True,
+            structural=False,
+            slot_id=0,
+        )
+
+        restored = ReplayEvictionLoop()
+        restored.load_state_dict(loop.state_dict())
+
+        diag = restored.diagnostics()
+        assert diag["commit_policy"] == "learned"
+        assert diag["commit_online_lr"] == pytest.approx(0.07)
+        assert diag["learned_commit_policy"]["feedback_updates"] == 1
 
     def test_refresh_ranks_candidates_with_oracle_not_proxy(self, monkeypatch):
         loop = ReplayEvictionLoop(
@@ -1587,7 +1734,11 @@ class TestSlotTableTick:
         assert diag["prototype_distill_skips_total"] == 1
 
     def test_oracle_rejection_blocks_active_mutation(self):
-        loop = ReplayEvictionLoop(action_mode="active", min_slot_age_steps=0)
+        loop = ReplayEvictionLoop(
+            action_mode="active",
+            commit_policy="rule",
+            min_slot_age_steps=0,
+        )
         model = _StubModel(n_slots=1, memory_benefit=0.0, use_table=True)
         table = model.outer_model.table
         sid = table.active_slot_ids()[0]

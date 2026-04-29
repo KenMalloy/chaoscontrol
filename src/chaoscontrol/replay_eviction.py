@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import time
 from collections import deque
@@ -39,6 +40,7 @@ __all__ = [
     "replay_score_slots",
     "MaintenancePolicy",
     "FullAControllerState",
+    "LearnedCommitPolicy",
     "CpuRefreshProposalModel",
     "ProbeFrame",
     "_evict_slots",
@@ -50,6 +52,14 @@ SLOT_EVICT = "EVICT"
 SLOT_REFRESH = "REFRESH"
 SLOT_QUARANTINE = "QUARANTINE"
 SLOT_DISTILL = "DISTILL"
+SLOT_ACTION_ORDER = (
+    SLOT_PRESERVE,
+    SLOT_DECAY,
+    SLOT_EVICT,
+    SLOT_REFRESH,
+    SLOT_QUARANTINE,
+    SLOT_DISTILL,
+)
 
 
 @dataclass
@@ -757,6 +767,9 @@ class FullAControllerState:
             return torch.zeros(1, int(slot_dim), dtype=torch.float32)
         return F.normalize(proposal, dim=-1, eps=1e-8)
 
+    def hidden_state(self) -> torch.Tensor:
+        return self._state.detach().cpu().float().clone()
+
     def update_feedback(
         self,
         *,
@@ -1277,7 +1290,12 @@ class CpuRefreshProposalModel:
 
 
 class MaintenancePolicy:
-    """Policy-shaped action selector. Deterministic rules now, swappable later."""
+    """Rule prior for the learned commit controller.
+
+    This is no longer the active owner of maintenance mutations in Exp26. The
+    learned Full-A action simplex consumes these values as one feature family
+    and trace rows keep the rule winner as a counterfactual shadow.
+    """
 
     def action_values(
         self,
@@ -1362,6 +1380,354 @@ class MaintenancePolicy:
         return max(vals, key=lambda k: vals[k])
 
 
+@dataclass
+class CommitDecision:
+    action: str
+    rule_action: str
+    confidence: float
+    probability: float
+    entropy: float
+    logits: dict[str, float]
+    probabilities: dict[str, float]
+    rule_values: dict[str, float]
+    vetoed_action: str = ""
+    veto_reason: str = ""
+
+
+class LearnedCommitPolicy:
+    """Full-A recurrent simplex over the six maintenance commit actions."""
+
+    input_dim = FullAControllerState.input_dim
+
+    def __init__(
+        self,
+        *,
+        controller_state_dim: int = 32,
+        controller_rank: int = 8,
+        controller_dt: float = 1.0,
+        controller_gamma: float = 0.08,
+        controller_target_log_sv: float = -0.05,
+        controller_max_state_norm: float = 8.0,
+        controller_perturbation_scale: float = 0.25,
+        controller_feedback_lr: float = 0.05,
+        online_lr: float = 0.05,
+        rule_prior_scale: float = 1.0,
+        temperature: float = 0.75,
+        seed: int = 2718,
+    ) -> None:
+        self.actions = tuple(SLOT_ACTION_ORDER)
+        self.online_lr = max(0.0, float(online_lr))
+        self.rule_prior_scale = max(0.0, float(rule_prior_scale))
+        self.temperature = max(1.0e-4, float(temperature))
+        self._controller = FullAControllerState(
+            state_dim=int(controller_state_dim),
+            rank=int(controller_rank),
+            dt=float(controller_dt),
+            gamma=float(controller_gamma),
+            max_top_log_sv=float(controller_target_log_sv),
+            max_state_norm=float(controller_max_state_norm),
+            perturbation_scale=float(controller_perturbation_scale),
+            feedback_lr=float(controller_feedback_lr),
+            seed=int(seed),
+        )
+        gen = torch.Generator(device="cpu")
+        gen.manual_seed(int(seed) + 211)
+        self._bias = torch.zeros(len(self.actions), dtype=torch.float32)
+        self._readout_lr = torch.randn(
+            self._controller.state_dim,
+            len(self.actions),
+            generator=gen,
+            dtype=torch.float32,
+        ) * 0.01
+        self.decisions_total = 0
+        self.feedback_updates = 0
+        self.oracle_accepts = 0
+        self.oracle_rejects = 0
+        self.safety_vetoes = 0
+        self.rule_disagreements = 0
+        self.last_action = SLOT_PRESERVE
+        self.last_rule_action = SLOT_PRESERVE
+        self.last_confidence = 0.0
+        self.last_entropy = 0.0
+
+    def _features(
+        self,
+        rec: SlotRecord,
+        *,
+        rule_values: dict[str, float],
+        capacity_pressure: bool,
+        frame_age_steps: int,
+        queue_depth: int,
+    ) -> torch.Tensor:
+        age = max(0, int(rec.last_scored_step) - int(rec.created_step))
+        drift = max(
+            float(rec.activation_drift_ema),
+            float(rec.representation_drift_ema),
+            float(rec.semantic_drift_ema),
+        )
+        values = torch.tensor(
+            [
+                float(rec.marginal_gain_ema),
+                float(rec.utility_ema),
+                float(rec.sharpness_ema),
+                drift,
+                float(rec.contradiction_ema),
+                float(rec.retrieval_mass_ema),
+                float(rec.peak_utility),
+                float(rec.peak_sharpness),
+                math.tanh(float(rec.score_count) / 8.0),
+                math.tanh(float(age) / 512.0),
+                math.tanh(float(rec.negative_streak) / 4.0),
+                math.tanh(float(rec.positive_streak) / 4.0),
+                1.0 if capacity_pressure else 0.0,
+                math.tanh(float(frame_age_steps) / 256.0),
+                math.tanh(float(queue_depth) / 32.0),
+                self._rule_gap(rule_values),
+            ],
+            dtype=torch.float32,
+        )
+        return torch.nan_to_num(values, nan=0.0, posinf=1.0, neginf=-1.0)
+
+    @staticmethod
+    def _rule_gap(rule_values: dict[str, float]) -> float:
+        vals = sorted((float(v) for v in rule_values.values()), reverse=True)
+        if not vals:
+            return 0.0
+        if len(vals) == 1:
+            return math.tanh(vals[0])
+        return math.tanh(vals[0] - vals[1])
+
+    def choose(
+        self,
+        rec: SlotRecord,
+        *,
+        rule_values: dict[str, float],
+        capacity_pressure: bool,
+        frame_age_steps: int,
+        queue_depth: int,
+    ) -> CommitDecision:
+        features = self._features(
+            rec,
+            rule_values=rule_values,
+            capacity_pressure=capacity_pressure,
+            frame_age_steps=frame_age_steps,
+            queue_depth=queue_depth,
+        )
+        controller_logits = self._controller.step(
+            features,
+            slot_dim=len(self.actions),
+        ).flatten()
+        hidden = self._controller.hidden_state()
+        learned_logits = (
+            controller_logits.reshape(-1)
+            + (hidden @ self._readout_lr).reshape(-1)
+            + self._bias
+        )
+        rule_prior = self._normalized_rule_prior(rule_values)
+        logits = learned_logits + self.rule_prior_scale * rule_prior
+        action, vetoed, reason = self._select_legal_action(
+            rec=rec,
+            logits=logits,
+            capacity_pressure=capacity_pressure,
+        )
+        scaled = logits / self.temperature
+        probs = torch.softmax(scaled, dim=0)
+        entropy = float(-(probs * probs.clamp_min(1.0e-9).log()).sum().item())
+        idx = self.actions.index(action)
+        top2 = torch.topk(probs, k=min(2, probs.numel())).values
+        confidence = (
+            float((top2[0] - top2[1]).item())
+            if top2.numel() >= 2
+            else float(top2[0].item())
+        )
+        rule_action = max(rule_values, key=lambda k: rule_values[k])
+        self.decisions_total += 1
+        self.last_action = action
+        self.last_rule_action = rule_action
+        self.last_confidence = confidence
+        self.last_entropy = entropy
+        if action != rule_action:
+            self.rule_disagreements += 1
+        if vetoed:
+            self.safety_vetoes += 1
+        return CommitDecision(
+            action=action,
+            rule_action=rule_action,
+            confidence=confidence,
+            probability=float(probs[idx].item()),
+            entropy=entropy,
+            logits={a: float(logits[i].item()) for i, a in enumerate(self.actions)},
+            probabilities={a: float(probs[i].item()) for i, a in enumerate(self.actions)},
+            rule_values={a: float(rule_values.get(a, 0.0)) for a in self.actions},
+            vetoed_action=vetoed,
+            veto_reason=reason,
+        )
+
+    def _normalized_rule_prior(self, rule_values: dict[str, float]) -> torch.Tensor:
+        vals = torch.tensor(
+            [float(rule_values.get(action, 0.0)) for action in self.actions],
+            dtype=torch.float32,
+        )
+        vals = torch.nan_to_num(vals, nan=0.0, posinf=0.0, neginf=0.0)
+        scale = vals.abs().max().clamp_min(1.0e-6)
+        return vals / scale
+
+    def _select_legal_action(
+        self,
+        *,
+        rec: SlotRecord,
+        logits: torch.Tensor,
+        capacity_pressure: bool,
+    ) -> tuple[str, str, str]:
+        order = torch.argsort(logits, descending=True).tolist()
+        vetoed = ""
+        reason = ""
+        for idx in order:
+            action = self.actions[int(idx)]
+            ok, why = self._legal_action(rec, action, capacity_pressure)
+            if ok:
+                return action, vetoed, reason
+            if not vetoed:
+                vetoed = action
+                reason = why
+        return SLOT_PRESERVE, vetoed or SLOT_PRESERVE, reason or "no_legal_action"
+
+    @staticmethod
+    def _legal_action(
+        rec: SlotRecord,
+        action: str,
+        capacity_pressure: bool,
+    ) -> tuple[bool, str]:
+        if rec.score_count <= 0 and action != SLOT_PRESERVE:
+            return False, "unscored_slot"
+        if rec.state == SLOT_WARMING and action in {
+            SLOT_EVICT,
+            SLOT_QUARANTINE,
+            SLOT_DISTILL,
+        }:
+            return False, "warming_structural"
+        if action == SLOT_EVICT and not capacity_pressure:
+            return False, "below_capacity"
+        return True, ""
+
+    def apply_feedback(
+        self,
+        decision: CommitDecision,
+        *,
+        oracle_score: float | None,
+        accepted: bool,
+        structural: bool,
+    ) -> bool:
+        if self.online_lr <= 0.0:
+            return False
+        if oracle_score is None:
+            return False
+        action_idx = self.actions.index(decision.action)
+        p = torch.tensor(
+            [decision.probabilities.get(a, 0.0) for a in self.actions],
+            dtype=torch.float32,
+        )
+        one_hot = torch.zeros_like(p)
+        one_hot[action_idx] = 1.0
+        score_mag = min(1.0, abs(float(oracle_score)) * 1000.0)
+        advantage = score_mag if accepted else -score_mag
+        grad = (one_hot - p) * float(advantage) * self.online_lr
+        self._bias = torch.clamp(self._bias + grad, -4.0, 4.0)
+        hidden = self._controller.hidden_state().flatten().unsqueeze(1)
+        self._readout_lr = torch.clamp(
+            self._readout_lr + hidden @ grad.unsqueeze(0),
+            -1.0,
+            1.0,
+        )
+        identity = p.reshape(1, -1)
+        best = one_hot.reshape(1, -1) if accepted else torch.zeros_like(identity)
+        self._controller.update_feedback(
+            identity=identity,
+            best=best,
+            improvement=max(0.0, float(advantage)),
+            structural_accepted=bool(structural and accepted),
+        )
+        self.feedback_updates += 1
+        if accepted:
+            self.oracle_accepts += 1
+        else:
+            self.oracle_rejects += 1
+        return True
+
+    def diagnostics(self) -> dict[str, Any]:
+        return {
+            "mode": "full_a_action_simplex",
+            "actions": list(self.actions),
+            "online_lr": self.online_lr,
+            "rule_prior_scale": self.rule_prior_scale,
+            "temperature": self.temperature,
+            "decisions_total": self.decisions_total,
+            "feedback_updates": self.feedback_updates,
+            "oracle_accepts": self.oracle_accepts,
+            "oracle_rejects": self.oracle_rejects,
+            "safety_vetoes": self.safety_vetoes,
+            "rule_disagreements": self.rule_disagreements,
+            "last_action": self.last_action,
+            "last_rule_action": self.last_rule_action,
+            "last_confidence": self.last_confidence,
+            "last_entropy": self.last_entropy,
+            "controller": self._controller.diagnostics(),
+        }
+
+    def state_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": 1,
+            "online_lr": self.online_lr,
+            "rule_prior_scale": self.rule_prior_scale,
+            "temperature": self.temperature,
+            "bias": self._bias.detach().cpu(),
+            "readout_lr": self._readout_lr.detach().cpu(),
+            "controller": self._controller.state_dict(),
+            "decisions_total": self.decisions_total,
+            "feedback_updates": self.feedback_updates,
+            "oracle_accepts": self.oracle_accepts,
+            "oracle_rejects": self.oracle_rejects,
+            "safety_vetoes": self.safety_vetoes,
+            "rule_disagreements": self.rule_disagreements,
+            "last_action": self.last_action,
+            "last_rule_action": self.last_rule_action,
+            "last_confidence": self.last_confidence,
+            "last_entropy": self.last_entropy,
+        }
+
+    def load_state_dict(self, state: dict[str, Any]) -> None:
+        self.online_lr = float(state.get("online_lr", self.online_lr))
+        self.rule_prior_scale = float(
+            state.get("rule_prior_scale", self.rule_prior_scale)
+        )
+        self.temperature = float(state.get("temperature", self.temperature))
+        bias = state.get("bias")
+        if torch.is_tensor(bias) and bias.numel() == len(self.actions):
+            self._bias = bias.detach().cpu().float().reshape(-1)
+        readout = state.get("readout_lr")
+        if torch.is_tensor(readout) and tuple(readout.shape) == tuple(self._readout_lr.shape):
+            self._readout_lr = readout.detach().cpu().float()
+        controller_state = state.get("controller")
+        if isinstance(controller_state, dict):
+            self._controller.load_state_dict(controller_state)
+        self.decisions_total = int(state.get("decisions_total", self.decisions_total))
+        self.feedback_updates = int(
+            state.get("feedback_updates", self.feedback_updates)
+        )
+        self.oracle_accepts = int(state.get("oracle_accepts", self.oracle_accepts))
+        self.oracle_rejects = int(state.get("oracle_rejects", self.oracle_rejects))
+        self.safety_vetoes = int(state.get("safety_vetoes", self.safety_vetoes))
+        self.rule_disagreements = int(
+            state.get("rule_disagreements", self.rule_disagreements)
+        )
+        self.last_action = str(state.get("last_action", self.last_action))
+        self.last_rule_action = str(
+            state.get("last_rule_action", self.last_rule_action)
+        )
+        self.last_confidence = float(state.get("last_confidence", self.last_confidence))
+        self.last_entropy = float(state.get("last_entropy", self.last_entropy))
+
+
 class ReplayEvictionLoop:
     """Adaptive Residual Memory control plane.
 
@@ -1416,6 +1782,10 @@ class ReplayEvictionLoop:
         frame_ttl_steps: int = 256,
         slot_work_chunk_size: int = 64,
         action_agreement_count: int = 2,
+        commit_policy: str = "learned",
+        commit_online_lr: float = 0.05,
+        commit_rule_prior_scale: float = 1.0,
+        commit_temperature: float = 0.75,
         arm_runtime_enabled: bool = False,
         arm_runtime_namespace: str | None = None,
     ) -> None:
@@ -1423,8 +1793,11 @@ class ReplayEvictionLoop:
             raise ValueError("action_mode must be 'active' or 'shadow'")
         if scoring_mode not in {"proxy", "oracle"}:
             raise ValueError("scoring_mode must be 'proxy' or 'oracle'")
+        if commit_policy not in {"learned", "rule"}:
+            raise ValueError("commit_policy must be 'learned' or 'rule'")
         self._action_mode = str(action_mode)
         self._scoring_mode = str(scoring_mode)
+        self._commit_policy_mode = str(commit_policy)
         self._memory_streams = max(1, int(memory_streams))
         self._threshold = float(eviction_threshold)
         self._ema_beta = float(eviction_ema_beta)
@@ -1453,6 +1826,9 @@ class ReplayEvictionLoop:
         self._frame_ttl_steps = max(0, int(frame_ttl_steps))
         self._slot_work_chunk_size = max(1, int(slot_work_chunk_size))
         self._action_agreement_count = max(1, int(action_agreement_count))
+        self._commit_online_lr = max(0.0, float(commit_online_lr))
+        self._commit_rule_prior_scale = max(0.0, float(commit_rule_prior_scale))
+        self._commit_temperature = max(1.0e-4, float(commit_temperature))
         self._refresh_proposal_model = CpuRefreshProposalModel(
             k=self._refresh_candidate_count,
             rank=max(1, int(refresh_proposal_rank)),
@@ -1551,6 +1927,7 @@ class ReplayEvictionLoop:
         self._last_proxy_oracle_sign_match_rate: float = 0.0
         self._last_proxy_oracle_abs_error: float = 0.0
         self._last_oracle_candidates: int = 0
+        self._last_oracle_score_by_slot: dict[int, float] = {}
         self._probe_seconds_total: float = 0.0
         self._last_probe_seconds: float = 0.0
         self._probe_over_budget_total: int = 0
@@ -1611,6 +1988,98 @@ class ReplayEvictionLoop:
 
         # Policy
         self._policy = MaintenancePolicy()
+        self._commit_policy = LearnedCommitPolicy(
+            controller_state_dim=int(controller_state_dim),
+            controller_rank=int(controller_rank),
+            controller_dt=float(controller_dt),
+            controller_gamma=float(controller_gamma),
+            controller_target_log_sv=float(controller_target_log_sv),
+            controller_max_state_norm=float(controller_max_state_norm),
+            controller_perturbation_scale=float(controller_perturbation_scale),
+            controller_feedback_lr=float(controller_feedback_lr),
+            online_lr=self._commit_online_lr,
+            rule_prior_scale=self._commit_rule_prior_scale,
+            temperature=self._commit_temperature,
+            seed=int(refresh_proposal_seed) + 313,
+        )
+        self._commit_decisions_total = 0
+        self._commit_rule_disagreements_total = 0
+        self._commit_feedback_updates_total = 0
+
+    def _policy_kwargs(self, outer: Any) -> dict[str, Any]:
+        return dict(
+            eviction_threshold=self._threshold,
+            useful_threshold=self._useful_threshold,
+            drift_threshold=self._drift_threshold,
+            quarantine_threshold=self._quarantine_threshold,
+            distill_peak_threshold=self._distill_peak_threshold,
+            peak_preserve_utility_threshold=self._peak_preserve_utility_threshold,
+            peak_preserve_sharpness_threshold=self._peak_preserve_sharpness_threshold,
+            min_age=self._min_age,
+            min_score_count=self._min_score_count,
+            capacity_pressure=self._capacity_pressure(outer),
+        )
+
+    def _choose_commit_decision(
+        self,
+        rec: SlotRecord,
+        policy_kwargs: dict[str, Any],
+    ) -> CommitDecision:
+        values = self._policy.action_values(rec, **policy_kwargs)
+        rule_action = max(values, key=lambda k: values[k])
+        if self._commit_policy_mode == "rule":
+            return CommitDecision(
+                action=rule_action,
+                rule_action=rule_action,
+                confidence=1.0,
+                probability=1.0,
+                entropy=0.0,
+                logits={a: float(values.get(a, 0.0)) for a in SLOT_ACTION_ORDER},
+                probabilities={
+                    a: 1.0 if a == rule_action else 0.0 for a in SLOT_ACTION_ORDER
+                },
+                rule_values={a: float(values.get(a, 0.0)) for a in SLOT_ACTION_ORDER},
+            )
+        decision = self._commit_policy.choose(
+            rec,
+            rule_values=values,
+            capacity_pressure=bool(policy_kwargs.get("capacity_pressure", False)),
+            frame_age_steps=self._last_frame_age_steps,
+            queue_depth=self._last_queue_depth,
+        )
+        self._commit_decisions_total += 1
+        if decision.action != decision.rule_action:
+            self._commit_rule_disagreements_total += 1
+        return decision
+
+    def _commit_action_ready(
+        self,
+        slot_id: int,
+        action: str,
+        rec: SlotRecord | None,
+    ) -> bool:
+        if self._commit_policy_mode == "learned":
+            return True
+        return self._has_action_agreement(slot_id, action, rec)
+
+    def _record_commit_feedback(
+        self,
+        decision: CommitDecision,
+        *,
+        accepted: bool,
+        structural: bool,
+        slot_id: int,
+    ) -> None:
+        if self._commit_policy_mode != "learned":
+            return
+        updated = self._commit_policy.apply_feedback(
+            decision,
+            oracle_score=self._last_oracle_score_by_slot.get(int(slot_id)),
+            accepted=bool(accepted),
+            structural=bool(structural),
+        )
+        if updated:
+            self._commit_feedback_updates_total += 1
 
     def _init_arm_runtime(self, namespace: str | None) -> None:
         """Create the native CPU conductor and its local shm ring boundary."""
@@ -2295,19 +2764,9 @@ class ReplayEvictionLoop:
         table = getattr(outer, "table", None)
         if table is None:
             return
-        policy_kwargs = dict(
-            eviction_threshold=self._threshold,
-            useful_threshold=self._useful_threshold,
-            drift_threshold=self._drift_threshold,
-            quarantine_threshold=self._quarantine_threshold,
-            distill_peak_threshold=self._distill_peak_threshold,
-            peak_preserve_utility_threshold=self._peak_preserve_utility_threshold,
-            peak_preserve_sharpness_threshold=self._peak_preserve_sharpness_threshold,
-            min_age=self._min_age,
-            min_score_count=self._min_score_count,
-            capacity_pressure=self._capacity_pressure(outer),
-        )
+        policy_kwargs = self._policy_kwargs(outer)
         actions: dict[int, str] = {}
+        decisions: dict[int, CommitDecision] = {}
         for phys_idx in cf.slot_indices:
             sid = table.physical_to_slot_id(phys_idx)
             if sid is None:
@@ -2315,8 +2774,9 @@ class ReplayEvictionLoop:
             rec = table.record(sid)
             if rec is None:
                 continue
-            action = self._policy.choose(rec, **policy_kwargs)
-            actions[sid] = action
+            decision = self._choose_commit_decision(rec, policy_kwargs)
+            actions[sid] = decision.action
+            decisions[sid] = decision
         confirmations = self._confirm_actions_with_oracle(
             model=model, outer=outer, actions=actions, cf=cf, t0=t0
         )
@@ -2325,6 +2785,7 @@ class ReplayEvictionLoop:
             if rec is None:
                 continue
             confirmed = confirmations.get(sid, action == SLOT_PRESERVE)
+            decision = decisions.get(sid)
             self._shadow_actions_total += 1
             self._shadow_action_counts[action] = (
                 self._shadow_action_counts.get(action, 0) + 1
@@ -2336,7 +2797,7 @@ class ReplayEvictionLoop:
                 rec,
                 accepted=confirmed,
                 reason="shadow_confirmed" if confirmed else "shadow_oracle_rejected",
-                extra=self._decision_trace_extra(rec, policy_kwargs),
+                extra=self._decision_trace_extra(rec, policy_kwargs, decision),
             )
 
     def _budget_exhausted(self, t0: float) -> bool:
@@ -2463,6 +2924,7 @@ class ReplayEvictionLoop:
             SLOT_QUARANTINE,
             SLOT_DISTILL,
         }
+        self._last_oracle_score_by_slot.clear()
         candidate_pairs: list[tuple[int, int, str, float]] = []
         for sid, action in actions.items():
             if action not in needs_oracle:
@@ -2480,6 +2942,7 @@ class ReplayEvictionLoop:
             confirmations: dict[int, bool] = {}
             n_pairs = 0
             for sid, phys, action, oracle_score in candidate_pairs:
+                self._last_oracle_score_by_slot[int(sid)] = float(oracle_score)
                 confirmed = self._action_confirmed(
                     action=action,
                     proxy_score=oracle_score,
@@ -2544,6 +3007,7 @@ class ReplayEvictionLoop:
             if phys not in oracle_by_phys:
                 continue
             oracle_score = oracle_by_phys[phys]
+            self._last_oracle_score_by_slot[int(sid)] = float(oracle_score)
             confirmed = self._action_confirmed(
                 action=action,
                 proxy_score=proxy_score,
@@ -2588,6 +3052,11 @@ class ReplayEvictionLoop:
     ) -> bool:
         """Decide whether the oracle supports a proxy-proposed action."""
         del proxy_score
+        if self._commit_policy_mode == "learned":
+            return self._learned_action_physics_confirmed(
+                action=action,
+                oracle_score=oracle_score,
+            )
         low_value = oracle_score <= max(self._threshold, self._useful_threshold)
         if action in {SLOT_EVICT, SLOT_QUARANTINE}:
             return low_value
@@ -2597,6 +3066,29 @@ class ReplayEvictionLoop:
             return low_value and oracle_score >= self._quarantine_threshold
         if action == SLOT_REFRESH:
             return oracle_score > self._useful_threshold
+        return True
+
+    @staticmethod
+    def _learned_action_physics_confirmed(
+        *,
+        action: str,
+        oracle_score: float,
+    ) -> bool:
+        """Threshold-free GPU3 physics veto for learned commit actions.
+
+        ``oracle_score`` is mean ``NLL_hide_slot - NLL_force_on``. Positive
+        means hiding the slot hurts, so the slot is currently useful. Negative
+        means hiding the slot helps, so the slot is harmful. The learned
+        controller owns the action choice; this only prevents physically
+        incoherent mutations.
+        """
+        score = float(oracle_score)
+        if not math.isfinite(score):
+            return False
+        if action in {SLOT_EVICT, SLOT_QUARANTINE, SLOT_DECAY, SLOT_DISTILL}:
+            return score <= 0.0
+        if action == SLOT_REFRESH:
+            return score > 0.0
         return True
 
     def _has_action_agreement(
@@ -2649,21 +3141,11 @@ class ReplayEvictionLoop:
         table = getattr(outer, "table", None)
         has_table = table is not None
         result = TickResult()
-        policy_kwargs = dict(
-            eviction_threshold=self._threshold,
-            useful_threshold=self._useful_threshold,
-            drift_threshold=self._drift_threshold,
-            quarantine_threshold=self._quarantine_threshold,
-            distill_peak_threshold=self._distill_peak_threshold,
-            peak_preserve_utility_threshold=self._peak_preserve_utility_threshold,
-            peak_preserve_sharpness_threshold=self._peak_preserve_sharpness_threshold,
-            min_age=self._min_age,
-            min_score_count=self._min_score_count,
-            capacity_pressure=self._capacity_pressure(outer),
-        )
+        policy_kwargs = self._policy_kwargs(outer)
 
         # Collect actions per slot
         actions: dict[int, str] = {}  # slot_id_or_idx -> action
+        decisions: dict[int, CommitDecision] = {}
 
         if has_table:
             # Check quarantine releases first
@@ -2689,8 +3171,9 @@ class ReplayEvictionLoop:
                 rec = table.record(sid)
                 if rec is None:
                     continue
-                action = self._policy.choose(rec, **policy_kwargs)
-                actions[sid] = action
+                decision = self._choose_commit_decision(rec, policy_kwargs)
+                actions[sid] = decision.action
+                decisions[sid] = decision
 
             confirmations = self._confirm_actions_with_oracle(
                 model=model, outer=outer, actions=actions, cf=cf, t0=t0
@@ -2703,13 +3186,21 @@ class ReplayEvictionLoop:
                 rec = table.record(sid)
                 if rec is None:
                     continue
-                extra = self._decision_trace_extra(rec, policy_kwargs)
+                decision = decisions.get(sid)
+                extra = self._decision_trace_extra(rec, policy_kwargs, decision)
                 confirmed = confirmations.get(sid, action == SLOT_PRESERVE)
                 if action == SLOT_REFRESH:
                     accepted = False
-                    agreed = confirmed and self._has_action_agreement(sid, action, rec)
+                    agreed = confirmed and self._commit_action_ready(sid, action, rec)
                     if agreed:
                         accepted = self._execute_refresh(model, outer, sid, cf, t0=t0)
+                    if decision is not None:
+                        self._record_commit_feedback(
+                            decision,
+                            accepted=accepted,
+                            structural=True,
+                            slot_id=sid,
+                        )
                     if accepted:
                         result.refreshed.append(sid)
                         self._refreshes_total += 1
@@ -2728,12 +3219,19 @@ class ReplayEvictionLoop:
                 elif action == SLOT_QUARANTINE:
                     if not confirmed:
                         rec.last_action = action
+                        if decision is not None:
+                            self._record_commit_feedback(
+                                decision,
+                                accepted=False,
+                                structural=True,
+                                slot_id=sid,
+                            )
                         self._trace_event(
                             step, sid, action, rec,
                             accepted=False, reason="oracle_rejected", extra=extra,
                         )
                         continue
-                    if not self._has_action_agreement(sid, action, rec):
+                    if not self._commit_action_ready(sid, action, rec):
                         rec.last_action = action
                         self._trace_event(
                             step, sid, action, rec,
@@ -2743,10 +3241,24 @@ class ReplayEvictionLoop:
                     self._execute_quarantine(outer, sid)
                     result.quarantined.append(sid)
                     rec.last_action = action
+                    if decision is not None:
+                        self._record_commit_feedback(
+                            decision,
+                            accepted=True,
+                            structural=True,
+                            slot_id=sid,
+                        )
                     self._trace_event(step, sid, action, rec, extra=extra)
                 elif action == SLOT_DECAY:
                     if not confirmed:
                         rec.last_action = action
+                        if decision is not None:
+                            self._record_commit_feedback(
+                                decision,
+                                accepted=False,
+                                structural=False,
+                                slot_id=sid,
+                            )
                         self._trace_event(
                             step, sid, action, rec,
                             accepted=False, reason="oracle_rejected", extra=extra,
@@ -2757,6 +3269,13 @@ class ReplayEvictionLoop:
                     self._decays_total += 1
                     rec.state = SLOT_DECAYING
                     rec.last_action = action
+                    if decision is not None:
+                        self._record_commit_feedback(
+                            decision,
+                            accepted=True,
+                            structural=False,
+                            slot_id=sid,
+                        )
                     self._trace_event(step, sid, action, rec, extra=extra)
                 elif action == SLOT_PRESERVE:
                     if rec.sharpness_ema > self._useful_threshold:
@@ -2764,6 +3283,13 @@ class ReplayEvictionLoop:
                     elif rec.state == SLOT_WARMING and rec.score_count >= self._min_score_count:
                         rec.state = SLOT_ACTIVE
                     rec.last_action = action
+                    if decision is not None:
+                        self._record_commit_feedback(
+                            decision,
+                            accepted=True,
+                            structural=False,
+                            slot_id=sid,
+                        )
                     self._trace_event(step, sid, action, rec, extra=extra)
 
             # Execute structural actions (evict, distill) — descending physical order
@@ -2776,7 +3302,8 @@ class ReplayEvictionLoop:
                 if self._budget_exhausted(t0):
                     break
                 rec = table.record(sid)
-                extra = self._decision_trace_extra(rec, policy_kwargs)
+                decision = decisions.get(sid)
+                extra = self._decision_trace_extra(rec, policy_kwargs, decision)
                 if not confirmations.get(sid, False):
                     self._trace_event(
                         step, sid, action, rec,
@@ -2784,8 +3311,15 @@ class ReplayEvictionLoop:
                     )
                     if rec:
                         rec.last_action = action
+                    if decision is not None:
+                        self._record_commit_feedback(
+                            decision,
+                            accepted=False,
+                            structural=True,
+                            slot_id=sid,
+                        )
                     continue
-                if not self._has_action_agreement(sid, action, rec):
+                if not self._commit_action_ready(sid, action, rec):
                     self._trace_event(
                         step, sid, action, rec,
                         accepted=False, reason="awaiting_agreement", extra=extra,
@@ -2804,6 +3338,13 @@ class ReplayEvictionLoop:
                     if receipt.accepted:
                         result.distilled.append(sid)
                         self._distills_total += 1
+                        if decision is not None:
+                            self._record_commit_feedback(
+                                decision,
+                                accepted=True,
+                                structural=True,
+                                slot_id=sid,
+                            )
                         self._trace_event(
                             step,
                             sid,
@@ -2813,6 +3354,13 @@ class ReplayEvictionLoop:
                             extra=distill_extra,
                         )
                     else:
+                        if decision is not None:
+                            self._record_commit_feedback(
+                                decision,
+                                accepted=False,
+                                structural=True,
+                                slot_id=sid,
+                            )
                         self._trace_event(
                             step, sid, action, rec,
                             accepted=False,
@@ -2823,6 +3371,13 @@ class ReplayEvictionLoop:
                     table.retire(sid, reason="evicted")
                     result.evicted.append(sid)
                     self._evictions_total += 1
+                    if decision is not None:
+                        self._record_commit_feedback(
+                            decision,
+                            accepted=True,
+                            structural=True,
+                            slot_id=sid,
+                        )
                     self._trace_event(
                         step, sid, action, rec, reason="evicted", extra=extra
                     )
@@ -3192,6 +3747,7 @@ class ReplayEvictionLoop:
         self,
         rec: SlotRecord | None,
         policy_kwargs: dict[str, Any],
+        decision: CommitDecision | None = None,
     ) -> dict[str, Any]:
         if rec is None:
             return {}
@@ -3200,6 +3756,25 @@ class ReplayEvictionLoop:
             f"action_value_{action.lower()}": float(value)
             for action, value in values.items()
         }
+        extra["commit_policy"] = self._commit_policy_mode
+        if decision is not None:
+            extra.update({
+                "learned_commit_action": decision.action,
+                "rule_shadow_action": decision.rule_action,
+                "learned_commit_confidence": decision.confidence,
+                "learned_commit_probability": decision.probability,
+                "learned_commit_entropy": decision.entropy,
+                "learned_commit_vetoed_action": decision.vetoed_action,
+                "learned_commit_veto_reason": decision.veto_reason,
+            })
+            for action in SLOT_ACTION_ORDER:
+                key = action.lower()
+                extra[f"learned_commit_logit_{key}"] = decision.logits.get(
+                    action, 0.0
+                )
+                extra[f"learned_commit_p_{key}"] = decision.probabilities.get(
+                    action, 0.0
+                )
         for factor in (0.5, 2.0):
             kwargs = dict(policy_kwargs)
             kwargs["eviction_threshold"] = float(kwargs["eviction_threshold"]) * factor
@@ -3530,6 +4105,11 @@ class ReplayEvictionLoop:
             "frame_ttl_steps": self._frame_ttl_steps,
             "slot_work_chunk_size": self._slot_work_chunk_size,
             "action_agreement_count": self._action_agreement_count,
+            "commit_policy": self._commit_policy_mode,
+            "commit_online_lr": self._commit_online_lr,
+            "commit_rule_prior_scale": self._commit_rule_prior_scale,
+            "commit_temperature": self._commit_temperature,
+            "commit_policy_state": self._commit_policy.state_dict(),
             "refresh_proposal_model": self._refresh_proposal_model.state_dict(),
             "legacy_slot_utility_ema": dict(self._slot_utility_ema),
             "legacy_slot_first_seen_step": dict(self._slot_first_seen_step),
@@ -3596,6 +4176,9 @@ class ReplayEvictionLoop:
             "slot_work_items_total": self._slot_work_items_total,
             "action_agreements_total": self._action_agreements_total,
             "action_agreements_reset_total": self._action_agreements_reset_total,
+            "commit_decisions_total": self._commit_decisions_total,
+            "commit_rule_disagreements_total": self._commit_rule_disagreements_total,
+            "commit_feedback_updates_total": self._commit_feedback_updates_total,
             "queue_depth_sum": self._queue_depth_sum,
             "queue_depth_samples": self._queue_depth_samples,
             "queue_depth_max": self._queue_depth_max,
@@ -3619,6 +4202,21 @@ class ReplayEvictionLoop:
         proposal_state = state.get("refresh_proposal_model")
         if isinstance(proposal_state, dict):
             self._refresh_proposal_model.load_state_dict(proposal_state)
+        commit_state = state.get("commit_policy_state")
+        if isinstance(commit_state, dict):
+            self._commit_policy.load_state_dict(commit_state)
+        self._commit_policy_mode = str(
+            state.get("commit_policy", self._commit_policy_mode)
+        )
+        self._commit_online_lr = float(
+            state.get("commit_online_lr", self._commit_online_lr)
+        )
+        self._commit_rule_prior_scale = float(
+            state.get("commit_rule_prior_scale", self._commit_rule_prior_scale)
+        )
+        self._commit_temperature = float(
+            state.get("commit_temperature", self._commit_temperature)
+        )
         self._slot_utility_ema = {
             int(k): float(v)
             for k, v in state.get("legacy_slot_utility_ema", {}).items()
@@ -3684,6 +4282,9 @@ class ReplayEvictionLoop:
             "_slot_work_items_total": "slot_work_items_total",
             "_action_agreements_total": "action_agreements_total",
             "_action_agreements_reset_total": "action_agreements_reset_total",
+            "_commit_decisions_total": "commit_decisions_total",
+            "_commit_rule_disagreements_total": "commit_rule_disagreements_total",
+            "_commit_feedback_updates_total": "commit_feedback_updates_total",
             "_queue_depth_sum": "queue_depth_sum",
             "_queue_depth_samples": "queue_depth_samples",
             "_queue_depth_max": "queue_depth_max",
@@ -3966,6 +4567,14 @@ class ReplayEvictionLoop:
                 if elapsed_wall > 0.0
                 else 0.0
             ),
+            "commit_policy": self._commit_policy_mode,
+            "learned_commit_policy": self._commit_policy.diagnostics(),
+            "commit_decisions_total": self._commit_decisions_total,
+            "commit_rule_disagreements_total": self._commit_rule_disagreements_total,
+            "commit_feedback_updates_total": self._commit_feedback_updates_total,
+            "commit_online_lr": self._commit_online_lr,
+            "commit_rule_prior_scale": self._commit_rule_prior_scale,
+            "commit_temperature": self._commit_temperature,
             "action_agreement_count": self._action_agreement_count,
             "action_agreements_total": self._action_agreements_total,
             "action_agreements_reset_total": self._action_agreements_reset_total,

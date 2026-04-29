@@ -129,6 +129,8 @@ def test_smoke_matrix_two_entries_and_isolated_outputs(exp26, speed_config):
     assert active["bucket_prototypes"] is True
     assert active["prototype_dim"] == 64
     assert active["replay_eviction_action_agreement_count"] == 1
+    assert active["replay_eviction_commit_policy"] == "learned"
+    assert active["replay_eviction_commit_online_lr"] == 0.05
     assert "smoke" in active["replay_eviction_trace_path"]
     assert "calibration" not in active["replay_eviction_trace_path"]
     assert "results" not in active["replay_eviction_trace_path"]
@@ -150,6 +152,7 @@ def test_calibration_matrix_single_entry(exp26, speed_config):
     assert e["fast_slow_enabled"] is True
     assert "exp26_calibration_shadow_s42" in e["name"]
     assert e["replay_eviction_action_agreement_count"] == 1
+    assert e["replay_eviction_commit_policy"] == "learned"
     assert e["replay_eviction_max_seconds"] == 8.0
     # Trace path lives in the calibration directory.
     assert "calibration" in str(e["replay_eviction_trace_path"])
@@ -158,7 +161,7 @@ def test_calibration_matrix_single_entry(exp26, speed_config):
 def test_calibration_matrix_uses_full_arm_pipeline(exp26, speed_config):
     """Calibration should run the SAME pipeline knobs as headline arms.
 
-    The signal distributions we observe must reflect what arm_d/arm_e
+    The signal distributions we observe must reflect what arm_d
     will actually see, not a stripped-down telemetry-only path.
     """
     entries = exp26.build_calibration_matrix(speed_config=speed_config)
@@ -188,6 +191,7 @@ def test_calibration_matrix_uses_full_arm_pipeline(exp26, speed_config):
     assert e["replay_eviction_probe_buffer_size"] == 32
     assert e["replay_eviction_frame_ttl_steps"] == 256
     assert e["replay_eviction_max_seconds"] == 8.0
+    assert e["replay_eviction_commit_policy"] == "learned"
     assert e["replay_eviction_trace_flush_rows"] == 256
     # Mode is shadow, not active.
     assert e["replay_eviction_mode"] == "shadow"
@@ -318,15 +322,16 @@ def _write_realistic_manifest(path: Path) -> None:
     path.write_text(json.dumps(manifest, indent=2))
 
 
-def test_arm_v1_matrix_requires_manifest(tmp_path, exp26, speed_config):
-    with pytest.raises(FileNotFoundError, match="calibration manifest missing"):
-        exp26.build_arm_v1_matrix(
-            speed_config=speed_config,
-            calibration_manifest_path=tmp_path / "missing.json",
-        )
+def test_arm_v1_matrix_does_not_require_threshold_manifest(tmp_path, exp26, speed_config):
+    entries = exp26.build_arm_v1_matrix(
+        speed_config=speed_config,
+        calibration_manifest_path=tmp_path / "missing.json",
+        seed_values=[1337],
+    )
+    assert {entry["arm"] for entry in entries} == set(exp26.ARM_V1_ARMS)
 
 
-def test_arm_v1_matrix_5_arms_x_3_seeds(tmp_path, exp26, speed_config):
+def test_arm_v1_matrix_4_arms_x_3_seeds(tmp_path, exp26, speed_config):
     manifest_path = tmp_path / "manifest.json"
     _write_realistic_manifest(manifest_path)
     entries = exp26.build_arm_v1_matrix(
@@ -334,51 +339,32 @@ def test_arm_v1_matrix_5_arms_x_3_seeds(tmp_path, exp26, speed_config):
         calibration_manifest_path=manifest_path,
         seed_values=[1337, 2674, 4011],
     )
-    assert len(entries) == 5 * 3
+    assert len(entries) == 4 * 3
     arms_seen = {e["arm"] for e in entries}
     assert arms_seen == set(exp26.ARM_V1_ARMS)
     assert {e["model_dim"] for e in entries} == {384}
 
 
-def test_arm_v1_balanced_uses_calibrated_thresholds(tmp_path, exp26, speed_config):
+def test_arm_v1_active_uses_learned_commit_authority(tmp_path, exp26, speed_config):
     manifest_path = tmp_path / "manifest.json"
     _write_realistic_manifest(manifest_path)
     entries = exp26.build_arm_v1_matrix(
         speed_config=speed_config,
         calibration_manifest_path=manifest_path,
         seed_values=[1337],
-        arms=["arm_d_crct_replay_active_balanced"],
+        arms=["arm_d_crct_replay_active_learned"],
     )
     assert len(entries) == 1
     e = entries[0]
-    # Balanced thresholds from manifest land in the entry config.
+    # Manifest thresholds land only as rule-prior features/counterfactual
+    # telemetry. The active owner is the learned Full-A action simplex.
     assert e["replay_eviction_threshold"] == 0.01
     assert e["replay_eviction_peak_preserve_utility_threshold"] == 0.05
     assert e["replay_eviction_peak_preserve_sharpness_threshold"] == 0.03
-    assert e["replay_eviction_action_agreement_count"] == 2
-    assert e["replay_eviction_mode"] == "active"
-
-
-def test_arm_v1_aggressive_uses_aggressive_thresholds(tmp_path, exp26, speed_config):
-    manifest_path = tmp_path / "manifest.json"
-    _write_realistic_manifest(manifest_path)
-    entries = exp26.build_arm_v1_matrix(
-        speed_config=speed_config,
-        calibration_manifest_path=manifest_path,
-        seed_values=[1337],
-        arms=["arm_e_crct_replay_active_aggressive"],
-    )
-    assert len(entries) == 1
-    e = entries[0]
-    # Aggressive thresholds.
-    assert e["replay_eviction_threshold"] == 0.04
-    assert e["replay_eviction_peak_preserve_utility_threshold"] == 0.005
-    assert e["replay_eviction_peak_preserve_sharpness_threshold"] == 0.003
-    # Aggressive policy: act on first observation; oracle chunk shape stays fixed.
     assert e["replay_eviction_action_agreement_count"] == 1
-    assert e["replay_eviction_oracle_confirm_top_k"] == 32
-    assert e["replay_eviction_refresh_candidate_count"] == 16
-    assert e["replay_eviction_refresh_candidate_variant_chunk_size"] == 16
+    assert e["replay_eviction_commit_policy"] == "learned"
+    assert e["replay_eviction_commit_online_lr"] == 0.05
+    assert e["replay_eviction_commit_rule_prior_scale"] == 1.0
     assert e["replay_eviction_mode"] == "active"
 
 
@@ -405,12 +391,12 @@ def test_arm_v1_per_arm_per_seed_trace_paths(tmp_path, exp26, speed_config):
         speed_config=speed_config,
         calibration_manifest_path=manifest_path,
         seed_values=[1337, 2674],
-        arms=["arm_d_crct_replay_active_balanced"],
+        arms=["arm_d_crct_replay_active_learned"],
     )
     paths = {e["replay_eviction_trace_path"] for e in entries}
     assert len(paths) == 2  # two seeds, two trace paths
     for p in paths:
-        assert "arm_d_crct_replay_active_balanced" in p
+        assert "arm_d_crct_replay_active_learned" in p
 
 
 def test_arm_v1_unknown_arm_raises(tmp_path, exp26, speed_config):

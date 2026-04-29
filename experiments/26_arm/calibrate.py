@@ -3,9 +3,9 @@
 
 Reads a shadow-mode replay-maintenance trace (NDJSON), pulls per-decision
 EMAs out of the action rows, and writes a manifest of percentile-anchored
-threshold sets — one for the balanced arm (arm_d), one for the aggressive
-arm (arm_e). Replaces unmotivated round-number defaults with values
-anchored to the actual signal distributions our model produces.
+threshold counterfactuals. These values seed rule-prior features and trace
+what a threshold policy would have done; they no longer define active arms
+or own the commit decision.
 """
 
 from __future__ import annotations
@@ -127,7 +127,7 @@ def _summarize(signals: dict[str, list[float]]) -> dict[str, dict[str, float]]:
 
 
 def _balanced_thresholds(summary: dict[str, dict[str, float]]) -> dict[str, float]:
-    """Threshold set for arm_d. Mid-aggressive percentile anchors."""
+    """Balanced threshold counterfactual. Mid-aggressive percentile anchors."""
     return {
         "threshold": summary["utility_ema"]["p50"],
         "useful_threshold": summary["utility_ema"]["p25"],
@@ -143,11 +143,11 @@ def _balanced_thresholds(summary: dict[str, dict[str, float]]) -> dict[str, floa
 
 
 def _aggressive_thresholds(summary: dict[str, dict[str, float]]) -> dict[str, float]:
-    """Threshold set for arm_e. Pushes the policy harder.
+    """Aggressive threshold counterfactual. Pushes the shadow policy harder.
 
     More slots above eviction floor, less preservation force, distill
-    fires earlier, refresh fires earlier. Tests whether the calibrated
-    defaults left signal on the table.
+    fires earlier, refresh fires earlier. This remains useful for post-hoc
+    threshold replay, not as a live Exp26 arm.
     """
     return {
         "threshold": summary["utility_ema"]["p75"],

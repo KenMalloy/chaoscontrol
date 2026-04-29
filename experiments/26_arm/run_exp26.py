@@ -7,11 +7,11 @@ Three-stage discipline plus a phase-0 runtime smoke:
                           CRCT+ARM cell, isolated under smoke/.
   Stage 1 (calibrate)   : 1 cell, 1 seed, ~180s, shadow mode, full ARM pipeline.
                           Trace at calibration/trace.ndjson.
-  Stage 2 (analyze)     : Read trace, percentile-anchor thresholds, write
-                          calibration/manifest.json.
-  Stage 3 (headline)    : 5 arms x 3 seeds, 600s each. Reads manifest at
-                          construction time; folds calibrated thresholds
-                          into arm_d (balanced) and arm_e (aggressive).
+  Stage 2 (analyze)     : Read trace, percentile-anchor threshold
+                          counterfactuals, write calibration/manifest.json.
+  Stage 3 (headline)    : 4 arms x 3 seeds, 600s each. The active ARM cell
+                          uses learned Full-A commit authority; manifest
+                          thresholds are rule-prior telemetry only.
 
 Usage:
 
@@ -24,7 +24,7 @@ Usage:
   # calibrate-only (writes manifest then stops)
   python experiments/26_arm/run_exp26.py --stage calibrate
 
-  # headline only (requires manifest from a prior calibrate)
+  # headline only (uses manifest when present, but does not require it)
   python experiments/26_arm/run_exp26.py --stage headline
 
   # dry-run any stage to print entries without launching
