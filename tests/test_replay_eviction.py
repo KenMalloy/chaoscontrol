@@ -8,11 +8,12 @@ import torch.nn as nn
 
 import pytest
 
-from chaoscontrol.memory import BucketPrototypes
+from chaoscontrol.memory import BucketPrototypes, MultiSlotOuterModel
 import chaoscontrol.replay_eviction as replay_eviction_mod
 from chaoscontrol.replay_eviction import (
     ReplayEvictionLoop, TickResult, MaintenancePolicy,
-    counterfactual_probe, oracle_confirm_slots, replay_score_slots, _evict_slots,
+    counterfactual_probe, oracle_confirm_slots, oracle_confirm_refresh_candidates,
+    replay_score_slots, _evict_slots,
     _compute_per_slot_sharpness, _compute_representation_drift,
     CounterfactualResult, DistillReceipt, MemoryEvent,
     SLOT_PRESERVE, SLOT_DECAY, SLOT_EVICT, SLOT_REFRESH,
@@ -91,12 +92,17 @@ class _StubModel(nn.Module):
         memory_mode: str = "off",
         cache_read_cutoff=None,
         memory_slot_mask: torch.Tensor | None = None,
+        memory_slot_override_index: int | None = None,
+        memory_slot_override_values: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        del memory_slot_mask
+        del memory_slot_mask, cache_read_cutoff, memory_slot_override_index
         batch, seq = input_ids.shape
         base = torch.randn(batch, seq, self.dim) * 0.1
         if memory_mode == "force_on" and self.outer_model is not None:
             base = base + self._memory_benefit
+            if memory_slot_override_values is not None:
+                strength = memory_slot_override_values.float().mean(dim=-1)
+                base = base + strength.view(batch, 1, 1) * 0.01
             outer = self.outer_model
             if hasattr(outer, 'table') and outer.table is not None:
                 n_slots = len(outer.table)
@@ -800,6 +806,97 @@ class TestOracleConfirmation:
         assert scorer.rows == (2 + 1 + 1) * 2 * 8
         assert result.oracle_deltas.device.type == "cpu"
 
+    def test_refresh_oracle_uses_sparse_slot_override_batch(self):
+        model = _StubModel(n_slots=3, memory_benefit=0.25, use_table=True)
+        original_encode = model.encode
+        seen: list[tuple[torch.Tensor | None, int | None, torch.Tensor | None]] = []
+
+        def counted_encode(input_ids: torch.Tensor, **kwargs):
+            seen.append((
+                kwargs.get("memory_slot_mask"),
+                kwargs.get("memory_slot_override_index"),
+                kwargs.get("memory_slot_override_values"),
+            ))
+            return original_encode(input_ids, **kwargs)
+
+        model.encode = counted_encode  # type: ignore[method-assign]
+        input_ids = torch.randint(0, 32, (2, 9))
+        valid_mask = torch.ones(2, 9)
+        candidates = [
+            ("identity", torch.zeros(1, 8)),
+            ("proposal_a", torch.ones(1, 8)),
+            ("proposal_b", torch.full((1, 8), 2.0)),
+        ]
+
+        result = oracle_confirm_refresh_candidates(
+            model=model,
+            outer=model.outer_model,
+            probe_input_ids=input_ids,
+            probe_valid_mask=valid_mask,
+            slot_index=1,
+            candidate_tensors=candidates,
+            variant_chunk_size=8,
+        )
+
+        assert result.candidate_names == ["identity", "proposal_a", "proposal_b"]
+        assert result.candidate_scores.shape == (3,)
+        assert len(seen) == 2  # one no-sidecar pass, one batched candidate pass.
+        off_mask, off_override_idx, off_values = seen[0]
+        assert off_mask is not None and not off_mask.any()
+        assert off_override_idx is None
+        assert off_values is None
+        cand_mask, cand_override_idx, cand_values = seen[1]
+        assert cand_mask is None
+        assert cand_override_idx == 1
+        assert cand_values.shape == (3 * 2, 8)
+        assert result.chunk_count == 1
+        assert result.variants_total == 3
+
+    def test_refresh_oracle_reports_internal_candidate_chunks(self):
+        model = _StubModel(n_slots=3, memory_benefit=0.25, use_table=True)
+        input_ids = torch.randint(0, 32, (2, 9))
+        valid_mask = torch.ones(2, 9)
+        candidates = [(f"c{i}", torch.full((1, 8), float(i))) for i in range(5)]
+
+        result = oracle_confirm_refresh_candidates(
+            model=model,
+            outer=model.outer_model,
+            probe_input_ids=input_ids,
+            probe_valid_mask=valid_mask,
+            slot_index=1,
+            candidate_tensors=candidates,
+            variant_chunk_size=2,
+        )
+
+        assert result.chunk_count == 3
+        assert result.variants_total == 5
+
+
+class TestMemorySlotOverride:
+    def test_multislot_read_override_matches_temporary_replacement_without_mutation(self):
+        torch.manual_seed(123)
+        outer = MultiSlotOuterModel(model_dim=16, outer_dim=8, max_slots=8)
+        s0 = torch.randn(1, 8)
+        s1 = torch.randn(1, 8)
+        candidate = torch.randn(1, 8)
+        outer.table.append(s0, bucket_id=0)
+        outer.table.append(s1, bucket_id=0)
+        cue = torch.randn(3, 16)
+
+        override = outer.read(
+            3,
+            cue=cue,
+            slot_override_index=1,
+            slot_override_values=candidate.expand(3, -1),
+        )
+        original = outer.table.get_tensor(1).detach().clone()
+        outer.table.replace_tensor(1, candidate, bump_generation=False)
+        replaced = outer.read(3, cue=cue)
+        outer.table.replace_tensor(1, original, bump_generation=False)
+
+        assert torch.allclose(override, replaced, atol=1e-6)
+        assert torch.allclose(outer.table.get_tensor(1), original)
+
 
 # ---------------------------------------------------------------------------
 # Tests for signal decomposition
@@ -1205,8 +1302,21 @@ class TestSlotTableTick:
         assert loop.diagnostics()["action_agreements_total"] == 0
 
     def test_refresh_ranks_candidates_with_oracle_not_proxy(self, monkeypatch):
-        loop = ReplayEvictionLoop(action_mode="active", refresh_margin=0.001)
+        loop = ReplayEvictionLoop(
+            action_mode="active",
+            refresh_margin=0.001,
+            refresh_candidate_count=4,
+            refresh_candidate_variant_chunk_size=4,
+        )
         model = _StubModel(n_slots=1, use_table=True)
+        outer = model.outer_model
+
+        class RaisingLinear(nn.Linear):
+            def forward(self, _input):  # pragma: no cover - should never run
+                raise AssertionError("refresh candidate proposal must run on CPU")
+
+        outer.encoder = RaisingLinear(16, outer.outer_dim, bias=False)
+        outer.decoder = RaisingLinear(outer.outer_dim, 16, bias=False)
         table = model.outer_model.table
         sid = table.active_slot_ids()[0]
         rec = table.record(sid)
@@ -1226,39 +1336,62 @@ class TestSlotTableTick:
             mask=torch.ones(1, 2, dtype=torch.bool),
             slot_indices=[0],
         )
-        scores = iter([0.0, 1.0, 0.25, 0.1])
         oracle_calls = 0
 
         def fake_counterfactual_probe(**_kwargs):
             raise AssertionError("refresh acceptance must not use cheap proxy")
 
-        def fake_oracle(**_kwargs):
+        def fake_refresh_oracle(**kwargs):
             nonlocal oracle_calls
             oracle_calls += 1
-            score = next(scores)
-            return replay_eviction_mod.OracleConfirmationResult(
-                slot_indices=[0],
-                oracle_deltas=torch.full((1, 1, 2), score),
-                nll_baseline=torch.zeros(1, 2),
+            assert len(kwargs["candidate_tensors"]) == 4
+            assert kwargs["variant_chunk_size"] == 4
+            scores = torch.tensor([0.0, 1.0, 0.25, 0.1])
+            return replay_eviction_mod.RefreshCandidateOracleResult(
+                slot_index=0,
+                candidate_names=[name for name, _tensor in kwargs["candidate_tensors"]],
+                candidate_scores=scores,
+                candidate_improvements=scores - scores[0],
                 nll_no_sidecar=torch.zeros(1, 2),
+                nll_candidates=torch.zeros(4, 1, 2),
                 mask=torch.ones(1, 2, dtype=torch.bool),
+                chunk_count=1,
+                variants_total=4,
             )
 
         monkeypatch.setattr(
             replay_eviction_mod, "counterfactual_probe", fake_counterfactual_probe
         )
-        monkeypatch.setattr(replay_eviction_mod, "oracle_confirm_slots", fake_oracle)
+        monkeypatch.setattr(
+            replay_eviction_mod,
+            "oracle_confirm_refresh_candidates",
+            fake_refresh_oracle,
+        )
 
         accepted = loop._execute_refresh(
             model, model.outer_model, sid, cf, t0=time.monotonic()
         )
 
         assert accepted is True
-        assert oracle_calls >= 2
+        assert oracle_calls == 1
         assert rec.write_generation == before_generation + 1
+        diag = loop.diagnostics()
+        assert diag["refresh_candidate_proposal_device"] == "cpu"
+        assert diag["last_refresh_candidate_count"] == 4
+        assert diag["refresh_candidate_proposals_total"] == 3
+        assert diag["refresh_candidate_oracle_batches_total"] == 1
+        assert diag["refresh_candidate_oracle_chunks_total"] == 1
+        assert diag["refresh_candidate_oracle_variants_total"] == 4
+        assert diag["last_refresh_candidate_best_index"] == 1
+        assert diag["refresh_candidate_accepts_total"] == 1
+        assert diag["refresh_proposal_model"]["structural_accepts_total"] == 1
 
     def test_rejected_refresh_probe_swaps_do_not_bump_generation(self, monkeypatch):
-        loop = ReplayEvictionLoop(action_mode="active", refresh_margin=0.001)
+        loop = ReplayEvictionLoop(
+            action_mode="active",
+            refresh_margin=0.001,
+            refresh_candidate_count=4,
+        )
         model = _StubModel(n_slots=1, use_table=True)
         table = model.outer_model.table
         sid = table.active_slot_ids()[0]
@@ -1281,16 +1414,25 @@ class TestSlotTableTick:
             slot_indices=[0],
         )
 
-        def fake_oracle(**_kwargs):
-            return replay_eviction_mod.OracleConfirmationResult(
-                slot_indices=[0],
-                oracle_deltas=torch.zeros(1, 1, 2),
-                nll_baseline=torch.zeros(1, 2),
+        def fake_refresh_oracle(**kwargs):
+            scores = torch.zeros(len(kwargs["candidate_tensors"]))
+            return replay_eviction_mod.RefreshCandidateOracleResult(
+                slot_index=0,
+                candidate_names=[name for name, _tensor in kwargs["candidate_tensors"]],
+                candidate_scores=scores,
+                candidate_improvements=scores - scores[0],
                 nll_no_sidecar=torch.zeros(1, 2),
+                nll_candidates=torch.zeros(len(kwargs["candidate_tensors"]), 1, 2),
                 mask=torch.ones(1, 2, dtype=torch.bool),
+                chunk_count=1,
+                variants_total=len(kwargs["candidate_tensors"]),
             )
 
-        monkeypatch.setattr(replay_eviction_mod, "oracle_confirm_slots", fake_oracle)
+        monkeypatch.setattr(
+            replay_eviction_mod,
+            "oracle_confirm_refresh_candidates",
+            fake_refresh_oracle,
+        )
 
         accepted = loop._execute_refresh(
             model, model.outer_model, sid, cf, t0=time.monotonic()
@@ -1299,6 +1441,8 @@ class TestSlotTableTick:
         assert accepted is False
         assert rec.write_generation == before_generation
         assert torch.allclose(table.get_tensor(sid), before_tensor)
+        assert loop.diagnostics()["refresh_candidate_rejects_total"] == 1
+        assert loop.diagnostics()["refresh_proposal_model"]["structural_rejects_total"] == 1
 
     def test_distill_requires_sink_before_retiring_slot(self):
         loop = ReplayEvictionLoop(action_mode="active")

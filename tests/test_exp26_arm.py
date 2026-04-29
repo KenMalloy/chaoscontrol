@@ -119,6 +119,10 @@ def test_smoke_matrix_two_entries_and_isolated_outputs(exp26, speed_config):
     )
     assert active["replay_eviction_cpu_scorer_backend"] == "amx_bf16"
     assert active["replay_eviction_cpu_scorer_lanes"] == 56
+    assert active["replay_eviction_refresh_candidate_count"] == 16
+    assert active["replay_eviction_refresh_proposal_rank"] == 8
+    assert active["replay_eviction_refresh_candidate_variant_chunk_size"] == 16
+    assert active["replay_eviction_refresh_proposal_weight_sync_interval_steps"] == 64
     assert active["bucket_prototypes"] is True
     assert active["prototype_dim"] == 64
     assert active["replay_eviction_action_agreement_count"] == 1
@@ -171,6 +175,10 @@ def test_calibration_matrix_uses_full_arm_pipeline(exp26, speed_config):
     assert e["replay_eviction_cpu_scorer_weight_sync_interval_steps"] == 64
     assert e["replay_eviction_oracle_confirm_top_k"] == 32
     assert e["replay_eviction_oracle_variant_chunk_size"] == 1
+    assert e["replay_eviction_refresh_candidate_count"] == 16
+    assert e["replay_eviction_refresh_proposal_rank"] == 8
+    assert e["replay_eviction_refresh_candidate_variant_chunk_size"] == 16
+    assert e["replay_eviction_refresh_proposal_weight_sync_interval_steps"] == 64
     assert e["replay_eviction_probe_buffer_size"] == 32
     assert e["replay_eviction_frame_ttl_steps"] == 256
     assert e["replay_eviction_max_seconds"] == 8.0
@@ -363,6 +371,8 @@ def test_arm_v1_aggressive_uses_aggressive_thresholds(tmp_path, exp26, speed_con
     # Aggressive policy: act on first observation; oracle chunk shape stays fixed.
     assert e["replay_eviction_action_agreement_count"] == 1
     assert e["replay_eviction_oracle_confirm_top_k"] == 32
+    assert e["replay_eviction_refresh_candidate_count"] == 16
+    assert e["replay_eviction_refresh_candidate_variant_chunk_size"] == 16
     assert e["replay_eviction_mode"] == "active"
 
 

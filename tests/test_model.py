@@ -242,6 +242,47 @@ class TestChaosStudentLM(unittest.TestCase):
         torch.testing.assert_close(h_cutoff_before_write, h_off, rtol=0, atol=0)
         assert not torch.allclose(h_cutoff_at_write, h_off)
 
+    def test_encode_slot_override_matches_temporary_replacement_in_bucket_path(self) -> None:
+        torch.manual_seed(5)
+        model = ChaosStudentLM(
+            vocab_size=64,
+            dim=8,
+            num_layers=1,
+            ff_mult=2,
+            a_mode="diag",
+            rich_b_mode="none",
+            outer_model_dim=8,
+            outer_model_type="multislot",
+            outer_max_slots=8,
+            buffer_mode="append_only",
+            retrieval_mode="softmax_all",
+        )
+        assert model.outer_model is not None
+        with torch.no_grad():
+            model.outer_model.decoder.weight.copy_(torch.eye(8))
+            model.outer_model.cue_proj.weight.copy_(torch.eye(8))
+        model.outer_model._append_kv_batch_committed(
+            torch.stack([torch.randn(8), torch.randn(8)]),
+            torch.tensor([0, 0]),
+            event_ids=torch.tensor([1, 1]),
+        )
+        ids = torch.randint(0, 64, (3, 6))
+        candidate = torch.randn(1, 8)
+
+        h_override = model.encode(
+            ids,
+            memory_mode="force_on",
+            memory_slot_override_index=0,
+            memory_slot_override_values=candidate.expand(ids.shape[0], -1),
+        )
+        original = model.outer_model.table.get_tensor(0).detach().clone()
+        model.outer_model.table.replace_tensor(0, candidate, bump_generation=False)
+        h_replaced = model.encode(ids, memory_mode="force_on")
+        model.outer_model.table.replace_tensor(0, original, bump_generation=False)
+
+        torch.testing.assert_close(h_override, h_replaced, rtol=1e-5, atol=1e-5)
+        torch.testing.assert_close(model.outer_model.table.get_tensor(0), original)
+
 
 class TestChaosStudentLMHybrid(unittest.TestCase):
     def test_student_lm_with_hybrid_top_block(self) -> None:

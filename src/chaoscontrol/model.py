@@ -1104,6 +1104,8 @@ class ChaosStudentLM(nn.Module):
         cache_read_cutoff: int | None = None,
         teacher_gate: torch.Tensor | None = None,
         memory_slot_mask: torch.Tensor | None = None,
+        memory_slot_override_index: int | None = None,
+        memory_slot_override_values: torch.Tensor | None = None,
         return_controller_logits: bool = False,
         return_memory_meta: bool = False,
         initial_states: list[torch.Tensor] | None = None,
@@ -1142,6 +1144,12 @@ class ChaosStudentLM(nn.Module):
         ``memory_mode='off'`` and lets the sidecar oracle evaluate
         ``[baseline, no-sidecar, hide-slot-i]`` variants as one expanded
         batch without changing train-rank trunk execution.
+
+        ``memory_slot_override_index``/``memory_slot_override_values`` let
+        rank-3 maintenance score refresh candidates in one expanded GPU3
+        batch.  The override is sparse and per sample: retrieval treats the
+        selected physical slot as if it contained the supplied value, without
+        mutating the SlotTable or exposing the candidate to train ranks.
 
         Side effects: none. Unlike ``forward()`` this path never
         performs memory writes (those live in ``forward()`` after
@@ -1248,6 +1256,12 @@ class ChaosStudentLM(nn.Module):
                         mode=self.retrieval_mode, k=self.retrieval_k, cue=cue,
                         read_cutoff=cache_read_cutoff,
                         slot_mask=memory_slot_mask[mask] if memory_slot_mask is not None else None,
+                        slot_override_index=memory_slot_override_index,
+                        slot_override_values=(
+                            memory_slot_override_values[mask]
+                            if memory_slot_override_values is not None
+                            else None
+                        ),
                     )
                     outer_read[mask] = read.unsqueeze(1).to(dtype=x.dtype)
                 x = _add_memory_bias(x, outer_read)
@@ -1269,6 +1283,8 @@ class ChaosStudentLM(nn.Module):
                     cue=cue,
                     read_cutoff=cache_read_cutoff,
                     slot_mask=memory_slot_mask,
+                    slot_override_index=memory_slot_override_index,
+                    slot_override_values=memory_slot_override_values,
                 )
             else:
                 outer_read = self.outer_model.read(x.size(0))

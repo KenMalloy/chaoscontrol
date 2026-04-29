@@ -6827,6 +6827,13 @@ def train_fast_for_budget(
     replay_eviction_repr_drift_threshold: float = 0.2,
     replay_eviction_refresh_lr: float = 0.1,
     replay_eviction_refresh_margin: float = 0.001,
+    replay_eviction_refresh_candidate_count: int = 16,
+    replay_eviction_refresh_proposal_rank: int = 8,
+    replay_eviction_refresh_proposal_noise_scale: float = 0.04,
+    replay_eviction_refresh_proposal_momentum: float = 0.9,
+    replay_eviction_refresh_proposal_weight_sync_interval_steps: int = 64,
+    replay_eviction_refresh_candidate_variant_chunk_size: int = 16,
+    replay_eviction_refresh_proposal_seed: int = 1729,
     replay_eviction_quarantine_threshold: float = -0.01,
     replay_eviction_max_quarantined: int = 8,
     replay_eviction_quarantine_release_streak: int = 2,
@@ -7510,6 +7517,21 @@ def train_fast_for_budget(
             repr_drift_threshold=float(replay_eviction_repr_drift_threshold),
             refresh_lr=float(replay_eviction_refresh_lr),
             refresh_margin=float(replay_eviction_refresh_margin),
+            refresh_candidate_count=int(replay_eviction_refresh_candidate_count),
+            refresh_proposal_rank=int(replay_eviction_refresh_proposal_rank),
+            refresh_proposal_noise_scale=float(
+                replay_eviction_refresh_proposal_noise_scale
+            ),
+            refresh_proposal_momentum=float(
+                replay_eviction_refresh_proposal_momentum
+            ),
+            refresh_proposal_weight_sync_interval_steps=int(
+                replay_eviction_refresh_proposal_weight_sync_interval_steps
+            ),
+            refresh_candidate_variant_chunk_size=int(
+                replay_eviction_refresh_candidate_variant_chunk_size
+            ),
+            refresh_proposal_seed=int(replay_eviction_refresh_proposal_seed),
             quarantine_threshold=float(replay_eviction_quarantine_threshold),
             max_quarantined=int(replay_eviction_max_quarantined),
             quarantine_release_streak=int(replay_eviction_quarantine_release_streak),
@@ -9053,6 +9075,27 @@ def _warmup(
         replay_eviction_repr_drift_threshold=float(config.get("replay_eviction_repr_drift_threshold", 0.2)),
         replay_eviction_refresh_lr=float(config.get("replay_eviction_refresh_lr", 0.1)),
         replay_eviction_refresh_margin=float(config.get("replay_eviction_refresh_margin", 0.001)),
+        replay_eviction_refresh_candidate_count=int(
+            config.get("replay_eviction_refresh_candidate_count", 16)
+        ),
+        replay_eviction_refresh_proposal_rank=int(
+            config.get("replay_eviction_refresh_proposal_rank", 8)
+        ),
+        replay_eviction_refresh_proposal_noise_scale=float(
+            config.get("replay_eviction_refresh_proposal_noise_scale", 0.04)
+        ),
+        replay_eviction_refresh_proposal_momentum=float(
+            config.get("replay_eviction_refresh_proposal_momentum", 0.9)
+        ),
+        replay_eviction_refresh_proposal_weight_sync_interval_steps=int(
+            config.get("replay_eviction_refresh_proposal_weight_sync_interval_steps", 64)
+        ),
+        replay_eviction_refresh_candidate_variant_chunk_size=int(
+            config.get("replay_eviction_refresh_candidate_variant_chunk_size", 16)
+        ),
+        replay_eviction_refresh_proposal_seed=int(
+            config.get("replay_eviction_refresh_proposal_seed", 1729)
+        ),
         replay_eviction_quarantine_threshold=float(config.get("replay_eviction_quarantine_threshold", -0.01)),
         replay_eviction_max_quarantined=int(config.get("replay_eviction_max_quarantined", 8)),
         replay_eviction_quarantine_release_streak=int(config.get("replay_eviction_quarantine_release_streak", 2)),
@@ -9628,6 +9671,27 @@ def run_condition(
         replay_eviction_repr_drift_threshold=float(config.get("replay_eviction_repr_drift_threshold", 0.2)),
         replay_eviction_refresh_lr=float(config.get("replay_eviction_refresh_lr", 0.1)),
         replay_eviction_refresh_margin=float(config.get("replay_eviction_refresh_margin", 0.001)),
+        replay_eviction_refresh_candidate_count=int(
+            config.get("replay_eviction_refresh_candidate_count", 16)
+        ),
+        replay_eviction_refresh_proposal_rank=int(
+            config.get("replay_eviction_refresh_proposal_rank", 8)
+        ),
+        replay_eviction_refresh_proposal_noise_scale=float(
+            config.get("replay_eviction_refresh_proposal_noise_scale", 0.04)
+        ),
+        replay_eviction_refresh_proposal_momentum=float(
+            config.get("replay_eviction_refresh_proposal_momentum", 0.9)
+        ),
+        replay_eviction_refresh_proposal_weight_sync_interval_steps=int(
+            config.get("replay_eviction_refresh_proposal_weight_sync_interval_steps", 64)
+        ),
+        replay_eviction_refresh_candidate_variant_chunk_size=int(
+            config.get("replay_eviction_refresh_candidate_variant_chunk_size", 16)
+        ),
+        replay_eviction_refresh_proposal_seed=int(
+            config.get("replay_eviction_refresh_proposal_seed", 1729)
+        ),
         replay_eviction_quarantine_threshold=float(config.get("replay_eviction_quarantine_threshold", -0.01)),
         replay_eviction_max_quarantined=int(config.get("replay_eviction_max_quarantined", 8)),
         replay_eviction_quarantine_release_streak=int(config.get("replay_eviction_quarantine_release_streak", 2)),

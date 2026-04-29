@@ -35,8 +35,10 @@ __all__ = [
     "TickResult",
     "counterfactual_probe",
     "oracle_confirm_slots",
+    "oracle_confirm_refresh_candidates",
     "replay_score_slots",
     "MaintenancePolicy",
+    "CpuRefreshProposalModel",
     "ProbeFrame",
     "_evict_slots",
 ]
@@ -84,6 +86,21 @@ class OracleConfirmationResult:
     nll_baseline: torch.Tensor
     nll_no_sidecar: torch.Tensor
     mask: torch.Tensor
+
+
+@dataclass
+class RefreshCandidateOracleResult:
+    """Real-physics verification for CPU-proposed refresh candidates."""
+
+    slot_index: int
+    candidate_names: list[str]
+    candidate_scores: torch.Tensor
+    candidate_improvements: torch.Tensor
+    nll_no_sidecar: torch.Tensor
+    nll_candidates: torch.Tensor
+    mask: torch.Tensor
+    chunk_count: int = 0
+    variants_total: int = 0
 
 
 @dataclass
@@ -420,6 +437,137 @@ def oracle_confirm_slots(
 
 
 @torch.inference_mode()
+def oracle_confirm_refresh_candidates(
+    *,
+    model: Any,
+    outer: Any,
+    probe_input_ids: torch.Tensor,
+    probe_valid_mask: torch.Tensor,
+    slot_index: int,
+    candidate_tensors: list[tuple[str, torch.Tensor]],
+    cache_read_cutoff: int | None = None,
+    variant_chunk_size: int = 16,
+    cpu_scorer: Any | None = None,
+) -> RefreshCandidateOracleResult:
+    """Verify candidate slot tensors under the real force-on read path.
+
+    CPU proposes tensors; this function is the GPU3 physics gate.  It scores
+    all candidates as one expanded batch using a sparse per-sample SlotTable
+    override, so refresh acceptance never serially mutates the table and never
+    falls back to the cheap proxy.
+    """
+    x = probe_input_ids[:, :-1]
+    y = probe_input_ids[:, 1:]
+    mask = probe_valid_mask[:, 1:].bool()
+    B, T = x.shape
+    dev = x.device
+
+    table = getattr(outer, "table", None)
+    n_slots = len(table) if table is not None else len(getattr(outer, "_slots", []))
+    phys = int(slot_index)
+    if n_slots <= 0 or phys < 0 or phys >= int(n_slots) or not candidate_tensors:
+        empty = torch.zeros(0, B, T, device=dev)
+        return RefreshCandidateOracleResult(
+            slot_index=phys,
+            candidate_names=[],
+            candidate_scores=torch.zeros(0, device=dev),
+            candidate_improvements=torch.zeros(0, device=dev),
+            nll_no_sidecar=torch.zeros(B, T, device=dev),
+            nll_candidates=empty,
+            mask=mask,
+            chunk_count=0,
+            variants_total=0,
+        )
+
+    names: list[str] = []
+    values: list[torch.Tensor] = []
+    for name, tensor in candidate_tensors:
+        t = tensor.detach()
+        if t.dim() == 1:
+            t = t.unsqueeze(0)
+        if t.dim() == 3 and t.shape[1] == 1:
+            t = t.squeeze(1)
+        if t.dim() != 2 or t.shape[0] != 1:
+            raise ValueError("refresh candidate tensors must have shape (1, outer_dim)")
+        names.append(str(name))
+        values.append(t)
+    candidate_stack = torch.cat(values, dim=0).to(device=dev)
+    K = int(candidate_stack.shape[0])
+
+    ac = (
+        torch.autocast(dev.type, dtype=torch.bfloat16)
+        if dev.type == "cuda"
+        else torch.autocast("cpu", dtype=torch.bfloat16)
+    )
+
+    def _score_hidden(hidden: torch.Tensor, targets: torch.Tensor, variants: int) -> torch.Tensor:
+        if cpu_scorer is not None:
+            return chunked_nll_from_hidden(
+                model,
+                hidden.detach().cpu(),
+                targets.detach().cpu(),
+                cpu_scorer=cpu_scorer,
+            ).reshape(variants, B, T)
+        return chunked_nll_from_hidden(model, hidden, targets).reshape(variants, B, T)
+
+    off_mask = torch.zeros(1, n_slots, device=dev, dtype=torch.bool)
+    off_mask_exp = off_mask.expand(B, n_slots)
+    with ac:
+        hidden_off = model.encode(
+            x,
+            memory_mode="force_on",
+            cache_read_cutoff=cache_read_cutoff,
+            memory_slot_mask=off_mask_exp,
+        )
+    nll_no_sidecar = _score_hidden(hidden_off, y, 1)[0]
+
+    chunk = max(1, int(variant_chunk_size))
+    chunk_count = 0
+    nll_candidates = torch.empty(K, B, T, device=nll_no_sidecar.device, dtype=torch.float32)
+    for start in range(0, K, chunk):
+        chunk_count += 1
+        end = min(K, start + chunk)
+        k = end - start
+        x_exp = x.unsqueeze(0).expand(k, -1, -1).reshape(k * B, T)
+        y_exp = y.unsqueeze(0).expand(k, -1, -1).reshape(k * B, T)
+        values_exp = (
+            candidate_stack[start:end]
+            .to(dtype=candidate_stack.dtype)
+            .unsqueeze(1)
+            .expand(k, B, candidate_stack.shape[-1])
+            .reshape(k * B, candidate_stack.shape[-1])
+        )
+        with ac:
+            hidden = model.encode(
+                x_exp,
+                memory_mode="force_on",
+                cache_read_cutoff=cache_read_cutoff,
+                memory_slot_override_index=phys,
+                memory_slot_override_values=values_exp,
+            )
+        nll_candidates[start:end] = _score_hidden(hidden, y_exp, k)
+
+    mask_f = mask.to(device=nll_candidates.device, dtype=torch.float32)
+    denom = mask_f.sum().clamp(min=1.0)
+    candidate_scores = (
+        (nll_no_sidecar.to(device=nll_candidates.device).unsqueeze(0) - nll_candidates)
+        * mask_f.unsqueeze(0)
+    ).sum(dim=(1, 2)) / denom
+    candidate_improvements = candidate_scores - candidate_scores[0].detach()
+    return RefreshCandidateOracleResult(
+        slot_index=phys,
+        candidate_names=names,
+        candidate_scores=candidate_scores.cpu(),
+        candidate_improvements=candidate_improvements.cpu(),
+        nll_no_sidecar=nll_no_sidecar.cpu(),
+        nll_candidates=nll_candidates.cpu(),
+        mask=mask.cpu(),
+        chunk_count=chunk_count,
+        variants_total=K,
+    )
+
+
+@torch.inference_mode()
 def replay_score_slots(
     *,
     model: Any,
@@ -495,6 +643,264 @@ def _compute_representation_drift(
         dim=0,
     )
     return float(1.0 - cos.item())
+
+
+class CpuRefreshProposalModel:
+    """CPU-side proposal model for refresh candidates.
+
+    It is deliberately lightweight but stateful: the CPU controller owns
+    proposal generation, learns a residual direction from GPU3 oracle feedback,
+    and emits a vectorized candidate set for the GPU3 verifier.  The SlotTable
+    is only mutated after oracle approval.
+    """
+
+    def __init__(
+        self,
+        *,
+        k: int = 16,
+        rank: int = 8,
+        lr: float = 0.1,
+        noise_scale: float = 0.04,
+        momentum: float = 0.9,
+        weight_sync_interval_steps: int = 64,
+        seed: int = 1729,
+    ) -> None:
+        self.k = max(2, int(k))
+        self.rank = max(1, int(rank))
+        self.lr = float(lr)
+        self.noise_scale = float(noise_scale)
+        self.momentum = float(momentum)
+        self.weight_sync_interval_steps = max(1, int(weight_sync_interval_steps))
+        self._seed = int(seed)
+        self._generator = torch.Generator(device="cpu")
+        self._generator.manual_seed(self._seed)
+        self._basis: torch.Tensor | None = None
+        self._learned_direction: torch.Tensor | None = None
+        self._weight_cache: dict[tuple[int, int], tuple[torch.Tensor, torch.Tensor | None]] = {}
+        self._active_step = 0
+        self._dim: int = 0
+        self.samples_total = 0
+        self.updates_total = 0
+        self.positive_updates_total = 0
+        self.structural_accepts_total = 0
+        self.structural_rejects_total = 0
+        self.below_margin_positive_updates_total = 0
+        self.weight_syncs_total = 0
+        self.improvement_sum = 0.0
+        self.last_best_index = 0
+        self.last_best_name = "identity"
+        self.last_best_improvement = 0.0
+
+    def _ensure_dim(self, dim: int) -> None:
+        if self._basis is not None and self._dim == int(dim):
+            return
+        self._dim = int(dim)
+        basis = torch.randn(self.rank, self._dim, generator=self._generator)
+        basis = F.normalize(basis, dim=-1, eps=1e-8)
+        self._basis = basis
+        self._learned_direction = torch.zeros(1, self._dim)
+
+    def _cpu_linear(self, module: Any, x: torch.Tensor) -> torch.Tensor | None:
+        weight = getattr(module, "weight", None)
+        if weight is None:
+            return None
+        bias = getattr(module, "bias", None)
+        bucket = int(self._active_step) // self.weight_sync_interval_steps
+        key = (id(module), bucket)
+        cached = self._weight_cache.get(key)
+        if cached is None:
+            stale_keys = [old_key for old_key in self._weight_cache if old_key[0] == id(module)]
+            for old_key in stale_keys:
+                self._weight_cache.pop(old_key, None)
+            weight_cpu = weight.detach().to(device="cpu", dtype=torch.float32)
+            bias_cpu = (
+                None
+                if bias is None
+                else bias.detach().to(device="cpu", dtype=torch.float32)
+            )
+            self._weight_cache[key] = (weight_cpu, bias_cpu)
+            self.weight_syncs_total += 1
+        else:
+            weight_cpu, bias_cpu = cached
+        return F.linear(x, weight_cpu, bias_cpu)
+
+    def _roundtrip(self, outer: Any, slot_cpu: torch.Tensor) -> torch.Tensor | None:
+        encoder = getattr(outer, "encoder", None)
+        decoder = getattr(outer, "decoder", None)
+        if encoder is None or decoder is None:
+            return None
+        decoded = self._cpu_linear(decoder, slot_cpu)
+        if decoded is None:
+            return None
+        rt_raw = self._cpu_linear(encoder, decoded)
+        if rt_raw is None:
+            return None
+        rt = torch.tanh(rt_raw)
+        return rt if torch.isfinite(rt).all() else None
+
+    def _cue_direction(
+        self,
+        outer: Any,
+        slot_cpu: torch.Tensor,
+        context: dict[str, Any] | None,
+    ) -> torch.Tensor | None:
+        if not context:
+            return None
+        cue = context.get("probe_cue")
+        if cue is None:
+            return None
+        cue_cpu = cue.detach().to(device="cpu", dtype=torch.float32)
+        if cue_cpu.dim() == 3:
+            cue_cpu = cue_cpu.mean(dim=1)
+        if cue_cpu.dim() == 1:
+            cue_cpu = cue_cpu.unsqueeze(0)
+        if cue_cpu.dim() != 2:
+            return None
+        if cue_cpu.shape[-1] != slot_cpu.shape[-1]:
+            cue_proj = getattr(outer, "cue_proj", None)
+            if cue_proj is None:
+                return None
+            projected = self._cpu_linear(cue_proj, cue_cpu)
+            if projected is None:
+                return None
+            cue_cpu = projected
+        target = cue_cpu.mean(dim=0, keepdim=True)
+        delta = target - slot_cpu
+        if not torch.isfinite(delta).all() or delta.norm().item() <= 1e-8:
+            return None
+        return F.normalize(delta, dim=-1, eps=1e-8)
+
+    def sample_k(
+        self,
+        *,
+        outer: Any,
+        slot: torch.Tensor,
+        context: dict[str, Any] | None = None,
+    ) -> list[tuple[str, torch.Tensor]]:
+        if context and "step" in context:
+            self._active_step = int(context["step"])
+        slot_cpu = slot.detach().to(device="cpu", dtype=torch.float32).reshape(1, -1).clone()
+        self._ensure_dim(slot_cpu.shape[-1])
+        assert self._basis is not None
+        assert self._learned_direction is not None
+
+        candidates: list[tuple[str, torch.Tensor]] = [("identity", slot_cpu)]
+        rt = self._roundtrip(outer, slot_cpu)
+        directions: list[tuple[str, torch.Tensor]] = []
+        if rt is not None:
+            rt_delta = rt - slot_cpu
+            if rt_delta.norm().item() > 1e-8:
+                directions.append(("roundtrip", F.normalize(rt_delta, dim=-1, eps=1e-8)))
+                slot_abs = slot_cpu.abs()
+                threshold = slot_abs.mean() + slot_abs.std()
+                sharp_mask = (slot_abs > threshold).float()
+                sharp = (slot_cpu * sharp_mask + rt * (1.0 - sharp_mask)) - slot_cpu
+                if sharp.norm().item() > 1e-8:
+                    directions.append(("sharp_preserve", F.normalize(sharp, dim=-1, eps=1e-8)))
+
+        cue_dir = self._cue_direction(outer, slot_cpu, context)
+        if cue_dir is not None:
+            directions.append(("cue_align", cue_dir))
+            directions.append(("cue_anti", -cue_dir))
+
+        if self._learned_direction.norm().item() > 1e-8:
+            learned = F.normalize(self._learned_direction, dim=-1, eps=1e-8)
+            directions.append(("learned", learned))
+            directions.append(("learned_anti", -learned))
+
+        norm = slot_cpu.norm().item() / max(1.0, float(slot_cpu.numel()) ** 0.5)
+        amp_base = max(1e-4, self.lr * (norm + 1e-3))
+        scales = (0.25, 0.5, 1.0, 1.5)
+
+        for name, direction in directions:
+            for scale in scales:
+                if len(candidates) >= self.k:
+                    break
+                cand = slot_cpu + (amp_base * scale) * direction
+                if torch.isfinite(cand).all():
+                    candidates.append((f"{name}_{scale:g}", cand.detach().clone()))
+            if len(candidates) >= self.k:
+                break
+
+        while len(candidates) < self.k:
+            coeff = torch.randn(1, self.rank, generator=self._generator)
+            direction = coeff @ self._basis
+            if self._learned_direction.norm().item() > 1e-8:
+                direction = direction + 0.35 * F.normalize(
+                    self._learned_direction, dim=-1, eps=1e-8
+                )
+            direction = F.normalize(direction, dim=-1, eps=1e-8)
+            jitter = torch.randn(slot_cpu.shape, generator=self._generator) * self.noise_scale
+            cand = slot_cpu + amp_base * direction + amp_base * 0.1 * jitter
+            if torch.isfinite(cand).all():
+                candidates.append((f"proposal_{len(candidates)}", cand.detach().clone()))
+
+        self.samples_total += len(candidates)
+        return candidates[: self.k]
+
+    def update(
+        self,
+        *,
+        candidates: list[tuple[str, torch.Tensor]],
+        scores: torch.Tensor,
+        accepted_index: int,
+        structural_accepted: bool,
+    ) -> None:
+        if not candidates:
+            return
+        idx = int(accepted_index)
+        scores_cpu = scores.detach().to(device="cpu", dtype=torch.float32).reshape(-1)
+        improvement = (
+            float(scores_cpu[idx].item() - scores_cpu[0].item())
+            if 0 <= idx < int(scores_cpu.numel())
+            else 0.0
+        )
+        self.updates_total += 1
+        self.last_best_index = idx
+        self.last_best_name = candidates[idx][0] if 0 <= idx < len(candidates) else ""
+        self.last_best_improvement = improvement
+        self.improvement_sum += improvement
+        if structural_accepted:
+            self.structural_accepts_total += 1
+        else:
+            self.structural_rejects_total += 1
+        if idx > 0 and improvement > 0.0:
+            identity = candidates[0][1].detach().to(device="cpu", dtype=torch.float32).reshape(1, -1)
+            best = candidates[idx][1].detach().to(device="cpu", dtype=torch.float32).reshape(1, -1)
+            self._ensure_dim(identity.shape[-1])
+            assert self._learned_direction is not None
+            delta = best - identity
+            self._learned_direction = (
+                self.momentum * self._learned_direction
+                + (1.0 - self.momentum) * delta
+            )
+            self.positive_updates_total += 1
+            if not structural_accepted:
+                self.below_margin_positive_updates_total += 1
+        else:
+            if self._learned_direction is not None:
+                self._learned_direction = self.momentum * self._learned_direction
+
+    def diagnostics(self) -> dict[str, Any]:
+        return {
+            "k": self.k,
+            "rank": self.rank,
+            "lr": self.lr,
+            "noise_scale": self.noise_scale,
+            "momentum": self.momentum,
+            "weight_sync_interval_steps": self.weight_sync_interval_steps,
+            "samples_total": self.samples_total,
+            "updates_total": self.updates_total,
+            "positive_updates_total": self.positive_updates_total,
+            "structural_accepts_total": self.structural_accepts_total,
+            "structural_rejects_total": self.structural_rejects_total,
+            "below_margin_positive_updates_total": self.below_margin_positive_updates_total,
+            "weight_syncs_total": self.weight_syncs_total,
+            "improvement_sum": self.improvement_sum,
+            "last_best_index": self.last_best_index,
+            "last_best_name": self.last_best_name,
+            "last_best_improvement": self.last_best_improvement,
+        }
 
 
 class MaintenancePolicy:
@@ -610,6 +1016,13 @@ class ReplayEvictionLoop:
         repr_drift_threshold: float = 0.2,
         refresh_lr: float = 0.1,
         refresh_margin: float = 0.001,
+        refresh_candidate_count: int = 16,
+        refresh_proposal_rank: int = 8,
+        refresh_proposal_noise_scale: float = 0.04,
+        refresh_proposal_momentum: float = 0.9,
+        refresh_proposal_weight_sync_interval_steps: int = 64,
+        refresh_candidate_variant_chunk_size: int = 16,
+        refresh_proposal_seed: int = 1729,
         quarantine_threshold: float = -0.01,
         max_quarantined: int = 8,
         quarantine_release_streak: int = 2,
@@ -649,6 +1062,10 @@ class ReplayEvictionLoop:
         self._repr_drift_threshold = float(repr_drift_threshold)
         self._refresh_lr = float(refresh_lr)
         self._refresh_margin = float(refresh_margin)
+        self._refresh_candidate_count = max(2, int(refresh_candidate_count))
+        self._refresh_candidate_variant_chunk_size = max(
+            1, int(refresh_candidate_variant_chunk_size)
+        )
         self._quarantine_threshold = float(quarantine_threshold)
         self._max_quarantined = int(max_quarantined)
         self._quarantine_release_streak = int(quarantine_release_streak)
@@ -681,6 +1098,15 @@ class ReplayEvictionLoop:
         self._cpu_scorer_last_sync_step: int = -1
         self._cpu_scorer_errors_total: int = 0
         self._cpu_scorer_last_error: str = ""
+        self._refresh_proposal_model = CpuRefreshProposalModel(
+            k=self._refresh_candidate_count,
+            rank=max(1, int(refresh_proposal_rank)),
+            lr=self._refresh_lr,
+            noise_scale=float(refresh_proposal_noise_scale),
+            momentum=float(refresh_proposal_momentum),
+            weight_sync_interval_steps=int(refresh_proposal_weight_sync_interval_steps),
+            seed=int(refresh_proposal_seed),
+        )
         self._arm_runtime_enabled_requested = bool(arm_runtime_enabled)
         self._arm_runtime_active = False
         self._arm_runtime_error = ""
@@ -725,6 +1151,21 @@ class ReplayEvictionLoop:
         self._tick_count: int = 0
         self._evictions_total: int = 0
         self._refreshes_total: int = 0
+        self._refresh_candidate_proposals_total: int = 0
+        self._refresh_candidate_proposal_seconds_total: float = 0.0
+        self._refresh_candidate_oracle_batches_total: int = 0
+        self._refresh_candidate_oracle_chunks_total: int = 0
+        self._refresh_candidate_oracle_variants_total: int = 0
+        self._refresh_candidate_oracle_seconds_total: float = 0.0
+        self._refresh_candidate_accepts_total: int = 0
+        self._refresh_candidate_rejects_total: int = 0
+        self._last_refresh_candidate_count: int = 0
+        self._last_refresh_candidate_device: str = ""
+        self._last_refresh_candidate_best_name: str = ""
+        self._last_refresh_candidate_best_index: int = 0
+        self._last_refresh_candidate_best_improvement: float = 0.0
+        self._last_refresh_candidate_oracle_chunks: int = 0
+        self._last_refresh_candidate_oracle_variants: int = 0
         self._distills_total: int = 0
         self._prototype_distills_total: int = 0
         self._prototype_distill_skips_total: int = 0
@@ -2124,84 +2565,106 @@ class ReplayEvictionLoop:
         if slot is None:
             return False
 
-        encoder = getattr(outer, "encoder", None)
-        decoder = getattr(outer, "decoder", None)
-        cue_proj = getattr(outer, "cue_proj", None)
-        if encoder is None or decoder is None:
-            return False
-
-        # Generate candidates
-        candidates: list[tuple[str, torch.Tensor]] = [("identity", slot)]
-
-        # Roundtrip: decode → re-encode
-        with torch.inference_mode():
-            decoded = decoder(slot.to(dtype=decoder.weight.dtype))
-            rt = torch.tanh(encoder(decoded.to(dtype=encoder.weight.dtype)))
-            if torch.isfinite(rt).all():
-                candidates.append(("roundtrip", rt.detach()))
-
-            # Cue-aligned: lerp toward mean cue direction
-            if cue_proj is not None and cf.weights_baseline is not None:
-                cue_mean = cf.weights_baseline.mean(dim=0)  # not a true cue, but shape (N,)
-                # Use the probe hidden states to get an actual cue
-                if self._probe_input_ids is not None:
-                    # We already have h_base from the probe, but we don't store it
-                    # Use roundtrip as base, nudge toward better alignment
-                    nudged = slot + self._refresh_lr * (rt - slot)
-                    if torch.isfinite(nudged).all():
-                        candidates.append(("cue_aligned", nudged.detach()))
-
-            # Sharp-preserving: keep high-magnitude components
-            slot_abs = slot.abs()
-            threshold = slot_abs.mean() + slot_abs.std()
-            sharp_mask = (slot_abs > threshold).float()
-            preserved = slot * sharp_mask + rt * (1 - sharp_mask)
-            if torch.isfinite(preserved).all():
-                candidates.append(("sharp_preserving", preserved.detach()))
-
-        # Score candidates: use identity as real-physics oracle baseline.
+        candidates = self._propose_refresh_candidates_cpu(outer=outer, slot=slot)
         if len(candidates) <= 1:
             return False
-
-        identity_tensor = candidates[0][1].detach().clone()
-        best_name = "identity"
-        best_tensor = identity_tensor
-        best_improvement = 0.0
 
         phys = table.slot_id_to_physical(slot_id)
         if phys is None:
             return False
-        baseline_score = self._oracle_slot_score(model=model, outer=outer, phys=phys, t0=t0)
-        if baseline_score is None:
+        if (
+            self._probe_input_ids is None
+            or self._probe_valid_mask is None
+            or self._budget_exhausted(t0)
+        ):
             return False
 
-        accepted = False
-        try:
-            for name, tensor in candidates[1:]:
-                if self._budget_exhausted(t0):
-                    break
-                table.replace_tensor(slot_id, tensor, bump_generation=False)
-                candidate_score = self._oracle_slot_score(
-                    model=model, outer=outer, phys=phys, t0=t0
-                )
-                if candidate_score is None:
-                    break
-                improvement = candidate_score - baseline_score
-                if improvement > best_improvement + self._refresh_margin:
-                    best_name = name
-                    best_tensor = tensor.detach().clone()
-                    best_improvement = improvement
-
-            # Apply best or revert to identity.  Candidate probes are not
-            # writes; only the accepted refresh bumps write_generation.
-            if best_name != "identity":
-                table.replace_tensor(slot_id, best_tensor)
-                accepted = True
-                return True
+        oracle_t0 = time.monotonic()
+        oracle = oracle_confirm_refresh_candidates(
+            model=model,
+            outer=outer,
+            probe_input_ids=self._probe_input_ids,
+            probe_valid_mask=self._probe_valid_mask,
+            slot_index=phys,
+            candidate_tensors=candidates,
+            cache_read_cutoff=self._probe_cache_cutoff,
+            variant_chunk_size=self._refresh_candidate_variant_chunk_size,
+            cpu_scorer=self._cpu_scorer_for(model=model, step=self._probe_step),
+        )
+        elapsed = time.monotonic() - oracle_t0
+        self._last_oracle_seconds = elapsed
+        self._oracle_seconds_total += elapsed
+        self._refresh_candidate_oracle_batches_total += 1
+        self._refresh_candidate_oracle_chunks_total += int(oracle.chunk_count)
+        self._refresh_candidate_oracle_variants_total += int(oracle.variants_total)
+        self._refresh_candidate_oracle_seconds_total += elapsed
+        self._last_refresh_candidate_oracle_chunks = int(oracle.chunk_count)
+        self._last_refresh_candidate_oracle_variants = int(oracle.variants_total)
+        self._last_stage_seconds["oracle"] = elapsed
+        self._stage_seconds_total["oracle"] += elapsed
+        self._last_oracle_candidates = len(oracle.candidate_names)
+        if not oracle.candidate_names or oracle.candidate_scores.numel() == 0:
+            self._refresh_candidate_rejects_total += 1
             return False
-        finally:
-            if not accepted:
-                table.replace_tensor(slot_id, identity_tensor, bump_generation=False)
+
+        best_idx = int(torch.argmax(oracle.candidate_scores).item())
+        best_improvement = float(oracle.candidate_improvements[best_idx].item())
+        best_name = oracle.candidate_names[best_idx]
+        self._last_refresh_candidate_best_index = best_idx
+        self._last_refresh_candidate_best_name = best_name
+        self._last_refresh_candidate_best_improvement = best_improvement
+        structural_accepted = best_idx > 0 and best_improvement > self._refresh_margin
+        self._refresh_proposal_model.update(
+            candidates=candidates,
+            scores=oracle.candidate_scores,
+            accepted_index=best_idx,
+            structural_accepted=structural_accepted,
+        )
+        self._trace_refresh_candidates(
+            slot_id=slot_id,
+            oracle=oracle,
+            accepted_index=best_idx,
+            accepted=structural_accepted,
+        )
+
+        if structural_accepted:
+            best_tensor = candidates[best_idx][1].detach().to(
+                device=slot.device,
+                dtype=slot.dtype,
+            )
+            table.replace_tensor(slot_id, best_tensor)
+            self._refresh_candidate_accepts_total += 1
+            return True
+
+        self._refresh_candidate_rejects_total += 1
+        return False
+
+    def _propose_refresh_candidates_cpu(
+        self,
+        *,
+        outer: Any,
+        slot: torch.Tensor,
+    ) -> list[tuple[str, torch.Tensor]]:
+        """Generate learned refresh candidates on CPU; GPU3 verifies physics."""
+        proposal_t0 = time.monotonic()
+        self._last_refresh_candidate_device = "cpu"
+        with torch.inference_mode():
+            candidates = self._refresh_proposal_model.sample_k(
+                outer=outer,
+                slot=slot,
+                context={
+                    "stream_id": self._probe_stream_id,
+                    "frame_id": self._active_frame_id,
+                    "step": self._probe_step,
+                    "probe_cue": self._probe_cue,
+                },
+            )
+        self._last_refresh_candidate_count = len(candidates)
+        self._refresh_candidate_proposals_total += max(0, len(candidates) - 1)
+        self._refresh_candidate_proposal_seconds_total += (
+            time.monotonic() - proposal_t0
+        )
+        return candidates
 
     def _oracle_slot_score(
         self,
@@ -2443,6 +2906,55 @@ class ReplayEvictionLoop:
         self._slot_utility_ema = reindex(self._slot_utility_ema)
         self._slot_first_seen_step = reindex(self._slot_first_seen_step)
         self._slot_score_count = reindex(self._slot_score_count)
+
+    def _trace_refresh_candidates(
+        self,
+        *,
+        slot_id: int,
+        oracle: RefreshCandidateOracleResult,
+        accepted_index: int,
+        accepted: bool,
+    ) -> None:
+        if self._trace_path is None:
+            return
+        if self._trace_max_rows > 0 and self._trace_rows_written >= self._trace_max_rows:
+            return
+        scores = oracle.candidate_scores.detach().cpu().tolist()
+        improvements = oracle.candidate_improvements.detach().cpu().tolist()
+        event = {
+            "row_type": "replay_refresh_candidates",
+            "step": int(self._active_frame_step),
+            "tick": self._tick_count,
+            "slot_id": int(slot_id),
+            "frame_id": self._active_frame_id,
+            "frame_step": self._active_frame_step,
+            "frame_age_steps": self._last_frame_age_steps,
+            "frame_age_seconds": self._last_frame_age_seconds,
+            "stream_id": self._probe_stream_id,
+            "candidate_count": len(oracle.candidate_names),
+            "candidate_names": oracle.candidate_names,
+            "candidate_scores": [float(x) for x in scores],
+            "candidate_improvements": [float(x) for x in improvements],
+            "oracle_chunk_count": int(oracle.chunk_count),
+            "oracle_variants_total": int(oracle.variants_total),
+            "accepted_index": int(accepted_index),
+            "accepted_name": (
+                oracle.candidate_names[int(accepted_index)]
+                if 0 <= int(accepted_index) < len(oracle.candidate_names)
+                else ""
+            ),
+            "accepted": bool(accepted),
+            "best_improvement": (
+                float(improvements[int(accepted_index)])
+                if 0 <= int(accepted_index) < len(improvements)
+                else 0.0
+            ),
+            "oracle_seconds": self._last_oracle_seconds,
+            "proposal_model": self._refresh_proposal_model.diagnostics(),
+        }
+        self._trace_buffer.append(json.dumps(event, separators=(",", ":")) + "\n")
+        self._trace_rows_written += 1
+        self._flush_trace_if_needed()
 
     def _trace_event(
         self,
@@ -2713,6 +3225,42 @@ class ReplayEvictionLoop:
             "replays_total": self._replays_total,
             "evictions_total": self._evictions_total,
             "refreshes_total": self._refreshes_total,
+            "refresh_candidate_count_config": self._refresh_candidate_count,
+            "refresh_candidate_variant_chunk_size": (
+                self._refresh_candidate_variant_chunk_size
+            ),
+            "refresh_candidate_proposal_device": self._last_refresh_candidate_device,
+            "refresh_candidate_proposals_total": self._refresh_candidate_proposals_total,
+            "refresh_candidate_proposal_seconds_total": (
+                self._refresh_candidate_proposal_seconds_total
+            ),
+            "refresh_candidate_oracle_batches_total": (
+                self._refresh_candidate_oracle_batches_total
+            ),
+            "refresh_candidate_oracle_chunks_total": (
+                self._refresh_candidate_oracle_chunks_total
+            ),
+            "refresh_candidate_oracle_variants_total": (
+                self._refresh_candidate_oracle_variants_total
+            ),
+            "refresh_candidate_oracle_seconds_total": (
+                self._refresh_candidate_oracle_seconds_total
+            ),
+            "refresh_candidate_accepts_total": self._refresh_candidate_accepts_total,
+            "refresh_candidate_rejects_total": self._refresh_candidate_rejects_total,
+            "last_refresh_candidate_count": self._last_refresh_candidate_count,
+            "last_refresh_candidate_best_name": self._last_refresh_candidate_best_name,
+            "last_refresh_candidate_best_index": self._last_refresh_candidate_best_index,
+            "last_refresh_candidate_best_improvement": (
+                self._last_refresh_candidate_best_improvement
+            ),
+            "last_refresh_candidate_oracle_chunks": (
+                self._last_refresh_candidate_oracle_chunks
+            ),
+            "last_refresh_candidate_oracle_variants": (
+                self._last_refresh_candidate_oracle_variants
+            ),
+            "refresh_proposal_model": self._refresh_proposal_model.diagnostics(),
             "distills_total": self._distills_total,
             "prototype_distills_total": self._prototype_distills_total,
             "prototype_distill_skips_total": self._prototype_distill_skips_total,

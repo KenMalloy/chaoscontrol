@@ -419,6 +419,8 @@ class MultiSlotOuterModel(nn.Module):
         cue: torch.Tensor | None = None,
         read_cutoff: int | None = None,
         slot_mask: torch.Tensor | None = None,
+        slot_override_index: int | None = None,
+        slot_override_values: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Cue-dependent retrieval across slots.
 
@@ -446,11 +448,20 @@ class MultiSlotOuterModel(nn.Module):
                 device=slot_matrix.device,
                 dtype=torch.bool,
             )[:, indices]
+        override_pos, override_values = self._slot_override_for_matrix(
+            slot_matrix=slot_matrix,
+            indices=indices,
+            batch_size=batch_size,
+            slot_override_index=slot_override_index,
+            slot_override_values=slot_override_values,
+        )
 
         if cue is not None:
             cue = cue.to(dtype=self.cue_proj.weight.dtype)
             cue_outer = self.cue_proj(cue)
             sim = torch.mm(cue_outer, slot_matrix.T)
+            if override_pos is not None and override_values is not None:
+                sim[:, override_pos] = (cue_outer * override_values).sum(dim=-1)
             if selected_mask is not None:
                 sim = sim.masked_fill(~selected_mask, float("-inf"))
             all_masked = torch.isinf(sim).all(dim=-1, keepdim=True)
@@ -463,13 +474,32 @@ class MultiSlotOuterModel(nn.Module):
             self._retrieval_weights = weights.detach()
             self._retrieval_indices = indices
             retrieved = torch.mm(weights, slot_matrix)
+            retrieved = self._apply_retrieval_override(
+                retrieved,
+                weights,
+                slot_matrix,
+                override_pos=override_pos,
+                override_values=override_values,
+            )
         else:
             if selected_mask is not None:
                 weights = selected_mask.to(dtype=slot_matrix.dtype)
                 denom = weights.sum(dim=-1, keepdim=True).clamp(min=1.0)
-                retrieved = torch.mm(weights / denom, slot_matrix)
+                norm_weights = weights / denom
+                retrieved = torch.mm(norm_weights, slot_matrix)
+                retrieved = self._apply_retrieval_override(
+                    retrieved,
+                    norm_weights,
+                    slot_matrix,
+                    override_pos=override_pos,
+                    override_values=override_values,
+                )
             else:
                 retrieved = slot_matrix.mean(dim=0, keepdim=True).expand(batch_size, -1)
+                if override_pos is not None and override_values is not None:
+                    retrieved = retrieved + (
+                        override_values - slot_matrix[override_pos].unsqueeze(0)
+                    ) / max(1, slot_matrix.shape[0])
             self._retrieval_weights = None
             self._retrieval_indices = None
 
@@ -477,6 +507,57 @@ class MultiSlotOuterModel(nn.Module):
         if decoded.shape[0] == 1 and batch_size != 1:
             return decoded.expand(batch_size, -1)
         return decoded
+
+    def _slot_override_for_matrix(
+        self,
+        *,
+        slot_matrix: torch.Tensor,
+        indices: list[int],
+        batch_size: int,
+        slot_override_index: int | None,
+        slot_override_values: torch.Tensor | None,
+    ) -> tuple[int | None, torch.Tensor | None]:
+        if slot_override_index is None or slot_override_values is None:
+            return None, None
+        try:
+            override_pos = indices.index(int(slot_override_index))
+        except ValueError:
+            return None, None
+        values = slot_override_values.detach().to(
+            device=slot_matrix.device,
+            dtype=slot_matrix.dtype,
+        )
+        if values.dim() == 3 and values.shape[1] == 1:
+            values = values.squeeze(1)
+        if values.dim() == 1:
+            values = values.unsqueeze(0)
+        if values.dim() != 2 or values.shape[-1] != slot_matrix.shape[-1]:
+            raise ValueError(
+                "slot_override_values must have shape (outer_dim,), "
+                "(batch, outer_dim), or (batch, 1, outer_dim)"
+            )
+        if values.shape[0] == 1 and batch_size != 1:
+            values = values.expand(batch_size, -1)
+        elif values.shape[0] != batch_size:
+            raise ValueError(
+                f"slot_override_values batch {values.shape[0]} does not match "
+                f"read batch {batch_size}"
+            )
+        return override_pos, values
+
+    def _apply_retrieval_override(
+        self,
+        retrieved: torch.Tensor,
+        weights: torch.Tensor,
+        slot_matrix: torch.Tensor,
+        *,
+        override_pos: int | None,
+        override_values: torch.Tensor | None,
+    ) -> torch.Tensor:
+        if override_pos is None or override_values is None:
+            return retrieved
+        delta = override_values - slot_matrix[override_pos].unsqueeze(0)
+        return retrieved + weights[:, override_pos:override_pos + 1] * delta
 
     def write(
         self,
@@ -543,6 +624,8 @@ class MultiSlotOuterModel(nn.Module):
         cue: torch.Tensor | None = None,
         read_cutoff: int | None = None,
         slot_mask: torch.Tensor | None = None,
+        slot_override_index: int | None = None,
+        slot_override_values: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Retrieve from a specific Wernicke bucket using the specified mode.
 
@@ -571,9 +654,18 @@ class MultiSlotOuterModel(nn.Module):
             selected_mask = None
             if slot_mask is not None:
                 selected_mask = slot_mask.to(device=device, dtype=torch.bool)[:, indices]
+            override_pos, override_values = self._slot_override_for_matrix(
+                slot_matrix=slot_matrix,
+                indices=indices,
+                batch_size=batch_size,
+                slot_override_index=slot_override_index,
+                slot_override_values=slot_override_values,
+            )
             if cue is not None:
                 q = cue.to(dtype=dtype)
                 scores = q @ slot_matrix.T  # (batch, n)
+                if override_pos is not None and override_values is not None:
+                    scores[:, override_pos] = (q * override_values).sum(dim=-1)
                 if selected_mask is not None:
                     scores = scores.masked_fill(~selected_mask, float("-inf"))
                 all_masked = torch.isinf(scores).all(dim=-1, keepdim=True)
@@ -583,13 +675,32 @@ class MultiSlotOuterModel(nn.Module):
                     torch.softmax(scores, dim=-1),
                 )
                 retrieved = weights @ slot_matrix
+                retrieved = self._apply_retrieval_override(
+                    retrieved,
+                    weights,
+                    slot_matrix,
+                    override_pos=override_pos,
+                    override_values=override_values,
+                )
             else:
                 if selected_mask is not None:
                     weights = selected_mask.to(dtype=dtype)
                     denom = weights.sum(dim=-1, keepdim=True).clamp(min=1.0)
-                    retrieved = (weights / denom) @ slot_matrix
+                    norm_weights = weights / denom
+                    retrieved = norm_weights @ slot_matrix
+                    retrieved = self._apply_retrieval_override(
+                        retrieved,
+                        norm_weights,
+                        slot_matrix,
+                        override_pos=override_pos,
+                        override_values=override_values,
+                    )
                 else:
                     retrieved = slot_matrix.mean(dim=0, keepdim=True).expand(batch_size, -1)
+                    if override_pos is not None and override_values is not None:
+                        retrieved = retrieved + (
+                            override_values - slot_matrix[override_pos].unsqueeze(0)
+                        ) / max(1, slot_matrix.shape[0])
             decoded = self.decoder(retrieved)  # (1, model_dim)
             if decoded.shape[0] == 1 and batch_size != 1:
                 return decoded.expand(batch_size, -1)
@@ -607,35 +718,82 @@ class MultiSlotOuterModel(nn.Module):
         selected_mask = None
         if slot_mask is not None:
             selected_mask = slot_mask.to(device=device, dtype=torch.bool)[:, indices]
+        override_pos, override_values = self._slot_override_for_matrix(
+            slot_matrix=bucket_slots,
+            indices=indices,
+            batch_size=batch_size,
+            slot_override_index=slot_override_index,
+            slot_override_values=slot_override_values,
+        )
 
         if mode == "bucket_mean":
             if selected_mask is not None:
                 weights = selected_mask.to(dtype=dtype)
                 denom = weights.sum(dim=-1, keepdim=True).clamp(min=1.0)
-                retrieved = (weights / denom) @ bucket_slots
+                norm_weights = weights / denom
+                retrieved = norm_weights @ bucket_slots
+                retrieved = self._apply_retrieval_override(
+                    retrieved,
+                    norm_weights,
+                    bucket_slots,
+                    override_pos=override_pos,
+                    override_values=override_values,
+                )
             else:
                 retrieved = bucket_slots.mean(dim=0, keepdim=True).expand(batch_size, -1)
+                if override_pos is not None and override_values is not None:
+                    retrieved = retrieved + (
+                        override_values - bucket_slots[override_pos].unsqueeze(0)
+                    ) / max(1, bucket_slots.shape[0])
 
         elif mode == "bucket_recent":
-            recent = bucket_slots[-k:]  # last k entries
+            recent_start = max(0, bucket_slots.shape[0] - k)
+            recent = bucket_slots[recent_start:]  # last k entries
+            recent_override_pos = (
+                None
+                if override_pos is None or override_pos < recent_start
+                else override_pos - recent_start
+            )
             if selected_mask is not None:
                 recent_mask = selected_mask[:, -recent.shape[0]:]
                 weights = recent_mask.to(dtype=dtype)
                 denom = weights.sum(dim=-1, keepdim=True).clamp(min=1.0)
-                retrieved = (weights / denom) @ recent
+                norm_weights = weights / denom
+                retrieved = norm_weights @ recent
+                retrieved = self._apply_retrieval_override(
+                    retrieved,
+                    norm_weights,
+                    recent,
+                    override_pos=recent_override_pos,
+                    override_values=override_values,
+                )
             else:
                 retrieved = recent.mean(dim=0, keepdim=True).expand(batch_size, -1)
+                if recent_override_pos is not None and override_values is not None:
+                    retrieved = retrieved + (
+                        override_values - recent[recent_override_pos].unsqueeze(0)
+                    ) / max(1, recent.shape[0])
 
         elif mode == "bucket_topk":
             if cue is None:
                 raise ValueError("bucket_topk requires a cue tensor")
             q = cue.to(dtype=dtype)
             scores = q @ bucket_slots.T  # (batch, n)
+            if override_pos is not None and override_values is not None:
+                scores[:, override_pos] = (q * override_values).sum(dim=-1)
             if selected_mask is not None:
                 scores = scores.masked_fill(~selected_mask, float("-inf"))
             topk = min(k, scores.shape[-1])
             topk_scores, topk_idx = scores.topk(topk, dim=-1)
             topk_slots = bucket_slots[topk_idx]  # (batch, k, outer_dim)
+            if override_pos is not None and override_values is not None:
+                override_mask = topk_idx == override_pos
+                if override_mask.any():
+                    topk_slots = torch.where(
+                        override_mask.unsqueeze(-1),
+                        override_values.unsqueeze(1).expand_as(topk_slots),
+                        topk_slots,
+                    )
             all_masked = torch.isinf(topk_scores).all(dim=-1, keepdim=True)
             weights = torch.where(
                 all_masked.expand_as(topk_scores),
