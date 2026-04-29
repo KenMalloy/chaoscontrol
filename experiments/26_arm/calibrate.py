@@ -137,7 +137,6 @@ def _balanced_thresholds(summary: dict[str, dict[str, float]]) -> dict[str, floa
         "peak_preserve_utility_threshold": summary["peak_utility"]["p75"],
         "peak_preserve_sharpness_threshold": summary["peak_sharpness"]["p75"],
         "min_age_steps": 128,
-        "min_score_count": 2,
     }
 
 

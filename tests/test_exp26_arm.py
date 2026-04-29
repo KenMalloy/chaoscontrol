@@ -283,7 +283,6 @@ def _write_realistic_manifest(path: Path) -> None:
             "peak_preserve_utility_threshold": 0.05,
             "peak_preserve_sharpness_threshold": 0.03,
             "min_age_steps": 128,
-            "min_score_count": 2,
         },
     }
     path.write_text(json.dumps(manifest, indent=2))

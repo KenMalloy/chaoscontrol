@@ -18,11 +18,11 @@ from chaoscontrol.replay_eviction import (
     CounterfactualResult, DistillReceipt, MemoryEvent,
     FullAControllerState, CpuRefreshProposalModel,
     SLOT_PRESERVE, SLOT_DECAY, SLOT_EVICT, SLOT_REFRESH,
-    SLOT_QUARANTINE, SLOT_DISTILL,
+    SLOT_QUARANTINE, SLOT_DISTILL, SLOT_RELEASE,
 )
 from chaoscontrol.slot_table import (
     SlotTable, SlotRecord,
-    SLOT_WARMING, SLOT_ACTIVE, SLOT_SHARP, SLOT_DECAYING,
+    SLOT_WARMING, SLOT_ACTIVE, SLOT_DECAYING,
     SLOT_QUARANTINED, SLOT_RETIRED,
 )
 
@@ -277,44 +277,18 @@ class TestReplayEvictionLoop:
         assert torch.equal(loop._probe_input_ids, second)
         assert loop.latest_probe_step() == 20
 
-    def test_min_age_respected(self):
+    def test_no_slot_table_path_does_not_mutate_legacy_lists(self):
         loop = ReplayEvictionLoop(min_slot_age_steps=1000, eviction_threshold=100.0)
         model = _StubModel(n_slots=5, memory_benefit=0.0)
         input_ids = torch.randint(0, 32, (2, 33))
         valid_mask = torch.ones(2, 33)
+        before = len(model.outer_model._slots)
         loop.cache_probe(input_ids=input_ids, valid_mask=valid_mask,
                          cache_read_cutoff=None, step=0)
         loop.tick(model=model, step=10)
         result = loop.tick(model=model, step=20)
         assert result.evicted_indices == []
-
-    def test_score_count_gate(self):
-        loop = ReplayEvictionLoop(min_slot_age_steps=0, eviction_threshold=100.0)
-        model = _StubModel(n_slots=5, memory_benefit=0.0)
-        input_ids = torch.randint(0, 32, (2, 33))
-        valid_mask = torch.ones(2, 33)
-        loop.cache_probe(input_ids=input_ids, valid_mask=valid_mask,
-                         cache_read_cutoff=None, step=0)
-        result = loop.tick(model=model, step=200)
-        assert result.evicted_indices == []
-
-    def test_eviction_after_multiple_ticks(self):
-        loop = ReplayEvictionLoop(
-            min_slot_age_steps=0,
-            eviction_threshold=100.0,
-            max_seconds_per_tick=999.0,
-            frame_ttl_steps=1000,
-        )
-        model = _StubModel(n_slots=5, memory_benefit=0.0)
-        input_ids = torch.randint(0, 32, (2, 33))
-        valid_mask = torch.ones(2, 33)
-        loop.cache_probe(input_ids=input_ids, valid_mask=valid_mask,
-                         cache_read_cutoff=None, step=0)
-        loop.tick(model=model, step=200)
-        loop.cache_probe(input_ids=input_ids, valid_mask=valid_mask,
-                         cache_read_cutoff=None, step=1)
-        result = loop.tick(model=model, step=300)
-        assert len(result.evicted_indices) > 0
+        assert len(model.outer_model._slots) == before
 
     def test_diagnostics(self):
         loop = ReplayEvictionLoop(memory_streams=8)
@@ -365,7 +339,6 @@ class TestReplayEvictionLoop:
             scoring_mode="oracle",
             commit_policy="rule",
             min_slot_age_steps=0,
-            min_score_count=1,
             eviction_threshold=100.0,
             slot_work_chunk_size=2,
         )
@@ -411,28 +384,6 @@ class TestReplayEvictionLoop:
         assert diag["oracle_direct_confirmations_total"] == 2
         assert diag["oracle_confirmations_total"] == 2
         assert diag["proxy_oracle_pairs_total"] == 0
-
-    def test_ema_smoothing(self):
-        loop = ReplayEvictionLoop(eviction_ema_beta=0.9)
-        slot_idx = 42
-        loop._slot_first_seen_step[slot_idx] = 0
-        loop._slot_utility_ema[slot_idx] = 1.0
-        loop._slot_score_count[slot_idx] = 1
-        old = loop._slot_utility_ema[slot_idx]
-        loop._slot_utility_ema[slot_idx] = 0.9 * old + 0.1 * 0.0
-        loop._slot_score_count[slot_idx] = 2
-        assert loop._slot_utility_ema[slot_idx] == pytest.approx(0.9, abs=1e-6)
-
-    def test_reindex_after_eviction(self):
-        loop = ReplayEvictionLoop()
-        loop._slot_utility_ema = {0: 0.5, 1: 0.1, 2: 0.8, 3: 0.2, 4: 0.9}
-        loop._slot_first_seen_step = {0: 0, 1: 0, 2: 0, 3: 0, 4: 0}
-        loop._slot_score_count = {0: 3, 1: 3, 2: 3, 3: 3, 4: 3}
-        loop._reindex_after_eviction([1, 3])
-        assert set(loop._slot_utility_ema.keys()) == {0, 1, 2}
-        assert loop._slot_utility_ema[0] == pytest.approx(0.5)
-        assert loop._slot_utility_ema[1] == pytest.approx(0.8)
-        assert loop._slot_utility_ema[2] == pytest.approx(0.9)
 
     def test_refresh_score_maps_physical_index_to_probe_local_index(self):
         loop = ReplayEvictionLoop()
@@ -1021,7 +972,6 @@ class TestPolicy:
             peak_preserve_utility_threshold=0.04,
             peak_preserve_sharpness_threshold=0.04,
             min_age=128,
-            min_score_count=2,
             capacity_pressure=False,
         )
 
@@ -1128,6 +1078,7 @@ class TestPolicy:
         assert set(vals.keys()) == {
             SLOT_PRESERVE, SLOT_DECAY, SLOT_EVICT,
             SLOT_REFRESH, SLOT_QUARANTINE, SLOT_DISTILL,
+            SLOT_RELEASE,
         }
 
 
@@ -1175,7 +1126,6 @@ class TestSlotTableTick:
         loop = ReplayEvictionLoop(
             action_mode="shadow",
             eviction_ema_beta=0.5,
-            min_score_count=99,
             oracle_confirm_top_k=0,
         )
         model = _StubModel(n_slots=2, memory_benefit=0.0, use_table=True)
@@ -1269,7 +1219,6 @@ class TestSlotTableTick:
             commit_policy="rule",
             eviction_ema_beta=0.0,
             min_slot_age_steps=0,
-            min_score_count=1,
             action_agreement_count=2,
         )
         model = _StubModel(n_slots=1, memory_benefit=0.0, use_table=True)
@@ -1313,7 +1262,6 @@ class TestSlotTableTick:
             commit_policy="rule",
             eviction_ema_beta=0.0,
             min_slot_age_steps=0,
-            min_score_count=1,
             action_agreement_count=2,
         )
         model = _StubModel(n_slots=1, memory_benefit=0.0, use_table=True)
@@ -1430,6 +1378,85 @@ class TestSlotTableTick:
         assert diag["action_agreements_total"] == 0
         assert diag["commit_policy"] == "learned"
 
+    def test_learned_commit_can_structurally_mutate_warming_slot(self, monkeypatch):
+        loop = ReplayEvictionLoop(action_mode="active", commit_policy="learned")
+        model = _StubModel(n_slots=1, use_table=True)
+        table = model.outer_model.table
+        sid = table.active_slot_ids()[0]
+        rec = table.record(sid)
+        rec.state = SLOT_WARMING
+        rec.score_count = 1
+        rec.last_scored_step = 300
+        loop._commit_policy._bias.zero_()
+        loop._commit_policy._bias[
+            loop._commit_policy.actions.index(SLOT_QUARANTINE)
+        ] = 8.0
+        loop._confirm_actions_with_oracle = lambda **_kwargs: {sid: True}  # type: ignore[method-assign]
+        cf = CounterfactualResult(
+            marginal_gains=-torch.ones(1, 1, 2),
+            sidecar_value=torch.zeros(1, 2),
+            nll_baseline=torch.zeros(1, 2),
+            nll_no_sidecar=torch.zeros(1, 2),
+            weights_baseline=torch.ones(1, 1),
+            mask=torch.ones(1, 2, dtype=torch.bool),
+            slot_indices=[0],
+        )
+
+        result = loop._classify_and_act(
+            model=model,
+            outer=model.outer_model,
+            step=300,
+            cf=cf,
+            slot_marginals=[-1.0],
+            sharpness_per_slot=torch.zeros(1),
+            t0=time.monotonic(),
+        )
+
+        assert result.quarantined == [sid]
+        assert table.record(sid).state == SLOT_QUARANTINED
+
+    def test_learned_commit_releases_quarantined_slot_as_action(self):
+        loop = ReplayEvictionLoop(action_mode="active", commit_policy="learned")
+        model = _StubModel(n_slots=1, use_table=True)
+        table = model.outer_model.table
+        sid = table.active_slot_ids()[0]
+        table.quarantine(sid)
+        loop._quarantined.add(sid)
+        rec = table.record(sid)
+        rec.score_count = 2
+        rec.last_scored_step = 300
+        rec.marginal_gain_ema = 1.0
+        rec.positive_streak = 3
+        loop._commit_policy._bias.zero_()
+        loop._commit_policy._bias[
+            loop._commit_policy.actions.index(SLOT_RELEASE)
+        ] = 8.0
+        loop._confirm_actions_with_oracle = lambda **_kwargs: {sid: True}  # type: ignore[method-assign]
+        cf = CounterfactualResult(
+            marginal_gains=torch.ones(1, 1, 2),
+            sidecar_value=torch.zeros(1, 2),
+            nll_baseline=torch.zeros(1, 2),
+            nll_no_sidecar=torch.zeros(1, 2),
+            weights_baseline=torch.ones(1, 1),
+            mask=torch.ones(1, 2, dtype=torch.bool),
+            slot_indices=[0],
+        )
+
+        result = loop._classify_and_act(
+            model=model,
+            outer=model.outer_model,
+            step=300,
+            cf=cf,
+            slot_marginals=[1.0],
+            sharpness_per_slot=torch.zeros(1),
+            t0=time.monotonic(),
+        )
+
+        assert result.released == [sid]
+        assert sid not in loop._quarantined
+        assert table.record(sid).state == SLOT_ACTIVE
+        assert loop.diagnostics()["releases_total"] == 1
+
     def test_learned_commit_oracle_gate_uses_physics_not_thresholds(self):
         learned = ReplayEvictionLoop(
             commit_policy="learned",
@@ -1533,7 +1560,6 @@ class TestSlotTableTick:
     def test_refresh_ranks_candidates_with_oracle_not_proxy(self, monkeypatch):
         loop = ReplayEvictionLoop(
             action_mode="active",
-            refresh_margin=0.001,
             refresh_candidate_count=4,
             refresh_candidate_variant_chunk_size=4,
         )
@@ -1575,7 +1601,7 @@ class TestSlotTableTick:
             oracle_calls += 1
             assert len(kwargs["candidate_tensors"]) == 4
             assert kwargs["variant_chunk_size"] == 4
-            scores = torch.tensor([0.0, 1.0, 0.25, 0.1])
+            scores = torch.tensor([0.0, 0.0005, 0.00025, 0.0001])
             return replay_eviction_mod.RefreshCandidateOracleResult(
                 slot_index=0,
                 candidate_names=[name for name, _tensor in kwargs["candidate_tensors"]],
@@ -1614,11 +1640,11 @@ class TestSlotTableTick:
         assert diag["last_refresh_candidate_best_index"] == 1
         assert diag["refresh_candidate_accepts_total"] == 1
         assert diag["refresh_proposal_model"]["structural_accepts_total"] == 1
+        assert diag["refresh_proposal_model"]["improvement_scale_updates"] == 1
 
     def test_rejected_refresh_probe_swaps_do_not_bump_generation(self, monkeypatch):
         loop = ReplayEvictionLoop(
             action_mode="active",
-            refresh_margin=0.001,
             refresh_candidate_count=4,
         )
         model = _StubModel(n_slots=1, use_table=True)

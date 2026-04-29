@@ -207,7 +207,6 @@ def _calibration_thresholds() -> dict[str, Any]:
         "replay_eviction_peak_preserve_sharpness_threshold": 0.005,
         "replay_eviction_action_agreement_count": 1,
         "replay_eviction_min_age_steps": 32,
-        "replay_eviction_min_score_count": 2,
     }
 
 

@@ -3,7 +3,8 @@
 The episodic sidecar is a living residual layer over the SSM, not a
 passive cache. Each memory slot is continuously scored relative to
 the current model via counterfactual probes and classified into one
-of six actions: PRESERVE, DECAY, EVICT, REFRESH, QUARANTINE, DISTILL.
+of seven actions: PRESERVE, DECAY, EVICT, REFRESH, QUARANTINE, DISTILL,
+RELEASE.
 
 The probe engine consumes a rolling stream of probe frames and bounded
 slot-work microbatches. Each microbatch runs 1 SSM encode + vectorized
@@ -28,7 +29,7 @@ import torch.nn.functional as F
 from .cache_utility import chunked_nll_from_hidden
 from .kernels import _cpu_ssm_controller as _ext
 from .slot_table import SlotTable, SlotRecord, SlotId
-from .slot_table import SLOT_WARMING, SLOT_ACTIVE, SLOT_SHARP
+from .slot_table import SLOT_WARMING, SLOT_ACTIVE
 from .slot_table import SLOT_DECAYING, SLOT_QUARANTINED, SLOT_RETIRED
 
 __all__ = [
@@ -52,6 +53,7 @@ SLOT_EVICT = "EVICT"
 SLOT_REFRESH = "REFRESH"
 SLOT_QUARANTINE = "QUARANTINE"
 SLOT_DISTILL = "DISTILL"
+SLOT_RELEASE = "RELEASE"
 SLOT_ACTION_ORDER = (
     SLOT_PRESERVE,
     SLOT_DECAY,
@@ -59,6 +61,7 @@ SLOT_ACTION_ORDER = (
     SLOT_REFRESH,
     SLOT_QUARANTINE,
     SLOT_DISTILL,
+    SLOT_RELEASE,
 )
 
 
@@ -786,7 +789,7 @@ class FullAControllerState:
         if not torch.isfinite(delta).all() or delta.norm().item() <= 1e-8:
             return
         trust = 1.0 if structural_accepted else 0.25
-        gain = float(torch.tanh(torch.tensor(max(0.0, float(improvement)) / 0.01)))
+        gain = max(0.0, min(1.0, float(improvement)))
         if gain <= 0.0:
             return
         h = F.normalize(self._state.detach(), dim=-1, eps=1e-8)
@@ -928,9 +931,11 @@ class CpuRefreshProposalModel:
         self.positive_updates_total = 0
         self.structural_accepts_total = 0
         self.structural_rejects_total = 0
-        self.below_margin_positive_updates_total = 0
+        self.rejected_positive_updates_total = 0
         self.weight_syncs_total = 0
         self.improvement_sum = 0.0
+        self.improvement_abs_ema = 0.0
+        self.improvement_scale_updates = 0
         self.last_best_index = 0
         self.last_best_name = "identity"
         self.last_best_improvement = 0.0
@@ -1154,6 +1159,16 @@ class CpuRefreshProposalModel:
         self.last_best_name = candidates[idx][0] if 0 <= idx < len(candidates) else ""
         self.last_best_improvement = improvement
         self.improvement_sum += improvement
+        abs_improvement = abs(improvement)
+        if self.improvement_scale_updates == 0:
+            self.improvement_abs_ema = abs_improvement
+        else:
+            self.improvement_abs_ema = (
+                0.95 * self.improvement_abs_ema + 0.05 * abs_improvement
+            )
+        self.improvement_scale_updates += 1
+        scale = max(self.improvement_abs_ema, 1.0e-8)
+        improvement_credit = max(-1.0, min(1.0, improvement / scale))
         if structural_accepted:
             self.structural_accepts_total += 1
         else:
@@ -1171,12 +1186,12 @@ class CpuRefreshProposalModel:
             self._controller.update_feedback(
                 identity=identity,
                 best=best,
-                improvement=improvement,
+                improvement=max(0.0, improvement_credit),
                 structural_accepted=structural_accepted,
             )
             self.positive_updates_total += 1
             if not structural_accepted:
-                self.below_margin_positive_updates_total += 1
+                self.rejected_positive_updates_total += 1
         else:
             if self._learned_direction is not None:
                 self._learned_direction = self.momentum * self._learned_direction
@@ -1194,9 +1209,11 @@ class CpuRefreshProposalModel:
             "positive_updates_total": self.positive_updates_total,
             "structural_accepts_total": self.structural_accepts_total,
             "structural_rejects_total": self.structural_rejects_total,
-            "below_margin_positive_updates_total": self.below_margin_positive_updates_total,
+            "rejected_positive_updates_total": self.rejected_positive_updates_total,
             "weight_syncs_total": self.weight_syncs_total,
             "improvement_sum": self.improvement_sum,
+            "improvement_abs_ema": self.improvement_abs_ema,
+            "improvement_scale_updates": self.improvement_scale_updates,
             "last_best_index": self.last_best_index,
             "last_best_name": self.last_best_name,
             "last_best_improvement": self.last_best_improvement,
@@ -1227,11 +1244,11 @@ class CpuRefreshProposalModel:
             "positive_updates_total": self.positive_updates_total,
             "structural_accepts_total": self.structural_accepts_total,
             "structural_rejects_total": self.structural_rejects_total,
-            "below_margin_positive_updates_total": (
-                self.below_margin_positive_updates_total
-            ),
+            "rejected_positive_updates_total": self.rejected_positive_updates_total,
             "weight_syncs_total": self.weight_syncs_total,
             "improvement_sum": self.improvement_sum,
+            "improvement_abs_ema": self.improvement_abs_ema,
+            "improvement_scale_updates": self.improvement_scale_updates,
             "last_best_index": self.last_best_index,
             "last_best_name": self.last_best_name,
             "last_best_improvement": self.last_best_improvement,
@@ -1269,16 +1286,19 @@ class CpuRefreshProposalModel:
         self.structural_rejects_total = int(
             state.get("structural_rejects_total", self.structural_rejects_total)
         )
-        self.below_margin_positive_updates_total = int(
-            state.get(
-                "below_margin_positive_updates_total",
-                self.below_margin_positive_updates_total,
-            )
+        self.rejected_positive_updates_total = int(
+            state.get("rejected_positive_updates_total", self.rejected_positive_updates_total)
         )
         self.weight_syncs_total = int(
             state.get("weight_syncs_total", self.weight_syncs_total)
         )
         self.improvement_sum = float(state.get("improvement_sum", self.improvement_sum))
+        self.improvement_abs_ema = float(
+            state.get("improvement_abs_ema", self.improvement_abs_ema)
+        )
+        self.improvement_scale_updates = int(
+            state.get("improvement_scale_updates", self.improvement_scale_updates)
+        )
         self.last_best_index = int(state.get("last_best_index", self.last_best_index))
         self.last_best_name = str(state.get("last_best_name", self.last_best_name))
         self.last_best_improvement = float(
@@ -1310,10 +1330,9 @@ class MaintenancePolicy:
         peak_preserve_utility_threshold: float,
         peak_preserve_sharpness_threshold: float,
         min_age: int,
-        min_score_count: int,
         capacity_pressure: bool = False,
     ) -> dict[str, float]:
-        enough = rec.score_count >= min_score_count
+        enough = rec.score_count > 0
         old = (
             (rec.last_scored_step - rec.created_step) >= min_age
             if rec.last_scored_step > 0
@@ -1356,6 +1375,10 @@ class MaintenancePolicy:
         if drift_max > drift_threshold and rec.marginal_gain_ema > useful_threshold:
             refresh_v = 0.8 * drift_max + 0.6 * rec.marginal_gain_ema
 
+        release_v = 0.0
+        if rec.state == SLOT_QUARANTINED and enough:
+            release_v = max(0.0, rec.marginal_gain_ema) + 0.25 * rec.positive_streak
+
         preserve_v = (
             rec.marginal_gain_ema
             + 0.7 * rec.sharpness_ema
@@ -1374,6 +1397,7 @@ class MaintenancePolicy:
             SLOT_REFRESH: refresh_v,
             SLOT_PRESERVE: preserve_v,
             SLOT_DECAY: decay_v,
+            SLOT_RELEASE: release_v,
         }
 
     def choose(self, rec: SlotRecord, **kwargs: Any) -> str:
@@ -1482,7 +1506,7 @@ class LearnedCommitPolicy:
                 1.0 if capacity_pressure else 0.0,
                 math.tanh(float(frame_age_steps) / 256.0),
                 math.tanh(float(queue_depth) / 32.0),
-                math.tanh(float(rec.refresh_count + rec.quarantine_count) / 4.0),
+                1.0 if rec.state == SLOT_QUARANTINED else 0.0,
             ],
             dtype=torch.float32,
         )
@@ -1580,12 +1604,10 @@ class LearnedCommitPolicy:
     ) -> tuple[bool, str]:
         if rec.score_count <= 0 and action != SLOT_PRESERVE:
             return False, "unscored_slot"
-        if rec.state == SLOT_WARMING and action in {
-            SLOT_EVICT,
-            SLOT_QUARANTINE,
-            SLOT_DISTILL,
-        }:
-            return False, "warming_structural"
+        if action == SLOT_RELEASE and rec.state != SLOT_QUARANTINED:
+            return False, "not_quarantined"
+        if rec.state == SLOT_QUARANTINED and action == SLOT_QUARANTINE:
+            return False, "already_quarantined"
         if action == SLOT_EVICT and not capacity_pressure:
             return False, "below_capacity"
         return True, ""
@@ -1748,7 +1770,6 @@ class ReplayEvictionLoop:
         drift_threshold: float = 0.3,
         repr_drift_threshold: float = 0.2,
         refresh_lr: float = 0.1,
-        refresh_margin: float = 0.001,
         refresh_candidate_count: int = 16,
         refresh_proposal_rank: int = 8,
         refresh_proposal_noise_scale: float = 0.04,
@@ -1766,12 +1787,10 @@ class ReplayEvictionLoop:
         controller_feedback_lr: float = 0.05,
         quarantine_threshold: float = -0.01,
         max_quarantined: int = 8,
-        quarantine_release_streak: int = 2,
         distill_peak_threshold: float = 0.04,
         peak_preserve_utility_threshold: float = 0.20,
         peak_preserve_sharpness_threshold: float = 0.20,
         useful_threshold: float = 0.005,
-        min_score_count: int = 2,
         probe_buffer_size: int = 32,
         frame_ttl_steps: int = 256,
         slot_work_chunk_size: int = 64,
@@ -1802,19 +1821,16 @@ class ReplayEvictionLoop:
         self._drift_threshold = float(drift_threshold)
         self._repr_drift_threshold = float(repr_drift_threshold)
         self._refresh_lr = float(refresh_lr)
-        self._refresh_margin = float(refresh_margin)
         self._refresh_candidate_count = max(2, int(refresh_candidate_count))
         self._refresh_candidate_variant_chunk_size = max(
             1, int(refresh_candidate_variant_chunk_size)
         )
         self._quarantine_threshold = float(quarantine_threshold)
         self._max_quarantined = int(max_quarantined)
-        self._quarantine_release_streak = int(quarantine_release_streak)
         self._distill_peak_threshold = float(distill_peak_threshold)
         self._peak_preserve_utility_threshold = float(peak_preserve_utility_threshold)
         self._peak_preserve_sharpness_threshold = float(peak_preserve_sharpness_threshold)
         self._useful_threshold = float(useful_threshold)
-        self._min_score_count = int(min_score_count)
         self._probe_buffer_size = max(1, int(probe_buffer_size))
         self._frame_ttl_steps = max(0, int(frame_ttl_steps))
         self._slot_work_chunk_size = max(1, int(slot_work_chunk_size))
@@ -1858,11 +1874,6 @@ class ReplayEvictionLoop:
         self._active_arm_job: dict[str, Any] | None = None
         if self._arm_runtime_enabled_requested:
             self._init_arm_runtime(arm_runtime_namespace)
-
-        # Legacy per-index tracking (kept for backward compat in tests)
-        self._slot_utility_ema: dict[int, float] = {}
-        self._slot_first_seen_step: dict[int, int] = {}
-        self._slot_score_count: dict[int, int] = {}
 
         # Probe cache
         self._probe_input_ids: torch.Tensor | None = None
@@ -1968,7 +1979,6 @@ class ReplayEvictionLoop:
 
         # Quarantine tracking (by slot_id when using SlotTable, by index otherwise)
         self._quarantined: set[int] = set()
-        self._quarantine_positive_streak: dict[int, int] = {}
         self._action_evidence: dict[int, tuple[str, int, int, int]] = {}
 
         # Trace
@@ -2007,7 +2017,6 @@ class ReplayEvictionLoop:
             peak_preserve_utility_threshold=self._peak_preserve_utility_threshold,
             peak_preserve_sharpness_threshold=self._peak_preserve_sharpness_threshold,
             min_age=self._min_age,
-            min_score_count=self._min_score_count,
             capacity_pressure=self._capacity_pressure(outer),
         )
 
@@ -2673,20 +2682,8 @@ class ReplayEvictionLoop:
                         rec.positive_streak += 1
                         rec.negative_streak = 0
 
-                    if rec.state == SLOT_WARMING and rec.score_count >= self._min_score_count:
+                    if rec.state == SLOT_WARMING and rec.score_count > 0:
                         rec.state = SLOT_ACTIVE
-        else:
-            for i, phys_idx in enumerate(cf.slot_indices):
-                mg = slot_marginals[i]
-                # Legacy path
-                if phys_idx not in self._slot_first_seen_step:
-                    self._slot_first_seen_step[phys_idx] = step
-                    self._slot_utility_ema[phys_idx] = mg
-                    self._slot_score_count[phys_idx] = 1
-                else:
-                    old = self._slot_utility_ema.get(phys_idx, mg)
-                    self._slot_utility_ema[phys_idx] = self._ema_beta * old + (1 - self._ema_beta) * mg
-                    self._slot_score_count[phys_idx] = self._slot_score_count.get(phys_idx, 0) + 1
         self._last_stage_seconds["ema"] = time.monotonic() - ema_t0
         self._stage_seconds_total["ema"] += self._last_stage_seconds["ema"]
 
@@ -2914,6 +2911,7 @@ class ReplayEvictionLoop:
             SLOT_REFRESH,
             SLOT_QUARANTINE,
             SLOT_DISTILL,
+            SLOT_RELEASE,
         }
         self._last_oracle_score_by_slot.clear()
         candidate_pairs: list[tuple[int, int, str, float]] = []
@@ -3057,6 +3055,8 @@ class ReplayEvictionLoop:
             return low_value and oracle_score >= self._quarantine_threshold
         if action == SLOT_REFRESH:
             return oracle_score > self._useful_threshold
+        if action == SLOT_RELEASE:
+            return oracle_score > self._useful_threshold
         return True
 
     @staticmethod
@@ -3078,7 +3078,7 @@ class ReplayEvictionLoop:
             return False
         if action in {SLOT_EVICT, SLOT_QUARANTINE, SLOT_DECAY, SLOT_DISTILL}:
             return score <= 0.0
-        if action == SLOT_REFRESH:
+        if action in {SLOT_REFRESH, SLOT_RELEASE}:
             return score > 0.0
         return True
 
@@ -3139,25 +3139,11 @@ class ReplayEvictionLoop:
         decisions: dict[int, CommitDecision] = {}
 
         if has_table:
-            # Check quarantine releases first
-            for sid in list(self._quarantined):
-                rec = table.record(sid)
-                if rec is None:
-                    self._quarantined.discard(sid)
-                    continue
-                if rec.positive_streak >= self._quarantine_release_streak:
-                    table.release(sid)
-                    self._quarantined.discard(sid)
-                    self._quarantine_positive_streak.pop(sid, None)
-                    self._releases_total += 1
-                    result.released.append(sid)
-                    rec.state = SLOT_ACTIVE
-                    self._trace_event(step, sid, "RELEASE", rec)
-
-            # Classify each active slot
+            # Classify each scheduled slot, including quarantined slots. Release
+            # is a learned action now, not a streak-triggered side effect.
             for i, phys_idx in enumerate(cf.slot_indices):
                 sid = table.physical_to_slot_id(phys_idx)
-                if sid is None or sid in self._quarantined:
+                if sid is None:
                     continue
                 rec = table.record(sid)
                 if rec is None:
@@ -3268,10 +3254,44 @@ class ReplayEvictionLoop:
                             slot_id=sid,
                         )
                     self._trace_event(step, sid, action, rec, extra=extra)
+                elif action == SLOT_RELEASE:
+                    if not confirmed:
+                        rec.last_action = action
+                        if decision is not None:
+                            self._record_commit_feedback(
+                                decision,
+                                accepted=False,
+                                structural=True,
+                                slot_id=sid,
+                            )
+                        self._trace_event(
+                            step, sid, action, rec,
+                            accepted=False, reason="oracle_rejected", extra=extra,
+                        )
+                        continue
+                    if not self._commit_action_ready(sid, action, rec):
+                        rec.last_action = action
+                        self._trace_event(
+                            step, sid, action, rec,
+                            accepted=False, reason="awaiting_agreement", extra=extra,
+                        )
+                        continue
+                    table.release(sid)
+                    self._quarantined.discard(sid)
+                    result.released.append(sid)
+                    self._releases_total += 1
+                    rec.state = SLOT_ACTIVE
+                    rec.last_action = action
+                    if decision is not None:
+                        self._record_commit_feedback(
+                            decision,
+                            accepted=True,
+                            structural=True,
+                            slot_id=sid,
+                        )
+                    self._trace_event(step, sid, action, rec, extra=extra)
                 elif action == SLOT_PRESERVE:
-                    if rec.sharpness_ema > self._useful_threshold:
-                        rec.state = SLOT_SHARP
-                    elif rec.state == SLOT_WARMING and rec.score_count >= self._min_score_count:
+                    if rec.state == SLOT_WARMING and rec.score_count > 0:
                         rec.state = SLOT_ACTIVE
                     rec.last_action = action
                     if decision is not None:
@@ -3376,8 +3396,7 @@ class ReplayEvictionLoop:
                     rec.last_action = action
 
         else:
-            # Legacy path (no SlotTable)
-            result = self._apply_evictions_legacy(model=model, step=step)
+            result = TickResult()
 
         return result
 
@@ -3497,7 +3516,8 @@ class ReplayEvictionLoop:
         self._last_refresh_candidate_best_index = best_idx
         self._last_refresh_candidate_best_name = best_name
         self._last_refresh_candidate_best_improvement = best_improvement
-        structural_accepted = best_idx > 0 and best_improvement > self._refresh_margin
+        self._last_oracle_score_by_slot[int(slot_id)] = best_improvement
+        structural_accepted = best_idx > 0 and best_improvement > 0.0
         self._refresh_proposal_model.update(
             candidates=candidates,
             scores=oracle.candidate_scores,
@@ -3628,7 +3648,6 @@ class ReplayEvictionLoop:
         if table is not None:
             table.quarantine(slot_id)
         self._quarantined.add(slot_id)
-        self._quarantine_positive_streak[slot_id] = 0
 
         # Overflow: evict worst quarantined if over limit
         if len(self._quarantined) > self._max_quarantined and table is not None:
@@ -3778,56 +3797,6 @@ class ReplayEvictionLoop:
                 rec, **kwargs
             )
         return extra
-
-    def _apply_evictions_legacy(self, *, model: Any, step: int) -> TickResult:
-        """Legacy eviction path for models without SlotTable."""
-        outer = getattr(model, "outer_model", None)
-        if outer is None:
-            return TickResult()
-
-        evict_indices: list[int] = []
-        for idx, ema_util in self._slot_utility_ema.items():
-            first_seen = self._slot_first_seen_step.get(idx, step)
-            age = step - first_seen
-            sc = self._slot_score_count.get(idx, 0)
-            if age < self._min_age:
-                continue
-            if sc < 2:
-                continue
-            if ema_util < self._threshold:
-                evict_indices.append(idx)
-
-        if not evict_indices:
-            return TickResult()
-
-        actual = _evict_slots(outer, evict_indices)
-        for idx in actual:
-            self._slot_utility_ema.pop(idx, None)
-            self._slot_first_seen_step.pop(idx, None)
-            self._slot_score_count.pop(idx, None)
-        self._evictions_total += len(actual)
-
-        if actual:
-            self._reindex_after_eviction(actual)
-
-        return TickResult(evicted=actual)
-
-    def _reindex_after_eviction(self, evicted: list[int]) -> None:
-        evicted_set = set(evicted)
-        sorted_evicted = sorted(evicted_set, reverse=True)
-
-        def reindex(d: dict) -> dict:
-            new = {}
-            for old_idx in sorted(d.keys()):
-                if old_idx in evicted_set:
-                    continue
-                shift = sum(1 for e in sorted_evicted if e < old_idx)
-                new[old_idx - shift] = d[old_idx]
-            return new
-
-        self._slot_utility_ema = reindex(self._slot_utility_ema)
-        self._slot_first_seen_step = reindex(self._slot_first_seen_step)
-        self._slot_score_count = reindex(self._slot_score_count)
 
     def _trace_refresh_candidates(
         self,
@@ -4075,14 +4044,12 @@ class ReplayEvictionLoop:
             "drift_threshold": self._drift_threshold,
             "repr_drift_threshold": self._repr_drift_threshold,
             "refresh_lr": self._refresh_lr,
-            "refresh_margin": self._refresh_margin,
             "refresh_candidate_count": self._refresh_candidate_count,
             "refresh_candidate_variant_chunk_size": (
                 self._refresh_candidate_variant_chunk_size
             ),
             "quarantine_threshold": self._quarantine_threshold,
             "max_quarantined": self._max_quarantined,
-            "quarantine_release_streak": self._quarantine_release_streak,
             "distill_peak_threshold": self._distill_peak_threshold,
             "peak_preserve_utility_threshold": (
                 self._peak_preserve_utility_threshold
@@ -4091,7 +4058,6 @@ class ReplayEvictionLoop:
                 self._peak_preserve_sharpness_threshold
             ),
             "useful_threshold": self._useful_threshold,
-            "min_score_count": self._min_score_count,
             "probe_buffer_size": self._probe_buffer_size,
             "frame_ttl_steps": self._frame_ttl_steps,
             "slot_work_chunk_size": self._slot_work_chunk_size,
@@ -4101,12 +4067,8 @@ class ReplayEvictionLoop:
             "commit_temperature": self._commit_temperature,
             "commit_policy_state": self._commit_policy.state_dict(),
             "refresh_proposal_model": self._refresh_proposal_model.state_dict(),
-            "legacy_slot_utility_ema": dict(self._slot_utility_ema),
-            "legacy_slot_first_seen_step": dict(self._slot_first_seen_step),
-            "legacy_slot_score_count": dict(self._slot_score_count),
             "slot_last_scored_step": dict(self._slot_last_scored_step),
             "quarantined": sorted(self._quarantined),
-            "quarantine_positive_streak": dict(self._quarantine_positive_streak),
             "action_evidence": {
                 int(k): (str(v[0]), int(v[1]), int(v[2]), int(v[3]))
                 for k, v in self._action_evidence.items()
@@ -4204,27 +4166,11 @@ class ReplayEvictionLoop:
         self._commit_temperature = float(
             state.get("commit_temperature", self._commit_temperature)
         )
-        self._slot_utility_ema = {
-            int(k): float(v)
-            for k, v in state.get("legacy_slot_utility_ema", {}).items()
-        }
-        self._slot_first_seen_step = {
-            int(k): int(v)
-            for k, v in state.get("legacy_slot_first_seen_step", {}).items()
-        }
-        self._slot_score_count = {
-            int(k): int(v)
-            for k, v in state.get("legacy_slot_score_count", {}).items()
-        }
         self._slot_last_scored_step = {
             int(k): int(v)
             for k, v in state.get("slot_last_scored_step", {}).items()
         }
         self._quarantined = {int(x) for x in state.get("quarantined", [])}
-        self._quarantine_positive_streak = {
-            int(k): int(v)
-            for k, v in state.get("quarantine_positive_streak", {}).items()
-        }
         self._action_evidence = {
             int(k): (str(v[0]), int(v[1]), int(v[2]), int(v[3]))
             for k, v in state.get("action_evidence", {}).items()
@@ -4483,9 +4429,7 @@ class ReplayEvictionLoop:
             "decays_total": self._decays_total,
             "releases_total": self._releases_total,
             "slots_scored_total": self._slots_scored_total,
-            "slots_tracked": self._last_slots_tracked
-            if self._last_slots_tracked
-            else len(self._slot_utility_ema),
+            "slots_tracked": self._last_slots_tracked,
             "shadow_actions_total": self._shadow_actions_total,
             "shadow_action_counts": dict(self._shadow_action_counts),
             "trace_flush_rows": self._trace_flush_rows,

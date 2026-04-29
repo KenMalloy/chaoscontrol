@@ -6820,7 +6820,6 @@ def train_fast_for_budget(
     replay_eviction_drift_threshold: float = 0.3,
     replay_eviction_repr_drift_threshold: float = 0.2,
     replay_eviction_refresh_lr: float = 0.1,
-    replay_eviction_refresh_margin: float = 0.001,
     replay_eviction_refresh_candidate_count: int = 16,
     replay_eviction_refresh_proposal_rank: int = 8,
     replay_eviction_refresh_proposal_noise_scale: float = 0.04,
@@ -6838,12 +6837,10 @@ def train_fast_for_budget(
     replay_eviction_controller_feedback_lr: float = 0.05,
     replay_eviction_quarantine_threshold: float = -0.01,
     replay_eviction_max_quarantined: int = 8,
-    replay_eviction_quarantine_release_streak: int = 2,
     replay_eviction_distill_peak_threshold: float = 0.04,
     replay_eviction_peak_preserve_utility_threshold: float = 0.20,
     replay_eviction_peak_preserve_sharpness_threshold: float = 0.20,
     replay_eviction_useful_threshold: float = 0.005,
-    replay_eviction_min_score_count: int = 2,
     replay_eviction_probe_buffer_size: int = 32,
     replay_eviction_frame_ttl_steps: int = 256,
     replay_eviction_slot_work_chunk_size: int = 64,
@@ -7508,7 +7505,6 @@ def train_fast_for_budget(
             drift_threshold=float(replay_eviction_drift_threshold),
             repr_drift_threshold=float(replay_eviction_repr_drift_threshold),
             refresh_lr=float(replay_eviction_refresh_lr),
-            refresh_margin=float(replay_eviction_refresh_margin),
             refresh_candidate_count=int(replay_eviction_refresh_candidate_count),
             refresh_proposal_rank=int(replay_eviction_refresh_proposal_rank),
             refresh_proposal_noise_scale=float(
@@ -7540,7 +7536,6 @@ def train_fast_for_budget(
             controller_feedback_lr=float(replay_eviction_controller_feedback_lr),
             quarantine_threshold=float(replay_eviction_quarantine_threshold),
             max_quarantined=int(replay_eviction_max_quarantined),
-            quarantine_release_streak=int(replay_eviction_quarantine_release_streak),
             distill_peak_threshold=float(replay_eviction_distill_peak_threshold),
             peak_preserve_utility_threshold=float(
                 replay_eviction_peak_preserve_utility_threshold
@@ -7549,7 +7544,6 @@ def train_fast_for_budget(
                 replay_eviction_peak_preserve_sharpness_threshold
             ),
             useful_threshold=float(replay_eviction_useful_threshold),
-            min_score_count=int(replay_eviction_min_score_count),
             probe_buffer_size=int(replay_eviction_probe_buffer_size),
             frame_ttl_steps=int(replay_eviction_frame_ttl_steps),
             slot_work_chunk_size=int(replay_eviction_slot_work_chunk_size),
@@ -9089,7 +9083,6 @@ def _warmup(
         replay_eviction_drift_threshold=float(config.get("replay_eviction_drift_threshold", 0.3)),
         replay_eviction_repr_drift_threshold=float(config.get("replay_eviction_repr_drift_threshold", 0.2)),
         replay_eviction_refresh_lr=float(config.get("replay_eviction_refresh_lr", 0.1)),
-        replay_eviction_refresh_margin=float(config.get("replay_eviction_refresh_margin", 0.001)),
         replay_eviction_refresh_candidate_count=int(
             config.get("replay_eviction_refresh_candidate_count", 16)
         ),
@@ -9137,7 +9130,6 @@ def _warmup(
         ),
         replay_eviction_quarantine_threshold=float(config.get("replay_eviction_quarantine_threshold", -0.01)),
         replay_eviction_max_quarantined=int(config.get("replay_eviction_max_quarantined", 8)),
-        replay_eviction_quarantine_release_streak=int(config.get("replay_eviction_quarantine_release_streak", 2)),
         replay_eviction_distill_peak_threshold=float(config.get("replay_eviction_distill_peak_threshold", 0.04)),
         replay_eviction_peak_preserve_utility_threshold=float(
             config.get("replay_eviction_peak_preserve_utility_threshold", 0.20)
@@ -9146,7 +9138,6 @@ def _warmup(
             config.get("replay_eviction_peak_preserve_sharpness_threshold", 0.20)
         ),
         replay_eviction_useful_threshold=float(config.get("replay_eviction_useful_threshold", 0.005)),
-        replay_eviction_min_score_count=int(config.get("replay_eviction_min_score_count", 2)),
         replay_eviction_probe_buffer_size=int(config.get("replay_eviction_probe_buffer_size", 32)),
         replay_eviction_frame_ttl_steps=int(config.get("replay_eviction_frame_ttl_steps", 256)),
         replay_eviction_slot_work_chunk_size=int(config.get("replay_eviction_slot_work_chunk_size", 64)),
@@ -9696,7 +9687,6 @@ def run_condition(
         replay_eviction_drift_threshold=float(config.get("replay_eviction_drift_threshold", 0.3)),
         replay_eviction_repr_drift_threshold=float(config.get("replay_eviction_repr_drift_threshold", 0.2)),
         replay_eviction_refresh_lr=float(config.get("replay_eviction_refresh_lr", 0.1)),
-        replay_eviction_refresh_margin=float(config.get("replay_eviction_refresh_margin", 0.001)),
         replay_eviction_refresh_candidate_count=int(
             config.get("replay_eviction_refresh_candidate_count", 16)
         ),
@@ -9744,7 +9734,6 @@ def run_condition(
         ),
         replay_eviction_quarantine_threshold=float(config.get("replay_eviction_quarantine_threshold", -0.01)),
         replay_eviction_max_quarantined=int(config.get("replay_eviction_max_quarantined", 8)),
-        replay_eviction_quarantine_release_streak=int(config.get("replay_eviction_quarantine_release_streak", 2)),
         replay_eviction_distill_peak_threshold=float(config.get("replay_eviction_distill_peak_threshold", 0.04)),
         replay_eviction_peak_preserve_utility_threshold=float(
             config.get("replay_eviction_peak_preserve_utility_threshold", 0.20)
@@ -9753,7 +9742,6 @@ def run_condition(
             config.get("replay_eviction_peak_preserve_sharpness_threshold", 0.20)
         ),
         replay_eviction_useful_threshold=float(config.get("replay_eviction_useful_threshold", 0.005)),
-        replay_eviction_min_score_count=int(config.get("replay_eviction_min_score_count", 2)),
         replay_eviction_probe_buffer_size=int(config.get("replay_eviction_probe_buffer_size", 32)),
         replay_eviction_frame_ttl_steps=int(config.get("replay_eviction_frame_ttl_steps", 256)),
         replay_eviction_slot_work_chunk_size=int(config.get("replay_eviction_slot_work_chunk_size", 64)),
