@@ -8,6 +8,7 @@ import torch.nn as nn
 
 import pytest
 
+import chaoscontrol.replay_eviction as replay_eviction_mod
 from chaoscontrol.replay_eviction import (
     ReplayEvictionLoop, TickResult, MaintenancePolicy,
     counterfactual_probe, oracle_confirm_slots, replay_score_slots, _evict_slots,
@@ -705,6 +706,98 @@ class TestSlotTableTick:
         diag = loop.diagnostics()
         assert diag["action_mode"] == "shadow"
         assert diag["shadow_actions_total"] > 0
+
+    def test_tick_batch_ema_update_matches_scalar_order(self, monkeypatch):
+        loop = ReplayEvictionLoop(
+            action_mode="shadow",
+            eviction_ema_beta=0.5,
+            min_score_count=99,
+            oracle_confirm_top_k=0,
+        )
+        model = _StubModel(n_slots=2, memory_benefit=0.0, use_table=True)
+        table = model.outer_model.table
+        sids = table.active_slot_ids()
+        rec0 = table.record(sids[0])
+        rec1 = table.record(sids[1])
+        assert rec0 is not None and rec1 is not None
+
+        rec0.utility_ema = 0.2
+        rec0.marginal_gain_ema = 0.4
+        rec0.sharpness_ema = 0.6
+        rec0.activation_drift_ema = 0.8
+        rec0.representation_drift_ema = 1.0
+        rec0.semantic_drift_ema = 1.2
+        rec0.retrieval_mass_ema = 0.1
+        rec0.contradiction_ema = 0.3
+        rec0.peak_utility = 0.25
+        rec0.peak_sharpness = 0.65
+
+        rec1.utility_ema = -0.2
+        rec1.marginal_gain_ema = -0.4
+        rec1.sharpness_ema = 0.2
+        rec1.activation_drift_ema = 0.4
+        rec1.representation_drift_ema = 0.6
+        rec1.semantic_drift_ema = 0.8
+        rec1.retrieval_mass_ema = 0.9
+        rec1.contradiction_ema = 0.1
+        rec1.peak_utility = 0.05
+        rec1.peak_sharpness = 0.25
+
+        cf = CounterfactualResult(
+            marginal_gains=torch.tensor([[[2.0, 0.0]], [[-2.0, 0.0]]]),
+            sidecar_value=torch.zeros(1, 2),
+            nll_baseline=torch.zeros(1, 2),
+            nll_no_sidecar=torch.zeros(1, 2),
+            weights_baseline=torch.tensor([[0.2, 0.8]]),
+            mask=torch.ones(1, 2, dtype=torch.bool),
+            slot_indices=[0, 1],
+        )
+        monkeypatch.setattr(
+            replay_eviction_mod,
+            "counterfactual_probe",
+            lambda **_kwargs: cf,
+        )
+        monkeypatch.setattr(
+            replay_eviction_mod,
+            "_compute_representation_drift",
+            lambda *_args, **_kwargs: 0.25,
+        )
+        loop.cache_probe(
+            input_ids=torch.zeros(1, 3, dtype=torch.long),
+            valid_mask=torch.ones(1, 3),
+            cache_read_cutoff=None,
+            step=0,
+        )
+
+        loop.tick(model=model, step=200)
+
+        assert rec0.utility_ema == pytest.approx(0.6)
+        assert rec0.marginal_gain_ema == pytest.approx(0.7)
+        assert rec0.sharpness_ema == pytest.approx(0.8)
+        assert rec0.activation_drift_ema == pytest.approx(0.45)
+        assert rec0.representation_drift_ema == pytest.approx(0.625)
+        assert rec0.semantic_drift_ema == pytest.approx(0.75)
+        assert rec0.retrieval_mass_ema == pytest.approx(0.15)
+        assert rec0.contradiction_ema == pytest.approx(0.15)
+        assert rec0.peak_utility == pytest.approx(0.6)
+        assert rec0.peak_sharpness == pytest.approx(0.8)
+        assert rec0.score_count == 1
+        assert rec0.positive_streak == 1
+        assert rec0.negative_streak == 0
+
+        assert rec1.utility_ema == pytest.approx(-0.6)
+        assert rec1.marginal_gain_ema == pytest.approx(-0.7)
+        assert rec1.sharpness_ema == pytest.approx(0.6)
+        assert rec1.activation_drift_ema == pytest.approx(0.25)
+        assert rec1.representation_drift_ema == pytest.approx(0.425)
+        assert rec1.semantic_drift_ema == pytest.approx(0.55)
+        assert rec1.retrieval_mass_ema == pytest.approx(0.85)
+        assert rec1.contradiction_ema == pytest.approx(0.55)
+        assert rec1.peak_utility == pytest.approx(0.05)
+        assert rec1.peak_sharpness == pytest.approx(0.6)
+        assert rec1.score_count == 1
+        assert rec1.positive_streak == 0
+        assert rec1.negative_streak == 1
 
     def test_oracle_rejection_blocks_active_mutation(self):
         loop = ReplayEvictionLoop(action_mode="active", min_slot_age_steps=0)

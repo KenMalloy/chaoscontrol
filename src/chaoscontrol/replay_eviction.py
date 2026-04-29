@@ -703,37 +703,67 @@ class ReplayEvictionLoop:
         sharpness_per_slot = _compute_per_slot_sharpness(cf.marginal_gains, cf.mask)
         mask_f = cf.mask.float()
         n_valid = mask_f.sum().clamp(min=1)
+        n_scored = len(cf.slot_indices)
 
         # Per-slot marginal gain (mean over tokens and batch)
         if cf.marginal_gains.shape[0] > 0:
-            slot_marginals = (
+            slot_marginals_t = (
                 (cf.marginal_gains * mask_f.unsqueeze(0)).sum(dim=(1, 2)) / n_valid
-            ).float().tolist()
+            ).float()
         else:
-            slot_marginals = []
-        if len(slot_marginals) < len(cf.slot_indices):
-            slot_marginals.extend([0.0] * (len(cf.slot_indices) - len(slot_marginals)))
+            slot_marginals_t = torch.zeros(0, dtype=torch.float32)
+        if slot_marginals_t.numel() < n_scored:
+            slot_marginals_t = torch.cat(
+                [
+                    slot_marginals_t,
+                    torch.zeros(
+                        n_scored - slot_marginals_t.numel(),
+                        dtype=slot_marginals_t.dtype,
+                        device=slot_marginals_t.device,
+                    ),
+                ]
+            )
+        slot_marginals = slot_marginals_t.tolist()
 
         # Per-slot retrieval mass
         if cf.weights_baseline.numel() > 0:
-            slot_retrieval_mass = cf.weights_baseline.mean(dim=0).float().tolist()
+            slot_retrieval_mass_t = cf.weights_baseline.mean(dim=0).float()
         else:
-            slot_retrieval_mass = []
-        if len(slot_retrieval_mass) < len(cf.slot_indices):
-            slot_retrieval_mass.extend(
-                [0.0] * (len(cf.slot_indices) - len(slot_retrieval_mass))
+            slot_retrieval_mass_t = torch.zeros(0, dtype=torch.float32)
+        if slot_retrieval_mass_t.numel() < n_scored:
+            slot_retrieval_mass_t = torch.cat(
+                [
+                    slot_retrieval_mass_t,
+                    torch.zeros(
+                        n_scored - slot_retrieval_mass_t.numel(),
+                        dtype=slot_retrieval_mass_t.dtype,
+                        device=slot_retrieval_mass_t.device,
+                    ),
+                ]
+            )
+        slot_retrieval_mass = slot_retrieval_mass_t.tolist()
+
+        sharpness_t = sharpness_per_slot.float()
+        if sharpness_t.numel() < n_scored:
+            sharpness_t = torch.cat(
+                [
+                    sharpness_t,
+                    torch.zeros(
+                        n_scored - sharpness_t.numel(),
+                        dtype=sharpness_t.dtype,
+                        device=sharpness_t.device,
+                    ),
+                ]
             )
 
         # Update SlotRecords (or legacy dicts)
         table = getattr(outer, "table", None)
         has_table = table is not None
 
-        for i, phys_idx in enumerate(cf.slot_indices):
-            mg = slot_marginals[i]
-            sharp = float(sharpness_per_slot[i]) if i < len(sharpness_per_slot) else 0.0
-            rm = slot_retrieval_mass[i]
-
-            if has_table:
+        if has_table:
+            update_rows: list[tuple[int, int, SlotRecord]] = []
+            repr_drifts: list[float] = []
+            for i, phys_idx in enumerate(cf.slot_indices):
                 sid = table.physical_to_slot_id(phys_idx)
                 if sid is None:
                     continue
@@ -741,32 +771,140 @@ class ReplayEvictionLoop:
                 if rec is None:
                     continue
                 slot_tensor = table.get_tensor(sid)
-                repr_drift = _compute_representation_drift(outer, slot_tensor) if slot_tensor is not None else 0.0
+                repr_drifts.append(
+                    _compute_representation_drift(outer, slot_tensor)
+                    if slot_tensor is not None
+                    else 0.0
+                )
+                update_rows.append((i, phys_idx, rec))
 
+            if update_rows:
                 beta = self._ema_beta
-                rec.utility_ema = beta * rec.utility_ema + (1 - beta) * mg
-                rec.marginal_gain_ema = beta * rec.marginal_gain_ema + (1 - beta) * mg
-                rec.sharpness_ema = beta * rec.sharpness_ema + (1 - beta) * sharp
-                rec.activation_drift_ema = beta * rec.activation_drift_ema + (1 - beta) * abs(rm - rec.retrieval_mass_ema)
-                rec.representation_drift_ema = beta * rec.representation_drift_ema + (1 - beta) * repr_drift
-                rec.semantic_drift_ema = beta * rec.semantic_drift_ema + (1 - beta) * abs(mg - rec.marginal_gain_ema)
-                rec.retrieval_mass_ema = beta * rec.retrieval_mass_ema + (1 - beta) * rm
-                rec.contradiction_ema = beta * rec.contradiction_ema + (1 - beta) * max(0.0, -mg)
-                rec.peak_utility = max(rec.peak_utility, rec.utility_ema)
-                rec.peak_sharpness = max(rec.peak_sharpness, rec.sharpness_ema)
-                rec.score_count += 1
-                rec.last_scored_step = step
+                one_minus = 1.0 - beta
+                row_idx = torch.tensor(
+                    [row[0] for row in update_rows],
+                    dtype=torch.long,
+                    device=slot_marginals_t.device,
+                )
+                mg_t = slot_marginals_t[row_idx]
+                sharp_t = sharpness_t.to(device=slot_marginals_t.device)[row_idx]
+                rm_t = slot_retrieval_mass_t.to(device=slot_marginals_t.device)[row_idx]
+                repr_t = torch.tensor(
+                    repr_drifts,
+                    dtype=torch.float32,
+                    device=slot_marginals_t.device,
+                )
 
-                if mg < 0:
-                    rec.negative_streak += 1
-                    rec.positive_streak = 0
-                else:
-                    rec.positive_streak += 1
-                    rec.negative_streak = 0
+                records = [row[2] for row in update_rows]
+                old_utility = torch.tensor(
+                    [rec.utility_ema for rec in records],
+                    dtype=torch.float32,
+                    device=slot_marginals_t.device,
+                )
+                old_marginal = torch.tensor(
+                    [rec.marginal_gain_ema for rec in records],
+                    dtype=torch.float32,
+                    device=slot_marginals_t.device,
+                )
+                old_sharpness = torch.tensor(
+                    [rec.sharpness_ema for rec in records],
+                    dtype=torch.float32,
+                    device=slot_marginals_t.device,
+                )
+                old_activation = torch.tensor(
+                    [rec.activation_drift_ema for rec in records],
+                    dtype=torch.float32,
+                    device=slot_marginals_t.device,
+                )
+                old_repr = torch.tensor(
+                    [rec.representation_drift_ema for rec in records],
+                    dtype=torch.float32,
+                    device=slot_marginals_t.device,
+                )
+                old_semantic = torch.tensor(
+                    [rec.semantic_drift_ema for rec in records],
+                    dtype=torch.float32,
+                    device=slot_marginals_t.device,
+                )
+                old_retrieval = torch.tensor(
+                    [rec.retrieval_mass_ema for rec in records],
+                    dtype=torch.float32,
+                    device=slot_marginals_t.device,
+                )
+                old_contradiction = torch.tensor(
+                    [rec.contradiction_ema for rec in records],
+                    dtype=torch.float32,
+                    device=slot_marginals_t.device,
+                )
+                old_peak_utility = torch.tensor(
+                    [rec.peak_utility for rec in records],
+                    dtype=torch.float32,
+                    device=slot_marginals_t.device,
+                )
+                old_peak_sharpness = torch.tensor(
+                    [rec.peak_sharpness for rec in records],
+                    dtype=torch.float32,
+                    device=slot_marginals_t.device,
+                )
 
-                if rec.state == SLOT_WARMING and rec.score_count >= self._min_score_count:
-                    rec.state = SLOT_ACTIVE
-            else:
+                new_utility = beta * old_utility + one_minus * mg_t
+                new_marginal = beta * old_marginal + one_minus * mg_t
+                new_sharpness = beta * old_sharpness + one_minus * sharp_t
+                new_activation = (
+                    beta * old_activation
+                    + one_minus * torch.abs(rm_t - old_retrieval)
+                )
+                new_repr = beta * old_repr + one_minus * repr_t
+                new_semantic = (
+                    beta * old_semantic
+                    + one_minus * torch.abs(mg_t - new_marginal)
+                )
+                new_retrieval = beta * old_retrieval + one_minus * rm_t
+                new_contradiction = (
+                    beta * old_contradiction + one_minus * torch.clamp(-mg_t, min=0.0)
+                )
+                new_peak_utility = torch.maximum(old_peak_utility, new_utility)
+                new_peak_sharpness = torch.maximum(old_peak_sharpness, new_sharpness)
+
+                utility_l = new_utility.tolist()
+                marginal_l = new_marginal.tolist()
+                sharpness_l = new_sharpness.tolist()
+                activation_l = new_activation.tolist()
+                repr_l = new_repr.tolist()
+                semantic_l = new_semantic.tolist()
+                retrieval_l = new_retrieval.tolist()
+                contradiction_l = new_contradiction.tolist()
+                peak_utility_l = new_peak_utility.tolist()
+                peak_sharpness_l = new_peak_sharpness.tolist()
+                mg_l = mg_t.tolist()
+
+                for j, rec in enumerate(records):
+                    mg = mg_l[j]
+                    rec.utility_ema = utility_l[j]
+                    rec.marginal_gain_ema = marginal_l[j]
+                    rec.sharpness_ema = sharpness_l[j]
+                    rec.activation_drift_ema = activation_l[j]
+                    rec.representation_drift_ema = repr_l[j]
+                    rec.semantic_drift_ema = semantic_l[j]
+                    rec.retrieval_mass_ema = retrieval_l[j]
+                    rec.contradiction_ema = contradiction_l[j]
+                    rec.peak_utility = peak_utility_l[j]
+                    rec.peak_sharpness = peak_sharpness_l[j]
+                    rec.score_count += 1
+                    rec.last_scored_step = step
+
+                    if mg < 0:
+                        rec.negative_streak += 1
+                        rec.positive_streak = 0
+                    else:
+                        rec.positive_streak += 1
+                        rec.negative_streak = 0
+
+                    if rec.state == SLOT_WARMING and rec.score_count >= self._min_score_count:
+                        rec.state = SLOT_ACTIVE
+        else:
+            for i, phys_idx in enumerate(cf.slot_indices):
+                mg = slot_marginals[i]
                 # Legacy path
                 if phys_idx not in self._slot_first_seen_step:
                     self._slot_first_seen_step[phys_idx] = step
