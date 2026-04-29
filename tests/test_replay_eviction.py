@@ -318,7 +318,8 @@ class TestReplayEvictionLoop:
         assert diag["tick_count"] == 0
         assert diag["memory_streams"] == 8
         assert diag["memory_streams_requested"] == 8
-        assert diag["memory_streams_active"] is True
+        assert diag["memory_streams_active"] is False
+        assert diag["memory_stream_execution_mode"] == "single_threaded_time_sliced"
         assert diag["probe_buffer_size"] == 32
         assert diag["queue_depth_last"] == 0
         assert diag["slot_work_chunk_size"] == 64

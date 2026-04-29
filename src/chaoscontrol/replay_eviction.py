@@ -2115,8 +2115,14 @@ class ReplayEvictionLoop:
             "action_mode": self._action_mode,
             "memory_streams": self._memory_streams,
             "memory_streams_requested": self._memory_streams,
-            "memory_streams_active": True,
-            "memory_streams_note": "probe-frame stream ids actively partition replay-maintenance work on rank 3",
+            "memory_streams_active": False,
+            "memory_stream_execution_mode": "single_threaded_time_sliced",
+            "memory_streams_note": (
+                "stream_id partitions replay-maintenance telemetry and work "
+                "ownership, but this Python control plane executes one probe "
+                "chunk at a time; literal CPU memory-lane fanout would need "
+                "a native structure-of-arrays worker plane"
+            ),
             "tick_count": self._tick_count,
             "replays_total": self._replays_total,
             "evictions_total": self._evictions_total,
