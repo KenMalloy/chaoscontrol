@@ -418,6 +418,7 @@ class MultiSlotOuterModel(nn.Module):
         *,
         cue: torch.Tensor | None = None,
         read_cutoff: int | None = None,
+        slot_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Cue-dependent retrieval across slots.
 
@@ -439,22 +440,43 @@ class MultiSlotOuterModel(nn.Module):
             return torch.zeros(batch_size, self.model_dim, device=self.decoder.weight.device)
 
         slot_matrix = self.table.slot_matrix(indices)
+        selected_mask: torch.Tensor | None = None
+        if slot_mask is not None:
+            selected_mask = slot_mask.to(
+                device=slot_matrix.device,
+                dtype=torch.bool,
+            )[:, indices]
 
         if cue is not None:
             cue = cue.to(dtype=self.cue_proj.weight.dtype)
             cue_outer = self.cue_proj(cue)
             sim = torch.mm(cue_outer, slot_matrix.T)
-            weights = F.softmax(sim, dim=-1)
+            if selected_mask is not None:
+                sim = sim.masked_fill(~selected_mask, float("-inf"))
+            all_masked = torch.isinf(sim).all(dim=-1, keepdim=True)
+            weights = torch.where(
+                all_masked.expand_as(sim),
+                torch.zeros_like(sim),
+                F.softmax(sim, dim=-1),
+            )
 
             self._retrieval_weights = weights.detach()
             self._retrieval_indices = indices
             retrieved = torch.mm(weights, slot_matrix)
         else:
-            retrieved = slot_matrix.mean(dim=0, keepdim=True).expand(batch_size, -1)
+            if selected_mask is not None:
+                weights = selected_mask.to(dtype=slot_matrix.dtype)
+                denom = weights.sum(dim=-1, keepdim=True).clamp(min=1.0)
+                retrieved = torch.mm(weights / denom, slot_matrix)
+            else:
+                retrieved = slot_matrix.mean(dim=0, keepdim=True).expand(batch_size, -1)
             self._retrieval_weights = None
             self._retrieval_indices = None
 
-        return self.decoder(retrieved.to(dtype=self.decoder.weight.dtype))
+        decoded = self.decoder(retrieved.to(dtype=self.decoder.weight.dtype))
+        if decoded.shape[0] == 1 and batch_size != 1:
+            return decoded.expand(batch_size, -1)
+        return decoded
 
     def write(
         self,
@@ -520,6 +542,7 @@ class MultiSlotOuterModel(nn.Module):
         k: int = 8,
         cue: torch.Tensor | None = None,
         read_cutoff: int | None = None,
+        slot_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Retrieve from a specific Wernicke bucket using the specified mode.
 
@@ -545,15 +568,32 @@ class MultiSlotOuterModel(nn.Module):
             if not indices:
                 return torch.zeros(batch_size, self.model_dim, device=device)
             slot_matrix = torch.cat([self._slots[i] for i in indices], dim=0).to(dtype=dtype)  # (n, outer_dim)
+            selected_mask = None
+            if slot_mask is not None:
+                selected_mask = slot_mask.to(device=device, dtype=torch.bool)[:, indices]
             if cue is not None:
-                q = cue[0:1].to(dtype=dtype)  # (1, outer_dim)
-                scores = (slot_matrix @ q.T).squeeze(-1)  # (n,)
-                weights = torch.softmax(scores, dim=0)  # (n,)
-                retrieved = (weights.unsqueeze(-1) * slot_matrix).sum(dim=0, keepdim=True)
+                q = cue.to(dtype=dtype)
+                scores = q @ slot_matrix.T  # (batch, n)
+                if selected_mask is not None:
+                    scores = scores.masked_fill(~selected_mask, float("-inf"))
+                all_masked = torch.isinf(scores).all(dim=-1, keepdim=True)
+                weights = torch.where(
+                    all_masked.expand_as(scores),
+                    torch.zeros_like(scores),
+                    torch.softmax(scores, dim=-1),
+                )
+                retrieved = weights @ slot_matrix
             else:
-                retrieved = slot_matrix.mean(dim=0, keepdim=True)
+                if selected_mask is not None:
+                    weights = selected_mask.to(dtype=dtype)
+                    denom = weights.sum(dim=-1, keepdim=True).clamp(min=1.0)
+                    retrieved = (weights / denom) @ slot_matrix
+                else:
+                    retrieved = slot_matrix.mean(dim=0, keepdim=True).expand(batch_size, -1)
             decoded = self.decoder(retrieved)  # (1, model_dim)
-            return decoded.expand(batch_size, -1)
+            if decoded.shape[0] == 1 and batch_size != 1:
+                return decoded.expand(batch_size, -1)
+            return decoded
 
         # Gather slots belonging to this bucket
         indices = self._visible_slot_indices(
@@ -564,24 +604,45 @@ class MultiSlotOuterModel(nn.Module):
             return torch.zeros(batch_size, self.model_dim, device=device)
 
         bucket_slots = torch.cat([self._slots[i] for i in indices], dim=0).to(dtype=dtype)  # (n, outer_dim)
+        selected_mask = None
+        if slot_mask is not None:
+            selected_mask = slot_mask.to(device=device, dtype=torch.bool)[:, indices]
 
         if mode == "bucket_mean":
-            retrieved = bucket_slots.mean(dim=0, keepdim=True)  # (1, outer_dim)
+            if selected_mask is not None:
+                weights = selected_mask.to(dtype=dtype)
+                denom = weights.sum(dim=-1, keepdim=True).clamp(min=1.0)
+                retrieved = (weights / denom) @ bucket_slots
+            else:
+                retrieved = bucket_slots.mean(dim=0, keepdim=True).expand(batch_size, -1)
 
         elif mode == "bucket_recent":
             recent = bucket_slots[-k:]  # last k entries
-            retrieved = recent.mean(dim=0, keepdim=True)  # (1, outer_dim)
+            if selected_mask is not None:
+                recent_mask = selected_mask[:, -recent.shape[0]:]
+                weights = recent_mask.to(dtype=dtype)
+                denom = weights.sum(dim=-1, keepdim=True).clamp(min=1.0)
+                retrieved = (weights / denom) @ recent
+            else:
+                retrieved = recent.mean(dim=0, keepdim=True).expand(batch_size, -1)
 
         elif mode == "bucket_topk":
             if cue is None:
                 raise ValueError("bucket_topk requires a cue tensor")
-            q = cue[0:1].to(dtype=dtype)  # (1, outer_dim)
-            scores = (bucket_slots @ q.T).squeeze(-1)  # (n,)
-            topk_idx = scores.topk(min(k, len(scores))).indices
-            topk_slots = bucket_slots[topk_idx]  # (k, outer_dim)
-            topk_scores = scores[topk_idx]
-            weights = torch.softmax(topk_scores, dim=0)  # (k,)
-            retrieved = (weights.unsqueeze(-1) * topk_slots).sum(dim=0, keepdim=True)
+            q = cue.to(dtype=dtype)
+            scores = q @ bucket_slots.T  # (batch, n)
+            if selected_mask is not None:
+                scores = scores.masked_fill(~selected_mask, float("-inf"))
+            topk = min(k, scores.shape[-1])
+            topk_scores, topk_idx = scores.topk(topk, dim=-1)
+            topk_slots = bucket_slots[topk_idx]  # (batch, k, outer_dim)
+            all_masked = torch.isinf(topk_scores).all(dim=-1, keepdim=True)
+            weights = torch.where(
+                all_masked.expand_as(topk_scores),
+                torch.zeros_like(topk_scores),
+                torch.softmax(topk_scores, dim=-1),
+            )
+            retrieved = torch.bmm(weights.unsqueeze(1), topk_slots).squeeze(1)
 
         else:
             raise ValueError(f"Unknown retrieval mode: {mode}")
@@ -589,7 +650,9 @@ class MultiSlotOuterModel(nn.Module):
         # Decode from outer_dim back to model_dim so the retrieved vector
         # can be added directly to the hidden stream (dimensional alignment)
         decoded = self.decoder(retrieved)  # (1, model_dim)
-        return decoded.expand(batch_size, -1)
+        if decoded.shape[0] == 1 and batch_size != 1:
+            return decoded.expand(batch_size, -1)
+        return decoded
 
     def append_kv(self, encoded: torch.Tensor, bucket_id: int | None = None) -> None:
         """Unconditional append -- no surprise gating, no compression if unlimited.

@@ -1455,6 +1455,7 @@ def build_crct_v1_matrix(
     replay_eviction_lock = {
         "replay_eviction_enabled": True,
         "replay_eviction_memory_streams": 8,
+        "replay_eviction_oracle_confirm_top_k": 32,
         "replay_eviction_trace_path": (
             "experiments/24_training_time_bundle/results/traces/"
             "crct_replay_eviction.ndjson"
@@ -1505,15 +1506,19 @@ def build_crct_v1_matrix(
                 budget_seconds=budget_seconds,
             )
             entry.update(arm)
-            entries.append(
-                _named_entry(
-                    base=entry,
-                    phase="phase3",
-                    mechanism="crct_v1",
-                    arm=f"crct_v1_{arm_name}",
-                    seed=int(seed),
-                )
+            named = _named_entry(
+                base=entry,
+                phase="phase3",
+                mechanism="crct_v1",
+                arm=f"crct_v1_{arm_name}",
+                seed=int(seed),
             )
+            if named.get("replay_eviction_enabled"):
+                named["replay_eviction_trace_path"] = (
+                    "experiments/24_training_time_bundle/results/traces/"
+                    f"crct_replay_eviction_{arm_name}_s{int(seed)}.ndjson"
+                )
+            entries.append(named)
     return entries
 
 

@@ -1741,10 +1741,14 @@ def test_crct_v1_matrix_threads_memory_controller_and_random_sampling():
     assert replay_shadow["replay_eviction_enabled"] is True
     assert replay_shadow["replay_eviction_mode"] == "shadow"
     assert replay_shadow["replay_eviction_memory_streams"] == 8
+    assert replay_shadow["replay_eviction_oracle_confirm_top_k"] == 32
+    assert "arm_c_crct_replay_shadow_s1337" in replay_shadow["replay_eviction_trace_path"]
     assert replay_active["crct_enabled"] is True
     assert replay_active["replay_eviction_enabled"] is True
     assert replay_active["replay_eviction_mode"] == "active"
     assert replay_active["replay_eviction_memory_streams"] == 8
+    assert replay_active["replay_eviction_oracle_confirm_top_k"] == 32
+    assert "arm_d_crct_replay_active_s1337" in replay_active["replay_eviction_trace_path"]
 
 
 def test_run_exp24_cli_crct_v1_dry_run(tmp_path):

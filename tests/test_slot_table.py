@@ -170,6 +170,13 @@ class TestReplaceTensor:
         t = SlotTable()
         assert t.replace_tensor(999, torch.randn(1, 4)) is False
 
+    def test_scale_survival(self):
+        t = SlotTable()
+        s0 = t.append(torch.zeros(1, 4), survival=1.0)
+        assert t.scale_survival(s0, 0.25) is True
+        assert t._survival[0] == pytest.approx(0.25)
+        assert t.scale_survival(999, 0.5) is False
+
 
 class TestPurgeRetired:
     def test_purge(self):

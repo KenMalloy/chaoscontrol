@@ -171,6 +171,7 @@ class ChaosControlConfig:
     replay_eviction_trace_path: str = ""
     replay_eviction_trace_max_rows: int = 0
     replay_eviction_probe_chunk_size: int = 16
+    replay_eviction_oracle_confirm_top_k: int = 32
     replay_eviction_drift_threshold: float = 0.3
     replay_eviction_repr_drift_threshold: float = 0.2
     replay_eviction_refresh_lr: float = 0.1

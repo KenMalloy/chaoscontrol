@@ -190,6 +190,14 @@ class SlotTable:
         self._slots[phys] = tensor.detach()
         return True
 
+    def scale_survival(self, slot_id: SlotId, factor: float) -> bool:
+        """Scale a slot's survival score without exposing table internals."""
+        if slot_id not in self._id_to_physical:
+            return False
+        phys = self._id_to_physical[slot_id]
+        self._survival[phys] *= float(factor)
+        return True
+
     def get_tensor(self, slot_id: SlotId) -> torch.Tensor | None:
         if slot_id not in self._id_to_physical:
             return None

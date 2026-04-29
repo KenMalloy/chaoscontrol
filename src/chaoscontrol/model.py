@@ -1103,6 +1103,7 @@ class ChaosStudentLM(nn.Module):
         memory_mode: str = "controller",
         cache_read_cutoff: int | None = None,
         teacher_gate: torch.Tensor | None = None,
+        memory_slot_mask: torch.Tensor | None = None,
         return_controller_logits: bool = False,
         return_memory_meta: bool = False,
         initial_states: list[torch.Tensor] | None = None,
@@ -1135,6 +1136,12 @@ class ChaosStudentLM(nn.Module):
         gate.  With ``enable_controller=False`` the default ``"controller"``
         path is intentionally bit-identical to the old full-strength memory
         path.
+
+        ``memory_slot_mask`` optionally provides a per-sample physical-slot
+        mask for rank-3 maintenance probes. It is ignored when
+        ``memory_mode='off'`` and lets the sidecar oracle evaluate
+        ``[baseline, no-sidecar, hide-slot-i]`` variants as one expanded
+        batch without changing train-rank trunk execution.
 
         Side effects: none. Unlike ``forward()`` this path never
         performs memory writes (those live in ``forward()`` after
@@ -1204,6 +1211,15 @@ class ChaosStudentLM(nn.Module):
         if self.wernicke is not None:
             x, bucket_ids, _balance_loss = self.wernicke(x)
 
+        if isinstance(self.outer_model, MultiSlotOuterModel) and self.cue_projection:
+            # Rank-3 sidecar maintenance needs the same pre-SSM cue used by
+            # real memory reads.  Stashing this tensor makes the cheap
+            # saliency map falsifiable against the full oracle path without
+            # forcing train ranks to observe any sidecar state.
+            self._last_outer_cue = x.detach().mean(dim=1)
+        else:
+            self._last_outer_cue = None
+
         # Buffer read path (mirrors forward() body 1-for-1 for the configs
         # that wire an outer_model). For bare-SSM both branches are skipped
         # because ``self.outer_model`` is None.
@@ -1231,6 +1247,7 @@ class ChaosStudentLM(nn.Module):
                         int(mask.sum()), bucket_id=int(b_id.item()),
                         mode=self.retrieval_mode, k=self.retrieval_k, cue=cue,
                         read_cutoff=cache_read_cutoff,
+                        slot_mask=memory_slot_mask[mask] if memory_slot_mask is not None else None,
                     )
                     outer_read[mask] = read.unsqueeze(1).to(dtype=x.dtype)
                 x = _add_memory_bias(x, outer_read)
@@ -1251,6 +1268,7 @@ class ChaosStudentLM(nn.Module):
                     x.size(0),
                     cue=cue,
                     read_cutoff=cache_read_cutoff,
+                    slot_mask=memory_slot_mask,
                 )
             else:
                 outer_read = self.outer_model.read(x.size(0))

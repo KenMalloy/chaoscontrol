@@ -28,6 +28,7 @@ __all__ = [
     "ReplayEvictionLoop",
     "TickResult",
     "counterfactual_probe",
+    "oracle_confirm_slots",
     "replay_score_slots",
     "MaintenancePolicy",
     "_evict_slots",
@@ -64,6 +65,17 @@ class CounterfactualResult:
     weights_baseline: torch.Tensor
     mask: torch.Tensor
     slot_indices: list[int]
+
+
+@dataclass
+class OracleConfirmationResult:
+    """Real-physics batched confirmation for a small candidate set."""
+
+    slot_indices: list[int]
+    oracle_deltas: torch.Tensor
+    nll_baseline: torch.Tensor
+    nll_no_sidecar: torch.Tensor
+    mask: torch.Tensor
 
 
 @dataclass
@@ -104,6 +116,7 @@ def counterfactual_probe(
     outer: Any,
     probe_input_ids: torch.Tensor,
     probe_valid_mask: torch.Tensor,
+    probe_cue: torch.Tensor | None = None,
     cache_read_cutoff: int | None = None,
     chunk_size: int = 16,
 ) -> CounterfactualResult:
@@ -179,7 +192,7 @@ def counterfactual_probe(
         )
 
     with ac:
-        cue = h_base.detach().mean(dim=1)
+        cue = probe_cue.to(device=dev) if probe_cue is not None else h_base.detach().mean(dim=1)
         cue_outer = cue_proj(cue.to(dtype=cue_proj.weight.dtype))
         sim = cue_outer @ slot_mat.to(dtype=cue_outer.dtype).T
 
@@ -250,6 +263,81 @@ def counterfactual_probe(
         weights_baseline=weights_baseline.cpu(),
         mask=mask.cpu(),
         slot_indices=vis,
+    )
+
+
+@torch.inference_mode()
+def oracle_confirm_slots(
+    *,
+    model: Any,
+    outer: Any,
+    probe_input_ids: torch.Tensor,
+    probe_valid_mask: torch.Tensor,
+    slot_indices: list[int],
+    cache_read_cutoff: int | None = None,
+) -> OracleConfirmationResult:
+    """Confirm candidate slots with real memory-injected SSM dynamics.
+
+    This is the "ripple" pass: one expanded batch evaluates baseline,
+    no-sidecar, and hide-one variants using ``model.encode(...,
+    memory_mode='force_on')``.  The cheap counterfactual map proposes
+    candidate slots; this function measures their effect under the real
+    pre-SSM injection path.
+    """
+    x = probe_input_ids[:, :-1]
+    y = probe_input_ids[:, 1:]
+    mask = probe_valid_mask[:, 1:].bool()
+    B, T = x.shape
+    dev = x.device
+
+    table = getattr(outer, "table", None)
+    n_slots = len(table) if table is not None else len(getattr(outer, "_slots", []))
+    candidates = [
+        int(i)
+        for i in dict.fromkeys(slot_indices)
+        if 0 <= int(i) < int(n_slots)
+    ]
+    if n_slots <= 0 or not candidates:
+        empty = torch.zeros(0, B, T, device=dev)
+        return OracleConfirmationResult(
+            slot_indices=[],
+            oracle_deltas=empty,
+            nll_baseline=torch.zeros(B, T, device=dev),
+            nll_no_sidecar=torch.zeros(B, T, device=dev),
+            mask=mask,
+        )
+
+    variants = len(candidates) + 2
+    slot_masks = torch.ones(variants, n_slots, device=dev, dtype=torch.bool)
+    slot_masks[1, :] = False
+    for row, phys_idx in enumerate(candidates, start=2):
+        slot_masks[row, phys_idx] = False
+
+    x_exp = x.unsqueeze(0).expand(variants, -1, -1).reshape(variants * B, T)
+    y_exp = y.unsqueeze(0).expand(variants, -1, -1).reshape(variants * B, T)
+    slot_masks_exp = (
+        slot_masks[:, None, :]
+        .expand(variants, B, n_slots)
+        .reshape(variants * B, n_slots)
+    )
+
+    with torch.autocast(dev.type, dtype=torch.bfloat16) if dev.type == "cuda" else torch.autocast("cpu", dtype=torch.bfloat16):
+        hidden = model.encode(
+            x_exp,
+            memory_mode="force_on",
+            cache_read_cutoff=cache_read_cutoff,
+            memory_slot_mask=slot_masks_exp,
+        )
+    nll = chunked_nll_from_hidden(model, hidden, y_exp).reshape(variants, B, T)
+    nll_baseline = nll[0]
+    nll_no_sidecar = nll[1]
+    oracle_deltas = nll[2:] - nll_baseline.unsqueeze(0)
+    return OracleConfirmationResult(
+        slot_indices=candidates,
+        oracle_deltas=oracle_deltas.cpu(),
+        nll_baseline=nll_baseline.cpu(),
+        nll_no_sidecar=nll_no_sidecar.cpu(),
+        mask=mask.cpu(),
     )
 
 
@@ -407,6 +495,7 @@ class ReplayEvictionLoop:
         trace_path: str | None = None,
         trace_max_rows: int = 0,
         probe_chunk_size: int = 16,
+        oracle_confirm_top_k: int = 32,
         drift_threshold: float = 0.3,
         repr_drift_threshold: float = 0.2,
         refresh_lr: float = 0.1,
@@ -427,6 +516,7 @@ class ReplayEvictionLoop:
         self._min_age = int(min_slot_age_steps)
         self._max_seconds = float(max_seconds_per_tick)
         self._probe_chunk_size = int(probe_chunk_size)
+        self._oracle_confirm_top_k = max(0, int(oracle_confirm_top_k))
         self._drift_threshold = float(drift_threshold)
         self._repr_drift_threshold = float(repr_drift_threshold)
         self._refresh_lr = float(refresh_lr)
@@ -446,6 +536,7 @@ class ReplayEvictionLoop:
         # Probe cache
         self._probe_input_ids: torch.Tensor | None = None
         self._probe_valid_mask: torch.Tensor | None = None
+        self._probe_cue: torch.Tensor | None = None
         self._probe_cache_cutoff: int | None = None
         self._probe_step: int = 0
         self._probe_stream_id: int = 0
@@ -462,6 +553,15 @@ class ReplayEvictionLoop:
         self._last_slots_tracked: int = 0
         self._shadow_actions_total: int = 0
         self._shadow_action_counts: dict[str, int] = {}
+        self._oracle_confirmations_total: int = 0
+        self._oracle_confirmed_actions_total: int = 0
+        self._oracle_rejected_actions_total: int = 0
+        self._proxy_oracle_sign_matches: int = 0
+        self._proxy_oracle_pairs_total: int = 0
+        self._proxy_oracle_abs_error_sum: float = 0.0
+        self._last_proxy_oracle_sign_match_rate: float = 0.0
+        self._last_proxy_oracle_abs_error: float = 0.0
+        self._last_oracle_candidates: int = 0
 
         # Quarantine tracking (by slot_id when using SlotTable, by index otherwise)
         self._quarantined: set[int] = set()
@@ -481,12 +581,14 @@ class ReplayEvictionLoop:
         *,
         input_ids: torch.Tensor,
         valid_mask: torch.Tensor,
+        cue: torch.Tensor | None = None,
         cache_read_cutoff: int | None,
         step: int,
         stream_id: int = 0,
     ) -> None:
         self._probe_input_ids = input_ids.detach()
         self._probe_valid_mask = valid_mask.detach()
+        self._probe_cue = None if cue is None else cue.detach()
         self._probe_cache_cutoff = cache_read_cutoff
         self._probe_step = step
         self._probe_stream_id = int(stream_id) % self._memory_streams
@@ -512,6 +614,7 @@ class ReplayEvictionLoop:
             outer=outer,
             probe_input_ids=self._probe_input_ids,
             probe_valid_mask=self._probe_valid_mask,
+            probe_cue=self._probe_cue,
             cache_read_cutoff=self._probe_cache_cutoff,
             chunk_size=self._probe_chunk_size,
         )
@@ -607,21 +710,24 @@ class ReplayEvictionLoop:
         # mutates the table.  This lets CRCT vs CRCT+maintenance be measured
         # without conflating the first run with a new controller.
         if self._action_mode == "shadow":
-            self._classify_shadow(outer=outer, step=step, cf=cf)
+            self._classify_shadow(model=model, outer=outer, step=step, cf=cf, t0=t0)
             return TickResult()
 
         result = self._classify_and_act(
             model=model, outer=outer, step=step, cf=cf,
             slot_marginals=slot_marginals, sharpness_per_slot=sharpness_per_slot,
+            t0=t0,
         )
         return result
 
     def _classify_shadow(
         self,
         *,
+        model: Any,
         outer: Any,
         step: int,
         cf: CounterfactualResult,
+        t0: float,
     ) -> None:
         table = getattr(outer, "table", None)
         if table is None:
@@ -635,6 +741,7 @@ class ReplayEvictionLoop:
             min_age=self._min_age,
             min_score_count=self._min_score_count,
         )
+        actions: dict[int, str] = {}
         for phys_idx in cf.slot_indices:
             sid = table.physical_to_slot_id(phys_idx)
             if sid is None:
@@ -643,6 +750,15 @@ class ReplayEvictionLoop:
             if rec is None:
                 continue
             action = self._policy.choose(rec, **policy_kwargs)
+            actions[sid] = action
+        confirmations = self._confirm_actions_with_oracle(
+            model=model, outer=outer, actions=actions, cf=cf, t0=t0
+        )
+        for sid, action in actions.items():
+            rec = table.record(sid)
+            if rec is None:
+                continue
+            confirmed = confirmations.get(sid, action == SLOT_PRESERVE)
             self._shadow_actions_total += 1
             self._shadow_action_counts[action] = (
                 self._shadow_action_counts.get(action, 0) + 1
@@ -652,9 +768,142 @@ class ReplayEvictionLoop:
                 sid,
                 action,
                 rec,
-                accepted=False,
-                reason="shadow",
+                accepted=confirmed,
+                reason="shadow_confirmed" if confirmed else "shadow_oracle_rejected",
             )
+
+    def _budget_exhausted(self, t0: float) -> bool:
+        return (time.monotonic() - t0) > self._max_seconds
+
+    def _confirm_actions_with_oracle(
+        self,
+        *,
+        model: Any,
+        outer: Any,
+        actions: dict[int, str],
+        cf: CounterfactualResult,
+        t0: float,
+    ) -> dict[int, bool]:
+        """Use one batched real-encode oracle pass to confirm actions.
+
+        The proxy saliency map can rank all slots cheaply.  Active mutations
+        still need real SSM dynamics, so this confirms the top physical slots
+        with ``oracle_confirm_slots`` and records proxy/oracle disagreement.
+        """
+        table = getattr(outer, "table", None)
+        if (
+            table is None
+            or self._oracle_confirm_top_k <= 0
+            or self._probe_input_ids is None
+            or self._probe_valid_mask is None
+            or self._budget_exhausted(t0)
+        ):
+            return {}
+
+        needs_oracle = {
+            SLOT_DECAY,
+            SLOT_EVICT,
+            SLOT_REFRESH,
+            SLOT_QUARANTINE,
+            SLOT_DISTILL,
+        }
+        candidate_pairs: list[tuple[int, int, str, float]] = []
+        for sid, action in actions.items():
+            if action not in needs_oracle:
+                continue
+            phys = table.slot_id_to_physical(sid)
+            if phys is None:
+                continue
+            proxy_score = self._slot_mean_marginal(phys, cf)
+            candidate_pairs.append((sid, phys, action, proxy_score))
+        if not candidate_pairs:
+            return {}
+
+        candidate_pairs.sort(key=lambda row: abs(row[3]), reverse=True)
+        candidate_pairs = candidate_pairs[: self._oracle_confirm_top_k]
+        oracle = oracle_confirm_slots(
+            model=model,
+            outer=outer,
+            probe_input_ids=self._probe_input_ids,
+            probe_valid_mask=self._probe_valid_mask,
+            slot_indices=[phys for _sid, phys, _action, _proxy in candidate_pairs],
+            cache_read_cutoff=self._probe_cache_cutoff,
+        )
+        self._last_oracle_candidates = len(oracle.slot_indices)
+        if not oracle.slot_indices:
+            return {}
+
+        mask_f = oracle.mask.float()
+        denom = mask_f.sum().clamp(min=1.0)
+        oracle_by_phys: dict[int, float] = {}
+        for local_idx, phys in enumerate(oracle.slot_indices):
+            if local_idx >= oracle.oracle_deltas.shape[0]:
+                continue
+            delta = (oracle.oracle_deltas[local_idx] * mask_f).sum() / denom
+            oracle_by_phys[int(phys)] = float(delta.item())
+
+        confirmations: dict[int, bool] = {}
+        sign_matches = 0
+        abs_error_sum = 0.0
+        n_pairs = 0
+        for sid, phys, action, proxy_score in candidate_pairs:
+            if phys not in oracle_by_phys:
+                continue
+            oracle_score = oracle_by_phys[phys]
+            confirmed = self._action_confirmed(
+                action=action,
+                proxy_score=proxy_score,
+                oracle_score=oracle_score,
+            )
+            confirmations[sid] = confirmed
+            n_pairs += 1
+            if (proxy_score >= 0.0) == (oracle_score >= 0.0):
+                sign_matches += 1
+            abs_error_sum += abs(proxy_score - oracle_score)
+            if confirmed:
+                self._oracle_confirmed_actions_total += 1
+            else:
+                self._oracle_rejected_actions_total += 1
+
+            rec = table.record(sid)
+            self._trace_oracle_event(
+                step=self._probe_step,
+                slot_id=sid,
+                action=action,
+                rec=rec,
+                proxy_score=proxy_score,
+                oracle_score=oracle_score,
+                confirmed=confirmed,
+            )
+
+        if n_pairs:
+            self._oracle_confirmations_total += n_pairs
+            self._proxy_oracle_sign_matches += sign_matches
+            self._proxy_oracle_pairs_total += n_pairs
+            self._proxy_oracle_abs_error_sum += abs_error_sum
+            self._last_proxy_oracle_sign_match_rate = sign_matches / n_pairs
+            self._last_proxy_oracle_abs_error = abs_error_sum / n_pairs
+        return confirmations
+
+    def _action_confirmed(
+        self,
+        *,
+        action: str,
+        proxy_score: float,
+        oracle_score: float,
+    ) -> bool:
+        """Decide whether the oracle supports a proxy-proposed action."""
+        del proxy_score
+        low_value = oracle_score <= max(self._threshold, self._useful_threshold)
+        if action in {SLOT_EVICT, SLOT_QUARANTINE}:
+            return low_value
+        if action == SLOT_DECAY:
+            return oracle_score <= max(2.0 * self._threshold, self._useful_threshold)
+        if action == SLOT_DISTILL:
+            return low_value and oracle_score >= self._quarantine_threshold
+        if action == SLOT_REFRESH:
+            return oracle_score > self._useful_threshold
+        return True
 
     def _classify_and_act(
         self,
@@ -665,6 +914,7 @@ class ReplayEvictionLoop:
         cf: CounterfactualResult,
         slot_marginals: list[float],
         sharpness_per_slot: torch.Tensor,
+        t0: float,
     ) -> TickResult:
         table = getattr(outer, "table", None)
         has_table = table is not None
@@ -709,26 +959,50 @@ class ReplayEvictionLoop:
                 action = self._policy.choose(rec, **policy_kwargs)
                 actions[sid] = action
 
+            confirmations = self._confirm_actions_with_oracle(
+                model=model, outer=outer, actions=actions, cf=cf, t0=t0
+            )
+
             # Execute non-structural actions first (refresh, quarantine, decay)
             for sid, action in actions.items():
+                if self._budget_exhausted(t0):
+                    break
                 rec = table.record(sid)
                 if rec is None:
                     continue
+                confirmed = confirmations.get(sid, action == SLOT_PRESERVE)
                 if action == SLOT_REFRESH:
-                    accepted = self._execute_refresh(model, outer, sid, cf)
+                    accepted = False
+                    if confirmed:
+                        accepted = self._execute_refresh(model, outer, sid, cf, t0=t0)
                     if accepted:
                         result.refreshed.append(sid)
                         self._refreshes_total += 1
                         rec.refresh_count += 1
                         rec.state = SLOT_ACTIVE
                     rec.last_action = action
-                    self._trace_event(step, sid, action, rec, accepted=accepted)
+                    reason = "" if confirmed else "oracle_rejected"
+                    self._trace_event(step, sid, action, rec, accepted=accepted, reason=reason)
                 elif action == SLOT_QUARANTINE:
+                    if not confirmed:
+                        rec.last_action = action
+                        self._trace_event(
+                            step, sid, action, rec,
+                            accepted=False, reason="oracle_rejected",
+                        )
+                        continue
                     self._execute_quarantine(outer, sid)
                     result.quarantined.append(sid)
                     rec.last_action = action
                     self._trace_event(step, sid, action, rec)
                 elif action == SLOT_DECAY:
+                    if not confirmed:
+                        rec.last_action = action
+                        self._trace_event(
+                            step, sid, action, rec,
+                            accepted=False, reason="oracle_rejected",
+                        )
+                        continue
                     self._execute_decay(outer, sid)
                     result.decayed.append(sid)
                     self._decays_total += 1
@@ -749,7 +1023,17 @@ class ReplayEvictionLoop:
                     retire_ids.append((sid, action))
 
             for sid, action in retire_ids:
+                if self._budget_exhausted(t0):
+                    break
                 rec = table.record(sid)
+                if not confirmations.get(sid, False):
+                    self._trace_event(
+                        step, sid, action, rec,
+                        accepted=False, reason="oracle_rejected",
+                    )
+                    if rec:
+                        rec.last_action = action
+                    continue
                 if action == SLOT_DISTILL:
                     receipt = self._execute_distill(outer, sid, step)
                     result.distilled.append(sid)
@@ -770,7 +1054,13 @@ class ReplayEvictionLoop:
         return result
 
     def _execute_refresh(
-        self, model: Any, outer: Any, slot_id: int, cf: CounterfactualResult
+        self,
+        model: Any,
+        outer: Any,
+        slot_id: int,
+        cf: CounterfactualResult,
+        *,
+        t0: float,
     ) -> bool:
         table = getattr(outer, "table", None)
         if table is None:
@@ -829,6 +1119,8 @@ class ReplayEvictionLoop:
         baseline_score = self._slot_mean_marginal(phys, cf)
 
         for name, tensor in candidates[1:]:
+            if self._budget_exhausted(t0):
+                break
             table.replace_tensor(slot_id, tensor)
             if self._probe_input_ids is None or self._probe_valid_mask is None:
                 table.replace_tensor(slot_id, identity_tensor)
@@ -900,9 +1192,7 @@ class ReplayEvictionLoop:
     def _execute_decay(self, outer: Any, slot_id: int) -> None:
         table = getattr(outer, "table", None)
         if table is not None:
-            phys = table.slot_id_to_physical(slot_id)
-            if phys is not None and phys < len(table._survival):
-                table._survival[phys] *= 0.9
+            table.scale_survival(slot_id, 0.9)
 
     def _execute_distill(
         self, outer: Any, slot_id: int, step: int
@@ -1025,6 +1315,51 @@ class ReplayEvictionLoop:
         self._trace_buffer.append(json.dumps(event, separators=(",", ":")) + "\n")
         self._trace_rows_written += 1
 
+    def _trace_oracle_event(
+        self,
+        *,
+        step: int,
+        slot_id: int,
+        action: str,
+        rec: SlotRecord | None,
+        proxy_score: float,
+        oracle_score: float,
+        confirmed: bool,
+    ) -> None:
+        if self._trace_path is None:
+            return
+        if self._trace_max_rows > 0 and self._trace_rows_written >= self._trace_max_rows:
+            return
+        event = {
+            "row_type": "replay_oracle_confirm",
+            "step": int(step),
+            "tick": self._tick_count,
+            "slot_id": int(slot_id),
+            "action": action,
+            "proxy_score": float(proxy_score),
+            "oracle_score": float(oracle_score),
+            "proxy_oracle_abs_error": float(abs(proxy_score - oracle_score)),
+            "proxy_oracle_sign_match": bool(
+                (proxy_score >= 0.0) == (oracle_score >= 0.0)
+            ),
+            "oracle_confirmed": bool(confirmed),
+        }
+        if rec is not None:
+            event.update(
+                {
+                    "marginal_gain": rec.marginal_gain_ema,
+                    "sharpness": rec.sharpness_ema,
+                    "activation_drift": rec.activation_drift_ema,
+                    "representation_drift": rec.representation_drift_ema,
+                    "semantic_drift": rec.semantic_drift_ema,
+                    "contradiction": rec.contradiction_ema,
+                    "retrieval_mass": rec.retrieval_mass_ema,
+                    "state": rec.state,
+                }
+            )
+        self._trace_buffer.append(json.dumps(event, separators=(",", ":")) + "\n")
+        self._trace_rows_written += 1
+
     def flush_trace(self) -> None:
         if self._trace_path is None or not self._trace_buffer:
             return
@@ -1042,6 +1377,9 @@ class ReplayEvictionLoop:
             "enabled": True,
             "action_mode": self._action_mode,
             "memory_streams": self._memory_streams,
+            "memory_streams_requested": self._memory_streams,
+            "memory_streams_active": False,
+            "memory_streams_note": "logical stream ids only; parallel stream fanout is not active",
             "tick_count": self._tick_count,
             "replays_total": self._replays_total,
             "evictions_total": self._evictions_total,
@@ -1055,6 +1393,24 @@ class ReplayEvictionLoop:
             else len(self._slot_utility_ema),
             "shadow_actions_total": self._shadow_actions_total,
             "shadow_action_counts": dict(self._shadow_action_counts),
+            "oracle_confirm_top_k": self._oracle_confirm_top_k,
+            "oracle_confirmations_total": self._oracle_confirmations_total,
+            "oracle_confirmed_actions_total": self._oracle_confirmed_actions_total,
+            "oracle_rejected_actions_total": self._oracle_rejected_actions_total,
+            "proxy_oracle_pairs_total": self._proxy_oracle_pairs_total,
+            "proxy_oracle_sign_match_rate_total": (
+                self._proxy_oracle_sign_matches / self._proxy_oracle_pairs_total
+                if self._proxy_oracle_pairs_total
+                else 0.0
+            ),
+            "proxy_oracle_abs_error_mean": (
+                self._proxy_oracle_abs_error_sum / self._proxy_oracle_pairs_total
+                if self._proxy_oracle_pairs_total
+                else 0.0
+            ),
+            "last_proxy_oracle_sign_match_rate": self._last_proxy_oracle_sign_match_rate,
+            "last_proxy_oracle_abs_error": self._last_proxy_oracle_abs_error,
+            "last_oracle_candidates": self._last_oracle_candidates,
             "quarantined_count": len(self._quarantined),
             "eviction_threshold": self._threshold,
             "has_probe": self.has_probe(),

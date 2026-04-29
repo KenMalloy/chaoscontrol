@@ -101,7 +101,10 @@ def test_replay_eviction_probe_tracks_latest_rank3_teacher_batch() -> None:
     )
     assert mod._crct_replay_cache_probe(loop, model, 10) is True
     assert loop._probe_step == 10
+    assert loop._probe_cue is not None
     first_probe = loop._probe_input_ids.clone()
+    first_cue = loop._probe_cue.clone()
+    assert mod._crct_replay_cache_probe(loop, model, 10) is False
 
     inputs_2 = ((torch.arange(16).reshape(2, 8) + 7) % 32).to(torch.int32)
     targets_2 = ((torch.arange(16).reshape(2, 8) + 11) % 32).to(torch.long)
@@ -123,6 +126,8 @@ def test_replay_eviction_probe_tracks_latest_rank3_teacher_batch() -> None:
     assert mod._crct_replay_cache_probe(loop, model, 20) is True
     assert loop._probe_step == 20
     assert not torch.equal(loop._probe_input_ids, first_probe)
+    assert loop._probe_cue is not None
+    assert not torch.equal(loop._probe_cue, first_cue)
 
 
 def _pick_free_port_or_skip() -> int:

@@ -1,6 +1,8 @@
 """Tests for the Adaptive Residual Memory control plane."""
 from __future__ import annotations
 
+import time
+
 import torch
 import torch.nn as nn
 
@@ -8,7 +10,7 @@ import pytest
 
 from chaoscontrol.replay_eviction import (
     ReplayEvictionLoop, TickResult, MaintenancePolicy,
-    counterfactual_probe, replay_score_slots, _evict_slots,
+    counterfactual_probe, oracle_confirm_slots, replay_score_slots, _evict_slots,
     _compute_per_slot_sharpness, _compute_representation_drift,
     CounterfactualResult, DistillReceipt, MemoryEvent,
     SLOT_PRESERVE, SLOT_DECAY, SLOT_EVICT, SLOT_REFRESH,
@@ -81,8 +83,14 @@ class _StubModel(nn.Module):
         self._memory_benefit = memory_benefit
 
     def encode(
-        self, input_ids: torch.Tensor, *, memory_mode: str = "off", cache_read_cutoff=None
+        self,
+        input_ids: torch.Tensor,
+        *,
+        memory_mode: str = "off",
+        cache_read_cutoff=None,
+        memory_slot_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        del memory_slot_mask
         batch, seq = input_ids.shape
         base = torch.randn(batch, seq, self.dim) * 0.1
         if memory_mode == "force_on" and self.outer_model is not None:
@@ -295,6 +303,10 @@ class TestReplayEvictionLoop:
         assert "quarantined_count" in diag
         assert diag["tick_count"] == 0
         assert diag["memory_streams"] == 8
+        assert diag["memory_streams_requested"] == 8
+        assert diag["memory_streams_active"] is False
+        assert "oracle_confirmations_total" in diag
+        assert "proxy_oracle_abs_error_mean" in diag
 
     def test_ema_smoothing(self):
         loop = ReplayEvictionLoop(eviction_ema_beta=0.9)
@@ -336,6 +348,20 @@ class TestReplayEvictionLoop:
         assert loop._quick_refresh_score(None, 3, cf) == pytest.approx(2.0)
         assert loop._quick_refresh_score(None, 4, cf) == pytest.approx(0.0)
 
+    def test_cache_probe_stores_real_read_cue(self):
+        loop = ReplayEvictionLoop()
+        ids = torch.zeros(2, 17, dtype=torch.long)
+        mask = torch.ones(2, 17)
+        cue = torch.randn(2, 16)
+        loop.cache_probe(
+            input_ids=ids,
+            valid_mask=mask,
+            cue=cue,
+            cache_read_cutoff=None,
+            step=7,
+        )
+        assert torch.equal(loop._probe_cue, cue)
+
 
 # ---------------------------------------------------------------------------
 # Tests for counterfactual probe
@@ -366,6 +392,40 @@ class TestCounterfactualProbe:
             probe_input_ids=input_ids, probe_valid_mask=valid_mask,
         )
         assert len(result.slot_indices) == 0
+
+
+class TestOracleConfirmation:
+    def test_batched_oracle_uses_one_encode_with_slot_masks(self):
+        model = _StubModel(n_slots=4, memory_benefit=0.25, use_table=True)
+        original_encode = model.encode
+        seen_masks: list[torch.Tensor] = []
+
+        def counted_encode(input_ids: torch.Tensor, **kwargs):
+            mask = kwargs.get("memory_slot_mask")
+            assert mask is not None
+            seen_masks.append(mask.detach().clone())
+            return original_encode(input_ids, **kwargs)
+
+        model.encode = counted_encode  # type: ignore[method-assign]
+        input_ids = torch.randint(0, 32, (2, 17))
+        valid_mask = torch.ones(2, 17)
+        result = oracle_confirm_slots(
+            model=model,
+            outer=model.outer_model,
+            probe_input_ids=input_ids,
+            probe_valid_mask=valid_mask,
+            slot_indices=[0, 2],
+        )
+        assert result.slot_indices == [0, 2]
+        assert result.oracle_deltas.shape[0] == 2
+        assert len(seen_masks) == 1
+        mask = seen_masks[0]
+        assert mask.shape == (8, 4)  # (baseline, off, hide0, hide2) x batch
+        assert mask[0:2].all()
+        assert not mask[2:4].any()
+        assert not mask[4:6, 0].any()
+        assert mask[4:6, 1:].all()
+        assert not mask[6:8, 2].any()
 
 
 # ---------------------------------------------------------------------------
@@ -535,6 +595,40 @@ class TestSlotTableTick:
         diag = loop.diagnostics()
         assert diag["action_mode"] == "shadow"
         assert diag["shadow_actions_total"] > 0
+
+    def test_oracle_rejection_blocks_active_mutation(self):
+        loop = ReplayEvictionLoop(action_mode="active", min_slot_age_steps=0)
+        model = _StubModel(n_slots=1, memory_benefit=0.0, use_table=True)
+        table = model.outer_model.table
+        sid = table.active_slot_ids()[0]
+        rec = table.record(sid)
+        rec.score_count = 3
+        rec.utility_ema = -1.0
+        rec.marginal_gain_ema = -1.0
+        rec.contradiction_ema = 1.0
+        rec.negative_streak = 3
+        cf = CounterfactualResult(
+            marginal_gains=torch.zeros(1, 1, 2),
+            sidecar_value=torch.zeros(1, 2),
+            nll_baseline=torch.zeros(1, 2),
+            nll_no_sidecar=torch.zeros(1, 2),
+            weights_baseline=torch.ones(1, 1),
+            mask=torch.ones(1, 2, dtype=torch.bool),
+            slot_indices=[0],
+        )
+        loop._confirm_actions_with_oracle = lambda **_kwargs: {sid: False}  # type: ignore[method-assign]
+        result = loop._classify_and_act(
+            model=model,
+            outer=model.outer_model,
+            step=200,
+            cf=cf,
+            slot_marginals=[-1.0],
+            sharpness_per_slot=torch.zeros(1),
+            t0=time.monotonic(),
+        )
+        assert result.evicted_indices == []
+        assert table.active_slot_ids() == [sid]
+        assert sid not in loop._quarantined
 
 
 class TestDistillReceipt:

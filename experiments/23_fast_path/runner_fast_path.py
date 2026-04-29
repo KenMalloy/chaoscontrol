@@ -1011,8 +1011,6 @@ def _crct_replay_cache_probe(
         return False
     probe_ids = getattr(model, "_last_crct_probe_input_ids", None)
     if probe_ids is None:
-        probe_ids = getattr(model, "_last_input_ids", None)
-    if probe_ids is None:
         return False
     probe_step = int(getattr(model, "_last_crct_probe_step", step))
     if loop.has_probe() and int(getattr(loop, "_probe_step", -1)) == probe_step:
@@ -1020,9 +1018,11 @@ def _crct_replay_cache_probe(
     valid_mask = getattr(model, "_last_crct_probe_valid_mask", None)
     if valid_mask is None:
         valid_mask = torch.ones_like(probe_ids, dtype=torch.bool)
+    probe_cue = getattr(model, "_last_crct_probe_outer_cue", None)
     loop.cache_probe(
         input_ids=probe_ids,
         valid_mask=valid_mask,
+        cue=probe_cue,
         cache_read_cutoff=None,
         step=probe_step,
         stream_id=probe_step,
@@ -1070,6 +1070,9 @@ def _crct_score_payload_inline(
         gradient_conflict_monitor=gradient_conflict_monitor,
         step=int(step),
     )
+    outer_cue = getattr(model, "_last_outer_cue", None)
+    if outer_cue is not None:
+        setattr(model, "_last_crct_probe_outer_cue", outer_cue.detach())
     if scarcity_optimizer is not None:
         target = score["controller_target"]
         mask = _crct_valid_mask(input_ids)[:, 1:].to(device=target.device)
@@ -6787,6 +6790,7 @@ def train_fast_for_budget(
     replay_eviction_trace_path: str = "",
     replay_eviction_trace_max_rows: int = 0,
     replay_eviction_probe_chunk_size: int = 16,
+    replay_eviction_oracle_confirm_top_k: int = 32,
     replay_eviction_drift_threshold: float = 0.3,
     replay_eviction_repr_drift_threshold: float = 0.2,
     replay_eviction_refresh_lr: float = 0.1,
@@ -7444,6 +7448,7 @@ def train_fast_for_budget(
             trace_path=str(replay_eviction_trace_path) or None,
             trace_max_rows=int(replay_eviction_trace_max_rows),
             probe_chunk_size=int(replay_eviction_probe_chunk_size),
+            oracle_confirm_top_k=int(replay_eviction_oracle_confirm_top_k),
             drift_threshold=float(replay_eviction_drift_threshold),
             repr_drift_threshold=float(replay_eviction_repr_drift_threshold),
             refresh_lr=float(replay_eviction_refresh_lr),
@@ -8235,10 +8240,10 @@ def train_fast_for_budget(
             # Replay-eviction: rank-3 idle maintenance tick.
             # Uses the most recent teacher scoring batch as probe data.
             if replay_eviction_loop is not None and rank_ == world_size_ - 1:
-                _crct_replay_cache_probe(replay_eviction_loop, model, steps)
-                tick_result = replay_eviction_loop.tick(model=model, step=steps)
-                if tick_result.evicted_indices:
-                    replay_eviction_loop.flush_trace()
+                if _crct_replay_cache_probe(replay_eviction_loop, model, steps):
+                    tick_result = replay_eviction_loop.tick(model=model, step=steps)
+                    if tick_result.evicted_indices:
+                        replay_eviction_loop.flush_trace()
             # Phase B5: deferred post-step CE pair pass on the episodic
             # rank. The in-step drain stages each successful replay and
             # the just-emitted REPLAY_OUTCOME dict; this call runs a
@@ -8937,6 +8942,9 @@ def _warmup(
         replay_eviction_trace_path=str(config.get("replay_eviction_trace_path", "")),
         replay_eviction_trace_max_rows=int(config.get("replay_eviction_trace_max_rows", 0)),
         replay_eviction_probe_chunk_size=int(config.get("replay_eviction_probe_chunk_size", 16)),
+        replay_eviction_oracle_confirm_top_k=int(
+            config.get("replay_eviction_oracle_confirm_top_k", 32)
+        ),
         replay_eviction_drift_threshold=float(config.get("replay_eviction_drift_threshold", 0.3)),
         replay_eviction_repr_drift_threshold=float(config.get("replay_eviction_repr_drift_threshold", 0.2)),
         replay_eviction_refresh_lr=float(config.get("replay_eviction_refresh_lr", 0.1)),
@@ -9470,6 +9478,9 @@ def run_condition(
         replay_eviction_trace_path=str(config.get("replay_eviction_trace_path", "")),
         replay_eviction_trace_max_rows=int(config.get("replay_eviction_trace_max_rows", 0)),
         replay_eviction_probe_chunk_size=int(config.get("replay_eviction_probe_chunk_size", 16)),
+        replay_eviction_oracle_confirm_top_k=int(
+            config.get("replay_eviction_oracle_confirm_top_k", 32)
+        ),
         replay_eviction_drift_threshold=float(config.get("replay_eviction_drift_threshold", 0.3)),
         replay_eviction_repr_drift_threshold=float(config.get("replay_eviction_repr_drift_threshold", 0.2)),
         replay_eviction_refresh_lr=float(config.get("replay_eviction_refresh_lr", 0.1)),

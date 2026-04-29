@@ -131,6 +131,21 @@ class TestMultiSlotOuterModel(unittest.TestCase):
         read2 = om.read(1, cue=h2)
         assert not torch.allclose(read1, read2, atol=1e-3)
 
+    def test_read_slot_mask_is_per_sample(self) -> None:
+        om = MultiSlotOuterModel(model_dim=4, outer_dim=4, max_slots=8)
+        with torch.no_grad():
+            om.decoder.weight.copy_(torch.eye(4))
+            om.cue_proj.weight.copy_(torch.eye(4))
+        s0 = torch.tensor([[1.0, 0.0, 0.0, 0.0]])
+        s1 = torch.tensor([[0.0, 1.0, 0.0, 0.0]])
+        om.table.append(s0)
+        om.table.append(s1)
+        cue = torch.tensor([[10.0, 0.0, 0.0, 0.0], [0.0, 10.0, 0.0, 0.0]])
+        slot_mask = torch.tensor([[True, False], [False, True]])
+        out = om.read(2, cue=cue, slot_mask=slot_mask)
+        assert torch.allclose(out[0], s0.squeeze(0), atol=1e-3)
+        assert torch.allclose(out[1], s1.squeeze(0), atol=1e-3)
+
     def test_compression_fires_at_capacity(self) -> None:
         om = MultiSlotOuterModel(model_dim=16, outer_dim=32, max_slots=4)
         for _ in range(5):
