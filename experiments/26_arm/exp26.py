@@ -50,6 +50,8 @@ ARM_V1_ARMS: tuple[str, ...] = (
     "arm_e_crct_replay_active_aggressive",
 )
 
+EXP26_MODEL_DIM = 384
+
 
 def _named_entry(
     *,
@@ -69,6 +71,17 @@ def _named_entry(
         }
     )
     return entry
+
+
+def _artifact_size_lock() -> dict[str, Any]:
+    """Artifact-safe trunk size for the 16k-vocab Exp26 headline.
+
+    Local artifact-pipeline sizing on the CRCT+bucket-prototype shape:
+    dim=384 -> 13.71 MB int6/LZMA-preset0; dim=416 -> 15.19 MB; dim=448
+    -> 16.73 MB; dim=512 -> 20.16 MB. 384 is the largest comfortable lock
+    with enough room for trained-weight entropy and artifact metadata drift.
+    """
+    return {"model_dim": EXP26_MODEL_DIM}
 
 
 def _fast_slow_lock() -> dict[str, Any]:
@@ -186,6 +199,7 @@ def build_smoke_matrix(
     and trace-writing breakage. Outputs are isolated under ``smoke/`` so a
     sanity check cannot contaminate calibration thresholds or headline results.
     """
+    size_lock = _artifact_size_lock()
     fast_slow = _fast_slow_lock()
     crct = _crct_lock()
     pipeline = _replay_eviction_pipeline_lock()
@@ -215,6 +229,7 @@ def build_smoke_matrix(
             "arm": arm_name,
             "exp26_mechanism": "arm_v1_smoke",
             "artifact_impact": ARTIFACT_CHANGES_WEIGHTS_ONLY,
+            **size_lock,
             **fast_slow,
             **arm_overrides,
         }
@@ -250,6 +265,7 @@ def build_calibration_matrix(
     analyzer reads those rows and percentile-anchors the headline
     thresholds.
     """
+    size_lock = _artifact_size_lock()
     fast_slow = _fast_slow_lock()
     crct = _crct_lock()
     pipeline = _replay_eviction_pipeline_lock()
@@ -258,6 +274,7 @@ def build_calibration_matrix(
         "arm": "calibration",
         "exp26_mechanism": "arm_v1_calibration",
         "artifact_impact": ARTIFACT_CHANGES_WEIGHTS_ONLY,
+        **size_lock,
         **fast_slow,
         **crct,
         **pipeline,
@@ -356,6 +373,7 @@ def build_arm_v1_matrix(
     manifest is missing.
     """
     manifest = load_manifest(calibration_manifest_path)
+    size_lock = _artifact_size_lock()
     fast_slow = _fast_slow_lock()
     crct = _crct_lock()
     pipeline = _replay_eviction_pipeline_lock()
@@ -394,6 +412,7 @@ def build_arm_v1_matrix(
             "arm": arm_name,
             "exp26_mechanism": "arm_v1",
             "artifact_impact": ARTIFACT_CHANGES_WEIGHTS_ONLY,
+            **size_lock,
             **fast_slow,
             **arm_overrides,
         }

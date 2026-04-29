@@ -6,6 +6,13 @@ focused staged experiment: first run a short runtime smoke, observe signal
 distributions in shadow mode, calibrate thresholds from observed percentiles,
 then run the 5-arm headline matrix.
 
+Exp26 locks the trunk at `model_dim=384`. That is the largest comfortable
+increase over the exp24 `256` lock under the 16 MB artifact budget with the
+16k vocabulary: local artifact-pipeline sizing of the CRCT+bucket-prototype
+shape gives `384 -> 13.71 MB`, `416 -> 15.19 MB`, `448 -> 16.73 MB`, and
+`512 -> 20.16 MB` using the current int6/LZMA path. `384` leaves enough
+headroom for trained-weight entropy and metadata drift; `512` does not fit.
+
 ## Two-stage discipline
 
 **Phase 0 — smoke.** Two short cells, isolated under `smoke/`: locked

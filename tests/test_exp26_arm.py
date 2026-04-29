@@ -40,6 +40,7 @@ def speed_config() -> dict:
     return {
         "lr": 0.064,
         "world_size": 4,
+        "model_dim": 256,
         "seq_len": 512,
         "batch_size": 64,
         "warmup_steps": 10,
@@ -102,9 +103,11 @@ def test_smoke_matrix_two_entries_and_isolated_outputs(exp26, speed_config):
     control = by_arm["smoke_fastslow_control"]
     active = by_arm["smoke_crct_replay_active"]
     assert control["budget_seconds"] == 30.0
+    assert control["model_dim"] == exp26.EXP26_MODEL_DIM == 384
     assert control.get("crct_enabled") is not True
     assert control.get("replay_eviction_enabled") is not True
     assert active["budget_seconds"] == 30.0
+    assert active["model_dim"] == 384
     assert active["crct_enabled"] is True
     assert active["replay_eviction_enabled"] is True
     assert active["replay_eviction_mode"] == "active"
@@ -146,6 +149,7 @@ def test_calibration_matrix_uses_full_arm_pipeline(exp26, speed_config):
     assert len(entries) == 1
     e = entries[0]
     # Pipeline knobs identical to headline lock.
+    assert e["model_dim"] == 384
     assert e["replay_eviction_memory_streams"] == 8
     assert e["replay_eviction_oracle_confirm_top_k"] == 32
     assert e["replay_eviction_probe_buffer_size"] == 32
@@ -298,6 +302,7 @@ def test_arm_v1_matrix_5_arms_x_3_seeds(tmp_path, exp26, speed_config):
     assert len(entries) == 5 * 3
     arms_seen = {e["arm"] for e in entries}
     assert arms_seen == set(exp26.ARM_V1_ARMS)
+    assert {e["model_dim"] for e in entries} == {384}
 
 
 def test_arm_v1_balanced_uses_calibrated_thresholds(tmp_path, exp26, speed_config):
