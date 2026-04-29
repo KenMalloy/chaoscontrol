@@ -1542,11 +1542,19 @@ class ReplayEvictionLoop:
                     continue
                 if action == SLOT_DISTILL:
                     receipt = self._execute_distill(outer, sid, step)
-                    result.distilled.append(sid)
-                    self._distills_total += 1
-                    self._trace_event(
-                        step, sid, action, rec, reason="distilled", extra=extra
-                    )
+                    if receipt.accepted:
+                        result.distilled.append(sid)
+                        self._distills_total += 1
+                        self._trace_event(
+                            step, sid, action, rec, reason="distilled", extra=extra
+                        )
+                    else:
+                        self._trace_event(
+                            step, sid, action, rec,
+                            accepted=False,
+                            reason=f"distill_{receipt.target}_unavailable",
+                            extra=extra,
+                        )
                 else:
                     table.retire(sid, reason="evicted")
                     result.evicted.append(sid)
@@ -1719,21 +1727,29 @@ class ReplayEvictionLoop:
             target="latent_trace",
         )
 
-        # Save to latent traces
-        if table is not None:
-            slot_tensor = table.get_tensor(slot_id)
-            if slot_tensor is not None:
-                latent_traces = getattr(outer, "_latent_traces", None)
-                if latent_traces is not None:
-                    bucket_id = rec.bucket_id if rec else -1
-                    latent_traces.append({
-                        "bucket_id": bucket_id,
-                        "centroid_contrib": slot_tensor.detach().clone(),
-                    })
-                    receipt.target = "latent_trace"
-                    receipt.accepted = True
+        if table is None:
+            receipt.target = "missing_table"
+            return receipt
+        slot_tensor = table.get_tensor(slot_id)
+        if slot_tensor is None:
+            receipt.target = "missing_slot"
+            return receipt
+        latent_traces = getattr(outer, "_latent_traces", None)
+        if latent_traces is None:
+            receipt.target = "missing_latent_trace"
+            return receipt
 
-            table.retire(slot_id, reason="distilled")
+        bucket_id = rec.bucket_id if rec else -1
+        latent_traces.append({
+            "bucket_id": bucket_id,
+            "centroid_contrib": slot_tensor.detach().clone(),
+        })
+        max_latent = int(getattr(outer, "max_slots", 0) or 0)
+        while max_latent > 0 and len(latent_traces) > max_latent:
+            latent_traces.pop(0)
+        receipt.target = "latent_trace"
+        receipt.accepted = True
+        table.retire(slot_id, reason="distilled")
 
         return receipt
 

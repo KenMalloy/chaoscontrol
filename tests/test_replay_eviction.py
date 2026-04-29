@@ -1013,6 +1013,35 @@ class TestSlotTableTick:
         assert table.record(sid).state != SLOT_QUARANTINED
         assert loop.diagnostics()["action_agreements_total"] == 0
 
+    def test_distill_requires_sink_before_retiring_slot(self):
+        loop = ReplayEvictionLoop(action_mode="active")
+        model = _StubModel(n_slots=1, use_table=True)
+        table = model.outer_model.table
+        sid = table.active_slot_ids()[0]
+        delattr(model.outer_model, "_latent_traces")
+
+        receipt = loop._execute_distill(model.outer_model, sid, step=10)
+
+        assert receipt.accepted is False
+        assert receipt.target == "missing_latent_trace"
+        assert table.active_slot_ids() == [sid]
+
+    def test_distill_archives_trace_then_retires_slot(self):
+        loop = ReplayEvictionLoop(action_mode="active")
+        model = _StubModel(n_slots=1, use_table=True)
+        table = model.outer_model.table
+        sid = table.active_slot_ids()[0]
+        rec = table.record(sid)
+        rec.bucket_id = 7
+
+        receipt = loop._execute_distill(model.outer_model, sid, step=10)
+
+        assert receipt.accepted is True
+        assert receipt.target == "latent_trace"
+        assert table.active_slot_ids() == []
+        assert model.outer_model._latent_traces[0]["bucket_id"] == 7
+        assert "centroid_contrib" in model.outer_model._latent_traces[0]
+
     def test_oracle_rejection_blocks_active_mutation(self):
         loop = ReplayEvictionLoop(action_mode="active", min_slot_age_steps=0)
         model = _StubModel(n_slots=1, memory_benefit=0.0, use_table=True)
