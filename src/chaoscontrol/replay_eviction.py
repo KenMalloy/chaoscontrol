@@ -103,6 +103,7 @@ class MemoryEvent:
     contradiction: float = 0.0
     retrieval_mass: float = 0.0
     peak_utility: float = 0.0
+    peak_sharpness: float = 0.0
     score_count: int = 0
     accepted: bool = True
     reason: str = ""
@@ -431,35 +432,64 @@ class MaintenancePolicy:
         drift_threshold: float,
         quarantine_threshold: float,
         distill_peak_threshold: float,
+        peak_preserve_utility_threshold: float,
+        peak_preserve_sharpness_threshold: float,
         min_age: int,
         min_score_count: int,
+        capacity_pressure: bool = False,
     ) -> dict[str, float]:
         enough = rec.score_count >= min_score_count
-        old = (rec.last_scored_step - rec.created_step) >= min_age if rec.last_scored_step > 0 else False
+        old = (
+            (rec.last_scored_step - rec.created_step) >= min_age
+            if rec.last_scored_step > 0
+            else False
+        )
+        converged = enough and old
+        peak_preserve = (
+            rec.peak_utility >= peak_preserve_utility_threshold
+            or rec.peak_sharpness >= peak_preserve_sharpness_threshold
+        )
 
         quarantine_v = 0.0
-        if enough and rec.contradiction_ema > abs(quarantine_threshold):
+        if converged and rec.contradiction_ema > abs(quarantine_threshold):
             quarantine_v = rec.contradiction_ema + 0.5 * rec.negative_streak
 
         distill_v = 0.0
-        if old and enough and rec.peak_utility > distill_peak_threshold:
+        if (
+            converged
+            and not peak_preserve
+            and rec.peak_utility > distill_peak_threshold
+        ):
             internalization = 1.0 - rec.marginal_gain_ema / max(rec.peak_utility, 1e-6)
             if internalization > 0.5 and rec.marginal_gain_ema < 2 * eviction_threshold:
                 distill_v = internalization * rec.peak_utility
 
         evict_v = 0.0
-        if old and enough and rec.utility_ema < eviction_threshold:
-            evict_v = eviction_threshold - rec.utility_ema
+        if (
+            capacity_pressure
+            and converged
+            and not peak_preserve
+            and rec.utility_ema < eviction_threshold
+        ):
+            evict_v = (
+                eviction_threshold - rec.utility_ema
+                + max(0.0, useful_threshold - rec.marginal_gain_ema)
+            )
 
         refresh_v = 0.0
         drift_max = max(rec.activation_drift_ema, rec.representation_drift_ema, rec.semantic_drift_ema)
         if drift_max > drift_threshold and rec.marginal_gain_ema > useful_threshold:
             refresh_v = 0.8 * drift_max + 0.6 * rec.marginal_gain_ema
 
-        preserve_v = rec.marginal_gain_ema + 0.7 * rec.sharpness_ema
+        preserve_v = (
+            rec.marginal_gain_ema
+            + 0.7 * rec.sharpness_ema
+            + 0.25 * rec.peak_utility
+            + 0.25 * rec.peak_sharpness
+        )
 
         decay_v = 0.0
-        if not old and rec.utility_ema < 2 * eviction_threshold:
+        if not capacity_pressure and rec.utility_ema < 2 * eviction_threshold:
             decay_v = 2 * eviction_threshold - rec.utility_ema
 
         return {
@@ -504,6 +534,8 @@ class ReplayEvictionLoop:
         max_quarantined: int = 8,
         quarantine_release_streak: int = 2,
         distill_peak_threshold: float = 0.04,
+        peak_preserve_utility_threshold: float = 0.20,
+        peak_preserve_sharpness_threshold: float = 0.20,
         useful_threshold: float = 0.005,
         min_score_count: int = 2,
     ) -> None:
@@ -525,6 +557,8 @@ class ReplayEvictionLoop:
         self._max_quarantined = int(max_quarantined)
         self._quarantine_release_streak = int(quarantine_release_streak)
         self._distill_peak_threshold = float(distill_peak_threshold)
+        self._peak_preserve_utility_threshold = float(peak_preserve_utility_threshold)
+        self._peak_preserve_sharpness_threshold = float(peak_preserve_sharpness_threshold)
         self._useful_threshold = float(useful_threshold)
         self._min_score_count = int(min_score_count)
 
@@ -595,6 +629,13 @@ class ReplayEvictionLoop:
 
     def has_probe(self) -> bool:
         return self._probe_input_ids is not None
+
+    def _capacity_pressure(self, outer: Any) -> bool:
+        table = getattr(outer, "table", None)
+        max_slots = int(getattr(outer, "max_slots", 0) or 0)
+        if table is None or max_slots <= 0:
+            return False
+        return len(table) >= max_slots
 
     def tick(self, *, model: Any, step: int) -> TickResult:
         """One maintenance tick. Probe, classify, act."""
@@ -678,6 +719,7 @@ class ReplayEvictionLoop:
                 rec.retrieval_mass_ema = beta * rec.retrieval_mass_ema + (1 - beta) * rm
                 rec.contradiction_ema = beta * rec.contradiction_ema + (1 - beta) * max(0.0, -mg)
                 rec.peak_utility = max(rec.peak_utility, rec.utility_ema)
+                rec.peak_sharpness = max(rec.peak_sharpness, rec.sharpness_ema)
                 rec.score_count += 1
                 rec.last_scored_step = step
 
@@ -738,8 +780,11 @@ class ReplayEvictionLoop:
             drift_threshold=self._drift_threshold,
             quarantine_threshold=self._quarantine_threshold,
             distill_peak_threshold=self._distill_peak_threshold,
+            peak_preserve_utility_threshold=self._peak_preserve_utility_threshold,
+            peak_preserve_sharpness_threshold=self._peak_preserve_sharpness_threshold,
             min_age=self._min_age,
             min_score_count=self._min_score_count,
+            capacity_pressure=self._capacity_pressure(outer),
         )
         actions: dict[int, str] = {}
         for phys_idx in cf.slot_indices:
@@ -925,8 +970,11 @@ class ReplayEvictionLoop:
             drift_threshold=self._drift_threshold,
             quarantine_threshold=self._quarantine_threshold,
             distill_peak_threshold=self._distill_peak_threshold,
+            peak_preserve_utility_threshold=self._peak_preserve_utility_threshold,
+            peak_preserve_sharpness_threshold=self._peak_preserve_sharpness_threshold,
             min_age=self._min_age,
             min_score_count=self._min_score_count,
+            capacity_pressure=self._capacity_pressure(outer),
         )
 
         # Collect actions per slot
@@ -1309,6 +1357,7 @@ class ReplayEvictionLoop:
                 "contradiction": rec.contradiction_ema,
                 "retrieval_mass": rec.retrieval_mass_ema,
                 "peak_utility": rec.peak_utility,
+                "peak_sharpness": rec.peak_sharpness,
                 "score_count": rec.score_count,
                 "state": rec.state,
             })
@@ -1354,6 +1403,8 @@ class ReplayEvictionLoop:
                     "semantic_drift": rec.semantic_drift_ema,
                     "contradiction": rec.contradiction_ema,
                     "retrieval_mass": rec.retrieval_mass_ema,
+                    "peak_utility": rec.peak_utility,
+                    "peak_sharpness": rec.peak_sharpness,
                     "state": rec.state,
                 }
             )
@@ -1413,6 +1464,8 @@ class ReplayEvictionLoop:
             "last_oracle_candidates": self._last_oracle_candidates,
             "quarantined_count": len(self._quarantined),
             "eviction_threshold": self._threshold,
+            "peak_preserve_utility_threshold": self._peak_preserve_utility_threshold,
+            "peak_preserve_sharpness_threshold": self._peak_preserve_sharpness_threshold,
             "has_probe": self.has_probe(),
             "probe_step": self._probe_step,
             "probe_stream_id": self._probe_stream_id,

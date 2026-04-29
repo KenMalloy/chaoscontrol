@@ -6799,6 +6799,8 @@ def train_fast_for_budget(
     replay_eviction_max_quarantined: int = 8,
     replay_eviction_quarantine_release_streak: int = 2,
     replay_eviction_distill_peak_threshold: float = 0.04,
+    replay_eviction_peak_preserve_utility_threshold: float = 0.20,
+    replay_eviction_peak_preserve_sharpness_threshold: float = 0.20,
     replay_eviction_useful_threshold: float = 0.005,
     replay_eviction_min_score_count: int = 2,
 ) -> dict[str, Any]:
@@ -7457,6 +7459,12 @@ def train_fast_for_budget(
             max_quarantined=int(replay_eviction_max_quarantined),
             quarantine_release_streak=int(replay_eviction_quarantine_release_streak),
             distill_peak_threshold=float(replay_eviction_distill_peak_threshold),
+            peak_preserve_utility_threshold=float(
+                replay_eviction_peak_preserve_utility_threshold
+            ),
+            peak_preserve_sharpness_threshold=float(
+                replay_eviction_peak_preserve_sharpness_threshold
+            ),
             useful_threshold=float(replay_eviction_useful_threshold),
             min_score_count=int(replay_eviction_min_score_count),
         )
@@ -8953,6 +8961,12 @@ def _warmup(
         replay_eviction_max_quarantined=int(config.get("replay_eviction_max_quarantined", 8)),
         replay_eviction_quarantine_release_streak=int(config.get("replay_eviction_quarantine_release_streak", 2)),
         replay_eviction_distill_peak_threshold=float(config.get("replay_eviction_distill_peak_threshold", 0.04)),
+        replay_eviction_peak_preserve_utility_threshold=float(
+            config.get("replay_eviction_peak_preserve_utility_threshold", 0.20)
+        ),
+        replay_eviction_peak_preserve_sharpness_threshold=float(
+            config.get("replay_eviction_peak_preserve_sharpness_threshold", 0.20)
+        ),
         replay_eviction_useful_threshold=float(config.get("replay_eviction_useful_threshold", 0.005)),
         replay_eviction_min_score_count=int(config.get("replay_eviction_min_score_count", 2)),
     )
@@ -9489,6 +9503,12 @@ def run_condition(
         replay_eviction_max_quarantined=int(config.get("replay_eviction_max_quarantined", 8)),
         replay_eviction_quarantine_release_streak=int(config.get("replay_eviction_quarantine_release_streak", 2)),
         replay_eviction_distill_peak_threshold=float(config.get("replay_eviction_distill_peak_threshold", 0.04)),
+        replay_eviction_peak_preserve_utility_threshold=float(
+            config.get("replay_eviction_peak_preserve_utility_threshold", 0.20)
+        ),
+        replay_eviction_peak_preserve_sharpness_threshold=float(
+            config.get("replay_eviction_peak_preserve_sharpness_threshold", 0.20)
+        ),
         replay_eviction_useful_threshold=float(config.get("replay_eviction_useful_threshold", 0.005)),
         replay_eviction_min_score_count=int(config.get("replay_eviction_min_score_count", 2)),
     )

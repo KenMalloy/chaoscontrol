@@ -139,6 +139,7 @@ class TestStateDict:
         rec = t.record(s1)
         rec.utility_ema = 0.42
         rec.peak_utility = 0.99
+        rec.peak_sharpness = 0.77
 
         sd = t.state_dict()
         t2 = SlotTable()
@@ -148,6 +149,7 @@ class TestStateDict:
         assert t2.record(s0).state == SLOT_QUARANTINED
         assert t2.record(s1).utility_ema == pytest.approx(0.42)
         assert t2.record(s1).peak_utility == pytest.approx(0.99)
+        assert t2.record(s1).peak_sharpness == pytest.approx(0.77)
 
     def test_retired_excluded_from_state_dict(self):
         t = SlotTable()

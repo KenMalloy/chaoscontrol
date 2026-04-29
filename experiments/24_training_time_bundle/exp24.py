@@ -1456,6 +1456,8 @@ def build_crct_v1_matrix(
         "replay_eviction_enabled": True,
         "replay_eviction_memory_streams": 8,
         "replay_eviction_oracle_confirm_top_k": 32,
+        "replay_eviction_peak_preserve_utility_threshold": 0.20,
+        "replay_eviction_peak_preserve_sharpness_threshold": 0.20,
         "replay_eviction_trace_path": (
             "experiments/24_training_time_bundle/results/traces/"
             "crct_replay_eviction.ndjson"

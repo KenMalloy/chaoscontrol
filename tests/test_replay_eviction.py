@@ -494,8 +494,11 @@ class TestPolicy:
             drift_threshold=0.3,
             quarantine_threshold=-0.01,
             distill_peak_threshold=0.04,
+            peak_preserve_utility_threshold=0.04,
+            peak_preserve_sharpness_threshold=0.04,
             min_age=128,
             min_score_count=2,
+            capacity_pressure=False,
         )
 
     def test_preserve_high_utility(self):
@@ -504,10 +507,18 @@ class TestPolicy:
         action = p.choose(rec, **self._policy_kwargs())
         assert action == SLOT_PRESERVE
 
-    def test_evict_low_utility(self):
+    def test_low_utility_below_capacity_does_not_evict(self):
         p = MaintenancePolicy()
         rec = self._make_rec(utility_ema=0.001, marginal_gain_ema=0.001)
         action = p.choose(rec, **self._policy_kwargs())
+        assert action != SLOT_EVICT
+
+    def test_capacity_pressure_evicts_low_utility(self):
+        p = MaintenancePolicy()
+        rec = self._make_rec(utility_ema=0.001, marginal_gain_ema=0.001)
+        kwargs = self._policy_kwargs()
+        kwargs["capacity_pressure"] = True
+        action = p.choose(rec, **kwargs)
         assert action == SLOT_EVICT
 
     def test_quarantine_contradictory(self):
@@ -525,8 +536,48 @@ class TestPolicy:
             peak_utility=0.5, utility_ema=0.015,
             marginal_gain_ema=0.015,
         )
-        action = p.choose(rec, **self._policy_kwargs())
+        kwargs = self._policy_kwargs()
+        kwargs["peak_preserve_utility_threshold"] = 1.0
+        action = p.choose(rec, **kwargs)
         assert action == SLOT_DISTILL
+
+    def test_peak_utility_blocks_distill_and_evict(self):
+        p = MaintenancePolicy()
+        rec = self._make_rec(
+            peak_utility=0.5,
+            utility_ema=0.001,
+            marginal_gain_ema=0.001,
+        )
+        kwargs = self._policy_kwargs()
+        kwargs["capacity_pressure"] = True
+        action = p.choose(rec, **kwargs)
+        assert action not in {SLOT_DISTILL, SLOT_EVICT}
+
+    def test_peak_sharpness_blocks_distill_and_evict(self):
+        p = MaintenancePolicy()
+        rec = self._make_rec(
+            peak_utility=0.5,
+            peak_sharpness=0.5,
+            utility_ema=0.001,
+            marginal_gain_ema=0.001,
+        )
+        kwargs = self._policy_kwargs()
+        kwargs["capacity_pressure"] = True
+        kwargs["peak_preserve_utility_threshold"] = 1.0
+        action = p.choose(rec, **kwargs)
+        assert action not in {SLOT_DISTILL, SLOT_EVICT}
+
+    def test_incidental_high_peak_trace_is_preserved_under_capacity_pressure(self):
+        p = MaintenancePolicy()
+        rec = self._make_rec(
+            peak_utility=0.5,
+            utility_ema=0.001,
+            marginal_gain_ema=0.001,
+        )
+        kwargs = self._policy_kwargs()
+        kwargs["capacity_pressure"] = True
+        action = p.choose(rec, **kwargs)
+        assert action == SLOT_PRESERVE
 
     def test_refresh_drifted(self):
         p = MaintenancePolicy()

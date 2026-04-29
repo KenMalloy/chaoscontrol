@@ -44,6 +44,7 @@ class SlotRecord:
     contradiction_ema: float = 0.0
     retrieval_mass_ema: float = 0.0
     peak_utility: float = 0.0
+    peak_sharpness: float = 0.0
     score_count: int = 0
     negative_streak: int = 0
     positive_streak: int = 0
