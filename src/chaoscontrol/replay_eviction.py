@@ -1893,6 +1893,10 @@ class ReplayEvictionLoop:
         self._evidence_lm_head_refresh_errors_total = 0
         self._evidence_last_lm_head_refresh_step: int = -1
         self._evidence_last_lm_head_refresh_error = ""
+        self._evidence_cue_populated_total = 0
+        self._evidence_cue_skipped_no_cue_total = 0
+        self._evidence_cue_skipped_shape_total = 0
+        self._evidence_cue_populate_errors_total = 0
         if self._evidence_engine_enabled_requested:
             self._init_evidence_engine()
 
@@ -2186,6 +2190,55 @@ class ReplayEvictionLoop:
                 f"{self._evidence_engine_error}"
             ) from exc
 
+    def _populate_evidence_cue(
+        self,
+        *,
+        cue: torch.Tensor | None,
+        input_ids: torch.Tensor,
+    ) -> None:
+        """Copy the trunk's cue activations + token ids into pinned buffers.
+
+        The engine's binding contract is bf16[T_PROBE_MAX, D] cue + i32
+        [T_PROBE_MAX] targets. The probe frame's ``cue`` may be ``None``
+        (no encoded cue available), 2-D ``[T, D]``, or 3-D ``[B, T, D]``
+        with B == 1. Anything else is a shape we cannot honestly project
+        onto the engine's contract, so we fall back to the zero buffer
+        and bump a counter rather than block the maintenance loop.
+        """
+        cue_buffer = self._evidence_cue_buffer
+        targets_buffer = self._evidence_targets_buffer
+        if cue_buffer is None or targets_buffer is None:
+            return
+        t_max, d_model = int(cue_buffer.shape[0]), int(cue_buffer.shape[1])
+        if cue is None:
+            cue_buffer.zero_()
+            targets_buffer.zero_()
+            self._evidence_cue_skipped_no_cue_total += 1
+            return
+        try:
+            cue_cpu = cue.detach().to(device="cpu", dtype=torch.bfloat16)
+            if cue_cpu.dim() == 3 and cue_cpu.shape[0] >= 1:
+                cue_cpu = cue_cpu[0]
+            if cue_cpu.dim() != 2 or int(cue_cpu.shape[1]) != d_model:
+                cue_buffer.zero_()
+                targets_buffer.zero_()
+                self._evidence_cue_skipped_shape_total += 1
+                return
+            ids_cpu = input_ids.detach().to(device="cpu", dtype=torch.int32)
+            if ids_cpu.dim() == 2 and ids_cpu.shape[0] >= 1:
+                ids_cpu = ids_cpu[0]
+            t_used = min(int(cue_cpu.shape[0]), int(ids_cpu.shape[0]), t_max)
+            cue_buffer.zero_()
+            targets_buffer.zero_()
+            if t_used > 0:
+                cue_buffer[:t_used].copy_(cue_cpu[:t_used])
+                targets_buffer[:t_used].copy_(ids_cpu[:t_used])
+            self._evidence_cue_populated_total += 1
+        except Exception:
+            cue_buffer.zero_()
+            targets_buffer.zero_()
+            self._evidence_cue_populate_errors_total += 1
+
     def refresh_evidence_weights(
         self,
         *,
@@ -2314,6 +2367,7 @@ class ReplayEvictionLoop:
             and self._evidence_cue_buffer is not None
             and self._evidence_targets_buffer is not None
         ):
+            self._populate_evidence_cue(cue=cue_d, input_ids=input_ids_d)
             try:
                 self._evidence_engine.ingest_frame(
                     self._evidence_cue_buffer,
@@ -4467,6 +4521,10 @@ class ReplayEvictionLoop:
             "lm_head_refresh_errors_total": self._evidence_lm_head_refresh_errors_total,
             "last_lm_head_refresh_step": self._evidence_last_lm_head_refresh_step,
             "last_lm_head_refresh_error": self._evidence_last_lm_head_refresh_error,
+            "cue_populated_total": self._evidence_cue_populated_total,
+            "cue_skipped_no_cue_total": self._evidence_cue_skipped_no_cue_total,
+            "cue_skipped_shape_total": self._evidence_cue_skipped_shape_total,
+            "cue_populate_errors_total": self._evidence_cue_populate_errors_total,
             "native": evidence_engine_native_diag,
         }
         starvation_reasons = (
