@@ -8,6 +8,7 @@ import torch.nn as nn
 
 import pytest
 
+from chaoscontrol.memory import BucketPrototypes
 import chaoscontrol.replay_eviction as replay_eviction_mod
 from chaoscontrol.replay_eviction import (
     ReplayEvictionLoop, TickResult, MaintenancePolicy,
@@ -1137,6 +1138,66 @@ class TestSlotTableTick:
         assert table.active_slot_ids() == []
         assert model.outer_model._latent_traces[0]["bucket_id"] == 7
         assert "centroid_contrib" in model.outer_model._latent_traces[0]
+
+    def test_distill_updates_bucket_prototype_then_retires_slot(self):
+        loop = ReplayEvictionLoop(action_mode="active")
+        model = _StubModel(n_slots=1, use_table=True)
+        model.bucket_prototypes_module = BucketPrototypes(
+            k_max=8,
+            prototype_dim=8,
+            model_dim=16,
+            update_rate=1.0,
+        )
+        table = model.outer_model.table
+        sid = table.active_slot_ids()[0]
+        rec = table.record(sid)
+        rec.bucket_id = 3
+        slot = torch.arange(8, dtype=torch.float32).view(1, 8)
+        table.replace_tensor(sid, slot)
+
+        receipt = loop._execute_distill(model.outer_model, sid, step=10, model=model)
+
+        assert receipt.accepted is True
+        assert receipt.target == "latent_trace+bucket_prototype"
+        assert receipt.prototype_updated is True
+        assert receipt.prototype_reason == "updated"
+        assert table.active_slot_ids() == []
+        assert torch.allclose(
+            model.bucket_prototypes_module.prototypes[3],
+            slot.squeeze(0),
+        )
+        diag = loop.diagnostics()
+        assert diag["prototype_distills_total"] == 1
+        assert diag["prototype_distill_skips_total"] == 0
+        assert diag["last_prototype_distill_bucket"] == 3
+
+    def test_distill_prototype_mismatch_preserves_trace_and_slot_retirement(self):
+        loop = ReplayEvictionLoop(action_mode="active")
+        model = _StubModel(n_slots=1, use_table=True)
+        model.bucket_prototypes_module = BucketPrototypes(
+            k_max=8,
+            prototype_dim=4,
+            model_dim=16,
+            update_rate=1.0,
+        )
+        table = model.outer_model.table
+        sid = table.active_slot_ids()[0]
+        rec = table.record(sid)
+        rec.bucket_id = 3
+        before = model.bucket_prototypes_module.prototypes.clone()
+
+        receipt = loop._execute_distill(model.outer_model, sid, step=10, model=model)
+
+        assert receipt.accepted is True
+        assert receipt.target == "latent_trace"
+        assert receipt.prototype_updated is False
+        assert receipt.prototype_reason == "prototype_dim_mismatch"
+        assert table.active_slot_ids() == []
+        assert len(model.outer_model._latent_traces) == 1
+        assert torch.allclose(model.bucket_prototypes_module.prototypes, before)
+        diag = loop.diagnostics()
+        assert diag["prototype_distills_total"] == 0
+        assert diag["prototype_distill_skips_total"] == 1
 
     def test_oracle_rejection_blocks_active_mutation(self):
         loop = ReplayEvictionLoop(action_mode="active", min_slot_age_steps=0)

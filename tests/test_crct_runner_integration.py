@@ -76,6 +76,28 @@ def _tiny_crct_model() -> ChaosStudentLM:
     return model
 
 
+def test_crct_fast_path_allows_bucket_prototypes_as_sidecar_prior() -> None:
+    mod = _load_module("runner_fast_path_crct_bucket_prototype_gate", RUNNER_PATH)
+    model = ChaosStudentLM(
+        vocab_size=32,
+        dim=8,
+        num_layers=1,
+        ff_mult=2,
+        a_mode="diag",
+        outer_model_dim=4,
+        outer_model_type="multislot",
+        outer_max_slots=64,
+        buffer_mode="append_only",
+        enable_controller=True,
+        controller_hidden_dim=4,
+        bucket_prototypes=True,
+        prototype_dim=4,
+    )
+
+    assert model.bucket_prototypes_module is not None
+    mod._reject_unsupported_fast_step(model, crct_enabled=True)
+
+
 def test_replay_eviction_probe_tracks_latest_rank3_teacher_batch() -> None:
     mod = _load_module("runner_fast_path_crct_probe_test", RUNNER_PATH)
     model = _tiny_crct_model()

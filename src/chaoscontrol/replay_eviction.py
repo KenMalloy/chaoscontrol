@@ -91,6 +91,8 @@ class DistillReceipt:
     marginal_gain_current: float
     target: str
     accepted: bool = False
+    prototype_updated: bool = False
+    prototype_reason: str = ""
 
 
 @dataclass
@@ -638,6 +640,10 @@ class ReplayEvictionLoop:
         self._evictions_total: int = 0
         self._refreshes_total: int = 0
         self._distills_total: int = 0
+        self._prototype_distills_total: int = 0
+        self._prototype_distill_skips_total: int = 0
+        self._last_prototype_distill_bucket: int = -1
+        self._last_prototype_distill_reason: str = ""
         self._decays_total: int = 0
         self._releases_total: int = 0
         self._replays_total: int = 0
@@ -1541,19 +1547,30 @@ class ReplayEvictionLoop:
                         rec.last_action = action
                     continue
                 if action == SLOT_DISTILL:
-                    receipt = self._execute_distill(outer, sid, step)
+                    receipt = self._execute_distill(outer, sid, step, model=model)
+                    distill_extra = dict(extra)
+                    distill_extra.update({
+                        "distill_target": receipt.target,
+                        "distill_prototype_updated": receipt.prototype_updated,
+                        "distill_prototype_reason": receipt.prototype_reason,
+                    })
                     if receipt.accepted:
                         result.distilled.append(sid)
                         self._distills_total += 1
                         self._trace_event(
-                            step, sid, action, rec, reason="distilled", extra=extra
+                            step,
+                            sid,
+                            action,
+                            rec,
+                            reason="distilled",
+                            extra=distill_extra,
                         )
                     else:
                         self._trace_event(
                             step, sid, action, rec,
                             accepted=False,
                             reason=f"distill_{receipt.target}_unavailable",
-                            extra=extra,
+                            extra=distill_extra,
                         )
                 else:
                     table.retire(sid, reason="evicted")
@@ -1748,7 +1765,7 @@ class ReplayEvictionLoop:
             table.scale_survival(slot_id, 0.9)
 
     def _execute_distill(
-        self, outer: Any, slot_id: int, step: int
+        self, outer: Any, slot_id: int, step: int, *, model: Any | None = None
     ) -> DistillReceipt:
         table = getattr(outer, "table", None)
         rec = table.record(slot_id) if table else None
@@ -1774,18 +1791,63 @@ class ReplayEvictionLoop:
             return receipt
 
         bucket_id = rec.bucket_id if rec else -1
-        latent_traces.append({
+        trace = {
             "bucket_id": bucket_id,
             "centroid_contrib": slot_tensor.detach().clone(),
-        })
+        }
+        latent_traces.append(trace)
         max_latent = int(getattr(outer, "max_slots", 0) or 0)
         while max_latent > 0 and len(latent_traces) > max_latent:
             latent_traces.pop(0)
         receipt.target = "latent_trace"
         receipt.accepted = True
+        if model is not None:
+            (
+                receipt.prototype_updated,
+                receipt.prototype_reason,
+            ) = self._distill_trace_into_bucket_prototype(
+                model=model,
+                trace=trace,
+            )
+            self._last_prototype_distill_bucket = int(bucket_id)
+            self._last_prototype_distill_reason = receipt.prototype_reason
+            if receipt.prototype_updated:
+                receipt.target = "latent_trace+bucket_prototype"
+                self._prototype_distills_total += 1
+            else:
+                self._prototype_distill_skips_total += 1
         table.retire(slot_id, reason="distilled")
 
         return receipt
+
+    def _distill_trace_into_bucket_prototype(
+        self,
+        *,
+        model: Any,
+        trace: dict[str, Any],
+    ) -> tuple[bool, str]:
+        prototypes = getattr(model, "bucket_prototypes_module", None)
+        if prototypes is None:
+            return False, "missing_bucket_prototypes"
+        proto_buf = getattr(prototypes, "prototypes", None)
+        if proto_buf is None:
+            return False, "missing_prototype_buffer"
+        if "bucket_id" not in trace or "centroid_contrib" not in trace:
+            return False, "malformed_latent_trace"
+        bucket_id = int(trace["bucket_id"])
+        if bucket_id < 0 or bucket_id >= int(getattr(prototypes, "k_max", 0)):
+            return False, "bucket_out_of_range"
+        slot_tensor = trace["centroid_contrib"]
+        if not torch.is_tensor(slot_tensor):
+            return False, "latent_trace_not_tensor"
+        proto_dim = int(getattr(prototypes, "prototype_dim", proto_buf.shape[-1]))
+        value = slot_tensor.detach().reshape(-1, slot_tensor.shape[-1])
+        if int(value.shape[-1]) != proto_dim:
+            return False, "prototype_dim_mismatch"
+        value = value.to(device=proto_buf.device, dtype=proto_buf.dtype)
+        with torch.no_grad():
+            prototypes.update(int(bucket_id), value)
+        return True, "updated"
 
     def _decision_trace_extra(
         self,
@@ -2060,6 +2122,10 @@ class ReplayEvictionLoop:
             "evictions_total": self._evictions_total,
             "refreshes_total": self._refreshes_total,
             "distills_total": self._distills_total,
+            "prototype_distills_total": self._prototype_distills_total,
+            "prototype_distill_skips_total": self._prototype_distill_skips_total,
+            "last_prototype_distill_bucket": self._last_prototype_distill_bucket,
+            "last_prototype_distill_reason": self._last_prototype_distill_reason,
             "decays_total": self._decays_total,
             "releases_total": self._releases_total,
             "slots_scored_total": self._slots_scored_total,

@@ -990,8 +990,10 @@ def _reject_unsupported_fast_step(
         ("wernicke", "wernicke layer"),
         ("semantic_tier", "semantic_tier bias"),
         ("posterior", "posterior correction module"),
-        ("bucket_prototypes_module", "bucket_prototypes"),
     )
+    # CRCT train ranks call encode(..., memory_mode="off"), so bucket
+    # prototypes are not on the trunk hot path.  Replay maintenance may still
+    # use them on the sidecar rank as the slow-prior consumer for DISTILL.
     for attr, label in unsupported:
         if getattr(model, attr, None) is not None:
             raise ValueError(

@@ -1740,6 +1740,8 @@ def test_crct_v1_matrix_threads_memory_controller_and_random_sampling():
     assert replay_shadow["crct_enabled"] is True
     assert replay_shadow["replay_eviction_enabled"] is True
     assert replay_shadow["replay_eviction_mode"] == "shadow"
+    assert replay_shadow["bucket_prototypes"] is True
+    assert replay_shadow["prototype_dim"] == 64
     assert replay_shadow["replay_eviction_memory_streams"] == 8
     assert replay_shadow["replay_eviction_oracle_confirm_top_k"] == 32
     assert replay_shadow["replay_eviction_probe_buffer_size"] == 32
@@ -1752,6 +1754,8 @@ def test_crct_v1_matrix_threads_memory_controller_and_random_sampling():
     assert replay_active["crct_enabled"] is True
     assert replay_active["replay_eviction_enabled"] is True
     assert replay_active["replay_eviction_mode"] == "active"
+    assert replay_active["bucket_prototypes"] is True
+    assert replay_active["prototype_dim"] == 64
     assert replay_active["replay_eviction_memory_streams"] == 8
     assert replay_active["replay_eviction_oracle_confirm_top_k"] == 32
     assert replay_active["replay_eviction_probe_buffer_size"] == 32

@@ -1454,6 +1454,8 @@ def build_crct_v1_matrix(
     }
     replay_eviction_lock = {
         "replay_eviction_enabled": True,
+        "bucket_prototypes": True,
+        "prototype_dim": 64,
         "replay_eviction_memory_streams": 8,
         "replay_eviction_oracle_confirm_top_k": 32,
         "replay_eviction_peak_preserve_utility_threshold": 0.20,
