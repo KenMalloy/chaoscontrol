@@ -38,6 +38,8 @@ RUNNER21_PATH = REPO / "experiments" / "21_sgns_tokenizer" / "runner_exp21.py"
 def _restore_fast_runner_backend_env():
     keys = ("CHAOSCONTROL_DIAG_SCAN_BACKEND", "CHAOSCONTROL_POST_SCAN_BACKEND")
     old = {key: os.environ.get(key) for key in keys}
+    os.environ["CHAOSCONTROL_DIAG_SCAN_BACKEND"] = "chunked"
+    os.environ["CHAOSCONTROL_POST_SCAN_BACKEND"] = "eager"
     try:
         yield
     finally:
@@ -150,6 +152,50 @@ def test_replay_eviction_probe_tracks_latest_rank3_teacher_batch() -> None:
     assert not torch.equal(loop._probe_input_ids, first_probe)
     assert loop._probe_cue is not None
     assert not torch.equal(loop._probe_cue, first_cue)
+
+
+def test_replay_eviction_tick_uses_teacher_step_not_memory_rank_spin_step() -> None:
+    mod = _load_module("runner_fast_path_crct_replay_clock_test", RUNNER_PATH)
+    model = _tiny_crct_model()
+    cache = TransactionalWakeCache(max_moments=0, max_hidden_buffer=0)
+    loop = ReplayEvictionLoop(
+        min_slot_age_steps=0,
+        max_seconds_per_tick=999.0,
+        frame_ttl_steps=256,
+        slot_work_chunk_size=4,
+    )
+
+    inputs = (torch.arange(16).reshape(2, 8) % 32).to(torch.int32)
+    targets = ((torch.arange(16).reshape(2, 8) + 1) % 32).to(torch.long)
+    mod._crct_score_payload_inline(
+        model=model,
+        cache=cache,
+        scarcity_optimizer=None,
+        inputs=inputs,
+        targets=targets,
+        step=10,
+        total_steps=100,
+        tau=0.10,
+        strength=0.10,
+        w_max=1.20,
+        alpha_max=0.15,
+        memory_write_tokens=4,
+        update_model_memory_after=True,
+    )
+    assert mod._crct_replay_cache_probe(loop, model, 10) is True
+    assert loop.has_probe()
+
+    # Rank 3 can execute many local maintenance iterations while train ranks
+    # advance only a few steps.  The replay frame should age by the teacher's
+    # train step, not by this local spin counter.
+    replay_step = mod._crct_replay_tick_step(loop, model, fallback_step=10_000)
+    assert replay_step == 10
+    result = loop.tick(model=model, step=replay_step)
+    diag = loop.diagnostics()
+    assert result is not None
+    assert diag["probe_frames_dropped_stale"] == 0
+    assert diag["replays_total"] == 1
+    assert diag["slots_scored_total"] > 0
 
 
 def _pick_free_port_or_skip() -> int:

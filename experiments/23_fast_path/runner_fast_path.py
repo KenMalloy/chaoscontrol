@@ -1032,6 +1032,26 @@ def _crct_replay_cache_probe(
     return True
 
 
+def _crct_replay_tick_step(
+    loop: ReplayEvictionLoop,
+    model: torch.nn.Module,
+    fallback_step: int,
+) -> int:
+    """Return the train-step clock for rank-3 replay maintenance.
+
+    The memory rank can spin much faster than the train ranks.  Replay frames
+    are produced by CRCT teacher payloads and their TTL is expressed in train
+    steps, so using rank 3's local loop counter would age valid frames out
+    before the sidecar has a chance to process them.
+    """
+    probe_step = getattr(model, "_last_crct_probe_step", None)
+    if probe_step is not None:
+        return int(probe_step)
+    if loop.has_probe():
+        return int(getattr(loop, "_probe_step", fallback_step))
+    return int(fallback_step)
+
+
 def _crct_score_payload_inline(
     *,
     model: torch.nn.Module,
@@ -8260,9 +8280,15 @@ def train_fast_for_budget(
             # bounded slot-work chunks from the rolling frame stream.
             if replay_eviction_loop is not None and rank_ == world_size_ - 1:
                 _crct_replay_cache_probe(replay_eviction_loop, model, steps)
-                tick_result = replay_eviction_loop.tick(model=model, step=steps)
-                if tick_result.evicted_indices:
-                    replay_eviction_loop.flush_trace()
+                if replay_eviction_loop.has_probe():
+                    replay_step = _crct_replay_tick_step(
+                        replay_eviction_loop,
+                        model,
+                        steps,
+                    )
+                    tick_result = replay_eviction_loop.tick(model=model, step=replay_step)
+                    if tick_result.evicted_indices:
+                        replay_eviction_loop.flush_trace()
             # Phase B5: deferred post-step CE pair pass on the episodic
             # rank. The in-step drain stages each successful replay and
             # the just-emitted REPLAY_OUTCOME dict; this call runs a
