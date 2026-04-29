@@ -127,6 +127,9 @@ def chunked_nll_from_hidden(
     while start < seq:
         end = min(start + effective_chunk, seq)
         h_chunk = hidden_states[:, start:end, :]
+        head_dtype = lm_head.weight.dtype
+        if h_chunk.dtype != head_dtype:
+            h_chunk = h_chunk.to(dtype=head_dtype)
         logits_chunk = lm_head(final_norm(h_chunk))
         tgt_chunk = targets[:, start:end]
         nll_flat = F.cross_entropy(

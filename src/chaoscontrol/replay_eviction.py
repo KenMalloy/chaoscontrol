@@ -320,6 +320,7 @@ def oracle_confirm_slots(
     probe_valid_mask: torch.Tensor,
     slot_indices: list[int],
     cache_read_cutoff: int | None = None,
+    variant_chunk_size: int = 1,
 ) -> OracleConfirmationResult:
     """Confirm candidate slots with real memory-injected SSM dynamics.
 
@@ -352,32 +353,48 @@ def oracle_confirm_slots(
             mask=mask,
         )
 
-    variants = len(candidates) + 2
-    slot_masks = torch.ones(variants, n_slots, device=dev, dtype=torch.bool)
-    slot_masks[1, :] = False
-    rows = torch.arange(2, variants, device=dev)
-    cols = torch.tensor(candidates, device=dev, dtype=torch.long)
-    slot_masks[rows, cols] = False
-
-    x_exp = x.unsqueeze(0).expand(variants, -1, -1).reshape(variants * B, T)
-    y_exp = y.unsqueeze(0).expand(variants, -1, -1).reshape(variants * B, T)
-    slot_masks_exp = (
-        slot_masks[:, None, :]
-        .expand(variants, B, n_slots)
-        .reshape(variants * B, n_slots)
+    ac = (
+        torch.autocast(dev.type, dtype=torch.bfloat16)
+        if dev.type == "cuda"
+        else torch.autocast("cpu", dtype=torch.bfloat16)
     )
 
-    with torch.autocast(dev.type, dtype=torch.bfloat16) if dev.type == "cuda" else torch.autocast("cpu", dtype=torch.bfloat16):
-        hidden = model.encode(
-            x_exp,
-            memory_mode="force_on",
-            cache_read_cutoff=cache_read_cutoff,
-            memory_slot_mask=slot_masks_exp,
+    def _score_masks(slot_masks: torch.Tensor) -> torch.Tensor:
+        variants = int(slot_masks.shape[0])
+        x_exp = x.unsqueeze(0).expand(variants, -1, -1).reshape(variants * B, T)
+        y_exp = y.unsqueeze(0).expand(variants, -1, -1).reshape(variants * B, T)
+        slot_masks_exp = (
+            slot_masks[:, None, :]
+            .expand(variants, B, n_slots)
+            .reshape(variants * B, n_slots)
         )
-    nll = chunked_nll_from_hidden(model, hidden, y_exp).reshape(variants, B, T)
-    nll_baseline = nll[0]
-    nll_no_sidecar = nll[1]
-    oracle_deltas = nll[2:] - nll_baseline.unsqueeze(0)
+        with ac:
+            hidden = model.encode(
+                x_exp,
+                memory_mode="force_on",
+                cache_read_cutoff=cache_read_cutoff,
+                memory_slot_mask=slot_masks_exp,
+            )
+        return chunked_nll_from_hidden(model, hidden, y_exp).reshape(variants, B, T)
+
+    base_masks = torch.ones(2, n_slots, device=dev, dtype=torch.bool)
+    base_masks[1, :] = False
+    base_nll = _score_masks(base_masks)
+    nll_baseline = base_nll[0]
+    nll_no_sidecar = base_nll[1]
+
+    candidate_chunk = max(1, int(variant_chunk_size))
+    oracle_deltas = torch.empty(len(candidates), B, T, device=dev, dtype=torch.float32)
+    for start in range(0, len(candidates), candidate_chunk):
+        chunk = candidates[start : start + candidate_chunk]
+        slot_masks = torch.ones(len(chunk), n_slots, device=dev, dtype=torch.bool)
+        rows = torch.arange(len(chunk), device=dev)
+        cols = torch.tensor(chunk, device=dev, dtype=torch.long)
+        slot_masks[rows, cols] = False
+        nll_hide = _score_masks(slot_masks)
+        oracle_deltas[start : start + len(chunk)] = (
+            nll_hide - nll_baseline.unsqueeze(0)
+        )
     return OracleConfirmationResult(
         slot_indices=candidates,
         oracle_deltas=oracle_deltas.cpu(),
@@ -571,6 +588,7 @@ class ReplayEvictionLoop:
         trace_max_rows: int = 0,
         probe_chunk_size: int = 16,
         oracle_confirm_top_k: int = 32,
+        oracle_variant_chunk_size: int = 1,
         drift_threshold: float = 0.3,
         repr_drift_threshold: float = 0.2,
         refresh_lr: float = 0.1,
@@ -598,6 +616,7 @@ class ReplayEvictionLoop:
         self._max_seconds = float(max_seconds_per_tick)
         self._probe_chunk_size = int(probe_chunk_size)
         self._oracle_confirm_top_k = max(0, int(oracle_confirm_top_k))
+        self._oracle_variant_chunk_size = max(1, int(oracle_variant_chunk_size))
         self._drift_threshold = float(drift_threshold)
         self._repr_drift_threshold = float(repr_drift_threshold)
         self._refresh_lr = float(refresh_lr)
@@ -1277,6 +1296,7 @@ class ReplayEvictionLoop:
             probe_valid_mask=self._probe_valid_mask,
             slot_indices=[phys for _sid, phys, _action, _proxy in candidate_pairs],
             cache_read_cutoff=self._probe_cache_cutoff,
+            variant_chunk_size=self._oracle_variant_chunk_size,
         )
         self._last_oracle_seconds = time.monotonic() - oracle_t0
         self._oracle_seconds_total += self._last_oracle_seconds
@@ -2147,6 +2167,7 @@ class ReplayEvictionLoop:
             "shadow_actions_total": self._shadow_actions_total,
             "shadow_action_counts": dict(self._shadow_action_counts),
             "oracle_confirm_top_k": self._oracle_confirm_top_k,
+            "oracle_variant_chunk_size": self._oracle_variant_chunk_size,
             "oracle_confirmations_total": self._oracle_confirmations_total,
             "oracle_confirmed_actions_total": self._oracle_confirmed_actions_total,
             "oracle_rejected_actions_total": self._oracle_rejected_actions_total,

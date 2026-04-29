@@ -155,7 +155,12 @@ def _replay_eviction_pipeline_lock() -> dict[str, Any]:
         "bucket_prototypes": True,
         "prototype_dim": 64,
         "replay_eviction_memory_streams": 8,
+        # Rank-3 maintenance runs off the trunk critical path. The generic
+        # 0.5s default was a scaffold-era placeholder and suppresses action
+        # telemetry at Exp26's real 16k-vocab probe cost.
+        "replay_eviction_max_seconds": 8.0,
         "replay_eviction_oracle_confirm_top_k": 32,
+        "replay_eviction_oracle_variant_chunk_size": 1,
         "replay_eviction_probe_buffer_size": 32,
         "replay_eviction_frame_ttl_steps": 256,
         "replay_eviction_slot_work_chunk_size": 16,

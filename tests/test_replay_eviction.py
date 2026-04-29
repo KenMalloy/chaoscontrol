@@ -580,7 +580,7 @@ class TestCounterfactualProbe:
 
 
 class TestOracleConfirmation:
-    def test_batched_oracle_uses_one_encode_with_slot_masks(self):
+    def test_oracle_uses_slot_masks_in_memory_bounded_microbatches(self):
         model = _StubModel(n_slots=4, memory_benefit=0.25, use_table=True)
         original_encode = model.encode
         seen_masks: list[torch.Tensor] = []
@@ -600,17 +600,21 @@ class TestOracleConfirmation:
             probe_input_ids=input_ids,
             probe_valid_mask=valid_mask,
             slot_indices=[0, 2],
+            variant_chunk_size=1,
         )
         assert result.slot_indices == [0, 2]
         assert result.oracle_deltas.shape[0] == 2
-        assert len(seen_masks) == 1
-        mask = seen_masks[0]
-        assert mask.shape == (8, 4)  # (baseline, off, hide0, hide2) x batch
-        assert mask[0:2].all()
-        assert not mask[2:4].any()
-        assert not mask[4:6, 0].any()
-        assert mask[4:6, 1:].all()
-        assert not mask[6:8, 2].any()
+        assert len(seen_masks) == 3
+        base_mask, hide0_mask, hide2_mask = seen_masks
+        assert base_mask.shape == (4, 4)  # (baseline, off) x batch
+        assert base_mask[0:2].all()
+        assert not base_mask[2:4].any()
+        assert hide0_mask.shape == (2, 4)
+        assert not hide0_mask[:, 0].any()
+        assert hide0_mask[:, 1:].all()
+        assert hide2_mask.shape == (2, 4)
+        assert not hide2_mask[:, 2].any()
+        assert hide2_mask[:, [0, 1, 3]].all()
 
 
 # ---------------------------------------------------------------------------

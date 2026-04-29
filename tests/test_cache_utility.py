@@ -317,6 +317,21 @@ class TestChunkedNllFromHidden:
             "chunk_size budget clamp must not change the per-token NLL output"
         )
 
+    def test_casts_hidden_to_lm_head_dtype(self) -> None:
+        # Rank-3 maintenance probes may produce fp32 hidden variants even
+        # when the trained model head is bf16. The helper owns that dtype
+        # boundary so callers do not need to keep autocast alive around the
+        # chunked LM-head pass.
+        model = self._build_model(dim=4, vocab=8).to(dtype=torch.bfloat16)
+        hidden = torch.randn(2, 5, 4, dtype=torch.float32)
+        targets = torch.randint(0, 8, (2, 5))
+
+        nll = chunked_nll_from_hidden(model, hidden, targets, chunk_size=2)
+
+        assert nll.shape == (2, 5)
+        assert nll.dtype == torch.float32
+        assert torch.isfinite(nll).all()
+
 
 # ---------------------------------------------------------------------------
 # alpha_ramp

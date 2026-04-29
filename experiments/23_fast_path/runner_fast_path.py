@@ -6814,6 +6814,7 @@ def train_fast_for_budget(
     replay_eviction_trace_max_rows: int = 0,
     replay_eviction_probe_chunk_size: int = 16,
     replay_eviction_oracle_confirm_top_k: int = 32,
+    replay_eviction_oracle_variant_chunk_size: int = 1,
     replay_eviction_drift_threshold: float = 0.3,
     replay_eviction_repr_drift_threshold: float = 0.2,
     replay_eviction_refresh_lr: float = 0.1,
@@ -7478,6 +7479,7 @@ def train_fast_for_budget(
             trace_max_rows=int(replay_eviction_trace_max_rows),
             probe_chunk_size=int(replay_eviction_probe_chunk_size),
             oracle_confirm_top_k=int(replay_eviction_oracle_confirm_top_k),
+            oracle_variant_chunk_size=int(replay_eviction_oracle_variant_chunk_size),
             drift_threshold=float(replay_eviction_drift_threshold),
             repr_drift_threshold=float(replay_eviction_repr_drift_threshold),
             refresh_lr=float(replay_eviction_refresh_lr),
@@ -8991,6 +8993,9 @@ def _warmup(
         replay_eviction_oracle_confirm_top_k=int(
             config.get("replay_eviction_oracle_confirm_top_k", 32)
         ),
+        replay_eviction_oracle_variant_chunk_size=int(
+            config.get("replay_eviction_oracle_variant_chunk_size", 1)
+        ),
         replay_eviction_drift_threshold=float(config.get("replay_eviction_drift_threshold", 0.3)),
         replay_eviction_repr_drift_threshold=float(config.get("replay_eviction_repr_drift_threshold", 0.2)),
         replay_eviction_refresh_lr=float(config.get("replay_eviction_refresh_lr", 0.1)),
@@ -9536,6 +9541,9 @@ def run_condition(
         replay_eviction_probe_chunk_size=int(config.get("replay_eviction_probe_chunk_size", 16)),
         replay_eviction_oracle_confirm_top_k=int(
             config.get("replay_eviction_oracle_confirm_top_k", 32)
+        ),
+        replay_eviction_oracle_variant_chunk_size=int(
+            config.get("replay_eviction_oracle_variant_chunk_size", 1)
         ),
         replay_eviction_drift_threshold=float(config.get("replay_eviction_drift_threshold", 0.3)),
         replay_eviction_repr_drift_threshold=float(config.get("replay_eviction_repr_drift_threshold", 0.2)),
