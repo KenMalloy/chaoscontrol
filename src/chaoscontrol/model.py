@@ -1251,15 +1251,15 @@ class ChaosStudentLM(nn.Module):
                         f"episodic_residual shape {tuple(residual.shape)} "
                         f"cannot feed hidden shape {tuple(reference.shape)}"
                     )
-                if residual.shape[1] not in (1, reference.shape[1]):
+                if residual.shape[1] != 1:
                     raise ValueError(
-                        f"episodic_residual shape {tuple(residual.shape)} "
-                        f"cannot feed sequence length {reference.shape[1]}"
+                        "episodic_residual packets must be compact with shape "
+                        f"(B, D) or (B, 1, D); got {tuple(residual.shape)}"
                     )
             else:
                 raise ValueError(
-                    "episodic_residual must have shape (B, D), (B, 1, D), "
-                    "or (B, T, D)"
+                    "episodic_residual must have compact shape (B, D) or "
+                    "(B, 1, D)"
                 )
             return residual
 

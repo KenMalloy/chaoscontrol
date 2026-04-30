@@ -225,6 +225,23 @@ class TestChaosStudentLM(unittest.TestCase):
         assert out["memory_meta"]["memory_gate"].shape == (2, 6)
         assert out["memory_meta"]["memory_residual"].shape == (2, 1, 8)
 
+    def test_encode_packet_mode_rejects_sequence_residual_packets(self) -> None:
+        model = ChaosStudentLM(
+            vocab_size=64, dim=8, num_layers=1, ff_mult=2,
+            a_mode="diag", rich_b_mode="none", outer_model_dim=8,
+        )
+        ids = torch.randint(0, 64, (2, 6))
+        residual = torch.randn(2, 6, 8)
+        gate = torch.ones(2, 6)
+
+        with pytest.raises(ValueError, match="compact"):
+            model.encode(
+                ids,
+                memory_mode="packet",
+                episodic_residual=residual,
+                episodic_gate=gate,
+            )
+
     def test_force_on_memory_residual_can_replay_as_packet(self) -> None:
         torch.manual_seed(35)
         model = ChaosStudentLM(

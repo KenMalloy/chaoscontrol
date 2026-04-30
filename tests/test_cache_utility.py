@@ -165,6 +165,36 @@ class _PacketMockModel(_MockModel):
         return hidden
 
 
+class _SequencePacketMockModel(_PacketMockModel):
+    def encode(
+        self,
+        input_ids: torch.Tensor,
+        *,
+        memory_mode: str,
+        cache_read_cutoff: int,
+        return_memory_meta: bool = False,
+    ) -> torch.Tensor | dict[str, Any]:
+        hidden = _MockModel.encode(
+            self,
+            input_ids,
+            memory_mode=memory_mode,
+            cache_read_cutoff=cache_read_cutoff,
+        )
+        if return_memory_meta and memory_mode == "force_on":
+            return {
+                "hidden": hidden,
+                "memory_meta": {
+                    "memory_residual": torch.ones(
+                        input_ids.shape[0],
+                        input_ids.shape[1] - 1,
+                        self._dim,
+                        device=input_ids.device,
+                    ),
+                },
+            }
+        return hidden
+
+
 # ---------------------------------------------------------------------------
 # positive_only_lm_weight
 # ---------------------------------------------------------------------------
@@ -549,6 +579,20 @@ class TestRank3ScoreBatchCausal:
         assert out["memory_residual"].shape == (2, 1, 8)
         assert torch.all(out["memory_residual"] == 1.0)
         assert torch.equal(out["memory_gate"], out["controller_target"])
+
+    def test_rejects_sequence_memory_packet_from_encoder_meta(self) -> None:
+        cache = _MockCache(cutoff=42)
+        model = _SequencePacketMockModel(dim=8, vocab=32, seed=3)
+        input_ids = torch.randint(0, 32, (2, 6))
+        valid_mask = torch.ones((2, 6), dtype=torch.bool)
+
+        with pytest.raises(ValueError, match="compact"):
+            rank3_score_batch_causal(
+                model=model,
+                cache=cache,
+                input_ids=input_ids,
+                valid_mask=valid_mask,
+            )
 
     def test_output_shapes_are_per_target_token(self) -> None:
         model, cache, ids, mask = self._setup(batch=2, seq=6)

@@ -639,6 +639,125 @@ def test_crct_mailbox_transport_round_trips_memory_packet(tmp_path) -> None:
     assert rank0.diagnostics()["memory_packets_received"] == 1
 
 
+def test_crct_mailbox_aliases_memory_gate_to_target_for_compact_packet(tmp_path) -> None:
+    mod = _load_module("runner_fast_path_crct_mailbox_packet_alias", RUNNER_PATH)
+    kwargs = {
+        "world_size": 4,
+        "mailbox_dir": str(tmp_path),
+        "payload_shape": (1, 2, 5),
+        "full_ids_shape": (2, 6),
+        "device": torch.device("cpu"),
+        "payload_dtype": torch.float32,
+        "max_local_batches": 8,
+        "max_payload_lag_steps": 8,
+        "score_interval_steps": 1,
+    }
+    rank0 = mod._CrctMailboxTeacherTransport(rank=0, **kwargs)
+    rank3 = mod._CrctMailboxTeacherTransport(rank=3, **kwargs)
+    inputs = torch.randint(0, 32, (2, 5), dtype=torch.int32)
+    targets = torch.randint(0, 32, (2, 5), dtype=torch.long)
+    rank0.local_batches_by_step[0] = (inputs, targets)
+    rank0.local_batch_order.append(0)
+    residual = torch.randn(2, 1, 8)
+    target = torch.full((2, 5), 0.85)
+
+    rank3._write_result(
+        request_step=0,
+        scored={
+            "target": target,
+            "confidence": torch.ones(2, 5),
+            "loss_weight": torch.ones(2, 5),
+            "utility": torch.zeros(2, 5),
+            "memory_residual": residual,
+            "memory_gate": target,
+            "memory_gate_alias_target": True,
+        },
+    )
+
+    payload_cpu = torch.load(
+        tmp_path / "result_000000000000.pt",
+        map_location="cpu",
+        weights_only=True,
+    )
+    assert payload_cpu["memory_gate_alias_target"] is True
+    assert "memory_gate" not in payload_cpu
+
+    ready = rank0._poll_results(current_step=1)
+    assert ready is not None
+    payload, _inputs, _targets = ready
+    assert torch.allclose(payload["memory_residual"], residual)
+    assert torch.allclose(payload["memory_gate"], target)
+    diag3 = rank3.diagnostics()
+    diag0 = rank0.diagnostics()
+    assert diag3["memory_packet_gate_alias_target_sent"] == 1
+    assert diag0["memory_packet_gate_alias_target_received"] == 1
+    assert diag3["memory_packet_bytes_sent"] == residual.numel() * residual.element_size()
+
+
+def test_crct_mailbox_rejects_sequence_memory_packet(tmp_path) -> None:
+    mod = _load_module("runner_fast_path_crct_mailbox_packet_rejects", RUNNER_PATH)
+    kwargs = {
+        "world_size": 4,
+        "mailbox_dir": str(tmp_path),
+        "payload_shape": (1, 2, 5),
+        "full_ids_shape": (2, 6),
+        "device": torch.device("cpu"),
+        "payload_dtype": torch.float32,
+        "max_local_batches": 8,
+        "max_payload_lag_steps": 8,
+        "score_interval_steps": 1,
+    }
+    rank3 = mod._CrctMailboxTeacherTransport(rank=3, **kwargs)
+
+    with pytest.raises(ValueError, match="compact"):
+        rank3._write_result(
+            request_step=0,
+            scored={
+                "target": torch.full((2, 5), 0.85),
+                "confidence": torch.ones(2, 5),
+                "loss_weight": torch.ones(2, 5),
+                "utility": torch.zeros(2, 5),
+                "memory_residual": torch.randn(2, 5, 8),
+                "memory_gate": torch.ones(2, 5),
+            },
+        )
+    assert rank3.diagnostics()["memory_packet_sequence_residual_rejections"] == 1
+
+
+def test_crct_mailbox_defers_low_priority_maintenance_for_packet_work(tmp_path) -> None:
+    mod = _load_module("runner_fast_path_crct_mailbox_packet_priority", RUNNER_PATH)
+    kwargs = {
+        "world_size": 4,
+        "mailbox_dir": str(tmp_path),
+        "payload_shape": (1, 2, 5),
+        "full_ids_shape": (2, 6),
+        "device": torch.device("cpu"),
+        "payload_dtype": torch.float32,
+        "max_local_batches": 8,
+        "max_payload_lag_steps": 8,
+        "score_interval_steps": 1,
+    }
+    rank3 = mod._CrctMailboxTeacherTransport(rank=3, **kwargs)
+
+    assert rank3.should_defer_low_priority_maintenance() is False
+    rank3.pending_input_requests.append(
+        {"step": 7, "buffer": torch.zeros((2, 6), dtype=torch.int32)}
+    )
+    assert rank3.should_defer_low_priority_maintenance() is True
+    rank3.pending_input_requests.clear()
+    torch.save(
+        {"step": 8, "full_ids": torch.zeros((2, 6), dtype=torch.int32)},
+        tmp_path / "request_000000000008.pt",
+    )
+    assert rank3.should_defer_low_priority_maintenance() is True
+
+    diag = rank3.diagnostics()
+    assert diag["low_priority_maintenance_allows"] == 1
+    assert diag["low_priority_maintenance_defers"] == 2
+    assert diag["low_priority_maintenance_defer_pending_requests"] == 1
+    assert diag["low_priority_maintenance_defer_request_mailbox"] == 1
+
+
 def test_crct_mailbox_weight_snapshot_applies_latest_model(tmp_path) -> None:
     mod = _load_module("runner_fast_path_crct_mailbox_weights", RUNNER_PATH)
     kwargs = {

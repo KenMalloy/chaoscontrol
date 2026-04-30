@@ -1096,6 +1096,10 @@ def _crct_score_payload_inline(
     if "memory_residual" in score and "memory_gate" in score:
         payload["memory_residual"] = score["memory_residual"].detach().clone()
         payload["memory_gate"] = score["memory_gate"].detach().clone()
+        # rank3_score_batch_causal defines the packet gate as the same tensor
+        # as the CRCT controller target. The mailbox can transport that once
+        # and alias it back to memory_gate on the train rank.
+        payload["memory_gate_alias_target"] = True
     return payload
 
 
@@ -1362,7 +1366,18 @@ class _CrctAsyncTeacherTransport:
             "memory_packets_received": 0,
             "memory_packet_bytes_sent": 0,
             "memory_packet_bytes_received": 0,
+            "memory_packet_bytes_sent_max": 0,
+            "memory_packet_bytes_received_max": 0,
             "memory_packet_missing_payloads": 0,
+            "memory_packet_compact_residuals_sent": 0,
+            "memory_packet_compact_residuals_received": 0,
+            "memory_packet_sequence_residual_rejections": 0,
+            "memory_packet_residual_elements_max": 0,
+            "memory_packet_gate_elements_max": 0,
+            "memory_packet_lag_steps_sum": 0,
+            "memory_packet_lag_steps_max": 0,
+            "memory_packet_last_residual_shape": [],
+            "memory_packet_last_gate_shape": [],
             "sentinel_broadcasts": 0,
             "sentinels_received": 0,
             "stale_payloads_dropped": 0,
@@ -1919,7 +1934,20 @@ class _CrctMailboxTeacherTransport:
             "memory_packets_received": 0,
             "memory_packet_bytes_sent": 0,
             "memory_packet_bytes_received": 0,
+            "memory_packet_bytes_sent_max": 0,
+            "memory_packet_bytes_received_max": 0,
             "memory_packet_missing_payloads": 0,
+            "memory_packet_compact_residuals_sent": 0,
+            "memory_packet_compact_residuals_received": 0,
+            "memory_packet_gate_alias_target_sent": 0,
+            "memory_packet_gate_alias_target_received": 0,
+            "memory_packet_sequence_residual_rejections": 0,
+            "memory_packet_residual_elements_max": 0,
+            "memory_packet_gate_elements_max": 0,
+            "memory_packet_lag_steps_sum": 0,
+            "memory_packet_lag_steps_max": 0,
+            "memory_packet_last_residual_shape": [],
+            "memory_packet_last_gate_shape": [],
             "sentinel_broadcasts": 0,
             "sentinels_received": 0,
             "stale_payloads_dropped": 0,
@@ -2022,6 +2050,12 @@ class _CrctMailboxTeacherTransport:
             "fast_slow_slow_mirror_last_step": -1,
             "fast_slow_slow_mirror_version_lag_steps": 0,
             "fast_slow_slow_mirror_last_error": "",
+            "low_priority_maintenance_checks": 0,
+            "low_priority_maintenance_allows": 0,
+            "low_priority_maintenance_defers": 0,
+            "low_priority_maintenance_defer_pending_requests": 0,
+            "low_priority_maintenance_defer_request_mailbox": 0,
+            "low_priority_maintenance_last_reason": "",
         }
 
     def begin_step(
@@ -2213,6 +2247,12 @@ class _CrctMailboxTeacherTransport:
         out["score_seconds_mean"] = (
             float(out["score_seconds_sum"]) / float(scored) if scored else 0.0
         )
+        packets = int(out.get("memory_packets_received", 0))
+        out["memory_packet_lag_steps_mean"] = (
+            float(out["memory_packet_lag_steps_sum"]) / float(packets)
+            if packets
+            else 0.0
+        )
         return out
 
     def _refresh_fast_slow_slow_model(
@@ -2332,6 +2372,58 @@ class _CrctMailboxTeacherTransport:
                 dtype=src.dtype,
                 device="cpu",
             )
+
+    def _compact_memory_packet_residual_to_cpu(
+        self,
+        residual: torch.Tensor,
+    ) -> torch.Tensor:
+        residual_d = residual.detach()
+        if residual_d.dim() == 2:
+            residual_d = residual_d.unsqueeze(1)
+        if residual_d.dim() != 3 or int(residual_d.shape[1]) != 1:
+            self.metrics["memory_packet_sequence_residual_rejections"] += 1
+            self.metrics["last_drop_reason"] = "memory_packet_sequence_residual"
+            raise ValueError(
+                "memory_residual packets must be compact with shape "
+                f"(B, D) or (B, 1, D); got {tuple(residual.shape)}"
+            )
+        self.metrics["memory_packet_compact_residuals_sent"] += 1
+        self.metrics["memory_packet_residual_elements_max"] = max(
+            int(self.metrics["memory_packet_residual_elements_max"]),
+            int(residual_d.numel()),
+        )
+        self.metrics["memory_packet_last_residual_shape"] = list(residual_d.shape)
+        return residual_d.to(device="cpu", dtype=self.payload_dtype)
+
+    def should_defer_low_priority_maintenance(self) -> bool:
+        """Return True when rank-3 should publish packets before slot work."""
+        if self.rank != self.memory_rank:
+            return False
+        self.metrics["low_priority_maintenance_checks"] += 1
+        if self.pending_input_requests:
+            self.metrics["low_priority_maintenance_defers"] += 1
+            self.metrics["low_priority_maintenance_defer_pending_requests"] += 1
+            self.metrics["low_priority_maintenance_last_reason"] = "pending_request"
+            return True
+        try:
+            has_request_file = next(self.mailbox_dir.glob("request_*.pt"), None) is not None
+        except Exception as exc:
+            self.metrics["errors"] += 1
+            self.metrics["last_error"] = "".join(
+                traceback.format_exception_only(type(exc), exc)
+            ).strip()
+            self.metrics["low_priority_maintenance_last_reason"] = (
+                "request_mailbox_scan_error"
+            )
+            has_request_file = False
+        if has_request_file:
+            self.metrics["low_priority_maintenance_defers"] += 1
+            self.metrics["low_priority_maintenance_defer_request_mailbox"] += 1
+            self.metrics["low_priority_maintenance_last_reason"] = "request_mailbox"
+            return True
+        self.metrics["low_priority_maintenance_allows"] += 1
+        self.metrics["low_priority_maintenance_last_reason"] = "allowed"
+        return False
 
     def maybe_publish_weight_snapshot(
         self,
@@ -2788,11 +2880,12 @@ class _CrctMailboxTeacherTransport:
             self.metrics["last_drop_reason"] = "request_mailbox_read_error"
 
     def _write_result(self, *, request_step: int, scored: dict[str, torch.Tensor]) -> None:
+        target_cpu = scored["target"].detach().to(
+            device="cpu", dtype=self.payload_dtype
+        )
         payload = {
             "step": int(request_step),
-            "target": scored["target"].detach().to(
-                device="cpu", dtype=self.payload_dtype
-            ),
+            "target": target_cpu,
             "confidence": scored["confidence"].detach().to(
                 device="cpu", dtype=self.payload_dtype
             ),
@@ -2814,18 +2907,40 @@ class _CrctMailboxTeacherTransport:
         memory_residual = scored.get("memory_residual")
         memory_gate = scored.get("memory_gate")
         if isinstance(memory_residual, torch.Tensor) and isinstance(memory_gate, torch.Tensor):
-            payload["memory_residual"] = memory_residual.detach().to(
-                device="cpu", dtype=self.payload_dtype
+            payload["memory_residual"] = self._compact_memory_packet_residual_to_cpu(
+                memory_residual
             )
-            payload["memory_gate"] = memory_gate.detach().to(
-                device="cpu", dtype=self.payload_dtype
-            )
-            self.metrics["memory_packets_sent"] += 1
-            self.metrics["memory_packet_bytes_sent"] += int(
+            gate_alias_target = bool(scored.get("memory_gate_alias_target", False))
+            if gate_alias_target and tuple(memory_gate.shape) == tuple(scored["target"].shape):
+                payload["memory_gate_alias_target"] = True
+                gate_bytes = 0
+                self.metrics["memory_packet_gate_alias_target_sent"] += 1
+                self.metrics["memory_packet_last_gate_shape"] = ["alias:target"]
+            else:
+                payload["memory_gate"] = memory_gate.detach().to(
+                    device="cpu", dtype=self.payload_dtype
+                )
+                gate_bytes = int(
+                    payload["memory_gate"].numel()
+                    * payload["memory_gate"].element_size()
+                )
+                self.metrics["memory_packet_last_gate_shape"] = list(
+                    payload["memory_gate"].shape
+                )
+            residual_bytes = int(
                 payload["memory_residual"].numel()
                 * payload["memory_residual"].element_size()
-                + payload["memory_gate"].numel()
-                * payload["memory_gate"].element_size()
+            )
+            packet_bytes = residual_bytes + gate_bytes
+            self.metrics["memory_packets_sent"] += 1
+            self.metrics["memory_packet_bytes_sent"] += int(packet_bytes)
+            self.metrics["memory_packet_bytes_sent_max"] = max(
+                int(self.metrics["memory_packet_bytes_sent_max"]),
+                int(packet_bytes),
+            )
+            self.metrics["memory_packet_gate_elements_max"] = max(
+                int(self.metrics["memory_packet_gate_elements_max"]),
+                int(memory_gate.numel()),
             )
         else:
             self.metrics["memory_packet_missing_payloads"] += 1
@@ -2905,17 +3020,61 @@ class _CrctMailboxTeacherTransport:
                 payload["fast_slow_decision"] = fast_slow_decision_to_dict(decision)
             memory_residual = payload_cpu.get("memory_residual")
             memory_gate = payload_cpu.get("memory_gate")
+            gate_alias_target = bool(payload_cpu.get("memory_gate_alias_target", False))
+            if gate_alias_target:
+                memory_gate = payload_cpu.get("target")
             if isinstance(memory_residual, torch.Tensor) and isinstance(memory_gate, torch.Tensor):
-                payload["memory_residual"] = memory_residual.to(
+                residual = memory_residual
+                if residual.dim() == 2:
+                    residual = residual.unsqueeze(1)
+                if residual.dim() != 3 or int(residual.shape[1]) != 1:
+                    self.metrics["memory_packet_sequence_residual_rejections"] += 1
+                    self.metrics["last_drop_reason"] = (
+                        "memory_packet_sequence_residual_received"
+                    )
+                    continue
+                payload["memory_residual"] = residual.to(
                     device=self.device, dtype=torch.float32
                 )
                 payload["memory_gate"] = memory_gate.to(
                     device=self.device, dtype=torch.float32
                 )
+                residual_bytes = int(residual.numel() * residual.element_size())
+                gate_bytes = (
+                    0
+                    if gate_alias_target
+                    else int(memory_gate.numel() * memory_gate.element_size())
+                )
+                packet_bytes = residual_bytes + gate_bytes
                 self.metrics["memory_packets_received"] += 1
-                self.metrics["memory_packet_bytes_received"] += int(
-                    memory_residual.numel() * memory_residual.element_size()
-                    + memory_gate.numel() * memory_gate.element_size()
+                self.metrics["memory_packet_compact_residuals_received"] += 1
+                if gate_alias_target:
+                    self.metrics["memory_packet_gate_alias_target_received"] += 1
+                self.metrics["memory_packet_bytes_received"] += int(packet_bytes)
+                self.metrics["memory_packet_bytes_received_max"] = max(
+                    int(self.metrics["memory_packet_bytes_received_max"]),
+                    int(packet_bytes),
+                )
+                self.metrics["memory_packet_residual_elements_max"] = max(
+                    int(self.metrics["memory_packet_residual_elements_max"]),
+                    int(residual.numel()),
+                )
+                self.metrics["memory_packet_gate_elements_max"] = max(
+                    int(self.metrics["memory_packet_gate_elements_max"]),
+                    int(memory_gate.numel()),
+                )
+                self.metrics["memory_packet_lag_steps_sum"] += max(0, lag)
+                self.metrics["memory_packet_lag_steps_max"] = max(
+                    int(self.metrics["memory_packet_lag_steps_max"]),
+                    max(0, lag),
+                )
+                self.metrics["memory_packet_last_residual_shape"] = list(
+                    residual.shape
+                )
+                self.metrics["memory_packet_last_gate_shape"] = (
+                    ["alias:target"]
+                    if gate_alias_target
+                    else list(memory_gate.shape)
                 )
             inputs, targets = batch
             ready = (payload, inputs, targets)
@@ -9278,7 +9437,16 @@ def train_fast_for_budget(
             # bounded slot-work chunks from the rolling frame stream.
             if replay_eviction_loop is not None and rank_ == world_size_ - 1:
                 _crct_replay_cache_probe(replay_eviction_loop, model, steps)
-                if replay_eviction_loop.has_probe():
+                defer_low_priority = False
+                if crct_teacher_transport is not None:
+                    should_defer = getattr(
+                        crct_teacher_transport,
+                        "should_defer_low_priority_maintenance",
+                        None,
+                    )
+                    if callable(should_defer):
+                        defer_low_priority = bool(should_defer())
+                if replay_eviction_loop.has_probe() and not defer_low_priority:
                     replay_step = _crct_replay_tick_step(
                         replay_eviction_loop,
                         model,

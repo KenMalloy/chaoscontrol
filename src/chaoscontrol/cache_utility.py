@@ -660,6 +660,32 @@ def _autocast_for(device_type: str) -> Any:
     return contextlib.nullcontext()
 
 
+def _compact_memory_packet_residual(
+    residual: torch.Tensor,
+    *,
+    batch_size: int,
+) -> torch.Tensor:
+    """Normalize rank-3 memory packets to the trunk's compact residual lane."""
+    if residual.dim() == 2:
+        if int(residual.shape[0]) != int(batch_size):
+            raise ValueError(
+                "memory_residual packet batch mismatch: "
+                f"{tuple(residual.shape)} for batch {batch_size}"
+            )
+        return residual.unsqueeze(1)
+    if residual.dim() == 3:
+        if int(residual.shape[0]) != int(batch_size) or int(residual.shape[1]) != 1:
+            raise ValueError(
+                "memory_residual packets must be compact with shape "
+                f"(B, D) or (B, 1, D); got {tuple(residual.shape)}"
+            )
+        return residual
+    raise ValueError(
+        "memory_residual packets must be compact with shape (B, D) or (B, 1, D); "
+        f"got {tuple(residual.shape)}"
+    )
+
+
 @torch.inference_mode()
 def rank3_score_batch_causal(
     *,
@@ -751,7 +777,10 @@ def rank3_score_batch_causal(
     if memory_meta is not None:
         maybe_residual = memory_meta.get("memory_residual")
         if isinstance(maybe_residual, torch.Tensor):
-            memory_residual = maybe_residual.detach()
+            memory_residual = _compact_memory_packet_residual(
+                maybe_residual.detach(),
+                batch_size=int(x.shape[0]),
+            )
 
     if update_model_memory_after:
         append_fn = getattr(model, "append_memory_from_hidden", None)
