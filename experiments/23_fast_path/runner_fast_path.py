@@ -112,6 +112,7 @@ from chaoscontrol.optim.criticality import CriticalityDistillation  # noqa: E402
 from chaoscontrol.optim.semantic import SemanticOptimizer  # noqa: E402
 from chaoscontrol.precision import autocast_context  # noqa: E402
 from chaoscontrol.train_ssm import (  # noqa: E402
+    _compiled_packet_step_fn,
     _compiled_step_fn,
     _reject_unsupported,
     chunked_lm_head_backward,
@@ -6961,30 +6962,36 @@ def _run_train_step(
     # not paid by ``episodic_enabled=False`` runs.
     per_token_ce_for_episodic: torch.Tensor | None = None
     with autocast_context(precision, device_type=inputs.device.type):
+        packet_residual = (
+            crct_payload.get("memory_residual")
+            if crct_enabled and crct_payload is not None
+            else None
+        )
+        packet_gate = (
+            crct_payload.get("memory_gate")
+            if crct_enabled and crct_payload is not None
+            else None
+        )
         if compile_full_path:
-            if crct_enabled:
-                raise ValueError(
-                    "crct_enabled=True is incompatible with compile_full_path=True "
-                    "because CRCT trains through the explicit episodic packet "
-                    "lane rather than the compiled bare-trunk closure."
+            if (
+                crct_enabled
+                and isinstance(packet_residual, torch.Tensor)
+                and isinstance(packet_gate, torch.Tensor)
+            ):
+                hidden = _compiled_packet_step_fn()(
+                    model,
+                    inputs,
+                    packet_residual,
+                    packet_gate,
                 )
-            hidden = _compiled_step_fn()(model, inputs)
+            else:
+                hidden = _compiled_step_fn()(model, inputs)
         elif crct_enabled:
             # GPU3/CPU own the episodic memory decision plane. Train ranks
             # consume only the latest-complete residual packet through a fixed
             # pre-recurrence lane; when the teacher lags, ``packet`` is a
             # bit-identical zero-residual no-op. No local slot reads and no
             # token-wise controller MLP run on the trunk hot path.
-            packet_residual = (
-                crct_payload.get("memory_residual")
-                if crct_payload is not None
-                else None
-            )
-            packet_gate = (
-                crct_payload.get("memory_gate")
-                if crct_payload is not None
-                else None
-            )
             hidden = model.encode(
                 inputs,
                 memory_mode="packet",

@@ -442,6 +442,21 @@ def _encode_only(
     return model.encode(inputs)
 
 
+def _encode_packet_only(
+    model: torch.nn.Module,
+    inputs: torch.Tensor,
+    episodic_residual: torch.Tensor,
+    episodic_gate: torch.Tensor,
+) -> torch.Tensor:
+    """Compile target: encoder forward with the explicit memory packet lane."""
+    return model.encode(
+        inputs,
+        memory_mode="packet",
+        episodic_residual=episodic_residual,
+        episodic_gate=episodic_gate,
+    )
+
+
 @functools.cache
 def _compiled_step_fn() -> Callable[..., torch.Tensor]:
     """Compiled wrapper over ``_encode_only``, memoized so
@@ -476,6 +491,14 @@ def _compiled_step_fn() -> Callable[..., torch.Tensor]:
     """
     return torch.compile(
         _encode_only, fullgraph=True, dynamic=False,
+    )
+
+
+@functools.cache
+def _compiled_packet_step_fn() -> Callable[..., torch.Tensor]:
+    """Compiled wrapper over ``_encode_packet_only`` for ARM packet steps."""
+    return torch.compile(
+        _encode_packet_only, fullgraph=True, dynamic=False,
     )
 
 

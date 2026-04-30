@@ -130,7 +130,7 @@ def _crct_lock() -> dict[str, Any]:
         "retrieval_mode": "softmax_all",
         "retrieval_k": 16,
         "train_sampling_mode": "random",
-        "compile_full_path": False,
+        "compile_full_path": True,
         "cuda_graph_mode": "none",
         "crct_gradient_conflict_enabled": True,
         "crct_gradient_conflict_soft_gate_strength": 0.0,

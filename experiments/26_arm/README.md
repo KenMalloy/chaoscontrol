@@ -47,6 +47,10 @@ GPU0-2 graph compatibility comes from stable tensor addresses and shapes:
 the recurrent stream always has a residual input buffer and gate buffer. The
 contents may be zero, stale-but-safe, or latest-complete, but the trunk graph
 does not change shape and does not block waiting for a fresher packet.
+The train-rank encoder compile path has two static targets: the bare encoder
+for no-packet steps and the packet encoder for latest-complete residual steps.
+This keeps ARM on the compiled trunk path without making missing packets pay
+zero-residual packet math.
 
 `memory_mode="off"` remains valid only as an oracle/counterfactual mode: GPU3
 uses it to measure marginal memory value. It is not the final product path.

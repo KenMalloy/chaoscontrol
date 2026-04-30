@@ -80,6 +80,22 @@ class _TinyTrainStepModel(nn.Module):
         return self.encoder(inputs)
 
 
+class _TinyPacketTrainStepModel(_TinyTrainStepModel):
+    def encode(
+        self,
+        inputs: torch.Tensor,
+        *,
+        memory_mode: str = "packet",
+        episodic_residual: torch.Tensor | None = None,
+        episodic_gate: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        hidden = self.encoder(inputs)
+        if episodic_residual is None or episodic_gate is None:
+            return hidden
+        assert memory_mode == "packet"
+        return hidden + episodic_residual * episodic_gate.unsqueeze(-1)
+
+
 class _TinySemanticModel(nn.Module):
     def __init__(self):
         super().__init__()
@@ -1671,6 +1687,60 @@ def test_run_train_step_uses_compiled_encoder_when_enabled(monkeypatch):
     finally:
         if hasattr(train_ssm._compiled_step_fn, "cache_clear"):
             train_ssm._compiled_step_fn.cache_clear()
+
+
+def test_run_train_step_uses_compiled_packet_encoder_for_crct_payload(monkeypatch):
+    mod = _load_runner_module()
+    for fn in (train_ssm._compiled_step_fn, train_ssm._compiled_packet_step_fn):
+        if hasattr(fn, "cache_clear"):
+            fn.cache_clear()
+
+    compile_calls: list[tuple[str, bool, bool]] = []
+
+    def fake_compile(fn, *, fullgraph, dynamic):
+        compile_calls.append((fn.__name__, fullgraph, dynamic))
+
+        def compiled(*args):
+            compile_calls.append(("compiled", True, True))
+            return fn(*args)
+
+        return compiled
+
+    monkeypatch.setattr(mod.torch, "compile", fake_compile)
+
+    model = _TinyPacketTrainStepModel()
+    inputs = torch.randn(2, 3, 4)
+    targets = torch.zeros(2, 3, dtype=torch.long)
+    payload = {
+        "memory_residual": torch.randn(2, 1, 4),
+        "memory_gate": torch.ones(2, 3),
+        "loss_weight": torch.ones(2, 3),
+    }
+
+    try:
+        loss = mod._run_train_step(
+            model=model,
+            inputs=inputs,
+            targets=targets,
+            chunk_size=2,
+            precision="bf16",
+            ddp_active=False,
+            world_size=1,
+            compile_full_path=True,
+            lm_head_backward_mode="single",
+            crct_enabled=True,
+            crct_payload=payload,
+        )
+
+        assert loss.ndim == 0
+        assert compile_calls == [
+            ("_encode_packet_only", True, False),
+            ("compiled", True, True),
+        ]
+    finally:
+        for fn in (train_ssm._compiled_step_fn, train_ssm._compiled_packet_step_fn):
+            if hasattr(fn, "cache_clear"):
+                fn.cache_clear()
 
 
 def test_run_train_step_leaves_encoder_eager_when_compile_disabled(monkeypatch):
