@@ -164,6 +164,16 @@ class TestPodNativeExtensionBootstrap:
         assert 'export CPATH="$CUDNN_HOME/include:$CU13_HOME/include:${CPATH:-}"' in source
         assert "pip install \"${PIP_FLAGS[@]}\" numpy ninja packaging pyyaml" in source
 
+    def test_cuda13_setup_puts_nvcc_on_path_before_te(self) -> None:
+        """If TE falls back to source build, its setup hook needs nvcc
+        before the TransformerEngine pip install begins.
+        """
+        source = POD_SETUP.read_text()
+        nvcc_pos = source.index("==> 3c/5 installing nvcc/runtime pins before TE build")
+        te_pos = source.index("==> 4/5 installing TransformerEngine")
+        assert nvcc_pos < te_pos
+        assert 'export PATH="$CU13_HOME/bin:$PATH"' in source
+
     def test_bootstrap_defaults_to_exp27_val_cache_path(self) -> None:
         """The final scorer path is Exp27; the default cache name should
         not send fresh pods into the older Exp23 cache directory.

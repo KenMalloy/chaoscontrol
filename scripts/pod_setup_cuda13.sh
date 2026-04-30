@@ -180,6 +180,23 @@ export CPLUS_INCLUDE_PATH="$CUDNN_HOME/include:$CU13_HOME/include:${CPLUS_INCLUD
 export LIBRARY_PATH="$CUDNN_HOME/lib:$CU13_HOME/lib:${LIBRARY_PATH:-}"
 export LD_LIBRARY_PATH="$CUDNN_HOME/lib:$CU13_HOME/lib:${LD_LIBRARY_PATH:-}"
 
+echo "==> 3c/5 installing nvcc/runtime pins before TE build"
+# TransformerEngine's build-requirements hook may ask for CUDA version
+# information before it starts compiling. On Python/torch combos without a
+# matching prebuilt TE wheel, that hook needs a real nvcc on PATH; package
+# metadata alone has been insufficient on RunPod's CUDA 12 base images.
+pip install "${PIP_FLAGS[@]}" $NVIDIA_INDEX \
+    'nvidia-cuda-nvcc==13.2.78' \
+    'nvidia-nvvm==13.2.78' \
+    'nvidia-cuda-cccl==13.2.27'
+pip install "${PIP_FLAGS[@]}" $NVIDIA_INDEX --force-reinstall --no-deps \
+    'nvidia-cuda-runtime==13.2.75' \
+    'nvidia-cuda-nvrtc==13.2.78' \
+    'nvidia-cuda-cupti==13.2.75'
+ln -sf libcudart.so.13 "$CU13_LIB/libcudart.so"
+export PATH="$CU13_HOME/bin:$PATH"
+export NVCC_PREPEND_FLAGS=${NVCC_PREPEND_FLAGS:-"-DCCCL_DISABLE_CTK_COMPATIBILITY_CHECK"}
+
 echo "==> 4/5 installing TransformerEngine 2.13.0 (with NVIDIA index for cu13 deps)"
 # transformer_engine_torch is an sdist-only pybind11 extension that wraps
 # libtransformer_engine (which lives in the prebuilt transformer_engine_cu13
@@ -201,7 +218,7 @@ echo "==> 4b/5 force-pinning nvidia-cublas==13.4.0.1 (post-TE)"
 pip install "${PIP_FLAGS[@]}" $NVIDIA_INDEX --force-reinstall --no-deps \
     'nvidia-cublas==13.4.0.1'
 
-echo "==> 4c/5 installing nvcc + nvvm + cccl for bespoke ext build"
+echo "==> 4c/5 ensuring nvcc + nvvm + cccl for bespoke ext build"
 # The bespoke cuBLASLt fp8 extension ships a .cu kernel (fused_amax_cast),
 # so `python setup.py build_ext` needs nvcc and its tool chain. Keep the
 # three wheels at the SAME minor version (13.2.x): cicc (from nvvm) emits
