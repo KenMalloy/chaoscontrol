@@ -162,7 +162,7 @@ class TestPodNativeExtensionBootstrap:
         assert "CUDNN_HOME=$PY_SITEPKG/nvidia/cudnn" in source
         assert 'export CUDA_HOME="$CU13_HOME"' in source
         assert 'export CPATH="$CUDNN_HOME/include:$CU13_HOME/include:${CPATH:-}"' in source
-        assert "pip install \"${PIP_FLAGS[@]}\" numpy ninja packaging pyyaml" in source
+        assert "pip install \"${PIP_FLAGS[@]}\" numpy ninja packaging pyyaml wheel" in source
 
     def test_cuda13_setup_puts_nvcc_on_path_before_te(self) -> None:
         """If TE falls back to source build, its setup hook needs nvcc

@@ -173,7 +173,7 @@ echo "==> 3b/5 installing TE build helpers and exporting wheel CUDA headers"
 # otherwise discover /usr/local/cuda/include first and fail to find the
 # cudnn headers provided by nvidia-cudnn-cu13. Point the build at the
 # wheel-owned CUDA/CUDNN headers and libs before invoking the TE build.
-pip install "${PIP_FLAGS[@]}" numpy ninja packaging pyyaml
+pip install "${PIP_FLAGS[@]}" numpy ninja packaging pyyaml wheel
 export CUDA_HOME="$CU13_HOME"
 export CPATH="$CUDNN_HOME/include:$CU13_HOME/include:${CPATH:-}"
 export CPLUS_INCLUDE_PATH="$CUDNN_HOME/include:$CU13_HOME/include:${CPLUS_INCLUDE_PATH:-}"
@@ -263,7 +263,7 @@ echo "$CU13_LIB" > /etc/ld.so.conf.d/cuda13.conf
 ldconfig
 
 echo "==> installing remaining deps and chaoscontrol (editable)"
-pip install "${PIP_FLAGS[@]}" sentencepiece numpy pytest
+pip install "${PIP_FLAGS[@]}" sentencepiece numpy pytest wheel
 if [ -f "$REPO_ROOT/pyproject.toml" ] || [ -f "$REPO_ROOT/setup.py" ]; then
     cd "$REPO_ROOT"
     # The editable install triggers setup.py build_ext for the bespoke
