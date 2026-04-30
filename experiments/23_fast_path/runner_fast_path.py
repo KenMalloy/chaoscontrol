@@ -168,6 +168,9 @@ from runner_exp17 import (  # noqa: E402
     build_sentencepiece_luts,
     evaluate_bpb_sp,
 )
+import chaoscontrol.eval.calc_types  # noqa: F401, E402  (registers calc_types)
+from chaoscontrol.eval.runner_dispatch import dispatch_eval_for_config  # noqa: E402
+from chaoscontrol.eval_stream.val_cache import load_val_cache  # noqa: E402
 from runner_exp21 import (  # noqa: E402
     _apply_embed_init,
     _save_output_ckpt,
@@ -10380,6 +10383,7 @@ def run_condition(
     output_json: str | None,
     output_ckpt: str | None,
     world_size_override: int | None,
+    val_cache_dir: str | None = None,
 ) -> dict[str, Any]:
     rank, world_size, local_rank = _init_distributed(world_size_override)
     is_rank0 = rank == 0
@@ -10984,10 +10988,21 @@ def run_condition(
         dist.barrier()
 
     eval_result: dict[str, Any] = {}
-    if is_rank0 and eval_batches > 0:
-        eval_result = evaluate_bpb_sp(
-            model,
-            tokens=val_tokens,
+    calc_types_requested = list(config.get("calc_types") or [])
+    if is_rank0 and (eval_batches > 0 or calc_types_requested):
+        val_cache = None
+        if calc_types_requested:
+            if not val_cache_dir:
+                raise ValueError(
+                    "config sets calc_types but --val-cache-dir was not "
+                    "provided to the runner"
+                )
+            val_cache = load_val_cache(Path(val_cache_dir))
+        eval_result = dispatch_eval_for_config(
+            config,
+            model=model,
+            val_cache=val_cache,
+            val_tokens=val_tokens,
             eval_starts=eval_starts,
             batch_size=batch_size,
             seq_len=seq_len,
@@ -10995,6 +11010,7 @@ def run_condition(
             base_bytes_lut=base_bytes_lut,
             has_leading_space_lut=has_leading_space_lut,
             is_boundary_token_lut=is_boundary_token_lut,
+            legacy_evaluate_fn=evaluate_bpb_sp,
         )
 
     if ddp_active:
@@ -11072,6 +11088,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--output-json", default=None)
     parser.add_argument("--output-ckpt", default=None)
     parser.add_argument("--world-size", type=int, default=None)
+    parser.add_argument(
+        "--val-cache-dir",
+        default=None,
+        help="Path to a ValCache directory (tokens.npy/docs.npy/manifest.json). "
+        "Required when the config sets calc_types.",
+    )
     args = parser.parse_args(argv)
 
     config = yaml.safe_load(Path(args.config).read_text())
@@ -11088,6 +11110,7 @@ def main(argv: list[str] | None = None) -> int:
         output_json=args.output_json,
         output_ckpt=args.output_ckpt,
         world_size_override=args.world_size,
+        val_cache_dir=args.val_cache_dir,
     )
     return 0
 
