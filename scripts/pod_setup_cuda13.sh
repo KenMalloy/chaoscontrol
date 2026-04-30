@@ -49,7 +49,10 @@
 #     but missing sentencepiece / pytest / editable chaoscontrol install
 #     would hit the fast-path, declare "Pod ready," and then immediately
 #     fail the first test import. The probe below covers every dep the
-#     full install below produces.
+#     full install below produces. The CPU SSM controller's CUDA
+#     write-event pack is deliberately optional here: it is built only when
+#     nvcc's CUDA major.minor matches torch.version.cuda. A mismatched pod
+#     should be ready with the CPU-only controller path, not fail setup.
 #
 # Dead-ends we tried that did NOT work — do not copy from shell history:
 #   - transformer-engine==1.13 / 1.14 / 2.1 / 2.12 (source builds need
@@ -120,23 +123,17 @@ import chaoscontrol  # noqa: F401 — editable install present
 # extension is absent.
 from chaoscontrol.kernels._cublaslt import _C  # noqa: F401
 from chaoscontrol.kernels._ssm_scan import _C as _ssm_scan_C  # noqa: F401
-# CPU SSM controller (AMX BF16 backend) — load the C extension and
-# verify the CUDA write-event pack is available. Without the latter,
-# episodic-on-CUDA runs fall back to the legacy CPU producer path,
-# which is the silent regression that ate $30 of pod time on
-# 2026-04-27 (see docs/reports/2026-04-27-step3-results.md).
+# CPU SSM controller (AMX BF16 backend) — load the C extension. The
+# CUDA write-event pack availability is reported in the smoke check below;
+# setup_ext.py refuses mismatched nvcc/torch CUDA builds and cleanly builds
+# the CPU-only controller in that case.
 from chaoscontrol.kernels import _cpu_ssm_controller as _cpu_ext
-assert _cpu_ext.write_event_cuda_pack_available(), (
-    "CPU SSM controller built without write_event_pack.cu; rebuild "
-    "with CHAOSCONTROL_CPU_SSM_CUDA_WRITE_EVENT=1 + matched cu13 "
-    "runtime pins (see step 4e of pod_setup_cuda13.sh)"
-)
 _ = te.Linear(16, 16, device='cuda' if torch.cuda.is_available() else 'cpu')
 PROBE
 then
     echo "    torch + TE + sentencepiece + numpy + pytest + chaoscontrol all import;"
-    echo "    cuBLASLt fp8 + SSM scan extensions importable; CPU SSM controller has"
-    echo "    the CUDA write-event pack; TE Linear constructs — skipping reinstall."
+    echo "    cuBLASLt fp8 + SSM scan extensions importable; CPU SSM controller loads;"
+    echo "    TE Linear constructs — skipping reinstall."
     echo "    (force-reinstall by removing one of the above imports from the pod.)"
     echo ""
     echo "Pod ready."
@@ -235,10 +232,11 @@ if [ -f "$REPO_ROOT/pyproject.toml" ] || [ -f "$REPO_ROOT/setup.py" ]; then
     # nvcc bin dir to PATH and point CUDA_HOME at the cu13 umbrella so
     # nvcc finds cccl headers and its own ptxas. MAX_JOBS fans the 9 TUs
     # out across ninja workers instead of compiling them serially.
-    # CHAOSCONTROL_CPU_SSM_CUDA_WRITE_EVENT=1 forces the .cu file into
-    # the _cpu_ssm_controller build (the auto-detect via
-    # torch.utils.cpp_extension.CUDA_HOME would also pick it up here, but
-    # explicit is safer for repeatable pod setups).
+    # The CPU SSM controller build auto-enables write_event_pack.cu only
+    # when nvcc's CUDA major.minor matches torch.version.cuda. Do not force
+    # CHAOSCONTROL_CPU_SSM_CUDA_WRITE_EVENT=1 here: PyTorch cu130 plus a
+    # 13.2 toolkit is a valid setup, but forcing the pack would correctly
+    # fail because the CUDA ABIs do not match.
     # NVCC_PREPEND_FLAGS=-DCCCL_DISABLE_CTK_COMPATIBILITY_CHECK is a
     # belt-and-suspenders against the cccl header version check —
     # step 4e's runtime pins should make it unnecessary, but the bypass
@@ -246,7 +244,6 @@ if [ -f "$REPO_ROOT/pyproject.toml" ] || [ -f "$REPO_ROOT/setup.py" ]; then
     MAX_JOBS=$(nproc) \
     PATH="$CU13_LIB/../bin:$PATH" \
     CUDA_HOME="$CU13_LIB/.." \
-    CHAOSCONTROL_CPU_SSM_CUDA_WRITE_EVENT=1 \
     NVCC_PREPEND_FLAGS=-DCCCL_DISABLE_CTK_COMPATIBILITY_CHECK \
         pip install \
             -e . --no-deps --no-build-isolation
@@ -287,6 +284,12 @@ if torch.cuda.is_available():
     update = torch.randn(2, 4, 8, device="cuda", dtype=torch.bfloat16)
     y = ssm_scan_forward(decay, update)
     print(f"ssm scan smoke OK: y.shape={tuple(y.shape)} dtype={y.dtype}")
+
+    from chaoscontrol.kernels import _cpu_ssm_controller as cpu_ext
+    print(
+        "cpu ssm controller smoke OK: "
+        f"cuda_write_event_pack={cpu_ext.write_event_cuda_pack_available()}"
+    )
 else:
     print("no CUDA device visible; fp8 smoke skipped")
 PY

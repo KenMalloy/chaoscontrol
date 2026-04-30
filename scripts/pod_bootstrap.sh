@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
 # One-command pod bootstrap. After cloning the repo to /workspace, run:
 #
-#     HF_TOKEN=hf_... bash scripts/pod_bootstrap.sh
+#     bash scripts/pod_bootstrap.sh
+#
+# Add `CHAOSCONTROL_BUILD_VAL_CACHE=1 HF_TOKEN=hf_...` only when the
+# full Exp20 scorer val cache is needed.
 #
 # The script is idempotent — re-running on a partially-set-up pod skips
 # anything that's already done.
@@ -10,13 +13,17 @@
 #   1. CUDA 13 + TE 2.13 + chaoscontrol editable install (calls
 #      pod_setup_cuda13.sh which is itself idempotent)
 #   2. Build/smoke native extensions from the current repo checkout
+#      (CUDA write-event pack is optional and depends on toolkit/PyTorch
+#      CUDA minor-version agreement; the CPU controller extension itself is
+#      required)
 #   3. Install huggingface-hub + requests in the venv
 #   4. Fetch SP16384 train+val shards + tokenizer (Natooka)
-#   5. Stream first 50k docs of docs_selected.jsonl (willdepueoai)
-#   6. Build val cache for Exp 20 fast scorer
-#   7. Smoke-import everything to confirm the pod is fire-ready
+#   5. Optionally stream first 50k docs and build the Exp20 scorer val cache
+#      (set CHAOSCONTROL_BUILD_VAL_CACHE=1; not required for Exp26)
+#   6. Smoke-import everything to confirm the pod is fire-ready
 #
-# Total wall on a fresh pod: ~15 min (most of it pod_setup pip installs).
+# Total wall on a fresh pod: ~15 min for Exp26 readiness (most of it
+# pod_setup pip installs), plus optional val-cache time if requested.
 #
 # Reproducibility: every dependency, env var, and download path is
 # captured here. The next pod is one bash invocation away from ready.
@@ -27,6 +34,7 @@ REPO_ROOT=${REPO_ROOT:-/workspace/chaoscontrol}
 WORKSPACE_VENV=${WORKSPACE_VENV:-/workspace/venv}
 VAL_CACHE_DIR=${VAL_CACHE_DIR:-/workspace/cache/exp23_val_16384}
 HF_TOKEN_REQUIRED=${HF_TOKEN_REQUIRED:-1}
+CHAOSCONTROL_BUILD_VAL_CACHE=${CHAOSCONTROL_BUILD_VAL_CACHE:-0}
 
 if [ ! -d "$REPO_ROOT" ]; then
     echo "ERROR: $REPO_ROOT not found. Clone the repo first:" >&2
@@ -44,43 +52,46 @@ bash scripts/pod_setup_cuda13.sh
 source "$WORKSPACE_VENV/bin/activate"
 
 echo ""
-echo "==> Step 2/7: build/smoke native extensions"
+echo "==> Step 2/6: build/smoke native extensions"
 bash scripts/pod_build_native_extensions.sh
 
 echo ""
-echo "==> Step 3/7: install huggingface-hub + requests in venv"
+echo "==> Step 3/6: install huggingface-hub + requests in venv"
 # Idempotent: pip skips if up-to-date.
 pip install --only-binary=:all: huggingface-hub requests
 
 echo ""
-echo "==> Step 4/7: fetch SP16384 train+val shards + tokenizer"
+echo "==> Step 4/6: fetch SP16384 train+val shards + tokenizer"
 python "$REPO_ROOT/scripts/fetch_sp16384_dataset.py"
 
 echo ""
-echo "==> Step 5/7: stream first 50k docs of docs_selected.jsonl"
-if [ -z "${HF_TOKEN:-}" ] && [ "$HF_TOKEN_REQUIRED" = "1" ]; then
-    echo "ERROR: HF_TOKEN env var required (willdepueoai/parameter-golf is auth-only)" >&2
-    echo "  HF_TOKEN=hf_... bash scripts/pod_bootstrap.sh" >&2
-    exit 1
-fi
-python "$REPO_ROOT/scripts/stream_docs_selected.py"
+echo "==> Step 5/6: optional Exp20 scorer val cache"
+if [ "$CHAOSCONTROL_BUILD_VAL_CACHE" = "1" ]; then
+    echo "    CHAOSCONTROL_BUILD_VAL_CACHE=1, streaming docs and building cache"
+    if [ -z "${HF_TOKEN:-}" ] && [ "$HF_TOKEN_REQUIRED" = "1" ]; then
+        echo "ERROR: HF_TOKEN env var required (willdepueoai/parameter-golf is auth-only)" >&2
+        echo "  HF_TOKEN=hf_... CHAOSCONTROL_BUILD_VAL_CACHE=1 bash scripts/pod_bootstrap.sh" >&2
+        exit 1
+    fi
+    python "$REPO_ROOT/scripts/stream_docs_selected.py"
 
-echo ""
-echo "==> Step 6/7: build val cache (50k docs, SP16384 tokenizer)"
-DOCS_JSONL="$REPO_ROOT/baselines/parameter_golf/datasets/docs_selected.jsonl"
-SP_MODEL="$REPO_ROOT/baselines/parameter_golf/tokenizers/fineweb_16384_bpe.model"
-if [ -f "$VAL_CACHE_DIR/manifest.json" ]; then
-    echo "    val cache already built at $VAL_CACHE_DIR — skipping"
+    DOCS_JSONL="$REPO_ROOT/baselines/parameter_golf/datasets/docs_selected.jsonl"
+    SP_MODEL="$REPO_ROOT/baselines/parameter_golf/tokenizers/fineweb_16384_bpe.model"
+    if [ -f "$VAL_CACHE_DIR/manifest.json" ]; then
+        echo "    val cache already built at $VAL_CACHE_DIR — skipping"
+    else
+        python "$REPO_ROOT/scripts/build_exp20_val_cache.py" \
+            --jsonl-path "$DOCS_JSONL" \
+            --sp-model-path "$SP_MODEL" \
+            --cache-dir "$VAL_CACHE_DIR" \
+            --max-docs 50000
+    fi
 else
-    python "$REPO_ROOT/scripts/build_exp20_val_cache.py" \
-        --jsonl-path "$DOCS_JSONL" \
-        --sp-model-path "$SP_MODEL" \
-        --cache-dir "$VAL_CACHE_DIR" \
-        --max-docs 50000
+    echo "    skipping; set CHAOSCONTROL_BUILD_VAL_CACHE=1 for full scorer cache setup"
 fi
 
 echo ""
-echo "==> Step 7/7: smoke check"
+echo "==> Step 6/6: smoke check"
 python - <<'PY'
 import torch
 from chaoscontrol.kernels import _cpu_ssm_controller as cpu_ext
@@ -93,10 +104,11 @@ PY
 
 echo ""
 echo "Pod ready. Launch the matrix with:"
-echo "  EPISODIC_CONTROLLER_V1_WEIGHTS_PATH=$REPO_ROOT/experiments/25_controller_pretrain/simplex_policy_v1.cswg \\"
-echo "    python $REPO_ROOT/experiments/24_training_time_bundle/run_exp24.py \\"
-echo "    --matrix episodic_controller_v1 --limit 18 \\"
-echo "    --full-val-score --val-cache-dir $VAL_CACHE_DIR --val-budget-seconds 600"
+echo "  PYTHONPATH=$REPO_ROOT/src \\"
+echo "    python $REPO_ROOT/experiments/26_arm/profile_exp26.py \\"
+echo "    --world-size 4 --arm both --budget 45 \\"
+echo "    --results-dir $REPO_ROOT/experiments/26_arm/validation/profile_4h100_both_45s"
 echo ""
-echo "(scp simplex_policy_v1.cswg from your local Mac before launch — it's"
-echo " gitignored and not on HF.)"
+echo "For the fixed canary:"
+echo "  PYTHONPATH=$REPO_ROOT/src \\"
+echo "    python $REPO_ROOT/experiments/26_arm/run_exp26.py --world-size 4 --budget 45"

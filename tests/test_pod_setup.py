@@ -92,12 +92,25 @@ class TestPodNativeExtensionBootstrap:
         assert "from chaoscontrol.kernels._ssm_scan import _C" in source
         assert "write_event_cuda_pack_available()" in source
 
+    def test_one_command_bootstrap_keeps_val_cache_optional(self) -> None:
+        """Exp26 setup needs SP16384 shards, not the full scorer val cache.
+        The HF-token-gated docs stream should only run when explicitly
+        requested.
+        """
+        source = POD_BOOTSTRAP.read_text()
+        assert "CHAOSCONTROL_BUILD_VAL_CACHE=${CHAOSCONTROL_BUILD_VAL_CACHE:-0}" in source
+        assert 'if [ "$CHAOSCONTROL_BUILD_VAL_CACHE" = "1" ]; then' in source
+        assert "stream_docs_selected.py" in source
+        assert "build_exp20_val_cache.py" in source
+        assert "not required for Exp26" in source
+
     def test_native_extension_helper_pins_cuda_home_and_builds_all_required_extensions(
         self,
     ) -> None:
         """The helper encodes the H100 pod lesson: nvcc may exist under
         /usr/local/cuda-12.8 without being on PATH, and the CPU SSM
-        controller must be built with the CUDA write-event pack.
+        controller must build whether the CUDA write-event pack is
+        auto-enabled or explicitly unavailable.
         """
         source = POD_BUILD_NATIVE_EXTENSIONS.read_text()
         assert "/usr/local/cuda-12.8" in source
@@ -110,3 +123,22 @@ class TestPodNativeExtensionBootstrap:
         assert "src/chaoscontrol/kernels/_cpu_ssm_controller/setup_ext.py" in source
         assert "src/chaoscontrol/kernels/_ssm_scan/setup_ext.py" in source
         assert "write_event_cuda_pack_available()" in source
+
+    def test_native_extension_helper_does_not_force_write_event_pack(self) -> None:
+        """Default pod setup should not force a CUDA pack build against a
+        mismatched toolkit. setup_ext.py owns the ABI decision: matched
+        torch/nvcc versions build the pack, mismatches build the explicit
+        CPU-only controller.
+        """
+        source = POD_BUILD_NATIVE_EXTENSIONS.read_text()
+        assert "CHAOSCONTROL_CPU_SSM_CUDA_WRITE_EVENT=${" not in source
+        assert "write pack:  ${CHAOSCONTROL_CPU_SSM_CUDA_WRITE_EVENT:-auto}" in source
+
+    def test_cuda13_setup_does_not_force_write_event_pack(self) -> None:
+        """The full CUDA13 setup path must stay compatible with torch cu130
+        plus a non-13.0 toolkit by leaving the write-event pack on auto.
+        """
+        source = POD_SETUP.read_text()
+        assert "\n    CHAOSCONTROL_CPU_SSM_CUDA_WRITE_EVENT=1 \\\n" not in source
+        assert "write_event_cuda_pack_available()" in source
+        assert "auto-enables write_event_pack.cu" in source

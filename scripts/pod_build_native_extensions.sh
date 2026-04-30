@@ -14,6 +14,14 @@
 #   WORKSPACE_VENV=/workspace/venv
 #   CUDA_HOME=/usr/local/cuda-12.8
 #   CHAOSCONTROL_CUDA_ARCH_LIST=9.0
+#   CHAOSCONTROL_CPU_SSM_CUDA_WRITE_EVENT=0|1
+#
+# The CPU SSM controller auto-enables write_event_pack.cu only when nvcc's
+# CUDA major.minor matches torch.version.cuda. Leave
+# CHAOSCONTROL_CPU_SSM_CUDA_WRITE_EVENT unset for the normal pod path: matched
+# toolkits build the pack, mismatched toolkits build the explicit CPU-only
+# controller. Set it to 1 only when you want a fail-fast assertion that the
+# toolkit matches PyTorch.
 
 set -euo pipefail
 
@@ -93,7 +101,6 @@ if [ -z "${CHAOSCONTROL_CPU_SSM_X86_ACCEL:-}" ]; then
         export CHAOSCONTROL_CPU_SSM_X86_ACCEL=0
     fi
 fi
-export CHAOSCONTROL_CPU_SSM_CUDA_WRITE_EVENT=${CHAOSCONTROL_CPU_SSM_CUDA_WRITE_EVENT:-1}
 
 echo "==> native extension build config"
 echo "    repo:        $REPO_ROOT"
@@ -102,7 +109,7 @@ echo "    torch cuda:  $TORCH_CUDA"
 echo "    CUDA_HOME:   $CUDA_HOME"
 echo "    arch list:   $CHAOSCONTROL_CUDA_ARCH_LIST"
 echo "    x86 accel:   $CHAOSCONTROL_CPU_SSM_X86_ACCEL"
-echo "    write pack:  $CHAOSCONTROL_CPU_SSM_CUDA_WRITE_EVENT"
+echo "    write pack:  ${CHAOSCONTROL_CPU_SSM_CUDA_WRITE_EVENT:-auto}"
 python - <<'PY'
 import torch
 print(f"    cuda ok:     {torch.cuda.is_available()} ({torch.cuda.device_count()} device(s))")
@@ -127,9 +134,6 @@ from chaoscontrol.kernels._ssm_scan import _C as ssm_scan_C  # noqa: F401
 from chaoscontrol.kernels import _cpu_ssm_controller as cpu_ext
 
 assert torch.cuda.is_available(), "CUDA is not visible after extension build"
-assert cpu_ext.write_event_cuda_pack_available(), (
-    "CPU SSM controller extension loaded, but CUDA write-event pack is absent"
-)
 print("    _lm_head_loss:         OK")
 print("    _ssm_scan:             OK")
 print("    cpu_ssm_controller:    OK")
