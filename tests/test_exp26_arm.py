@@ -84,6 +84,7 @@ def test_validation_active_is_full_arm_not_crct_only_or_shadow():
     assert active["replay_eviction_commit_policy"] == "learned"
     assert active["replay_eviction_scoring_mode"] == "oracle"
     assert active["crct_teacher_score_interval_steps"] == 1
+    assert active["crct_memory_write_tokens_per_step"] == 32
     assert "crct_async_teacher_pending_batches" not in active
     assert "crct_async_teacher_max_lag_steps" not in active
     assert active["compile_full_path"] is False

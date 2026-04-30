@@ -115,7 +115,11 @@ def _crct_lock() -> dict[str, Any]:
         "crct_ema_beta": 0.95,
         "crct_max_price": 0.50,
         "crct_plasticity_budget_strength": 0.25,
-        "crct_memory_write_tokens_per_step": 128,
+        # Keep GPU3 targeted: score every arrived request if possible, then
+        # write only the highest-utility residuals. A 128-token write budget
+        # made append_memory a first-order stage cost on 8xH100 profiles,
+        # starving later packets without improving freshness.
+        "crct_memory_write_tokens_per_step": 32,
         "crct_async_teacher_transport": True,
         "crct_async_teacher_transport_backend": "mailbox",
         "crct_async_teacher_payload_dtype": "auto",
