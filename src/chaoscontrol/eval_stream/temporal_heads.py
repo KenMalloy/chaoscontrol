@@ -100,11 +100,11 @@ def update_online_exp_weighted_log_weights(
         )
     token_log_probs = torch.stack(
         [
-            logp.gather(-1, target.unsqueeze(-1)).squeeze(-1)
+            logp.gather(-1, target.to(device=logp.device).unsqueeze(-1)).squeeze(-1)
             for logp in head_log_probs
         ],
         dim=1,
-    )
+    ).to(device=log_weights.device)
     return torch.log_softmax(
         log_weights + float(eta) * token_log_probs,
         dim=1,

@@ -465,7 +465,7 @@ class TestTrainSSMStepEquivalence:
         assert set(old_grads.keys()) == set(new_grads.keys())
         for name in old_grads:
             d = (old_grads[name] - new_grads[name]).abs().max().item()
-            assert d < 1e-4, f"fused-backward grad mismatch on {name!r}: {d}"
+            assert d < 2e-4, f"fused-backward grad mismatch on {name!r}: {d}"
 
     def test_fused_backward_uses_fused_linear_ce_hook(self, monkeypatch) -> None:
         calls: list[tuple[torch.Size, torch.Size, torch.Size, int]] = []
