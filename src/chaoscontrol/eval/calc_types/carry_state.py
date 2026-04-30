@@ -20,6 +20,13 @@ from chaoscontrol.eval.ttt_eval import (
 )
 
 
+def _lm_logits(model: torch.nn.Module, hidden: torch.Tensor) -> torch.Tensor:
+    final_norm = getattr(model, "final_norm", None)
+    if final_norm is not None:
+        hidden = final_norm(hidden)
+    return model.lm_head(hidden)
+
+
 @register_calc_type(
     "carry_state",
     requires_source_order=True,
@@ -68,7 +75,7 @@ def carry_state(ctx: CalcTypeContext) -> CalcTypeResult:
                     initial_states=prev_states,
                     return_final_states=True,
                 )
-                logits = model.lm_head(hidden)
+                logits = _lm_logits(model, hidden)
                 ce_sum = F.cross_entropy(
                     logits[:, :-1].reshape(-1, logits.size(-1)),
                     input_ids[:, 1:].reshape(-1),

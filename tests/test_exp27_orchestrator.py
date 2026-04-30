@@ -75,6 +75,7 @@ def test_analyze_writes_manifest_with_required_keys(tmp_path, calibrate):
     loaded = json.loads(manifest_path.read_text())
     assert set(loaded["calc_type_hyperparams"].keys()) == {
         "score_only_reset",
+        "adaptive_carry",
         "carry_state",
         "dreamworld_eval",
     }
@@ -148,10 +149,9 @@ def test_matrix_entries_carry_default_calc_types_and_hyperparams(
         configs = entry["calc_type_configs"]
         assert set(configs.keys()) == set(exp27.CALC_TYPES_DEFAULT)
         # Stub defaults survive the round-trip into the entry.
-        assert configs["carry_state"]["decay"] == 1.0
-        assert configs["dreamworld_eval"]["K"] == 8
-        assert configs["dreamworld_eval"]["L"] == 64
-        assert configs["dreamworld_eval"]["per_doc_reset"] is True
+        assert configs["adaptive_carry"]["decay"] == 1.0
+        assert configs["adaptive_carry"]["horizon_shifts"] == [-0.5, 0.0, 0.5]
+        assert configs["adaptive_carry"]["online_eta"] == 1.0
         # Default checkpoint_path is None until the orchestrator sets it.
         assert entry["checkpoint_path"] is None
         # World size + budget land in the entry.
@@ -197,19 +197,19 @@ def test_matrix_missing_manifest_raises(tmp_path, exp27, speed_config):
         )
 
 
-def test_matrix_checkpoint_path_lands_in_entry(
+def test_matrix_checkpoint_path_fails_loud_until_runner_load_is_wired(
     tmp_path, exp27, calibrate, speed_config
 ):
     manifest_path = tmp_path / "manifest.json"
     _write_stub_manifest(manifest_path, calibrate)
     ckpt = tmp_path / "winner.pt"
-    entries = exp27.build_ttt_headline_matrix(
-        speed_config=speed_config,
-        calibration_manifest_path=manifest_path,
-        checkpoint_path=ckpt,
-        seed_values=[1337],
-    )
-    assert entries[0]["checkpoint_path"] == str(ckpt)
+    with pytest.raises(NotImplementedError, match="checkpoint_path"):
+        exp27.build_ttt_headline_matrix(
+            speed_config=speed_config,
+            calibration_manifest_path=manifest_path,
+            checkpoint_path=ckpt,
+            seed_values=[1337],
+        )
 
 
 # ---- orchestrator dry-run isolation ----------------------------------------

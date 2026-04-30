@@ -1,9 +1,8 @@
 # Exp27 TTT Headline
 
 Test-time-training headline measurement on the winning trunk from exp26.
-A single trained trunk per seed runs three calc_types as separate 600s
-eval sessions; the spread between sessions tells us which TTT strategies
-clear the no-TTT floor.
+A single trained trunk per seed runs the score-only floor and the strongest
+eval-time adaptation candidate: packet-clean adaptive carry.
 
 ## Three-stage discipline
 
@@ -31,6 +30,7 @@ the exp26 winner.
 | Calc_type | What it does | Source order | Grad |
 |---|---|---|---|
 | `score_only_reset` | reset SSM state per doc, no params changed; the floor | no | no |
+| `adaptive_carry` | carry SSM state and causally mix fast/base/slow recurrent horizons | yes | no |
 | `carry_state` | SSM state continues across docs (optional decay) | yes | no |
 | `dreamworld_eval` | per-doc dream rollout + backward + SGD step | no | yes |
 
@@ -43,6 +43,12 @@ runner passes `source_order_preserved=True`. Future code that shuffles
 the cache must pass `False` and the dispatcher will refuse to run any
 order-sensitive calc_type. Each calc_type body manages its own grad
 scope.
+
+`adaptive_carry` is the default TTT candidate for final runs. It calls
+`model.encode(memory_mode="packet")` and `lm_head` directly, so it stays
+on the same packet-clean trunk lane as training and cannot silently use
+the legacy direct sidecar read path. The online head mixer is token-causal:
+token `t` is scored with weights learned from tokens `< t`.
 
 `dreamworld_eval` rejects `per_doc_reset=False` until a separate
 continual variant is registered with `requires_source_order=True` —
@@ -59,9 +65,9 @@ design conversation, not part of this experiment.
 
 ## Reading the matrix
 
-- `score_only_reset` -> `carry_state`: does state-carry across docs help?
-- `score_only_reset` -> `dreamworld_eval`: does per-doc self-distill TTT
-  help?
+- `score_only_reset` -> `adaptive_carry`: does causal recurrent-state TTT help?
+- `score_only_reset` -> `carry_state`: does raw state-carry across docs help?
+- `score_only_reset` -> `dreamworld_eval`: does per-doc self-distill TTT help?
 
 The floor is the same checkpoint each calc_type rides on, so deltas
 isolate the eval-time strategy from anything training-time.
@@ -98,11 +104,7 @@ python experiments/27_ttt_headline/run_exp27.py --stage headline
 
 # Restrict the headline to a subset of calc_types.
 python experiments/27_ttt_headline/run_exp27.py --stage headline \
-    --calc-types score_only_reset carry_state
-
-# Target an existing checkpoint instead of training fresh per seed.
-python experiments/27_ttt_headline/run_exp27.py --stage headline \
-    --checkpoint-path /path/to/exp26_winner.pt
+    --calc-types score_only_reset adaptive_carry
 
 # Dry-run any stage; prints entries and returns without touching disk.
 python experiments/27_ttt_headline/run_exp27.py --stage all --dry-run
@@ -115,6 +117,8 @@ writes a manifest of default hyperparameters and records `source_trace
 = "stub"`. The defaults are:
 
 - `score_only_reset`: `{}`
+- `adaptive_carry`: `{"horizon_shifts": [-0.5, 0.0, 0.5],
+  "online_eta": 1.0, "decay": 1.0}`
 - `carry_state`: `{"decay": 1.0}`
 - `dreamworld_eval`: `{"K": 8, "L": 64, "lr": 0.001, "steps": 1,
   "per_doc_reset": True, "dream_target_mode": "argmax",

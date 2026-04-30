@@ -32,6 +32,11 @@ def _default_calc_type_hyperparams() -> dict[str, dict[str, Any]]:
     """Sensible defaults that fit the 600s eval budget on the locked trunk."""
     return {
         "score_only_reset": {},
+        "adaptive_carry": {
+            "horizon_shifts": [-0.5, 0.0, 0.5],
+            "online_eta": 1.0,
+            "decay": 1.0,
+        },
         "carry_state": {"decay": 1.0},
         "dreamworld_eval": {
             "K": 8,

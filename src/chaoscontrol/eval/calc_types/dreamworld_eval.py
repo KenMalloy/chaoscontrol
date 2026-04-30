@@ -34,6 +34,7 @@ BPB aggregation matches ``chaoscontrol.evaluation.compute_bpb``:
 """
 from __future__ import annotations
 
+import inspect
 import math
 from typing import Any
 
@@ -47,16 +48,44 @@ from chaoscontrol.eval.ttt_eval import (
 )
 
 
-def _model_logits(out: Any) -> torch.Tensor:
+def _packet_encode(
+    model: torch.nn.Module,
+    input_ids: torch.Tensor,
+    *,
+    initial_states: list[torch.Tensor] | None = None,
+) -> tuple[torch.Tensor, list[torch.Tensor]]:
+    """Encode on the packet-clean lane, falling back for tiny test doubles."""
+    encode = getattr(model, "encode")
+    kwargs: dict[str, Any] = {
+        "initial_states": initial_states,
+        "return_final_states": True,
+    }
+    if "memory_mode" in inspect.signature(encode).parameters:
+        out = encode(input_ids, memory_mode="packet", **kwargs)
+    else:
+        out = encode(input_ids, **kwargs)
     if isinstance(out, dict):
-        return out["logits"]  # type: ignore[index,return-value]
-    return out  # type: ignore[return-value]
+        return out["hidden"], list(out["final_states"])
+    hidden, final_states = out
+    return hidden, list(final_states)
 
 
-def _model_final_states(out: Any) -> list[torch.Tensor] | None:
-    if isinstance(out, dict) and out.get("final_states"):
-        return list(out["final_states"])
-    return None
+def _packet_logits_and_states(
+    model: torch.nn.Module,
+    input_ids: torch.Tensor,
+    *,
+    initial_states: list[torch.Tensor] | None = None,
+) -> tuple[torch.Tensor, list[torch.Tensor]]:
+    hidden, final_states = _packet_encode(
+        model,
+        input_ids,
+        initial_states=initial_states,
+    )
+    final_norm = getattr(model, "final_norm", None)
+    if final_norm is not None:
+        hidden = final_norm(hidden)
+    logits = model.lm_head(hidden)
+    return logits, final_states
 
 
 def _snapshot_params(model: torch.nn.Module) -> dict[str, torch.Tensor]:
@@ -133,10 +162,10 @@ def _generate_dream_rollouts(
     with torch.no_grad():
         prefix = prefix_tokens.to(device=device, dtype=torch.long).view(1, -1)
         # Encode the prefix once at batch=1 to get the conditioning state.
-        _, prefix_states = model.encode(
+        _, prefix_states = _packet_encode(
+            model,
             prefix,
             initial_states=None,
-            return_final_states=True,
         )
         # Replicate prefix state across K rollouts.
         states = _expand_states(prefix_states, k)
@@ -153,11 +182,14 @@ def _generate_dream_rollouts(
             # bare-SSM model returns logits-only and gives no path to
             # propagate state across rollout tokens — leaving rollouts
             # autoregressive in token space but frozen in state space.
-            hidden, states = model.encode(
+            hidden, states = _packet_encode(
+                model,
                 cur,
                 initial_states=states,
-                return_final_states=True,
             )
+            final_norm = getattr(model, "final_norm", None)
+            if final_norm is not None:
+                hidden = final_norm(hidden)
             logits = model.lm_head(hidden)
             # ``logits`` shape: (K, 1, V).
             step_logits = logits[:, -1, :].to(torch.float32)
@@ -192,8 +224,11 @@ def _dream_backward(
     # Detach the conditioning state — backward updates params via the
     # rollout's own logits; we do NOT propagate into the prefix encode.
     cond_states = [s.detach() for s in prefix_states]
-    out = model(inputs, initial_states=cond_states)
-    logits = _model_logits(out)
+    logits, _final_states = _packet_logits_and_states(
+        model,
+        inputs,
+        initial_states=cond_states,
+    )
     loss = F.cross_entropy(
         logits.reshape(-1, logits.size(-1)).to(torch.float32),
         targets.reshape(-1),
@@ -231,8 +266,7 @@ def _score_doc_ce(
         return 0.0, 0
     chunk = tokens.to(device=device, dtype=torch.long).view(1, -1)
     with torch.no_grad():
-        out = model(chunk)
-        logits = _model_logits(out)
+        logits, _final_states = _packet_logits_and_states(model, chunk)
         loss = F.cross_entropy(
             logits[:, :-1].reshape(-1, logits.size(-1)).to(torch.float32),
             chunk[:, 1:].reshape(-1),
@@ -349,10 +383,10 @@ def dreamworld_eval(ctx: CalcTypeContext) -> CalcTypeResult:
                     # it inside ``_dream_backward`` so backward only
                     # touches params via the rollout logits, not via
                     # the prefix encode graph.
-                    _, prefix_states = model.encode(
+                    _, prefix_states = _packet_encode(
+                        model,
                         prefix_tokens.view(1, -1),
                         initial_states=None,
-                        return_final_states=True,
                     )
                     expanded = _expand_states(prefix_states, k)
                     _dream_backward(

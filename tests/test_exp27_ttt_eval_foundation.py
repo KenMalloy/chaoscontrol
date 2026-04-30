@@ -18,7 +18,7 @@ def test_registry_module_imports() -> None:
     assert hasattr(mod, "CalcTypeResult")
 
 
-def test_calc_type_subpackage_registers_three_names() -> None:
+def test_calc_type_subpackage_registers_names() -> None:
     # Import the subpackage so registration happens.
     import chaoscontrol.eval.calc_types  # noqa: F401
     from chaoscontrol.eval.ttt_eval import (
@@ -28,6 +28,7 @@ def test_calc_type_subpackage_registers_three_names() -> None:
 
     expected = {
         "score_only_reset",
+        "adaptive_carry",
         "carry_state",
         "dreamworld_eval",
     }
@@ -48,6 +49,8 @@ def test_metadata_records_source_order_and_grad_flags() -> None:
 
     # carry_state breaks reset-commutativity → requires source_order
     assert calc_type_metadata("carry_state")["requires_source_order"] is True
+    # adaptive_carry also carries stream state and online head weights.
+    assert calc_type_metadata("adaptive_carry")["requires_source_order"] is True
     # score_only_reset is the floor → reset-commutative
     assert calc_type_metadata("score_only_reset")["requires_source_order"] is False
     # dreamworld_eval needs autograd
@@ -100,7 +103,7 @@ def test_evaluate_rejects_order_sensitive_when_source_order_not_preserved() -> N
         evaluate_with_calc_types(
             model=None,  # never reached
             val_cache=None,  # type: ignore[arg-type]
-            calc_types=["score_only_reset", "carry_state"],
+            calc_types=["score_only_reset", "adaptive_carry"],
             calc_type_configs={},
             device=None,  # type: ignore[arg-type]
             base_bytes_lut=None,  # type: ignore[arg-type]

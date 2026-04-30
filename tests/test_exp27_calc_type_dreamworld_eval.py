@@ -4,11 +4,11 @@ A focused-fixture test suite for the per-doc dream-rollout calc_type.
 We use a minimal ``nn.Module`` that exposes the surface
 ``dreamworld_eval`` actually touches:
 
-- ``model(input_ids, initial_states=...)`` → ``{"logits", "final_states"}``
-- ``model.encode(input_ids, *, initial_states=None, return_final_states=True)``
+- ``model.encode(input_ids, *, memory_mode="packet", initial_states=None,
+  return_final_states=True)``
   → ``(hidden, [state])``
 - ``model.lm_head`` and ``model.final_norm`` — present so the symbol
-  contract matches even though we don't call them directly here.
+  contract matches even though Dreamworld now calls ``lm_head`` directly.
 
 The synthetic ValCache is built by hand from ``ValCache``'s dataclass
 constructor; we do not exercise the on-disk write/load path.
@@ -49,14 +49,17 @@ class TinyRecurrentLM(nn.Module):
         self.mix = nn.Linear(dim, dim, bias=False)
         self.final_norm = nn.LayerNorm(dim)
         self.lm_head = nn.Linear(dim, vocab, bias=False)
+        self.memory_modes: list[str] = []
 
     def encode(
         self,
         input_ids: torch.Tensor,
         *,
+        memory_mode: str = "packet",
         initial_states: list[torch.Tensor] | None = None,
         return_final_states: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
+        self.memory_modes.append(memory_mode)
         x = self.embed(input_ids.to(torch.long))
         x = self.mix(x)
         b, t, d = x.shape
@@ -83,14 +86,8 @@ class TinyRecurrentLM(nn.Module):
         input_ids: torch.Tensor,
         *,
         initial_states: list[torch.Tensor] | None = None,
-    ) -> dict[str, torch.Tensor | list[torch.Tensor]]:
-        hidden, final_states = self.encode(
-            input_ids,
-            initial_states=initial_states,
-            return_final_states=True,
-        )
-        logits = self.lm_head(self.final_norm(hidden))
-        return {"logits": logits, "final_states": final_states}
+    ) -> dict[str, torch.Tensor | list[torch.Tensor]]:  # pragma: no cover
+        raise AssertionError("dreamworld_eval must use packet-clean encode")
 
 
 # ---- synthetic ValCache fixture --------------------------------------------
@@ -168,6 +165,7 @@ def test_returns_finite_bpb_and_loss():
     assert result.docs_scored == 3
     assert result.tokens_scored > 0
     assert result.raw_bytes > 0
+    assert set(model.memory_modes) == {"packet"}
 
 
 def test_per_doc_reset_keeps_params_bit_equal_at_start_of_each_doc():

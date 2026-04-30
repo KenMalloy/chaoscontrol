@@ -9,6 +9,7 @@ Registered calc_types:
 
 - ``score_only_reset`` — reset SSM state per doc, no params changed (the floor).
 - ``carry_state`` — SSM state continues across docs (with optional decay).
+- ``adaptive_carry`` — packet-clean state carry with online horizon mixing.
 - ``dreamworld_eval`` — per-doc dream-rollout + backward + SGD step.
 """
 from __future__ import annotations
@@ -17,4 +18,5 @@ from __future__ import annotations
 # raise at registration time so duplicates surface immediately.
 from chaoscontrol.eval.calc_types import score_only_reset  # noqa: F401
 from chaoscontrol.eval.calc_types import carry_state  # noqa: F401
+from chaoscontrol.eval.calc_types import adaptive_carry  # noqa: F401
 from chaoscontrol.eval.calc_types import dreamworld_eval  # noqa: F401

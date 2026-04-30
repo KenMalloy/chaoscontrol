@@ -1,15 +1,22 @@
 #!/usr/bin/env python3
 """Exp27 TTT headline matrix builder.
 
-Single trunk (the winning trunk from exp26) under three test-time-training
-strategies, each its own 600s eval session:
+Single trunk (the winning trunk from exp26) under a compact test-time-training
+selector. The default run keeps the legal floor and the strongest
+gradient-free TTT candidate:
 
   1. ``score_only_reset``  — reset SSM state per doc; floor.
-  2. ``carry_state``       — SSM state continues across docs (source-order).
-  3. ``dreamworld_eval``   — per-doc dream rollout + backward + SGD.
+  2. ``adaptive_carry``    — source-ordered state carry plus causal online
+                             horizon mixing on the packet-clean encode path.
+
+Legacy exploratory calc_types remain registered and can be requested
+explicitly:
+
+  * ``carry_state``       — raw SSM state continues across docs.
+  * ``dreamworld_eval``   — per-doc dream rollout + backward + SGD.
 
 A single headline entry trains (or loads) one trunk and runs every
-requested calc_type as a serial eval pass. The three registrations live
+requested calc_type as a serial eval pass. The registrations live
 in ``chaoscontrol.eval.calc_types``; this builder only references their
 names and forwards calibrated hyperparameters.
 
@@ -34,15 +41,14 @@ from typing import Any
 
 REPO = Path(__file__).resolve().parents[2]
 EXP24 = REPO / "experiments" / "24_training_time_bundle"
+EXP26 = REPO / "experiments" / "26_arm"
 SRC = REPO / "src"
+sys.path.insert(0, str(EXP26))
 sys.path.insert(0, str(EXP24))
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from exp24 import (  # noqa: E402
-    ARTIFACT_CHANGES_WEIGHTS_ONLY,
-    _base_entry,
-)
+from exp26 import build_validation_matrix as _build_exp26_validation_matrix  # noqa: E402
 
 
 EXP27_DIR = Path(__file__).resolve().parent
@@ -52,11 +58,11 @@ DEFAULT_MANIFEST_PATH = DEFAULT_CALIBRATION_DIR / "manifest.json"
 
 CALC_TYPES_DEFAULT: tuple[str, ...] = (
     "score_only_reset",
-    "carry_state",
-    "dreamworld_eval",
+    "adaptive_carry",
 )
 
 DEFAULT_HEADLINE_SEEDS: tuple[int, ...] = (1337, 2674, 4011)
+EXP26_ARM_NAME = "validation_adaptive_residual_memory"
 
 
 def _registered_calc_types() -> list[str]:
@@ -107,6 +113,12 @@ def build_ttt_headline_matrix(
     same trained weights. Calibrated hyperparameters for each calc_type
     are read from the manifest and embedded into the entry config.
     """
+    if checkpoint_path is not None:
+        raise NotImplementedError(
+            "Exp27 checkpoint_path is not wired into runner_fast_path loading. "
+            "Run the Exp26 ARM entry fresh for final TTT, or add an explicit "
+            "checkpoint-load path before using this option."
+        )
     seeds = list(seed_values) if seed_values is not None else list(
         DEFAULT_HEADLINE_SEEDS
     )
@@ -130,17 +142,27 @@ def build_ttt_headline_matrix(
     ckpt_value = str(checkpoint_path) if checkpoint_path is not None else None
     entries: list[dict[str, Any]] = []
     for seed in seeds:
-        entry = _base_entry(
+        exp26_entries = _build_exp26_validation_matrix(
             speed_config=speed_config,
             world_size=int(world_size),
             budget_seconds=float(budget_seconds),
+            seed=int(seed),
         )
+        arm_entries = [
+            e for e in exp26_entries
+            if str(e.get("arm", "")) == EXP26_ARM_NAME
+        ]
+        if len(arm_entries) != 1:
+            raise RuntimeError(
+                f"expected one Exp26 {EXP26_ARM_NAME!r} entry, "
+                f"got {len(arm_entries)}"
+            )
+        entry = copy.deepcopy(arm_entries[0])
         entry.update(
             {
                 "name": f"exp27_ttt_headline_s{int(seed)}",
                 "seed": int(seed),
                 "exp27_mechanism": "ttt_headline_v1",
-                "artifact_impact": ARTIFACT_CHANGES_WEIGHTS_ONLY,
                 "calc_types": list(requested),
                 "calc_type_configs": copy.deepcopy(calc_type_configs),
                 "checkpoint_path": ckpt_value,

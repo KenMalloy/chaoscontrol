@@ -10,8 +10,9 @@ Three-stage discipline mirroring exp26:
                           ``calibration/manifest.json``. Today the analyzer
                           writes the stub defaults.
   Stage 3 (headline)   : Winning trunk x N seeds. Each entry trains one
-                          trunk and runs every calc_type as a serial eval
-                          pass at 600s budget per session.
+                          trunk and runs the selected calc_types as serial
+                          eval passes. The default selector is the floor
+                          plus packet-clean adaptive carry.
 
 ``--dry-run`` is strictly side-effect-free: no ``mkdir``, no ``write_matrix``,
 no manifest write, no run. Each stage's dry-run path prints entries (or the
@@ -219,9 +220,8 @@ def main(argv: list[str] | None = None) -> int:
         type=Path,
         default=None,
         help=(
-            "Optional path to a pre-trained checkpoint. When set, the "
-            "headline stage targets this checkpoint instead of training "
-            "fresh per seed."
+            "Reserved for a future explicit checkpoint-load path. Currently "
+            "unsupported because runner_fast_path does not load this field."
         ),
     )
     parser.add_argument("--world-size", type=int, default=4)
