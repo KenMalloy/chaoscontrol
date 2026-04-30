@@ -34,7 +34,7 @@ set -euo pipefail
 
 REPO_ROOT=${REPO_ROOT:-/workspace/chaoscontrol}
 WORKSPACE_VENV=${WORKSPACE_VENV:-/workspace/venv}
-VAL_CACHE_DIR=${VAL_CACHE_DIR:-/workspace/cache/exp23_val_16384}
+VAL_CACHE_DIR=${VAL_CACHE_DIR:-/workspace/cache/exp27_val_16384}
 HF_TOKEN_REQUIRED=${HF_TOKEN_REQUIRED:-1}
 CHAOSCONTROL_BUILD_VAL_CACHE=${CHAOSCONTROL_BUILD_VAL_CACHE:-0}
 

@@ -144,3 +144,19 @@ class TestPodNativeExtensionBootstrap:
         assert "\n    CHAOSCONTROL_CPU_SSM_CUDA_WRITE_EVENT=1 \\\n" not in source
         assert "write_event_cuda_pack_available()" in source
         assert "auto-enables write_event_pack.cu" in source
+
+    def test_cuda13_setup_discovers_venv_site_packages(self) -> None:
+        """RunPod templates do not all ship the same Python minor version.
+        The CUDA13 wheel path must come from the active venv, not a
+        hard-coded ``python3.12`` directory.
+        """
+        source = POD_SETUP.read_text()
+        assert "site.getsitepackages()" in source
+        assert "lib/python3.12/site-packages" not in source
+
+    def test_bootstrap_defaults_to_exp27_val_cache_path(self) -> None:
+        """The final scorer path is Exp27; the default cache name should
+        not send fresh pods into the older Exp23 cache directory.
+        """
+        source = POD_BOOTSTRAP.read_text()
+        assert "VAL_CACHE_DIR=${VAL_CACHE_DIR:-/workspace/cache/exp27_val_16384}" in source

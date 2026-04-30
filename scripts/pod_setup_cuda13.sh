@@ -91,7 +91,14 @@ else
     source "$WORKSPACE_VENV/bin/activate"
 fi
 
-PY_SITEPKG=${PY_SITEPKG:-$WORKSPACE_VENV/lib/python3.12/site-packages}
+PY_SITEPKG=${PY_SITEPKG:-$(python3 - <<'PY'
+import site
+paths = site.getsitepackages()
+if not paths:
+    raise SystemExit("no site-packages directory found")
+print(paths[0])
+PY
+)}
 CU13_LIB=$PY_SITEPKG/nvidia/cu13/lib
 REPO_ROOT=${REPO_ROOT:-/workspace/chaoscontrol}
 
