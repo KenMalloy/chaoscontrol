@@ -213,15 +213,14 @@ def _add_boundary_winner_counts(
     log_probs_by_shift: dict[float | str, torch.Tensor],
     target: torch.Tensor,
 ) -> None:
-    token_nlls = torch.stack(
-        [
-            -log_probs_by_shift[head_key]
-            .gather(-1, target.unsqueeze(-1))
-            .squeeze(-1)
-            for head_key in head_keys
-        ],
-        dim=0,
-    )
+    nlls = []
+    for head_key in head_keys:
+        log_probs = log_probs_by_shift[head_key]
+        target_on_device = target.to(device=log_probs.device)
+        nlls.append(
+            -log_probs.gather(-1, target_on_device.unsqueeze(-1)).squeeze(-1)
+        )
+    token_nlls = torch.stack(nlls, dim=0)
     winners = token_nlls.argmin(dim=0)
     for idx, head_key in enumerate(head_keys):
         winner_counts[head_key] = winner_counts.get(head_key, 0) + int(
