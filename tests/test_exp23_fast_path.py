@@ -69,6 +69,19 @@ def _load_runner_module():
     return mod
 
 
+def test_crct_object_collectives_use_gloo_side_group() -> None:
+    """Telemetry objects should not ride the NCCL tensor group.
+
+    On 8xH100, the training step completed but rank 0 died while gathering
+    CRCT diagnostics with ``gather_object`` over the NCCL all-rank group.
+    Keep a Gloo side-group for Python objects so telemetry cannot poison the
+    final train/eval run.
+    """
+    source = RUNNER_PATH.read_text()
+    assert 'object_group = dist.new_group(list(range(world_size_)), backend="gloo")' in source
+    assert "group=object_group or all_group" in source
+
+
 class _TinyTrainStepModel(nn.Module):
     def __init__(self):
         super().__init__()

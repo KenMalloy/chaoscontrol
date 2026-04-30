@@ -9206,6 +9206,7 @@ def train_fast_for_budget(
     train_group = None
     teacher_group = None
     grad_group = None
+    object_group = None
     grad_world_size = world_size_
     memory_rank_joins_grad = True
     stop_group = None
@@ -9230,6 +9231,11 @@ def train_fast_for_budget(
         # subgroup. Here all_group is the world group, so all ranks
         # participate.
         all_group = dist.new_group(list(range(world_size_)))
+        # Post-run diagnostics and online eval state are Python objects.
+        # Keep those object collectives on Gloo even when tensor collectives
+        # use NCCL; NCCL object gather materializes CUDA byte tensors and has
+        # proven fragile on 8xH100 after asymmetric memory-rank work.
+        object_group = dist.new_group(list(range(world_size_)), backend="gloo")
         grad_group = all_group
         if crct_enabled and not episodic_enabled:
             # CRCT's rank-3 teacher is an asynchronous coprocessor, not a
@@ -10888,7 +10894,7 @@ def train_fast_for_budget(
                 local_cache_payload,
                 object_gather_list=gathered_payloads,
                 dst=0,
-                group=all_group,
+                group=object_group or all_group,
             )
             if rank_ == 0 and gathered_payloads is not None:
                 episodic_cache_payload = next(
@@ -10989,7 +10995,7 @@ def train_fast_for_budget(
                 crct_local_diagnostics,
                 object_gather_list=gathered_crct,
                 dst=0,
-                group=all_group,
+                group=object_group or all_group,
             )
             if rank_ == 0:
                 crct_rank_diagnostics = gathered_crct
@@ -11008,7 +11014,7 @@ def train_fast_for_budget(
                 local_online_state,
                 object_gather_list=gathered_online,
                 dst=0,
-                group=all_group,
+                group=object_group or all_group,
             )
             if rank_ == 0 and gathered_online is not None:
                 online_eval_state_payload = next(
