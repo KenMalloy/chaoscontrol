@@ -574,6 +574,11 @@ pybind11::dict wire_event_sizes() {
   d["ArmMaintenanceJob"] = static_cast<int64_t>(sizeof(ArmMaintenanceJob));
   d["ArmMaintenanceResult"] =
       static_cast<int64_t>(sizeof(ArmMaintenanceResult));
+  d["TensorWireSlice"] = static_cast<int64_t>(sizeof(TensorWireSlice));
+  d["TeacherRequest"] = static_cast<int64_t>(sizeof(TeacherRequest));
+  d["TeacherResult"] = static_cast<int64_t>(sizeof(TeacherResult));
+  d["WeightSnapshotHeader"] =
+      static_cast<int64_t>(sizeof(WeightSnapshotHeader));
   return d;
 }
 
@@ -596,6 +601,19 @@ pybind11::dict wire_event_constants() {
       static_cast<int64_t>(SIMPLEX_CANDIDATES_DEFAULT);
   d["ARM_MAINTENANCE_SLOT_CAPACITY"] =
       static_cast<int64_t>(ARM_MAINTENANCE_SLOT_CAPACITY);
+  d["TEACHER_REQUEST_SLICES"] =
+      static_cast<int64_t>(TEACHER_REQUEST_SLICES);
+  d["TEACHER_RESULT_SLICES"] =
+      static_cast<int64_t>(TEACHER_RESULT_SLICES);
+  d["TEACHER_WIRE_VERSION"] = static_cast<int64_t>(TEACHER_WIRE_VERSION);
+  d["TEACHER_WEIGHT_SNAPSHOT_MAGIC"] =
+      static_cast<int64_t>(TEACHER_WEIGHT_SNAPSHOT_MAGIC);
+  d["TEACHER_DTYPE_NONE"] = static_cast<int64_t>(TEACHER_DTYPE_NONE);
+  d["TEACHER_DTYPE_INT32"] = static_cast<int64_t>(TEACHER_DTYPE_INT32);
+  d["TEACHER_DTYPE_FLOAT32"] = static_cast<int64_t>(TEACHER_DTYPE_FLOAT32);
+  d["TEACHER_DTYPE_FLOAT16"] = static_cast<int64_t>(TEACHER_DTYPE_FLOAT16);
+  d["TEACHER_DTYPE_BFLOAT16"] =
+      static_cast<int64_t>(TEACHER_DTYPE_BFLOAT16);
   return d;
 }
 
@@ -628,6 +646,8 @@ using ShmRingQueryEventT = ShmRing<QueryEvent, 16384>;
 using ShmRingReplayOutcomeT = ShmRing<ReplayOutcome, 8192>;
 using ShmRingArmMaintenanceJobT = ShmRing<ArmMaintenanceJob, 1024>;
 using ShmRingArmMaintenanceResultT = ShmRing<ArmMaintenanceResult, 1024>;
+using ShmRingTeacherRequestT = ShmRing<TeacherRequest, 1024>;
+using ShmRingTeacherResultT = ShmRing<TeacherResult, 1024>;
 
 bool write_event_cuda_pack_available() {
 #ifdef CHAOSCONTROL_CPU_SSM_CUDA_WRITE_EVENT_KERNEL
@@ -827,6 +847,83 @@ pybind11::list f32_array_to_list(const float* src, std::size_t n) {
   pybind11::list out(n);
   for (std::size_t i = 0; i < n; ++i) {
     out[i] = pybind11::float_(src[i]);
+  }
+  return out;
+}
+
+void copy_u32_array(const pybind11::handle& seq,
+                    uint32_t* dst,
+                    std::size_t n,
+                    const char* field_name) {
+  auto pyseq = pybind11::reinterpret_borrow<pybind11::sequence>(seq);
+  if (static_cast<std::size_t>(pybind11::len(pyseq)) != n) {
+    throw pybind11::value_error(
+        std::string("field '") + field_name + "' must have length " +
+        std::to_string(n) + ", got " + std::to_string(pybind11::len(pyseq)));
+  }
+  for (std::size_t i = 0; i < n; ++i) {
+    dst[i] = pyseq[i].cast<uint32_t>();
+  }
+}
+
+pybind11::list u32_array_to_list(const uint32_t* src, std::size_t n) {
+  pybind11::list out(n);
+  for (std::size_t i = 0; i < n; ++i) {
+    out[i] = pybind11::int_(src[i]);
+  }
+  return out;
+}
+
+// --- TensorWireSlice dict <-> struct ---
+constexpr const char* kTensorWireSliceKeys[] = {
+    "offset_bytes", "nbytes", "dtype", "rank", "shape",
+};
+constexpr std::size_t kTensorWireSliceKeyCount =
+    sizeof(kTensorWireSliceKeys) / sizeof(kTensorWireSliceKeys[0]);
+
+TensorWireSlice dict_to_tensor_wire_slice(const pybind11::dict& d) {
+  check_dict_keys(d, kTensorWireSliceKeys, kTensorWireSliceKeyCount,
+                  "TensorWireSlice");
+  TensorWireSlice slice{};
+  slice.offset_bytes = d["offset_bytes"].cast<uint64_t>();
+  slice.nbytes = d["nbytes"].cast<uint64_t>();
+  slice.dtype = d["dtype"].cast<uint32_t>();
+  slice.rank = d["rank"].cast<uint32_t>();
+  copy_u32_array(d["shape"], slice.shape, 4, "shape");
+  return slice;
+}
+
+pybind11::dict tensor_wire_slice_to_dict(const TensorWireSlice& slice) {
+  pybind11::dict d;
+  d["offset_bytes"] = pybind11::int_(slice.offset_bytes);
+  d["nbytes"] = pybind11::int_(slice.nbytes);
+  d["dtype"] = pybind11::int_(slice.dtype);
+  d["rank"] = pybind11::int_(slice.rank);
+  d["shape"] = u32_array_to_list(slice.shape, 4);
+  return d;
+}
+
+void copy_tensor_wire_slice_array(const pybind11::handle& seq,
+                                  TensorWireSlice* dst,
+                                  std::size_t n,
+                                  const char* field_name) {
+  auto pyseq = pybind11::reinterpret_borrow<pybind11::sequence>(seq);
+  if (static_cast<std::size_t>(pybind11::len(pyseq)) != n) {
+    throw pybind11::value_error(
+        std::string("field '") + field_name + "' must have length " +
+        std::to_string(n) + ", got " + std::to_string(pybind11::len(pyseq)));
+  }
+  for (std::size_t i = 0; i < n; ++i) {
+    dst[i] = dict_to_tensor_wire_slice(pyseq[i].cast<pybind11::dict>());
+  }
+}
+
+pybind11::list tensor_wire_slice_array_to_list(
+    const TensorWireSlice* src,
+    std::size_t n) {
+  pybind11::list out(n);
+  for (std::size_t i = 0; i < n; ++i) {
+    out[i] = tensor_wire_slice_to_dict(src[i]);
   }
   return out;
 }
@@ -1160,6 +1257,101 @@ pybind11::dict arm_maintenance_result_to_dict(
   d["frame_age_seconds"] = pybind11::float_(ev.frame_age_seconds);
   d["slot_ids"] = u64_array_to_list(
       ev.slot_ids, ARM_MAINTENANCE_SLOT_CAPACITY);
+  return d;
+}
+
+// --- Teacher request/result dict <-> struct ---
+constexpr const char* kTeacherRequestKeys[] = {
+    "event_type", "source_rank", "status", "flags", "slice_count",
+    "request_id", "step", "weight_snapshot_version", "full_ids",
+};
+constexpr std::size_t kTeacherRequestKeyCount =
+    sizeof(kTeacherRequestKeys) / sizeof(kTeacherRequestKeys[0]);
+
+TeacherRequest dict_to_teacher_request(const pybind11::dict& d) {
+  check_dict_keys(d, kTeacherRequestKeys, kTeacherRequestKeyCount,
+                  "TeacherRequest");
+  TeacherRequest ev{};
+  ev.event_type = d["event_type"].cast<uint8_t>();
+  ev.source_rank = d["source_rank"].cast<uint8_t>();
+  ev.status = d["status"].cast<uint8_t>();
+  ev.flags = d["flags"].cast<uint8_t>();
+  ev.slice_count = d["slice_count"].cast<uint32_t>();
+  ev.request_id = d["request_id"].cast<uint64_t>();
+  ev.step = d["step"].cast<uint64_t>();
+  ev.weight_snapshot_version =
+      d["weight_snapshot_version"].cast<uint64_t>();
+  ev.full_ids = dict_to_tensor_wire_slice(d["full_ids"].cast<pybind11::dict>());
+  return ev;
+}
+
+pybind11::dict teacher_request_to_dict(const TeacherRequest& ev) {
+  pybind11::dict d;
+  d["event_type"] = pybind11::int_(ev.event_type);
+  d["source_rank"] = pybind11::int_(ev.source_rank);
+  d["status"] = pybind11::int_(ev.status);
+  d["flags"] = pybind11::int_(ev.flags);
+  d["slice_count"] = pybind11::int_(ev.slice_count);
+  d["request_id"] = pybind11::int_(ev.request_id);
+  d["step"] = pybind11::int_(ev.step);
+  d["weight_snapshot_version"] =
+      pybind11::int_(ev.weight_snapshot_version);
+  d["full_ids"] = tensor_wire_slice_to_dict(ev.full_ids);
+  return d;
+}
+
+constexpr const char* kTeacherResultKeys[] = {
+    "event_type", "source_rank", "status", "flags", "slice_count",
+    "request_id", "step", "weight_snapshot_version", "payload_version",
+    "score_seconds", "packet_seconds", "target_token_count", "hidden_dim",
+    "plasticity_dim", "slices",
+};
+constexpr std::size_t kTeacherResultKeyCount =
+    sizeof(kTeacherResultKeys) / sizeof(kTeacherResultKeys[0]);
+
+TeacherResult dict_to_teacher_result(const pybind11::dict& d) {
+  check_dict_keys(d, kTeacherResultKeys, kTeacherResultKeyCount,
+                  "TeacherResult");
+  TeacherResult ev{};
+  ev.event_type = d["event_type"].cast<uint8_t>();
+  ev.source_rank = d["source_rank"].cast<uint8_t>();
+  ev.status = d["status"].cast<uint8_t>();
+  ev.flags = d["flags"].cast<uint8_t>();
+  ev.slice_count = d["slice_count"].cast<uint32_t>();
+  ev.request_id = d["request_id"].cast<uint64_t>();
+  ev.step = d["step"].cast<uint64_t>();
+  ev.weight_snapshot_version =
+      d["weight_snapshot_version"].cast<uint64_t>();
+  ev.payload_version = d["payload_version"].cast<uint64_t>();
+  ev.score_seconds = d["score_seconds"].cast<float>();
+  ev.packet_seconds = d["packet_seconds"].cast<float>();
+  ev.target_token_count = d["target_token_count"].cast<uint32_t>();
+  ev.hidden_dim = d["hidden_dim"].cast<uint32_t>();
+  ev.plasticity_dim = d["plasticity_dim"].cast<uint32_t>();
+  copy_tensor_wire_slice_array(d["slices"], ev.slices,
+                               TEACHER_RESULT_SLICES, "slices");
+  return ev;
+}
+
+pybind11::dict teacher_result_to_dict(const TeacherResult& ev) {
+  pybind11::dict d;
+  d["event_type"] = pybind11::int_(ev.event_type);
+  d["source_rank"] = pybind11::int_(ev.source_rank);
+  d["status"] = pybind11::int_(ev.status);
+  d["flags"] = pybind11::int_(ev.flags);
+  d["slice_count"] = pybind11::int_(ev.slice_count);
+  d["request_id"] = pybind11::int_(ev.request_id);
+  d["step"] = pybind11::int_(ev.step);
+  d["weight_snapshot_version"] =
+      pybind11::int_(ev.weight_snapshot_version);
+  d["payload_version"] = pybind11::int_(ev.payload_version);
+  d["score_seconds"] = pybind11::float_(ev.score_seconds);
+  d["packet_seconds"] = pybind11::float_(ev.packet_seconds);
+  d["target_token_count"] = pybind11::int_(ev.target_token_count);
+  d["hidden_dim"] = pybind11::int_(ev.hidden_dim);
+  d["plasticity_dim"] = pybind11::int_(ev.plasticity_dim);
+  d["slices"] = tensor_wire_slice_array_to_list(
+      ev.slices, TEACHER_RESULT_SLICES);
   return d;
 }
 
@@ -2563,6 +2755,76 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "REGION_BYTES",
           [](pybind11::object) {
             return ShmRingArmMaintenanceResultT::REGION_BYTES;
+          });
+
+  pybind11::class_<ShmRingTeacherRequestT>(m, "ShmRingTeacherRequest")
+      .def_static("create", &ShmRingTeacherRequestT::create,
+                  pybind11::arg("name"),
+                  "Creator-side factory for train-rank -> GPU3 teacher requests.")
+      .def_static("attach", &ShmRingTeacherRequestT::attach,
+                  pybind11::arg("name"),
+                  "Attacher-side factory for train-rank -> GPU3 teacher requests.")
+      .def("push",
+           [](ShmRingTeacherRequestT& self, const pybind11::dict& d) {
+             return self.push(dict_to_teacher_request(d));
+           },
+           pybind11::arg("event"),
+           "Push a TeacherRequest dict; returns False if full.")
+      .def("pop",
+           [](ShmRingTeacherRequestT& self) -> pybind11::object {
+             auto opt = self.pop();
+             if (!opt.has_value()) {
+               return pybind11::none();
+             }
+             return teacher_request_to_dict(*opt);
+           },
+           "Pop a TeacherRequest dict, or None if empty.")
+      .def("size", &ShmRingTeacherRequestT::size)
+      .def("name", &ShmRingTeacherRequestT::name)
+      .def_static("unlink", &ShmRingTeacherRequestT::unlink,
+                  pybind11::arg("name"))
+      .def_property_readonly_static(
+          "capacity",
+          [](pybind11::object) { return ShmRingTeacherRequestT::capacity(); })
+      .def_property_readonly_static(
+          "REGION_BYTES",
+          [](pybind11::object) {
+            return ShmRingTeacherRequestT::REGION_BYTES;
+          });
+
+  pybind11::class_<ShmRingTeacherResultT>(m, "ShmRingTeacherResult")
+      .def_static("create", &ShmRingTeacherResultT::create,
+                  pybind11::arg("name"),
+                  "Creator-side factory for GPU3 -> train-rank teacher packets.")
+      .def_static("attach", &ShmRingTeacherResultT::attach,
+                  pybind11::arg("name"),
+                  "Attacher-side factory for GPU3 -> train-rank teacher packets.")
+      .def("push",
+           [](ShmRingTeacherResultT& self, const pybind11::dict& d) {
+             return self.push(dict_to_teacher_result(d));
+           },
+           pybind11::arg("event"),
+           "Push a TeacherResult dict; returns False if full.")
+      .def("pop",
+           [](ShmRingTeacherResultT& self) -> pybind11::object {
+             auto opt = self.pop();
+             if (!opt.has_value()) {
+               return pybind11::none();
+             }
+             return teacher_result_to_dict(*opt);
+           },
+           "Pop a TeacherResult dict, or None if empty.")
+      .def("size", &ShmRingTeacherResultT::size)
+      .def("name", &ShmRingTeacherResultT::name)
+      .def_static("unlink", &ShmRingTeacherResultT::unlink,
+                  pybind11::arg("name"))
+      .def_property_readonly_static(
+          "capacity",
+          [](pybind11::object) { return ShmRingTeacherResultT::capacity(); })
+      .def_property_readonly_static(
+          "REGION_BYTES",
+          [](pybind11::object) {
+            return ShmRingTeacherResultT::REGION_BYTES;
           });
 
   pybind11::class_<ArmMaintenanceScheduler>(m, "ArmMaintenanceScheduler")

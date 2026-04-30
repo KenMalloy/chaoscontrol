@@ -25,6 +25,12 @@ def test_wire_event_sizes_match_design():
     # Pre-pivot size was 544B; post-pivot is 736B.
     assert sizes["QueryEvent"] == 736, sizes
     assert sizes["ReplayOutcome"] == 96, sizes
+    assert sizes["ArmMaintenanceJob"] == 168, sizes
+    assert sizes["ArmMaintenanceResult"] == 192, sizes
+    assert sizes["TensorWireSlice"] == 40, sizes
+    assert sizes["TeacherRequest"] == 72, sizes
+    assert sizes["TeacherResult"] == 424, sizes
+    assert sizes["WeightSnapshotHeader"] == 64, sizes
 
 
 def test_wire_event_min_slot_alignment_is_8_bytes():
@@ -40,3 +46,8 @@ def test_wire_event_constants_exposed():
     constants = _ext.wire_event_constants()
     assert constants["KEY_REP_DIM_DEFAULT"] == 256
     assert constants["SPAN_LENGTH_DEFAULT"] == 4
+    assert constants["TEACHER_REQUEST_SLICES"] == 1
+    assert constants["TEACHER_RESULT_SLICES"] == 9
+    assert constants["TEACHER_WIRE_VERSION"] == 1
+    assert constants["TEACHER_DTYPE_INT32"] == 1
+    assert constants["TEACHER_DTYPE_BFLOAT16"] == 4

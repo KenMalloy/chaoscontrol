@@ -232,6 +232,14 @@ ShmRingArmMaintenanceResult = (
     getattr(_C, "ShmRingArmMaintenanceResult", _missing_extension)
     if _C is not None else _missing_extension
 )
+ShmRingTeacherRequest = (
+    getattr(_C, "ShmRingTeacherRequest", _missing_extension)
+    if _C is not None else _missing_extension
+)
+ShmRingTeacherResult = (
+    getattr(_C, "ShmRingTeacherResult", _missing_extension)
+    if _C is not None else _missing_extension
+)
 ArmMaintenanceScheduler = (
     getattr(_C, "ArmMaintenanceScheduler", _missing_extension)
     if _C is not None else _missing_extension
@@ -286,6 +294,8 @@ __all__ = [
     "ShmRingReplayOutcome",
     "ShmRingArmMaintenanceJob",
     "ShmRingArmMaintenanceResult",
+    "ShmRingTeacherRequest",
+    "ShmRingTeacherResult",
     "ArmMaintenanceScheduler",
     "CpuEvidenceEngine",
 ]

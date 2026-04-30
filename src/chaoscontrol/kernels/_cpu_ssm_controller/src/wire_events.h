@@ -33,6 +33,16 @@ constexpr int SPAN_LENGTH_DEFAULT = 4;
 // covers the whole simplex on the SPR forward path.
 constexpr int SIMPLEX_CANDIDATES_DEFAULT = 16;
 constexpr int ARM_MAINTENANCE_SLOT_CAPACITY = 16;
+constexpr int TEACHER_REQUEST_SLICES = 1;
+constexpr int TEACHER_RESULT_SLICES = 9;
+constexpr uint32_t TEACHER_WIRE_VERSION = 1;
+constexpr uint32_t TEACHER_WEIGHT_SNAPSHOT_MAGIC = 0x53574343;  // "CCWS" LE
+
+constexpr uint32_t TEACHER_DTYPE_NONE = 0;
+constexpr uint32_t TEACHER_DTYPE_INT32 = 1;
+constexpr uint32_t TEACHER_DTYPE_FLOAT32 = 2;
+constexpr uint32_t TEACHER_DTYPE_FLOAT16 = 3;
+constexpr uint32_t TEACHER_DTYPE_BFLOAT16 = 4;
 
 // Sentinel values for unpopulated simplex candidate slots. Heuristic-only
 // (V0) producers fill the entire candidate arrays with sentinels so the
@@ -48,6 +58,18 @@ constexpr uint64_t SIMPLEX_CANDIDATE_SLOT_SENTINEL =
 constexpr float SIMPLEX_CANDIDATE_COSINE_SENTINEL = 0.0f;
 
 #pragma pack(push, 1)
+
+// Contiguous tensor payload descriptor for the teacher shm transport. The
+// tensor bytes live in a fixed-layout shared-memory payload region; ring
+// events carry only offsets, byte counts, dtype, rank, and up to 4 shape dims.
+// This is the shared vocabulary for TeacherRequest and TeacherResult.
+struct TensorWireSlice {
+    uint64_t offset_bytes;
+    uint64_t nbytes;
+    uint32_t dtype;
+    uint32_t rank;
+    uint32_t shape[4];
+};
 
 // 568 bytes total: header(8) + 3*u64(24) + key_rep[256]*u16(512) +
 // value_tok_ids[4]*u16(8) + u32(4) + 2*f32(8) + _pad1(4)
@@ -170,8 +192,65 @@ struct ArmMaintenanceResult {
     uint64_t slot_ids[ARM_MAINTENANCE_SLOT_CAPACITY];
 };
 
+// 72 bytes total: header(8) + 3*u64(24) + full_ids slice(40).
+// Train rank -> GPU3 teacher request. The request's token tensor is stored
+// in the teacher payload region and described by `full_ids`.
+struct TeacherRequest {
+    uint8_t  event_type;                          // = 6
+    uint8_t  source_rank;
+    uint8_t  status;                              // 0=ok, nonzero=drop/error marker
+    uint8_t  flags;
+    uint32_t slice_count;                         // = TEACHER_REQUEST_SLICES
+    uint64_t request_id;
+    uint64_t step;
+    uint64_t weight_snapshot_version;
+    TensorWireSlice full_ids;                     // int32 [B, T+1]
+};
+
+// 424 bytes total: header(8) + 4*u64(32) + 2*f32(8) + 3*u32(12) + pad(4)
+// + slices[9]*40(360). GPU3 -> train rank teacher packet. Slice order:
+// target, confidence, loss_weight, utility, memory_residual, memory_gate,
+// plasticity_coverage, plasticity_confidence, plasticity_budget.
+struct TeacherResult {
+    uint8_t  event_type;                          // = 7
+    uint8_t  source_rank;                         // producer rank, normally GPU3
+    uint8_t  status;                              // 0=ok, nonzero=fail-open reason
+    uint8_t  flags;
+    uint32_t slice_count;                         // = TEACHER_RESULT_SLICES
+    uint64_t request_id;
+    uint64_t step;
+    uint64_t weight_snapshot_version;
+    uint64_t payload_version;
+    float    score_seconds;
+    float    packet_seconds;
+    uint32_t target_token_count;
+    uint32_t hidden_dim;
+    uint32_t plasticity_dim;
+    uint32_t _pad0;
+    TensorWireSlice slices[TEACHER_RESULT_SLICES];
+};
+
+// 64 bytes. Header stored at the front of each weight-snapshot buffer in
+// the double-buffered shared-memory region. Tensor layout metadata is fixed
+// once at startup; this header only publishes latest-complete version state.
+struct WeightSnapshotHeader {
+    uint32_t magic;                               // TEACHER_WEIGHT_SNAPSHOT_MAGIC
+    uint32_t wire_version;                        // TEACHER_WIRE_VERSION
+    uint32_t header_bytes;                        // = sizeof(WeightSnapshotHeader)
+    uint32_t flags;
+    uint64_t step;
+    uint64_t snapshot_version;
+    uint64_t total_bytes;
+    uint64_t checksum;
+    uint32_t tensor_count;
+    uint32_t active_buffer;
+    uint64_t reserved0;
+};
+
 #pragma pack(pop)
 
+static_assert(sizeof(TensorWireSlice) == 40,
+              "TensorWireSlice must be exactly 40 bytes on the wire");
 static_assert(sizeof(WriteEvent) == 568,
               "WriteEvent must be exactly 568 bytes on the wire");
 static_assert(sizeof(QueryEvent) == 736,
@@ -182,3 +261,9 @@ static_assert(sizeof(ArmMaintenanceJob) == 168,
               "ArmMaintenanceJob must be exactly 168 bytes on the wire");
 static_assert(sizeof(ArmMaintenanceResult) == 192,
               "ArmMaintenanceResult must be exactly 192 bytes on the wire");
+static_assert(sizeof(TeacherRequest) == 72,
+              "TeacherRequest must be exactly 72 bytes on the wire");
+static_assert(sizeof(TeacherResult) == 424,
+              "TeacherResult must be exactly 424 bytes on the wire");
+static_assert(sizeof(WeightSnapshotHeader) == 64,
+              "WeightSnapshotHeader must be exactly 64 bytes on the wire");
