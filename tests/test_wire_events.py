@@ -30,7 +30,7 @@ def test_wire_event_sizes_match_design():
     assert sizes["TensorWireSlice"] == 40, sizes
     assert sizes["TeacherRequest"] == 72, sizes
     assert sizes["TeacherResult"] == 456, sizes
-    assert sizes["WeightSnapshotHeader"] == 64, sizes
+    assert sizes["WeightSnapshotHeader"] == 96, sizes
 
 
 def test_wire_event_min_slot_alignment_is_8_bytes():

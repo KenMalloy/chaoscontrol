@@ -19,6 +19,7 @@ import socket
 import sys
 import tempfile
 import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -76,6 +77,20 @@ def _tiny_crct_model() -> ChaosStudentLM:
     )
     model.train()
     return model
+
+
+def _wait_for_metric(
+    transport,
+    key: str,
+    expected: int,
+    timeout_s: float = 5.0,
+) -> None:
+    deadline = time.monotonic() + float(timeout_s)
+    while time.monotonic() < deadline:
+        if int(transport.diagnostics().get(key, 0)) >= int(expected):
+            return
+        time.sleep(0.01)
+    assert int(transport.diagnostics().get(key, 0)) >= int(expected)
 
 
 def test_crct_fast_path_allows_bucket_prototypes_as_sidecar_prior() -> None:
@@ -861,8 +876,7 @@ def test_crct_mailbox_weight_snapshot_applies_latest_model(tmp_path) -> None:
         for param in model0.parameters():
             param.fill_(0.75)
     assert rank0._weight_publish_thread is not None
-    rank0._weight_publish_thread.join(timeout=5.0)
-    assert not rank0._weight_publish_thread.is_alive()
+    _wait_for_metric(rank0, "weight_snapshot_published", 1)
 
     rank3.poll_weight_snapshot(model=model3, step=11)
 
@@ -882,9 +896,13 @@ def test_crct_mailbox_weight_snapshot_applies_latest_model(tmp_path) -> None:
     )
     assert host_bytes == diag0["weight_snapshot_stage_bytes"]
     assert diag0["mailbox_write_seconds_max"] == 0.0
+    assert diag0["weight_snapshot_shm_writes"] == 1
+    assert diag0["weight_snapshot_pickle_writes"] == 0
     assert diag3["weight_snapshot_applied"] == 1
     assert diag3["weight_snapshot_last_applied_step"] == 7
     assert diag3["weight_snapshot_version_lag_steps"] == 4
+    assert diag3["weight_snapshot_shm_reads"] == 1
+    assert diag3["weight_snapshot_pickle_reads"] == 0
     rank3.poll_weight_snapshot(model=model3, step=12)
     diag3_after = rank3.diagnostics()
     assert diag3_after["weight_snapshot_applied"] == 1
@@ -935,8 +953,7 @@ def test_crct_mailbox_weight_snapshot_applies_fastslow_decision(tmp_path) -> Non
         fast_slow_decision=decision,
     )
     assert rank0._weight_publish_thread is not None
-    rank0._weight_publish_thread.join(timeout=5.0)
-    assert not rank0._weight_publish_thread.is_alive()
+    _wait_for_metric(rank0, "weight_snapshot_published", 1)
 
     rank3.poll_weight_snapshot(model=model3, step=11, fast_slow=fast_slow)
 
@@ -989,8 +1006,8 @@ def test_fastslow_result_payload_applies_memory_rank_decision() -> None:
     )
 
 
-def test_crct_mailbox_weight_snapshot_drops_when_writer_busy(tmp_path) -> None:
-    mod = _load_module("runner_fast_path_crct_mailbox_weights_busy", RUNNER_PATH)
+def test_crct_mailbox_weight_snapshot_ignores_stale_writer_thread_state(tmp_path) -> None:
+    mod = _load_module("runner_fast_path_crct_mailbox_weights_no_busy_gate", RUNNER_PATH)
     rank0 = mod._CrctMailboxTeacherTransport(
         rank=0,
         world_size=4,
@@ -1010,17 +1027,20 @@ def test_crct_mailbox_weight_snapshot_drops_when_writer_busy(tmp_path) -> None:
         blocker_started.set()
         blocker_release.wait(timeout=5.0)
 
-    rank0._weight_publish_thread = threading.Thread(target=_block_writer)
-    rank0._weight_publish_thread.start()
+    stale_thread = threading.Thread(target=_block_writer)
+    rank0._weight_publish_thread = stale_thread
+    stale_thread.start()
     assert blocker_started.wait(timeout=1.0)
     rank0.maybe_publish_weight_snapshot(model=torch.nn.Linear(2, 2), step=1)
+    _wait_for_metric(rank0, "weight_snapshot_published", 1)
     blocker_release.set()
-    rank0._weight_publish_thread.join(timeout=1.0)
+    stale_thread.join(timeout=1.0)
 
     diag = rank0.diagnostics()
     assert diag["weight_snapshot_attempts"] == 1
-    assert diag["weight_snapshot_publish_skipped_busy"] == 1
-    assert diag["weight_snapshot_published"] == 0
+    assert diag["weight_snapshot_publish_skipped_busy"] == 0
+    assert diag["weight_snapshot_published"] == 1
+    assert diag["weight_snapshot_pickle_writes"] == 0
 
 
 def test_crct_mailbox_request_ignores_stale_writer_thread_state(tmp_path) -> None:

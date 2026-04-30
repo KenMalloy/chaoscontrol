@@ -16,6 +16,7 @@ import json
 import math
 import os
 import random
+import struct
 import sys
 import threading
 import time
@@ -1418,8 +1419,10 @@ class _CrctAsyncTeacherTransport:
         self.full_ids_shape = tuple(int(x) for x in full_ids_shape)
         self.device = device
         self.payload_dtype = payload_dtype
-        self.max_local_batches = max(1, int(max_local_batches))
-        self.max_payload_lag_steps = max(0, int(max_payload_lag_steps))
+        self.max_local_batches_configured = max(1, int(max_local_batches))
+        self.max_payload_lag_steps_configured = max(0, int(max_payload_lag_steps))
+        self.max_local_batches = self.max_local_batches_configured
+        self.max_payload_lag_steps = self.max_payload_lag_steps_configured
         self.score_interval_steps = max(1, int(score_interval_steps))
         self.pending_result_broadcasts: deque[dict[str, Any]] = deque()
         self.pending_input_requests: deque[dict[str, Any]] = deque()
@@ -1946,6 +1949,7 @@ _TEACHER_RESULT_SLICE_NAMES = (
     "plasticity_confidence",
     "plasticity_budget",
 )
+_WEIGHT_SNAPSHOT_HEADER = struct.Struct("<IIIIQQQQIIIIQfffIQ")
 
 
 def _align64(n: int) -> int:
@@ -2091,8 +2095,10 @@ class _CrctMailboxTeacherTransport:
         self.device = device
         self.payload_dtype = payload_dtype
         self.plasticity_ema_beta = min(max(float(plasticity_ema_beta), 0.0), 0.9999)
-        self.max_local_batches = max(1, int(max_local_batches))
-        self.max_payload_lag_steps = max(0, int(max_payload_lag_steps))
+        self.max_local_batches_configured = max(1, int(max_local_batches))
+        self.max_payload_lag_steps_configured = max(0, int(max_payload_lag_steps))
+        self.max_local_batches = self.max_local_batches_configured
+        self.max_payload_lag_steps = self.max_payload_lag_steps_configured
         self.score_interval_steps = max(1, int(score_interval_steps))
         self.pending_input_requests: deque[dict[str, Any]] = deque()
         self.local_batches_by_step: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
@@ -2100,10 +2106,16 @@ class _CrctMailboxTeacherTransport:
         self._request_write_thread: threading.Thread | None = None
         self._weight_publish_thread: threading.Thread | None = None
         self._last_applied_weight_step = -1
-        self._last_seen_weight_snapshot_stat: tuple[int, int] | None = None
         self._fast_slow_slow_model: torch.nn.Module | None = None
-        self._weight_snapshot_staging: dict[str, torch.Tensor] = {}
         self._weight_snapshot_host_staging: dict[str, torch.Tensor] = {}
+        self._weight_snapshot_stage_banks: list[dict[str, Any]] = []
+        self._weight_snapshot_bank_count = 3
+        self._weight_snapshot_pending: dict[str, Any] | None = None
+        self._weight_snapshot_writer_bank: int | None = None
+        self._weight_snapshot_writer_stop = False
+        self._weight_snapshot_worker_active = False
+        self._weight_snapshot_lock = threading.Lock()
+        self._weight_snapshot_cv = threading.Condition(self._weight_snapshot_lock)
         self._request_host_staging: torch.Tensor | None = None
         self._plasticity_coverage_ema: torch.Tensor | None = None
         self._plasticity_confidence_ema: torch.Tensor | None = None
@@ -2116,9 +2128,16 @@ class _CrctMailboxTeacherTransport:
         self._teacher_result_ring_name = _teacher_shm_name(self.mailbox_dir, "tr")
         self._teacher_request_payload_name = _teacher_shm_name(self.mailbox_dir, "tqb")
         self._teacher_result_payload_name = _teacher_shm_name(self.mailbox_dir, "trb")
+        self._weight_snapshot_shm_name = _teacher_shm_name(self.mailbox_dir, "ws")
+        self._weight_snapshot_shm: Any | None = None
+        self._weight_snapshot_layout: list[dict[str, Any]] | None = None
+        self._weight_snapshot_buffer_bytes = 0
+        self._weight_snapshot_region_bytes = 0
         self._teacher_request_seq = 0
         self._teacher_result_seq = 0
         self._teacher_ring_capacity = int(_ext.ShmRingTeacherRequest.capacity)
+        self.max_local_batches = int(self._teacher_ring_capacity)
+        self.max_payload_lag_steps = 0
         self._teacher_request_slot_bytes = _align64(
             int(np.prod(self.full_ids_shape)) * _teacher_dtype_nbytes(torch.int32)
         )
@@ -2151,6 +2170,7 @@ class _CrctMailboxTeacherTransport:
             "teacher_shm_result_ring": self._teacher_result_ring_name,
             "teacher_shm_request_payload": self._teacher_request_payload_name,
             "teacher_shm_result_payload": self._teacher_result_payload_name,
+            "weight_snapshot_shm": self._weight_snapshot_shm_name,
             "teacher_shm_ring_capacity": int(self._teacher_ring_capacity),
             "teacher_shm_request_slot_bytes": int(self._teacher_request_slot_bytes),
             "teacher_shm_result_slot_bytes": int(self._teacher_result_slot_bytes),
@@ -2159,6 +2179,10 @@ class _CrctMailboxTeacherTransport:
             ),
             "teacher_shm_result_payload_bytes": int(
                 self._teacher_result_payload_bytes
+            ),
+            "max_local_batches_configured": int(self.max_local_batches_configured),
+            "max_payload_lag_steps_configured": int(
+                self.max_payload_lag_steps_configured
             ),
             "teacher_shm_request_ring_full_drops": 0,
             "teacher_shm_result_ring_full_drops": 0,
@@ -2310,6 +2334,18 @@ class _CrctMailboxTeacherTransport:
             "weight_snapshot_last_applied_step": -1,
             "weight_snapshot_version_lag_steps": 0,
             "weight_snapshot_publisher_busy": False,
+            "weight_snapshot_shm_bytes": 0,
+            "weight_snapshot_shm_header_bytes": int(_WEIGHT_SNAPSHOT_HEADER.size),
+            "weight_snapshot_shm_writes": 0,
+            "weight_snapshot_shm_reads": 0,
+            "weight_snapshot_shm_attach_misses": 0,
+            "weight_snapshot_pickle_writes": 0,
+            "weight_snapshot_pickle_reads": 0,
+            "weight_snapshot_stage_bank_count": int(self._weight_snapshot_bank_count),
+            "weight_snapshot_latest_overwrites": 0,
+            "weight_snapshot_worker_wakeups": 0,
+            "weight_snapshot_shm_write_seconds_sum": 0.0,
+            "weight_snapshot_shm_write_seconds_max": 0.0,
             "fast_slow_snapshot_decisions_published": 0,
             "fast_slow_snapshot_decisions_applied": 0,
             "fast_slow_readiness_scores": 0,
@@ -2353,6 +2389,7 @@ class _CrctMailboxTeacherTransport:
                 (_ext.ShmRingTeacherResult, self._teacher_result_ring_name),
                 (_ext.PosixShm, self._teacher_request_payload_name),
                 (_ext.PosixShm, self._teacher_result_payload_name),
+                (_ext.PosixShm, self._weight_snapshot_shm_name),
             ):
                 try:
                     cls.unlink(name)
@@ -2635,9 +2672,15 @@ class _CrctMailboxTeacherTransport:
 
     def diagnostics(self) -> dict[str, Any]:
         out = dict(self.metrics)
-        busy = (
-            self._weight_publish_thread is not None
-            and self._weight_publish_thread.is_alive()
+        with self._weight_snapshot_lock:
+            busy = self._weight_snapshot_writer_bank is not None
+            pending = self._weight_snapshot_pending
+            writer_bank = self._weight_snapshot_writer_bank
+        out["weight_snapshot_pending_step"] = (
+            int(pending["step"]) if pending is not None else -1
+        )
+        out["weight_snapshot_writer_bank"] = (
+            int(writer_bank) if writer_bank is not None else -1
         )
         out["weight_snapshot_publisher_busy"] = bool(busy)
         request_busy = (
@@ -2734,55 +2777,24 @@ class _CrctMailboxTeacherTransport:
     def close(self) -> None:
         if self._request_write_thread is not None:
             self._request_write_thread.join(timeout=0.01)
+        with self._weight_snapshot_cv:
+            self._weight_snapshot_writer_stop = True
+            self._weight_snapshot_cv.notify_all()
         if self._weight_publish_thread is not None:
-            self._weight_publish_thread.join(timeout=0.01)
+            self._weight_publish_thread.join(timeout=0.25)
         if self.rank == self.coordinator_rank:
             for cls, name in (
                 (_ext.ShmRingTeacherRequest, self._teacher_request_ring_name),
                 (_ext.ShmRingTeacherResult, self._teacher_result_ring_name),
                 (_ext.PosixShm, self._teacher_request_payload_name),
                 (_ext.PosixShm, self._teacher_result_payload_name),
+                (_ext.PosixShm, self._weight_snapshot_shm_name),
             ):
                 try:
                     cls.unlink(name)
                 except Exception:
                     pass
         return
-
-    def _request_path(self, step: int) -> Path:
-        return self.mailbox_dir / f"request_{int(step):012d}.pt"
-
-    def _result_path(self, step: int) -> Path:
-        return self.mailbox_dir / f"result_{int(step):012d}.pt"
-
-    def _weight_path(self) -> Path:
-        return self.mailbox_dir / "weights_latest.pt"
-
-    def _atomic_save(
-        self,
-        obj: dict[str, Any],
-        path: Path,
-        *,
-        record_mailbox_metrics: bool = True,
-    ) -> None:
-        t0 = time.perf_counter()
-        tmp = path.with_name(f"{path.name}.rank{self.rank}.tmp")
-        torch.save(obj, tmp)
-        tmp.replace(path)
-        elapsed = time.perf_counter() - t0
-        if record_mailbox_metrics:
-            self.metrics["mailbox_write_seconds_sum"] += float(elapsed)
-            self.metrics["mailbox_write_seconds_max"] = max(
-                float(self.metrics["mailbox_write_seconds_max"]),
-                float(elapsed),
-            )
-
-    def _safe_unlink(self, path: Path) -> None:
-        try:
-            path.unlink()
-            self.metrics["mailbox_unlinks"] += 1
-        except FileNotFoundError:
-            pass
 
     def _host_staging_like(self, src: torch.Tensor) -> torch.Tensor:
         want_pinned = bool(torch.cuda.is_available() and src.device.type == "cuda")
@@ -2846,6 +2858,464 @@ class _CrctMailboxTeacherTransport:
         self.metrics["low_priority_maintenance_last_reason"] = "allowed"
         return False
 
+    def _build_weight_snapshot_layout(
+        self,
+        state_dict: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        layout: list[dict[str, Any]] = []
+        cursor = _align64(_WEIGHT_SNAPSHOT_HEADER.size)
+        for name, value in state_dict.items():
+            if not torch.is_tensor(value):
+                continue
+            tensor = value.detach()
+            nbytes = int(tensor.numel() * tensor.element_size())
+            layout.append(
+                {
+                    "name": str(name),
+                    "shape": tuple(int(x) for x in tensor.shape),
+                    "stride": tuple(int(x) for x in tensor.stride()),
+                    "dtype": tensor.dtype,
+                    "offset": int(cursor),
+                    "nbytes": int(nbytes),
+                }
+            )
+            cursor = _align64(cursor + nbytes)
+        return layout
+
+    def _ensure_weight_snapshot_writer(
+        self,
+        state_dict: dict[str, Any],
+    ) -> bool:
+        if self.rank != self.coordinator_rank:
+            return False
+        if self._weight_snapshot_layout is None:
+            layout = self._build_weight_snapshot_layout(state_dict)
+            buffer_bytes = _align64(
+                max(
+                    _WEIGHT_SNAPSHOT_HEADER.size,
+                    max(
+                        (
+                            int(item["offset"]) + int(item["nbytes"])
+                            for item in layout
+                        ),
+                        default=0,
+                    ),
+                )
+            )
+            region_bytes = int(buffer_bytes) * 2
+            self._weight_snapshot_layout = layout
+            self._weight_snapshot_buffer_bytes = int(buffer_bytes)
+            self._weight_snapshot_region_bytes = int(region_bytes)
+        assert self._weight_snapshot_layout is not None
+        recreate = self._weight_snapshot_shm is None
+        if recreate:
+            try:
+                _ext.PosixShm.unlink(self._weight_snapshot_shm_name)
+            except Exception:
+                pass
+            self._weight_snapshot_shm = _ext.PosixShm(
+                self._weight_snapshot_shm_name,
+                int(self._weight_snapshot_region_bytes),
+                True,
+            )
+            self.metrics["weight_snapshot_shm_bytes"] = int(
+                self._weight_snapshot_region_bytes
+            )
+            self._weight_snapshot_stage_banks = []
+        return True
+
+    def _ensure_weight_snapshot_stage_banks(
+        self,
+        state_dict: dict[str, Any],
+    ) -> None:
+        if self._weight_snapshot_stage_banks:
+            return
+        banks: list[dict[str, Any]] = []
+        for bank_idx in range(int(self._weight_snapshot_bank_count)):
+            tensors: dict[str, torch.Tensor] = {}
+            for name, value in state_dict.items():
+                if not torch.is_tensor(value):
+                    continue
+                src = value.detach()
+                tensors[name] = torch.empty_like(src)
+            banks.append(
+                {
+                    "bank": int(bank_idx),
+                    "tensors": tensors,
+                    "passthrough": {},
+                    "event": None,
+                    "start_event": None,
+                    "step": -1,
+                    "decision_payload": None,
+                }
+            )
+        self._weight_snapshot_stage_banks = banks
+
+    def _ensure_weight_snapshot_worker(self) -> None:
+        if (
+            self._weight_snapshot_worker_active
+            and self._weight_publish_thread is not None
+            and self._weight_publish_thread.is_alive()
+        ):
+            return
+        with self._weight_snapshot_cv:
+            self._weight_snapshot_writer_stop = False
+            self._weight_snapshot_worker_active = True
+        self._weight_publish_thread = threading.Thread(
+            target=self._weight_snapshot_worker_loop,
+            name="crct-weight-snapshot-shm-writer",
+            daemon=True,
+        )
+        self._weight_publish_thread.start()
+
+    def _weight_snapshot_worker_loop(self) -> None:
+        while True:
+            with self._weight_snapshot_cv:
+                while (
+                    self._weight_snapshot_pending is None
+                    and not self._weight_snapshot_writer_stop
+                ):
+                    self._weight_snapshot_cv.wait()
+                if self._weight_snapshot_writer_stop:
+                    self._weight_snapshot_worker_active = False
+                    return
+                pending = self._weight_snapshot_pending
+                self._weight_snapshot_pending = None
+                assert pending is not None
+                self._weight_snapshot_writer_bank = int(pending["bank"])
+                self.metrics["weight_snapshot_publisher_busy"] = True
+                self.metrics["weight_snapshot_worker_wakeups"] += 1
+
+            stage_event = pending.get("event")
+            stage_start_event = pending.get("start_event")
+            wait_t0 = time.perf_counter()
+            if stage_event is not None:
+                try:
+                    stage_event.synchronize()
+                    if stage_start_event is not None:
+                        stage_gpu_s = float(
+                            stage_start_event.elapsed_time(stage_event)
+                        ) / 1000.0
+                        self.metrics["weight_snapshot_stage_gpu_seconds_sum"] += (
+                            stage_gpu_s
+                        )
+                        self.metrics["weight_snapshot_stage_gpu_seconds_max"] = max(
+                            float(
+                                self.metrics[
+                                    "weight_snapshot_stage_gpu_seconds_max"
+                                ]
+                            ),
+                            stage_gpu_s,
+                        )
+                except Exception as exc:
+                    self.metrics["weight_snapshot_publish_errors"] += 1
+                    self.metrics["last_error"] = "".join(
+                        traceback.format_exception_only(type(exc), exc)
+                    ).strip()
+                    self.metrics["last_drop_reason"] = "weight_snapshot_stage_wait_error"
+                    with self._weight_snapshot_cv:
+                        self._weight_snapshot_writer_bank = None
+                        self.metrics["weight_snapshot_publisher_busy"] = False
+                        self._weight_snapshot_cv.notify_all()
+                    continue
+            wait_s = time.perf_counter() - wait_t0
+            self.metrics["weight_snapshot_stage_wait_seconds_sum"] += float(wait_s)
+            self.metrics["weight_snapshot_stage_wait_seconds_max"] = max(
+                float(self.metrics["weight_snapshot_stage_wait_seconds_max"]),
+                float(wait_s),
+            )
+
+            copy_t0 = time.perf_counter()
+            try:
+                state_cpu: dict[str, Any] = {}
+                pinned_buffers = 0
+                pinned_bytes = 0
+                pageable_buffers = 0
+                pageable_bytes = 0
+                staged_tensors = pending["staged_tensors"]
+                for name, tensor in staged_tensors.items():
+                    host = self._weight_snapshot_host_staging.get(name)
+                    if (
+                        host is None
+                        or tuple(host.shape) != tuple(tensor.shape)
+                        or tuple(host.stride()) != tuple(tensor.stride())
+                        or host.dtype != tensor.dtype
+                    ):
+                        host = self._host_staging_like(tensor)
+                        self._weight_snapshot_host_staging[name] = host
+                    host.copy_(tensor.detach(), non_blocking=False)
+                    nbytes = int(host.numel() * host.element_size())
+                    if bool(host.is_pinned()):
+                        pinned_buffers += 1
+                        pinned_bytes += nbytes
+                    else:
+                        pageable_buffers += 1
+                        pageable_bytes += nbytes
+                    state_cpu[name] = host
+                state_cpu.update(pending.get("passthrough", {}))
+                self.metrics["weight_snapshot_host_pinned_buffers"] = int(
+                    pinned_buffers
+                )
+                self.metrics["weight_snapshot_host_pinned_bytes"] = int(
+                    pinned_bytes
+                )
+                self.metrics["weight_snapshot_host_pageable_buffers"] = int(
+                    pageable_buffers
+                )
+                self.metrics["weight_snapshot_host_pageable_bytes"] = int(
+                    pageable_bytes
+                )
+            except Exception as exc:
+                self.metrics["weight_snapshot_publish_errors"] += 1
+                self.metrics["last_error"] = "".join(
+                    traceback.format_exception_only(type(exc), exc)
+                ).strip()
+                self.metrics["last_drop_reason"] = "weight_snapshot_writer_cpu_copy_error"
+                with self._weight_snapshot_cv:
+                    self._weight_snapshot_writer_bank = None
+                    self.metrics["weight_snapshot_publisher_busy"] = False
+                    self._weight_snapshot_cv.notify_all()
+                continue
+            copy_s = time.perf_counter() - copy_t0
+            self.metrics["weight_snapshot_copy_started"] += 1
+            self.metrics["weight_snapshot_copy_seconds_sum"] += float(copy_s)
+            self.metrics["weight_snapshot_copy_seconds_max"] = max(
+                float(self.metrics["weight_snapshot_copy_seconds_max"]),
+                float(copy_s),
+            )
+            self.metrics["weight_snapshot_writer_cpu_copy_seconds_sum"] += float(
+                copy_s
+            )
+            self.metrics["weight_snapshot_writer_cpu_copy_seconds_max"] = max(
+                float(self.metrics["weight_snapshot_writer_cpu_copy_seconds_max"]),
+                float(copy_s),
+            )
+
+            save_t0 = time.perf_counter()
+            try:
+                self._write_weight_snapshot_shm(
+                    state_cpu=state_cpu,
+                    step=int(pending["step"]),
+                    decision_payload=pending.get("decision_payload"),
+                )
+                save_s = time.perf_counter() - save_t0
+                self.metrics["weight_snapshot_published"] += 1
+                self.metrics["weight_snapshot_last_published_step"] = int(
+                    pending["step"]
+                )
+                self.metrics["weight_snapshot_save_seconds_sum"] += float(save_s)
+                self.metrics["weight_snapshot_save_seconds_max"] = max(
+                    float(self.metrics["weight_snapshot_save_seconds_max"]),
+                    float(save_s),
+                )
+                self.metrics["weight_snapshot_shm_write_seconds_sum"] += float(save_s)
+                self.metrics["weight_snapshot_shm_write_seconds_max"] = max(
+                    float(self.metrics["weight_snapshot_shm_write_seconds_max"]),
+                    float(save_s),
+                )
+            except Exception as exc:
+                self.metrics["weight_snapshot_publish_errors"] += 1
+                self.metrics["last_error"] = "".join(
+                    traceback.format_exception_only(type(exc), exc)
+                ).strip()
+                self.metrics["last_drop_reason"] = "weight_snapshot_shm_write_error"
+            finally:
+                with self._weight_snapshot_cv:
+                    self._weight_snapshot_writer_bank = None
+                    self.metrics["weight_snapshot_publisher_busy"] = False
+                    self._weight_snapshot_cv.notify_all()
+
+    def _ensure_weight_snapshot_reader(
+        self,
+        state_dict: dict[str, Any],
+    ) -> bool:
+        if self.rank != self.memory_rank:
+            return False
+        if self._weight_snapshot_layout is None:
+            self._weight_snapshot_layout = self._build_weight_snapshot_layout(state_dict)
+            self._weight_snapshot_buffer_bytes = _align64(
+                max(
+                    _WEIGHT_SNAPSHOT_HEADER.size,
+                    max(
+                        (
+                            int(item["offset"]) + int(item["nbytes"])
+                            for item in self._weight_snapshot_layout
+                        ),
+                        default=0,
+                    ),
+                )
+            )
+            self._weight_snapshot_region_bytes = int(self._weight_snapshot_buffer_bytes) * 2
+        if self._weight_snapshot_shm is None:
+            try:
+                self._weight_snapshot_shm = _ext.PosixShm(
+                    self._weight_snapshot_shm_name,
+                    0,
+                    False,
+                )
+            except Exception:
+                self.metrics["weight_snapshot_shm_attach_misses"] += 1
+                return False
+            self.metrics["weight_snapshot_shm_bytes"] = int(
+                self._weight_snapshot_shm.size()
+            )
+        return True
+
+    def _pack_weight_snapshot_header(
+        self,
+        *,
+        step: int,
+        active_buffer: int,
+        tensor_count: int,
+        total_bytes: int,
+        decision_payload: dict[str, object] | None,
+    ) -> bytes:
+        constants = _ext.wire_event_constants()
+        mode = str(decision_payload.get("mode", "")) if decision_payload else ""
+        reason = str(decision_payload.get("reason", "")) if decision_payload else ""
+        return _WEIGHT_SNAPSHOT_HEADER.pack(
+            int(constants["TEACHER_WEIGHT_SNAPSHOT_MAGIC"]),
+            int(constants["TEACHER_WIRE_VERSION"]),
+            int(_WEIGHT_SNAPSHOT_HEADER.size),
+            0,
+            int(step),
+            int(step),
+            int(total_bytes),
+            0,
+            int(tensor_count),
+            int(active_buffer),
+            _fast_slow_mode_code(mode),
+            int(bool(decision_payload.get("accepted", False))) if decision_payload else 0,
+            int(decision_payload.get("step", 0)) if decision_payload else 0,
+            float(decision_payload.get("alpha", 0.0)) if decision_payload else 0.0,
+            float(decision_payload.get("gate", 0.0)) if decision_payload else 0.0,
+            float(decision_payload.get("effective_alpha", 0.0)) if decision_payload else 0.0,
+            _fast_slow_reason_code(reason),
+            0,
+        )
+
+    def _unpack_weight_snapshot_header(self, raw: bytes) -> dict[str, Any] | None:
+        if len(raw) != _WEIGHT_SNAPSHOT_HEADER.size:
+            return None
+        values = _WEIGHT_SNAPSHOT_HEADER.unpack(raw)
+        constants = _ext.wire_event_constants()
+        if int(values[0]) != int(constants["TEACHER_WEIGHT_SNAPSHOT_MAGIC"]):
+            return None
+        if int(values[2]) != int(_WEIGHT_SNAPSHOT_HEADER.size):
+            return None
+        return {
+            "step": int(values[4]),
+            "snapshot_version": int(values[5]),
+            "total_bytes": int(values[6]),
+            "tensor_count": int(values[8]),
+            "active_buffer": int(values[9]),
+            "fast_slow_mode": int(values[10]),
+            "fast_slow_accepted": int(values[11]),
+            "fast_slow_step": int(values[12]),
+            "fast_slow_alpha": float(values[13]),
+            "fast_slow_gate": float(values[14]),
+            "fast_slow_effective_alpha": float(values[15]),
+            "fast_slow_reason": int(values[16]),
+        }
+
+    def _write_weight_snapshot_shm(
+        self,
+        *,
+        state_cpu: dict[str, Any],
+        step: int,
+        decision_payload: dict[str, object] | None,
+    ) -> None:
+        if self._weight_snapshot_shm is None or self._weight_snapshot_layout is None:
+            raise RuntimeError("weight snapshot shm writer is not initialized")
+        active_buffer = (int(step) & 1)
+        buffer_base = active_buffer * int(self._weight_snapshot_buffer_bytes)
+        self._weight_snapshot_shm.write_bytes(
+            buffer_base,
+            bytes(_WEIGHT_SNAPSHOT_HEADER.size),
+        )
+        for item in self._weight_snapshot_layout:
+            tensor = state_cpu[item["name"]]
+            if not torch.is_tensor(tensor):
+                continue
+            src = tensor.detach().to(dtype=item["dtype"], device="cpu").contiguous()
+            self._weight_snapshot_shm.write_tensor(
+                buffer_base + int(item["offset"]),
+                src,
+            )
+        header = self._pack_weight_snapshot_header(
+            step=int(step),
+            active_buffer=active_buffer,
+            tensor_count=len(self._weight_snapshot_layout),
+            total_bytes=int(self._weight_snapshot_buffer_bytes),
+            decision_payload=decision_payload,
+        )
+        # Publish latest-complete last. The consumer ignores buffers whose
+        # header is absent or stale.
+        self._weight_snapshot_shm.write_bytes(buffer_base, header)
+        self.metrics["weight_snapshot_shm_writes"] += 1
+
+    def _read_weight_snapshot_shm(
+        self,
+        *,
+        model: torch.nn.Module,
+        min_snapshot_version: int = -1,
+    ) -> tuple[int, dict[str, torch.Tensor], dict[str, object] | None] | None:
+        state_template = model.state_dict()
+        if not self._ensure_weight_snapshot_reader(state_template):
+            return None
+        assert self._weight_snapshot_shm is not None
+        assert self._weight_snapshot_layout is not None
+        best_header: dict[str, Any] | None = None
+        best_base = 0
+        for active_buffer in (0, 1):
+            buffer_base = active_buffer * int(self._weight_snapshot_buffer_bytes)
+            raw = self._weight_snapshot_shm.read_bytes(
+                buffer_base,
+                _WEIGHT_SNAPSHOT_HEADER.size,
+            )
+            header = self._unpack_weight_snapshot_header(raw)
+            if header is None:
+                continue
+            if int(header["active_buffer"]) != active_buffer:
+                continue
+            if best_header is None or int(header["snapshot_version"]) > int(
+                best_header["snapshot_version"]
+            ):
+                best_header = header
+                best_base = buffer_base
+        if best_header is None:
+            return None
+        if int(best_header["snapshot_version"]) <= int(min_snapshot_version):
+            return int(best_header["step"]), {}, None
+        state_cpu: dict[str, torch.Tensor] = {}
+        for item in self._weight_snapshot_layout:
+            template = state_template[item["name"]]
+            if not torch.is_tensor(template):
+                continue
+            out = torch.empty(
+                tuple(item["shape"]),
+                dtype=item["dtype"],
+                device="cpu",
+            ).contiguous()
+            self._weight_snapshot_shm.read_tensor_into(
+                best_base + int(item["offset"]),
+                out,
+            )
+            state_cpu[item["name"]] = out
+        decision_payload = None
+        if int(best_header["fast_slow_mode"]) != 0:
+            decision_payload = {
+                "mode": _fast_slow_mode_from_code(best_header["fast_slow_mode"]),
+                "accepted": bool(best_header["fast_slow_accepted"]),
+                "alpha": float(best_header["fast_slow_alpha"]),
+                "gate": float(best_header["fast_slow_gate"]),
+                "effective_alpha": float(best_header["fast_slow_effective_alpha"]),
+                "step": int(best_header["fast_slow_step"]),
+                "reason": _fast_slow_reason_from_code(best_header["fast_slow_reason"]),
+            }
+        self.metrics["weight_snapshot_shm_reads"] += 1
+        return int(best_header["step"]), state_cpu, decision_payload
+
     def maybe_publish_weight_snapshot(
         self,
         *,
@@ -2856,34 +3326,46 @@ class _CrctMailboxTeacherTransport:
         """Publish a latest-only teacher snapshot without a rank-3 rendezvous.
 
         Rank 0 performs only a vectorized device-local staging copy in the step
-        body. The expensive model->CPU copy and serialization happen on a
-        daemon thread from that stable staging buffer. If the writer is busy,
-        this drops the refresh rather than queuing, preserving latest-only
-        semantics.
+        body.  A persistent writer thread publishes the latest completed stage
+        into the double-buffered shared-memory mirror.  Newer stages overwrite
+        older unpublished stages; the trunk never waits for the writer and the
+        memory rank consumes by version stamp rather than by a software TTL.
         """
         if self.rank != self.coordinator_rank:
             return
         self.metrics["weight_snapshot_attempts"] += 1
-        if (
-            self._weight_publish_thread is not None
-            and self._weight_publish_thread.is_alive()
-        ):
-            self.metrics["weight_snapshot_publish_skipped_busy"] += 1
-            self.metrics["weight_snapshot_publisher_busy"] = True
+        state_dict = model.state_dict()
+        if not self._ensure_weight_snapshot_writer(state_dict):
             return
+        self._ensure_weight_snapshot_stage_banks(state_dict)
+        self._ensure_weight_snapshot_worker()
+
+        with self._weight_snapshot_cv:
+            writer_bank = self._weight_snapshot_writer_bank
+            preferred = int(step) % int(self._weight_snapshot_bank_count)
+            bank_idx = preferred
+            if writer_bank is not None and bank_idx == int(writer_bank):
+                for candidate in range(int(self._weight_snapshot_bank_count)):
+                    if candidate != int(writer_bank):
+                        bank_idx = int(candidate)
+                        break
+            if self._weight_snapshot_pending is not None:
+                self.metrics["weight_snapshot_latest_overwrites"] += 1
+        bank = self._weight_snapshot_stage_banks[bank_idx]
+
         stage_t0 = time.perf_counter()
         try:
-            staged_tensors: dict[str, torch.Tensor] = {}
+            staged_tensors: dict[str, torch.Tensor] = bank["tensors"]
             passthrough: dict[str, Any] = {}
             src_tensors: list[torch.Tensor] = []
             dst_tensors: list[torch.Tensor] = []
             stage_bytes = 0
-            for name, value in model.state_dict().items():
+            for name, value in state_dict.items():
                 if not torch.is_tensor(value):
                     passthrough[name] = value
                     continue
                 src = value.detach()
-                dst = self._weight_snapshot_staging.get(name)
+                dst = staged_tensors.get(name)
                 if (
                     dst is None
                     or tuple(dst.shape) != tuple(src.shape)
@@ -2891,10 +3373,9 @@ class _CrctMailboxTeacherTransport:
                     or dst.device != src.device
                 ):
                     dst = torch.empty_like(src)
-                    self._weight_snapshot_staging[name] = dst
+                    staged_tensors[name] = dst
                 src_tensors.append(src)
                 dst_tensors.append(dst)
-                staged_tensors[name] = dst
                 stage_bytes += int(src.numel() * src.element_size())
             if dst_tensors:
                 first_tensor = dst_tensors[0]
@@ -2931,141 +3412,26 @@ class _CrctMailboxTeacherTransport:
         self.metrics["weight_snapshot_stage_tensor_count"] = len(staged_tensors)
         self.metrics["weight_snapshot_stage_bytes"] = int(stage_bytes)
         self.metrics["weight_snapshot_publish_started"] += 1
-        self.metrics["weight_snapshot_publisher_busy"] = True
         version_step = int(step)
         decision_payload = fast_slow_decision_to_dict(fast_slow_decision)
         if decision_payload is not None:
             self.metrics["fast_slow_snapshot_decisions_published"] += 1
-
-        def _writer() -> None:
-            wait_t0 = time.perf_counter()
-            if stage_event is not None:
-                try:
-                    stage_event.synchronize()
-                    if stage_start_event is not None:
-                        stage_gpu_s = float(
-                            stage_start_event.elapsed_time(stage_event)
-                        ) / 1000.0
-                        self.metrics["weight_snapshot_stage_gpu_seconds_sum"] += (
-                            stage_gpu_s
-                        )
-                        self.metrics["weight_snapshot_stage_gpu_seconds_max"] = max(
-                            float(
-                                self.metrics[
-                                    "weight_snapshot_stage_gpu_seconds_max"
-                                ]
-                            ),
-                            stage_gpu_s,
-                        )
-                except Exception as exc:
-                    self.metrics["weight_snapshot_publish_errors"] += 1
-                    self.metrics["last_error"] = "".join(
-                        traceback.format_exception_only(type(exc), exc)
-                    ).strip()
-                    self.metrics["last_drop_reason"] = "weight_snapshot_stage_wait_error"
-                    self.metrics["weight_snapshot_publisher_busy"] = False
-                    return
-            wait_s = time.perf_counter() - wait_t0
-            self.metrics["weight_snapshot_stage_wait_seconds_sum"] += float(wait_s)
-            self.metrics["weight_snapshot_stage_wait_seconds_max"] = max(
-                float(self.metrics["weight_snapshot_stage_wait_seconds_max"]),
-                float(wait_s),
-            )
-            copy_t0 = time.perf_counter()
-            try:
-                state_cpu: dict[str, Any] = {}
-                pinned_buffers = 0
-                pinned_bytes = 0
-                pageable_buffers = 0
-                pageable_bytes = 0
-                for name, tensor in staged_tensors.items():
-                    host = self._weight_snapshot_host_staging.get(name)
-                    if (
-                        host is None
-                        or tuple(host.shape) != tuple(tensor.shape)
-                        or tuple(host.stride()) != tuple(tensor.stride())
-                        or host.dtype != tensor.dtype
-                    ):
-                        host = self._host_staging_like(tensor)
-                        self._weight_snapshot_host_staging[name] = host
-                    host.copy_(tensor.detach(), non_blocking=False)
-                    nbytes = int(host.numel() * host.element_size())
-                    if bool(host.is_pinned()):
-                        pinned_buffers += 1
-                        pinned_bytes += nbytes
-                    else:
-                        pageable_buffers += 1
-                        pageable_bytes += nbytes
-                    state_cpu[name] = host
-                state_cpu.update(passthrough)
-                self.metrics["weight_snapshot_host_pinned_buffers"] = int(
-                    pinned_buffers
-                )
-                self.metrics["weight_snapshot_host_pinned_bytes"] = int(
-                    pinned_bytes
-                )
-                self.metrics["weight_snapshot_host_pageable_buffers"] = int(
-                    pageable_buffers
-                )
-                self.metrics["weight_snapshot_host_pageable_bytes"] = int(
-                    pageable_bytes
-                )
-            except Exception as exc:
-                self.metrics["weight_snapshot_publish_errors"] += 1
-                self.metrics["last_error"] = "".join(
-                    traceback.format_exception_only(type(exc), exc)
-                ).strip()
-                self.metrics["last_drop_reason"] = "weight_snapshot_writer_cpu_copy_error"
-                self.metrics["weight_snapshot_publisher_busy"] = False
-                return
-            copy_s = time.perf_counter() - copy_t0
-            self.metrics["weight_snapshot_copy_started"] += 1
-            self.metrics["weight_snapshot_copy_seconds_sum"] += float(copy_s)
-            self.metrics["weight_snapshot_copy_seconds_max"] = max(
-                float(self.metrics["weight_snapshot_copy_seconds_max"]),
-                float(copy_s),
-            )
-            self.metrics["weight_snapshot_writer_cpu_copy_seconds_sum"] += float(
-                copy_s
-            )
-            self.metrics["weight_snapshot_writer_cpu_copy_seconds_max"] = max(
-                float(self.metrics["weight_snapshot_writer_cpu_copy_seconds_max"]),
-                float(copy_s),
-            )
-            save_t0 = time.perf_counter()
-            try:
-                self._atomic_save(
-                    {
-                        "step": version_step,
-                        "state_dict": state_cpu,
-                        "fast_slow_decision": decision_payload,
-                    },
-                    self._weight_path(),
-                    record_mailbox_metrics=False,
-                )
-                save_s = time.perf_counter() - save_t0
-                self.metrics["weight_snapshot_published"] += 1
-                self.metrics["weight_snapshot_last_published_step"] = version_step
-                self.metrics["weight_snapshot_save_seconds_sum"] += float(save_s)
-                self.metrics["weight_snapshot_save_seconds_max"] = max(
-                    float(self.metrics["weight_snapshot_save_seconds_max"]),
-                    float(save_s),
-                )
-            except Exception as exc:
-                self.metrics["weight_snapshot_publish_errors"] += 1
-                self.metrics["last_error"] = "".join(
-                    traceback.format_exception_only(type(exc), exc)
-                ).strip()
-                self.metrics["last_drop_reason"] = "weight_snapshot_save_error"
-            finally:
-                self.metrics["weight_snapshot_publisher_busy"] = False
-
-        self._weight_publish_thread = threading.Thread(
-            target=_writer,
-            name="crct-weight-snapshot-writer",
-            daemon=True,
-        )
-        self._weight_publish_thread.start()
+        bank["passthrough"] = passthrough
+        bank["event"] = stage_event
+        bank["start_event"] = stage_start_event
+        bank["step"] = version_step
+        bank["decision_payload"] = decision_payload
+        with self._weight_snapshot_cv:
+            self._weight_snapshot_pending = {
+                "bank": int(bank_idx),
+                "staged_tensors": staged_tensors,
+                "passthrough": passthrough,
+                "event": stage_event,
+                "start_event": stage_start_event,
+                "step": version_step,
+                "decision_payload": decision_payload,
+            }
+            self._weight_snapshot_cv.notify_all()
 
     def poll_weight_snapshot(
         self,
@@ -3084,32 +3450,24 @@ class _CrctMailboxTeacherTransport:
         """
         if self.rank != self.memory_rank:
             return
-        path = self._weight_path()
         try:
-            stat = path.stat()
-        except FileNotFoundError:
-            return
-        stat_id = (int(getattr(stat, "st_ino", 0)), int(stat.st_mtime_ns))
-        if stat_id == self._last_seen_weight_snapshot_stat:
-            self.metrics["weight_snapshot_stat_skips"] += 1
-            self.metrics["weight_snapshot_version_lag_steps"] = max(
-                0, int(step) - int(self._last_applied_weight_step)
+            snapshot = self._read_weight_snapshot_shm(
+                model=model,
+                min_snapshot_version=int(self._last_applied_weight_step),
             )
-            return
-        self.metrics["weight_snapshot_apply_attempts"] += 1
-        apply_t0 = time.perf_counter()
-        try:
-            payload = torch.load(path, map_location="cpu", weights_only=True)
-            self._last_seen_weight_snapshot_stat = stat_id
-            version_step = int(payload.get("step", -1))
+            if snapshot is None:
+                return
+            version_step, state_cpu, decision_payload = snapshot
             if version_step <= self._last_applied_weight_step:
-                self.metrics["weight_snapshot_apply_stale"] += 1
+                self.metrics["weight_snapshot_stat_skips"] += 1
                 self.metrics["weight_snapshot_version_lag_steps"] = max(
                     0, int(step) - int(self._last_applied_weight_step)
                 )
                 return
+            self.metrics["weight_snapshot_apply_attempts"] += 1
+            apply_t0 = time.perf_counter()
             load_result = model.load_state_dict(
-                payload["state_dict"],
+                state_cpu,
                 strict=False,
             )
             missing = getattr(load_result, "missing_keys", [])
@@ -3117,9 +3475,7 @@ class _CrctMailboxTeacherTransport:
             if missing or unexpected:
                 self.metrics["last_drop_reason"] = "weight_snapshot_partial_load"
             if fast_slow is not None:
-                decision = fast_slow_decision_from_dict(
-                    payload.get("fast_slow_decision")
-                )
+                decision = fast_slow_decision_from_dict(decision_payload)
                 if decision is not None:
                     fast_slow.apply_decision(model, decision)
                     self.metrics["fast_slow_snapshot_decisions_applied"] += 1
@@ -3149,8 +3505,6 @@ class _CrctMailboxTeacherTransport:
                     self.metrics["last_error"] = "".join(
                         traceback.format_exception_only(type(exc), exc)
                     ).strip()
-        except FileNotFoundError:
-            return
         except Exception as exc:
             self.metrics["weight_snapshot_apply_errors"] += 1
             self.metrics["last_error"] = "".join(
@@ -10423,6 +10777,15 @@ def train_fast_for_budget(
                 ),
                 "weight_snapshot_publish_skipped_busy": int(
                     coord.get("weight_snapshot_publish_skipped_busy", 0)
+                ),
+                "weight_snapshot_latest_overwrites": int(
+                    coord.get("weight_snapshot_latest_overwrites", 0)
+                ),
+                "weight_snapshot_shm_writes": int(
+                    coord.get("weight_snapshot_shm_writes", 0)
+                ),
+                "weight_snapshot_shm_reads": int(
+                    mem.get("weight_snapshot_shm_reads", 0)
                 ),
                 "weight_snapshot_publish_errors": int(
                     coord.get("weight_snapshot_publish_errors", 0)

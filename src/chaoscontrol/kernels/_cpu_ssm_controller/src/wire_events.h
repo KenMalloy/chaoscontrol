@@ -238,7 +238,7 @@ struct TeacherResult {
     TensorWireSlice slices[TEACHER_RESULT_SLICES];
 };
 
-// 64 bytes. Header stored at the front of each weight-snapshot buffer in
+// 96 bytes. Header stored at the front of each weight-snapshot buffer in
 // the double-buffered shared-memory region. Tensor layout metadata is fixed
 // once at startup; this header only publishes latest-complete version state.
 struct WeightSnapshotHeader {
@@ -252,6 +252,13 @@ struct WeightSnapshotHeader {
     uint64_t checksum;
     uint32_t tensor_count;
     uint32_t active_buffer;
+    uint32_t fast_slow_mode;
+    uint32_t fast_slow_accepted;
+    uint64_t fast_slow_step;
+    float    fast_slow_alpha;
+    float    fast_slow_gate;
+    float    fast_slow_effective_alpha;
+    uint32_t fast_slow_reason;
     uint64_t reserved0;
 };
 
@@ -273,5 +280,5 @@ static_assert(sizeof(TeacherRequest) == 72,
               "TeacherRequest must be exactly 72 bytes on the wire");
 static_assert(sizeof(TeacherResult) == 456,
               "TeacherResult must be exactly 456 bytes on the wire");
-static_assert(sizeof(WeightSnapshotHeader) == 64,
-              "WeightSnapshotHeader must be exactly 64 bytes on the wire");
+static_assert(sizeof(WeightSnapshotHeader) == 96,
+              "WeightSnapshotHeader must be exactly 96 bytes on the wire");
