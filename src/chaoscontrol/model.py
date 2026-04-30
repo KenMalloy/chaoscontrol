@@ -1282,11 +1282,15 @@ class CareStudentLM(nn.Module):
         if memory_mode == "packet" and episodic_residual is not None:
             packet_gate = _packet_gate(x)
             packet_residual = _packet_residual(x)
-            x = x + packet_residual * packet_gate.unsqueeze(-1)
+            x = x.addcmul_(packet_residual, packet_gate.unsqueeze(-1))
             memory_gate = packet_gate
             memory_residual = packet_residual
 
-        if isinstance(self.outer_model, MultiSlotOuterModel) and self.cue_projection:
+        if (
+            memory_mode not in {"off", "packet"}
+            and isinstance(self.outer_model, MultiSlotOuterModel)
+            and self.cue_projection
+        ):
             # Rank-3 sidecar maintenance needs the same pre-SSM cue used by
             # real memory reads.  Stashing this tensor makes the cheap
             # saliency map falsifiable against the full oracle path without

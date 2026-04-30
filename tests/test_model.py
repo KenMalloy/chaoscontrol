@@ -225,6 +225,30 @@ class TestCareStudentLM(unittest.TestCase):
         assert out["memory_meta"]["memory_gate"].shape == (2, 6)
         assert out["memory_meta"]["memory_residual"].shape == (2, 1, 8)
 
+    def test_encode_packet_mode_does_not_compute_sidecar_cue(self) -> None:
+        torch.manual_seed(36)
+        model = CareStudentLM(
+            vocab_size=64, dim=8, num_layers=1, ff_mult=2,
+            a_mode="diag", rich_b_mode="none", outer_model_dim=8,
+            outer_model_type="multislot",
+            buffer_mode="append_only",
+            retrieval_mode="softmax_all",
+        )
+        ids = torch.randint(0, 64, (2, 6))
+        residual = torch.randn(2, 1, 8)
+        gate = torch.ones(2, 6)
+
+        model.encode(
+            ids,
+            memory_mode="packet",
+            episodic_residual=residual,
+            episodic_gate=gate,
+        )
+        assert model._last_outer_cue is None
+
+        model.encode(ids, memory_mode="force_on")
+        assert model._last_outer_cue is not None
+
     def test_encode_packet_mode_rejects_sequence_residual_packets(self) -> None:
         model = CareStudentLM(
             vocab_size=64, dim=8, num_layers=1, ff_mult=2,

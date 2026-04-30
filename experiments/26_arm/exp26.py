@@ -130,8 +130,12 @@ def _crct_lock() -> dict[str, Any]:
         "retrieval_mode": "softmax_all",
         "retrieval_k": 16,
         "train_sampling_mode": "random",
-        "compile_full_path": True,
-        "cuda_graph_mode": "probe",
+        # Packet-mode compile is supported by the runner, but the encoder-only
+        # compile gain is too small to pay for multi-minute cold-starts inside
+        # the validation budget. Keep the CRCT lane eager unless a separate
+        # warm-compile run is explicitly being profiled.
+        "compile_full_path": False,
+        "cuda_graph_mode": "none",
         "optimizer_log_a_beta_coupling": True,
         "optimizer_log_a_beta_ema": 0.99,
         "optimizer_log_a_beta_min": 0.5,

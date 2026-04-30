@@ -84,8 +84,8 @@ def test_validation_active_is_full_arm_not_crct_only_or_shadow():
     assert active["crct_teacher_score_interval_steps"] == 1
     assert "crct_async_teacher_pending_batches" not in active
     assert "crct_async_teacher_max_lag_steps" not in active
-    assert active["compile_full_path"] is True
-    assert active["cuda_graph_mode"] == "probe"
+    assert active["compile_full_path"] is False
+    assert active["cuda_graph_mode"] == "none"
     assert active["optimizer_log_a_beta_coupling"] is True
     assert active["optimizer_log_a_beta_ema"] == 0.99
     assert active["optimizer_log_a_beta_min"] == 0.5

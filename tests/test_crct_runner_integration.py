@@ -595,7 +595,8 @@ def test_crct_mailbox_transport_matches_stored_batch(tmp_path) -> None:
     targets = ((base + 1) % 32).to(dtype=torch.long)
 
     assert rank0.begin_step(inputs=inputs, targets=targets, step=0) is None
-    assert rank0._request_write_thread is None
+    assert rank0._request_write_thread is not None
+    _wait_for_metric(rank0, "teacher_shm_request_events_pushed", 1)
     assert rank3.begin_step(inputs=inputs, targets=targets, step=0) is None
     rank3.after_optimizer_step(
         model=model,
@@ -611,8 +612,9 @@ def test_crct_mailbox_transport_matches_stored_batch(tmp_path) -> None:
     )
 
     ready = rank0.begin_step(inputs=inputs + 3, targets=targets + 3, step=1)
-    assert rank0._request_write_thread is None
+    assert rank0._request_write_thread is not None
     assert ready is not None
+    _wait_for_metric(rank0, "teacher_shm_request_events_pushed", 2)
     payload, train_inputs, train_targets = ready
     assert int(payload["step_id"].item()) == 0
     assert torch.equal(train_inputs, inputs)
@@ -624,6 +626,7 @@ def test_crct_mailbox_transport_matches_stored_batch(tmp_path) -> None:
     assert diag0["payloads_used"] == 1
     assert diag0["request_stage_started"] == 2
     assert diag0["request_writer_cpu_copy_seconds_max"] >= 0.0
+    assert diag0["request_submit_seconds_max"] >= 0.0
     assert diag0["request_host_stage_bytes"] == (
         inputs.shape[0] * (inputs.shape[1] + 1) * 4
     )

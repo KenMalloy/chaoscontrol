@@ -2104,6 +2104,12 @@ class _CrctMailboxTeacherTransport:
         self.local_batches_by_step: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
         self.local_batch_order: deque[int] = deque()
         self._request_write_thread: threading.Thread | None = None
+        self._request_write_lock = threading.Lock()
+        self._request_write_cv = threading.Condition(self._request_write_lock)
+        self._request_write_pending: dict[str, Any] | None = None
+        self._request_write_stop = False
+        self._request_write_worker_active = False
+        self._request_copy_stream: torch.cuda.Stream | None = None
         self._weight_publish_thread: threading.Thread | None = None
         self._last_applied_weight_step = -1
         self._fast_slow_slow_model: torch.nn.Module | None = None
@@ -2206,7 +2212,11 @@ class _CrctMailboxTeacherTransport:
             "request_broadcasts_completed": 0,
             "request_interval_skips": 0,
             "request_write_skipped_busy": 0,
+            "request_write_latest_overwrites": 0,
             "request_write_publisher_busy": False,
+            "request_writer_wakeups": 0,
+            "request_submit_seconds_sum": 0.0,
+            "request_submit_seconds_max": 0.0,
             "request_stage_started": 0,
             "request_stage_seconds_sum": 0.0,
             "request_stage_seconds_max": 0.0,
@@ -2524,7 +2534,7 @@ class _CrctMailboxTeacherTransport:
     ) -> tuple[dict[str, torch.Tensor], torch.Tensor, torch.Tensor] | None:
         if self.rank == self.coordinator_rank:
             ready = self._poll_results(current_step=int(step))
-            self._write_request(inputs=inputs, targets=targets, step=int(step))
+            self._submit_request(inputs=inputs, targets=targets, step=int(step))
             return ready
         if self.rank == self.memory_rank:
             self._poll_requests()
@@ -2684,10 +2694,15 @@ class _CrctMailboxTeacherTransport:
             int(writer_bank) if writer_bank is not None else -1
         )
         out["weight_snapshot_publisher_busy"] = bool(busy)
-        request_busy = (
-            self._request_write_thread is not None
-            and self._request_write_thread.is_alive()
-        )
+        with self._request_write_lock:
+            request_busy = bool(
+                self._request_write_pending is not None
+                or (
+                    self._request_write_thread is not None
+                    and self._request_write_thread.is_alive()
+                    and self.metrics.get("request_write_publisher_busy", False)
+                )
+            )
         out["request_write_publisher_busy"] = bool(request_busy)
         out.update(
             {
@@ -2776,8 +2791,11 @@ class _CrctMailboxTeacherTransport:
         return
 
     def close(self) -> None:
+        with self._request_write_cv:
+            self._request_write_stop = True
+            self._request_write_cv.notify_all()
         if self._request_write_thread is not None:
-            self._request_write_thread.join(timeout=0.01)
+            self._request_write_thread.join(timeout=0.25)
         with self._weight_snapshot_cv:
             self._weight_snapshot_writer_stop = True
             self._weight_snapshot_cv.notify_all()
@@ -3526,33 +3544,30 @@ class _CrctMailboxTeacherTransport:
             ).strip()
             self.metrics["last_drop_reason"] = "weight_snapshot_apply_error"
 
-    def _write_request(
+    def _ensure_request_worker(self) -> None:
+        if (
+            self._request_write_worker_active
+            and self._request_write_thread is not None
+            and self._request_write_thread.is_alive()
+        ):
+            return
+        with self._request_write_cv:
+            self._request_write_stop = False
+            self._request_write_worker_active = True
+        self._request_write_thread = threading.Thread(
+            target=self._request_writer_loop,
+            name="crct-teacher-request-shm-writer",
+            daemon=True,
+        )
+        self._request_write_thread.start()
+
+    def _record_local_request_batch(
         self,
         *,
         inputs: torch.Tensor,
         targets: torch.Tensor,
         step: int,
     ) -> None:
-        if self._teacher_request_ring is None or self._teacher_request_payload is None:
-            self.metrics["last_drop_reason"] = "teacher_shm_request_not_ready"
-            return
-        stage_t0 = time.perf_counter()
-        full_ids = _crct_full_input_ids(inputs, targets).to(
-            dtype=torch.int32
-        ).contiguous()
-        if tuple(full_ids.shape) != self.full_ids_shape:
-            raise ValueError(
-                "CRCT mailbox transport saw a dynamic batch shape: "
-                f"{tuple(full_ids.shape)} != {self.full_ids_shape}"
-            )
-        full_ids_staged = full_ids.detach()
-        stage_s = time.perf_counter() - stage_t0
-        self.metrics["request_stage_started"] += 1
-        self.metrics["request_stage_seconds_sum"] += float(stage_s)
-        self.metrics["request_stage_seconds_max"] = max(
-            float(self.metrics["request_stage_seconds_max"]),
-            float(stage_s),
-        )
         # Inputs/targets are immutable batch tensors for this step. Keep
         # references for matched-label replay instead of cloning a second
         # GPU batch on rank0's hot path.
@@ -3567,12 +3582,119 @@ class _CrctMailboxTeacherTransport:
             if self.local_batches_by_step.pop(old_step, None) is not None:
                 self.metrics["local_request_evictions"] += 1
                 self.metrics["last_drop_reason"] = "local_request_evicted"
-        self.metrics["requests_started"] += 1
-        self.metrics["request_broadcasts_started"] += 1
         self.metrics["max_local_pending_batches"] = max(
             int(self.metrics["max_local_pending_batches"]),
             len(self.local_batches_by_step),
         )
+
+    def _submit_request(
+        self,
+        *,
+        inputs: torch.Tensor,
+        targets: torch.Tensor,
+        step: int,
+    ) -> None:
+        if self.rank != self.coordinator_rank:
+            return
+        submit_t0 = time.perf_counter()
+        self._record_local_request_batch(
+            inputs=inputs,
+            targets=targets,
+            step=int(step),
+        )
+        ready_event = None
+        if inputs.device.type == "cuda" and torch.cuda.is_available():
+            ready_event = torch.cuda.Event(enable_timing=False)
+            ready_event.record(torch.cuda.current_stream(inputs.device))
+        self._ensure_request_worker()
+        with self._request_write_cv:
+            if self._request_write_pending is not None:
+                self.metrics["request_write_latest_overwrites"] += 1
+            self._request_write_pending = {
+                "inputs": inputs.detach(),
+                "targets": targets.detach(),
+                "step": int(step),
+                "ready_event": ready_event,
+            }
+            self._request_write_cv.notify()
+        elapsed = time.perf_counter() - submit_t0
+        self.metrics["request_submit_seconds_sum"] += float(elapsed)
+        self.metrics["request_submit_seconds_max"] = max(
+            float(self.metrics["request_submit_seconds_max"]),
+            float(elapsed),
+        )
+
+    def _request_writer_loop(self) -> None:
+        while True:
+            with self._request_write_cv:
+                while (
+                    self._request_write_pending is None
+                    and not self._request_write_stop
+                ):
+                    self._request_write_cv.wait()
+                if self._request_write_stop:
+                    self._request_write_worker_active = False
+                    return
+                pending = self._request_write_pending
+                self._request_write_pending = None
+                self.metrics["request_write_publisher_busy"] = True
+                self.metrics["request_writer_wakeups"] += 1
+            assert pending is not None
+            try:
+                self._write_request(
+                    inputs=pending["inputs"],
+                    targets=pending["targets"],
+                    step=int(pending["step"]),
+                    ready_event=pending.get("ready_event"),
+                )
+            finally:
+                with self._request_write_cv:
+                    self.metrics["request_write_publisher_busy"] = False
+                    self._request_write_cv.notify_all()
+
+    def _write_request(
+        self,
+        *,
+        inputs: torch.Tensor,
+        targets: torch.Tensor,
+        step: int,
+        ready_event: torch.cuda.Event | None = None,
+    ) -> None:
+        if self._teacher_request_ring is None or self._teacher_request_payload is None:
+            self.metrics["last_drop_reason"] = "teacher_shm_request_not_ready"
+            return
+        stage_t0 = time.perf_counter()
+        stream = None
+        if inputs.device.type == "cuda" and torch.cuda.is_available():
+            if self._request_copy_stream is None:
+                self._request_copy_stream = torch.cuda.Stream(device=inputs.device)
+            stream = self._request_copy_stream
+        if stream is not None:
+            with torch.cuda.stream(stream):
+                if ready_event is not None:
+                    stream.wait_event(ready_event)
+                full_ids = _crct_full_input_ids(inputs, targets).to(
+                    dtype=torch.int32
+                ).contiguous()
+        else:
+            full_ids = _crct_full_input_ids(inputs, targets).to(
+                dtype=torch.int32
+            ).contiguous()
+        if tuple(full_ids.shape) != self.full_ids_shape:
+            raise ValueError(
+                "CRCT mailbox transport saw a dynamic batch shape: "
+                f"{tuple(full_ids.shape)} != {self.full_ids_shape}"
+            )
+        full_ids_staged = full_ids.detach()
+        stage_s = time.perf_counter() - stage_t0
+        self.metrics["request_stage_started"] += 1
+        self.metrics["request_stage_seconds_sum"] += float(stage_s)
+        self.metrics["request_stage_seconds_max"] = max(
+            float(self.metrics["request_stage_seconds_max"]),
+            float(stage_s),
+        )
+        self.metrics["requests_started"] += 1
+        self.metrics["request_broadcasts_started"] += 1
         request_step = int(step)
         try:
             copy_t0 = time.perf_counter()
@@ -3587,7 +3709,12 @@ class _CrctMailboxTeacherTransport:
                     full_ids_staged
                 )
                 host = self._request_host_staging
-            host.copy_(full_ids_staged, non_blocking=False)
+            if stream is not None:
+                with torch.cuda.stream(stream):
+                    host.copy_(full_ids_staged, non_blocking=True)
+                stream.synchronize()
+            else:
+                host.copy_(full_ids_staged, non_blocking=False)
             copy_s = time.perf_counter() - copy_t0
             self.metrics["request_writer_cpu_copy_seconds_sum"] += float(copy_s)
             self.metrics["request_writer_cpu_copy_seconds_max"] = max(
