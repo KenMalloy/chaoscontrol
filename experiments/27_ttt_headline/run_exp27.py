@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Any
@@ -48,6 +49,8 @@ from typing import Any
 REPO = Path(__file__).resolve().parents[2]
 EXP23 = REPO / "experiments" / "23_fast_path"
 EXP24 = REPO / "experiments" / "24_training_time_bundle"
+EXP17 = REPO / "experiments" / "17_local_attn_sidecar"
+EXP21 = REPO / "experiments" / "21_sgns_tokenizer"
 EXP27 = Path(__file__).resolve().parent
 DEFAULT_CONFIG = EXP23 / "configs" / "base_seq_epoch_lr0064_full_corpus.yaml"
 DEFAULT_DATA_PATH = (
@@ -60,6 +63,8 @@ DEFAULT_VAL_CACHE_DIR = EXP27 / "val_cache"
 
 sys.path.insert(0, str(EXP23))
 sys.path.insert(0, str(EXP24))
+sys.path.insert(0, str(EXP17))
+sys.path.insert(0, str(EXP21))
 sys.path.insert(0, str(EXP27))
 sys.path.insert(0, str(REPO / "src"))
 
@@ -84,6 +89,32 @@ def _print_entries(entries: list[dict[str, Any]]) -> None:
 def _print_manifest(manifest: dict[str, Any]) -> None:
     print("[exp27] manifest preview")
     print(json.dumps(manifest, indent=2, sort_keys=True, default=str))
+
+
+def _ensure_child_pythonpath() -> None:
+    """Make torchrun children see the same experiment helpers as this launcher."""
+    required = [
+        REPO / "src",
+        EXP17,
+        REPO / "experiments",
+        EXP21,
+        EXP23,
+        EXP24,
+        REPO / "experiments" / "26_arm",
+        EXP27,
+    ]
+    current = [
+        part for part in os.environ.get("PYTHONPATH", "").split(os.pathsep)
+        if part
+    ]
+    merged: list[str] = []
+    seen: set[str] = set()
+    for part in [*(str(p) for p in required), *current]:
+        if part in seen:
+            continue
+        seen.add(part)
+        merged.append(part)
+    os.environ["PYTHONPATH"] = os.pathsep.join(merged)
 
 
 def _run_calibration(*, dry_run: bool) -> None:
@@ -189,6 +220,7 @@ def _run_headline(
     from launch import run_matrix_entries  # noqa: E402
     from chaoscontrol.data import load_fineweb_tokens  # noqa: E402
 
+    _ensure_child_pythonpath()
     output_dir.mkdir(parents=True, exist_ok=True)
     write_matrix(output_dir / "matrix.json", entries)
     train_tokens, val_tokens = load_fineweb_tokens(str(data_path))

@@ -244,3 +244,20 @@ def test_dry_run_creates_no_files(tmp_path, run_exp27_module):
     assert not headline_dir.exists()
     assert not manifest_path.parent.exists()
     assert not manifest_path.exists()
+
+
+def test_launcher_pythonpath_includes_runner_helper_dirs(
+    monkeypatch, run_exp27_module
+):
+    monkeypatch.setenv("PYTHONPATH", "/already/here")
+
+    run_exp27_module._ensure_child_pythonpath()
+
+    parts = run_exp27_module.os.environ["PYTHONPATH"].split(
+        run_exp27_module.os.pathsep
+    )
+    assert str(run_exp27_module.REPO / "src") in parts
+    assert str(run_exp27_module.REPO / "experiments") in parts
+    assert str(run_exp27_module.EXP17) in parts
+    assert str(run_exp27_module.EXP21) in parts
+    assert "/already/here" in parts
