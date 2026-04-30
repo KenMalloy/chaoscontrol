@@ -2263,6 +2263,12 @@ class _CrctMailboxTeacherTransport:
             "ready_result_queue_max": 0,
             "ready_result_queue_drops": 0,
             "memory_rank_pump_steps": 0,
+            "memory_rank_outer_loop_seconds_sum": 0.0,
+            "memory_rank_outer_loop_seconds_max": 0.0,
+            "memory_rank_pre_pump_seconds_sum": 0.0,
+            "memory_rank_pre_pump_seconds_max": 0.0,
+            "memory_rank_replay_seconds_sum": 0.0,
+            "memory_rank_replay_seconds_max": 0.0,
             "memory_rank_pump_loop_seconds_sum": 0.0,
             "memory_rank_pump_loop_seconds_max": 0.0,
             "memory_rank_pump_idle_spins": 0,
@@ -10195,6 +10201,16 @@ def train_fast_for_budget(
 
     try:
         while True:
+            memory_rank_loop_t0 = (
+                time.perf_counter()
+                if (
+                    crct_enabled
+                    and bool(is_episodic_rank)
+                    and not bool(episodic_enabled)
+                    and not bool(memory_rank_joins_grad)
+                )
+                else None
+            )
             # Resolve the previous loss decision at the step boundary so
             # ``update`` can leave CUDA loss-pressure math unmaterialized.
             if event_sleep_queued_decision is not None:
@@ -10271,7 +10287,26 @@ def train_fast_for_budget(
                         payload_device=device,
                     )
                     crct_teacher_requests += 1
+                if (
+                    crct_teacher_transport is not None
+                    and memory_rank_loop_t0 is not None
+                ):
+                    pre_pump_s = time.perf_counter() - memory_rank_loop_t0
+                    crct_teacher_transport.metrics[
+                        "memory_rank_pre_pump_seconds_sum"
+                    ] += float(pre_pump_s)
+                    crct_teacher_transport.metrics[
+                        "memory_rank_pre_pump_seconds_max"
+                    ] = max(
+                        float(
+                            crct_teacher_transport.metrics[
+                                "memory_rank_pre_pump_seconds_max"
+                            ]
+                        ),
+                        float(pre_pump_s),
+                    )
                 pump_work_done = _pump_crct_memory_rank(steps)
+                replay_t0 = time.perf_counter()
                 if replay_eviction_loop is not None:
                     _crct_replay_cache_probe(replay_eviction_loop, model, steps)
                     defer_low_priority = False
@@ -10296,6 +10331,21 @@ def train_fast_for_budget(
                         pump_work_done = True
                         if tick_result.evicted_indices:
                             replay_eviction_loop.flush_trace()
+                if crct_teacher_transport is not None:
+                    replay_s = time.perf_counter() - replay_t0
+                    crct_teacher_transport.metrics[
+                        "memory_rank_replay_seconds_sum"
+                    ] += float(replay_s)
+                    crct_teacher_transport.metrics[
+                        "memory_rank_replay_seconds_max"
+                    ] = max(
+                        float(
+                            crct_teacher_transport.metrics[
+                                "memory_rank_replay_seconds_max"
+                            ]
+                        ),
+                        float(replay_s),
+                    )
                 if pump_work_done:
                     if crct_teacher_transport is not None:
                         crct_teacher_transport.metrics["memory_rank_pump_steps"] += 1
@@ -10323,6 +10373,24 @@ def train_fast_for_budget(
                             ),
                             float(sleep_s),
                         )
+                if (
+                    crct_teacher_transport is not None
+                    and memory_rank_loop_t0 is not None
+                ):
+                    loop_s = time.perf_counter() - memory_rank_loop_t0
+                    crct_teacher_transport.metrics[
+                        "memory_rank_outer_loop_seconds_sum"
+                    ] += float(loop_s)
+                    crct_teacher_transport.metrics[
+                        "memory_rank_outer_loop_seconds_max"
+                    ] = max(
+                        float(
+                            crct_teacher_transport.metrics[
+                                "memory_rank_outer_loop_seconds_max"
+                            ]
+                        ),
+                        float(loop_s),
+                    )
                 continue
 
             if prefetcher is not None:
@@ -11340,6 +11408,24 @@ def train_fast_for_budget(
                 ),
                 "memory_rank_request_events_superseded": int(
                     mem.get("memory_rank_request_events_superseded", 0)
+                ),
+                "memory_rank_outer_loop_seconds_sum": float(
+                    mem.get("memory_rank_outer_loop_seconds_sum", 0.0)
+                ),
+                "memory_rank_outer_loop_seconds_max": float(
+                    mem.get("memory_rank_outer_loop_seconds_max", 0.0)
+                ),
+                "memory_rank_pre_pump_seconds_sum": float(
+                    mem.get("memory_rank_pre_pump_seconds_sum", 0.0)
+                ),
+                "memory_rank_pre_pump_seconds_max": float(
+                    mem.get("memory_rank_pre_pump_seconds_max", 0.0)
+                ),
+                "memory_rank_replay_seconds_sum": float(
+                    mem.get("memory_rank_replay_seconds_sum", 0.0)
+                ),
+                "memory_rank_replay_seconds_max": float(
+                    mem.get("memory_rank_replay_seconds_max", 0.0)
                 ),
                 "memory_rank_pump_loop_seconds_sum": float(
                     mem.get("memory_rank_pump_loop_seconds_sum", 0.0)

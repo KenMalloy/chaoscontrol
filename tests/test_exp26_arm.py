@@ -200,6 +200,12 @@ def test_profile_summary_extracts_transport_and_maintenance_health(tmp_path):
             "weight_snapshot_read_tensor_count": 51,
             "weight_snapshot_read_bytes": 34957058,
             "memory_rank_request_events_superseded": 13,
+            "memory_rank_outer_loop_seconds_sum": 2.0,
+            "memory_rank_outer_loop_seconds_max": 0.75,
+            "memory_rank_pre_pump_seconds_sum": 0.5,
+            "memory_rank_pre_pump_seconds_max": 0.1,
+            "memory_rank_replay_seconds_sum": 0.25,
+            "memory_rank_replay_seconds_max": 0.05,
             "memory_rank_pump_loop_seconds_sum": 1.25,
             "memory_rank_pump_loop_seconds_max": 0.5,
             "memory_rank_pump_idle_sleep_seconds_sum": 0.25,
@@ -232,6 +238,12 @@ def test_profile_summary_extracts_transport_and_maintenance_health(tmp_path):
     assert row["weight_snapshot_read_tensor_count"] == 51
     assert row["weight_snapshot_read_bytes"] == 34957058
     assert row["memory_rank_request_events_superseded"] == 13
+    assert row["memory_rank_outer_loop_seconds_sum"] == pytest.approx(2.0)
+    assert row["memory_rank_outer_loop_seconds_max"] == pytest.approx(0.75)
+    assert row["memory_rank_pre_pump_seconds_sum"] == pytest.approx(0.5)
+    assert row["memory_rank_pre_pump_seconds_max"] == pytest.approx(0.1)
+    assert row["memory_rank_replay_seconds_sum"] == pytest.approx(0.25)
+    assert row["memory_rank_replay_seconds_max"] == pytest.approx(0.05)
     assert row["memory_rank_pump_loop_seconds_sum"] == pytest.approx(1.25)
     assert row["memory_rank_pump_loop_seconds_max"] == pytest.approx(0.5)
     assert row["memory_rank_pump_idle_sleep_seconds_sum"] == pytest.approx(0.25)
