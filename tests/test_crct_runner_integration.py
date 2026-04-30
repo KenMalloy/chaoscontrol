@@ -688,6 +688,107 @@ def test_crct_mailbox_gpu3_packet_score_ignores_fastslow_readiness(tmp_path) -> 
     assert diag3["fast_slow_decisions_issued"] == 0
 
 
+def test_crct_mailbox_preserves_burst_results_fifo(tmp_path) -> None:
+    mod = _load_module("runner_fast_path_crct_mailbox_result_fifo", RUNNER_PATH)
+    kwargs = {
+        "world_size": 4,
+        "mailbox_dir": str(tmp_path),
+        "payload_shape": (1, 2, 5),
+        "full_ids_shape": (2, 6),
+        "device": torch.device("cpu"),
+        "payload_dtype": torch.float32,
+        "max_local_batches": 8,
+        "max_payload_lag_steps": 8,
+        "score_interval_steps": 1,
+    }
+    rank0 = mod._CrctMailboxTeacherTransport(rank=0, **kwargs)
+    rank3 = mod._CrctMailboxTeacherTransport(rank=3, **kwargs)
+    inputs0 = torch.full((2, 5), 3, dtype=torch.int32)
+    targets0 = torch.full((2, 5), 4, dtype=torch.long)
+    inputs1 = torch.full((2, 5), 7, dtype=torch.int32)
+    targets1 = torch.full((2, 5), 8, dtype=torch.long)
+    rank0.local_batches_by_step[0] = (inputs0, targets0)
+    rank0.local_batch_order.append(0)
+    rank0.local_batches_by_step[1] = (inputs1, targets1)
+    rank0.local_batch_order.append(1)
+
+    for step, value in ((0, 0.25), (1, 0.75)):
+        rank3._write_result(
+            request_step=step,
+            scored={
+                "target": torch.full((2, 5), value),
+                "confidence": torch.ones(2, 5),
+                "loss_weight": torch.ones(2, 5),
+                "utility": torch.zeros(2, 5),
+            },
+        )
+
+    ready0 = rank0._poll_results(current_step=2)
+    ready1 = rank0._poll_results(current_step=3)
+
+    assert ready0 is not None
+    assert ready1 is not None
+    payload0, train_inputs0, train_targets0 = ready0
+    payload1, train_inputs1, train_targets1 = ready1
+    assert int(payload0["step_id"].item()) == 0
+    assert int(payload1["step_id"].item()) == 1
+    assert torch.equal(train_inputs0, inputs0)
+    assert torch.equal(train_targets0, targets0)
+    assert torch.equal(train_inputs1, inputs1)
+    assert torch.equal(train_targets1, targets1)
+    diag0 = rank0.diagnostics()
+    assert diag0["payloads_received"] == 2
+    assert diag0["payloads_used"] == 2
+    assert diag0["superseded_payloads_dropped"] == 0
+    assert diag0["ready_result_queue_max"] == 2
+
+
+def test_crct_mailbox_preserves_burst_requests_fifo(tmp_path) -> None:
+    mod = _load_module("runner_fast_path_crct_mailbox_request_fifo", RUNNER_PATH)
+    kwargs = {
+        "world_size": 4,
+        "mailbox_dir": str(tmp_path),
+        "payload_shape": (1, 2, 5),
+        "full_ids_shape": (2, 6),
+        "device": torch.device("cpu"),
+        "payload_dtype": torch.float32,
+        "max_local_batches": 8,
+        "max_payload_lag_steps": 8,
+        "score_interval_steps": 1,
+    }
+    rank0 = mod._CrctMailboxTeacherTransport(rank=0, **kwargs)
+    rank3 = mod._CrctMailboxTeacherTransport(rank=3, **kwargs)
+    inputs0 = torch.full((2, 5), 3, dtype=torch.int32)
+    targets0 = torch.full((2, 5), 4, dtype=torch.long)
+    inputs1 = torch.full((2, 5), 7, dtype=torch.int32)
+    targets1 = torch.full((2, 5), 8, dtype=torch.long)
+
+    rank0.begin_step(inputs=inputs0, targets=targets0, step=0)
+    _wait_for_metric(rank0, "teacher_shm_request_events_pushed", 1)
+    rank0.begin_step(inputs=inputs1, targets=targets1, step=1)
+    _wait_for_metric(rank0, "teacher_shm_request_events_pushed", 2)
+
+    assert rank3.begin_step(inputs=inputs0, targets=targets0, step=1) is None
+
+    assert len(rank3.pending_input_requests) == 2
+    first = rank3.pending_input_requests.popleft()
+    second = rank3.pending_input_requests.popleft()
+    assert int(first["step"]) == 0
+    assert int(second["step"]) == 1
+    torch.testing.assert_close(
+        first["buffer"],
+        mod._crct_full_input_ids(inputs0, targets0).to(torch.int32),
+    )
+    torch.testing.assert_close(
+        second["buffer"],
+        mod._crct_full_input_ids(inputs1, targets1).to(torch.int32),
+    )
+    diag3 = rank3.diagnostics()
+    assert diag3["completed_requests_dropped"] == 0
+    assert diag3["memory_rank_pump_request_pops"] == 2
+    assert diag3["max_pending_input_requests"] == 2
+
+
 def test_crct_mailbox_transport_round_trips_memory_packet(tmp_path) -> None:
     mod = _load_module("runner_fast_path_crct_mailbox_packet", RUNNER_PATH)
     kwargs = {

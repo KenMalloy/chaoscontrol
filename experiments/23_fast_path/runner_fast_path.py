@@ -2101,6 +2101,9 @@ class _CrctMailboxTeacherTransport:
         self.max_payload_lag_steps = self.max_payload_lag_steps_configured
         self.score_interval_steps = max(1, int(score_interval_steps))
         self.pending_input_requests: deque[dict[str, Any]] = deque()
+        self.ready_results: deque[
+            tuple[dict[str, torch.Tensor], torch.Tensor, torch.Tensor]
+        ] = deque()
         self.local_batches_by_step: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
         self.local_batch_order: deque[int] = deque()
         self._request_write_thread: threading.Thread | None = None
@@ -2233,6 +2236,9 @@ class _CrctMailboxTeacherTransport:
             "payloads_sent": 0,
             "payloads_received": 0,
             "payloads_used": 0,
+            "ready_result_queue_depth": 0,
+            "ready_result_queue_max": 0,
+            "ready_result_queue_drops": 0,
             "memory_rank_pump_steps": 0,
             "memory_rank_pump_idle_spins": 0,
             "memory_rank_pump_request_pops": 0,
@@ -2580,13 +2586,7 @@ class _CrctMailboxTeacherTransport:
             )
         if self.rank != self.memory_rank or not self.pending_input_requests:
             return
-        if len(self.pending_input_requests) > 1:
-            self.metrics["completed_requests_dropped"] += (
-                len(self.pending_input_requests) - 1
-            )
-            self.metrics["last_drop_reason"] = "newer_completed_request_won"
-        slot = self.pending_input_requests.pop()
-        self.pending_input_requests.clear()
+        slot = self.pending_input_requests.popleft()
         request_step = int(slot["step"])
         request_full_ids = slot["buffer"]
         try:
@@ -2656,8 +2656,13 @@ class _CrctMailboxTeacherTransport:
                 "pending_result_broadcasts": 0,
                 "pending_input_requests": len(self.pending_input_requests),
                 "local_pending_batches": len(self.local_batches_by_step),
-                "ready_result_pending": False,
-                "ready_result_request_step": None,
+                "ready_result_pending": bool(self.ready_results),
+                "ready_result_request_step": (
+                    int(self.ready_results[0][0].get("step_id_int", -1))
+                    if self.ready_results
+                    else None
+                ),
+                "ready_result_queue_depth": len(self.ready_results),
             }
         )
         used = int(out.get("payloads_used", 0))
@@ -3716,45 +3721,45 @@ class _CrctMailboxTeacherTransport:
             return 0
         assert self._teacher_request_ring is not None
         assert self._teacher_request_payload is not None
-        latest: dict[str, object] | None = None
         popped = 0
         while True:
             event = self._teacher_request_ring.pop()
             if event is None:
                 break
-            latest = event
             popped += 1
-        if latest is None:
-            return 0
-        if popped > 1:
-            self.metrics["completed_requests_dropped"] += popped - 1
-            self.metrics["last_drop_reason"] = "newer_request_event_won"
-        self.metrics["teacher_shm_request_events_popped"] += popped
-        try:
-            full_ids_cpu = self._read_teacher_slice(
-                self._teacher_request_payload,
-                latest["full_ids"],  # type: ignore[arg-type]
-            )
-            if full_ids_cpu is None:
-                self.metrics["last_drop_reason"] = "teacher_request_empty_full_ids"
-                return int(popped)
-            full_ids = full_ids_cpu.to(device=self.device, dtype=torch.int32)
-            step = int(latest["step"])
-            self.pending_input_requests.append({"step": step, "buffer": full_ids})
-            self.metrics["memory_rank_pump_last_request_step"] = int(step)
-            self.metrics["mailbox_request_reads"] += 1
-            self.metrics["max_pending_input_requests"] = max(
-                int(self.metrics["max_pending_input_requests"]),
-                len(self.pending_input_requests),
-            )
-            return int(popped)
-        except Exception as exc:
-            self.metrics["errors"] += 1
-            self.metrics["last_error"] = "".join(
-                traceback.format_exception_only(type(exc), exc)
-            ).strip()
-            self.metrics["last_drop_reason"] = "request_shm_read_error"
-            return int(popped)
+            try:
+                full_ids_cpu = self._read_teacher_slice(
+                    self._teacher_request_payload,
+                    event["full_ids"],  # type: ignore[arg-type]
+                )
+                if full_ids_cpu is None:
+                    self.metrics["last_drop_reason"] = (
+                        "teacher_request_empty_full_ids"
+                    )
+                    continue
+                full_ids = full_ids_cpu.to(device=self.device, dtype=torch.int32)
+                step = int(event["step"])
+                self.pending_input_requests.append(
+                    {"step": step, "buffer": full_ids}
+                )
+                self.metrics["memory_rank_pump_last_request_step"] = int(step)
+                self.metrics["mailbox_request_reads"] += 1
+                while len(self.pending_input_requests) > int(self.max_local_batches):
+                    self.pending_input_requests.popleft()
+                    self.metrics["completed_requests_dropped"] += 1
+                    self.metrics["last_drop_reason"] = "request_queue_overflow"
+                self.metrics["max_pending_input_requests"] = max(
+                    int(self.metrics["max_pending_input_requests"]),
+                    len(self.pending_input_requests),
+                )
+            except Exception as exc:
+                self.metrics["errors"] += 1
+                self.metrics["last_error"] = "".join(
+                    traceback.format_exception_only(type(exc), exc)
+                ).strip()
+                self.metrics["last_drop_reason"] = "request_shm_read_error"
+        self.metrics["teacher_shm_request_events_popped"] += int(popped)
+        return int(popped)
 
     def _plasticity_ema_update(
         self,
@@ -3993,8 +3998,7 @@ class _CrctMailboxTeacherTransport:
         current_step: int,
     ) -> tuple[dict[str, torch.Tensor], torch.Tensor, torch.Tensor] | None:
         if self._teacher_result_ring is None or self._teacher_result_payload is None:
-            return None
-        ready: tuple[dict[str, torch.Tensor], torch.Tensor, torch.Tensor] | None = None
+            return self._pop_ready_result(current_step=current_step)
         while True:
             result_event = self._teacher_result_ring.pop()
             if result_event is None:
@@ -4011,8 +4015,6 @@ class _CrctMailboxTeacherTransport:
                 self.metrics["orphan_payloads_dropped"] += 1
                 self.metrics["last_drop_reason"] = "payload_without_local_batch"
                 continue
-            if ready is not None:
-                self.metrics["superseded_payloads_dropped"] += 1
             slices = {
                 name: desc
                 for name, desc in zip(
@@ -4196,17 +4198,41 @@ class _CrctMailboxTeacherTransport:
                     max(0, lag),
                 )
             inputs, targets = batch
-            ready = (payload, inputs, targets)
+            self.ready_results.append((payload, inputs, targets))
             self.metrics["payloads_received"] += 1
-            self.metrics["payloads_used"] += 1
             self.metrics["mailbox_result_reads"] += 1
             self.metrics["last_received_request_step"] = request_step
-            self.metrics["last_used_request_step"] = request_step
-            self.metrics["payload_lag_steps_sum"] += max(0, lag)
-            self.metrics["payload_lag_steps_max"] = max(
-                int(self.metrics["payload_lag_steps_max"]),
-                max(0, lag),
+            while len(self.ready_results) > int(self.max_local_batches):
+                self.ready_results.popleft()
+                self.metrics["ready_result_queue_drops"] += 1
+                self.metrics["last_drop_reason"] = "ready_result_queue_overflow"
+            self.metrics["ready_result_queue_depth"] = len(self.ready_results)
+            self.metrics["ready_result_queue_max"] = max(
+                int(self.metrics["ready_result_queue_max"]),
+                len(self.ready_results),
             )
+        return self._pop_ready_result(current_step=current_step)
+
+    def _pop_ready_result(
+        self,
+        *,
+        current_step: int,
+    ) -> tuple[dict[str, torch.Tensor], torch.Tensor, torch.Tensor] | None:
+        if not self.ready_results:
+            self.metrics["ready_result_queue_depth"] = 0
+            return None
+        ready = self.ready_results.popleft()
+        payload, _inputs, _targets = ready
+        request_step = int(payload.get("step_id_int", -1))
+        lag = int(current_step) - request_step
+        self.metrics["payloads_used"] += 1
+        self.metrics["last_used_request_step"] = request_step
+        self.metrics["payload_lag_steps_sum"] += max(0, lag)
+        self.metrics["payload_lag_steps_max"] = max(
+            int(self.metrics["payload_lag_steps_max"]),
+            max(0, lag),
+        )
+        self.metrics["ready_result_queue_depth"] = len(self.ready_results)
         return ready
 
 
@@ -10267,16 +10293,7 @@ def train_fast_for_budget(
                     if crct_teacher_transport is not None:
                         crct_teacher_transport.metrics["memory_rank_pump_steps"] += 1
                     losses.append(torch.zeros((), device=device, dtype=torch.float32))
-                    last_request_step = (
-                        int(
-                            crct_teacher_transport.metrics.get(
-                                "memory_rank_pump_last_request_step", -1
-                            )
-                        )
-                        if crct_teacher_transport is not None
-                        else -1
-                    )
-                    steps = max(int(steps) + 1, int(last_request_step) + 1)
+                    steps += 1
                 else:
                     if crct_teacher_transport is not None:
                         crct_teacher_transport.metrics[
