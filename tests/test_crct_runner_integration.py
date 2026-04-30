@@ -748,8 +748,8 @@ def test_crct_mailbox_preserves_burst_results_fifo(tmp_path) -> None:
     assert diag0["ready_result_queue_max"] == 2
 
 
-def test_crct_mailbox_preserves_burst_requests_fifo(tmp_path) -> None:
-    mod = _load_module("runner_fast_path_crct_mailbox_request_fifo", RUNNER_PATH)
+def test_crct_mailbox_request_ingest_is_latest_only(tmp_path) -> None:
+    mod = _load_module("runner_fast_path_crct_mailbox_request_latest", RUNNER_PATH)
     kwargs = {
         "world_size": 4,
         "mailbox_dir": str(tmp_path),
@@ -775,23 +775,18 @@ def test_crct_mailbox_preserves_burst_requests_fifo(tmp_path) -> None:
 
     assert rank3.begin_step(inputs=inputs0, targets=targets0, step=1) is None
 
-    assert len(rank3.pending_input_requests) == 2
-    first = rank3.pending_input_requests.popleft()
-    second = rank3.pending_input_requests.popleft()
-    assert int(first["step"]) == 0
-    assert int(second["step"]) == 1
+    assert len(rank3.pending_input_requests) == 1
+    latest = rank3.pending_input_requests.popleft()
+    assert int(latest["step"]) == 1
     torch.testing.assert_close(
-        first["buffer"],
-        mod._crct_full_input_ids(inputs0, targets0).to(torch.int32),
-    )
-    torch.testing.assert_close(
-        second["buffer"],
+        latest["buffer"],
         mod._crct_full_input_ids(inputs1, targets1).to(torch.int32),
     )
     diag3 = rank3.diagnostics()
-    assert diag3["completed_requests_dropped"] == 0
+    assert diag3["completed_requests_dropped"] == 1
+    assert diag3["memory_rank_request_events_superseded"] == 1
     assert diag3["memory_rank_pump_request_pops"] == 2
-    assert diag3["max_pending_input_requests"] == 2
+    assert diag3["max_pending_input_requests"] == 1
 
 
 def test_crct_mailbox_transport_round_trips_memory_packet(tmp_path) -> None:

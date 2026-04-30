@@ -105,6 +105,7 @@ def _health_from_result(result: dict[str, Any]) -> dict[str, Any]:
         "maintenance_jobs_popped": int(_get_path(replay, "arm_runtime.jobs_popped", 0) or 0),
         "maintenance_probe_seconds": float(replay.get("probe_seconds", 0.0) or 0.0),
         "maintenance_probe_budget_seconds": float(replay.get("probe_budget_seconds", 0.0) or 0.0),
+        "memory_rank_request_events_superseded": int(health.get("memory_rank_request_events_superseded", 0) or 0),
         "plasticity_packets_received": int(health.get("plasticity_packets_received", 0) or 0),
         "plasticity_lr_multiplier_max": float(plasticity.get("lr_multiplier_max", 0.0) or 0.0),
         "teacher_fail_open": int(crct.get("teacher_fail_open", 0) or 0),

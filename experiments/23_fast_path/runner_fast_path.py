@@ -2266,6 +2266,7 @@ class _CrctMailboxTeacherTransport:
             "memory_rank_pump_idle_spins": 0,
             "memory_rank_pump_request_pops": 0,
             "memory_rank_pump_last_request_step": -1,
+            "memory_rank_request_events_superseded": 0,
             "memory_rank_pump_score_calls": 0,
             "memory_packets_sent": 0,
             "memory_packets_received": 0,
@@ -3850,36 +3851,45 @@ class _CrctMailboxTeacherTransport:
         assert self._teacher_request_ring is not None
         assert self._teacher_request_payload is not None
         popped = 0
+        latest_event: dict[str, Any] | None = None
         while True:
             event = self._teacher_request_ring.pop()
             if event is None:
                 break
             popped += 1
+            if latest_event is not None:
+                self.metrics["memory_rank_request_events_superseded"] += 1
+                self.metrics["completed_requests_dropped"] += 1
+            latest_event = event
+        if latest_event is not None:
+            if self.pending_input_requests:
+                dropped = len(self.pending_input_requests)
+                self.pending_input_requests.clear()
+                self.metrics["memory_rank_request_events_superseded"] += int(dropped)
+                self.metrics["completed_requests_dropped"] += int(dropped)
             try:
                 full_ids_cpu = self._read_teacher_slice(
                     self._teacher_request_payload,
-                    event["full_ids"],  # type: ignore[arg-type]
+                    latest_event["full_ids"],  # type: ignore[arg-type]
                 )
                 if full_ids_cpu is None:
                     self.metrics["last_drop_reason"] = (
                         "teacher_request_empty_full_ids"
                     )
-                    continue
-                full_ids = full_ids_cpu.to(device=self.device, dtype=torch.int32)
-                step = int(event["step"])
-                self.pending_input_requests.append(
-                    {"step": step, "buffer": full_ids}
-                )
-                self.metrics["memory_rank_pump_last_request_step"] = int(step)
-                self.metrics["mailbox_request_reads"] += 1
-                while len(self.pending_input_requests) > int(self.max_local_batches):
-                    self.pending_input_requests.popleft()
-                    self.metrics["completed_requests_dropped"] += 1
-                    self.metrics["last_drop_reason"] = "request_queue_overflow"
-                self.metrics["max_pending_input_requests"] = max(
-                    int(self.metrics["max_pending_input_requests"]),
-                    len(self.pending_input_requests),
-                )
+                else:
+                    full_ids = full_ids_cpu.to(device=self.device, dtype=torch.int32)
+                    step = int(latest_event["step"])
+                    self.pending_input_requests.append(
+                        {"step": step, "buffer": full_ids}
+                    )
+                    self.metrics["memory_rank_pump_last_request_step"] = int(step)
+                    self.metrics["mailbox_request_reads"] += 1
+                    if self.metrics["memory_rank_request_events_superseded"]:
+                        self.metrics["last_drop_reason"] = "newer_request_won"
+                    self.metrics["max_pending_input_requests"] = max(
+                        int(self.metrics["max_pending_input_requests"]),
+                        len(self.pending_input_requests),
+                    )
             except Exception as exc:
                 self.metrics["errors"] += 1
                 self.metrics["last_error"] = "".join(
@@ -11264,6 +11274,9 @@ def train_fast_for_budget(
                 ),
                 "memory_rank_pump_request_pops": int(
                     mem.get("memory_rank_pump_request_pops", 0)
+                ),
+                "memory_rank_request_events_superseded": int(
+                    mem.get("memory_rank_request_events_superseded", 0)
                 ),
                 "memory_rank_pump_score_calls": int(
                     mem.get("memory_rank_pump_score_calls", 0)

@@ -199,6 +199,7 @@ def test_profile_summary_extracts_transport_and_maintenance_health(tmp_path):
             "weight_snapshot_read_seconds_max": 0.05,
             "weight_snapshot_read_tensor_count": 51,
             "weight_snapshot_read_bytes": 34957058,
+            "memory_rank_request_events_superseded": 13,
             "plasticity_packets_received": 8
           },
           "coordinator": {"teacher_shm_request_ring_full_drops": 9},
@@ -226,6 +227,7 @@ def test_profile_summary_extracts_transport_and_maintenance_health(tmp_path):
     assert row["weight_snapshot_read_seconds_max"] == pytest.approx(0.05)
     assert row["weight_snapshot_read_tensor_count"] == 51
     assert row["weight_snapshot_read_bytes"] == 34957058
+    assert row["memory_rank_request_events_superseded"] == 13
     assert row["plasticity_packets_received"] == 8
     assert row["score_stage_timing_enabled"] is True
     assert row["score_stage_samples"] == 2
