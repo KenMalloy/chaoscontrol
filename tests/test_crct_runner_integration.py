@@ -804,7 +804,7 @@ def test_crct_mailbox_rejects_sequence_memory_packet(tmp_path) -> None:
     assert rank3.diagnostics()["memory_packet_sequence_residual_rejections"] == 1
 
 
-def test_crct_mailbox_defers_low_priority_maintenance_for_packet_work(tmp_path) -> None:
+def test_crct_mailbox_defers_low_priority_maintenance_only_at_ring_capacity(tmp_path) -> None:
     mod = _load_module("runner_fast_path_crct_mailbox_packet_priority", RUNNER_PATH)
     kwargs = {
         "world_size": 4,
@@ -824,20 +824,31 @@ def test_crct_mailbox_defers_low_priority_maintenance_for_packet_work(tmp_path) 
     rank3.pending_input_requests.append(
         {"step": 7, "buffer": torch.zeros((2, 6), dtype=torch.int32)}
     )
-    assert rank3.should_defer_low_priority_maintenance() is True
+    assert rank3.should_defer_low_priority_maintenance() is False
     rank3.pending_input_requests.clear()
-    rank0.begin_step(
-        inputs=torch.zeros((2, 5), dtype=torch.int32),
-        targets=torch.ones((2, 5), dtype=torch.long),
-        step=8,
-    )
+    assert rank0._teacher_request_ring is not None
+    for i in range(int(rank3._teacher_ring_capacity) - 1):
+        assert rank0._teacher_request_ring.push(
+            {
+                "event_type": 6,
+                "source_rank": 0,
+                "status": 0,
+                "flags": 0,
+                "slice_count": 1,
+                "request_id": i,
+                "step": i,
+                "weight_snapshot_version": 0,
+                "full_ids": mod._teacher_empty_slice(),
+            }
+        )
     assert rank3.should_defer_low_priority_maintenance() is True
 
     diag = rank3.diagnostics()
-    assert diag["low_priority_maintenance_allows"] == 1
-    assert diag["low_priority_maintenance_defers"] == 2
-    assert diag["low_priority_maintenance_defer_pending_requests"] == 1
+    assert diag["low_priority_maintenance_allows"] == 2
+    assert diag["low_priority_maintenance_defers"] == 1
+    assert diag["low_priority_maintenance_defer_pending_requests"] == 0
     assert diag["low_priority_maintenance_defer_request_mailbox"] == 1
+    assert diag["low_priority_maintenance_last_reason"] == "request_ring_capacity"
 
 
 def test_crct_mailbox_weight_snapshot_applies_latest_model(tmp_path) -> None:

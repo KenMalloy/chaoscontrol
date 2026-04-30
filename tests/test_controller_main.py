@@ -6,6 +6,8 @@ import os
 import struct
 import time
 
+import pytest
+
 from chaoscontrol.kernels import _cpu_ssm_controller as _ext
 
 
@@ -74,6 +76,9 @@ def _read_counter_triplet(stats_shm: object) -> tuple[int, int, int]:
     return struct.unpack("<QQQ", stats_shm.read_bytes(0, 24))
 
 
+@pytest.mark.filterwarnings(
+    "ignore:This process .* is multi-threaded.*:DeprecationWarning"
+)
 def test_controller_main_polls_all_event_rings_until_exit_flag():
     """Forked controller attaches to all C1 rings, drains mixed events,
     and returns the total number of stub-handled records."""
@@ -166,6 +171,9 @@ def test_controller_main_polls_all_event_rings_until_exit_flag():
         _force_unlink(_ext.PosixShm, exit_name)
 
 
+@pytest.mark.filterwarnings(
+    "ignore:This process .* is multi-threaded.*:DeprecationWarning"
+)
 def test_controller_main_dispatches_each_event_type_to_its_handler_once():
     """C2 dispatches each typed ring pop through the matching handler."""
     pid_suffix = os.getpid()

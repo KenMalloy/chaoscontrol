@@ -82,6 +82,8 @@ def test_validation_active_is_full_arm_not_crct_only_or_shadow():
     assert active["replay_eviction_commit_policy"] == "learned"
     assert active["replay_eviction_scoring_mode"] == "oracle"
     assert active["crct_teacher_score_interval_steps"] == 1
+    assert "crct_async_teacher_pending_batches" not in active
+    assert "crct_async_teacher_max_lag_steps" not in active
     assert active["compile_full_path"] is True
     assert active["cuda_graph_mode"] == "probe"
     assert active["optimizer_log_a_beta_coupling"] is True
@@ -112,6 +114,7 @@ def test_validation_active_uses_full_runtime_pipeline_and_isolated_traces():
         == "exp26_validation_validation_adaptive_residual_memory_s42"
     )
     assert active["replay_eviction_memory_streams"] == 8
+    assert active["replay_eviction_max_seconds"] == 0.0
     assert active["replay_eviction_oracle_confirm_top_k"] == 32
     assert active["replay_eviction_oracle_variant_chunk_size"] == 1
     assert active["replay_eviction_refresh_candidate_count"] == 16
@@ -130,3 +133,80 @@ def test_exp26_module_no_longer_exposes_ablation_builders():
     assert not hasattr(exp26, "build_calibration_matrix")
     assert not hasattr(exp26, "ARM_V1_ARMS")
     assert not hasattr(exp26, "load_manifest")
+
+
+def test_profile_launcher_can_dry_run_single_arm(tmp_path):
+    profile = _load_module("exp26_profile_dry_run", EXP26 / "profile_exp26.py")
+
+    rc = profile.main(
+        [
+            "--dry-run",
+            "--arm",
+            "adaptive",
+            "--budget",
+            "3",
+            "--results-dir",
+            str(tmp_path),
+        ]
+    )
+
+    assert rc == 0
+    matrix = (tmp_path / "matrix.json").read_text()
+    assert "validation_adaptive_residual_memory" in matrix
+    assert "validation_fastslow_control" not in matrix
+
+
+def test_profile_summary_extracts_transport_and_maintenance_health(tmp_path):
+    profile = _load_module("exp26_profile_summary", EXP26 / "profile_exp26.py")
+    result_path = tmp_path / "arm.json"
+    result_path.write_text(
+        """
+{
+  "config": {"name": "arm", "arm": "validation_adaptive_residual_memory"},
+  "train": {
+    "steps": 2,
+    "elapsed_s": 1.5,
+    "aggregate_tokens_per_sec": 123.0,
+    "per_gpu_tokens_per_sec": 41.0,
+    "final_loss": 3.14,
+    "optimizer": {"plasticity_budget": {"lr_multiplier_max": 1.25}},
+    "mechanisms": {
+      "crct": {
+        "teacher_fail_open": 1,
+        "transport_summary": {
+          "health": {
+            "payloads_used": 2,
+            "payloads_scored": 3,
+            "weight_snapshot_published": 4,
+            "weight_snapshot_applied": 5,
+            "weight_snapshot_shm_writes": 6,
+            "weight_snapshot_shm_reads": 7,
+            "plasticity_packets_received": 8
+          },
+          "coordinator": {"teacher_shm_request_ring_full_drops": 9},
+          "memory": {"teacher_shm_result_ring_full_drops": 10}
+        },
+        "replay_eviction": {
+          "gpu3_starvation_reason": "ok",
+          "memory_streams_active": true,
+          "arm_runtime": {"jobs_pushed": 11, "jobs_popped": 12}
+        }
+      }
+    }
+  }
+}
+        """.strip()
+    )
+
+    summary = profile.summarize_profile(tmp_path)
+    row = summary["rows"][0]
+
+    assert row["payloads_used"] == 2
+    assert row["weight_snapshot_shm_writes"] == 6
+    assert row["weight_snapshot_shm_reads"] == 7
+    assert row["plasticity_packets_received"] == 8
+    assert row["request_ring_full_drops"] == 9
+    assert row["result_ring_full_drops"] == 10
+    assert row["maintenance_jobs_pushed"] == 11
+    assert row["maintenance_jobs_popped"] == 12
+    assert (tmp_path / "profile_summary.json").exists()

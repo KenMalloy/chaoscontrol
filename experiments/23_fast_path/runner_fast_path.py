@@ -2379,6 +2379,7 @@ class _CrctMailboxTeacherTransport:
             "low_priority_maintenance_defers": 0,
             "low_priority_maintenance_defer_pending_requests": 0,
             "low_priority_maintenance_defer_request_mailbox": 0,
+            "low_priority_maintenance_pending_requests": 0,
             "low_priority_maintenance_last_reason": "",
         }
 
@@ -2840,19 +2841,32 @@ class _CrctMailboxTeacherTransport:
         return residual_d.to(device="cpu", dtype=self.payload_dtype)
 
     def should_defer_low_priority_maintenance(self) -> bool:
-        """Return True when rank-3 should publish packets before slot work."""
+        """Return True only when packet-request substrate capacity is tight."""
         if self.rank != self.memory_rank:
             return False
         self.metrics["low_priority_maintenance_checks"] += 1
-        if self.pending_input_requests:
+        pending = len(self.pending_input_requests)
+        self.metrics["low_priority_maintenance_pending_requests"] = int(pending)
+        if (
+            pending >= int(self._teacher_ring_capacity)
+            or (
+                self._ensure_teacher_request_consumer()
+                and self._teacher_request_ring is not None
+                and self._teacher_request_ring.size()
+                >= max(1, int(self._teacher_ring_capacity) - 1)
+            )
+        ):
             self.metrics["low_priority_maintenance_defers"] += 1
-            self.metrics["low_priority_maintenance_defer_pending_requests"] += 1
-            self.metrics["low_priority_maintenance_last_reason"] = "pending_request"
-            return True
-        if self._ensure_teacher_request_consumer() and self._teacher_request_ring is not None and self._teacher_request_ring.size() > 0:
-            self.metrics["low_priority_maintenance_defers"] += 1
-            self.metrics["low_priority_maintenance_defer_request_mailbox"] += 1
-            self.metrics["low_priority_maintenance_last_reason"] = "request_ring"
+            if pending >= int(self._teacher_ring_capacity):
+                self.metrics["low_priority_maintenance_defer_pending_requests"] += 1
+                self.metrics["low_priority_maintenance_last_reason"] = (
+                    "pending_request_capacity"
+                )
+            else:
+                self.metrics["low_priority_maintenance_defer_request_mailbox"] += 1
+                self.metrics["low_priority_maintenance_last_reason"] = (
+                    "request_ring_capacity"
+                )
             return True
         self.metrics["low_priority_maintenance_allows"] += 1
         self.metrics["low_priority_maintenance_last_reason"] = "allowed"

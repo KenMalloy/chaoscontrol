@@ -11,6 +11,7 @@ from __future__ import annotations
 import os
 import time
 
+import pytest
 import torch
 
 from chaoscontrol.kernels import _cpu_ssm_controller as _ext
@@ -62,6 +63,9 @@ def test_posix_shm_tensor_copy_round_trip():
         _ext.PosixShm.unlink(SHM_NAME)
 
 
+@pytest.mark.filterwarnings(
+    "ignore:This process .* is multi-threaded.*:DeprecationWarning"
+)
 def test_posix_shm_cross_process_visibility():
     """Producer process writes; consumer process reads. Verify the
     consumer sees the producer's bytes (proves shared mapping, not

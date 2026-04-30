@@ -2632,7 +2632,7 @@ class ReplayEvictionLoop:
             self._stream_probe_seconds.get(frame.stream_id, 0.0)
             + self._last_probe_seconds
         )
-        if self._last_probe_seconds > self._max_seconds:
+        if self._max_seconds > 0.0 and self._last_probe_seconds > self._max_seconds:
             self._probe_over_budget_total += 1
 
         if len(cf.slot_indices) == 0:
@@ -2867,7 +2867,7 @@ class ReplayEvictionLoop:
         self._stage_seconds_total["ema"] += self._last_stage_seconds["ema"]
 
         elapsed = time.monotonic() - t0
-        if elapsed > self._max_seconds:
+        if self._max_seconds > 0.0 and elapsed > self._max_seconds:
             self._complete_arm_runtime_job(
                 step=step,
                 cf=cf,
@@ -2968,7 +2968,7 @@ class ReplayEvictionLoop:
             )
 
     def _budget_exhausted(self, t0: float) -> bool:
-        return (time.monotonic() - t0) > self._max_seconds
+        return self._max_seconds > 0.0 and (time.monotonic() - t0) > self._max_seconds
 
     def _record_arm_runtime_result(
         self,

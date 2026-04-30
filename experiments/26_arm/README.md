@@ -121,6 +121,10 @@ shape gives `384 -> 13.71 MB`, `416 -> 15.19 MB`, `448 -> 16.73 MB`, and
   memory-side params kept out of the train optimizer.
 - The ARM cell offers teacher work every step; stream backpressure and the
   latest-complete mirror decide what GPU3 actually adopts.
+- ARM maintenance uses `replay_eviction_max_seconds=0.0`, meaning no
+  software wall-clock governor. Ring occupancy, frame arrival, and GPU3/CPU
+  throughput are the backpressure sources; duty-cycle telemetry tells us if
+  the memory plane is actually hot.
 - `transport_summary.health.weight_snapshot_published` and
   `weight_snapshot_applied` are non-zero in the ARM cell; mirror copy/save/apply
   timing and version lag are visible.
@@ -138,6 +142,9 @@ PYTHONPATH=src .venv/bin/python experiments/26_arm/run_exp26.py --dry-run
 
 # Run the fixed validation canary.
 PYTHONPATH=src .venv/bin/python experiments/26_arm/run_exp26.py --budget 45
+
+# Short active-path pulse for wall-clock/telemetry debugging.
+PYTHONPATH=src .venv/bin/python experiments/26_arm/profile_exp26.py --budget 15
 ```
 
 Operational flags remain for paths, world size, seed, budget, and dry-run.

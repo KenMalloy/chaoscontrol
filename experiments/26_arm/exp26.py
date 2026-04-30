@@ -118,8 +118,6 @@ def _crct_lock() -> dict[str, Any]:
         "crct_memory_write_tokens_per_step": 128,
         "crct_async_teacher_transport": True,
         "crct_async_teacher_transport_backend": "mailbox",
-        "crct_async_teacher_pending_batches": 64,
-        "crct_async_teacher_max_lag_steps": 128,
         "crct_async_teacher_payload_dtype": "auto",
         # The memory plane gets an every-step opportunity. Backpressure and
         # latest-only mailbox semantics decide what GPU3 actually scores.
@@ -159,10 +157,9 @@ def _replay_eviction_pipeline_lock() -> dict[str, Any]:
         "prototype_dim": 64,
         "replay_eviction_memory_streams": 8,
         "replay_eviction_arm_runtime_enabled": True,
-        # Rank-3 maintenance runs off the trunk critical path. The generic
-        # 0.5s default was a scaffold-era placeholder and suppresses action
-        # telemetry at Exp26's real 16k-vocab probe cost.
-        "replay_eviction_max_seconds": 8.0,
+        # 0 means no software wall-clock governor. The maintenance plane runs
+        # on arrived frames and ring capacity; telemetry records duty cycle.
+        "replay_eviction_max_seconds": 0.0,
         "replay_eviction_scoring_mode": "oracle",
         "replay_eviction_oracle_confirm_top_k": 32,
         "replay_eviction_oracle_variant_chunk_size": 1,
