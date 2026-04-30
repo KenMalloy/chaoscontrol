@@ -94,6 +94,14 @@ class Muon(torch.optim.Optimizer):
         self._compute_dtype = compute_dtype
         # Id-keyed lookup from param tensor -> optional name for the classifier.
         self._param_name_by_id: dict[int, str] = {}
+        self._plasticity_multiplier: Tensor | None = None
+        self._plasticity_multiplier_views: dict[tuple[torch.device, torch.dtype], Tensor] = {}
+        self._plasticity_step: int = -1
+        self._plasticity_strength: float = 0.0
+        self._plasticity_updates: int = 0
+        self._plasticity_last_dim: int = 0
+        self._plasticity_last_budget: Tensor | None = None
+        self._plasticity_last_confidence: Tensor | None = None
 
     def bind_param_names(self, named_params: Iterable[tuple[str, Tensor]]) -> None:
         """Attach (name, param) pairs so the classifier can use names, if provided."""
@@ -104,6 +112,141 @@ class Muon(torch.optim.Optimizer):
         if self._matrix_param_names is not None and name is not None:
             return name in self._matrix_param_names
         return self._is_matrix_fn(p, name)
+
+    @torch.no_grad()
+    def set_plasticity_budget(
+        self,
+        budget: Tensor,
+        *,
+        confidence: Tensor | None = None,
+        strength: float = 0.25,
+        step: int | None = None,
+    ) -> None:
+        """Install the latest optimizer-side ARM plasticity packet.
+
+        ``budget`` is a per-channel trusted coverage gate in ``[0, 1]``.
+        Channels with high trusted coverage receive up to
+        ``1 + strength`` times the base optimizer update; missing packets
+        leave the previously installed latest-complete packet in place.
+        """
+        b = budget.detach().float().reshape(-1).clamp(min=0.0, max=1.0)
+        if confidence is None:
+            c = torch.ones_like(b)
+        else:
+            c = confidence.detach().float().reshape(-1).clamp(min=0.0, max=1.0)
+            if c.numel() != b.numel():
+                raise ValueError(
+                    "plasticity confidence must match budget shape; got "
+                    f"{tuple(c.shape)} vs {tuple(b.shape)}"
+                )
+        effective = b
+        self._plasticity_multiplier = 1.0 + float(strength) * effective
+        self._plasticity_multiplier_views.clear()
+        self._plasticity_step = -1 if step is None else int(step)
+        self._plasticity_strength = float(strength)
+        self._plasticity_updates += 1
+        self._plasticity_last_dim = int(effective.numel())
+        self._plasticity_last_budget = effective
+        self._plasticity_last_confidence = c
+
+    def plasticity_budget_trace(self) -> dict[str, float | int | bool | list[int] | list[float]]:
+        mult = self._plasticity_multiplier
+        if mult is None or int(mult.numel()) == 0:
+            return {
+                "enabled": False,
+                "updates": int(self._plasticity_updates),
+                "step": int(self._plasticity_step),
+                "dim": 0,
+                "strength": float(self._plasticity_strength),
+                "budget_mean": 0.0,
+                "budget_max": 0.0,
+                "confidence_mean": 0.0,
+                "lr_multiplier_min": 1.0,
+                "lr_multiplier_mean": 1.0,
+                "lr_multiplier_max": 1.0,
+                "budget_nonzero_fraction": 0.0,
+                "confidence_max": 0.0,
+                "top_channels": [],
+                "top_budget": [],
+            }
+        budget = self._plasticity_last_budget
+        confidence = self._plasticity_last_confidence
+        top_channels: list[int] = []
+        top_budget: list[float] = []
+        if budget is not None and int(budget.numel()) > 0:
+            k = min(8, int(budget.numel()))
+            vals, idx = torch.topk(budget.detach().float(), k=k)
+            top_channels = [int(i) for i in idx.cpu().tolist()]
+            top_budget = [float(v) for v in vals.cpu().tolist()]
+        return {
+            "enabled": True,
+            "updates": int(self._plasticity_updates),
+            "step": int(self._plasticity_step),
+            "dim": int(self._plasticity_last_dim),
+            "strength": float(self._plasticity_strength),
+            "budget_mean": (
+                float(self._plasticity_last_budget.mean().item())
+                if self._plasticity_last_budget is not None
+                else 0.0
+            ),
+            "budget_max": (
+                float(self._plasticity_last_budget.max().item())
+                if self._plasticity_last_budget is not None
+                else 0.0
+            ),
+            "confidence_mean": (
+                float(confidence.mean().item())
+                if confidence is not None
+                else 0.0
+            ),
+            "budget_nonzero_fraction": (
+                float((budget > 0).float().mean().item())
+                if budget is not None
+                else 0.0
+            ),
+            "confidence_max": (
+                float(confidence.max().item())
+                if confidence is not None
+                else 0.0
+            ),
+            "lr_multiplier_min": float(mult.min().item()),
+            "lr_multiplier_mean": float(mult.mean().item()),
+            "lr_multiplier_max": float(mult.max().item()),
+            "top_channels": top_channels,
+            "top_budget": top_budget,
+        }
+
+    def _plasticity_multiplier_for(self, p: Tensor) -> Tensor | None:
+        mult = self._plasticity_multiplier
+        if mult is None:
+            return None
+        name = self._param_name_by_id.get(id(p), "")
+        if not name.startswith("layers.") or ".core." not in name:
+            return None
+        view_key = (p.device, p.dtype)
+        m = self._plasticity_multiplier_views.get(view_key)
+        if m is None:
+            m = mult.to(device=p.device, dtype=p.dtype)
+            self._plasticity_multiplier_views[view_key] = m
+        d = int(m.numel())
+        if p.ndim == 1 and p.numel() == d and name.endswith(
+            (".log_a", ".log_r", ".theta")
+        ):
+            return m.reshape_as(p)
+        if p.ndim != 2:
+            return None
+        if name.endswith(
+            (
+                ".in_proj.weight",
+                ".select_proj.weight",
+                ".gate_proj.weight",
+                ".delta_proj.weight",
+            )
+        ) and int(p.shape[0]) == d:
+            return m.view(d, 1)
+        if name.endswith(".out_proj.weight") and int(p.shape[1]) == d:
+            return m.view(1, d)
+        return None
 
     @torch.no_grad()
     def step(self, closure: Callable[[], Tensor] | None = None) -> Tensor | None:
@@ -146,6 +289,9 @@ class Muon(torch.optim.Optimizer):
                     scale = max(1.0, rows / cols) ** 0.5
                     if wd > 0.0:
                         p.data.mul_(1.0 - lr * wd)
+                    mult = self._plasticity_multiplier_for(p)
+                    if mult is not None:
+                        update = update * mult
                     p.data.add_(update.to(dtype=p.dtype), alpha=-lr * scale)
                 else:
                     # Decoupled AdamW fallback for scalar / vector / non-matrix params.
@@ -164,7 +310,12 @@ class Muon(torch.optim.Optimizer):
                     denom = (exp_avg_sq.sqrt() / (bias2 ** 0.5)).add_(adamw_eps)
                     if adamw_wd > 0.0:
                         p.data.mul_(1.0 - adamw_lr * adamw_wd)
-                    p.data.addcdiv_(exp_avg, denom, value=-adamw_lr / bias1)
+                    mult = self._plasticity_multiplier_for(p)
+                    if mult is None:
+                        p.data.addcdiv_(exp_avg, denom, value=-adamw_lr / bias1)
+                    else:
+                        update = exp_avg / denom
+                        p.data.add_(update * mult, alpha=-adamw_lr / bias1)
 
         return loss
 
@@ -252,7 +403,11 @@ class Muon(torch.optim.Optimizer):
                     self.state[p]["momentum_buffer"].copy_(buf_stack[i])
                     if wd > 0.0:
                         p.data.mul_(1.0 - lr * wd)
-                    p.data.add_(update_stack[i].to(dtype=p.dtype), alpha=-lr * scale)
+                    update = update_stack[i]
+                    mult = self._plasticity_multiplier_for(p)
+                    if mult is not None:
+                        update = update * mult
+                    p.data.add_(update.to(dtype=p.dtype), alpha=-lr * scale)
 
             # ----- Non-matrix branch: coalesced AdamW over flat buffers.
             if not nonmatrix_params:
@@ -303,7 +458,12 @@ class Muon(torch.optim.Optimizer):
                     denom = (exp_avg_sq.sqrt() / (bias2 ** 0.5)).add_(adamw_eps)
                     if adamw_wd > 0.0:
                         p.data.mul_(1.0 - adamw_lr * adamw_wd)
-                    p.data.addcdiv_(exp_avg, denom, value=-adamw_lr / bias1)
+                    mult = self._plasticity_multiplier_for(p)
+                    if mult is None:
+                        p.data.addcdiv_(exp_avg, denom, value=-adamw_lr / bias1)
+                    else:
+                        update = exp_avg / denom
+                        p.data.add_(update * mult, alpha=-adamw_lr / bias1)
                 continue
 
             # Uniform step-count path: coalesced update over flat buffers.
@@ -367,8 +527,13 @@ class Muon(torch.optim.Optimizer):
                 state["step"] = t
                 if adamw_wd > 0.0:
                     p.data.mul_(1.0 - adamw_lr * adamw_wd)
-                p.data.addcdiv_(
-                    state["exp_avg"], denom_views[i], value=-adamw_lr / bias1,
-                )
+                mult = self._plasticity_multiplier_for(p)
+                if mult is None:
+                    p.data.addcdiv_(
+                        state["exp_avg"], denom_views[i], value=-adamw_lr / bias1,
+                    )
+                else:
+                    update = state["exp_avg"] / denom_views[i]
+                    p.data.add_(update * mult, alpha=-adamw_lr / bias1)
 
         return loss

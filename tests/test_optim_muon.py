@@ -203,6 +203,97 @@ class TestMuonAdamWFallback(unittest.TestCase):
         self.assertTrue(torch.allclose(ref.detach(), muon_param.detach(), atol=1e-6))
 
 
+class TestMuonPlasticityBudget(unittest.TestCase):
+    def test_channel_budget_maps_to_ssm_parameter_roles(self) -> None:
+        in_w = nn.Parameter(torch.zeros(3, 3))
+        out_w = nn.Parameter(torch.zeros(3, 3))
+        log_a = nn.Parameter(torch.zeros(3))
+        opt = Muon(
+            [in_w, out_w, log_a],
+            lr=0.01,
+            compute_dtype=torch.float32,
+        )
+        opt.bind_param_names(
+            [
+                ("layers.0.core.in_proj.weight", in_w),
+                ("layers.0.core.out_proj.weight", out_w),
+                ("layers.0.core.log_a", log_a),
+            ]
+        )
+        opt.set_plasticity_budget(
+            torch.tensor([0.0, 0.5, 1.0]),
+            confidence=torch.ones(3),
+            strength=0.25,
+            step=17,
+        )
+
+        expected = torch.tensor([1.0, 1.125, 1.25])
+        torch.testing.assert_close(
+            opt._plasticity_multiplier_for(in_w), expected.view(3, 1)
+        )
+        torch.testing.assert_close(
+            opt._plasticity_multiplier_for(out_w), expected.view(1, 3)
+        )
+        torch.testing.assert_close(opt._plasticity_multiplier_for(log_a), expected)
+        trace = opt.plasticity_budget_trace()
+        assert trace["enabled"] is True
+        assert trace["updates"] == 1
+        assert trace["step"] == 17
+        assert trace["lr_multiplier_max"] == pytest.approx(1.25)
+        assert trace["budget_nonzero_fraction"] == pytest.approx(2.0 / 3.0)
+        assert trace["top_channels"][0] == 2
+        assert trace["top_budget"][0] == pytest.approx(1.0)
+
+    def test_plasticity_budget_caches_dtype_device_views(self) -> None:
+        p = nn.Parameter(torch.ones(3, 4, dtype=torch.bfloat16))
+        opt = Muon(
+            [p],
+            lr=0.1,
+            fused=False,
+            matrix_param_names={"layers.0.core.in_proj.weight"},
+        )
+        opt.bind_param_names([("layers.0.core.in_proj.weight", p)])
+        opt.set_plasticity_budget(torch.tensor([0.0, 0.5, 1.0]), strength=0.5)
+
+        first = opt._plasticity_multiplier_for(p)
+        second = opt._plasticity_multiplier_for(p)
+
+        assert first is not None
+        assert second is not None
+        assert first.dtype == torch.bfloat16
+        assert second.data_ptr() == first.data_ptr()
+
+    def test_plasticity_budget_scales_log_a_adamw_update(self) -> None:
+        p = nn.Parameter(torch.zeros(2))
+        p.grad = torch.ones_like(p)
+        opt = Muon(
+            [p],
+            lr=0.1,
+            adamw_lr=0.1,
+            adamw_betas=(0.0, 0.0),
+            adamw_eps=1e-12,
+            adamw_weight_decay=0.0,
+            matrix_param_names=set(),
+            compute_dtype=torch.float32,
+        )
+        opt.bind_param_names([("layers.0.core.log_a", p)])
+        opt.set_plasticity_budget(
+            torch.tensor([0.0, 1.0]),
+            confidence=torch.ones(2),
+            strength=0.5,
+            step=3,
+        )
+
+        opt.step()
+
+        torch.testing.assert_close(
+            p.detach(),
+            torch.tensor([-0.1, -0.15]),
+            rtol=0,
+            atol=1e-6,
+        )
+
+
 class TestMuonClassifier(unittest.TestCase):
     def test_matrix_param_names_override(self) -> None:
         torch.manual_seed(19)

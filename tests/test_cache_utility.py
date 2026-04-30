@@ -27,6 +27,7 @@ from chaoscontrol.cache_utility import (
     alpha_ramp,
     assign_memory_credit,
     chunked_nll_from_hidden,
+    plasticity_budget_from_hidden_delta,
     positive_only_lm_weight,
     rank3_score_batch_causal,
 )
@@ -193,6 +194,55 @@ class _SequencePacketMockModel(_PacketMockModel):
                 },
             }
         return hidden
+
+
+# ---------------------------------------------------------------------------
+# plasticity_budget_from_hidden_delta
+# ---------------------------------------------------------------------------
+
+
+class TestPlasticityBudgetFromHiddenDelta:
+    def test_coverage_is_positive_when_residual_tracks_utility(self) -> None:
+        h_off = torch.zeros(1, 4, 3)
+        h_mem = torch.zeros_like(h_off)
+        h_mem[0, :, 0] = torch.tensor([0.0, 1.0, 2.0, 3.0])
+        h_mem[0, :, 1] = torch.tensor([3.0, 2.0, 1.0, 0.0])
+        utility = torch.tensor([[0.0, 1.0, 2.0, 3.0]])
+        mask = torch.ones_like(utility, dtype=torch.bool)
+
+        out = plasticity_budget_from_hidden_delta(
+            h_off=h_off,
+            h_mem=h_mem,
+            utility=utility,
+            mask=mask,
+            tau=0.5,
+        )
+
+        assert out["plasticity_coverage"].shape == (3,)
+        assert out["plasticity_confidence"].shape == (3,)
+        assert out["plasticity_budget"].shape == (3,)
+        assert out["plasticity_coverage"][0] > 0.99
+        assert out["plasticity_coverage"][1] < -0.99
+        assert out["plasticity_budget"][0] > 0.9
+        assert out["plasticity_budget"][1].item() == 0.0
+
+    def test_invalid_or_zero_utility_positions_do_not_open_budget(self) -> None:
+        h_off = torch.zeros(2, 3, 4)
+        h_mem = torch.randn_like(h_off)
+        utility = torch.zeros(2, 3)
+        mask = torch.zeros_like(utility, dtype=torch.bool)
+
+        out = plasticity_budget_from_hidden_delta(
+            h_off=h_off,
+            h_mem=h_mem,
+            utility=utility,
+            mask=mask,
+            tau=0.1,
+        )
+
+        assert torch.equal(out["plasticity_coverage"], torch.zeros(4))
+        assert torch.equal(out["plasticity_confidence"], torch.zeros(4))
+        assert torch.equal(out["plasticity_budget"], torch.zeros(4))
 
 
 # ---------------------------------------------------------------------------
@@ -561,6 +611,9 @@ class TestRank3ScoreBatchCausal:
             "controller_target",
             "loss_weight",
             "confidence",
+            "plasticity_coverage",
+            "plasticity_confidence",
+            "plasticity_budget",
         }
 
     def test_exports_memory_packet_when_encoder_returns_meta(self) -> None:
@@ -604,6 +657,9 @@ class TestRank3ScoreBatchCausal:
         assert out["controller_target"].shape == (2, 5)
         assert out["loss_weight"].shape == (2, 5)
         assert out["confidence"].shape == (2, 5)
+        assert out["plasticity_coverage"].shape == (model._dim,)
+        assert out["plasticity_confidence"].shape == (model._dim,)
+        assert out["plasticity_budget"].shape == (model._dim,)
 
     def test_controller_target_is_clamped_to_valid_range(self) -> None:
         model, cache, ids, mask = self._setup()

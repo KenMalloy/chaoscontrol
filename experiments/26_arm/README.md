@@ -68,6 +68,14 @@ stream before the SSM layers. It is not direct A-matrix modulation. If we add
 A-modulation later, it should be named as a separate mechanism rather than
 quietly overloading the residual lane.
 
+The optimizer receives a sibling packet on the same latest-complete protocol:
+GPU3 computes per-channel `plasticity_budget` from the correlation between
+`abs(h_mem - h_off)` and positive memory utility, the mailbox carries the EMA
+alongside the residual packet, and Muon uses it as a bounded LR multiplier on
+SSM-channel parameters. This is the training-time "gist" signal: where episodic
+memory is demonstrably supporting the recurrent state, the trunk can keep that
+channel more plastic without waiting for the memory plane.
+
 ## Validation Cells
 
 | Cell | Purpose |
@@ -93,6 +101,10 @@ shape gives `384 -> 13.71 MB`, `416 -> 15.19 MB`, `448 -> 16.73 MB`, and
 - `replay_eviction_arm_runtime_enabled` is true and the runtime namespace is
   per-cell.
 - GPU3 oracle/maintenance telemetry is non-empty.
+- Plasticity telemetry is present:
+  `transport_summary.health.plasticity_packets_received`,
+  `plasticity_budget_mean_received`, and optimizer
+  `plasticity_budget.lr_multiplier_max`.
 - The ARM cell offers teacher work every step; stream backpressure and the
   latest-complete mirror decide what GPU3 actually adopts.
 - `transport_summary.health.weight_snapshot_published` and

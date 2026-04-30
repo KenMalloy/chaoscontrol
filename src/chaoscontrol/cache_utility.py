@@ -31,6 +31,7 @@ __all__ = [
     "alpha_ramp",
     "assign_memory_credit",
     "chunked_nll_from_hidden",
+    "plasticity_budget_from_hidden_delta",
     "positive_only_lm_weight",
     "rank3_score_batch_causal",
     "ScarcityAwareMemoryOptimizer",
@@ -686,6 +687,74 @@ def _compact_memory_packet_residual(
     )
 
 
+def plasticity_budget_from_hidden_delta(
+    *,
+    h_off: torch.Tensor,
+    h_mem: torch.Tensor,
+    utility: torch.Tensor,
+    mask: torch.Tensor,
+    tau: float,
+    eps: float = 1e-6,
+) -> dict[str, torch.Tensor]:
+    """Per-channel evidence that episodic memory is doing useful work.
+
+    ``coverage[c]`` is the signed correlation, over valid batch tokens,
+    between residual magnitude ``|h_mem - h_off|[..., c]`` and positive
+    memory utility ``relu(nll_off - nll_mem)``.  Positive coverage says
+    channel ``c`` moves more when memory actually reduces NLL; negative
+    coverage says motion is anti-correlated with help.
+
+    ``confidence[c]`` downweights low-signal batches using the same
+    utility scale as the controller target.  ``budget[c]`` is the
+    optimizer-facing positive gate: trusted positive coverage only.
+    """
+    if h_off.shape != h_mem.shape:
+        raise ValueError(
+            f"h_off and h_mem must have identical shape, got "
+            f"{tuple(h_off.shape)} and {tuple(h_mem.shape)}"
+        )
+    if h_off.dim() != 3:
+        raise ValueError(f"hidden tensors must be (B, T, D), got {tuple(h_off.shape)}")
+    if utility.shape != h_off.shape[:2] or mask.shape != h_off.shape[:2]:
+        raise ValueError(
+            "utility and mask must match hidden batch/time shape; got "
+            f"utility={tuple(utility.shape)} mask={tuple(mask.shape)} "
+            f"hidden={tuple(h_off.shape)}"
+        )
+
+    x = (h_mem.detach().float() - h_off.detach().float()).abs()
+    y = torch.relu(utility.detach().float()) * mask.detach().float()
+    w = mask.detach().float()
+    n = w.sum().clamp_min(1.0)
+    d = int(h_off.shape[-1])
+
+    w3 = w.unsqueeze(-1)
+    x_mean = (x * w3).sum(dim=(0, 1)) / n
+    y_mean = y.sum() / n
+    dx = (x - x_mean.view(1, 1, d)) * w3
+    dy = (y - y_mean).unsqueeze(-1) * w3
+    cov = (dx * dy).sum(dim=(0, 1)) / n
+    x_var = ((x - x_mean.view(1, 1, d)).square() * w3).sum(dim=(0, 1)) / n
+    y_var = ((y - y_mean).square() * w).sum() / n
+    coverage = cov / torch.sqrt((x_var * y_var).clamp_min(float(eps)))
+    coverage = coverage.clamp(min=-1.0, max=1.0)
+
+    # A high correlation on a batch with no useful memory signal should
+    # not open the optimizer gate. The scalar energy term is shared across
+    # channels; correlation quality stays per-channel.
+    utility_energy = torch.sqrt((y.square() * w).sum() / n)
+    utility_conf = torch.tanh(utility_energy / max(float(tau), float(eps)))
+    confidence = coverage.abs() * utility_conf
+    confidence = confidence.clamp(min=0.0, max=1.0)
+    budget = torch.relu(coverage) * confidence
+
+    return {
+        "plasticity_coverage": coverage.detach(),
+        "plasticity_confidence": confidence.detach(),
+        "plasticity_budget": budget.detach(),
+    }
+
+
 @torch.inference_mode()
 def rank3_score_batch_causal(
     *,
@@ -752,6 +821,13 @@ def rank3_score_batch_causal(
     nll_mem = chunked_nll_from_hidden(model, h_mem, y)
 
     utility = (nll_off - nll_mem) * mask.float()
+    plasticity = plasticity_budget_from_hidden_delta(
+        h_off=h_off,
+        h_mem=h_mem,
+        utility=utility,
+        mask=mask,
+        tau=float(tau),
+    )
 
     if scarcity_optimizer is None:
         net = utility.float()
@@ -812,6 +888,7 @@ def rank3_score_batch_causal(
             if memory_residual is not None:
                 out["memory_residual"] = memory_residual
                 out["memory_gate"] = controller_target.detach()
+            out.update(plasticity)
             if gradient_conflict_monitor is not None:
                 out["gradient_conflict"] = torch.zeros_like(utility)
                 out["write_score"] = write_score.detach()
@@ -855,4 +932,5 @@ def rank3_score_batch_causal(
     if memory_residual is not None:
         out["memory_residual"] = memory_residual
         out["memory_gate"] = controller_target.detach()
+    out.update(plasticity)
     return out

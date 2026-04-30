@@ -532,6 +532,31 @@ def test_crct_train_step_does_not_read_slots_on_trunk_path() -> None:
     assert not hasattr(model, "memory_controller")
 
 
+def test_crct_plasticity_budget_payload_installs_on_optimizer() -> None:
+    mod = _load_module("runner_fast_path_crct_plasticity_apply", RUNNER_PATH)
+    from chaoscontrol.optim.muon import Muon
+
+    p = torch.nn.Parameter(torch.zeros(2))
+    opt = Muon([p], lr=0.01)
+    opt.bind_param_names([("layers.0.core.log_a", p)])
+
+    applied = mod._apply_plasticity_budget_payload(
+        optimizer=opt,
+        payload={
+            "step_id": torch.tensor(11),
+            "plasticity_budget": torch.tensor([0.0, 1.0]),
+            "plasticity_confidence": torch.ones(2),
+        },
+        strength=0.5,
+    )
+
+    assert applied is True
+    trace = opt.plasticity_budget_trace()
+    assert trace["enabled"] is True
+    assert trace["step"] == 11
+    assert trace["lr_multiplier_max"] == pytest.approx(1.5)
+
+
 def test_crct_mailbox_transport_matches_stored_batch(tmp_path) -> None:
     os.environ["CHAOSCONTROL_DIAG_SCAN_BACKEND"] = "chunked"
     mod = _load_module("runner_fast_path_crct_mailbox", RUNNER_PATH)
@@ -692,6 +717,57 @@ def test_crct_mailbox_aliases_memory_gate_to_target_for_compact_packet(tmp_path)
     assert diag3["memory_packet_gate_alias_target_sent"] == 1
     assert diag0["memory_packet_gate_alias_target_received"] == 1
     assert diag3["memory_packet_bytes_sent"] == residual.numel() * residual.element_size()
+
+
+def test_crct_mailbox_round_trips_plasticity_budget_packet(tmp_path) -> None:
+    mod = _load_module("runner_fast_path_crct_mailbox_plasticity", RUNNER_PATH)
+    kwargs = {
+        "world_size": 4,
+        "mailbox_dir": str(tmp_path),
+        "payload_shape": (1, 2, 5),
+        "full_ids_shape": (2, 6),
+        "device": torch.device("cpu"),
+        "payload_dtype": torch.float32,
+        "max_local_batches": 8,
+        "max_payload_lag_steps": 8,
+        "score_interval_steps": 1,
+        "plasticity_ema_beta": 0.5,
+    }
+    rank0 = mod._CrctMailboxTeacherTransport(rank=0, **kwargs)
+    rank3 = mod._CrctMailboxTeacherTransport(rank=3, **kwargs)
+    inputs = torch.randint(0, 32, (2, 5), dtype=torch.int32)
+    targets = torch.randint(0, 32, (2, 5), dtype=torch.long)
+    rank0.local_batches_by_step[0] = (inputs, targets)
+    rank0.local_batch_order.append(0)
+    coverage = torch.tensor([1.0, -0.5, 0.25])
+    confidence = torch.tensor([0.8, 0.7, 0.6])
+    budget = torch.tensor([0.8, 0.0, 0.15])
+
+    rank3._write_result(
+        request_step=0,
+        scored={
+            "target": torch.full((2, 5), 0.85),
+            "confidence": torch.ones(2, 5),
+            "loss_weight": torch.ones(2, 5),
+            "utility": torch.zeros(2, 5),
+            "plasticity_coverage": coverage,
+            "plasticity_confidence": confidence,
+            "plasticity_budget": budget,
+        },
+    )
+
+    ready = rank0._poll_results(current_step=2)
+    assert ready is not None
+    payload, _inputs, _targets = ready
+    torch.testing.assert_close(payload["plasticity_coverage"], coverage)
+    torch.testing.assert_close(payload["plasticity_confidence"], confidence)
+    torch.testing.assert_close(payload["plasticity_budget"], budget)
+    diag3 = rank3.diagnostics()
+    diag0 = rank0.diagnostics()
+    assert diag3["plasticity_packets_sent"] == 1
+    assert diag0["plasticity_packets_received"] == 1
+    assert diag0["plasticity_lag_steps_max"] == 2
+    assert diag0["plasticity_budget_max_received"] == pytest.approx(0.8)
 
 
 def test_crct_mailbox_rejects_sequence_memory_packet(tmp_path) -> None:

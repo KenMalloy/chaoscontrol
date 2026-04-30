@@ -619,6 +619,9 @@ def _optimizer_diagnostics(optimizer: torch.optim.Optimizer) -> dict[str, Any]:
     scarcity_trace = getattr(optimizer, "scarcity_trace", None)
     if callable(scarcity_trace):
         diagnostics["scarcity_trace"] = scarcity_trace()
+    plasticity_trace = getattr(optimizer, "plasticity_budget_trace", None)
+    if callable(plasticity_trace):
+        diagnostics["plasticity_budget"] = plasticity_trace()
     return diagnostics
 
 
@@ -1092,11 +1095,20 @@ def _crct_score_payload_inline(
         scarcity_optimizer.dual_step(actual_read_rate=actual_read_rate)
     payload = {
         "step_id": torch.tensor(int(step), device=inputs.device),
+        "step_id_int": int(step),
         "target": score["controller_target"].detach().clone(),
         "confidence": score["confidence"].detach().clone(),
         "loss_weight": score["loss_weight"].detach().clone(),
         "utility": score["utility"].detach().clone(),
     }
+    for key in (
+        "plasticity_coverage",
+        "plasticity_confidence",
+        "plasticity_budget",
+    ):
+        value = score.get(key)
+        if isinstance(value, torch.Tensor):
+            payload[key] = value.detach().clone()
     if "memory_residual" in score and "memory_gate" in score:
         payload["memory_residual"] = score["memory_residual"].detach().clone()
         payload["memory_gate"] = score["memory_gate"].detach().clone()
@@ -1277,6 +1289,33 @@ def _apply_fast_slow_result_payload(
             metrics.get("fast_slow_result_decisions_applied", 0)
         ) + 1
     return decision
+
+
+def _apply_plasticity_budget_payload(
+    *,
+    optimizer: torch.optim.Optimizer,
+    payload: dict[str, Any] | None,
+    strength: float,
+) -> bool:
+    setter = getattr(optimizer, "set_plasticity_budget", None)
+    if setter is None or not callable(setter) or not isinstance(payload, dict):
+        return False
+    budget = payload.get("plasticity_budget")
+    confidence = payload.get("plasticity_confidence")
+    if not isinstance(budget, torch.Tensor):
+        return False
+    step_tensor = payload.get("step_id")
+    step_raw = payload.get("step_id_int")
+    step = int(step_raw) if isinstance(step_raw, int) else None
+    if step is None and isinstance(step_tensor, torch.Tensor):
+        step = int(step_tensor.detach().cpu().item())
+    setter(
+        budget.detach(),
+        confidence=confidence.detach() if isinstance(confidence, torch.Tensor) else None,
+        strength=float(strength),
+        step=step,
+    )
+    return True
 
 
 def _dist_work_done(work: Any) -> bool:
@@ -1872,6 +1911,7 @@ class _CrctMailboxTeacherTransport:
         max_payload_lag_steps: int,
         score_interval_steps: int = 1,
         coordinator_rank: int = 0,
+        plasticity_ema_beta: float = 0.95,
     ) -> None:
         self.rank = int(rank)
         self.world_size = int(world_size)
@@ -1883,6 +1923,7 @@ class _CrctMailboxTeacherTransport:
         self.full_ids_shape = tuple(int(x) for x in full_ids_shape)
         self.device = device
         self.payload_dtype = payload_dtype
+        self.plasticity_ema_beta = min(max(float(plasticity_ema_beta), 0.0), 0.9999)
         self.max_local_batches = max(1, int(max_local_batches))
         self.max_payload_lag_steps = max(0, int(max_payload_lag_steps))
         self.score_interval_steps = max(1, int(score_interval_steps))
@@ -1897,6 +1938,9 @@ class _CrctMailboxTeacherTransport:
         self._weight_snapshot_staging: dict[str, torch.Tensor] = {}
         self._weight_snapshot_host_staging: dict[str, torch.Tensor] = {}
         self._request_host_staging: torch.Tensor | None = None
+        self._plasticity_coverage_ema: torch.Tensor | None = None
+        self._plasticity_confidence_ema: torch.Tensor | None = None
+        self._plasticity_budget_ema: torch.Tensor | None = None
         self.metrics: dict[str, Any] = {
             "mode": "async_rank0_memory_mailbox",
             "transport_group": "rank0_memory_mailbox",
@@ -1952,6 +1996,25 @@ class _CrctMailboxTeacherTransport:
             "memory_packet_lag_steps_max": 0,
             "memory_packet_last_residual_shape": [],
             "memory_packet_last_gate_shape": [],
+            "plasticity_ema_beta": float(self.plasticity_ema_beta),
+            "plasticity_packets_sent": 0,
+            "plasticity_packets_received": 0,
+            "plasticity_packets_missing": 0,
+            "plasticity_packet_bytes_sent": 0,
+            "plasticity_packet_bytes_received": 0,
+            "plasticity_packet_bytes_sent_max": 0,
+            "plasticity_packet_bytes_received_max": 0,
+            "plasticity_packet_last_shape": [],
+            "plasticity_budget_mean_sent": 0.0,
+            "plasticity_budget_max_sent": 0.0,
+            "plasticity_budget_mean_received": 0.0,
+            "plasticity_budget_max_received": 0.0,
+            "plasticity_confidence_mean_sent": 0.0,
+            "plasticity_confidence_mean_received": 0.0,
+            "plasticity_coverage_abs_mean_sent": 0.0,
+            "plasticity_coverage_abs_mean_received": 0.0,
+            "plasticity_lag_steps_sum": 0,
+            "plasticity_lag_steps_max": 0,
             "sentinel_broadcasts": 0,
             "sentinels_received": 0,
             "stale_payloads_dropped": 0,
@@ -2255,6 +2318,12 @@ class _CrctMailboxTeacherTransport:
         out["memory_packet_lag_steps_mean"] = (
             float(out["memory_packet_lag_steps_sum"]) / float(packets)
             if packets
+            else 0.0
+        )
+        plasticity_packets = int(out.get("plasticity_packets_received", 0))
+        out["plasticity_lag_steps_mean"] = (
+            float(out["plasticity_lag_steps_sum"]) / float(plasticity_packets)
+            if plasticity_packets
             else 0.0
         )
         return out
@@ -2883,6 +2952,52 @@ class _CrctMailboxTeacherTransport:
             ).strip()
             self.metrics["last_drop_reason"] = "request_mailbox_read_error"
 
+    def _plasticity_ema_update(
+        self,
+        scored: dict[str, torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
+        coverage = scored.get("plasticity_coverage")
+        confidence = scored.get("plasticity_confidence")
+        budget = scored.get("plasticity_budget")
+        if not (
+            isinstance(coverage, torch.Tensor)
+            and isinstance(confidence, torch.Tensor)
+            and isinstance(budget, torch.Tensor)
+        ):
+            return None
+        cov = coverage.detach().float().reshape(-1).cpu()
+        conf = confidence.detach().float().reshape(-1).cpu()
+        bud = budget.detach().float().reshape(-1).cpu()
+        if not (cov.numel() == conf.numel() == bud.numel()):
+            raise ValueError(
+                "plasticity packet tensors must share shape; got "
+                f"coverage={tuple(cov.shape)} confidence={tuple(conf.shape)} "
+                f"budget={tuple(bud.shape)}"
+            )
+        beta = float(self.plasticity_ema_beta)
+        if self._plasticity_coverage_ema is None:
+            self._plasticity_coverage_ema = cov.clone()
+            self._plasticity_confidence_ema = conf.clone()
+            self._plasticity_budget_ema = bud.clone()
+        else:
+            assert self._plasticity_confidence_ema is not None
+            assert self._plasticity_budget_ema is not None
+            if self._plasticity_coverage_ema.numel() != cov.numel():
+                raise ValueError(
+                    "plasticity packet channel count changed: "
+                    f"{self._plasticity_coverage_ema.numel()} -> {cov.numel()}"
+                )
+            self._plasticity_coverage_ema.mul_(beta).add_(cov, alpha=1.0 - beta)
+            self._plasticity_confidence_ema.mul_(beta).add_(
+                conf, alpha=1.0 - beta
+            )
+            self._plasticity_budget_ema.mul_(beta).add_(bud, alpha=1.0 - beta)
+        return (
+            self._plasticity_coverage_ema,
+            self._plasticity_confidence_ema,
+            self._plasticity_budget_ema,
+        )
+
     def _write_result(self, *, request_step: int, scored: dict[str, torch.Tensor]) -> None:
         target_cpu = scored["target"].detach().to(
             device="cpu", dtype=self.payload_dtype
@@ -2948,6 +3063,45 @@ class _CrctMailboxTeacherTransport:
             )
         else:
             self.metrics["memory_packet_missing_payloads"] += 1
+        plasticity = self._plasticity_ema_update(scored)
+        if plasticity is None:
+            self.metrics["plasticity_packets_missing"] += 1
+        else:
+            coverage_ema, confidence_ema, budget_ema = plasticity
+            payload["plasticity_coverage"] = coverage_ema.to(dtype=self.payload_dtype)
+            payload["plasticity_confidence"] = confidence_ema.to(
+                dtype=self.payload_dtype
+            )
+            payload["plasticity_budget"] = budget_ema.to(dtype=self.payload_dtype)
+            packet_bytes = int(
+                sum(
+                    payload[key].numel() * payload[key].element_size()
+                    for key in (
+                        "plasticity_coverage",
+                        "plasticity_confidence",
+                        "plasticity_budget",
+                    )
+                )
+            )
+            self.metrics["plasticity_packets_sent"] += 1
+            self.metrics["plasticity_packet_bytes_sent"] += int(packet_bytes)
+            self.metrics["plasticity_packet_bytes_sent_max"] = max(
+                int(self.metrics["plasticity_packet_bytes_sent_max"]),
+                int(packet_bytes),
+            )
+            self.metrics["plasticity_packet_last_shape"] = list(budget_ema.shape)
+            self.metrics["plasticity_budget_mean_sent"] = float(
+                budget_ema.mean().item()
+            )
+            self.metrics["plasticity_budget_max_sent"] = float(
+                budget_ema.max().item()
+            )
+            self.metrics["plasticity_confidence_mean_sent"] = float(
+                confidence_ema.mean().item()
+            )
+            self.metrics["plasticity_coverage_abs_mean_sent"] = float(
+                coverage_ema.abs().mean().item()
+            )
         self._atomic_save(payload, self._result_path(int(request_step)))
         self.metrics["payloads_sent"] += 1
         self.metrics["payloads_received"] += 0
@@ -3001,6 +3155,7 @@ class _CrctMailboxTeacherTransport:
                 self.metrics["superseded_payloads_dropped"] += 1
             payload = {
                 "step_id": torch.tensor(request_step, device=self.device),
+                "step_id_int": int(request_step),
                 "target": payload_cpu["target"].to(
                     device=self.device, dtype=torch.float32
                 ),
@@ -3079,6 +3234,68 @@ class _CrctMailboxTeacherTransport:
                     ["alias:target"]
                     if gate_alias_target
                     else list(memory_gate.shape)
+                )
+            plasticity_coverage = payload_cpu.get("plasticity_coverage")
+            plasticity_confidence = payload_cpu.get("plasticity_confidence")
+            plasticity_budget = payload_cpu.get("plasticity_budget")
+            if (
+                isinstance(plasticity_coverage, torch.Tensor)
+                and isinstance(plasticity_confidence, torch.Tensor)
+                and isinstance(plasticity_budget, torch.Tensor)
+            ):
+                cov_cpu = plasticity_coverage.reshape(-1).float()
+                conf_cpu = plasticity_confidence.reshape(-1).float()
+                budget_cpu = plasticity_budget.reshape(-1).float()
+                cov = cov_cpu.to(
+                    device=self.device, dtype=torch.float32
+                )
+                conf = conf_cpu.to(
+                    device=self.device, dtype=torch.float32
+                )
+                budget = budget_cpu.to(
+                    device=self.device, dtype=torch.float32
+                )
+                if not (cov.numel() == conf.numel() == budget.numel()):
+                    self.metrics["last_drop_reason"] = (
+                        "plasticity_packet_shape_mismatch"
+                    )
+                    continue
+                payload["plasticity_coverage"] = cov
+                payload["plasticity_confidence"] = conf
+                payload["plasticity_budget"] = budget
+                packet_bytes = int(
+                    sum(
+                        tensor.numel() * tensor.element_size()
+                        for tensor in (
+                            plasticity_coverage,
+                            plasticity_confidence,
+                            plasticity_budget,
+                        )
+                    )
+                )
+                self.metrics["plasticity_packets_received"] += 1
+                self.metrics["plasticity_packet_bytes_received"] += int(packet_bytes)
+                self.metrics["plasticity_packet_bytes_received_max"] = max(
+                    int(self.metrics["plasticity_packet_bytes_received_max"]),
+                    int(packet_bytes),
+                )
+                self.metrics["plasticity_packet_last_shape"] = list(budget.shape)
+                self.metrics["plasticity_budget_mean_received"] = float(
+                    budget_cpu.mean().item()
+                )
+                self.metrics["plasticity_budget_max_received"] = float(
+                    budget_cpu.max().item()
+                )
+                self.metrics["plasticity_confidence_mean_received"] = float(
+                    conf_cpu.mean().item()
+                )
+                self.metrics["plasticity_coverage_abs_mean_received"] = float(
+                    cov_cpu.abs().mean().item()
+                )
+                self.metrics["plasticity_lag_steps_sum"] += max(0, lag)
+                self.metrics["plasticity_lag_steps_max"] = max(
+                    int(self.metrics["plasticity_lag_steps_max"]),
+                    max(0, lag),
                 )
             inputs, targets = batch
             ready = (payload, inputs, targets)
@@ -7823,6 +8040,7 @@ def train_fast_for_budget(
     crct_dual_lr: float = 0.01,
     crct_ema_beta: float = 0.95,
     crct_max_price: float = 0.50,
+    crct_plasticity_budget_strength: float = 0.25,
     crct_memory_write_tokens_per_step: int = 256,
     crct_async_teacher_transport: bool = True,
     crct_async_teacher_transport_backend: str = "collective",
@@ -8492,6 +8710,8 @@ def train_fast_for_budget(
     event_sleep_trigger_count = 0
     event_sleep_replay_count = 0
     event_sleep_decision_count = 0
+    plasticity_budget_payloads_applied = 0
+    plasticity_budget_payloads_missing = 0
     event_sleep_pressure_sum = 0.0
     event_sleep_last_decision: dict[str, Any] | None = None
     event_sleep_queued_decision: LossTriggeredReplayDecision | None = None
@@ -8985,6 +9205,7 @@ def train_fast_for_budget(
                                 score_interval_steps=int(
                                     crct_teacher_score_interval_steps
                                 ),
+                                plasticity_ema_beta=float(crct_ema_beta),
                             )
                         else:
                             crct_teacher_transport = _CrctAsyncTeacherTransport(
@@ -9363,6 +9584,15 @@ def train_fast_for_budget(
                 _apply_scopt_pending(
                     scopt_opt, scopt_pending, skip=clipped_this_step
                 )
+            if crct_enabled:
+                if _apply_plasticity_budget_payload(
+                    optimizer=optimizer,
+                    payload=crct_payload,
+                    strength=float(crct_plasticity_budget_strength),
+                ):
+                    plasticity_budget_payloads_applied += 1
+                elif crct_payload is not None:
+                    plasticity_budget_payloads_missing += 1
             optimizer.step()
             if predictive_aux_optimizer is not None:
                 predictive_aux_optimizer.step()
@@ -9591,6 +9821,13 @@ def train_fast_for_budget(
                 if crct_scarcity is not None
                 else 0.0
             ),
+            "plasticity_budget_strength": float(crct_plasticity_budget_strength),
+            "plasticity_budget_payloads_applied": int(
+                plasticity_budget_payloads_applied
+            ),
+            "plasticity_budget_payloads_missing": int(
+                plasticity_budget_payloads_missing
+            ),
             "memory_slots": int(len(getattr(model.outer_model, "_slots", []))),
             "replay_eviction": (
                 replay_eviction_loop.diagnostics()
@@ -9808,6 +10045,24 @@ def train_fast_for_budget(
                 ),
                 "fast_slow_slow_mirror_version_lag_steps": int(
                     mem.get("fast_slow_slow_mirror_version_lag_steps", 0)
+                ),
+                "plasticity_packets_sent": int(
+                    mem.get("plasticity_packets_sent", 0)
+                ),
+                "plasticity_packets_received": int(
+                    coord.get("plasticity_packets_received", 0)
+                ),
+                "plasticity_budget_mean_received": float(
+                    coord.get("plasticity_budget_mean_received", 0.0)
+                ),
+                "plasticity_budget_max_received": float(
+                    coord.get("plasticity_budget_max_received", 0.0)
+                ),
+                "plasticity_confidence_mean_received": float(
+                    coord.get("plasticity_confidence_mean_received", 0.0)
+                ),
+                "plasticity_lag_steps_max": int(
+                    coord.get("plasticity_lag_steps_max", 0)
                 ),
             }
     timing = summarize_train_timing(
@@ -10036,6 +10291,15 @@ def train_fast_for_budget(
                 "teacher_requests": int(crct_teacher_requests),
                 "teacher_payloads": int(crct_teacher_payloads),
                 "teacher_fail_open": int(crct_teacher_fail_open),
+                "plasticity_budget_strength": float(
+                    crct_plasticity_budget_strength
+                ),
+                "plasticity_budget_payloads_applied": int(
+                    plasticity_budget_payloads_applied
+                ),
+                "plasticity_budget_payloads_missing": int(
+                    plasticity_budget_payloads_missing
+                ),
                 "transport_summary": crct_transport_summary,
                 "rank_diagnostics": crct_rank_diagnostics,
                 "read_price": (
@@ -10230,6 +10494,9 @@ def _warmup(
         crct_dual_lr=float(config.get("crct_dual_lr", 0.01)),
         crct_ema_beta=float(config.get("crct_ema_beta", 0.95)),
         crct_max_price=float(config.get("crct_max_price", 0.50)),
+        crct_plasticity_budget_strength=float(
+            config.get("crct_plasticity_budget_strength", 0.25)
+        ),
         crct_memory_write_tokens_per_step=int(
             config.get("crct_memory_write_tokens_per_step", 256)
         ),
@@ -10837,6 +11104,9 @@ def run_condition(
         crct_dual_lr=float(config.get("crct_dual_lr", 0.01)),
         crct_ema_beta=float(config.get("crct_ema_beta", 0.95)),
         crct_max_price=float(config.get("crct_max_price", 0.50)),
+        crct_plasticity_budget_strength=float(
+            config.get("crct_plasticity_budget_strength", 0.25)
+        ),
         crct_memory_write_tokens_per_step=int(
             config.get("crct_memory_write_tokens_per_step", 256)
         ),

@@ -113,6 +113,7 @@ def _crct_lock() -> dict[str, Any]:
         "crct_dual_lr": 0.01,
         "crct_ema_beta": 0.95,
         "crct_max_price": 0.50,
+        "crct_plasticity_budget_strength": 0.25,
         "crct_memory_write_tokens_per_step": 128,
         "crct_async_teacher_transport": True,
         "crct_async_teacher_transport_backend": "mailbox",
