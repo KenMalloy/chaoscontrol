@@ -103,7 +103,7 @@ class TransactionalWakeCache:
         """Reserve committed memory event ids for an external slot writer.
 
         ``rank3_score_batch_causal`` writes model memory through
-        ``ChaosStudentLM.append_memory_from_hidden`` rather than through
+        ``CareStudentLM.append_memory_from_hidden`` rather than through
         ``WakeCache`` itself.  Reserving ids from the same clock keeps the
         model-side slot MVCC and the cache-side transaction cutoff on one
         monotone timeline.

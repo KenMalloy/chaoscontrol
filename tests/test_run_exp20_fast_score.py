@@ -67,9 +67,9 @@ def tiny_fixture(tmp_path: Path) -> dict[str, Path]:
         for doc in docs:
             fh.write(json.dumps({"text": doc}) + "\n")
 
-    from chaoscontrol.model import ChaosStudentLM
+    from chaoscontrol.model import CareStudentLM
 
-    model = ChaosStudentLM(
+    model = CareStudentLM(
         vocab_size=64,
         dim=16,
         num_layers=2,
@@ -353,9 +353,9 @@ def test_batched_boundary_targets_match_direct_chunked_model_score(
 
 
 def test_fast_score_rejects_online_replay_eviction_checkpoint(tmp_path: Path) -> None:
-    from chaoscontrol.model import ChaosStudentLM
+    from chaoscontrol.model import CareStudentLM
 
-    model = ChaosStudentLM(
+    model = CareStudentLM(
         vocab_size=32,
         dim=8,
         num_layers=1,

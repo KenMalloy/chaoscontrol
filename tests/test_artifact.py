@@ -10,7 +10,7 @@ import torch
 import torch.nn.functional as F
 
 from chaoscontrol.config import ChaosControlConfig
-from chaoscontrol.model import ChaosStudentLM
+from chaoscontrol.model import CareStudentLM
 from chaoscontrol.memory import MultiSlotOuterModel
 from chaoscontrol.artifact import serialize_artifact, load_artifact
 from chaoscontrol.replay_eviction import ReplayEvictionLoop
@@ -34,9 +34,9 @@ def _make_tiny_config(**overrides) -> ChaosControlConfig:
     return ChaosControlConfig(**defaults)
 
 
-def _build_tiny_model(config: ChaosControlConfig) -> ChaosStudentLM:
+def _build_tiny_model(config: ChaosControlConfig) -> CareStudentLM:
     """Instantiate a small model from config on CPU."""
-    return ChaosStudentLM(
+    return CareStudentLM(
         vocab_size=config.vocab_size,
         dim=config.model_dim,
         num_layers=config.num_layers,

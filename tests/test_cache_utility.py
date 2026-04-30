@@ -31,7 +31,7 @@ from chaoscontrol.cache_utility import (
     positive_only_lm_weight,
     rank3_score_batch_causal,
 )
-from chaoscontrol.model import ChaosStudentLM
+from chaoscontrol.model import CareStudentLM
 from chaoscontrol.wake_cache_txn import TransactionalWakeCache
 
 
@@ -828,7 +828,7 @@ class TestRank3ScoreBatchCausal:
 
     def test_update_model_memory_writes_slots_newer_than_oracle_cutoff(self) -> None:
         torch.manual_seed(17)
-        model = ChaosStudentLM(
+        model = CareStudentLM(
             vocab_size=64,
             dim=8,
             num_layers=1,

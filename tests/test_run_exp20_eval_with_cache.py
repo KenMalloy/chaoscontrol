@@ -48,11 +48,11 @@ def test_run_config_exposes_episodic_cache_fields():
 
 def _make_tiny_corpus_and_ckpt(tmp_path: Path, *, with_cache: bool = False):
     """Stand up a 1-doc-per-line JSONL, a SP model trained on it, and a
-    tiny ChaosStudentLM checkpoint. Returns (jsonl, sp_model_path, ckpt_path).
+    tiny CareStudentLM checkpoint. Returns (jsonl, sp_model_path, ckpt_path).
     Saves ``episodic_cache`` into the checkpoint when ``with_cache=True``.
     """
     import sentencepiece as spm
-    from chaoscontrol.model import ChaosStudentLM
+    from chaoscontrol.model import CareStudentLM
     from chaoscontrol.optim.episodic_cache import EpisodicCache
 
     corpus = tmp_path / "corpus.txt"
@@ -74,7 +74,7 @@ def _make_tiny_corpus_and_ckpt(tmp_path: Path, *, with_cache: bool = False):
         ]:
             fh.write(json.dumps({"text": t}) + "\n")
 
-    m = ChaosStudentLM(
+    m = CareStudentLM(
         vocab_size=64, dim=16, num_layers=2,
         block_type="ssm", a_mode="diag",
     )

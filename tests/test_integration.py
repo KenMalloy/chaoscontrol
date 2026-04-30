@@ -1,7 +1,7 @@
 """Integration smoke test: all new features enabled simultaneously."""
 import unittest
 import torch
-from chaoscontrol.model import ChaosStudentLM
+from chaoscontrol.model import CareStudentLM
 from chaoscontrol.training import train_chaoscontrol_for_budget
 from chaoscontrol.evaluation import evaluate_chaoscontrol_bpb
 from chaoscontrol.data import build_lm_starts, choose_eval_starts
@@ -12,7 +12,7 @@ class TestFullStackIntegration(unittest.TestCase):
 
     def test_full_stack_trains_and_evals(self):
         torch.manual_seed(42)
-        model = ChaosStudentLM(
+        model = CareStudentLM(
             vocab_size=256, dim=32, num_layers=2, ff_mult=2,
             a_mode="diag",
             rich_b_mode="nn", rich_b_bottleneck=16,
@@ -88,7 +88,7 @@ class TestFullStackIntegration(unittest.TestCase):
     def test_step_interface_matches_forward_with_features(self):
         """step() should work on a model with Wernicke and memory."""
         torch.manual_seed(42)
-        model = ChaosStudentLM(
+        model = CareStudentLM(
             vocab_size=256, dim=32, num_layers=2,
             a_mode="diag",
             outer_model_dim=16, outer_model_type="multislot",
@@ -111,7 +111,7 @@ class TestFullStackIntegration(unittest.TestCase):
         """evaluate_chaoscontrol_bpb must dispatch to the correct gate
         function based on metabolic_mode and always produce bpb_gated."""
         torch.manual_seed(42)
-        model = ChaosStudentLM(
+        model = CareStudentLM(
             vocab_size=256, dim=32, num_layers=2, ff_mult=2,
             a_mode="diag",
             outer_model_dim=16, outer_model_type="multislot",
@@ -158,7 +158,7 @@ class TestFullStackIntegration(unittest.TestCase):
         """After training with CFR enabled, the regret table should have
         non-zero entries and at least one bucket with a non-uniform strategy."""
         torch.manual_seed(42)
-        model = ChaosStudentLM(
+        model = CareStudentLM(
             vocab_size=256, dim=32, num_layers=2, ff_mult=2,
             a_mode="diag",
             rich_b_mode="nn", rich_b_bottleneck=16,
@@ -226,7 +226,7 @@ class TestFullStackIntegration(unittest.TestCase):
 
 
     def test_tokenizer_training_integration(self):
-        """FixedStrideTokenizer + ChaosStudentLM: 5 training steps,
+        """FixedStrideTokenizer + CareStudentLM: 5 training steps,
         verify loss decreases and commit_loss/recon_loss are logged."""
         from chaoscontrol.tokenizer import FixedStrideTokenizer
 
@@ -246,7 +246,7 @@ class TestFullStackIntegration(unittest.TestCase):
         )
 
         # Model vocab_size = codebook_size (matches VQ token IDs)
-        model = ChaosStudentLM(
+        model = CareStudentLM(
             vocab_size=codebook_size, dim=model_dim, num_layers=2, ff_mult=2,
             a_mode="diag",
         )

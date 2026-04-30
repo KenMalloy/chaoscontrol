@@ -17,7 +17,7 @@ SRC = REPO / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from chaoscontrol.model import ChaosStudentLM
+from chaoscontrol.model import CareStudentLM
 
 
 MEASURED_DIM256_COMPRESSED_BYTES = 7_375_816
@@ -46,8 +46,8 @@ def build_crct_model(
     vocab_size: int,
     num_layers: int,
     ff_mult: int,
-) -> ChaosStudentLM:
-    return ChaosStudentLM(
+) -> CareStudentLM:
+    return CareStudentLM(
         vocab_size=vocab_size,
         dim=dim,
         num_layers=num_layers,

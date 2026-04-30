@@ -1,14 +1,14 @@
 """Modded-NanoGPT-style lean transformer variant for Exp 21 ablations.
 
 Kept separate from ``baselines.SimpleTransformerLM`` to avoid perturbing
-existing callers (which duck-type the latter into ``ChaosStudentLM``'s
+existing callers (which duck-type the latter into ``CareStudentLM``'s
 ``outer_model``/``wernicke``/``semantic_tier`` slots). This module implements
 the 4-cell ablation's A/B cell: d_model=256, n_head=4, n_layer=8, ff_mult=4,
 RoPE + RMSNorm + ReLU^2 + SDPA (Flash-Attn backend) + QK-norm; no auxiliary
 embeddings; untied embed/LM-head.
 
 RoPE math is inlined to keep the variant self-contained — importing
-``ChaosAttentionBlock.apply_rope`` would pull ``model.py``'s full SSM import
+``AttentionControlBlock.apply_rope`` would pull ``model.py``'s full SSM import
 chain for a five-line helper. The rotation math here is byte-identical to
 ``src/chaoscontrol/model.py:354`` (interleaved-pair RoFormer form), and the
 cos/sin cache build mirrors ``model.py:339-352``.
@@ -167,7 +167,7 @@ class NanoGPTLeanLM(nn.Module):
             persistent=False,
         )
 
-        # Duck-typing compatibility with ChaosStudentLM for shared train/eval
+        # Duck-typing compatibility with CareStudentLM for shared train/eval
         # loop (matches SimpleTransformerLM's hooks).
         self.outer_model = None
         self.wernicke = None
@@ -190,7 +190,7 @@ class NanoGPTLeanLM(nn.Module):
         ``torch.utils.checkpoint`` (``use_reentrant=False``) so activations
         are recomputed in backward. Peak memory drops by ~n_layer× at the
         cost of one extra forward per block in backward. Follows the
-        ``ChaosStudentLM`` pattern at ``model.py:1080`` — same flag, same
+        ``CareStudentLM`` pattern at ``model.py:1080`` — same flag, same
         checkpoint call shape, same ``use_reentrant=False`` policy.
         """
         T = input_ids.shape[1]

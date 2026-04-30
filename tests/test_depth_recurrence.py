@@ -1,4 +1,4 @@
-"""Tests for weight-tied depth recurrence in ChaosStudentLM.
+"""Tests for weight-tied depth recurrence in CareStudentLM.
 
 Exp 19 Phase 1 architectural lever. Depth recurrence runs a contiguous shared
 group of physical layers N times in the forward pass without duplicating
@@ -12,10 +12,10 @@ import unittest
 import torch
 import torch.nn.functional as F
 
-from chaoscontrol.model import ChaosStudentLM
+from chaoscontrol.model import CareStudentLM
 
 
-def _make_model(**overrides) -> ChaosStudentLM:
+def _make_model(**overrides) -> CareStudentLM:
     kwargs = dict(
         vocab_size=64,
         dim=16,
@@ -26,7 +26,7 @@ def _make_model(**overrides) -> ChaosStudentLM:
         outer_model_dim=0,
     )
     kwargs.update(overrides)
-    return ChaosStudentLM(**kwargs)
+    return CareStudentLM(**kwargs)
 
 
 class TestDepthRecurrenceParity(unittest.TestCase):
@@ -328,7 +328,7 @@ class TestDepthRecurrenceStepGuards(unittest.TestCase):
     silent quality drop during rollout.
     """
 
-    def _make_recurrent_model(self, count: int) -> ChaosStudentLM:
+    def _make_recurrent_model(self, count: int) -> CareStudentLM:
         torch.manual_seed(0)
         return _make_model(
             depth_recurrence_shared_layers=[1, 2],

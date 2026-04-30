@@ -108,7 +108,7 @@ class SleepCycle:
 
         Parameters
         ----------
-        model : ChaosStudentLM
+        model : CareStudentLM
             The model to consolidate.  Must have ``outer_model`` (MultiSlotOuterModel),
             and optionally ``wernicke``, ``semantic_tier``, ``typed_storage``.
         cache : WakeCache

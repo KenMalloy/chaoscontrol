@@ -36,29 +36,29 @@ Design notes:
   toolchain, mismatched CUDA/toolchain, etc.) without making
   import-time behavior brittle.
 
-- `FusedChaosSSMBlock` is a **drop-in replacement** for
-  `ChaosSSMBlock` when `a_mode == "diag"`, `rich_b_mode == "none"`, and
+- `FusedCareSSMBlock` is a **drop-in replacement** for
+  `CareSSMBlock` when `a_mode == "diag"`, `rich_b_mode == "none"`, and
   `return_jacobian_stats` is False. Any other configuration falls back
-  to the unfused `ChaosSSMBlock.forward` path.
+  to the unfused `CareSSMBlock.forward` path.
 
-- `FusedChaosSSMBlock.from_unfused(block)` copies weights from a
-  canonical `ChaosSSMBlock`, keeping the same parameter names and
+- `FusedCareSSMBlock.from_unfused(block)` copies weights from a
+  canonical `CareSSMBlock`, keeping the same parameter names and
   submodule layout so that state_dict round-trip is bit-exact. This
   makes the parity test clean.
 
-- This module does NOT touch `ChaosSSMCore.forward` or the chunked
+- This module does NOT touch `CareSSMCore.forward` or the chunked
   scan backend — both are validated by their own tests
   (`tests/test_core.py`). The fused path wraps the scan as an opaque
   primitive, consuming only its output tensor.
 
 Limitations / follow-ups:
 
-- No `step()` method. The unfused `ChaosSSMBlock.step()` is used for
+- No `step()` method. The unfused `CareSSMBlock.step()` is used for
   single-token autoregressive inference (MCTS rollout, sampling).
-  FusedChaosSSMBlock targets the training forward pass only, where the
+  FusedCareSSMBlock targets the training forward pass only, where the
   post-scan block cost is visible in tok/s. Single-token inference
-  should continue to use `ChaosSSMBlock` or a dedicated fused step
-  implementation — do NOT drop FusedChaosSSMBlock into an inference
+  should continue to use `CareSSMBlock` or a dedicated fused step
+  implementation — do NOT drop FusedCareSSMBlock into an inference
   path until a step method is added.
 
 - Maintenance coupling with `core.RMSNorm` and `core.FeedForward`.
@@ -80,7 +80,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from chaoscontrol.core import ChaosSSMCore, FeedForward, RMSNorm
+from chaoscontrol.core import CareSSMCore, FeedForward, RMSNorm
 
 
 def _post_scan_fused_eager(
@@ -105,12 +105,12 @@ def _post_scan_fused_eager(
     emits one or two fused kernels instead of the 5-6 unfused launches.
 
     All operations are written to route exactly through the same PyTorch
-    primitives as the eager `ChaosSSMBlock.forward` to guarantee autograd
+    primitives as the eager `CareSSMBlock.forward` to guarantee autograd
     and numerical parity.
 
     Args:
         x_pre_residual: (B, T, D) — block input before residual add.
-        scan_out: (B, T, D) — ChaosSSMCore diag-scan output.
+        scan_out: (B, T, D) — CareSSMCore diag-scan output.
         ff_norm_weight: (D,) — RMSNorm scale parameter for the FF norm.
         ff_norm_eps: RMSNorm epsilon (scalar).
         ff_fc_weight: (D * ff_mult, D) — FeedForward.fc.weight.
@@ -172,7 +172,7 @@ def _resolve_post_scan_impl() -> Any:
         return _post_scan_impl
 
     # Default: torch.compile. We don't use mode="reduce-overhead" (CUDA
-    # graphs) here because the surrounding ChaosSSMCore scan already
+    # graphs) here because the surrounding CareSSMCore scan already
     # synchronizes and sizes the activation batches — cudagraphs tend to
     # conflict with dynamic batch shapes that training uses. Default mode
     # still gets the Inductor elementwise fusion.
@@ -257,10 +257,10 @@ def post_scan_fused(
         )
 
 
-class FusedChaosSSMBlock(nn.Module):
-    """Kernel-fused variant of ChaosSSMBlock.
+class FusedCareSSMBlock(nn.Module):
+    """Kernel-fused variant of CareSSMBlock.
 
-    Structure and parameter naming are identical to `ChaosSSMBlock` so
+    Structure and parameter naming are identical to `CareSSMBlock` so
     state_dicts round-trip. The only difference is the forward pass:
     the post-scan residual + RMSNorm + FF + residual chain runs through
     `post_scan_fused`, which torch.compile fuses into 1-2 kernels
@@ -272,7 +272,7 @@ class FusedChaosSSMBlock(nn.Module):
         - return_jacobian_stats is False
 
     In every other configuration `forward` dispatches to the same
-    eager code path as `ChaosSSMBlock`, so the fused block is a
+    eager code path as `CareSSMBlock`, so the fused block is a
     safe drop-in for any config — correctness is preserved even in
     cases where fusion isn't available.
     """
@@ -288,12 +288,12 @@ class FusedChaosSSMBlock(nn.Module):
         ssm_delta_rank: int = 0,
     ) -> None:
         super().__init__()
-        # Names match ChaosSSMBlock so from_unfused() can copy weights
+        # Names match CareSSMBlock so from_unfused() can copy weights
         # without any remapping.
         self.input_norm = RMSNorm(dim)
         self.ff_norm = RMSNorm(dim)
         self.ff = FeedForward(dim, ff_mult)
-        self.core = ChaosSSMCore(
+        self.core = CareSSMCore(
             dim,
             a_mode=a_mode,
             a_full_rank=a_full_rank,
@@ -304,8 +304,8 @@ class FusedChaosSSMBlock(nn.Module):
         self._a_mode = a_mode
 
     @classmethod
-    def from_unfused(cls, block: nn.Module) -> "FusedChaosSSMBlock":
-        """Build a fused block by copying weights from an unfused ChaosSSMBlock.
+    def from_unfused(cls, block: nn.Module) -> "FusedCareSSMBlock":
+        """Build a fused block by copying weights from an unfused CareSSMBlock.
 
         Matches the source block's parameter dtype exactly, so bf16 source
         blocks produce bf16 fused blocks. This is critical for bf16 parity
@@ -319,11 +319,11 @@ class FusedChaosSSMBlock(nn.Module):
         core = block.core
         if core.a_mode != "diag":
             raise ValueError(
-                f"FusedChaosSSMBlock.from_unfused requires a_mode='diag', got {core.a_mode!r}"
+                f"FusedCareSSMBlock.from_unfused requires a_mode='diag', got {core.a_mode!r}"
             )
         if block.rich_b is not None:
             raise ValueError(
-                "FusedChaosSSMBlock.from_unfused requires rich_b=None"
+                "FusedCareSSMBlock.from_unfused requires rich_b=None"
             )
         dim = core.dim
         ff_mult = block.ff.fc.out_features // dim
@@ -349,7 +349,7 @@ class FusedChaosSSMBlock(nn.Module):
         return_final_state: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, ...]:
         # Unsupported configurations fall back to the unfused path. This
-        # keeps FusedChaosSSMBlock behaviorally identical to ChaosSSMBlock
+        # keeps FusedCareSSMBlock behaviorally identical to CareSSMBlock
         # for all inputs; fusion is strictly a fast path.
         # Non-zero initial_state forces the unfused path because the fused
         # kernel reuses the core fast scan which cannot seed a carry. Zero
@@ -364,10 +364,10 @@ class FusedChaosSSMBlock(nn.Module):
                 return_final_state=return_final_state,
             )
 
-        # 1) Input norm — identical to ChaosSSMBlock.
+        # 1) Input norm — identical to CareSSMBlock.
         normed = self.input_norm(x)
 
-        # 2) ChaosSSMCore diag scan — untouched, delegates to core.forward.
+        # 2) CareSSMCore diag scan — untouched, delegates to core.forward.
         if return_final_state:
             scan_out, final_state = self.core(
                 normed, rich_b=None, return_jacobian_stats=False,
@@ -398,7 +398,7 @@ class FusedChaosSSMBlock(nn.Module):
         initial_state: torch.Tensor | None = None,
         return_final_state: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, ...]:
-        """Fallback path matching ChaosSSMBlock.forward byte-for-byte."""
+        """Fallback path matching CareSSMBlock.forward byte-for-byte."""
         normed = self.input_norm(x)
         result = self.core(
             normed, rich_b=self.rich_b,

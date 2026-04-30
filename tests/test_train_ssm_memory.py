@@ -22,7 +22,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from chaoscontrol.model import ChaosStudentLM
+from chaoscontrol.model import CareStudentLM
 from chaoscontrol.train_ssm import train_ssm_step
 
 
@@ -56,7 +56,7 @@ class TestTrainSSMMemoryWin:
         device = torch.device("cuda")
 
         torch.manual_seed(2026)
-        model = ChaosStudentLM(**SUBMISSION_REGIME).to(device=device, dtype=torch.bfloat16)
+        model = CareStudentLM(**SUBMISSION_REGIME).to(device=device, dtype=torch.bfloat16)
         model.train()
 
         # Deterministic inputs matching the OOM regime exactly.

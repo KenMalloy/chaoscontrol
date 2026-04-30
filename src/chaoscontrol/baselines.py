@@ -18,7 +18,7 @@ class SimpleTransformerLM(nn.Module):
         ])
         self.final_norm = RMSNorm(dim)
         self.lm_head = nn.Linear(dim, vocab_size, bias=False)
-        # Duck-typing compatibility with ChaosStudentLM for shared train/eval
+        # Duck-typing compatibility with CareStudentLM for shared train/eval
         self.outer_model = None
         self.wernicke = None
         self.wernicke_balance_weight = 0.0
@@ -111,7 +111,7 @@ class Mamba2LM(nn.Module):
         self.final_norm = RMSNorm(dim)
         self.lm_head = nn.Linear(dim, vocab_size, bias=False)
 
-        # Duck-typing compatibility with ChaosStudentLM for shared train/eval
+        # Duck-typing compatibility with CareStudentLM for shared train/eval
         self.outer_model = None
         self.wernicke = None
         self.wernicke_balance_weight = 0.0

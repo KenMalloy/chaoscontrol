@@ -1,7 +1,7 @@
 """Tests for the DDP integration in chaoscontrol.training.
 
 These tests deliberately avoid any GPU requirement — the DDP path is
-exercised on CPU with the gloo backend. A small bare ``ChaosStudentLM`` is
+exercised on CPU with the gloo backend. A small bare ``CareStudentLM`` is
 used throughout so the model construction is cheap and the spawn overhead
 dominates the test time instead of compute.
 
@@ -22,7 +22,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 from chaoscontrol.core import verify_diag_recurrence
-from chaoscontrol.model import ChaosStudentLM
+from chaoscontrol.model import CareStudentLM
 from chaoscontrol.training import train_chaoscontrol_for_budget
 
 # Pre-warm the diag recurrence backend at import time so the first test's
@@ -67,10 +67,10 @@ N_TRAIN_TOKENS = 1024
 TRAIN_STARTS = list(range(0, 800, 8))  # 100 starts — safe for ws <= 4
 
 
-def _build_model(seed: int) -> ChaosStudentLM:
+def _build_model(seed: int) -> CareStudentLM:
     """Deterministic model construction under a fixed seed."""
     torch.manual_seed(seed)
-    return ChaosStudentLM(**MODEL_KWARGS)
+    return CareStudentLM(**MODEL_KWARGS)
 
 
 def _build_tokens(seed: int) -> torch.Tensor:
@@ -79,7 +79,7 @@ def _build_tokens(seed: int) -> torch.Tensor:
 
 
 def _train_fixed_steps(
-    model: ChaosStudentLM,
+    model: CareStudentLM,
     tokens: torch.Tensor,
     *,
     seed: int,

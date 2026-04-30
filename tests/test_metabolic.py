@@ -1,6 +1,6 @@
 """Tests for metabolic_fork scoring modes.
 
-Integration tests with ChaosStudentLM will be added once model.py is
+Integration tests with CareStudentLM will be added once model.py is
 extracted (Task 9).  For now we use a lightweight mock model.
 """
 from __future__ import annotations
@@ -16,7 +16,7 @@ import torch.nn as nn
 # ---------------------------------------------------------------------------
 
 class _MockModel(nn.Module):
-    """Minimal stand-in for ChaosStudentLM with the five attributes
+    """Minimal stand-in for CareStudentLM with the five attributes
     metabolic_fork accesses: embed, outer_model, layers, final_norm, lm_head.
     """
 

@@ -1,11 +1,11 @@
-"""ChaosSSMBlock, ChaosSSMHybridBlock, ChaosAttentionBlock and ChaosStudentLM — full model assembly.
+"""CareSSMBlock, CareSSMHybridBlock, AttentionControlBlock and CareStudentLM — full model assembly.
 
-ChaosAttentionBlock is a scientific control for Exp 19 Phase 2: it provides a
-causal-attention sibling to ChaosSSMBlock sharing the same block interface so
-an apples-to-apples comparison can be run inside a single ChaosStudentLM via
+AttentionControlBlock is a scientific control for Exp 19 Phase 2: it provides a
+causal-attention sibling to CareSSMBlock sharing the same block interface so
+an apples-to-apples comparison can be run inside a single CareStudentLM via
 the ``block_type`` constructor flag. It is not a submission candidate and
 does not participate in the hybrid SSM+local-attention path used by
-ChaosSSMHybridBlock — the two are independent choices.
+CareSSMHybridBlock — the two are independent choices.
 """
 from __future__ import annotations
 
@@ -16,7 +16,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint as _checkpoint
 
-from chaoscontrol.core import RMSNorm, FeedForward, ChaosSSMCore
+from chaoscontrol.core import RMSNorm, FeedForward, CareSSMCore
 from chaoscontrol.local_attn import LocalAttention, RollingKVCache
 from chaoscontrol.routing import RichBNN, DistributedB
 from chaoscontrol.memory import OuterModel, MultiSlotOuterModel, SemanticTier, BucketPrototypes
@@ -24,8 +24,8 @@ from chaoscontrol.posterior import GlobalDelta, BucketDelta, ResidualCache
 from chaoscontrol.wernicke import WernickeLayer, HierarchicalWernicke
 
 
-class ChaosSSMBlock(nn.Module):
-    """Single block: input_norm -> ChaosSSMCore (with optional rich_b) -> residual -> ff_norm -> FeedForward -> residual."""
+class CareSSMBlock(nn.Module):
+    """Single block: input_norm -> CareSSMCore (with optional rich_b) -> residual -> ff_norm -> FeedForward -> residual."""
 
     def __init__(
         self,
@@ -45,7 +45,7 @@ class ChaosSSMBlock(nn.Module):
         self.input_norm = RMSNorm(dim)
         self.ff_norm = RMSNorm(dim)
         self.ff = FeedForward(dim, ff_mult)
-        self.core = ChaosSSMCore(
+        self.core = CareSSMCore(
             dim,
             a_mode=a_mode,
             a_full_rank=a_full_rank,
@@ -96,11 +96,11 @@ class ChaosSSMBlock(nn.Module):
         initial_state: torch.Tensor | None = None,
         return_final_state: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, ...]:
-        """Sequence forward. See ChaosSSMCore.forward for state-threading semantics.
+        """Sequence forward. See CareSSMCore.forward for state-threading semantics.
 
         The block's residual + FF chain is unchanged regardless of the state
         kwargs — only the recurrence is seeded, and ``final_state`` is plumbed
-        out so ChaosStudentLM can assemble a per-block list.
+        out so CareStudentLM can assemble a per-block list.
 
         Returns:
             x                                     (both False)
@@ -140,7 +140,7 @@ class ChaosSSMBlock(nn.Module):
         return x
 
 
-class ChaosSSMHybridBlock(nn.Module):
+class CareSSMHybridBlock(nn.Module):
     """SSM block with local attention sidecar.
 
     Structure: input_norm -> SSM -> local_attn (gated) -> ff_norm -> FF -> residual.
@@ -167,11 +167,11 @@ class ChaosSSMHybridBlock(nn.Module):
         self.input_norm = RMSNorm(dim)
         self.ff_norm = RMSNorm(dim)
         self.ff = FeedForward(dim, ff_mult)
-        self.core = ChaosSSMCore(
+        self.core = CareSSMCore(
             dim, a_mode=a_mode, a_full_rank=a_full_rank,
             a_full_gamma=a_full_gamma, delta_rank=ssm_delta_rank,
         )
-        self.rich_b = None  # compatibility with ChaosSSMBlock
+        self.rich_b = None  # compatibility with CareSSMBlock
 
         # Attention sidecar (local window, top-k selective, or top-k random control)
         self.local_attn_window = local_attn_window
@@ -226,14 +226,14 @@ class ChaosSSMHybridBlock(nn.Module):
 
         SSM runs the compiled diag scan over the full sequence, then local
         attention is computed as a parallel causal sliding-window operation.
-        No sequential Python loop — matches pure ChaosSSMBlock throughput
+        No sequential Python loop — matches pure CareSSMBlock throughput
         plus a small attention matmul overhead.
 
         The step() method with RollingKVCache is still available for
         autoregressive inference.
 
         ``initial_state`` and ``return_final_state`` thread through to
-        ``ChaosSSMCore.forward`` identically to ``ChaosSSMBlock``. The
+        ``CareSSMCore.forward`` identically to ``CareSSMBlock``. The
         local-attention sidecar is stateless across forward calls here
         (KV cache lives only in the step() path via RollingKVCache), so
         the final_state is the SSM core's final state only.
@@ -278,19 +278,19 @@ class ChaosSSMHybridBlock(nn.Module):
         return y
 
 
-class ChaosAttentionBlock(nn.Module):
-    """Causal multi-head self-attention sibling to ChaosSSMBlock.
+class AttentionControlBlock(nn.Module):
+    """Causal multi-head self-attention sibling to CareSSMBlock.
 
     Scientific control for Exp 19 Phase 2's "SSM vs Attention under equal
     infrastructure" comparison. Not a submission candidate and NOT related to
-    ChaosSSMHybridBlock's local-attention sidecar — this is pure attention,
+    CareSSMHybridBlock's local-attention sidecar — this is pure attention,
     used when the whole model runs as a transformer for the controlled
     comparison against the pure-SSM path.
 
-    Matches ChaosSSMBlock's block interface exactly so the two can be swapped
-    in ChaosStudentLM via the ``block_type`` constructor flag.
+    Matches CareSSMBlock's block interface exactly so the two can be swapped
+    in CareStudentLM via the ``block_type`` constructor flag.
 
-    Architecture (mirrors ChaosSSMBlock's pre-norm + two-residual shape):
+    Architecture (mirrors CareSSMBlock's pre-norm + two-residual shape):
       - input_norm (RMSNorm) -> Q/K/V projection -> RoPE on Q/K -> causal SDPA
         -> out_proj -> residual
       - ff_norm (RMSNorm) -> FeedForward -> residual
@@ -304,7 +304,7 @@ class ChaosAttentionBlock(nn.Module):
     2021) applied to Q and K only (not V). Parameter-free — cos/sin tables
     are derived from position indices and a base constant (10000) and stored
     as non-persistent buffers so checkpoints are unaffected. This matches the
-    way ChaosSSMBlock's SSM recurrence gets position "for free" from the
+    way CareSSMBlock's SSM recurrence gets position "for free" from the
     state-transition dynamics: no learned positional parameters enter the
     comparison on either side. Rationale: without any position signal,
     self-attention is permutation-equivariant (modulo the causal mask),
@@ -323,7 +323,7 @@ class ChaosAttentionBlock(nn.Module):
     registered with ``persistent=False`` and do not show up in
     ``sum(p.numel() for p in block.parameters())`` or in the state_dict.
 
-    This is ~1 * dim^2 FEWER params than ChaosSSMBlock's core (which has
+    This is ~1 * dim^2 FEWER params than CareSSMBlock's core (which has
     in/select/gate/delta/out = 5 projections). Exp 19 Phase 2 compares
     per-token learning efficiency at matched block count, not matched
     per-block parameter count — the difference is documented honestly in
@@ -363,7 +363,7 @@ class ChaosAttentionBlock(nn.Module):
         self.ff_norm = RMSNorm(dim)
         self.ff = FeedForward(dim, ff_mult)
 
-        # Fused QKV projection matches the ChaosSSMCore convention of bias=False
+        # Fused QKV projection matches the CareSSMCore convention of bias=False
         # and keeps the per-block parameter footprint compact.
         self.qkv_proj = nn.Linear(dim, 3 * dim, bias=False)
         self.out_proj = nn.Linear(dim, dim, bias=False)
@@ -492,8 +492,8 @@ class ChaosAttentionBlock(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Single-token step through the block.
 
-        This interface exists so ChaosAttentionBlock is drop-in compatible with
-        ChaosSSMBlock in ChaosStudentLM.step() / dream_step(). Because single-
+        This interface exists so AttentionControlBlock is drop-in compatible with
+        CareSSMBlock in CareStudentLM.step() / dream_step(). Because single-
         token attention has no history (we intentionally do NOT maintain a KV
         cache — the task forbids hybrid SSM+attention paths here), this
         collapses to a pass through V + out_proj (the causal mask makes the
@@ -501,10 +501,10 @@ class ChaosAttentionBlock(nn.Module):
         weighted 1.0).
 
         The returned "new_state" is a zero tensor of the same shape as the
-        incoming state, preserving the shape contract that lets ChaosStudentLM
+        incoming state, preserving the shape contract that lets CareStudentLM
         iterate blocks uniformly. Attention has no cross-token state; this
         method is NOT valid for incremental decoding — it exists only so
-        ChaosStudentLM.step() / dream_step() do not crash when
+        CareStudentLM.step() / dream_step() do not crash when
         block_type="attention".
 
         Args:
@@ -534,17 +534,17 @@ class ChaosAttentionBlock(nn.Module):
         """Sequence forward pass. Shape: (batch, seq, dim) -> (batch, seq, dim).
 
         return_jacobian_stats is accepted for interface parity with
-        ChaosSSMBlock. Attention has no per-step Jacobian in the SSM sense, so
+        CareSSMBlock. Attention has no per-step Jacobian in the SSM sense, so
         we return dummy zero stats matching the SSM diag-mode contract (see
-        ChaosSSMCore.forward around the ``return_jacobian_stats`` branch).
+        CareSSMCore.forward around the ``return_jacobian_stats`` branch).
 
         ``initial_state`` / ``return_final_state`` are accepted for block
-        interface parity with ChaosSSMBlock. Attention has no cross-token
+        interface parity with CareSSMBlock. Attention has no cross-token
         recurrent state in this block (no KV cache threaded across forward
         calls — that lives in step()), so initial_state is ignored and
         final_state is returned as zeros of shape (batch, dim) to match the
         SSM contract. This mirrors the choice made in ``step()`` at line
-        458; it preserves uniform iteration in ChaosStudentLM without
+        458; it preserves uniform iteration in CareStudentLM without
         pretending attention has an SSM-shaped recurrent state.
         """
         normed = self.input_norm(x)
@@ -570,8 +570,8 @@ class ChaosAttentionBlock(nn.Module):
         return x
 
 
-class ChaosStudentLM(nn.Module):
-    """Full ChaosControl student language model wiring all components."""
+class CareStudentLM(nn.Module):
+    """CARE trunk language model wiring the diagonal SSM path plus optional tiers."""
 
     def __init__(
         self,
@@ -672,14 +672,14 @@ class ChaosStudentLM(nn.Module):
         self.block_type = block_type
         if block_type == "attention":
             # Pure-attention scientific control for Exp 19 Phase 2. All layers
-            # are ChaosAttentionBlock; local_attn_window / hybrid-SSM kwargs
+            # are AttentionControlBlock; local_attn_window / hybrid-SSM kwargs
             # are ignored in this path because the comparison is "full SSM
             # stack vs full attention stack", not "SSM with sidecar vs
             # attention with sidecar". If the comparison is ever widened, the
-            # ChaosSSMHybridBlock sidecar is still the right mechanism for
+            # CareSSMHybridBlock sidecar is still the right mechanism for
             # mixed configurations and should not be conflated with this flag.
             self.layers = nn.ModuleList([
-                ChaosAttentionBlock(
+                AttentionControlBlock(
                     dim,
                     ff_mult,
                     num_heads=attention_num_heads,
@@ -700,10 +700,10 @@ class ChaosStudentLM(nn.Module):
             )
             if local_attn_window > 0:
                 ssm_layers = [
-                    ChaosSSMBlock(dim, ff_mult, **ssm_block_kwargs)
+                    CareSSMBlock(dim, ff_mult, **ssm_block_kwargs)
                     for _ in range(num_layers - 1)
                 ]
-                hybrid_layer = ChaosSSMHybridBlock(
+                hybrid_layer = CareSSMHybridBlock(
                     dim, ff_mult,
                     a_mode=a_mode,
                     a_full_rank=a_full_rank,
@@ -718,7 +718,7 @@ class ChaosStudentLM(nn.Module):
                 self.layers = nn.ModuleList(ssm_layers + [hybrid_layer])
             else:
                 self.layers = nn.ModuleList([
-                    ChaosSSMBlock(dim, ff_mult, **ssm_block_kwargs)
+                    CareSSMBlock(dim, ff_mult, **ssm_block_kwargs)
                     for _ in range(num_layers)
                 ])
         else:
@@ -844,7 +844,7 @@ class ChaosStudentLM(nn.Module):
     def init_kv_caches(self) -> list[RollingKVCache | None]:
         """Initialize KV caches for hybrid blocks. Returns one entry per layer (None for pure SSM blocks)."""
         return [
-            layer._init_kv_cache() if isinstance(layer, ChaosSSMHybridBlock) else None
+            layer._init_kv_cache() if isinstance(layer, CareSSMHybridBlock) else None
             for layer in self.layers
         ]
 
@@ -888,7 +888,7 @@ class ChaosStudentLM(nn.Module):
         # rollout runs a different architecture than training did.
         if self.depth_recurrence_count > 1:
             raise NotImplementedError(
-                "ChaosStudentLM.step() does not implement depth recurrence. "
+                "CareStudentLM.step() does not implement depth recurrence. "
                 f"depth_recurrence_count={self.depth_recurrence_count} is set, "
                 "but step() iterates physical layers once — calling it would "
                 "silently run a shallower model than forward(). Use forward() "
@@ -902,7 +902,7 @@ class ChaosStudentLM(nn.Module):
             kv_caches = [None] * len(self.layers)
         new_states = []
         for i, layer in enumerate(self.layers):
-            if isinstance(layer, ChaosSSMHybridBlock):
+            if isinstance(layer, CareSSMHybridBlock):
                 if kv_caches[i] is None:
                     raise RuntimeError(
                         f"Layer {i} is a hybrid block but no KV cache provided. "
@@ -950,7 +950,7 @@ class ChaosStudentLM(nn.Module):
         # shallower model than forward() trained.
         if self.depth_recurrence_count > 1:
             raise NotImplementedError(
-                "ChaosStudentLM.dream_step() does not implement depth recurrence. "
+                "CareStudentLM.dream_step() does not implement depth recurrence. "
                 f"depth_recurrence_count={self.depth_recurrence_count} is set, "
                 "but dream_step() iterates physical layers once — calling it would "
                 "silently run a shallower model than forward(). Use forward() "
@@ -979,12 +979,12 @@ class ChaosStudentLM(nn.Module):
         if self.semantic_tier is not None:
             x = x + self.semantic_tier.read(x.size(0))
 
-        # SSM recurrence — use ChaosSSMBlock.step()
+        # SSM recurrence — use CareSSMBlock.step()
         if kv_caches is None:
             kv_caches = [None] * len(self.layers)
         new_states = []
         for i, layer in enumerate(self.layers):
-            if isinstance(layer, ChaosSSMHybridBlock):
+            if isinstance(layer, CareSSMHybridBlock):
                 if kv_caches[i] is None:
                     raise RuntimeError(
                         f"Layer {i} is a hybrid block but no KV cache provided. "

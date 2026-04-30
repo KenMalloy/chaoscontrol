@@ -7,7 +7,7 @@ import torch
 import torch.nn.functional as F
 
 from chaoscontrol.config import ChaosControlConfig
-from chaoscontrol.model import ChaosStudentLM
+from chaoscontrol.model import CareStudentLM
 from chaoscontrol.metabolic import metabolic_fork
 from chaoscontrol.training import (
     build_chaoscontrol_matrix,
@@ -18,7 +18,7 @@ from chaoscontrol.training import (
 
 class TestTraining(unittest.TestCase):
     def test_train_runs(self) -> None:
-        model = ChaosStudentLM(
+        model = CareStudentLM(
             vocab_size=256, dim=16, num_layers=2, ff_mult=2,
             a_mode="diag", rich_b_mode="none", outer_model_dim=0,
         )
@@ -35,7 +35,7 @@ class TestTraining(unittest.TestCase):
         assert "history" in result
 
     def test_train_with_outer_model(self) -> None:
-        model = ChaosStudentLM(
+        model = CareStudentLM(
             vocab_size=256, dim=16, num_layers=2, ff_mult=2,
             a_mode="diag", rich_b_mode="none", outer_model_dim=32,
         )
@@ -61,9 +61,9 @@ class TestOptimizerSelection(unittest.TestCase):
     return value (not just inferred from side effects).
     """
 
-    def _build_model(self) -> ChaosStudentLM:
+    def _build_model(self) -> CareStudentLM:
         torch.manual_seed(0)
-        return ChaosStudentLM(
+        return CareStudentLM(
             vocab_size=64, dim=16, num_layers=2, ff_mult=2,
             a_mode="diag", rich_b_mode="none", outer_model_dim=0,
         )
@@ -137,7 +137,7 @@ class TestMatrixRunner(unittest.TestCase):
 
 class TestMetabolicGate(unittest.TestCase):
     def test_fork_produces_logits(self) -> None:
-        model = ChaosStudentLM(
+        model = CareStudentLM(
             vocab_size=256, dim=16, num_layers=2, ff_mult=2,
             a_mode="diag", rich_b_mode="none", outer_model_dim=0,
         )
@@ -146,7 +146,7 @@ class TestMetabolicGate(unittest.TestCase):
         assert out["logits"].shape == (2, 16, 256)
 
     def test_training_with_gate_tracks_forks(self) -> None:
-        model = ChaosStudentLM(
+        model = CareStudentLM(
             vocab_size=256, dim=16, num_layers=2, ff_mult=2,
             a_mode="diag", rich_b_mode="none", outer_model_dim=0,
         )
@@ -199,7 +199,7 @@ class TestWarmupTriggerStateIsolated(unittest.TestCase):
         from chaoscontrol.evaluation import evaluate_chaoscontrol_bpb
         from chaoscontrol.memory import MultiSlotOuterModel
 
-        model = ChaosStudentLM(
+        model = CareStudentLM(
             vocab_size=256, dim=16, num_layers=2, ff_mult=2,
             a_mode="diag", rich_b_mode="none",
             outer_model_dim=16, outer_model_type="multislot",
@@ -246,7 +246,7 @@ class TestWarmupTriggerStateIsolated(unittest.TestCase):
         """Cold start should wipe memory during eval but restore it after."""
         from chaoscontrol.evaluation import evaluate_chaoscontrol_bpb
 
-        model = ChaosStudentLM(
+        model = CareStudentLM(
             vocab_size=256, dim=16, num_layers=2, ff_mult=2,
             a_mode="diag", rich_b_mode="none",
             outer_model_dim=16, outer_model_type="multislot",

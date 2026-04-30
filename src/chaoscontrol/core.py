@@ -1,4 +1,4 @@
-"""Core SSM components: ChaosSSMCore (diag/paired/full), RMSNorm, FeedForward, criticality_loss."""
+"""Core SSM components: CareSSMCore (diag hot path, paired/full diagnostics)."""
 from __future__ import annotations
 
 import math
@@ -357,8 +357,12 @@ class LowRankDeltaProjection(nn.Module):
         return self.up(self.down(x))
 
 
-class ChaosSSMCore(nn.Module):
-    """SSM recurrence with three A parameterizations: diag, paired, full."""
+class CareSSMCore(nn.Module):
+    """CARE trunk recurrence.
+
+    The production trunk uses the diagonal path.  Paired/full modes are
+    diagnostics, not the controller-plane ChaosSSM.
+    """
 
     def __init__(
         self,

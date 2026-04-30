@@ -5,9 +5,9 @@ Sibling to ``experiments/18_throughput_levers/runner_exp18_ssm.py``. The
 only functional differences:
 
 1. Local ``build_model`` that dispatches on ``config['model_type']``
-   (``ssm_exp18_t4b`` → bare ``ChaosStudentLM``, ``transformer_nanogpt_lean``
+   (``ssm_exp18_t4b`` → bare ``CareStudentLM``, ``transformer_nanogpt_lean``
    → ``NanoGPTLeanLM``). ``runner_exp18_ssm.py`` imports ``build_model``
-   from ``runner_exp17`` which is hardcoded to ``ChaosStudentLM``; threading
+   from ``runner_exp17`` which is hardcoded to ``CareStudentLM``; threading
    a flag through the frozen runner would touch the reproducibility path.
 
 2. ``_apply_embed_init`` honors ``config['embed_init_path']`` — loads a
@@ -52,7 +52,7 @@ from chaoscontrol.data import (  # noqa: E402
     resolve_device,
     resolve_param_dtype,
 )
-from chaoscontrol.model import ChaosStudentLM  # noqa: E402
+from chaoscontrol.model import CareStudentLM  # noqa: E402
 from chaoscontrol.optim.lamb import LAMB  # noqa: E402
 from chaoscontrol.optim.muon import Muon  # noqa: E402
 from chaoscontrol.train_ssm import (  # noqa: E402
@@ -68,17 +68,17 @@ from runner_exp17 import (  # noqa: E402
 
 
 def _ssm_constructor_kwargs(config: dict[str, Any]) -> dict[str, Any]:
-    """Extract the exact ChaosStudentLM(**kwargs) needed to reconstruct the
+    """Extract the exact CareStudentLM(**kwargs) needed to reconstruct the
     SSM-arm model from a runner training config.
 
     Single source of truth for the SSM arm: ``build_model`` consumes this
     dict to instantiate the live training model, and ``--output-ckpt``
     serializes the same dict so ``scripts/run_exp20_eval.py::_build_model``
-    can do ``ChaosStudentLM(**cfg)`` and reconstruct the matching shape.
+    can do ``CareStudentLM(**cfg)`` and reconstruct the matching shape.
 
-    Keys must match ``ChaosStudentLM.__init__`` parameter names — not YAML
+    Keys must match ``CareStudentLM.__init__`` parameter names — not YAML
     config keys (e.g. ``dim`` not ``model_dim``). Carries every kwarg that
-    affects parameter shape; defaults from ``ChaosStudentLM`` for absent
+    affects parameter shape; defaults from ``CareStudentLM`` for absent
     fields stay implicit and the class supplies them on reload.
     """
     crct_enabled = bool(config.get("crct_enabled", False))
@@ -160,7 +160,7 @@ def build_model(
 
     Dispatches on ``config['model_type']``:
       - ``'transformer_nanogpt_lean'`` → ``NanoGPTLeanLM`` (cells A, B, Phase 0)
-      - otherwise → ``ChaosStudentLM`` bare-SSM (cells C, D, controls)
+      - otherwise → ``CareStudentLM`` bare-SSM (cells C, D, controls)
 
     The bare-SSM branch matches the field reads in
     ``runner_exp17.build_model`` so SSM cells C/D are bit-identical to
@@ -174,7 +174,7 @@ def build_model(
             **_transformer_constructor_kwargs(config)
         )
     else:
-        model = ChaosStudentLM(**_ssm_constructor_kwargs(config))
+        model = CareStudentLM(**_ssm_constructor_kwargs(config))
     model = model.to(device)
     if device.type == "cuda":
         model = model.to(dtype=param_dtype)
@@ -299,7 +299,7 @@ def _save_output_ckpt(
     ``scripts/run_exp20_eval.py``.
 
     Both arms are saved with the right kwargs dict, but the consumer
-    currently hardcodes ``ChaosStudentLM(**cfg)`` and will only successfully
+    currently hardcodes ``CareStudentLM(**cfg)`` and will only successfully
     reconstruct the SSM arm. Transformer-arm checkpoints save correctly but
     require a future ``_build_model`` extension to load — left intentional
     since the submission target is SSM.

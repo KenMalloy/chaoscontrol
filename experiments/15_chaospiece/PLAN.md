@@ -18,7 +18,7 @@
 **What it does:**
 - CLI: accepts --config (YAML), --data-path, --budget, --output-json, --sp-model-path
 - Two data paths: SP8192 (load_fineweb_tokens + val/test split) and raw bytes (prepare_fineweb_splits)
-- Builds ChaosStudentLM or SimpleTransformerLM based on config `model_type`
+- Builds CareStudentLM or SimpleTransformerLM based on config `model_type`
 - Trains via train_chaoscontrol_for_budget() with all bolt-ons disabled
 - Evaluates with competition-correct bpb using per-token byte LUT from SentencePiece
 - Writes result JSON

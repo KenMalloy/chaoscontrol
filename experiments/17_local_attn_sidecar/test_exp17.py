@@ -12,7 +12,7 @@ REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO / "src"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from chaoscontrol.model import ChaosSSMBlock, ChaosSSMHybridBlock
+from chaoscontrol.model import CareSSMBlock, CareSSMHybridBlock
 import run_exp17
 from runner_exp17 import build_child_env, build_model, resolve_visible_cuda_devices, validate_gpu_concurrency
 
@@ -28,7 +28,7 @@ def test_build_model_bare_fast_ssm():
     }
     model = build_model(config, torch.device("cpu"), torch.float32)
     assert model.local_attn_window == 0
-    assert all(isinstance(layer, ChaosSSMBlock) for layer in model.layers)
+    assert all(isinstance(layer, CareSSMBlock) for layer in model.layers)
 
 
 def test_build_model_hybrid_top_block():
@@ -43,8 +43,8 @@ def test_build_model_hybrid_top_block():
         "local_attn_dim": 32,
     }
     model = build_model(config, torch.device("cpu"), torch.float32)
-    assert isinstance(model.layers[-1], ChaosSSMHybridBlock)
-    assert all(isinstance(layer, ChaosSSMBlock) for layer in model.layers[:-1])
+    assert isinstance(model.layers[-1], CareSSMHybridBlock)
+    assert all(isinstance(layer, CareSSMBlock) for layer in model.layers[:-1])
 
 
 def test_hybrid_model_forward_shape():

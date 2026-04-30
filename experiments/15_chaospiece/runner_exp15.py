@@ -50,7 +50,7 @@ from chaoscontrol.data import (
     maybe_autocast,
     maybe_sync_cuda,
 )
-from chaoscontrol.model import ChaosStudentLM
+from chaoscontrol.model import CareStudentLM
 from chaoscontrol.baselines import SimpleTransformerLM
 from chaoscontrol.training import train_chaoscontrol_for_budget
 from chaoscontrol.evaluation import compute_bpb
@@ -287,7 +287,7 @@ class _TransformerWrapper(torch.nn.Module):
 
 
 def build_model(config: dict, device: torch.device, param_dtype: torch.dtype):
-    """Build ChaosStudentLM or SimpleTransformerLM from config dict."""
+    """Build CareStudentLM or SimpleTransformerLM from config dict."""
     model_type = config.get("model_type", "ssm")
 
     if model_type == "transformer":
@@ -300,7 +300,7 @@ def build_model(config: dict, device: torch.device, param_dtype: torch.dtype):
         )
         model = _TransformerWrapper(inner)
     else:
-        model = ChaosStudentLM(
+        model = CareStudentLM(
             vocab_size=config["vocab_size"],
             dim=config["model_dim"],
             num_layers=config["num_layers"],

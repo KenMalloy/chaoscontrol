@@ -1,7 +1,7 @@
 """Measure bpb penalty of GPTQ int6 + LZMA roundtrip on an SSM checkpoint.
 
 Takes a checkpoint produced by ``runner_exp21.py --output-ckpt`` (format:
-``{"model": state_dict, "config": ChaosStudentLM kwargs}``) and:
+``{"model": state_dict, "config": CareStudentLM kwargs}``) and:
 
   1. Loads the bf16 model via the ``run_exp20_eval.py::_build_model`` pattern.
   2. Eval pass 1 — scores the FineWeb stream in bf16 to get ``bpb_bf16``.
@@ -68,11 +68,11 @@ def _load_checkpoint(
     ``run_exp20_eval.py`` measure the exact same artifact the downstream
     consumer loads.
     """
-    from chaoscontrol.model import ChaosStudentLM
+    from chaoscontrol.model import CareStudentLM
 
     blob = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     cfg: dict[str, Any] = blob["config"]
-    model = ChaosStudentLM(**cfg)
+    model = CareStudentLM(**cfg)
     model.load_state_dict(blob["model"], strict=True)
     model.to(device)
     model.eval()
@@ -150,9 +150,9 @@ def _eval_bpb(
             if time.monotonic() - t_start > budget_seconds:
                 break
             # Reset recurrence at doc boundary. initial_states=None gets the
-            # zero-init branch in ChaosStudentLM.forward (see model.py line
+            # zero-init branch in CareStudentLM.forward (see model.py line
             # 1128 — when None is passed, the layers are called with
-            # initial_state=None, which maps to zero-init in ChaosSSMCore).
+            # initial_state=None, which maps to zero-init in CareSSMCore).
             prev_final_states: list[torch.Tensor] | None = None
             for chunk_list in _iter_chunks(doc.tokens, chunk_size):
                 # Need at least 2 tokens to form one (input, target) pair —
@@ -226,10 +226,10 @@ def _eval_bpb(
 
 
 def _make_logit_fn(model: torch.nn.Module) -> Callable[[torch.Tensor], torch.Tensor]:
-    """Adapt ``ChaosStudentLM`` to the ``logit_fn`` contract.
+    """Adapt ``CareStudentLM`` to the ``logit_fn`` contract.
 
     ``ar_self_generated_calibration`` calls ``logit_fn(tokens) -> (B, T, V)``
-    logits; ``ChaosStudentLM.forward`` returns a ``dict`` whose ``"logits"``
+    logits; ``CareStudentLM.forward`` returns a ``dict`` whose ``"logits"``
     entry has exactly that shape. The ``initial_states=None`` is implicit
     in the bare call signature — AR sampling doesn't persist state across
     calibration sequences, which matches what ``collect_hessians`` expects
@@ -281,7 +281,7 @@ def _calibrate_and_quantize(
     quantizer = GPTQQuantizer()
     # collect_hessians will run each calibration sequence through the model
     # with forward hooks on every nn.Linear. Default forward_fn=None lets it
-    # call model(seq) directly — ChaosStudentLM's forward accepts
+    # call model(seq) directly — CareStudentLM's forward accepts
     # (batch, seq) int64 ids and returns a dict; the hooks only care about
     # the Linear inputs, not the model's return value.
     quantizer.calibrate(model, calib_tokens, device=device)
@@ -297,7 +297,7 @@ def _roundtrip_to_model(
     cfg: dict[str, Any],
     device: torch.device,
 ) -> torch.nn.Module:
-    """Rebuild a fresh ``ChaosStudentLM`` from an int6-lzma blob.
+    """Rebuild a fresh ``CareStudentLM`` from an int6-lzma blob.
 
     ``unpack_int6_lzma`` decompresses to ``(quantized, meta)``, then
     ``dequantize_state_dict`` reconstructs a float state dict. The
@@ -306,7 +306,7 @@ def _roundtrip_to_model(
     load is the load-bearing assertion that packaging+dequantization
     didn't drop or add any keys.
     """
-    from chaoscontrol.model import ChaosStudentLM
+    from chaoscontrol.model import CareStudentLM
     from chaoscontrol.quantization import (
         dequantize_state_dict,
         unpack_int6_lzma,
@@ -314,7 +314,7 @@ def _roundtrip_to_model(
 
     quantized, meta = unpack_int6_lzma(blob)
     deq_state = dequantize_state_dict(quantized, meta)
-    model = ChaosStudentLM(**cfg)
+    model = CareStudentLM(**cfg)
     model.load_state_dict(deq_state, strict=True)
     model.to(device)
     model.eval()

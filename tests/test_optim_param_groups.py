@@ -26,7 +26,7 @@ from chaoscontrol.optim.muon import Muon
 class _TinySSM(nn.Module):
     """Minimal shape-match for the classifier.
 
-    Mirrors the ChaosSSMCore parameter naming: ``layers.{i}.core.log_a``
+    Mirrors the CareSSMCore parameter naming: ``layers.{i}.core.log_a``
     is the spectral param; ``final_norm.weight`` is a 1D norm gain;
     everything else is a 2D matrix weight.
     """

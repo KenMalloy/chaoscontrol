@@ -765,7 +765,7 @@ class TestAutocastBf16Integration:
     """Integration test for the autocast bf16 production path.
 
     This is the load-bearing test that would have caught the shipped
-    HEAD e80e00a bug: run a real ChaosSSMCore forward+backward under
+    HEAD e80e00a bug: run a real CareSSMCore forward+backward under
     ``torch.autocast(device_type='cuda', dtype=torch.bfloat16)`` with
     ``CHAOSCONTROL_DIAG_SCAN_BACKEND=ssm_scan`` and confirm (1) the
     ssm_scan backend is actually active (not silently falling back),
@@ -801,7 +801,7 @@ class TestAutocastBf16Integration:
 
             torch.manual_seed(500)
             dim = 32
-            core_mod = core.ChaosSSMCore(dim=dim, a_mode="diag").cuda()
+            core_mod = core.CareSSMCore(dim=dim, a_mode="diag").cuda()
 
             # Submission-ish shape scaled down for test speed.
             B, T = 2, 64
@@ -859,7 +859,7 @@ class TestAutocastBf16Integration:
                 importlib.reload(sys.modules["chaoscontrol.core"])
 
     def test_autocast_bf16_full_forward_backward(self):
-        """End-to-end: run a ChaosSSMCore forward+backward inside
+        """End-to-end: run a CareSSMCore forward+backward inside
         autocast bf16 with ssm_scan backend active. Confirms the full
         training-step path — the one that crashed on step 1 in the
         real runner — works after the fix.
@@ -884,7 +884,7 @@ class TestAutocastBf16Integration:
 
             torch.manual_seed(501)
             dim = 32
-            core_mod = core.ChaosSSMCore(dim=dim, a_mode="diag").cuda()
+            core_mod = core.CareSSMCore(dim=dim, a_mode="diag").cuda()
 
             B, T = 2, 64
             x = torch.randn(

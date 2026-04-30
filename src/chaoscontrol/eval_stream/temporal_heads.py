@@ -280,7 +280,7 @@ def _token_nll_from_log_probs(log_probs: torch.Tensor, targets: torch.Tensor) ->
 
 
 def _find_ssm_cores(model) -> list:
-    return [m for m in model.modules() if type(m).__name__ == "ChaosSSMCore"]
+    return [m for m in model.modules() if type(m).__name__ == "CareSSMCore"]
 
 
 def _head_keys(cfg: TemporalHeadConfig) -> tuple[HeadKey, ...]:

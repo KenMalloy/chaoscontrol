@@ -1,11 +1,11 @@
-"""Tests for ChaosStudentLM.dream_step() — full-tier single-token forward."""
+"""Tests for CareStudentLM.dream_step() — full-tier single-token forward."""
 from __future__ import annotations
 
 import unittest
 
 import torch
 
-from chaoscontrol.model import ChaosStudentLM
+from chaoscontrol.model import CareStudentLM
 
 
 class TestDreamStepBasic(unittest.TestCase):
@@ -13,7 +13,7 @@ class TestDreamStepBasic(unittest.TestCase):
 
     def test_returns_correct_shapes(self):
         torch.manual_seed(42)
-        model = ChaosStudentLM(vocab_size=256, dim=16, num_layers=2)
+        model = CareStudentLM(vocab_size=256, dim=16, num_layers=2)
         token_ids = torch.tensor([[42], [7]])  # (batch=2, seq=1)
         state = model.init_state(batch_size=2)
         logits, hidden, new_state = model.dream_step(token_ids, state)
@@ -26,7 +26,7 @@ class TestDreamStepBasic(unittest.TestCase):
     def test_matches_step_on_bare_model(self):
         """Without Wernicke/memory/semantic, dream_step equals step."""
         torch.manual_seed(42)
-        model = ChaosStudentLM(vocab_size=256, dim=16, num_layers=2)
+        model = CareStudentLM(vocab_size=256, dim=16, num_layers=2)
         token_ids = torch.tensor([[42], [7]])
         state = model.init_state(batch_size=2)
         logits_step, hidden_step, state_step = model.step(token_ids, state)
@@ -41,7 +41,7 @@ class TestDreamStepBasic(unittest.TestCase):
     def test_diverges_from_step_with_features(self):
         """dream_step SHOULD differ from step when features are active."""
         torch.manual_seed(42)
-        model = ChaosStudentLM(
+        model = CareStudentLM(
             vocab_size=256, dim=16, num_layers=2,
             wernicke_enabled=True, wernicke_k_max=4, wernicke_window=4,
             outer_model_dim=8, outer_model_type="multislot",
@@ -70,7 +70,7 @@ class TestDreamStepWithOuterModel(unittest.TestCase):
 
     def test_with_single_outer_model(self):
         torch.manual_seed(42)
-        model = ChaosStudentLM(
+        model = CareStudentLM(
             vocab_size=256, dim=16, num_layers=2,
             outer_model_dim=8, outer_model_type="single",
         )
@@ -86,7 +86,7 @@ class TestDreamStepWithOuterModel(unittest.TestCase):
 
     def test_with_multislot_outer_model(self):
         torch.manual_seed(42)
-        model = ChaosStudentLM(
+        model = CareStudentLM(
             vocab_size=256, dim=16, num_layers=2,
             outer_model_dim=8, outer_model_type="multislot",
         )
@@ -103,7 +103,7 @@ class TestDreamStepWithOuterModel(unittest.TestCase):
     def test_multislot_cue_dependent_read(self):
         """Verify dream_step uses cue-dependent retrieval on multislot."""
         torch.manual_seed(42)
-        model = ChaosStudentLM(
+        model = CareStudentLM(
             vocab_size=256, dim=16, num_layers=2,
             outer_model_dim=8, outer_model_type="multislot",
         )
@@ -128,7 +128,7 @@ class TestDreamStepWithWernicke(unittest.TestCase):
 
     def test_wernicke_processes_input(self):
         torch.manual_seed(42)
-        model = ChaosStudentLM(
+        model = CareStudentLM(
             vocab_size=256, dim=16, num_layers=2,
             wernicke_enabled=True, wernicke_k_max=4, wernicke_window=4,
         )
@@ -141,7 +141,7 @@ class TestDreamStepWithWernicke(unittest.TestCase):
     def test_wernicke_with_all_tiers(self):
         """Full config: Wernicke + memory + semantic."""
         torch.manual_seed(42)
-        model = ChaosStudentLM(
+        model = CareStudentLM(
             vocab_size=256, dim=16, num_layers=2,
             wernicke_enabled=True, wernicke_k_max=4, wernicke_window=4,
             outer_model_dim=8, outer_model_type="multislot",
@@ -157,7 +157,7 @@ class TestDreamStepWithWernicke(unittest.TestCase):
     def test_sequential_dream_steps(self):
         """Multiple sequential dream_steps accumulate state correctly."""
         torch.manual_seed(42)
-        model = ChaosStudentLM(
+        model = CareStudentLM(
             vocab_size=256, dim=16, num_layers=2,
             wernicke_enabled=True, wernicke_k_max=4, wernicke_window=4,
             outer_model_dim=8, outer_model_type="single",

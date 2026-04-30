@@ -2,7 +2,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from pathlib import Path
-from chaoscontrol.model import ChaosStudentLM
+from chaoscontrol.model import CareStudentLM
 from chaoscontrol.eval_stream.doc_stream import DocStreamer
 from chaoscontrol.eval_stream.legality import LegalityController
 
@@ -12,7 +12,7 @@ def test_legality_controller_matches_naive_forward(tmp_path):
     # CPU-pin the test: bf16/tf32 on GPU exceeds the 1e-4 tolerance; the
     # bit-exact guarantee is about the harness composition, not the dtype path.
     device = torch.device("cpu")
-    m = ChaosStudentLM(
+    m = CareStudentLM(
         vocab_size=32, dim=16, num_layers=2, block_type="ssm", a_mode="diag",
     ).to(device)
     m.eval()  # must be in eval for deterministic comparison under block_type="attention" too
@@ -85,7 +85,7 @@ def test_chunked_carry_state_differs_from_reset(tmp_path):
         fh.write(json.dumps({"text": text2}) + "\n")
 
     # Tiny checkpoint
-    m = ChaosStudentLM(vocab_size=64, dim=16, num_layers=2, block_type="ssm", a_mode="diag")
+    m = CareStudentLM(vocab_size=64, dim=16, num_layers=2, block_type="ssm", a_mode="diag")
     ckpt = tmp_path / "ckpt.pt"
     torch.save({"model": m.state_dict(),
                 "config": {"vocab_size": 64, "dim": 16, "num_layers": 2,

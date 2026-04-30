@@ -393,10 +393,10 @@ class TestDemandDrivenCompression(unittest.TestCase):
 class TestEvalWarmup(unittest.TestCase):
     def test_warmup_does_not_persist_after_eval(self):
         """When warmup=True, eval writes to memory during eval but restores state after."""
-        from chaoscontrol.model import ChaosStudentLM
+        from chaoscontrol.model import CareStudentLM
         from chaoscontrol.evaluation import evaluate_chaoscontrol_bpb
         torch.manual_seed(42)
-        model = ChaosStudentLM(
+        model = CareStudentLM(
             vocab_size=256, dim=32, num_layers=2,
             outer_model_dim=16, outer_model_type="multislot",
         )
@@ -415,10 +415,10 @@ class TestEvalWarmup(unittest.TestCase):
 
     def test_no_warmup_does_not_write_slots(self):
         """When warmup=False (default), eval should NOT write to memory."""
-        from chaoscontrol.model import ChaosStudentLM
+        from chaoscontrol.model import CareStudentLM
         from chaoscontrol.evaluation import evaluate_chaoscontrol_bpb
         torch.manual_seed(42)
-        model = ChaosStudentLM(
+        model = CareStudentLM(
             vocab_size=256, dim=32, num_layers=2,
             outer_model_dim=16, outer_model_type="multislot",
         )
@@ -475,10 +475,10 @@ class TestLatentTraceEviction(unittest.TestCase):
 class TestWarmupIsolation(unittest.TestCase):
     def test_warmup_does_not_persist_slots_after_eval(self):
         """Warmup writes should not persist after eval completes."""
-        from chaoscontrol.model import ChaosStudentLM
+        from chaoscontrol.model import CareStudentLM
         from chaoscontrol.evaluation import evaluate_chaoscontrol_bpb
         torch.manual_seed(42)
-        model = ChaosStudentLM(
+        model = CareStudentLM(
             vocab_size=256, dim=32, num_layers=2,
             outer_model_dim=16, outer_model_type="multislot",
         )

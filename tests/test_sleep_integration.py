@@ -1,6 +1,6 @@
 """End-to-end integration test for the full sleep cycle.
 
-Builds a ChaosStudentLM with memory + Wernicke, populates slots,
+Builds a CareStudentLM with memory + Wernicke, populates slots,
 fills a WakeCache with moments, runs a full_cycle SleepCycle, and
 verifies that diagnostics are correct.
 """
@@ -8,16 +8,16 @@ from __future__ import annotations
 
 import torch
 
-from chaoscontrol.model import ChaosStudentLM
+from chaoscontrol.model import CareStudentLM
 from chaoscontrol.sleep import SleepConfig, SleepCycle
 from chaoscontrol.wake_cache import WakeCache
 from chaoscontrol.regret import RegretTable
 
 
-def _build_model() -> ChaosStudentLM:
-    """Build a ChaosStudentLM with outer_model_dim=16, multislot, wernicke."""
+def _build_model() -> CareStudentLM:
+    """Build a CareStudentLM with outer_model_dim=16, multislot, wernicke."""
     torch.manual_seed(42)
-    return ChaosStudentLM(
+    return CareStudentLM(
         vocab_size=256,
         dim=16,
         num_layers=2,
@@ -32,7 +32,7 @@ def _build_model() -> ChaosStudentLM:
     )
 
 
-def _populate_slots(model: ChaosStudentLM, n: int = 20) -> None:
+def _populate_slots(model: CareStudentLM, n: int = 20) -> None:
     """Write n slots with varying survival scores."""
     om = model.outer_model
     for i in range(n):
@@ -43,7 +43,7 @@ def _populate_slots(model: ChaosStudentLM, n: int = 20) -> None:
         om._survival[-1] = float(i) * 0.05
 
 
-def _fill_cache(model: ChaosStudentLM, n_moments: int = 8) -> WakeCache:
+def _fill_cache(model: CareStudentLM, n_moments: int = 8) -> WakeCache:
     """Fill a WakeCache with n_moments of random data."""
     cache = WakeCache(max_moments=32)
     seq_len = 32

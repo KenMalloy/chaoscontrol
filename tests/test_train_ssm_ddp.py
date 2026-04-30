@@ -21,7 +21,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 from chaoscontrol.core import verify_diag_recurrence
-from chaoscontrol.model import ChaosStudentLM
+from chaoscontrol.model import CareStudentLM
 
 
 MODEL_KWARGS = dict(
@@ -48,9 +48,9 @@ def _pick_free_port() -> int:
         return int(s.getsockname()[1])
 
 
-def _build_model(seed: int) -> ChaosStudentLM:
+def _build_model(seed: int) -> CareStudentLM:
     torch.manual_seed(seed)
-    return ChaosStudentLM(**MODEL_KWARGS)
+    return CareStudentLM(**MODEL_KWARGS)
 
 
 def _build_tokens(seed: int) -> torch.Tensor:

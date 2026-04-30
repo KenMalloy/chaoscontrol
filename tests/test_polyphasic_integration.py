@@ -1,6 +1,6 @@
 # tests/test_polyphasic_integration.py
 import torch
-from chaoscontrol.model import ChaosStudentLM
+from chaoscontrol.model import CareStudentLM
 from chaoscontrol.sleep import SleepCycle, SleepConfig
 from chaoscontrol.wake_cache import WakeCache
 from chaoscontrol.partition import (
@@ -10,7 +10,7 @@ from chaoscontrol.partition import (
 
 def test_full_polyphasic_cycle():
     """End-to-end: create model, write slots, schedule sleep, verify isolation."""
-    model = ChaosStudentLM(
+    model = CareStudentLM(
         vocab_size=256, dim=16, num_layers=2, ff_mult=2,
         outer_model_dim=8, outer_max_slots=32,
         outer_model_type="multislot",

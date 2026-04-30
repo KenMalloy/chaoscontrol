@@ -1,11 +1,11 @@
 """Tests for TTT warming-curve evaluation."""
 import torch
 from chaoscontrol.evaluation import evaluate_warming_curve
-from chaoscontrol.model import ChaosStudentLM
+from chaoscontrol.model import CareStudentLM
 
 
 def _make_model():
-    return ChaosStudentLM(
+    return CareStudentLM(
         vocab_size=256, dim=64, num_layers=2,
         outer_model_dim=32, outer_model_type="multislot",
         outer_max_slots=0,
@@ -65,7 +65,7 @@ def test_warming_curve_buffer_reset_between_segments():
 
 def test_warming_curve_with_topk():
     """Works with bucket_topk retrieval mode."""
-    model = ChaosStudentLM(
+    model = CareStudentLM(
         vocab_size=256, dim=64, num_layers=2,
         outer_model_dim=32, outer_model_type="multislot",
         outer_max_slots=0,

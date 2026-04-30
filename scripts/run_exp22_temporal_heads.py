@@ -147,7 +147,7 @@ def _average_layer_summaries(
 
 
 def _build_model(ckpt_path: Path, cfg: Exp22RunConfig) -> tuple[torch.nn.Module, dict]:
-    from chaoscontrol.model import ChaosStudentLM
+    from chaoscontrol.model import CareStudentLM
 
     blob = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     ckpt_cfg = dict(blob["config"])
@@ -157,7 +157,7 @@ def _build_model(ckpt_path: Path, cfg: Exp22RunConfig) -> tuple[torch.nn.Module,
             ckpt_cfg,
             depth_recurrence_count=cfg.depth_recurrence_count,
         )
-    model = ChaosStudentLM(**model_cfg)
+    model = CareStudentLM(**model_cfg)
     model.load_state_dict(blob["model"], strict=True)
     return model, ckpt_cfg
 

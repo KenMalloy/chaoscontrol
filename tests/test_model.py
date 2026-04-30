@@ -1,4 +1,4 @@
-"""Tests for ChaosSSMBlock and ChaosStudentLM."""
+"""Tests for CareSSMBlock and CareStudentLM."""
 from __future__ import annotations
 
 import unittest
@@ -8,33 +8,33 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from chaoscontrol.model import ChaosSSMBlock, ChaosStudentLM
+from chaoscontrol.model import CareSSMBlock, CareStudentLM
 
 
-class TestChaosSSMBlock(unittest.TestCase):
+class TestCareSSMBlock(unittest.TestCase):
     def test_basic_forward(self) -> None:
-        block = ChaosSSMBlock(16, ff_mult=2, a_mode="diag", rich_b_mode="none")
+        block = CareSSMBlock(16, ff_mult=2, a_mode="diag", rich_b_mode="none")
         x = torch.randn(2, 8, 16)
         out = block(x)
         assert out.shape == (2, 8, 16)
 
     def test_with_rich_b_nn(self) -> None:
-        block = ChaosSSMBlock(16, ff_mult=2, a_mode="diag", rich_b_mode="nn", rich_b_bottleneck=8)
+        block = CareSSMBlock(16, ff_mult=2, a_mode="diag", rich_b_mode="nn", rich_b_bottleneck=8)
         x = torch.randn(2, 8, 16)
         out = block(x)
         assert out.shape == (2, 8, 16)
 
     def test_jacobian_stats(self) -> None:
-        block = ChaosSSMBlock(16, ff_mult=2, a_mode="full", a_full_rank=4, rich_b_mode="none")
+        block = CareSSMBlock(16, ff_mult=2, a_mode="full", a_full_rank=4, rich_b_mode="none")
         x = torch.randn(2, 8, 16)
         out, stats = block(x, return_jacobian_stats=True)
         assert out.shape == (2, 8, 16)
         assert "lambda_max" in stats
 
 
-class TestChaosStudentLM(unittest.TestCase):
+class TestCareStudentLM(unittest.TestCase):
     def test_base_forward_produces_logits(self) -> None:
-        model = ChaosStudentLM(
+        model = CareStudentLM(
             vocab_size=256, dim=16, num_layers=2, ff_mult=2,
             a_mode="diag", rich_b_mode="none", outer_model_dim=0,
         )
@@ -43,7 +43,7 @@ class TestChaosStudentLM(unittest.TestCase):
         assert out["logits"].shape == (2, 16, 256)
 
     def test_full_config_forward(self) -> None:
-        model = ChaosStudentLM(
+        model = CareStudentLM(
             vocab_size=256, dim=16, num_layers=2, ff_mult=2,
             a_mode="full", a_full_rank=4,
             rich_b_mode="assembly", rich_b_bottleneck=8, rich_b_num_subnets=4,
@@ -54,7 +54,7 @@ class TestChaosStudentLM(unittest.TestCase):
         assert out["logits"].shape == (2, 16, 256)
 
     def test_gradients_flow(self) -> None:
-        model = ChaosStudentLM(
+        model = CareStudentLM(
             vocab_size=256, dim=16, num_layers=2, ff_mult=2,
             a_mode="paired", rich_b_mode="nn", rich_b_bottleneck=8,
             outer_model_dim=0,
@@ -67,7 +67,7 @@ class TestChaosStudentLM(unittest.TestCase):
         assert has_grad
 
     def test_artifact_bytes_under_budget(self) -> None:
-        model = ChaosStudentLM(
+        model = CareStudentLM(
             vocab_size=256, dim=128, num_layers=4, ff_mult=2,
             a_mode="full", a_full_rank=8,
             rich_b_mode="hybrid", rich_b_bottleneck=32, rich_b_num_subnets=4,
@@ -76,7 +76,7 @@ class TestChaosStudentLM(unittest.TestCase):
         assert model.artifact_bytes() < 16 * 1024 * 1024
 
     def test_with_outer_model_reads(self) -> None:
-        model = ChaosStudentLM(
+        model = CareStudentLM(
             vocab_size=256, dim=16, num_layers=2, ff_mult=2,
             a_mode="diag", rich_b_mode="none", outer_model_dim=32,
         )
@@ -85,7 +85,7 @@ class TestChaosStudentLM(unittest.TestCase):
         assert out["logits"].shape == (2, 16, 256)
 
     def test_jacobian_stats_with_full(self) -> None:
-        model = ChaosStudentLM(
+        model = CareStudentLM(
             vocab_size=256, dim=16, num_layers=2, ff_mult=2,
             a_mode="full", a_full_rank=4, rich_b_mode="none", outer_model_dim=0,
         )
@@ -95,7 +95,7 @@ class TestChaosStudentLM(unittest.TestCase):
 
 
     def test_posterior_global_delta_forward(self) -> None:
-        model = ChaosStudentLM(
+        model = CareStudentLM(
             vocab_size=256, dim=16, num_layers=2, ff_mult=2,
             a_mode="diag", rich_b_mode="none", outer_model_dim=0,
             posterior_mode="global_delta", posterior_lr=0.01,
@@ -106,7 +106,7 @@ class TestChaosStudentLM(unittest.TestCase):
         assert model.posterior is not None
 
     def test_posterior_bucket_delta_forward(self) -> None:
-        model = ChaosStudentLM(
+        model = CareStudentLM(
             vocab_size=256, dim=16, num_layers=2, ff_mult=2,
             a_mode="diag", rich_b_mode="none", outer_model_dim=0,
             wernicke_enabled=True, wernicke_k_max=8, wernicke_router="moe",
@@ -118,7 +118,7 @@ class TestChaosStudentLM(unittest.TestCase):
         assert model.posterior is not None
 
     def test_posterior_residual_cache_forward(self) -> None:
-        model = ChaosStudentLM(
+        model = CareStudentLM(
             vocab_size=256, dim=16, num_layers=2, ff_mult=2,
             a_mode="diag", rich_b_mode="none", outer_model_dim=0,
             posterior_mode="residual_cache", residual_cache_k=2,
@@ -129,14 +129,14 @@ class TestChaosStudentLM(unittest.TestCase):
         assert model.posterior is not None
 
     def test_posterior_none_default(self) -> None:
-        model = ChaosStudentLM(
+        model = CareStudentLM(
             vocab_size=256, dim=16, num_layers=2, ff_mult=2,
         )
         assert model.posterior is None
 
     def test_encode_memory_mode_off_disables_outer_memory_read(self) -> None:
         torch.manual_seed(0)
-        model = ChaosStudentLM(
+        model = CareStudentLM(
             vocab_size=64, dim=8, num_layers=1, ff_mult=2,
             a_mode="diag", rich_b_mode="none", outer_model_dim=8,
         )
@@ -151,7 +151,7 @@ class TestChaosStudentLM(unittest.TestCase):
 
     def test_encode_default_packet_mode_matches_memory_off(self) -> None:
         torch.manual_seed(1)
-        model = ChaosStudentLM(
+        model = CareStudentLM(
             vocab_size=64, dim=8, num_layers=1, ff_mult=2,
             a_mode="diag", rich_b_mode="none", outer_model_dim=8,
         )
@@ -164,7 +164,7 @@ class TestChaosStudentLM(unittest.TestCase):
 
     def test_encode_rejects_removed_controller_modes(self) -> None:
         torch.manual_seed(2)
-        model = ChaosStudentLM(
+        model = CareStudentLM(
             vocab_size=64, dim=8, num_layers=1, ff_mult=2,
             a_mode="diag", rich_b_mode="none", outer_model_dim=8,
         )
@@ -178,7 +178,7 @@ class TestChaosStudentLM(unittest.TestCase):
 
     def test_model_has_no_trunk_local_memory_controller(self) -> None:
         torch.manual_seed(3)
-        model = ChaosStudentLM(
+        model = CareStudentLM(
             vocab_size=64, dim=8, num_layers=1, ff_mult=2,
             a_mode="diag", rich_b_mode="none", outer_model_dim=8,
         )
@@ -187,7 +187,7 @@ class TestChaosStudentLM(unittest.TestCase):
 
     def test_encode_packet_mode_zero_payload_matches_memory_off(self) -> None:
         torch.manual_seed(33)
-        model = ChaosStudentLM(
+        model = CareStudentLM(
             vocab_size=64, dim=8, num_layers=1, ff_mult=2,
             a_mode="diag", rich_b_mode="none", outer_model_dim=8,
         )
@@ -202,7 +202,7 @@ class TestChaosStudentLM(unittest.TestCase):
 
     def test_encode_packet_mode_injects_residual_without_controller_head(self) -> None:
         torch.manual_seed(34)
-        model = ChaosStudentLM(
+        model = CareStudentLM(
             vocab_size=64, dim=8, num_layers=1, ff_mult=2,
             a_mode="diag", rich_b_mode="none", outer_model_dim=8,
         )
@@ -226,7 +226,7 @@ class TestChaosStudentLM(unittest.TestCase):
         assert out["memory_meta"]["memory_residual"].shape == (2, 1, 8)
 
     def test_encode_packet_mode_rejects_sequence_residual_packets(self) -> None:
-        model = ChaosStudentLM(
+        model = CareStudentLM(
             vocab_size=64, dim=8, num_layers=1, ff_mult=2,
             a_mode="diag", rich_b_mode="none", outer_model_dim=8,
         )
@@ -244,7 +244,7 @@ class TestChaosStudentLM(unittest.TestCase):
 
     def test_force_on_memory_residual_can_replay_as_packet(self) -> None:
         torch.manual_seed(35)
-        model = ChaosStudentLM(
+        model = CareStudentLM(
             vocab_size=64, dim=8, num_layers=1, ff_mult=2,
             a_mode="diag", rich_b_mode="none", outer_model_dim=8,
         )
@@ -284,7 +284,7 @@ class TestChaosStudentLM(unittest.TestCase):
 
     def test_encode_cache_read_cutoff_filters_append_only_multislot_reads(self) -> None:
         torch.manual_seed(4)
-        model = ChaosStudentLM(
+        model = CareStudentLM(
             vocab_size=64,
             dim=8,
             num_layers=1,
@@ -324,7 +324,7 @@ class TestChaosStudentLM(unittest.TestCase):
 
     def test_encode_slot_override_matches_temporary_replacement_in_bucket_path(self) -> None:
         torch.manual_seed(5)
-        model = ChaosStudentLM(
+        model = CareStudentLM(
             vocab_size=64,
             dim=8,
             num_layers=1,
@@ -364,9 +364,9 @@ class TestChaosStudentLM(unittest.TestCase):
         torch.testing.assert_close(model.outer_model.table.get_tensor(0), original)
 
 
-class TestChaosStudentLMHybrid(unittest.TestCase):
+class TestCareStudentLMHybrid(unittest.TestCase):
     def test_student_lm_with_hybrid_top_block(self) -> None:
-        model = ChaosStudentLM(
+        model = CareStudentLM(
             vocab_size=64, dim=32, num_layers=4, ff_mult=2,
             a_mode="diag", outer_model_dim=0, wernicke_enabled=False,
             local_attn_window=8, local_attn_heads=1, local_attn_dim=16,
@@ -376,7 +376,7 @@ class TestChaosStudentLMHybrid(unittest.TestCase):
         assert out["logits"].shape == (2, 10, 64)
 
     def test_student_lm_hybrid_step(self) -> None:
-        model = ChaosStudentLM(
+        model = CareStudentLM(
             vocab_size=64, dim=32, num_layers=4, ff_mult=2,
             a_mode="diag", outer_model_dim=0, wernicke_enabled=False,
             local_attn_window=8, local_attn_heads=1, local_attn_dim=16,
@@ -389,7 +389,7 @@ class TestChaosStudentLMHybrid(unittest.TestCase):
         assert len(new_states) == 4
 
     def test_student_lm_hybrid_step_raises_without_kv_caches(self) -> None:
-        model = ChaosStudentLM(
+        model = CareStudentLM(
             vocab_size=64, dim=32, num_layers=4, ff_mult=2,
             a_mode="diag", outer_model_dim=0, wernicke_enabled=False,
             local_attn_window=8, local_attn_heads=1, local_attn_dim=16,
@@ -400,7 +400,7 @@ class TestChaosStudentLMHybrid(unittest.TestCase):
             model.step(token, states)
 
     def test_student_lm_hybrid_dream_step(self) -> None:
-        model = ChaosStudentLM(
+        model = CareStudentLM(
             vocab_size=64, dim=32, num_layers=4, ff_mult=2,
             a_mode="diag", outer_model_dim=0, wernicke_enabled=False,
             local_attn_window=8, local_attn_heads=1, local_attn_dim=16,
@@ -413,8 +413,8 @@ class TestChaosStudentLMHybrid(unittest.TestCase):
         assert len(new_states) == 4
 
     def test_hybrid_block_jacobian_stats_returns_zeros(self) -> None:
-        from chaoscontrol.model import ChaosSSMHybridBlock
-        block = ChaosSSMHybridBlock(
+        from chaoscontrol.model import CareSSMHybridBlock
+        block = CareSSMHybridBlock(
             dim=32, ff_mult=2, a_mode="diag",
             local_attn_window=8, local_attn_heads=1, local_attn_dim=16,
         )
@@ -427,19 +427,19 @@ class TestChaosStudentLMHybrid(unittest.TestCase):
         assert stats["lambda_max"].item() == 0.0
 
     def test_student_lm_no_hybrid_by_default(self) -> None:
-        model = ChaosStudentLM(
+        model = CareStudentLM(
             vocab_size=64, dim=32, num_layers=4, ff_mult=2,
             a_mode="diag", outer_model_dim=0, wernicke_enabled=False,
         )
         # All layers should be plain SSM blocks
         for layer in model.layers:
-            assert isinstance(layer, ChaosSSMBlock)
+            assert isinstance(layer, CareSSMBlock)
 
 
-class TestChaosSSMHybridBlock(unittest.TestCase):
+class TestCareSSMHybridBlock(unittest.TestCase):
     def test_hybrid_block_forward_shape(self) -> None:
-        from chaoscontrol.model import ChaosSSMHybridBlock
-        block = ChaosSSMHybridBlock(
+        from chaoscontrol.model import CareSSMHybridBlock
+        block = CareSSMHybridBlock(
             dim=32, ff_mult=2, a_mode="diag",
             local_attn_window=8, local_attn_heads=1, local_attn_dim=16,
         )
@@ -448,8 +448,8 @@ class TestChaosSSMHybridBlock(unittest.TestCase):
         assert y.shape == (2, 12, 32)
 
     def test_hybrid_block_step_shape(self) -> None:
-        from chaoscontrol.model import ChaosSSMHybridBlock
-        block = ChaosSSMHybridBlock(
+        from chaoscontrol.model import CareSSMHybridBlock
+        block = CareSSMHybridBlock(
             dim=32, ff_mult=2, a_mode="diag",
             local_attn_window=8, local_attn_heads=1, local_attn_dim=16,
         )
@@ -460,8 +460,8 @@ class TestChaosSSMHybridBlock(unittest.TestCase):
         assert new_state.shape == (2, 32)
 
     def test_hybrid_block_gate_starts_near_zero(self) -> None:
-        from chaoscontrol.model import ChaosSSMHybridBlock
-        block = ChaosSSMHybridBlock(
+        from chaoscontrol.model import CareSSMHybridBlock
+        block = CareSSMHybridBlock(
             dim=32, ff_mult=2, a_mode="diag",
             local_attn_window=8, local_attn_heads=1, local_attn_dim=16,
         )
@@ -469,8 +469,8 @@ class TestChaosSSMHybridBlock(unittest.TestCase):
         assert block.gate_bias.item() < -3.0
 
     def test_hybrid_block_first_step_is_causal(self) -> None:
-        from chaoscontrol.model import ChaosSSMHybridBlock
-        block = ChaosSSMHybridBlock(
+        from chaoscontrol.model import CareSSMHybridBlock
+        block = CareSSMHybridBlock(
             dim=32, ff_mult=2, a_mode="diag",
             local_attn_window=8, local_attn_heads=1, local_attn_dim=16,
         )
@@ -485,10 +485,10 @@ class TestChaosSSMHybridBlock(unittest.TestCase):
 
     def test_hybrid_parallel_forward_matches_sequential_step(self) -> None:
         """Regression: parallel forward() must match sequential step() loop."""
-        from chaoscontrol.model import ChaosSSMHybridBlock
+        from chaoscontrol.model import CareSSMHybridBlock
         for window in (8, 16, 32):
             torch.manual_seed(42)
-            block = ChaosSSMHybridBlock(
+            block = CareSSMHybridBlock(
                 dim=32, ff_mult=2, a_mode="diag",
                 local_attn_window=window, local_attn_heads=1, local_attn_dim=16,
             )
@@ -516,10 +516,10 @@ class TestChaosSSMHybridBlock(unittest.TestCase):
         be -1e9 on early rows but non-causal positions still carry -1e9
         scores so they don't affect softmax.
         """
-        from chaoscontrol.model import ChaosSSMHybridBlock
+        from chaoscontrol.model import CareSSMHybridBlock
         for topk in (8, 16):
             torch.manual_seed(42)
-            block = ChaosSSMHybridBlock(
+            block = CareSSMHybridBlock(
                 dim=32, ff_mult=2, a_mode="diag",
                 local_attn_window=64, local_attn_heads=1, local_attn_dim=16,
                 local_attn_topk=topk, local_attn_topk_random=False,
@@ -545,10 +545,10 @@ class TestChaosSSMHybridBlock(unittest.TestCase):
         Same property test for the random selection branch, which picks
         k random causal positions per forward call.
         """
-        from chaoscontrol.model import ChaosSSMHybridBlock
+        from chaoscontrol.model import CareSSMHybridBlock
         for topk in (8, 16):
             torch.manual_seed(42)
-            block = ChaosSSMHybridBlock(
+            block = CareSSMHybridBlock(
                 dim=32, ff_mult=2, a_mode="diag",
                 local_attn_window=64, local_attn_heads=1, local_attn_dim=16,
                 local_attn_topk=topk, local_attn_topk_random=True,

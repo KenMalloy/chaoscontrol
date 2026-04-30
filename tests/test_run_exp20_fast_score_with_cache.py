@@ -46,9 +46,9 @@ def _cache_args(**overrides):
 def test_fast_score_loads_checkpoint_cache_into_legality_controller(tmp_path):
     """Loaded cache payload must survive into the fast_score controller."""
     mod = _load_module()
-    from chaoscontrol.model import ChaosStudentLM
+    from chaoscontrol.model import CareStudentLM
 
-    model = ChaosStudentLM(
+    model = CareStudentLM(
         vocab_size=32,
         dim=16,
         num_layers=1,

@@ -5,14 +5,14 @@ import unittest
 
 import torch
 
-from chaoscontrol.model import ChaosStudentLM
+from chaoscontrol.model import CareStudentLM
 from chaoscontrol.training import train_chaoscontrol_for_budget
 
 
 class TestTrainingWithSleep(unittest.TestCase):
     def test_training_with_sleep_runs(self) -> None:
         """Training with sleep enabled completes without error."""
-        model = ChaosStudentLM(
+        model = CareStudentLM(
             vocab_size=256, dim=16, num_layers=2, ff_mult=2,
             a_mode="diag", rich_b_mode="none",
             outer_model_dim=16, outer_model_type="multislot",
@@ -52,7 +52,7 @@ class TestTrainingWithSleep(unittest.TestCase):
 
     def test_training_without_sleep_has_zero_cycles(self) -> None:
         """Training without sleep enabled reports zero sleep cycles."""
-        model = ChaosStudentLM(
+        model = CareStudentLM(
             vocab_size=256, dim=16, num_layers=2, ff_mult=2,
             a_mode="diag", rich_b_mode="none", outer_model_dim=0,
         )

@@ -1,4 +1,4 @@
-"""Parity tests for FusedChaosSSMBlock in chaoscontrol.core_fused.
+"""Parity tests for FusedCareSSMBlock in chaoscontrol.core_fused.
 
 Exp 18 Test 8: kernel fusion for the block's post-scan hot path.
 
@@ -6,8 +6,8 @@ Load-bearing: if any of these parity checks drifts, the fusion is wrong
 and must be scrapped. Template follows
 `tests/test_core.py::TestChunkedDiagScan::test_chunked_backend_gradients_match_loop`.
 
-The fused block shares its ChaosSSMCore and submodules with the unfused
-ChaosSSMBlock, so forward outputs and backward gradients must agree to
+The fused block shares its CareSSMCore and submodules with the unfused
+CareSSMBlock, so forward outputs and backward gradients must agree to
 within numerical noise across float32 and bf16 for both single-forward
 parity and multi-step training trajectories.
 
@@ -35,21 +35,21 @@ def _force_eager_backends() -> None:
 
 
 class TestFusedBlockForwardParity(unittest.TestCase):
-    """Forward-pass parity between ChaosSSMBlock and FusedChaosSSMBlock."""
+    """Forward-pass parity between CareSSMBlock and FusedCareSSMBlock."""
 
     def setUp(self) -> None:
         _force_eager_backends()
         # Import after env setup so the resolver picks up eager backend.
-        from chaoscontrol.core_fused import FusedChaosSSMBlock  # noqa: F401
-        from chaoscontrol.model import ChaosSSMBlock  # noqa: F401
+        from chaoscontrol.core_fused import FusedCareSSMBlock  # noqa: F401
+        from chaoscontrol.model import CareSSMBlock  # noqa: F401
 
     def test_forward_parity_float32(self) -> None:
-        from chaoscontrol.core_fused import FusedChaosSSMBlock
-        from chaoscontrol.model import ChaosSSMBlock
+        from chaoscontrol.core_fused import FusedCareSSMBlock
+        from chaoscontrol.model import CareSSMBlock
 
         torch.manual_seed(0)
-        block = ChaosSSMBlock(dim=32, ff_mult=2, a_mode="diag")
-        fused = FusedChaosSSMBlock.from_unfused(block)
+        block = CareSSMBlock(dim=32, ff_mult=2, a_mode="diag")
+        fused = FusedCareSSMBlock.from_unfused(block)
 
         x = torch.randn(4, 16, 32)
         y_base = block(x)
@@ -62,12 +62,12 @@ class TestFusedBlockForwardParity(unittest.TestCase):
         assert y_base.shape == y_fused.shape
 
     def test_forward_parity_bf16(self) -> None:
-        from chaoscontrol.core_fused import FusedChaosSSMBlock
-        from chaoscontrol.model import ChaosSSMBlock
+        from chaoscontrol.core_fused import FusedCareSSMBlock
+        from chaoscontrol.model import CareSSMBlock
 
         torch.manual_seed(1)
-        block = ChaosSSMBlock(dim=32, ff_mult=2, a_mode="diag").to(torch.bfloat16)
-        fused = FusedChaosSSMBlock.from_unfused(block)
+        block = CareSSMBlock(dim=32, ff_mult=2, a_mode="diag").to(torch.bfloat16)
+        fused = FusedCareSSMBlock.from_unfused(block)
         assert fused.ff.fc.weight.dtype == torch.bfloat16, (
             "from_unfused should inherit source block dtype"
         )
@@ -84,8 +84,8 @@ class TestFusedBlockForwardParity(unittest.TestCase):
 
     def test_forward_shapes_various_configs(self) -> None:
         """Run a few (batch, seq, dim, ff_mult) configs."""
-        from chaoscontrol.core_fused import FusedChaosSSMBlock
-        from chaoscontrol.model import ChaosSSMBlock
+        from chaoscontrol.core_fused import FusedCareSSMBlock
+        from chaoscontrol.model import CareSSMBlock
 
         cases = [
             (1, 8, 16, 2),
@@ -94,8 +94,8 @@ class TestFusedBlockForwardParity(unittest.TestCase):
         ]
         for B, T, D, M in cases:
             torch.manual_seed(B * 1000 + T)
-            block = ChaosSSMBlock(dim=D, ff_mult=M, a_mode="diag")
-            fused = FusedChaosSSMBlock.from_unfused(block)
+            block = CareSSMBlock(dim=D, ff_mult=M, a_mode="diag")
+            fused = FusedCareSSMBlock.from_unfused(block)
             x = torch.randn(B, T, D)
             y_base = block(x)
             y_fused = fused(x)
@@ -107,14 +107,14 @@ class TestFusedBlockForwardParity(unittest.TestCase):
 
     def test_from_unfused_preserves_low_rank_delta_shape(self) -> None:
         from chaoscontrol.core import LowRankDeltaProjection
-        from chaoscontrol.core_fused import FusedChaosSSMBlock
-        from chaoscontrol.model import ChaosSSMBlock
+        from chaoscontrol.core_fused import FusedCareSSMBlock
+        from chaoscontrol.model import CareSSMBlock
 
         torch.manual_seed(17)
-        block = ChaosSSMBlock(
+        block = CareSSMBlock(
             dim=24, ff_mult=2, a_mode="diag", ssm_delta_rank=4
         )
-        fused = FusedChaosSSMBlock.from_unfused(block)
+        fused = FusedCareSSMBlock.from_unfused(block)
         assert isinstance(fused.core.delta_proj, LowRankDeltaProjection)
         assert fused.core.delta_rank == 4
 
@@ -125,7 +125,7 @@ class TestFusedBlockForwardParity(unittest.TestCase):
 
 
 class TestFusedBlockGradientParity(unittest.TestCase):
-    """Backward-pass parity between ChaosSSMBlock and FusedChaosSSMBlock.
+    """Backward-pass parity between CareSSMBlock and FusedCareSSMBlock.
 
     Load-bearing: if gradient magnitudes or directions diverge here the
     fusion changes the computational graph and cannot be used for
@@ -172,12 +172,12 @@ class TestFusedBlockGradientParity(unittest.TestCase):
             )
 
     def test_gradient_parity_float32(self) -> None:
-        from chaoscontrol.core_fused import FusedChaosSSMBlock
-        from chaoscontrol.model import ChaosSSMBlock
+        from chaoscontrol.core_fused import FusedCareSSMBlock
+        from chaoscontrol.model import CareSSMBlock
 
         torch.manual_seed(2)
-        block = ChaosSSMBlock(dim=32, ff_mult=2, a_mode="diag")
-        fused = FusedChaosSSMBlock.from_unfused(block)
+        block = CareSSMBlock(dim=32, ff_mult=2, a_mode="diag")
+        fused = FusedCareSSMBlock.from_unfused(block)
 
         x_base = torch.randn(4, 16, 32, requires_grad=True)
         x_fused = x_base.detach().clone().requires_grad_(True)
@@ -192,12 +192,12 @@ class TestFusedBlockGradientParity(unittest.TestCase):
         )
 
     def test_gradient_parity_bf16(self) -> None:
-        from chaoscontrol.core_fused import FusedChaosSSMBlock
-        from chaoscontrol.model import ChaosSSMBlock
+        from chaoscontrol.core_fused import FusedCareSSMBlock
+        from chaoscontrol.model import CareSSMBlock
 
         torch.manual_seed(3)
-        block = ChaosSSMBlock(dim=32, ff_mult=2, a_mode="diag").to(torch.bfloat16)
-        fused = FusedChaosSSMBlock.from_unfused(block)
+        block = CareSSMBlock(dim=32, ff_mult=2, a_mode="diag").to(torch.bfloat16)
+        fused = FusedCareSSMBlock.from_unfused(block)
 
         x_base = torch.randn(4, 16, 32, dtype=torch.bfloat16, requires_grad=True)
         x_fused = x_base.detach().clone().requires_grad_(True)
@@ -230,10 +230,10 @@ class TestFusedBlockTrainingParity(unittest.TestCase):
         _force_eager_backends()
 
     def _make_toy_lm(self, use_fused: bool, *, dim: int, vocab: int) -> nn.Module:
-        from chaoscontrol.core_fused import FusedChaosSSMBlock
-        from chaoscontrol.model import ChaosSSMBlock
+        from chaoscontrol.core_fused import FusedCareSSMBlock
+        from chaoscontrol.model import CareSSMBlock
 
-        cls = FusedChaosSSMBlock if use_fused else ChaosSSMBlock
+        cls = FusedCareSSMBlock if use_fused else CareSSMBlock
 
         class ToyLM(nn.Module):
             def __init__(self) -> None:
@@ -321,7 +321,7 @@ class TestFusedBlockTrainingParity(unittest.TestCase):
 class TestFusedBlockFallbackPaths(unittest.TestCase):
     """Non-fast-path configurations still return correct results.
 
-    FusedChaosSSMBlock is supposed to be a drop-in replacement: any
+    FusedCareSSMBlock is supposed to be a drop-in replacement: any
     configuration it doesn't support (jacobian stats, non-diag mode)
     should dispatch to the unfused path and produce correct outputs.
     """
@@ -330,12 +330,12 @@ class TestFusedBlockFallbackPaths(unittest.TestCase):
         _force_eager_backends()
 
     def test_return_jacobian_stats_falls_back(self) -> None:
-        from chaoscontrol.core_fused import FusedChaosSSMBlock
-        from chaoscontrol.model import ChaosSSMBlock
+        from chaoscontrol.core_fused import FusedCareSSMBlock
+        from chaoscontrol.model import CareSSMBlock
 
         torch.manual_seed(4)
-        block = ChaosSSMBlock(dim=16, ff_mult=2, a_mode="diag")
-        fused = FusedChaosSSMBlock.from_unfused(block)
+        block = CareSSMBlock(dim=16, ff_mult=2, a_mode="diag")
+        fused = FusedCareSSMBlock.from_unfused(block)
 
         x = torch.randn(2, 8, 16)
         y_base, stats_base = block(x, return_jacobian_stats=True)
@@ -351,7 +351,7 @@ class TestPostScanFusedFunction(unittest.TestCase):
 
     The function should match a hand-rolled reference that spells out
     every op. This catches subtle rewriting bugs in the fused function
-    body that could drift from ChaosSSMBlock semantics.
+    body that could drift from CareSSMBlock semantics.
     """
 
     def setUp(self) -> None:

@@ -27,13 +27,13 @@ sys.path.insert(0, str(REPO / "experiments" / "18_throughput_levers"))
 sys.path.insert(0, str(REPO / "experiments" / "17_local_attn_sidecar"))
 sys.path.insert(0, str(REPO / "src"))
 
-from chaoscontrol.model import ChaosStudentLM  # noqa: E402
+from chaoscontrol.model import CareStudentLM  # noqa: E402
 from runner_persistent_ddp import _require_config_match, _warmup_and_restore  # noqa: E402
 
 
-def _tiny_model() -> ChaosStudentLM:
+def _tiny_model() -> CareStudentLM:
     torch.manual_seed(42)
-    return ChaosStudentLM(
+    return CareStudentLM(
         vocab_size=32, dim=8, num_layers=1, ff_mult=2, a_mode="diag",
     )
 

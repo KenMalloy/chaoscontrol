@@ -37,7 +37,7 @@ def metabolic_fork(
     ``.outer_model``, ``.layers``, ``.final_norm``, and ``.lm_head``.
 
     Args:
-        model: A ChaosStudentLM (or compatible duck-typed object).
+        model: A CareStudentLM (or compatible duck-typed object).
         input_ids: Token ids, shape ``(batch, seq)``.
         k: Number of candidate rollouts.
         noise_std: Std-dev of Gaussian perturbation added to embeddings.

@@ -126,7 +126,7 @@ def _train_tiny_sp_model(out_dir: Path) -> Path:
 
 
 def _tiny_chaos_config() -> dict:
-    """ChaosStudentLM kwargs that build in <100ms on CPU.
+    """CareStudentLM kwargs that build in <100ms on CPU.
 
     Mirrors the tiny-config used in ``test_runner_exp21_output_ckpt.py``
     so this checkpoint reads back via the same loader contract that
@@ -150,18 +150,18 @@ def _tiny_chaos_config() -> dict:
 
 
 def _write_tiny_checkpoint(ckpt_path: Path, *, seed: int = 0) -> dict:
-    """Build a randomly-initialized ChaosStudentLM and save in the
+    """Build a randomly-initialized CareStudentLM and save in the
     Task-1 ``--output-ckpt`` format.
 
     No training is needed — random weights through the eval + calibration
     + quantize + dequantize + eval pipeline test the contract, not model
     quality.
     """
-    from chaoscontrol.model import ChaosStudentLM
+    from chaoscontrol.model import CareStudentLM
 
     cfg = _tiny_chaos_config()
     torch.manual_seed(seed)
-    model = ChaosStudentLM(**cfg)
+    model = CareStudentLM(**cfg)
     state = {k: v.detach().cpu() for k, v in model.state_dict().items()}
     torch.save({"model": state, "config": cfg}, ckpt_path)
     return cfg

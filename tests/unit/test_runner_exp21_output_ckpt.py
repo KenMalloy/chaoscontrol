@@ -5,7 +5,7 @@ The checkpoint format is the contract consumed by
 
     blob = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     cfg = blob["config"]
-    model = ChaosStudentLM(**cfg)
+    model = CareStudentLM(**cfg)
     model.load_state_dict(blob["model"], strict=True)
 
 These tests exercise that exact loader pattern against the runner's
@@ -59,11 +59,11 @@ def _tiny_transformer_config() -> dict:
 
 def _load_via_run_exp20_eval_pattern(ckpt_path: Path):
     """Mirror scripts/run_exp20_eval.py::_build_model line-for-line."""
-    from chaoscontrol.model import ChaosStudentLM
+    from chaoscontrol.model import CareStudentLM
 
     blob = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     cfg = blob["config"]
-    model = ChaosStudentLM(**cfg)
+    model = CareStudentLM(**cfg)
     model.load_state_dict(blob["model"], strict=True)
     online_eval_state = blob.get("online_eval_state")
     if isinstance(online_eval_state, dict):
@@ -205,23 +205,23 @@ def test_ssm_arm_round_trips_through_run_exp20_eval_loader(tmp_path):
         )
 
     # Reconstructed model is the same class, not some lookalike.
-    assert type(reloaded).__name__ == "ChaosStudentLM"
+    assert type(reloaded).__name__ == "CareStudentLM"
     assert type(reloaded).__module__ == "chaoscontrol.model"
 
 
 def test_ssm_kwargs_match_build_model_signature(tmp_path):
-    """The kwargs we save are accepted by ChaosStudentLM unchanged.
+    """The kwargs we save are accepted by CareStudentLM unchanged.
 
     Guards against silently introducing a config field that the model
     constructor would reject — caught here as TypeError before a real
     run_exp20_eval invocation.
     """
-    from chaoscontrol.model import ChaosStudentLM
+    from chaoscontrol.model import CareStudentLM
 
     cfg = _ssm_constructor_kwargs(_tiny_ssm_config())
-    # If any kwarg is not in ChaosStudentLM.__init__'s signature, this
+    # If any kwarg is not in CareStudentLM.__init__'s signature, this
     # raises TypeError("got an unexpected keyword argument").
-    model = ChaosStudentLM(**cfg)
+    model = CareStudentLM(**cfg)
     assert model.vocab_size == cfg["vocab_size"]
     assert model.dim == cfg["dim"]
 
@@ -231,7 +231,7 @@ def test_transformer_arm_save_loads_back_via_torch_load(tmp_path):
     doesn't currently know how to load them.
 
     Per design comment in _save_output_ckpt: the consumer hardcodes
-    ChaosStudentLM(**cfg). Transformer checkpoints save correctly with
+    CareStudentLM(**cfg). Transformer checkpoints save correctly with
     NanoGPTLeanLM kwargs and can be reloaded directly by NanoGPTLeanLM.
     """
     from chaoscontrol.baselines_nanogpt_lean import NanoGPTLeanLM

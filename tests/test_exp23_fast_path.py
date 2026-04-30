@@ -261,9 +261,9 @@ def test_build_optimizer_crct_uses_role_dispatch_for_muon():
 
 def test_build_optimizer_crct_keeps_low_rank_delta_on_adamw_path():
     mod = _load_runner_module()
-    from chaoscontrol.model import ChaosStudentLM
+    from chaoscontrol.model import CareStudentLM
 
-    model = ChaosStudentLM(
+    model = CareStudentLM(
         vocab_size=16,
         dim=8,
         num_layers=1,
@@ -841,19 +841,19 @@ def test_train_fast_for_budget_rejects_scopt_non_fused_baseline(monkeypatch):
 
 
 def test_scopt_optimizer_config_matches_real_chaos_ssm_core():
-    """Smoke-test against a real ChaosSSMCore. The tiny test models
+    """Smoke-test against a real CareSSMCore. The tiny test models
     above cover submodule naming convention but can't verify the map
     actually hits the real block's projections — reviewer flagged this
     gap after C5/C6 shipped broken last time against the real core."""
     mod = _load_runner_module()
-    from chaoscontrol.core import ChaosSSMCore
+    from chaoscontrol.core import CareSSMCore
 
     class _RealCoreShell(nn.Module):
         def __init__(self):
             super().__init__()
             self.embed = nn.Embedding(8, 6)
             self.layers = nn.ModuleList([nn.Module()])
-            self.layers[0].core = ChaosSSMCore(dim=6, a_mode="diag")
+            self.layers[0].core = CareSSMCore(dim=6, a_mode="diag")
             self.final_norm = nn.Identity()
             self.lm_head = nn.Linear(6, 8, bias=False)
 
@@ -884,13 +884,13 @@ def test_scopt_optimizer_config_matches_real_chaos_ssm_core():
 
 def test_scopt_realistic_core_hooks_fire_on_real_projections(monkeypatch):
     """Every mapped submodule's pre+post hooks must actually capture
-    tensors during the real ChaosSSMCore forward pass."""
+    tensors during the real CareSSMCore forward pass."""
     monkeypatch.setenv("CHAOSCONTROL_DIAG_SCAN_BACKEND", "chunked")
     monkeypatch.setenv("CHAOSCONTROL_POST_SCAN_BACKEND", "eager")
     _reload_backend_modules()
 
     mod = _load_runner_module()
-    from chaoscontrol.core import ChaosSSMCore
+    from chaoscontrol.core import CareSSMCore
     from chaoscontrol.optim.scopt import ScarcityAwareOptimizer
 
     class _RealCoreShell(nn.Module):
@@ -898,7 +898,7 @@ def test_scopt_realistic_core_hooks_fire_on_real_projections(monkeypatch):
             super().__init__()
             self.embed = nn.Embedding(8, 6)
             self.layers = nn.ModuleList([nn.Module()])
-            self.layers[0].core = ChaosSSMCore(dim=6, a_mode="diag")
+            self.layers[0].core = CareSSMCore(dim=6, a_mode="diag")
             self.final_norm = nn.Identity()
             self.lm_head = nn.Linear(6, 8, bias=False)
 
@@ -2937,7 +2937,7 @@ from contextlib import contextmanager  # noqa: E402
 
 
 class _FakeSSMCore(nn.Module):
-    """Minimal stand-in for ChaosSSMCore.
+    """Minimal stand-in for CareSSMCore.
 
     Exposes the two contract surfaces the runner walks for CD:
       * ``capture_states()`` — context manager yielding a getter for the

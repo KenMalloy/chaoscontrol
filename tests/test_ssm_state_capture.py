@@ -1,11 +1,11 @@
 import torch
 import pytest
-from chaoscontrol.core import ChaosSSMCore
+from chaoscontrol.core import CareSSMCore
 
 
-def _make_core(dim: int = 8) -> ChaosSSMCore:
+def _make_core(dim: int = 8) -> CareSSMCore:
     torch.manual_seed(0)
-    return ChaosSSMCore(dim=dim, a_mode="diag")
+    return CareSSMCore(dim=dim, a_mode="diag")
 
 
 def test_capture_states_context_manager_records_shape_via_helper():
@@ -85,7 +85,7 @@ def test_forward_output_is_identical_with_and_without_capture():
 
 def test_capture_states_raises_for_paired_mode():
     torch.manual_seed(0)
-    core = ChaosSSMCore(dim=8, a_mode="paired")
+    core = CareSSMCore(dim=8, a_mode="paired")
     with pytest.raises(NotImplementedError, match="capture_states"):
         with core.capture_states():
             pass
@@ -93,7 +93,7 @@ def test_capture_states_raises_for_paired_mode():
 
 def test_capture_states_raises_for_full_mode():
     torch.manual_seed(0)
-    core = ChaosSSMCore(dim=8, a_mode="full")
+    core = CareSSMCore(dim=8, a_mode="full")
     with pytest.raises(NotImplementedError, match="capture_states"):
         with core.capture_states():
             pass

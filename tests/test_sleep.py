@@ -5,7 +5,7 @@ import torch
 import torch.nn.functional as F
 
 from chaoscontrol.sleep import SleepConfig, SleepCycle
-from chaoscontrol.model import ChaosStudentLM
+from chaoscontrol.model import CareStudentLM
 from chaoscontrol.wake_cache import WakeCache
 from chaoscontrol.regret import RegretTable
 
@@ -21,8 +21,8 @@ def _make_model(
     typed_storage: bool = False,
     wernicke: bool = False,
     semantic: bool = False,
-) -> ChaosStudentLM:
-    """Build a minimal ChaosStudentLM with multislot outer model."""
+) -> CareStudentLM:
+    """Build a minimal CareStudentLM with multislot outer model."""
     torch.manual_seed(42)
     kw: dict = dict(
         vocab_size=256,
@@ -37,10 +37,10 @@ def _make_model(
         kw.update(wernicke_enabled=True, wernicke_k_max=4, wernicke_window=4)
     if semantic:
         kw["semantic_tier_bases"] = 4
-    return ChaosStudentLM(**kw)
+    return CareStudentLM(**kw)
 
 
-def _populate_slots(model: ChaosStudentLM, n: int = 8, buckets: list[int] | None = None) -> None:
+def _populate_slots(model: CareStudentLM, n: int = 8, buckets: list[int] | None = None) -> None:
     """Write n random slots into the outer model."""
     om = model.outer_model
     for i in range(n):
@@ -51,7 +51,7 @@ def _populate_slots(model: ChaosStudentLM, n: int = 8, buckets: list[int] | None
         om._survival[-1] = float(i) * 0.1
 
 
-def _make_cache(model: ChaosStudentLM, n_moments: int = 4) -> WakeCache:
+def _make_cache(model: CareStudentLM, n_moments: int = 4) -> WakeCache:
     """Build a WakeCache with n_moments of random data."""
     cache = WakeCache(max_moments=32)
     seq_len = 32
@@ -435,7 +435,7 @@ class TestEdgeCases:
     """Edge cases and boundary conditions."""
 
     def test_no_outer_model_returns_early(self):
-        model = ChaosStudentLM(vocab_size=256, dim=16, num_layers=2)
+        model = CareStudentLM(vocab_size=256, dim=16, num_layers=2)
         cache = WakeCache()
         cycle = SleepCycle()
         diag = cycle.run(model, cache, device="cpu")

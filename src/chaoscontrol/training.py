@@ -219,7 +219,7 @@ def train_chaoscontrol_for_budget(
     world_size: int | None = None,
     optimizer: str = "adamw",
 ) -> dict[str, Any]:
-    """Train ChaosStudentLM for a time budget with optional criticality regularization.
+    """Train CareStudentLM for a time budget with optional criticality regularization.
 
     DDP semantics:
         When ``world_size > 1`` (resolved from explicit args, torch.distributed
@@ -969,7 +969,7 @@ def run_chaoscontrol_matrix(
     Prints progress per cell and checkpoints results to output_json (if set)
     after every cell, so partial results survive pod crashes.
     """
-    from chaoscontrol.model import ChaosStudentLM
+    from chaoscontrol.model import CareStudentLM
     from chaoscontrol.evaluation import evaluate_chaoscontrol_bpb
 
     cells = build_chaoscontrol_matrix()
@@ -977,7 +977,7 @@ def run_chaoscontrol_matrix(
     total = len(cells)
 
     for i, cell in enumerate(cells):
-        model = ChaosStudentLM(
+        model = CareStudentLM(
             vocab_size=cfg.vocab_size,
             dim=cfg.model_dim,
             num_layers=cfg.num_layers,

@@ -12,12 +12,12 @@ from __future__ import annotations
 import torch
 
 from chaoscontrol.core import _should_use_zero_initial_state_fast_path
-from chaoscontrol.model import ChaosStudentLM
+from chaoscontrol.model import CareStudentLM
 
 
 def _tiny_lm():
     torch.manual_seed(0)
-    return ChaosStudentLM(vocab_size=32, dim=16, num_layers=2, block_type="ssm", a_mode="diag")
+    return CareStudentLM(vocab_size=32, dim=16, num_layers=2, block_type="ssm", a_mode="diag")
 
 
 def test_backward_compat_no_state_kwarg():

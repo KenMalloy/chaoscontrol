@@ -337,11 +337,11 @@ def test_criticality_loss_has_no_grad_path_to_pressure_or_states():
 def test_full_mechanism_moves_seat_log_a_more_than_non_seat():
     """After N training steps, seat-channel log_a values should move
     meaningfully while non-seat log_a values stay pinned."""
-    from chaoscontrol.core import ChaosSSMCore
+    from chaoscontrol.core import CareSSMCore
 
     torch.manual_seed(0)
     dim = 8
-    core = ChaosSSMCore(dim=dim, a_mode="diag")
+    core = CareSSMCore(dim=dim, a_mode="diag")
     cd = CriticalityDistillation(
         num_layers=1,
         dim=dim,

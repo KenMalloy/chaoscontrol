@@ -52,14 +52,14 @@ def _requires_online_replay_eval(blob: dict, cfg: dict) -> bool:
 
 
 def _build_model(ckpt_path: Path) -> tuple[torch.nn.Module, dict, dict]:
-    from chaoscontrol.model import ChaosStudentLM
+    from chaoscontrol.model import CareStudentLM
     # weights_only=False because the checkpoint payload is a dict with
     # {model, config, ...}, not a pure tensor. We trust our own checkpoints.
     blob = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     cfg = blob["config"]
     if _requires_online_replay_eval(blob, cfg):
         raise RuntimeError(_ONLINE_REPLAY_EVAL_ERROR)
-    model = ChaosStudentLM(**cfg)
+    model = CareStudentLM(**cfg)
     # strict=True: any unexpected / missing key is a checkpoint mismatch we
     # want to surface, not paper over. attach_trainable_h0 runs AFTER this
     # (see run() below) so eval-only params never need a loose load.

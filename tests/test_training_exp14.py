@@ -1,11 +1,11 @@
 """Tests for Experiment 14 training loop integration."""
 import torch
-from chaoscontrol.model import ChaosStudentLM
+from chaoscontrol.model import CareStudentLM
 from chaoscontrol.training import train_chaoscontrol_for_budget
 
 
 def _make_model(buffer_mode="append_only", retrieval_mode="bucket_mean"):
-    return ChaosStudentLM(
+    return CareStudentLM(
         vocab_size=256, dim=64, num_layers=2,
         outer_model_dim=32, outer_model_type="multislot",
         outer_max_slots=0,
@@ -67,7 +67,7 @@ def test_training_append_only_skips_consolidation():
 
 def test_training_legacy_mode_still_works():
     """Legacy mode should still use consolidation_step."""
-    model = ChaosStudentLM(
+    model = CareStudentLM(
         vocab_size=256, dim=64, num_layers=2,
         outer_model_dim=32, outer_model_type="multislot",
         outer_max_slots=64,

@@ -5,7 +5,7 @@ Test 3 asks whether wrapping the block stack in ``torch.utils.checkpoint``
 lets us trade recompute cost for VRAM headroom, pushing the single-GPU batch
 ceiling past the chunked scan's bs=512 wall (bound by fp64 cumprod
 intermediates) up to bs=1024 or bs=2048. The ``activation_checkpoint`` flag
-on ``ChaosStudentLM`` landed in the merged subagent work; this orchestrator
+on ``CareStudentLM`` landed in the merged subagent work; this orchestrator
 exercises it under real bpb measurement.
 
 Three conditions:

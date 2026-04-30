@@ -10101,7 +10101,7 @@ def train_fast_for_budget(
             # capture_states() contexts BEFORE the encode call in
             # _run_train_step so the cores write into _captured_states.
             # We keep the stack open across the train-step call and
-            # read getters BEFORE exiting — the real ChaosSSMCore clears
+            # read getters BEFORE exiting — the real CareSSMCore clears
             # _captured_states in its context finally block.
             cd_state_getters: list = []
             cd_stack = contextlib.ExitStack()
@@ -10208,7 +10208,7 @@ def train_fast_for_budget(
             # Criticality Distillation: ingest + seat refresh + loss add.
             # The capture_states() stack is still open, so reading the
             # getters is safe. After ingest we close the stack so the
-            # real ChaosSSMCore can clear its _captured_states per contract.
+            # real CareSSMCore can clear its _captured_states per contract.
             # ------------------------------------------------------------
             if cd is not None:
                 cd_states_per_layer = [g() for g in cd_state_getters]

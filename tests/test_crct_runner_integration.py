@@ -27,7 +27,7 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from chaoscontrol.model import ChaosStudentLM
+from chaoscontrol.model import CareStudentLM
 from chaoscontrol.replay_eviction import ReplayEvictionLoop
 from chaoscontrol.wake_cache_txn import TransactionalWakeCache
 
@@ -62,9 +62,9 @@ def _load_module(name: str, path: Path):
     return mod
 
 
-def _tiny_crct_model() -> ChaosStudentLM:
+def _tiny_crct_model() -> CareStudentLM:
     torch.manual_seed(123)
-    model = ChaosStudentLM(
+    model = CareStudentLM(
         vocab_size=32,
         dim=8,
         num_layers=1,
@@ -95,7 +95,7 @@ def _wait_for_metric(
 
 def test_crct_fast_path_allows_bucket_prototypes_as_sidecar_prior() -> None:
     mod = _load_module("runner_fast_path_crct_bucket_prototype_gate", RUNNER_PATH)
-    model = ChaosStudentLM(
+    model = CareStudentLM(
         vocab_size=32,
         dim=8,
         num_layers=1,

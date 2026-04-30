@@ -22,7 +22,7 @@ import torch
 import torch.nn.functional as F
 
 import chaoscontrol.kernels._lm_head_loss as _lm_head_loss
-from chaoscontrol.model import ChaosStudentLM
+from chaoscontrol.model import CareStudentLM
 from chaoscontrol.training import chunked_cross_entropy
 from chaoscontrol.train_ssm import (
     fused_lm_head_backend_for_mode,
@@ -118,9 +118,9 @@ class _DeterministicClock:
 
 
 @pytest.fixture
-def bare_ssm_model() -> ChaosStudentLM:
+def bare_ssm_model() -> CareStudentLM:
     torch.manual_seed(2026)
-    m = ChaosStudentLM(
+    m = CareStudentLM(
         vocab_size=64,
         dim=16,
         num_layers=2,
@@ -139,7 +139,7 @@ def _make_batch(batch: int, seq: int, vocab: int, seed: int = 0) -> tuple[torch.
 
 
 def _old_path_grads(
-    model: ChaosStudentLM,
+    model: CareStudentLM,
     inputs: torch.Tensor,
     targets: torch.Tensor,
 ) -> dict[str, torch.Tensor]:
@@ -167,7 +167,7 @@ def _old_path_grads(
 class TestTrainSSMStepEquivalence:
     """Parameter-gradient parity between train_ssm_step and the old path."""
 
-    def test_grads_match_bare_ssm_old_path(self, bare_ssm_model: ChaosStudentLM) -> None:
+    def test_grads_match_bare_ssm_old_path(self, bare_ssm_model: CareStudentLM) -> None:
         inputs, targets = _make_batch(batch=2, seq=16, vocab=64, seed=11)
 
         # Two independent copies of the same initial weights
@@ -208,7 +208,7 @@ class TestTrainSSMStepEquivalence:
         )
 
     def test_fused_grad_clip_matches_stdlib_trajectory(
-        self, bare_ssm_model: ChaosStudentLM,
+        self, bare_ssm_model: CareStudentLM,
     ) -> None:
         """End-to-end loss trajectory parity with fused_grad_clip toggled.
 
@@ -285,7 +285,7 @@ class TestTrainSSMStepEquivalence:
             )
 
     def test_fused_muon_matches_unfused_trajectory(
-        self, bare_ssm_model: ChaosStudentLM,
+        self, bare_ssm_model: CareStudentLM,
     ) -> None:
         """End-to-end loss trajectory parity with fused_muon toggled.
 
@@ -369,7 +369,7 @@ class TestTrainSSMStepEquivalence:
                 f"ref={lr_loss} new={ln_loss} diff={lr_loss - ln_loss}"
             )
 
-    def test_grads_match_with_small_chunks(self, bare_ssm_model: ChaosStudentLM) -> None:
+    def test_grads_match_with_small_chunks(self, bare_ssm_model: CareStudentLM) -> None:
         # Exercise actual chunking: seq=16, chunk=4 → 4 chunks.
         # Reduction order differs from the old path (per-chunk sum / N then
         # backward) so tolerance is looser but still well inside
@@ -397,7 +397,7 @@ class TestTrainSSMStepEquivalence:
             assert d < 1e-5, f"fp32 chunk=4 grad mismatch on {name!r}: {d}"
 
     def test_single_backward_mode_matches_bare_ssm_old_path(
-        self, bare_ssm_model: ChaosStudentLM,
+        self, bare_ssm_model: CareStudentLM,
     ) -> None:
         """Single-backward mode keeps the full graph intact.
 
@@ -436,7 +436,7 @@ class TestTrainSSMStepEquivalence:
         reason="fused_lm_head dispatcher no longer falls back on CPU; needs built _C",
     )
     def test_fused_backward_mode_matches_bare_ssm_old_path(
-        self, bare_ssm_model: ChaosStudentLM,
+        self, bare_ssm_model: CareStudentLM,
     ) -> None:
         """Fused mode is allowed to use native RMSNorm but not change math."""
         inputs, targets = _make_batch(batch=2, seq=16, vocab=64, seed=20)
@@ -550,7 +550,7 @@ class TestTrainSSMStepEquivalence:
     )
     def test_fused_step_modes_thread_backend_and_tile_size(
         self,
-        bare_ssm_model: ChaosStudentLM,
+        bare_ssm_model: CareStudentLM,
         monkeypatch,
         mode: str,
         backend: str,
@@ -600,7 +600,7 @@ class TestTrainSSMStepRejectsUnsupportedConfigs:
 
     def test_rejects_wernicke_enabled_model(self) -> None:
         torch.manual_seed(1)
-        model = ChaosStudentLM(
+        model = CareStudentLM(
             vocab_size=32, dim=8, num_layers=1, ff_mult=2,
             a_mode="diag",
             wernicke_enabled=True, wernicke_k_max=4, wernicke_window=4,
@@ -611,7 +611,7 @@ class TestTrainSSMStepRejectsUnsupportedConfigs:
 
     def test_rejects_outer_model_enabled(self) -> None:
         torch.manual_seed(2)
-        model = ChaosStudentLM(
+        model = CareStudentLM(
             vocab_size=32, dim=8, num_layers=1, ff_mult=2,
             a_mode="diag",
             outer_model_dim=8, outer_model_type="single",
@@ -630,7 +630,7 @@ class TestTrainSSMForBudget:
     wall-clock speed.
     """
 
-    def test_single_process_loop_has_deterministic_history(self, bare_ssm_model: ChaosStudentLM) -> None:
+    def test_single_process_loop_has_deterministic_history(self, bare_ssm_model: CareStudentLM) -> None:
         # Deterministic fake corpus — enough tokens to form a handful of
         # batches of short sequences.
         g = torch.Generator().manual_seed(17)
@@ -670,7 +670,7 @@ class TestTrainSSMForBudget:
         max_param_delta = (final_flat - initial_flat).abs().max().item()
         assert max_param_delta > 0.0, "optimizer steps should update model parameters"
 
-    def test_max_steps_caps_loop_below_budget(self, bare_ssm_model: ChaosStudentLM) -> None:
+    def test_max_steps_caps_loop_below_budget(self, bare_ssm_model: CareStudentLM) -> None:
         g = torch.Generator().manual_seed(23)
         vocab = bare_ssm_model.vocab_size
         train_tokens = torch.randint(0, vocab, (256,), generator=g)
@@ -696,7 +696,7 @@ class TestTrainSSMForBudget:
 
     def test_loop_threads_lm_head_tile_size_to_step(
         self,
-        bare_ssm_model: ChaosStudentLM,
+        bare_ssm_model: CareStudentLM,
         monkeypatch,
     ) -> None:
         calls: list[tuple[str, int]] = []
@@ -845,7 +845,7 @@ class TestFullPathCompile:
     """
 
     def test_compiled_step_matches_eager_on_small_batch(
-        self, bare_ssm_model: ChaosStudentLM,
+        self, bare_ssm_model: CareStudentLM,
     ) -> None:
         """Compiled and eager paths produce identical grads at fp32/CPU.
 
@@ -899,7 +899,7 @@ class TestFullPathCompile:
             )
 
     def test_fullgraph_raises_on_break_rather_than_fallback(
-        self, bare_ssm_model: ChaosStudentLM,
+        self, bare_ssm_model: CareStudentLM,
     ) -> None:
         """``fullgraph=True`` must raise on any graph break, not silently
         fall back to eager.
@@ -934,7 +934,7 @@ class TestFullPathCompile:
         )
 
     def test_compiled_trajectory_matches_eager(
-        self, bare_ssm_model: ChaosStudentLM,
+        self, bare_ssm_model: CareStudentLM,
     ) -> None:
         """Multi-step training: compiled and eager produce matched loss
         trajectories at the same seed.

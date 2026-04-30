@@ -10,7 +10,7 @@ from chaoscontrol.eval_stream.temporal_heads import (
     uniform_logprob_mixture,
     weighted_logprob_mixture,
 )
-from chaoscontrol.model import ChaosStudentLM
+from chaoscontrol.model import CareStudentLM
 
 
 def _mutate_suffix(tokens: torch.Tensor, *, cut: int, vocab_size: int) -> torch.Tensor:
@@ -59,7 +59,7 @@ def test_weighted_logprob_mixture_matches_probability_average():
 def test_model_prefix_logprobs_are_suffix_invariant():
     torch.manual_seed(17)
     vocab_size = 64
-    model = ChaosStudentLM(
+    model = CareStudentLM(
         vocab_size=vocab_size,
         dim=16,
         num_layers=2,
@@ -173,7 +173,7 @@ def test_online_exp_weighted_mixture_does_not_let_future_targets_change_current_
 
 def test_single_zero_shift_matches_direct_model():
     torch.manual_seed(0)
-    model = ChaosStudentLM(
+    model = CareStudentLM(
         vocab_size=64,
         dim=16,
         num_layers=2,
@@ -206,7 +206,7 @@ def test_single_zero_shift_matches_direct_model():
 
 def test_identical_uniform_heads_match_direct_model_with_independent_states():
     torch.manual_seed(0)
-    model = ChaosStudentLM(
+    model = CareStudentLM(
         vocab_size=64,
         dim=16,
         num_layers=2,
@@ -269,7 +269,7 @@ def test_base_prior_mixer_protects_base_probability():
 
 def test_temporal_heads_keep_independent_states():
     torch.manual_seed(0)
-    model = ChaosStudentLM(
+    model = CareStudentLM(
         vocab_size=64,
         dim=16,
         num_layers=2,
@@ -296,7 +296,7 @@ def test_temporal_heads_keep_independent_states():
 
 def test_score_temporal_heads_exposes_analysis_only_diagnostics():
     torch.manual_seed(0)
-    model = ChaosStudentLM(
+    model = CareStudentLM(
         vocab_size=64,
         dim=16,
         num_layers=2,
@@ -335,7 +335,7 @@ def test_score_temporal_heads_exposes_analysis_only_diagnostics():
 
 def test_temporal_heads_state_values_diverge_across_chunks():
     torch.manual_seed(0)
-    model = ChaosStudentLM(
+    model = CareStudentLM(
         vocab_size=64,
         dim=16,
         num_layers=2,

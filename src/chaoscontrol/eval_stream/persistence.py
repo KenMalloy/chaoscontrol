@@ -1,7 +1,7 @@
 from __future__ import annotations
 import torch
 import torch.nn as nn
-from chaoscontrol.core import ChaosSSMCore
+from chaoscontrol.core import CareSSMCore
 
 
 class StateManager:
@@ -19,7 +19,7 @@ class StateManager:
     def __init__(self, model: nn.Module, *, persistence_mode: str):
         self.model = model
         self.mode = persistence_mode
-        self._cores = [m for m in model.modules() if isinstance(m, ChaosSSMCore)]
+        self._cores = [m for m in model.modules() if isinstance(m, CareSSMCore)]
         self._state: list[torch.Tensor] = []
         self._doc_idx = -1
 
@@ -55,14 +55,14 @@ class StateManager:
 
 
 def attach_trainable_h0(model: nn.Module) -> None:
-    """Add a trainable h0 vector to each ChaosSSMCore. Eval-time only.
+    """Add a trainable h0 vector to each CareSSMCore. Eval-time only.
 
     Placed on the core's own device+dtype so subsequent `initial_states`
     threading doesn't trigger implicit copies. `nn.Parameter(...)` is registered
-    via attribute assignment because ChaosSSMCore inherits from nn.Module.
+    via attribute assignment because CareSSMCore inherits from nn.Module.
     """
     for core in model.modules():
-        if isinstance(core, ChaosSSMCore):
+        if isinstance(core, CareSSMCore):
             if not hasattr(core, "_trainable_h0"):
                 # Use an existing core parameter to pin device+dtype.
                 ref = next(core.parameters())
@@ -76,7 +76,7 @@ def detach_trainable_h0(model: nn.Module) -> None:
     `model.state_dict()` must contain no `_trainable_h0` keys.
     """
     for core in model.modules():
-        if isinstance(core, ChaosSSMCore):
+        if isinstance(core, CareSSMCore):
             if hasattr(core, "_trainable_h0"):
                 # Attribute delete also removes from _parameters.
                 del core._trainable_h0

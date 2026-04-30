@@ -2,11 +2,11 @@ import torch
 from chaoscontrol.eval_stream.persistence import (
     StateManager, attach_trainable_h0, detach_trainable_h0,
 )
-from chaoscontrol.model import ChaosStudentLM
+from chaoscontrol.model import CareStudentLM
 
 
 def _tiny_ssm_lm():
-    return ChaosStudentLM(vocab_size=32, dim=16, num_layers=2, block_type="ssm", a_mode="diag")
+    return CareStudentLM(vocab_size=32, dim=16, num_layers=2, block_type="ssm", a_mode="diag")
 
 
 def test_reset_mode_zeros_state():
@@ -64,7 +64,7 @@ def test_trainable_h0_receives_gradient():
     loss = out["logits"].sum()
     loss.backward()
     for core in m.modules():
-        from chaoscontrol.core import ChaosSSMCore
-        if isinstance(core, ChaosSSMCore):
+        from chaoscontrol.core import CareSSMCore
+        if isinstance(core, CareSSMCore):
             assert core._trainable_h0.grad is not None
             assert core._trainable_h0.grad.abs().sum() > 0

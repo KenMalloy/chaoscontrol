@@ -44,7 +44,7 @@ from chaoscontrol.data import (
     resolve_param_dtype,
 )
 from chaoscontrol.evaluation import compute_bpb
-from chaoscontrol.model import ChaosStudentLM
+from chaoscontrol.model import CareStudentLM
 from chaoscontrol.training import train_chaoscontrol_for_budget
 
 
@@ -146,9 +146,9 @@ def evaluate_bpb_sp(
     }
 
 
-def build_model(config: dict[str, Any], device: torch.device, param_dtype: torch.dtype) -> ChaosStudentLM:
+def build_model(config: dict[str, Any], device: torch.device, param_dtype: torch.dtype) -> CareStudentLM:
     """Build the bare SSM backbone used for the probe."""
-    model = ChaosStudentLM(
+    model = CareStudentLM(
         vocab_size=config["vocab_size"],
         dim=config["model_dim"],
         num_layers=config["num_layers"],
@@ -210,7 +210,7 @@ class ContentOracleSelector(nn.Module):
 
 
 def collect_oracle_examples(
-    model: ChaosStudentLM,
+    model: CareStudentLM,
     *,
     tokens: torch.Tensor,
     starts: list[int],

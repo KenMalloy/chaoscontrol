@@ -1,11 +1,11 @@
 """Tests for Experiment 14 model integration."""
 import torch
-from chaoscontrol.model import ChaosStudentLM
+from chaoscontrol.model import CareStudentLM
 
 
 def test_forward_append_only_mode():
     """Model creates with append_only buffer and produces logits."""
-    model = ChaosStudentLM(
+    model = CareStudentLM(
         vocab_size=256, dim=128, num_layers=2,
         outer_model_dim=64, outer_model_type="multislot",
         outer_max_slots=0,
@@ -22,7 +22,7 @@ def test_forward_append_only_mode():
 
 def test_forward_bucket_prototypes():
     """Model with bucket prototypes runs without error."""
-    model = ChaosStudentLM(
+    model = CareStudentLM(
         vocab_size=256, dim=128, num_layers=2,
         outer_model_dim=64, outer_model_type="multislot",
         outer_max_slots=0,
@@ -39,7 +39,7 @@ def test_forward_bucket_prototypes():
 
 def test_forward_hierarchical_wernicke():
     """Model with hierarchical Wernicke runs and reports bucket_ids."""
-    model = ChaosStudentLM(
+    model = CareStudentLM(
         vocab_size=256, dim=128, num_layers=2,
         outer_model_dim=64, outer_model_type="multislot",
         outer_max_slots=0,
@@ -59,7 +59,7 @@ def test_forward_hierarchical_wernicke():
 def test_forward_side_effect_free_by_default():
     """Fix 2: forward() with default memory_write_mode='none' must not
     modify the buffer."""
-    model = ChaosStudentLM(
+    model = CareStudentLM(
         vocab_size=256, dim=128, num_layers=2,
         outer_model_dim=64, outer_model_type="multislot",
         outer_max_slots=0,
@@ -77,7 +77,7 @@ def test_forward_side_effect_free_by_default():
 
 def test_forward_append_only_writes():
     """When memory_write_mode='append_only', buffer should grow."""
-    model = ChaosStudentLM(
+    model = CareStudentLM(
         vocab_size=256, dim=128, num_layers=2,
         outer_model_dim=64, outer_model_type="multislot",
         outer_max_slots=0,
@@ -94,7 +94,7 @@ def test_forward_append_only_writes():
 
 def test_forward_per_token_writes():
     """Fix 3: writes must be per-token, not one dominant bucket per batch."""
-    model = ChaosStudentLM(
+    model = CareStudentLM(
         vocab_size=256, dim=128, num_layers=2,
         outer_model_dim=64, outer_model_type="multislot",
         outer_max_slots=0,
@@ -111,7 +111,7 @@ def test_forward_per_token_writes():
 
 def test_forward_legacy_mode_unchanged():
     """Legacy buffer mode should use the old read() path."""
-    model = ChaosStudentLM(
+    model = CareStudentLM(
         vocab_size=256, dim=128, num_layers=2,
         outer_model_dim=64, outer_model_type="multislot",
         outer_max_slots=64,
@@ -125,7 +125,7 @@ def test_forward_legacy_mode_unchanged():
 
 
 def test_forward_returns_bucket_ids():
-    model = ChaosStudentLM(
+    model = CareStudentLM(
         vocab_size=256, dim=128, num_layers=2,
         outer_model_dim=64, outer_model_type="multislot",
         outer_max_slots=0,

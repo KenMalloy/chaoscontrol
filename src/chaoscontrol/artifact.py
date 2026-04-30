@@ -17,7 +17,7 @@ import torch
 import torch.nn as nn
 
 from chaoscontrol.config import ChaosControlConfig
-from chaoscontrol.model import ChaosStudentLM
+from chaoscontrol.model import CareStudentLM
 from chaoscontrol.memory import MultiSlotOuterModel, SemanticTier
 from chaoscontrol.regret import RegretTable
 
@@ -111,7 +111,7 @@ def _cpu_copy_tree(obj: Any) -> Any:
 # ---------------------------------------------------------------------------
 
 def serialize_artifact(
-    model: ChaosStudentLM,
+    model: CareStudentLM,
     tokenizer: nn.Module | None,
     config: ChaosControlConfig,
     path: str | Path,
@@ -312,7 +312,7 @@ def serialize_artifact(
 def load_artifact(
     path: str | Path,
     device: str | torch.device = "cpu",
-) -> tuple[ChaosStudentLM, nn.Module | None, ChaosControlConfig]:
+) -> tuple[CareStudentLM, nn.Module | None, ChaosControlConfig]:
     """Load a serialized artifact, returning (model, tokenizer, config).
 
     Dequantizes weights and restores all episodic/semantic/regret state.

@@ -1,4 +1,4 @@
-"""Forward/backward parity tests for ChaosStudentLM activation checkpointing.
+"""Forward/backward parity tests for CareStudentLM activation checkpointing.
 
 All tests run on CPU in float32 so bf16 quantization noise does not enter
 the parity checks. The checkpoint code path must reproduce the non-checkpoint
@@ -14,10 +14,10 @@ import unittest
 import torch
 import torch.nn as nn
 
-from chaoscontrol.model import ChaosStudentLM
+from chaoscontrol.model import CareStudentLM
 
 
-def _make_model(*, seed: int, activation_checkpoint: bool | None) -> ChaosStudentLM:
+def _make_model(*, seed: int, activation_checkpoint: bool | None) -> CareStudentLM:
     torch.manual_seed(seed)
     kwargs = dict(
         vocab_size=64,
@@ -30,12 +30,12 @@ def _make_model(*, seed: int, activation_checkpoint: bool | None) -> ChaosStuden
     )
     if activation_checkpoint is not None:
         kwargs["activation_checkpoint"] = activation_checkpoint
-    return ChaosStudentLM(**kwargs)
+    return CareStudentLM(**kwargs)
 
 
-def _make_hybrid_model(*, seed: int, activation_checkpoint: bool) -> ChaosStudentLM:
+def _make_hybrid_model(*, seed: int, activation_checkpoint: bool) -> CareStudentLM:
     torch.manual_seed(seed)
-    return ChaosStudentLM(
+    return CareStudentLM(
         vocab_size=64,
         dim=16,
         num_layers=3,
@@ -50,7 +50,7 @@ def _make_hybrid_model(*, seed: int, activation_checkpoint: bool) -> ChaosStuden
     )
 
 
-def _clone_with_flag(ref: ChaosStudentLM, activation_checkpoint: bool) -> ChaosStudentLM:
+def _clone_with_flag(ref: CareStudentLM, activation_checkpoint: bool) -> CareStudentLM:
     clone = copy.deepcopy(ref)
     clone.activation_checkpoint = activation_checkpoint
     return clone
@@ -115,7 +115,7 @@ class TestActivationCheckpointForwardParity(unittest.TestCase):
         self.assertLess(logits_diff, 1e-5, msg=f"logits drift with stats: {logits_diff}")
 
     def test_forward_parity_hybrid_block(self) -> None:
-        """Train-mode parity check on the ChaosSSMHybridBlock path. Uses the
+        """Train-mode parity check on the CareSSMHybridBlock path. Uses the
         checkpoint branch (use_ckpt=True) actively because the hybrid block
         has more internal operations than the pure SSM block and would be
         the first place a checkpoint-recompute determinism drift shows up.
@@ -167,7 +167,7 @@ class TestActivationCheckpointGradientParity(unittest.TestCase):
 
 
 class TestActivationCheckpointTrainingParity(unittest.TestCase):
-    def _run_fixed_steps(self, model: ChaosStudentLM, steps: int) -> list[float]:
+    def _run_fixed_steps(self, model: CareStudentLM, steps: int) -> list[float]:
         opt = torch.optim.SGD(model.parameters(), lr=1e-3)
         gen = torch.Generator().manual_seed(9999)
         losses: list[float] = []
@@ -206,12 +206,12 @@ class TestActivationCheckpointBackwardsCompat(unittest.TestCase):
     def test_default_off_matches_no_kwarg(self) -> None:
         """Building without the kwarg must equal building with ``False``."""
         torch.manual_seed(42)
-        no_kwarg = ChaosStudentLM(
+        no_kwarg = CareStudentLM(
             vocab_size=64, dim=16, num_layers=3, ff_mult=2,
             a_mode="diag", rich_b_mode="none", outer_model_dim=0,
         )
         torch.manual_seed(42)
-        explicit_off = ChaosStudentLM(
+        explicit_off = CareStudentLM(
             vocab_size=64, dim=16, num_layers=3, ff_mult=2,
             a_mode="diag", rich_b_mode="none", outer_model_dim=0,
             activation_checkpoint=False,

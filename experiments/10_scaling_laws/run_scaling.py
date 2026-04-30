@@ -5,8 +5,8 @@ Trains parameter-matched SSM and transformer configs at 5 sizes,
 logs results per-run, and generates a combined results JSON.
 
 Conditions:
-  bare_ssm   -- pure ChaosStudentLM (diag mode, no components)
-  full_ssm   -- ChaosStudentLM + winning component stack from exp 09
+  bare_ssm   -- pure CareStudentLM (diag mode, no components)
+  full_ssm   -- CareStudentLM + winning component stack from exp 09
   our_tfm    -- SimpleTransformerLM, parameter-matched to the SSM
   mamba2_ssm -- Mamba2LM baseline (requires mamba-ssm package)
 
@@ -97,7 +97,7 @@ def estimate_flops_per_step(
         base_flops = 6 * total_params * tokens
     else:
         # SSM per layer:
-        #   ChaosSSMCore: in_proj + select_proj + gate_proj + out_proj + delta_proj
+        #   CareSSMCore: in_proj + select_proj + gate_proj + out_proj + delta_proj
         #                 = 5*d*d + d (diag mode)
         #   FFN: 2*d*d*ff_mult
         per_layer_params = 5 * d * d + 2 * d * d * ff_mult
@@ -121,12 +121,12 @@ def estimate_flops_per_step(
 
 
 def count_ssm_params(dim: int, num_layers: int, ff_mult: int = 2) -> int:
-    """Count params for a bare ChaosStudentLM (diag mode, no components)."""
+    """Count params for a bare CareStudentLM (diag mode, no components)."""
     embed = 256 * dim
     lm_head = dim * 256
     final_norm = dim
     # Per SSM layer (diag mode):
-    #   ChaosSSMCore: in_proj(d,d) + select_proj(d,d) + gate_proj(d,d) +
+    #   CareSSMCore: in_proj(d,d) + select_proj(d,d) + gate_proj(d,d) +
     #                 out_proj(d,d) + delta_proj(d,d) + log_a(d) = 5*d*d + d
     #   FeedForward: fc(d, d*ff_mult) + proj(d*ff_mult, d) = 2*d*d*ff_mult
     #   RMSNorm x2: 2*d

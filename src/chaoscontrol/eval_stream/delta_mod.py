@@ -4,14 +4,14 @@ import torch.nn as nn
 
 
 class DeltaModulator:
-    """Context manager that attaches forward hooks to every ChaosSSMCore in a model
+    """Context manager that attaches forward hooks to every CareSSMCore in a model
     to rescale delta_proj output and shift log_a at eval. No gradients involved.
 
     --------------------------------------------------------------------------
     OPEN QUESTION — delta_scale semantics (pre-softplus vs post-softplus)
     --------------------------------------------------------------------------
 
-    In ChaosSSMCore.forward the recurrence step-size is
+    In CareSSMCore.forward the recurrence step-size is
 
         Δ = softplus(delta_proj(x)).clamp_min(1e-4)
 
@@ -27,7 +27,7 @@ class DeltaModulator:
          "lengthens/shortens memory uniformly"):
            Δ_new = s · softplus(Wx).clamp_min(1e-4)
          Semantically cleaner for the "memory-horizon knob" framing, but
-         requires either a new submodule wrapper inside ChaosSSMCore or a
+         requires either a new submodule wrapper inside CareSSMCore or a
          post-softplus hook that doesn't exist as a named submodule today.
 
     The two agree near Wx = 0 (softplus is ~linear there). They diverge at the
@@ -56,8 +56,8 @@ class DeltaModulator:
     noisy or obviously nonmonotone, we revisit with a post-softplus hook.
 
     Post-softplus implementation sketch if we ever need it: add a no-grad
-    buffer `_delta_post_scale` to ChaosSSMCore (init 1.0) and multiply Δ by
-    it after the softplus/clamp step inside ChaosSSMCore.forward. Then this
+    buffer `_delta_post_scale` to CareSSMCore (init 1.0) and multiply Δ by
+    it after the softplus/clamp step inside CareSSMCore.forward. Then this
     DeltaModulator sets/restores that buffer instead of hooking delta_proj.
     """
 
@@ -72,17 +72,17 @@ class DeltaModulator:
         self._log_a_originals: list[tuple[nn.Parameter, torch.Tensor]] = []
 
     def _find_cores(self) -> list[nn.Module]:
-        # NOTE: matches by class name rather than `isinstance(m, ChaosSSMCore)`.
+        # NOTE: matches by class name rather than `isinstance(m, CareSSMCore)`.
         # `tests/test_core.py::test_chunked_backend_selectable_via_env` reloads
         # `chaoscontrol.core` via `importlib.reload` (lines 180, 200) to flip
         # the env-var-gated diag-recurrence backend. After that reload the
-        # module-level ChaosSSMCore symbol points at a new class object, so
+        # module-level CareSSMCore symbol points at a new class object, so
         # any core instantiated earlier fails `isinstance` against the new
         # class and DeltaModulator silently returns no cores — turning it
         # into a no-op at the exact moment we rely on it for Axis 3. Name
         # matching survives the reload. The cost is brittleness to renames,
         # which is explicit and caught by our test suite.
-        return [m for m in self.module.modules() if type(m).__name__ == "ChaosSSMCore"]
+        return [m for m in self.module.modules() if type(m).__name__ == "CareSSMCore"]
 
     def __enter__(self):
         # Axis 3 (log_a_shift) is designed ⊥ Axis 1 (log_a adaptation). If the

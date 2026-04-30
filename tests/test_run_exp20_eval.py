@@ -18,9 +18,9 @@ def test_build_optimizer_uses_fused_muon_for_eval_ttt():
 
 
 def test_eval_loader_rejects_online_replay_eviction_checkpoint(tmp_path):
-    from chaoscontrol.model import ChaosStudentLM
+    from chaoscontrol.model import CareStudentLM
 
-    model = ChaosStudentLM(
+    model = CareStudentLM(
         vocab_size=32,
         dim=8,
         num_layers=1,
@@ -67,8 +67,8 @@ def test_driver_runs_tiny_stream(tmp_path):
             fh.write(json.dumps({"text": t}) + "\n")
 
     # Tiny checkpoint — vocab_size must match the SP model's piece count.
-    from chaoscontrol.model import ChaosStudentLM
-    m = ChaosStudentLM(vocab_size=64, dim=16, num_layers=2, block_type="ssm", a_mode="diag")
+    from chaoscontrol.model import CareStudentLM
+    m = CareStudentLM(vocab_size=64, dim=16, num_layers=2, block_type="ssm", a_mode="diag")
     ckpt_path = tmp_path / "ckpt.pt"
     torch.save({"model": m.state_dict(),
                 "config": {"vocab_size": 64, "dim": 16, "num_layers": 2,
@@ -96,7 +96,7 @@ def test_driver_runs_tiny_stream(tmp_path):
 
 def test_driver_writes_score_floor_summary_for_no_ttt_run(tmp_path):
     import sentencepiece as spm
-    from chaoscontrol.model import ChaosStudentLM
+    from chaoscontrol.model import CareStudentLM
 
     corpus = tmp_path / "corpus.txt"
     corpus.write_text("\n".join(["alpha beta gamma", "delta epsilon"] * 50))
@@ -110,7 +110,7 @@ def test_driver_writes_score_floor_summary_for_no_ttt_run(tmp_path):
         fh.write(json.dumps({"text": "hello world this is a doc"}) + "\n")
         fh.write(json.dumps({"text": "another small doc"}) + "\n")
 
-    m = ChaosStudentLM(vocab_size=64, dim=16, num_layers=2, block_type="ssm", a_mode="diag")
+    m = CareStudentLM(vocab_size=64, dim=16, num_layers=2, block_type="ssm", a_mode="diag")
     ckpt_path = tmp_path / "ckpt.pt"
     torch.save({"model": m.state_dict(),
                 "config": {"vocab_size": 64, "dim": 16, "num_layers": 2,
@@ -148,7 +148,7 @@ def test_driver_writes_score_floor_summary_for_no_ttt_run(tmp_path):
 
 def test_driver_skips_weight_ttt_when_floor_leaves_no_slack(tmp_path):
     import sentencepiece as spm
-    from chaoscontrol.model import ChaosStudentLM
+    from chaoscontrol.model import CareStudentLM
 
     corpus = tmp_path / "corpus.txt"
     corpus.write_text("\n".join(["alpha beta gamma", "delta epsilon"] * 50))
@@ -162,7 +162,7 @@ def test_driver_skips_weight_ttt_when_floor_leaves_no_slack(tmp_path):
         fh.write(json.dumps({"text": "hello world this is a doc"}) + "\n")
         fh.write(json.dumps({"text": "another small doc"}) + "\n")
 
-    m = ChaosStudentLM(vocab_size=64, dim=16, num_layers=2, block_type="ssm", a_mode="diag")
+    m = CareStudentLM(vocab_size=64, dim=16, num_layers=2, block_type="ssm", a_mode="diag")
     ckpt_path = tmp_path / "ckpt.pt"
     torch.save({"model": m.state_dict(),
                 "config": {"vocab_size": 64, "dim": 16, "num_layers": 2,

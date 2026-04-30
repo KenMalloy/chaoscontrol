@@ -3,11 +3,11 @@ import importlib.util
 import pytest
 import torch
 from chaoscontrol.eval_stream.ttt_runner import select_adapt_params
-from chaoscontrol.model import ChaosStudentLM
+from chaoscontrol.model import CareStudentLM
 
 
 def _tiny_ssm_lm():
-    return ChaosStudentLM(
+    return CareStudentLM(
         vocab_size=32, dim=16, num_layers=2, block_type="ssm", a_mode="diag",
     )
 

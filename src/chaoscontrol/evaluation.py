@@ -66,7 +66,7 @@ def evaluate_chaoscontrol_bpb(
     tokenizer: Any = None,
     prior_bias: Any = None,
 ) -> dict[str, float]:
-    """Evaluate ChaosStudentLM, returning loss and bits-per-byte.
+    """Evaluate CareStudentLM, returning loss and bits-per-byte.
 
     When metabolic_gate=True, runs both a plain forward pass and a gate-aware
     pass, returning both so experiments can compare.
@@ -307,7 +307,7 @@ def _reset_model_state(model: Any) -> None:
     reflect residual state from previous segments rather than the model's
     true adaptation speed on fresh data.
     """
-    # Reset SSM recurrence state (hidden states in ChaosSSMCore)
+    # Reset SSM recurrence state (hidden states in CareSSMCore)
     for layer in getattr(model, "layers", []):
         core = getattr(layer, "core", None)
         if core is not None and hasattr(core, "state"):
@@ -408,7 +408,7 @@ def evaluate_warming_curve(
     or segment_len (auto-derive non-overlapping segments from token length).
 
     Args:
-        model: ChaosStudentLM instance.
+        model: CareStudentLM instance.
         tokens: Full token tensor (1D, long).
         warmup_tokens: List of N values (default: WARMING_CURVE_STEPS).
         score_tokens: Number of tokens to score after warming.
@@ -535,7 +535,7 @@ def causal_slot_eval(
     gradients during SLOT optimization.
 
     Args:
-        model: ChaosStudentLM instance.
+        model: CareStudentLM instance.
         tokens: Full token tensor (1D, long).
         conditions: Which conditions to evaluate.
         warmup_tokens: List of N values (default: WARMING_CURVE_STEPS).

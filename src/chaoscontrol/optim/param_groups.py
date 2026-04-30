@@ -11,7 +11,7 @@ concrete asks that survive across sources:
       S5 sweeps with wd=0 on the dynamics triplet)
     - zero weight decay on norm gains and biases (standard LLM practice)
 
-Scope note: ChaosSSMCore has no standalone Δ parameter — its discretization
+Scope note: CareSSMCore has no standalone Δ parameter — its discretization
 step is ``F.softplus(delta_proj(x))``, computed per-token from a plain
 2D projection that lands in the ``main`` group with full weight decay.
 Only A's parameterization (the seven suffixes below) gets the dynamics
@@ -46,7 +46,7 @@ from torch import Tensor
 
 
 # Parameter-name suffixes that identify A-parameterization tensors across
-# the ChaosSSMCore a_modes. All live under ``layers.{i}.core.<suffix>``:
+# the CareSSMCore a_modes. All live under ``layers.{i}.core.<suffix>``:
 #
 #   diag mode:   log_a
 #   paired mode: log_r, theta
@@ -54,7 +54,7 @@ from torch import Tensor
 #
 # Any parameter whose name ends in one of these suffixes is treated as
 # dynamics (smaller LR, zero WD). Matched on the last dot-segment only.
-# The single-letter suffixes (``U``, ``V``) are specific to ChaosSSMCore's
+# The single-letter suffixes (``U``, ``V``) are specific to CareSSMCore's
 # full-mode low-rank factor; if a future module adopts them for something
 # unrelated, it would accidentally land in the dynamics group. No such
 # collision exists today.

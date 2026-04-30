@@ -15,7 +15,7 @@ from chaoscontrol.eval_stream.temporal_heads import (
     score_temporal_heads_chunk,
     update_online_exp_weighted_log_weights,
 )
-from chaoscontrol.model import ChaosStudentLM
+from chaoscontrol.model import CareStudentLM
 
 
 RAW_DOC_TEXTS = ("hello world this is a doc", "another small doc")
@@ -33,7 +33,7 @@ def _load_runner_module():
 
 def _write_tiny_fixture(tmp_path, *, condition, horizon_shifts, extra_config=None):
     import sentencepiece as spm
-    from chaoscontrol.model import ChaosStudentLM
+    from chaoscontrol.model import CareStudentLM
 
     corpus = tmp_path / "corpus.txt"
     corpus.write_text("\n".join(["alpha beta gamma", "delta epsilon"] * 50))
@@ -51,7 +51,7 @@ def _write_tiny_fixture(tmp_path, *, condition, horizon_shifts, extra_config=Non
         for text in RAW_DOC_TEXTS:
             fh.write(json.dumps({"text": text}) + "\n")
 
-    model = ChaosStudentLM(
+    model = CareStudentLM(
         vocab_size=64,
         dim=16,
         num_layers=2,
@@ -358,7 +358,7 @@ def test_exp22_runner_accepts_online_exp_weights_mixer(tmp_path):
 def test_exp22_runner_prefix_scores_are_suffix_invariant():
     torch.manual_seed(23)
     vocab_size = 64
-    model = ChaosStudentLM(
+    model = CareStudentLM(
         vocab_size=vocab_size,
         dim=16,
         num_layers=2,

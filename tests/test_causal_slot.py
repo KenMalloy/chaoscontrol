@@ -4,11 +4,11 @@ import math
 import torch
 
 from chaoscontrol.evaluation import causal_slot_eval
-from chaoscontrol.model import ChaosStudentLM
+from chaoscontrol.model import CareStudentLM
 
 
 def _make_model():
-    return ChaosStudentLM(
+    return CareStudentLM(
         vocab_size=256, dim=64, num_layers=2,
         outer_model_dim=32, outer_model_type="multislot",
         outer_max_slots=0,

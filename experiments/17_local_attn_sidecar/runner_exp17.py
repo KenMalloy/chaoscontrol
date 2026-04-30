@@ -34,7 +34,7 @@ from chaoscontrol.data import (
 )
 from chaoscontrol.core import verify_diag_recurrence
 from chaoscontrol.evaluation import compute_bpb
-from chaoscontrol.model import ChaosSSMBlock, ChaosSSMHybridBlock, ChaosStudentLM
+from chaoscontrol.model import CareSSMBlock, CareSSMHybridBlock, CareStudentLM
 from chaoscontrol.training import train_chaoscontrol_for_budget
 
 MIN_PYTHON = (3, 10)
@@ -315,7 +315,7 @@ def compute_gate_stats(
     hybrid_layers = [
         (i, layer)
         for i, layer in enumerate(model.layers)
-        if isinstance(layer, ChaosSSMHybridBlock)
+        if isinstance(layer, CareSSMHybridBlock)
     ]
     if not hybrid_layers:
         return []
@@ -340,7 +340,7 @@ def compute_gate_stats(
         # Run forward through early layers to compute x_ssm at each hybrid block
         x = model.embed(inputs)
         for i, layer in enumerate(model.layers):
-            if isinstance(layer, ChaosSSMHybridBlock):
+            if isinstance(layer, CareSSMHybridBlock):
                 normed = layer.input_norm(x)
                 ssm_out = layer.core.forward(normed)
                 x_ssm = x + ssm_out
@@ -362,9 +362,9 @@ def compute_gate_stats(
     return stats
 
 
-def build_model(config: dict[str, Any], device: torch.device, param_dtype: torch.dtype) -> ChaosStudentLM:
+def build_model(config: dict[str, Any], device: torch.device, param_dtype: torch.dtype) -> CareStudentLM:
     """Build bare or hybrid fast SP-SSM for Exp 17."""
-    model = ChaosStudentLM(
+    model = CareStudentLM(
         vocab_size=config["vocab_size"],
         dim=config["model_dim"],
         num_layers=config["num_layers"],
@@ -542,8 +542,8 @@ def run_single(
         "gate_stats": gate_stats,
         "model_shape": {
             "hybrid_enabled": bool(config.get("local_attn_window", 0) > 0),
-            "num_hybrid_layers": int(sum(isinstance(layer, ChaosSSMHybridBlock) for layer in model.layers)),
-            "num_pure_ssm_layers": int(sum(isinstance(layer, ChaosSSMBlock) for layer in model.layers)),
+            "num_hybrid_layers": int(sum(isinstance(layer, CareSSMHybridBlock) for layer in model.layers)),
+            "num_pure_ssm_layers": int(sum(isinstance(layer, CareSSMBlock) for layer in model.layers)),
         },
     }
 

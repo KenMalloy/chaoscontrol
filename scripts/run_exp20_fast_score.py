@@ -295,13 +295,13 @@ def _requires_online_replay_eval(blob: dict, cfg: dict) -> bool:
 
 
 def _build_model_with_blob(ckpt_path: Path) -> tuple[torch.nn.Module, dict, dict]:
-    from chaoscontrol.model import ChaosStudentLM
+    from chaoscontrol.model import CareStudentLM
 
     blob = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     cfg = blob["config"]
     if _requires_online_replay_eval(blob, cfg):
         raise RuntimeError(_ONLINE_REPLAY_EVAL_ERROR)
-    model = ChaosStudentLM(**cfg)
+    model = CareStudentLM(**cfg)
     model.load_state_dict(blob["model"], strict=True)
     online_eval_state = blob.get("online_eval_state")
     if isinstance(online_eval_state, dict):

@@ -1,4 +1,4 @@
-"""Tests for ChaosSSMCore and criticality_loss from chaoscontrol.core."""
+"""Tests for CareSSMCore and criticality_loss from chaoscontrol.core."""
 from __future__ import annotations
 
 import math
@@ -6,7 +6,7 @@ import unittest
 
 import torch
 
-from chaoscontrol.core import ChaosSSMCore, LowRankDeltaProjection, RMSNorm, criticality_loss
+from chaoscontrol.core import CareSSMCore, LowRankDeltaProjection, RMSNorm, criticality_loss
 
 
 def test_rms_norm_module_keeps_legacy_pytorch_math() -> None:
@@ -24,15 +24,15 @@ def test_rms_norm_module_keeps_legacy_pytorch_math() -> None:
     assert torch.equal(out, expected)
 
 
-class TestChaosSSMCore(unittest.TestCase):
+class TestCareSSMCore(unittest.TestCase):
     def test_diag_output_shape(self) -> None:
-        core = ChaosSSMCore(dim=16, a_mode="diag")
+        core = CareSSMCore(dim=16, a_mode="diag")
         x = torch.randn(2, 8, 16)
         y = core(x)
         assert y.shape == (2, 8, 16)
 
     def test_diag_deterministic(self) -> None:
-        core = ChaosSSMCore(dim=16, a_mode="diag")
+        core = CareSSMCore(dim=16, a_mode="diag")
         x = torch.randn(2, 8, 16)
         y1 = core(x)
         y2 = core(x)
@@ -41,7 +41,7 @@ class TestChaosSSMCore(unittest.TestCase):
     def test_diag_scan_matches_closed_loop_reference(self) -> None:
         """Vectorized diag path should match an explicit recurrence rollout."""
         torch.manual_seed(7)
-        core = ChaosSSMCore(dim=16, a_mode="diag")
+        core = CareSSMCore(dim=16, a_mode="diag")
         x = torch.randn(3, 11, 16)
 
         y_scan = core(x)
@@ -69,7 +69,7 @@ class TestChaosSSMCore(unittest.TestCase):
         ScOpt/TTT attach hooks to the named projection modules.  The packed
         content fast path is allowed only when those modules are unobserved.
         """
-        core = ChaosSSMCore(dim=16, a_mode="diag")
+        core = CareSSMCore(dim=16, a_mode="diag")
         x = torch.randn(2, 5, 16)
         calls: list[torch.Tensor] = []
 
@@ -88,8 +88,8 @@ class TestChaosSSMCore(unittest.TestCase):
     def test_low_rank_delta_projection_matches_equivalent_full_delta(self) -> None:
         """Low-rank delta is just a factored timescale projection."""
         torch.manual_seed(11)
-        low = ChaosSSMCore(dim=12, a_mode="diag", delta_rank=3)
-        full = ChaosSSMCore(dim=12, a_mode="diag")
+        low = CareSSMCore(dim=12, a_mode="diag", delta_rank=3)
+        full = CareSSMCore(dim=12, a_mode="diag")
         assert isinstance(low.delta_proj, LowRankDeltaProjection)
         assert low.delta_rank == 3
 
@@ -113,32 +113,32 @@ class TestChaosSSMCore(unittest.TestCase):
         assert low.delta_proj.up.weight.grad is not None
 
     def test_paired_output_shape(self) -> None:
-        core = ChaosSSMCore(dim=16, a_mode="paired")
+        core = CareSSMCore(dim=16, a_mode="paired")
         x = torch.randn(2, 8, 16)
         y = core(x)
         assert y.shape == (2, 8, 16)
 
     def test_full_output_shape(self) -> None:
-        core = ChaosSSMCore(dim=16, a_mode="full", a_full_rank=4)
+        core = CareSSMCore(dim=16, a_mode="full", a_full_rank=4)
         x = torch.randn(2, 8, 16)
         y = core(x)
         assert y.shape == (2, 8, 16)
 
     def test_full_jacobian_stats_returned(self) -> None:
-        core = ChaosSSMCore(dim=16, a_mode="full", a_full_rank=4)
+        core = CareSSMCore(dim=16, a_mode="full", a_full_rank=4)
         x = torch.randn(2, 8, 16)
         y, stats = core(x, return_jacobian_stats=True)
         assert "lambda_max" in stats
         assert "sv_log_var" in stats
 
     def test_full_skew_symmetric_is_antisymmetric(self) -> None:
-        core = ChaosSSMCore(dim=16, a_mode="full", a_full_rank=4)
+        core = CareSSMCore(dim=16, a_mode="full", a_full_rank=4)
         S = core._build_skew_symmetric()
         assert torch.allclose(S, -S.T, atol=1e-6)
 
     def test_paired_oscillates(self) -> None:
         """A paired-mode core with theta=pi/4 should oscillate, not just decay."""
-        core = ChaosSSMCore(dim=16, a_mode="paired")
+        core = CareSSMCore(dim=16, a_mode="paired")
         with torch.no_grad():
             core.theta.fill_(math.pi / 4)
             # log_r = -10 => softplus(-10) ~ 0 => r = exp(0) ~ 1.0 (minimal decay)
@@ -331,7 +331,7 @@ class TestChunkedDiagScan(unittest.TestCase):
 
 class TestCriticalityRegularizer(unittest.TestCase):
     def test_crit_loss_is_scalar(self) -> None:
-        core = ChaosSSMCore(dim=16, a_mode="full", a_full_rank=4)
+        core = CareSSMCore(dim=16, a_mode="full", a_full_rank=4)
         x = torch.randn(2, 8, 16)
         _, stats = core(x, return_jacobian_stats=True)
         loss = criticality_loss(stats, alpha=0.01, beta=0.001)
@@ -351,13 +351,13 @@ class TestCriticalityRegularizer(unittest.TestCase):
         assert loss.item() > 1e-5  # 0.0 is above the -0.13 target
 
 
-class TestChaosSSMCoreStep(unittest.TestCase):
+class TestCareSSMCoreStep(unittest.TestCase):
     """Test single-token stepping matches sequential forward pass."""
 
     def test_diag_step_matches_forward(self):
         """Stepping token-by-token should produce the same output as forward()."""
         torch.manual_seed(42)
-        core = ChaosSSMCore(dim=16, a_mode="diag")
+        core = CareSSMCore(dim=16, a_mode="diag")
         x = torch.randn(2, 8, 16)
 
         # Full forward
@@ -375,7 +375,7 @@ class TestChaosSSMCoreStep(unittest.TestCase):
 
     def test_paired_step_matches_forward(self):
         torch.manual_seed(42)
-        core = ChaosSSMCore(dim=16, a_mode="paired")
+        core = CareSSMCore(dim=16, a_mode="paired")
         x = torch.randn(2, 8, 16)
         y_full = core(x)
         state = torch.zeros(2, 16)
@@ -388,7 +388,7 @@ class TestChaosSSMCoreStep(unittest.TestCase):
 
     def test_full_step_matches_forward(self):
         torch.manual_seed(42)
-        core = ChaosSSMCore(dim=16, a_mode="full", a_full_rank=4)
+        core = CareSSMCore(dim=16, a_mode="full", a_full_rank=4)
         x = torch.randn(2, 8, 16)
         y_full = core(x)
         state = torch.zeros(2, 16)
@@ -400,7 +400,7 @@ class TestChaosSSMCoreStep(unittest.TestCase):
         assert torch.allclose(y_full, y_step, atol=1e-4)
 
     def test_step_returns_correct_shapes(self):
-        core = ChaosSSMCore(dim=16, a_mode="diag")
+        core = CareSSMCore(dim=16, a_mode="diag")
         inp = torch.randn(2, 16)  # (batch, dim) — single token
         state = torch.zeros(2, 16)
         out, new_state = core.step(inp, state)
@@ -410,8 +410,8 @@ class TestChaosSSMCoreStep(unittest.TestCase):
     def test_diag_scan_gradient_matches_step_reference(self):
         """Diag scan backend should preserve gradients for the common bare path."""
         torch.manual_seed(123)
-        core_scan = ChaosSSMCore(dim=8, a_mode="diag")
-        core_ref = ChaosSSMCore(dim=8, a_mode="diag")
+        core_scan = CareSSMCore(dim=8, a_mode="diag")
+        core_ref = CareSSMCore(dim=8, a_mode="diag")
         core_ref.load_state_dict(core_scan.state_dict())
 
         x_scan = torch.randn(2, 6, 8, requires_grad=True)

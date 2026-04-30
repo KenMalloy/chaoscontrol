@@ -1,4 +1,4 @@
-"""Equivalence tests for ``ChaosStudentLM.encode()`` vs ``forward()``.
+"""Equivalence tests for ``CareStudentLM.encode()`` vs ``forward()``.
 
 ``encode()`` is the new entry point used by ``train_ssm`` — it runs
 every pre-LM-head computation (embed, wernicke, outer-model reads,
@@ -18,13 +18,13 @@ from __future__ import annotations
 import pytest
 import torch
 
-from chaoscontrol.model import ChaosStudentLM
+from chaoscontrol.model import CareStudentLM
 
 
 @pytest.fixture
-def bare_ssm_model() -> ChaosStudentLM:
+def bare_ssm_model() -> CareStudentLM:
     torch.manual_seed(123)
-    model = ChaosStudentLM(
+    model = CareStudentLM(
         vocab_size=64,
         dim=16,
         num_layers=2,
@@ -43,7 +43,7 @@ def _make_input(batch: int, seq: int, vocab: int, seed: int = 0) -> torch.Tensor
 class TestEncodeBareSSMEquivalence:
     """On the bare-SSM config, encode + manual decode must equal forward."""
 
-    def test_logits_bit_identical_to_forward(self, bare_ssm_model: ChaosStudentLM) -> None:
+    def test_logits_bit_identical_to_forward(self, bare_ssm_model: CareStudentLM) -> None:
         # Build identical inputs; run both paths; compare logits exactly.
         model = bare_ssm_model
         inputs = _make_input(batch=2, seq=16, vocab=64, seed=1)
@@ -57,7 +57,7 @@ class TestEncodeBareSSMEquivalence:
             "logits from encode() + final_norm + lm_head must bit-match forward()"
         )
 
-    def test_encode_returns_hidden_tensor(self, bare_ssm_model: ChaosStudentLM) -> None:
+    def test_encode_returns_hidden_tensor(self, bare_ssm_model: CareStudentLM) -> None:
         # encode() returns the pre-final_norm hidden state. forward()["hidden"]
         # in the bare-SSM path is the same tensor (see model.py:1051).
         model = bare_ssm_model
@@ -72,7 +72,7 @@ class TestEncodeBareSSMEquivalence:
             "surfaces in out['hidden']"
         )
 
-    def test_encode_preserves_grad_flow(self, bare_ssm_model: ChaosStudentLM) -> None:
+    def test_encode_preserves_grad_flow(self, bare_ssm_model: CareStudentLM) -> None:
         # Gradients from encode() output must propagate back to model
         # parameters the same way forward()['hidden'] does.
         model = bare_ssm_model
@@ -102,7 +102,7 @@ class TestEncodeBareSSMEquivalence:
                 f"param {name!r} gradient differs between forward() and encode()"
             )
 
-    def test_encode_can_return_final_states(self, bare_ssm_model: ChaosStudentLM) -> None:
+    def test_encode_can_return_final_states(self, bare_ssm_model: CareStudentLM) -> None:
         model = bare_ssm_model
         inputs = _make_input(batch=2, seq=16, vocab=64, seed=4)
 
@@ -115,7 +115,7 @@ class TestEncodeBareSSMEquivalence:
         for from_forward, from_encode in zip(forward_out["final_states"], final_states):
             assert torch.equal(from_forward, from_encode)
 
-    def test_encode_accepts_initial_states(self, bare_ssm_model: ChaosStudentLM) -> None:
+    def test_encode_accepts_initial_states(self, bare_ssm_model: CareStudentLM) -> None:
         model = bare_ssm_model
         inputs = _make_input(batch=2, seq=16, vocab=64, seed=5)
         init_states = [torch.full((2, 16), 2.0) for _ in range(len(model.layers))]

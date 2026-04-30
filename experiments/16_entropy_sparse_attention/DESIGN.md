@@ -188,7 +188,7 @@ write_source = "x_state"
 where:
 
 - `x` is the post-SSM residual stream at the chosen layer.
-- `state` is the recurrence state returned by `ChaosSSMCore.step()`.
+- `state` is the recurrence state returned by `CareSSMCore.step()`.
 
 Using only `state` is a plausible ablation, but not the default. If the
 failure mode is that the SSM compressed away lexical detail, then the oracle

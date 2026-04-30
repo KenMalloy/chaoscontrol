@@ -13,7 +13,7 @@ from chaoscontrol.data import (
     resolve_device, resolve_param_dtype,
     prepare_fineweb_splits, build_lm_starts, choose_eval_starts, maybe_sync_cuda,
 )
-from chaoscontrol.model import ChaosStudentLM
+from chaoscontrol.model import CareStudentLM
 from chaoscontrol.training import train_chaoscontrol_for_budget
 from chaoscontrol.evaluation import evaluate_chaoscontrol_bpb, evaluate_warming_curve
 
@@ -56,7 +56,7 @@ def build_model(cfg: ChaosControlConfig, device: torch.device, param_dtype: torc
             num_layers=cfg.num_layers,
         )
     else:
-        model = ChaosStudentLM(
+        model = CareStudentLM(
             vocab_size=cfg.vocab_size, dim=cfg.model_dim,
             num_layers=cfg.num_layers, ff_mult=cfg.ff_mult,
             a_mode=cfg.a_mode, a_full_rank=cfg.a_full_rank,

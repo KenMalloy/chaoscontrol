@@ -1,15 +1,15 @@
-"""Tests for ChaosAttentionBlock — Exp 19 Phase 2 scientific control.
+"""Tests for AttentionControlBlock — Exp 19 Phase 2 scientific control.
 
-ChaosAttentionBlock is a causal multi-head self-attention sibling to
-ChaosSSMBlock. It exists so Exp 19 Phase 2 can run the same training stack
+AttentionControlBlock is a causal multi-head self-attention sibling to
+CareSSMBlock. It exists so Exp 19 Phase 2 can run the same training stack
 with attention substituted for SSM and measure per-token learning efficiency.
 
 These tests cover the block contract:
-  - Shape parity with ChaosSSMBlock (forward and return_jacobian_stats).
+  - Shape parity with CareSSMBlock (forward and return_jacobian_stats).
   - Causal masking: outputs at position t must not depend on inputs at
     positions > t.
   - Backward pass produces non-zero gradients on every learnable tensor.
-  - Shape interchangeability with ChaosSSMBlock inside ChaosStudentLM via
+  - Shape interchangeability with CareSSMBlock inside CareStudentLM via
     the `block_type="attention"` constructor flag.
   - No Flash Attention imports — SDPA only.
   - RoPE position sensitivity: outputs depend on absolute position (the
@@ -27,28 +27,28 @@ import torch
 import torch.nn.functional as F
 
 from chaoscontrol.model import (
-    ChaosAttentionBlock,
-    ChaosSSMBlock,
-    ChaosStudentLM,
+    AttentionControlBlock,
+    CareSSMBlock,
+    CareStudentLM,
 )
 
 
-class TestChaosAttentionBlockForwardShape(unittest.TestCase):
+class TestAttentionControlBlockForwardShape(unittest.TestCase):
     def test_forward_shape_matches_input(self) -> None:
-        block = ChaosAttentionBlock(dim=32, ff_mult=2, num_heads=4)
+        block = AttentionControlBlock(dim=32, ff_mult=2, num_heads=4)
         x = torch.randn(3, 11, 32)
         out = block(x)
         assert out.shape == (3, 11, 32), f"shape mismatch: {out.shape}"
 
     def test_forward_dtype_preserved(self) -> None:
-        block = ChaosAttentionBlock(dim=32, ff_mult=2, num_heads=4)
+        block = AttentionControlBlock(dim=32, ff_mult=2, num_heads=4)
         x = torch.randn(2, 8, 32)
         out = block(x)
         assert out.dtype == x.dtype
 
     def test_return_jacobian_stats_shape_contract(self) -> None:
-        """Match ChaosSSMBlock's return contract when return_jacobian_stats=True."""
-        block = ChaosAttentionBlock(dim=32, ff_mult=2, num_heads=4)
+        """Match CareSSMBlock's return contract when return_jacobian_stats=True."""
+        block = AttentionControlBlock(dim=32, ff_mult=2, num_heads=4)
         x = torch.randn(2, 8, 32)
         result = block(x, return_jacobian_stats=True)
         assert isinstance(result, tuple)
@@ -60,10 +60,10 @@ class TestChaosAttentionBlockForwardShape(unittest.TestCase):
         assert "sv_log_var" in stats
 
     def test_init_signature_shape_matches_ssm_block(self) -> None:
-        """ChaosAttentionBlock(dim, ff_mult=...) mirrors ChaosSSMBlock(dim, ff_mult=...)."""
+        """AttentionControlBlock(dim, ff_mult=...) mirrors CareSSMBlock(dim, ff_mult=...)."""
         dim = 32
-        attn = ChaosAttentionBlock(dim, ff_mult=2, num_heads=4)
-        ssm = ChaosSSMBlock(dim, ff_mult=2, a_mode="diag", rich_b_mode="none")
+        attn = AttentionControlBlock(dim, ff_mult=2, num_heads=4)
+        ssm = CareSSMBlock(dim, ff_mult=2, a_mode="diag", rich_b_mode="none")
         x = torch.randn(2, 8, dim)
         attn_out = attn(x)
         ssm_out = ssm(x)
@@ -71,18 +71,18 @@ class TestChaosAttentionBlockForwardShape(unittest.TestCase):
 
     def test_dim_not_divisible_by_heads_raises(self) -> None:
         with self.assertRaises(ValueError):
-            ChaosAttentionBlock(dim=32, ff_mult=2, num_heads=5)
+            AttentionControlBlock(dim=32, ff_mult=2, num_heads=5)
 
 
-class TestChaosAttentionBlockCausality(unittest.TestCase):
+class TestAttentionControlBlockCausality(unittest.TestCase):
     """A causal block's output at position t must be independent of inputs at
     positions > t. We test this empirically: mutate inputs at positions > t
     and check that outputs at positions <= t are unchanged.
     """
 
-    def _make_block(self) -> ChaosAttentionBlock:
+    def _make_block(self) -> AttentionControlBlock:
         torch.manual_seed(0)
-        block = ChaosAttentionBlock(dim=16, ff_mult=2, num_heads=4)
+        block = AttentionControlBlock(dim=16, ff_mult=2, num_heads=4)
         block.eval()  # disable dropout for deterministic comparison
         return block
 
@@ -135,10 +135,10 @@ class TestChaosAttentionBlockCausality(unittest.TestCase):
             )
 
 
-class TestChaosAttentionBlockBackward(unittest.TestCase):
+class TestAttentionControlBlockBackward(unittest.TestCase):
     def test_backward_produces_nonzero_grads_on_every_learnable(self) -> None:
         torch.manual_seed(0)
-        block = ChaosAttentionBlock(dim=32, ff_mult=2, num_heads=4)
+        block = AttentionControlBlock(dim=32, ff_mult=2, num_heads=4)
         x = torch.randn(2, 8, 32, requires_grad=True)
         out = block(x)
         loss = out.pow(2).mean()
@@ -161,7 +161,7 @@ class TestChaosAttentionBlockBackward(unittest.TestCase):
     def test_qkv_and_out_proj_receive_nonzero_grads_explicitly(self) -> None:
         """Sanity check on the named projections called out in the task spec."""
         torch.manual_seed(0)
-        block = ChaosAttentionBlock(dim=32, ff_mult=2, num_heads=4)
+        block = AttentionControlBlock(dim=32, ff_mult=2, num_heads=4)
         x = torch.randn(2, 8, 32)
         loss = block(x).pow(2).mean()
         loss.backward()
@@ -175,14 +175,14 @@ class TestChaosAttentionBlockBackward(unittest.TestCase):
         assert block.ff.proj.weight.grad.abs().sum().item() > 0
 
 
-class TestChaosStudentLMWithAttentionBlock(unittest.TestCase):
-    """Interchangeability: build ChaosStudentLM with ChaosAttentionBlock layers
+class TestCareStudentLMWithAttentionBlock(unittest.TestCase):
+    """Interchangeability: build CareStudentLM with AttentionControlBlock layers
     and verify the forward contract is identical to the SSM path.
     """
 
     def test_student_lm_attention_forward_shape_matches_ssm(self) -> None:
         vocab_size, dim, num_layers = 64, 32, 2
-        ssm_model = ChaosStudentLM(
+        ssm_model = CareStudentLM(
             vocab_size=vocab_size,
             dim=dim,
             num_layers=num_layers,
@@ -191,7 +191,7 @@ class TestChaosStudentLMWithAttentionBlock(unittest.TestCase):
             a_mode="diag",
             rich_b_mode="none",
         )
-        attn_model = ChaosStudentLM(
+        attn_model = CareStudentLM(
             vocab_size=vocab_size,
             dim=dim,
             num_layers=num_layers,
@@ -207,7 +207,7 @@ class TestChaosStudentLMWithAttentionBlock(unittest.TestCase):
         assert attn_out["hidden"].shape == (2, 16, dim)
 
     def test_student_lm_attention_uses_attention_block(self) -> None:
-        model = ChaosStudentLM(
+        model = CareStudentLM(
             vocab_size=64,
             dim=32,
             num_layers=2,
@@ -216,11 +216,11 @@ class TestChaosStudentLMWithAttentionBlock(unittest.TestCase):
             attention_num_heads=4,
         )
         for layer in model.layers:
-            assert isinstance(layer, ChaosAttentionBlock)
+            assert isinstance(layer, AttentionControlBlock)
         assert model.block_type == "attention"
 
     def test_student_lm_attention_gradients_flow(self) -> None:
-        model = ChaosStudentLM(
+        model = CareStudentLM(
             vocab_size=64,
             dim=32,
             num_layers=2,
@@ -240,21 +240,21 @@ class TestChaosStudentLMWithAttentionBlock(unittest.TestCase):
 
     def test_unknown_block_type_raises(self) -> None:
         with self.assertRaises(ValueError):
-            ChaosStudentLM(
+            CareStudentLM(
                 vocab_size=64, dim=32, num_layers=2, ff_mult=2,
                 block_type="lstm",
             )
 
     def test_student_lm_attention_step_shape(self) -> None:
-        """ChaosStudentLM.step() must work when block_type='attention'.
+        """CareStudentLM.step() must work when block_type='attention'.
 
         The attention block's step() is degenerate (single token, no history),
-        but it exists so ChaosStudentLM.step() / dream_step() iteration code
+        but it exists so CareStudentLM.step() / dream_step() iteration code
         does not crash. This test pins the shape contract so future refactors
-        of the ``isinstance(layer, ChaosSSMHybridBlock)`` branching or the
+        of the ``isinstance(layer, CareSSMHybridBlock)`` branching or the
         attention block's step() signature are caught automatically.
         """
-        model = ChaosStudentLM(
+        model = CareStudentLM(
             vocab_size=64,
             dim=32,
             num_layers=2,
@@ -270,19 +270,19 @@ class TestChaosStudentLMWithAttentionBlock(unittest.TestCase):
         assert hidden.shape == (2, 32)
         assert len(new_states) == 2
         assert all(s.shape == (2, 32) for s in new_states)
-        # ChaosAttentionBlock.step returns zero new_state (no cross-token
-        # state by design — see the docstring on ChaosAttentionBlock.step).
+        # AttentionControlBlock.step returns zero new_state (no cross-token
+        # state by design — see the docstring on AttentionControlBlock.step).
         assert all(s.abs().sum().item() == 0.0 for s in new_states)
 
     def test_student_lm_attention_causality(self) -> None:
-        """Full LM is causal when ChaosAttentionBlock is used.
+        """Full LM is causal when AttentionControlBlock is used.
 
         Perturb a single future input embedding (by replacing the token id at
         position t+1) and check that logits at positions <= t are unchanged.
         This ties the block-level causality test to the end-to-end model path.
         """
         torch.manual_seed(0)
-        model = ChaosStudentLM(
+        model = CareStudentLM(
             vocab_size=64,
             dim=32,
             num_layers=2,
@@ -309,10 +309,10 @@ class TestChaosStudentLMWithAttentionBlock(unittest.TestCase):
             )
 
 
-class TestChaosAttentionBlockPositionSensitivity(unittest.TestCase):
-    """RoPE tests for ChaosAttentionBlock (Codex review 2026-04-13, finding #1).
+class TestAttentionControlBlockPositionSensitivity(unittest.TestCase):
+    """RoPE tests for AttentionControlBlock (Codex review 2026-04-13, finding #1).
 
-    Before RoPE was added, ChaosAttentionBlock ran SDPA on raw token embeddings
+    Before RoPE was added, AttentionControlBlock ran SDPA on raw token embeddings
     with no positional signal. Attention is permutation-equivariant under the
     causal mask: reordering tokens produces an identical output *at positions
     where the full set of attended keys is the same*. In particular, at the
@@ -343,7 +343,7 @@ class TestChaosAttentionBlockPositionSensitivity(unittest.TestCase):
         """
         for dim, ff_mult, num_heads in [(32, 2, 4), (64, 2, 8), (128, 4, 8)]:
             with self.subTest(dim=dim, ff_mult=ff_mult, num_heads=num_heads):
-                block = ChaosAttentionBlock(
+                block = AttentionControlBlock(
                     dim=dim, ff_mult=ff_mult, num_heads=num_heads
                 )
                 actual = sum(p.numel() for p in block.parameters())
@@ -359,7 +359,7 @@ class TestChaosAttentionBlockPositionSensitivity(unittest.TestCase):
         Checkpoint size is user-visible; a persistent RoPE buffer would bloat
         every saved model and propagate a fixed max-seq-len into checkpoints.
         """
-        block = ChaosAttentionBlock(dim=32, ff_mult=2, num_heads=4)
+        block = AttentionControlBlock(dim=32, ff_mult=2, num_heads=4)
         # Trigger cache build so the buffers are non-empty.
         _ = block(torch.randn(1, 8, 32))
         state = block.state_dict()
@@ -381,7 +381,7 @@ class TestChaosAttentionBlockPositionSensitivity(unittest.TestCase):
         with RoPE.
         """
         torch.manual_seed(0)
-        block = ChaosAttentionBlock(dim=16, ff_mult=2, num_heads=4)
+        block = AttentionControlBlock(dim=16, ff_mult=2, num_heads=4)
         block.eval()
 
         # Build token embeddings A, B, C deterministically.
@@ -423,7 +423,7 @@ class TestChaosAttentionBlockPositionSensitivity(unittest.TestCase):
         t=2 vs t=7, not at the prefix positions.
         """
         torch.manual_seed(1)
-        block = ChaosAttentionBlock(dim=16, ff_mult=2, num_heads=4)
+        block = AttentionControlBlock(dim=16, ff_mult=2, num_heads=4)
         block.eval()
 
         # Shared prefix (two tokens) and the target token.
@@ -475,7 +475,7 @@ class TestChaosAttentionBlockPositionSensitivity(unittest.TestCase):
         seq_len = 12
         base = 10000.0
 
-        block = ChaosAttentionBlock(dim=dim, ff_mult=2, num_heads=num_heads)
+        block = AttentionControlBlock(dim=dim, ff_mult=2, num_heads=num_heads)
         # Build the cache at the target seq_len and float32 so we can read
         # the cos/sin tables directly.
         block._ensure_rope_cache(seq_len, torch.device("cpu"))
@@ -504,7 +504,7 @@ class TestChaosAttentionBlockPositionSensitivity(unittest.TestCase):
         # Compare to the block's apply_rope using the cached cos/sin tables.
         cos = block._rope_cos[:seq_len]
         sin = block._rope_sin[:seq_len]
-        x_rot_block = ChaosAttentionBlock.apply_rope(x, cos, sin)
+        x_rot_block = AttentionControlBlock.apply_rope(x, cos, sin)
 
         max_diff = (x_rot_block - x_rot_ref).abs().max().item()
         assert max_diff < 1e-6, (
@@ -514,7 +514,7 @@ class TestChaosAttentionBlockPositionSensitivity(unittest.TestCase):
     def test_apply_rope_is_identity_at_position_zero(self) -> None:
         """At t=0, cos=1 and sin=0 for every frequency, so RoPE is identity.
 
-        This property is what lets ChaosAttentionBlock.step() remain correct
+        This property is what lets AttentionControlBlock.step() remain correct
         without a special single-token branch: the step hits _attn with
         seq_len=1, the cache gives cos=[1,...,1] and sin=[0,...,0], and
         apply_rope passes Q and K through unchanged.
@@ -523,13 +523,13 @@ class TestChaosAttentionBlockPositionSensitivity(unittest.TestCase):
         dim = 16
         num_heads = 4
         head_dim = dim // num_heads
-        block = ChaosAttentionBlock(dim=dim, ff_mult=2, num_heads=num_heads)
+        block = AttentionControlBlock(dim=dim, ff_mult=2, num_heads=num_heads)
         block._ensure_rope_cache(1, torch.device("cpu"))
         cos = block._rope_cos[:1]
         sin = block._rope_sin[:1]
 
         x = torch.randn(2, num_heads, 1, head_dim)
-        x_rot = ChaosAttentionBlock.apply_rope(x, cos, sin)
+        x_rot = AttentionControlBlock.apply_rope(x, cos, sin)
         assert torch.allclose(x_rot, x, atol=1e-7), (
             "RoPE is not identity at position 0"
         )
@@ -537,12 +537,12 @@ class TestChaosAttentionBlockPositionSensitivity(unittest.TestCase):
     def test_head_dim_must_be_even_for_rope(self) -> None:
         """Explicit constructor check: odd head_dim must raise."""
         # dim=30, num_heads=5 -> head_dim=6 is even (valid).
-        _ = ChaosAttentionBlock(dim=30, ff_mult=2, num_heads=5)
+        _ = AttentionControlBlock(dim=30, ff_mult=2, num_heads=5)
         # dim=30, num_heads=3 -> head_dim=10 is even (valid).
-        _ = ChaosAttentionBlock(dim=30, ff_mult=2, num_heads=3)
+        _ = AttentionControlBlock(dim=30, ff_mult=2, num_heads=3)
         # dim=30, num_heads=6 -> head_dim=5 is odd -> must raise.
         with self.assertRaises(ValueError):
-            ChaosAttentionBlock(dim=30, ff_mult=2, num_heads=6)
+            AttentionControlBlock(dim=30, ff_mult=2, num_heads=6)
 
     def test_backward_with_rope_produces_nonzero_grads(self) -> None:
         """Forward + loss + backward end-to-end with RoPE active.
@@ -553,7 +553,7 @@ class TestChaosAttentionBlockPositionSensitivity(unittest.TestCase):
         both RMSNorm weights) receives non-zero, non-NaN gradients.
         """
         torch.manual_seed(4)
-        block = ChaosAttentionBlock(dim=32, ff_mult=2, num_heads=4)
+        block = AttentionControlBlock(dim=32, ff_mult=2, num_heads=4)
         x = torch.randn(2, 8, 32, requires_grad=True)
         out = block(x)
         loss = out.pow(2).mean()
@@ -588,7 +588,7 @@ class TestChaosAttentionBlockPositionSensitivity(unittest.TestCase):
 
 
 class TestNoFlashAttentionImport(unittest.TestCase):
-    """Task constraint: ChaosAttentionBlock must not depend on Flash Attention.
+    """Task constraint: AttentionControlBlock must not depend on Flash Attention.
     We verify by asserting no flash_attn module is loaded after importing
     chaoscontrol.model.
     """
@@ -602,7 +602,7 @@ class TestNoFlashAttentionImport(unittest.TestCase):
             name for name in sys.modules if name.startswith("flash_attn")
         ]
         assert flash_modules == [], (
-            f"ChaosAttentionBlock transitively imported flash_attn modules: "
+            f"AttentionControlBlock transitively imported flash_attn modules: "
             f"{flash_modules}"
         )
 
