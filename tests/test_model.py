@@ -359,6 +359,35 @@ class TestCareStudentLM(unittest.TestCase):
             atol=0,
         )
 
+    def test_append_memory_accepts_selected_event_ids(self) -> None:
+        model = CareStudentLM(
+            vocab_size=64,
+            dim=8,
+            num_layers=1,
+            ff_mult=2,
+            a_mode="diag",
+            rich_b_mode="none",
+            outer_model_dim=8,
+            outer_model_type="multislot",
+            outer_max_slots=8,
+            buffer_mode="append_only",
+        )
+        hidden = torch.randn(2, 5, 8)
+        score = torch.arange(10, dtype=torch.float32).reshape(2, 5)
+        event_ids = torch.tensor([100, 101, 102], dtype=torch.long)
+
+        wrote = model.append_memory_from_hidden(
+            hidden,
+            score=score,
+            max_tokens=3,
+            event_ids=event_ids,
+        )
+
+        assert wrote is True
+        assert model.outer_model is not None
+        assert model.outer_model.table._slot_event_ids == [100, 101, 102]
+        assert len(model.outer_model.table) == 3
+
     def test_encode_cache_read_cutoff_filters_append_only_multislot_reads(self) -> None:
         torch.manual_seed(4)
         model = CareStudentLM(

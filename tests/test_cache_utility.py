@@ -946,10 +946,10 @@ class TestRank3ScoreBatchCausal:
             memory_write_tokens=3,
         )
 
-        assert cache.reserved == (10, ids.device)
+        assert cache.reserved == (3, ids.device)
         event_ids = model.append_calls[0]["event_ids"]
         assert event_ids is not None
-        assert event_ids.tolist() == list(range(10, 20))
+        assert event_ids.tolist() == [10, 11, 12]
 
     def test_record_stage_seconds_populates_named_stages(self) -> None:
         # Opt-in stage timer fills a caller-provided dict; if omitted, the

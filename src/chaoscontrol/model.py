@@ -1034,17 +1034,12 @@ class CareStudentLM(nn.Module):
             return False
         batch, seq, dim = hidden.shape
         h_flat = hidden.detach().reshape(-1, dim)
-        event_flat = None
+        event_source = None
         if event_ids is not None:
-            event_flat = event_ids.detach().reshape(-1).to(
+            event_source = event_ids.detach().reshape(-1).to(
                 device=hidden.device,
                 dtype=torch.long,
             )
-            if event_flat.numel() != batch * seq:
-                raise ValueError(
-                    f"event_ids must have {batch * seq} entries for hidden shape "
-                    f"{tuple(hidden.shape)}, got {event_flat.numel()}"
-                )
         max_tokens_i = 0 if max_tokens is None else int(max_tokens)
         if max_tokens_i > 0 and h_flat.shape[0] > max_tokens_i:
             if score is not None:
@@ -1066,10 +1061,24 @@ class CareStudentLM(nn.Module):
                     device=hidden.device,
                 ).long()
             h_flat = h_flat.index_select(0, selected)
-            if event_flat is not None:
-                event_flat = event_flat.index_select(0, selected)
         else:
             selected = None
+        event_flat = None
+        if event_source is not None:
+            if event_source.numel() == batch * seq:
+                event_flat = (
+                    event_source.index_select(0, selected)
+                    if selected is not None
+                    else event_source
+                )
+            elif event_source.numel() == h_flat.shape[0]:
+                event_flat = event_source
+            else:
+                raise ValueError(
+                    "event_ids must either cover the full hidden shape "
+                    f"({batch * seq}) or the selected write count "
+                    f"({h_flat.shape[0]}), got {event_source.numel()}"
+                )
         encoded_flat = torch.tanh(
             self.outer_model.encoder(
                 h_flat.to(dtype=self.outer_model.encoder.weight.dtype)

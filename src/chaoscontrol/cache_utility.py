@@ -1004,8 +1004,11 @@ def rank3_score_batch_causal(
         event_ids = None
         reserve_event_ids = getattr(cache, "reserve_event_ids", None)
         if callable(reserve_event_ids):
+            n_write = int(h_off.shape[0] * h_off.shape[1])
+            if write_limit is not None:
+                n_write = min(n_write, max(0, int(write_limit)))
             event_ids = reserve_event_ids(
-                int(h_off.shape[0] * h_off.shape[1]),
+                n_write,
                 device=h_off.device,
             )
         append_kwargs = {
