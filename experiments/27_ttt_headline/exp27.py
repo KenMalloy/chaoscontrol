@@ -138,6 +138,10 @@ def build_ttt_headline_matrix(
     calc_type_configs: dict[str, dict[str, Any]] = {
         name: dict(hyperparams_by_calc_type.get(name, {})) for name in requested
     }
+    headline_calc_type = (
+        "adaptive_carry" if "adaptive_carry" in requested
+        else ("score_only_reset" if "score_only_reset" in requested else requested[0])
+    )
 
     ckpt_value = str(checkpoint_path) if checkpoint_path is not None else None
     entries: list[dict[str, Any]] = []
@@ -165,6 +169,7 @@ def build_ttt_headline_matrix(
                 "exp27_mechanism": "ttt_headline_v1",
                 "calc_types": list(requested),
                 "calc_type_configs": copy.deepcopy(calc_type_configs),
+                "headline_calc_type": headline_calc_type,
                 "checkpoint_path": ckpt_value,
             }
         )

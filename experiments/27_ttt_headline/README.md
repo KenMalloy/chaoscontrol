@@ -133,7 +133,7 @@ once exp26 picks a winning trunk.
 
 When the runner is invoked with `--val-cache-dir` and a config that
 sets `calc_types`, `result["eval"]` carries the per-calc_type dict
-plus a backward-compatible headline:
+plus the configured headline calc_type:
 
 ```jsonc
 {
@@ -143,17 +143,17 @@ plus a backward-compatible headline:
       "carry_state":      {"bpb": ..., "loss": ..., ...},
       "dreamworld_eval":  {"bpb": ..., "loss": ..., ...}
     },
-    "headline_calc_type": "score_only_reset",
-    "bpb": <score_only_reset's bpb>,
-    "loss": <score_only_reset's loss>
+    "headline_calc_type": "adaptive_carry",
+    "bpb": <adaptive_carry's bpb>,
+    "loss": <adaptive_carry's loss>
   }
 }
 ```
 
-The headline mirrors the floor calc_type (`score_only_reset`) when it
-was requested, otherwise the first calc_type in the requested list.
-Downstream tooling that reads `result["eval"]["bpb"]` continues to
-work; the calc_type breakdown is additive.
+Exp27 sets `headline_calc_type` to `adaptive_carry` when that calc_type
+is requested. Generic calc_type runs without an explicit headline retain
+the older floor-first fallback (`score_only_reset` if present, otherwise
+the first requested calc_type).
 
 ## Pre-launch checklist
 

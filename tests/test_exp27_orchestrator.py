@@ -157,6 +157,7 @@ def test_matrix_entries_carry_default_calc_types_and_hyperparams(
         # World size + budget land in the entry.
         assert entry["world_size"] == 4
         assert entry["budget_seconds"] == 600.0
+        assert entry["headline_calc_type"] == "adaptive_carry"
 
 
 def test_matrix_calc_type_subset_is_respected(
@@ -174,6 +175,7 @@ def test_matrix_calc_type_subset_is_respected(
     entry = entries[0]
     assert entry["calc_types"] == ["score_only_reset"]
     assert set(entry["calc_type_configs"].keys()) == {"score_only_reset"}
+    assert entry["headline_calc_type"] == "score_only_reset"
 
 
 def test_matrix_unknown_calc_type_raises(

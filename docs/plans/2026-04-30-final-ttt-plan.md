@@ -60,6 +60,9 @@ budget only if Dreamworld proves both legal and useful.
 - `run_exp27.py` owns the child `PYTHONPATH` needed by `torchrun`, and passes
   `--val-cache-dir` through `launch.run_matrix_entries` into
   `runner_fast_path.py`.
+- Exp27 sets `headline_calc_type=adaptive_carry` when the adaptive calc_type
+  is requested, while still recording `score_only_reset` as the floor in
+  `eval.calc_types`.
 
 ## Pod Evidence
 

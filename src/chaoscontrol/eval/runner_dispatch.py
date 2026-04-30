@@ -6,9 +6,10 @@ The runner picks one of two eval paths per cell:
   - Legacy: a single ``evaluate_bpb_sp`` pass over random-window starts.
     Used by every experiment before exp27. Returned as-is.
   - Calc_types: a ``ValCache``-driven multi-strategy pass. The headline
-    BPB is set to ``score_only_reset`` for backward compatibility with
-    downstream tooling that reads ``result["eval"]["bpb"]``; the full
-    per-calc_type dict lives under ``result["eval"]["calc_types"]``.
+    BPB is selected by ``config["headline_calc_type"]`` when present,
+    otherwise it falls back to ``score_only_reset`` for backward
+    compatibility; the full per-calc_type dict lives under
+    ``result["eval"]["calc_types"]``.
 
 The legacy eval is supplied as an injected callable so this module
 stays in ``src/`` without reverse-importing from ``experiments/``.
@@ -50,7 +51,7 @@ def dispatch_eval_for_config(
 
         {
           "calc_types": {<name>: {"bpb", "loss", ...}, ...},
-          "bpb":   <score_only_reset bpb if present, else first calc_type's bpb>,
+          "bpb":   <headline calc_type's bpb>,
           "loss":  <matching loss>,
         }
 
@@ -92,10 +93,19 @@ def dispatch_eval_for_config(
         source_order_preserved=True,
     )
 
-    headline_name = (
-        "score_only_reset" if "score_only_reset" in ct_results
-        else next(iter(ct_results))
-    )
+    requested_headline = config.get("headline_calc_type")
+    if requested_headline is not None:
+        headline_name = str(requested_headline)
+        if headline_name not in ct_results:
+            raise ValueError(
+                "headline_calc_type must be one of calc_types; "
+                f"got {headline_name!r} for {list(ct_results)}"
+            )
+    else:
+        headline_name = (
+            "score_only_reset" if "score_only_reset" in ct_results
+            else next(iter(ct_results))
+        )
     headline = ct_results[headline_name]
 
     nonfinite = [

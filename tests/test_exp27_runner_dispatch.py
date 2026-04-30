@@ -195,6 +195,38 @@ def test_dispatch_uses_first_calc_type_when_score_only_reset_absent(tiny_setup):
     assert out["bpb"] == out["calc_types"]["carry_state"]["bpb"]
 
 
+def test_dispatch_uses_configured_headline_calc_type(tiny_setup):
+    def legacy(model, **kwargs):
+        raise AssertionError("legacy path must not be called when calc_types set")
+
+    out = dispatch_eval_for_config(
+        config={
+            "calc_types": ["score_only_reset", "carry_state"],
+            "headline_calc_type": "carry_state",
+            "calc_type_configs": {"carry_state": {"decay": 1.0}},
+        },
+        legacy_evaluate_fn=legacy,
+        **tiny_setup,
+    )
+    assert out["headline_calc_type"] == "carry_state"
+    assert out["bpb"] == out["calc_types"]["carry_state"]["bpb"]
+
+
+def test_dispatch_rejects_headline_not_in_calc_types(tiny_setup):
+    def legacy(model, **kwargs):
+        raise AssertionError("legacy path must not be called when calc_types set")
+
+    with pytest.raises(ValueError, match="headline_calc_type"):
+        dispatch_eval_for_config(
+            config={
+                "calc_types": ["score_only_reset"],
+                "headline_calc_type": "adaptive_carry",
+            },
+            legacy_evaluate_fn=legacy,
+            **tiny_setup,
+        )
+
+
 def test_dispatch_raises_when_calc_types_set_but_val_cache_none(tiny_setup):
     setup = {**tiny_setup, "val_cache": None}
 
