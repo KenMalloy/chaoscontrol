@@ -432,15 +432,18 @@ class TestTrainSSMStepEquivalence:
             assert d < 1e-5, f"single-backward grad mismatch on {name!r}: {d}"
 
     @pytest.mark.skipif(
-        _lm_head_loss._C is None,
-        reason="fused_lm_head dispatcher no longer falls back on CPU; needs built _C",
+        _lm_head_loss._C is None or not torch.cuda.is_available(),
+        reason="fused_lm_head dispatcher needs a built CUDA extension",
     )
     def test_fused_backward_mode_matches_bare_ssm_old_path(
         self, bare_ssm_model: CareStudentLM,
     ) -> None:
         """Fused mode is allowed to use native RMSNorm but not change math."""
-        inputs, targets = _make_batch(batch=2, seq=16, vocab=64, seed=20)
-        model_old = bare_ssm_model
+        device = torch.device("cuda")
+        inputs, targets = (
+            tensor.to(device) for tensor in _make_batch(batch=2, seq=16, vocab=64, seed=20)
+        )
+        model_old = bare_ssm_model.to(device)
         model_new = copy.deepcopy(model_old)
 
         old_grads = _old_path_grads(model_old, inputs, targets)
@@ -503,8 +506,8 @@ class TestTrainSSMStepEquivalence:
         ]
 
     @pytest.mark.skipif(
-        _lm_head_loss._C is None,
-        reason="fused_lm_head dispatcher no longer falls back on CPU; needs built _C",
+        _lm_head_loss._C is None or not torch.cuda.is_available(),
+        reason="fused_lm_head dispatcher needs a built CUDA extension",
     )
     def test_fused_lm_head_backward_with_ce_returns_per_token_ce_matching_scalar(
         self,
@@ -518,10 +521,11 @@ class TestTrainSSMStepEquivalence:
         semantics.
         """
         torch.manual_seed(11)
-        hidden = torch.randn(2, 3, 4, requires_grad=True)
-        final_norm = torch.nn.RMSNorm(4, eps=1e-6)
-        lm_head = torch.nn.Linear(4, 6, bias=False)
-        targets = torch.randint(0, 6, (2, 3), dtype=torch.long)
+        device = torch.device("cuda")
+        hidden = torch.randn(2, 3, 4, device=device, requires_grad=True)
+        final_norm = torch.nn.RMSNorm(4, eps=1e-6).to(device)
+        lm_head = torch.nn.Linear(4, 6, bias=False).to(device)
+        targets = torch.randint(0, 6, (2, 3), device=device, dtype=torch.long)
 
         loss, per_token_ce = fused_lm_head_backward_with_ce(
             hidden,

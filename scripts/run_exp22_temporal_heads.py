@@ -200,6 +200,7 @@ def _boundary_nll_from_log_probs(
     log_probs: torch.Tensor,
     target: torch.Tensor,
 ) -> float:
+    target = target.to(device=log_probs.device)
     return float(
         -log_probs.gather(-1, target.unsqueeze(-1)).squeeze(-1).sum().item()
     )
