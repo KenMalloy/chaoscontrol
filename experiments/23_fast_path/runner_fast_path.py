@@ -10260,7 +10260,18 @@ def train_fast_for_budget(
 
             check_interval = max(1, int(stop_check_interval))
             max_steps_reached = max_steps is not None and steps >= int(max_steps)
-            if steps == 0 or steps % check_interval == 0 or max_steps_reached:
+            memory_rank_wall_stop_check = (
+                crct_enabled
+                and bool(is_episodic_rank)
+                and not bool(episodic_enabled)
+                and not bool(memory_rank_joins_grad)
+            )
+            if (
+                memory_rank_wall_stop_check
+                or steps == 0
+                or steps % check_interval == 0
+                or max_steps_reached
+            ):
                 elapsed = time.perf_counter() - start_time
                 local_stop = should_stop_training_loop(
                     steps=steps,

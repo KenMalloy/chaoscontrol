@@ -97,8 +97,8 @@ def test_score_stage_timing_config_reaches_main_train_call() -> None:
 def test_crct_memory_rank_checks_wall_clock_even_when_idle() -> None:
     """Idle memory rank must stop from wall clock, not local score steps."""
     source = RUNNER_PATH.read_text()
-    assert "memory_rank_wall_stop_check =" in source
-    assert "memory_rank_wall_stop_check\n                or steps == 0" in source
+    assert source.count("memory_rank_wall_stop_check =") >= 2
+    assert source.count("memory_rank_wall_stop_check\n                or steps == 0") >= 2
 
 
 class _TinyTrainStepModel(nn.Module):
