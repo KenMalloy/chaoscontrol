@@ -2263,6 +2263,8 @@ class _CrctMailboxTeacherTransport:
             "ready_result_queue_max": 0,
             "ready_result_queue_drops": 0,
             "memory_rank_pump_steps": 0,
+            "memory_rank_pump_loop_seconds_sum": 0.0,
+            "memory_rank_pump_loop_seconds_max": 0.0,
             "memory_rank_pump_idle_spins": 0,
             "memory_rank_pump_request_pops": 0,
             "memory_rank_pump_last_request_step": -1,
@@ -10124,43 +10126,70 @@ def train_fast_for_budget(
     def _pump_crct_memory_rank(step: int) -> bool:
         if crct_teacher_transport is None:
             return False
+        pump_t0 = time.perf_counter()
         assert crct_cache is not None
-        score_before = int(crct_teacher_transport.metrics.get("payloads_scored", 0))
-        weight_before = int(
-            crct_teacher_transport.metrics.get("weight_snapshot_applied", 0)
-        )
-        request_pops_before = int(
-            crct_teacher_transport.metrics.get("memory_rank_pump_request_pops", 0)
-        )
-        empty = torch.empty((0, 0), dtype=torch.int32, device=device)
-        crct_teacher_transport.begin_step(inputs=empty, targets=empty, step=int(step))
-        crct_teacher_transport.after_optimizer_step(
-            model=model,
-            cache=crct_cache,
-            scarcity_optimizer=crct_scarcity,
-            step=int(step),
-            total_steps=max_steps,
-            tau=float(crct_lm_weight_tau),
-            strength=float(crct_lm_weight_strength),
-            w_max=float(crct_lm_weight_w_max),
-            alpha_max=float(crct_lm_weight_alpha_max),
-            memory_write_tokens=int(crct_memory_write_tokens_per_step),
-            gradient_conflict_monitor=crct_gradient_conflict,
-            replay_eviction_loop=replay_eviction_loop,
-            fast_slow=None,
-            fast_slow_action_space=None,
-            fast_slow_nll_chunk_size=int(chunk_size),
-        )
-        request_pops_after = int(
-            crct_teacher_transport.metrics.get("memory_rank_pump_request_pops", 0)
-        )
-        return (
-            request_pops_after > request_pops_before
-            or int(crct_teacher_transport.metrics.get("payloads_scored", 0))
-            > score_before
-            or int(crct_teacher_transport.metrics.get("weight_snapshot_applied", 0))
-            > weight_before
-        )
+        try:
+            score_before = int(
+                crct_teacher_transport.metrics.get("payloads_scored", 0)
+            )
+            weight_before = int(
+                crct_teacher_transport.metrics.get("weight_snapshot_applied", 0)
+            )
+            request_pops_before = int(
+                crct_teacher_transport.metrics.get(
+                    "memory_rank_pump_request_pops", 0
+                )
+            )
+            poll_requests = getattr(crct_teacher_transport, "_poll_requests", None)
+            if callable(poll_requests):
+                popped = int(poll_requests())
+                crct_teacher_transport.metrics["memory_rank_pump_request_pops"] += (
+                    popped
+                )
+            crct_teacher_transport.after_optimizer_step(
+                model=model,
+                cache=crct_cache,
+                scarcity_optimizer=crct_scarcity,
+                step=int(step),
+                total_steps=max_steps,
+                tau=float(crct_lm_weight_tau),
+                strength=float(crct_lm_weight_strength),
+                w_max=float(crct_lm_weight_w_max),
+                alpha_max=float(crct_lm_weight_alpha_max),
+                memory_write_tokens=int(crct_memory_write_tokens_per_step),
+                gradient_conflict_monitor=crct_gradient_conflict,
+                replay_eviction_loop=replay_eviction_loop,
+                fast_slow=None,
+                fast_slow_action_space=None,
+                fast_slow_nll_chunk_size=int(chunk_size),
+            )
+            request_pops_after = int(
+                crct_teacher_transport.metrics.get("memory_rank_pump_request_pops", 0)
+            )
+            return (
+                request_pops_after > request_pops_before
+                or int(crct_teacher_transport.metrics.get("payloads_scored", 0))
+                > score_before
+                or int(
+                    crct_teacher_transport.metrics.get(
+                        "weight_snapshot_applied", 0
+                    )
+                )
+                > weight_before
+            )
+        finally:
+            elapsed = time.perf_counter() - pump_t0
+            crct_teacher_transport.metrics["memory_rank_pump_loop_seconds_sum"] += (
+                float(elapsed)
+            )
+            crct_teacher_transport.metrics["memory_rank_pump_loop_seconds_max"] = max(
+                float(
+                    crct_teacher_transport.metrics[
+                        "memory_rank_pump_loop_seconds_max"
+                    ]
+                ),
+                float(elapsed),
+            )
 
     try:
         while True:
@@ -11277,6 +11306,12 @@ def train_fast_for_budget(
                 ),
                 "memory_rank_request_events_superseded": int(
                     mem.get("memory_rank_request_events_superseded", 0)
+                ),
+                "memory_rank_pump_loop_seconds_sum": float(
+                    mem.get("memory_rank_pump_loop_seconds_sum", 0.0)
+                ),
+                "memory_rank_pump_loop_seconds_max": float(
+                    mem.get("memory_rank_pump_loop_seconds_max", 0.0)
                 ),
                 "memory_rank_pump_score_calls": int(
                     mem.get("memory_rank_pump_score_calls", 0)
