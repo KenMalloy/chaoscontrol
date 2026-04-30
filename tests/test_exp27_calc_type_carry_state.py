@@ -48,14 +48,18 @@ class TinyModel(nn.Module):
         self.layers = (None,)
         self._init_states_log: list[list[torch.Tensor] | None] = []
         self._final_states_log: list[torch.Tensor] = []
+        self._memory_modes_log: list[str | None] = []
+        self.forward_call_count = 0
 
     def encode(
         self,
         input_ids: torch.Tensor,
         *,
+        memory_mode: str | None = None,
         initial_states: list[torch.Tensor] | None = None,
         return_final_states: bool = False,
     ):
+        self._memory_modes_log.append(memory_mode)
         if initial_states is None:
             self._init_states_log.append(None)
         else:
@@ -86,6 +90,7 @@ class TinyModel(nn.Module):
         *,
         initial_states: list[torch.Tensor] | None = None,
     ) -> torch.Tensor:
+        self.forward_call_count += 1
         hidden = self.encode(input_ids, initial_states=initial_states)
         return self.lm_head(hidden)
 
@@ -253,3 +258,14 @@ def test_carry_state_preserves_train_mode(tmp_path):
     carry_state(ctx)
 
     assert model.training is True
+
+
+def test_carry_state_uses_packet_encode_lane(tmp_path):
+    model = TinyModel(seed=0)
+    cache = make_val_cache(tmp_path, doc_lens=[8, 8, 8])
+    ctx = make_ctx(model, cache)
+
+    carry_state(ctx)
+
+    assert model.forward_call_count == 0
+    assert model._memory_modes_log == ["packet", "packet", "packet"]

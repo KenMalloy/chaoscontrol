@@ -9,6 +9,8 @@ state. Order-sensitive — the orchestrator must load ``ValCache`` with
 from __future__ import annotations
 
 import math
+import inspect
+from typing import Any
 
 import torch
 import torch.nn.functional as F
@@ -25,6 +27,30 @@ def _lm_logits(model: torch.nn.Module, hidden: torch.Tensor) -> torch.Tensor:
     if final_norm is not None:
         hidden = final_norm(hidden)
     return model.lm_head(hidden)
+
+
+def _packet_encode(
+    model: torch.nn.Module,
+    input_ids: torch.Tensor,
+    *,
+    initial_states: list[torch.Tensor] | None,
+) -> tuple[torch.Tensor, list[torch.Tensor]]:
+    """Encode through packet mode when present, falling back for test doubles."""
+    encode = getattr(model, "encode")
+    kwargs: dict[str, Any] = {
+        "initial_states": initial_states,
+        "return_final_states": True,
+    }
+    if "memory_mode" in inspect.signature(encode).parameters:
+        kwargs["memory_mode"] = "packet"
+    out = encode(input_ids, **kwargs)
+    if isinstance(out, dict):
+        hidden = out["hidden"]
+        final_states = list(out["final_states"])
+    else:
+        hidden, final_states = out
+        final_states = list(final_states)
+    return hidden, final_states
 
 
 @register_calc_type(
@@ -70,10 +96,10 @@ def carry_state(ctx: CalcTypeContext) -> CalcTypeResult:
                 input_ids = torch.tensor(
                     tokens_np, dtype=torch.long, device=device
                 ).unsqueeze(0)
-                hidden, final_states = model.encode(
+                hidden, final_states = _packet_encode(
+                    model,
                     input_ids,
                     initial_states=prev_states,
-                    return_final_states=True,
                 )
                 logits = _lm_logits(model, hidden)
                 ce_sum = F.cross_entropy(

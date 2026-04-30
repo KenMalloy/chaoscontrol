@@ -7,6 +7,8 @@ this is the reference Param-Golf-legal eval contract.
 from __future__ import annotations
 
 import math
+import inspect
+from typing import Any
 
 import torch
 import torch.nn.functional as F
@@ -18,11 +20,24 @@ from chaoscontrol.eval.ttt_eval import (
 )
 
 
-def _model_logits(out: object) -> torch.Tensor:
-    """Extract logits from either a tensor or a dict-shaped model output."""
-    if isinstance(out, dict):
-        return out["logits"]  # type: ignore[return-value]
-    return out  # type: ignore[return-value]
+def _packet_logits(model: torch.nn.Module, input_ids: torch.Tensor) -> torch.Tensor:
+    """Score through the packet-clean encoder lane when the model supports it."""
+    encode = getattr(model, "encode", None)
+    if encode is None:
+        out = model(input_ids)
+        if isinstance(out, dict):
+            return out["logits"]  # type: ignore[return-value]
+        return out  # type: ignore[return-value]
+
+    kwargs: dict[str, Any] = {}
+    if "memory_mode" in inspect.signature(encode).parameters:
+        kwargs["memory_mode"] = "packet"
+    out = encode(input_ids, **kwargs)
+    hidden = out["hidden"] if isinstance(out, dict) else out
+    final_norm = getattr(model, "final_norm", None)
+    if final_norm is not None:
+        hidden = final_norm(hidden)
+    return model.lm_head(hidden)
 
 
 @register_calc_type(
@@ -59,8 +74,7 @@ def score_only_reset(ctx: CalcTypeContext) -> CalcTypeResult:
                 input_ids = torch.tensor(
                     tokens_np, dtype=torch.long, device=device
                 ).unsqueeze(0)
-                out = model(input_ids)
-                logits = _model_logits(out)
+                logits = _packet_logits(model, input_ids)
                 # Predict token i+1 from tokens 0..i: use logits[:, :-1] vs targets[:, 1:].
                 ce_sum = F.cross_entropy(
                     logits[:, :-1].reshape(-1, logits.size(-1)),

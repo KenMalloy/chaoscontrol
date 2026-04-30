@@ -2615,6 +2615,26 @@ def test_torchrun_command_uses_all_requested_gpus(tmp_path):
     assert "--output-json" in cmd and str(out) in cmd
 
 
+def test_torchrun_command_can_pass_val_cache_dir(tmp_path):
+    mod = _load_launch_module()
+    cfg = tmp_path / "cfg.yaml"
+    out = tmp_path / "out.json"
+    val_cache = tmp_path / "val-cache"
+    cmd = mod.build_torchrun_cmd(
+        runner_path=Path("experiments/23_fast_path/runner_fast_path.py"),
+        config_path=cfg,
+        data_path="/data/fineweb",
+        sp_model_path="/data/sp16384.model",
+        output_json=out,
+        world_size=4,
+        rdzv_port=23456,
+        val_cache_dir=val_cache,
+    )
+
+    assert "--val-cache-dir" in cmd
+    assert cmd[cmd.index("--val-cache-dir") + 1] == str(val_cache)
+
+
 def test_summarize_results_ranks_successes_and_records_errors(tmp_path):
     mod = _load_launch_module()
     results = tmp_path / "results"

@@ -36,6 +36,7 @@ def build_torchrun_cmd(
     rdzv_port: int | None = None,
     output_ckpt: Path | None = None,
     budget_seconds: float | None = None,
+    val_cache_dir: Path | str | None = None,
     dry_run: bool = False,
 ) -> list[str]:
     if rdzv_port is None:
@@ -62,6 +63,8 @@ def build_torchrun_cmd(
         cmd += ["--output-ckpt", str(output_ckpt)]
     if budget_seconds is not None:
         cmd += ["--budget", str(float(budget_seconds))]
+    if val_cache_dir is not None:
+        cmd += ["--val-cache-dir", str(val_cache_dir)]
     return cmd
 
 
@@ -132,6 +135,7 @@ def run_matrix_entries(
     dry_run: bool = False,
     skip_existing: bool = True,
     checkpoint_dir: Path | None = None,
+    val_cache_dir: Path | str | None = None,
 ) -> dict[str, Any]:
     results_dir.mkdir(parents=True, exist_ok=True)
     config_dir = results_dir / "configs"
@@ -160,6 +164,7 @@ def run_matrix_entries(
             output_ckpt=output_ckpt,
             world_size=world_size,
             budget_seconds=float(entry.get("budget_seconds", 90.0)),
+            val_cache_dir=val_cache_dir,
             dry_run=dry_run,
         )
         commands.append(cmd)

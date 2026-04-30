@@ -66,16 +66,20 @@ class TinyModel(nn.Module):
         # Number of "physical layers" — for our purposes a single state.
         self.layers = (None,)
         self._init_states_log: list[list[torch.Tensor] | None] = []
+        self._memory_modes_log: list[str | None] = []
+        self.forward_call_count = 0
 
     def encode(
         self,
         input_ids: torch.Tensor,
         *,
+        memory_mode: str | None = None,
         initial_states: list[torch.Tensor] | None = None,
         return_final_states: bool = False,
     ):
         """Tiny SSM-ish recurrence: state' = w_state(state) + w_in(embed)."""
         # Snapshot the initial state input for inspection by tests.
+        self._memory_modes_log.append(memory_mode)
         if initial_states is None:
             self._init_states_log.append(None)
         else:
@@ -105,6 +109,7 @@ class TinyModel(nn.Module):
         *,
         initial_states: list[torch.Tensor] | None = None,
     ) -> torch.Tensor:
+        self.forward_call_count += 1
         hidden = self.encode(input_ids, initial_states=initial_states)
         return self.lm_head(hidden)
 
@@ -212,6 +217,18 @@ def test_score_only_reset_resets_state_each_doc(tmp_path):
     assert len(model._init_states_log) == 3
     for entry in model._init_states_log:
         assert entry is None
+
+
+def test_score_only_reset_uses_packet_encode_lane(tmp_path):
+    """The floor must stay on the same packet lane as adaptive calc_types."""
+    model = TinyModel(seed=0)
+    cache = make_val_cache(tmp_path, doc_lens=[8, 8])
+    ctx = make_ctx(model, cache)
+
+    score_only_reset(ctx)
+
+    assert model.forward_call_count == 0
+    assert model._memory_modes_log == ["packet", "packet"]
 
 
 def test_score_only_reset_preserves_train_mode(tmp_path):

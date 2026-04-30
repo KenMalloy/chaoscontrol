@@ -56,6 +56,7 @@ DEFAULT_DATA_PATH = (
 DEFAULT_SP_MODEL_16384 = (
     REPO / "baselines" / "parameter_golf" / "tokenizers" / "fineweb_16384_bpe.model"
 )
+DEFAULT_VAL_CACHE_DIR = EXP27 / "val_cache"
 
 sys.path.insert(0, str(EXP23))
 sys.path.insert(0, str(EXP24))
@@ -135,6 +136,7 @@ def _run_headline(
     budget_seconds: float,
     data_path: Path,
     sp_model_path_16384: Path,
+    val_cache_dir: Path,
     output_dir: Path,
     manifest_path: Path,
     calc_types: list[str] | None,
@@ -176,6 +178,12 @@ def _run_headline(
     if dry_run:
         _print_entries(entries)
         return
+    if entries and not val_cache_dir.is_dir():
+        raise FileNotFoundError(
+            "Exp27 calc_types require a ValCache directory; build it with "
+            "scripts/build_exp20_val_cache.py and pass --val-cache-dir. "
+            f"Missing: {val_cache_dir}"
+        )
 
     from fast_path import write_matrix  # noqa: E402
     from launch import run_matrix_entries  # noqa: E402
@@ -200,6 +208,7 @@ def _run_headline(
         dry_run=False,
         skip_existing=skip_existing,
         checkpoint_dir=None,
+        val_cache_dir=val_cache_dir,
     )
 
 
@@ -214,6 +223,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--data-path", type=Path, default=DEFAULT_DATA_PATH)
     parser.add_argument(
         "--sp-model-path-16384", type=Path, default=DEFAULT_SP_MODEL_16384
+    )
+    parser.add_argument(
+        "--val-cache-dir",
+        type=Path,
+        default=DEFAULT_VAL_CACHE_DIR,
+        help=(
+            "ValCache directory consumed by runner_fast_path when calc_types "
+            "are enabled."
+        ),
     )
     parser.add_argument(
         "--checkpoint-path",
@@ -279,6 +297,7 @@ def main(argv: list[str] | None = None) -> int:
             budget_seconds=float(args.headline_budget),
             data_path=args.data_path,
             sp_model_path_16384=args.sp_model_path_16384,
+            val_cache_dir=args.val_cache_dir,
             output_dir=args.headline_output_dir,
             manifest_path=args.manifest_path,
             calc_types=list(args.calc_types) if args.calc_types else None,

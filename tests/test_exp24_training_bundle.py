@@ -1052,6 +1052,7 @@ def test_run_matrix_entries_dry_run_does_not_bind_port(tmp_path, monkeypatch):
         world_size=1,
         dry_run=True,
         skip_existing=False,
+        val_cache_dir=tmp_path / "val-cache",
     )
     commands = summary.get("commands") or []
     assert commands, "dry-run should populate summary['commands']"
@@ -1062,6 +1063,8 @@ def test_run_matrix_entries_dry_run_does_not_bind_port(tmp_path, monkeypatch):
         assert rdzv_endpoint == (
             f"--rdzv-endpoint=localhost:{launch.DRY_RUN_RDZV_PORT}"
         )
+        assert "--val-cache-dir" in cmd
+        assert cmd[cmd.index("--val-cache-dir") + 1] == str(tmp_path / "val-cache")
 
 
 def test_summarize_result_dir_merges_val_bpb(tmp_path):
