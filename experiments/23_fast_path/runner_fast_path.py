@@ -2124,6 +2124,7 @@ class _CrctMailboxTeacherTransport:
         self._last_applied_weight_step = -1
         self._fast_slow_slow_model: torch.nn.Module | None = None
         self._weight_snapshot_host_staging: dict[str, torch.Tensor] = {}
+        self._weight_snapshot_read_staging: dict[str, torch.Tensor] = {}
         self._weight_snapshot_stage_banks: list[dict[str, Any]] = []
         self._weight_snapshot_bank_count = 3
         self._weight_snapshot_pending: dict[str, Any] | None = None
@@ -2371,6 +2372,10 @@ class _CrctMailboxTeacherTransport:
             "weight_snapshot_apply_stale": 0,
             "weight_snapshot_apply_errors": 0,
             "weight_snapshot_stat_skips": 0,
+            "weight_snapshot_read_seconds_sum": 0.0,
+            "weight_snapshot_read_seconds_max": 0.0,
+            "weight_snapshot_read_tensor_count": 0,
+            "weight_snapshot_read_bytes": 0,
             "weight_snapshot_apply_seconds_sum": 0.0,
             "weight_snapshot_apply_seconds_max": 0.0,
             "weight_snapshot_last_published_step": -1,
@@ -3356,21 +3361,59 @@ class _CrctMailboxTeacherTransport:
             return None
         if int(best_header["snapshot_version"]) <= int(min_snapshot_version):
             return int(best_header["step"]), {}, None
+        read_t0 = time.perf_counter()
         state_cpu: dict[str, torch.Tensor] = {}
+        read_bytes = 0
+        read_tensors = 0
         for item in self._weight_snapshot_layout:
             template = state_template[item["name"]]
             if not torch.is_tensor(template):
                 continue
-            out = torch.empty(
-                tuple(item["shape"]),
-                dtype=item["dtype"],
-                device="cpu",
-            ).contiguous()
+            out = self._weight_snapshot_read_staging.get(item["name"])
+            if (
+                out is None
+                or tuple(out.shape) != tuple(item["shape"])
+                or out.dtype != item["dtype"]
+                or out.device.type != "cpu"
+                or not out.is_contiguous()
+            ):
+                want_pinned = bool(
+                    torch.cuda.is_available()
+                    and getattr(template, "device", torch.device("cpu")).type
+                    == "cuda"
+                )
+                try:
+                    out = torch.empty(
+                        tuple(item["shape"]),
+                        dtype=item["dtype"],
+                        device="cpu",
+                        pin_memory=want_pinned,
+                    )
+                except Exception:
+                    if want_pinned:
+                        self.metrics["host_pin_memory_failures"] += 1
+                        self.metrics["weight_snapshot_pin_memory_failures"] += 1
+                    out = torch.empty(
+                        tuple(item["shape"]),
+                        dtype=item["dtype"],
+                        device="cpu",
+                    )
+                self._weight_snapshot_read_staging[item["name"]] = out
             self._weight_snapshot_shm.read_tensor_into(
                 best_base + int(item["offset"]),
                 out,
             )
             state_cpu[item["name"]] = out
+            read_bytes += int(item["nbytes"])
+            read_tensors += 1
+        read_s = time.perf_counter() - read_t0
+        self.metrics["weight_snapshot_read_seconds_sum"] += float(read_s)
+        self.metrics["weight_snapshot_read_seconds_max"] = max(
+            float(self.metrics["weight_snapshot_read_seconds_max"]),
+            float(read_s),
+        )
+        self.metrics["weight_snapshot_read_tensor_count"] = int(read_tensors)
+        self.metrics["weight_snapshot_read_bytes"] = int(read_bytes)
         decision_payload = None
         if int(best_header["fast_slow_mode"]) != 0:
             decision_payload = {
@@ -11211,6 +11254,18 @@ def train_fast_for_budget(
                 ),
                 "weight_snapshot_save_seconds_max": float(
                     coord.get("weight_snapshot_save_seconds_max", 0.0)
+                ),
+                "weight_snapshot_read_seconds_sum": float(
+                    mem.get("weight_snapshot_read_seconds_sum", 0.0)
+                ),
+                "weight_snapshot_read_seconds_max": float(
+                    mem.get("weight_snapshot_read_seconds_max", 0.0)
+                ),
+                "weight_snapshot_read_tensor_count": int(
+                    mem.get("weight_snapshot_read_tensor_count", 0)
+                ),
+                "weight_snapshot_read_bytes": int(
+                    mem.get("weight_snapshot_read_bytes", 0)
                 ),
                 "weight_snapshot_apply_seconds_max": float(
                     mem.get("weight_snapshot_apply_seconds_max", 0.0)
