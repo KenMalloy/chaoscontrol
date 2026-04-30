@@ -306,6 +306,59 @@ class TestCareStudentLM(unittest.TestCase):
         assert torch.allclose(packet, force["hidden"], atol=0.0, rtol=0.0)
         assert torch.allclose(packet_zero, off, atol=0.0, rtol=0.0)
 
+    def test_encode_paired_for_score_matches_separate_off_and_force_on(self) -> None:
+        torch.manual_seed(36)
+        model = CareStudentLM(
+            vocab_size=64,
+            dim=8,
+            num_layers=1,
+            ff_mult=2,
+            a_mode="diag",
+            rich_b_mode="none",
+            outer_model_dim=8,
+            outer_model_type="multislot",
+            outer_max_slots=8,
+            buffer_mode="append_only",
+            retrieval_mode="bucket_mean",
+        )
+        assert model.outer_model is not None
+        with torch.no_grad():
+            model.outer_model.decoder.weight.copy_(torch.eye(8))
+        model.outer_model._append_kv_batch_committed(
+            torch.ones(1, 8),
+            torch.tensor([0]),
+            event_ids=torch.tensor([2]),
+        )
+        ids = torch.randint(0, 64, (3, 7))
+
+        h_off = model.encode(ids, memory_mode="off", cache_read_cutoff=2)
+        force = model.encode(
+            ids,
+            memory_mode="force_on",
+            cache_read_cutoff=2,
+            return_memory_meta=True,
+        )
+        assert isinstance(force, dict)
+        paired_off, paired_mem, meta = model.encode_paired_for_score(
+            ids,
+            cache_read_cutoff=2,
+        )
+
+        torch.testing.assert_close(paired_off, h_off, rtol=1e-5, atol=1e-6)
+        torch.testing.assert_close(paired_mem, force["hidden"], rtol=1e-5, atol=1e-6)
+        torch.testing.assert_close(
+            meta["memory_residual"],
+            force["memory_meta"]["memory_residual"],
+            rtol=1e-5,
+            atol=1e-6,
+        )
+        torch.testing.assert_close(
+            meta["memory_gate"],
+            force["memory_meta"]["memory_gate"],
+            rtol=0,
+            atol=0,
+        )
+
     def test_encode_cache_read_cutoff_filters_append_only_multislot_reads(self) -> None:
         torch.manual_seed(4)
         model = CareStudentLM(

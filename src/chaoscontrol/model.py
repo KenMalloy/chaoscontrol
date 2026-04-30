@@ -1095,8 +1095,162 @@ class CareStudentLM(nn.Module):
                 encoded_flat,
                 bids_flat,
                 event_ids=event_flat,
-            )
+        )
         return True
+
+    def encode_paired_for_score(
+        self,
+        input_ids: torch.Tensor,
+        *,
+        cache_read_cutoff: int | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
+        """Return ``(h_off, h_mem, memory_meta)`` for rank-side scoring.
+
+        GPU3/GPU7 exact scoring asks the same question every request:
+        ``memory_off`` vs ``force_on`` for the same token batch and cache
+        cutoff. Running embed/Wernicke once and stacking the off/on streams
+        through the SSM loop preserves the oracle contract while avoiding two
+        separate recurrent launches. Train ranks never call this method.
+        """
+        x_base = self.embed(input_ids)
+        bucket_ids = None
+        if self.wernicke is not None:
+            x_base, bucket_ids, _balance_loss = self.wernicke(x_base)
+
+        memory_gate: torch.Tensor | None = None
+        memory_residual: torch.Tensor | None = None
+
+        def _expanded_gate(reference: torch.Tensor) -> torch.Tensor:
+            nonlocal memory_gate
+            if memory_gate is None:
+                memory_gate = torch.ones(
+                    reference.shape[:2],
+                    device=reference.device,
+                    dtype=reference.dtype,
+                )
+            return memory_gate.unsqueeze(-1).to(dtype=reference.dtype)
+
+        def _add_force_bias(reference: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
+            nonlocal memory_residual
+            gate = _expanded_gate(reference)
+            bias = bias.to(device=reference.device, dtype=reference.dtype)
+            memory_residual = bias if memory_residual is None else memory_residual + bias
+            return reference + bias * gate
+
+        if (
+            isinstance(self.outer_model, MultiSlotOuterModel)
+            and self.cue_projection
+        ):
+            self._last_outer_cue = x_base.detach().mean(dim=1)
+        else:
+            self._last_outer_cue = None
+
+        x_mem = x_base
+        if self.outer_model is not None and self.buffer_mode == "append_only":
+            batch = x_base.size(0)
+            model_dim = x_base.size(2)
+            if isinstance(self.outer_model, MultiSlotOuterModel) and self.outer_model._slots:
+                if bucket_ids is not None:
+                    per_sample_buckets = bucket_ids.mode(dim=1).values
+                else:
+                    per_sample_buckets = torch.zeros(
+                        batch,
+                        dtype=torch.long,
+                        device=x_base.device,
+                    )
+                outer_read = torch.zeros(
+                    batch,
+                    1,
+                    model_dim,
+                    device=x_base.device,
+                    dtype=x_base.dtype,
+                )
+                for b_id in per_sample_buckets.unique():
+                    mask = per_sample_buckets == b_id
+                    cue = None
+                    if self.retrieval_mode in ("bucket_topk", "softmax_all"):
+                        cue = self.outer_model.cue_proj(
+                            x_base[mask]
+                            .detach()
+                            .mean(dim=1)
+                            .to(dtype=self.outer_model.cue_proj.weight.dtype)
+                        )
+                    read = self.outer_model.read_bucket(
+                        int(mask.sum()),
+                        bucket_id=int(b_id.item()),
+                        mode=self.retrieval_mode,
+                        k=self.retrieval_k,
+                        cue=cue,
+                        read_cutoff=cache_read_cutoff,
+                    )
+                    outer_read[mask] = read.unsqueeze(1).to(dtype=x_base.dtype)
+                x_mem = _add_force_bias(x_mem, outer_read)
+
+            if self.bucket_prototypes_module is not None and bucket_ids is not None:
+                per_sample_buckets = bucket_ids.mode(dim=1).values
+                proto_bias = torch.zeros(
+                    batch,
+                    1,
+                    model_dim,
+                    device=x_base.device,
+                    dtype=x_base.dtype,
+                )
+                for b_id in per_sample_buckets.unique():
+                    mask = per_sample_buckets == b_id
+                    proto = self.bucket_prototypes_module.read(
+                        int(mask.sum()),
+                        int(b_id.item()),
+                    )
+                    proto_bias[mask] = proto.unsqueeze(1).to(dtype=x_base.dtype)
+                x_mem = _add_force_bias(x_mem, proto_bias)
+        elif self.outer_model is not None:
+            if isinstance(self.outer_model, MultiSlotOuterModel):
+                cue = x_base.detach().mean(dim=1) if self.cue_projection else None
+                outer_read = self.outer_model.read(
+                    x_base.size(0),
+                    cue=cue,
+                    read_cutoff=cache_read_cutoff,
+                )
+            else:
+                outer_read = self.outer_model.read(x_base.size(0))
+            x_mem = _add_force_bias(x_mem, outer_read.unsqueeze(1))
+
+        if self.semantic_tier is not None:
+            semantic_bias = self.semantic_tier.read(x_base.size(0))
+            x_mem = _add_force_bias(x_mem, semantic_bias.unsqueeze(1))
+
+        x_pair = torch.cat([x_base, x_mem], dim=0)
+        for layer_idx in self._virtual_layer_indices:
+            layer = self.layers[layer_idx]
+            x_pair = layer(x_pair, return_jacobian_stats=False)
+        h_off, h_mem = x_pair.chunk(2, dim=0)
+
+        if self.posterior is not None:
+            if isinstance(self.posterior, GlobalDelta):
+                posterior_bias = self.posterior.read(h_mem.size(0))
+                h_mem = _add_force_bias(h_mem, posterior_bias.unsqueeze(1))
+            elif isinstance(self.posterior, BucketDelta) and bucket_ids is not None:
+                per_sample_buckets = bucket_ids.mode(dim=1).values
+                posterior_bias = torch.cat([
+                    self.posterior.read(
+                        bucket_id=int(per_sample_buckets[i].item()),
+                        batch_size=1,
+                    )
+                    for i in range(h_mem.size(0))
+                ], dim=0)
+                h_mem = _add_force_bias(h_mem, posterior_bias.unsqueeze(1))
+            elif isinstance(self.posterior, ResidualCache):
+                query = h_mem.detach().mean(dim=1)
+                posterior_bias = self.posterior.read(query)
+                h_mem = _add_force_bias(h_mem, posterior_bias.unsqueeze(1))
+
+        memory_meta = {
+            "memory_mode": "force_on",
+            "cache_read_cutoff": cache_read_cutoff,
+            "memory_gate": memory_gate,
+            "memory_residual": memory_residual,
+        }
+        return h_off, h_mem, memory_meta
 
     def encode(
         self,

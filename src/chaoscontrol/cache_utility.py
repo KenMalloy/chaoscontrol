@@ -873,29 +873,42 @@ def rank3_score_batch_causal(
 
     memory_meta: dict[str, Any] | None = None
     with _autocast_for(input_ids.device.type):
-        h_off = model.encode(
-            x, memory_mode="off", cache_read_cutoff=txn.read_cutoff
-        )
-        _mark("after_encode_off")
-        try:
-            h_mem_out = model.encode(
+        paired_encode = getattr(model, "encode_paired_for_score", None)
+        if callable(paired_encode):
+            h_off, h_mem, memory_meta = paired_encode(
                 x,
-                memory_mode="force_on",
                 cache_read_cutoff=txn.read_cutoff,
-                return_memory_meta=True,
             )
-        except TypeError:
-            h_mem_out = model.encode(
-                x, memory_mode="force_on", cache_read_cutoff=txn.read_cutoff
-            )
-        if isinstance(h_mem_out, dict):
-            h_mem = h_mem_out["hidden"]
-            meta = h_mem_out.get("memory_meta")
-            if isinstance(meta, dict):
-                memory_meta = meta
+            # The paired path is one recurrent pass over stacked off/on
+            # streams. Attribute all encode time to ``encode_off`` and leave
+            # ``encode_force_on`` near-zero so existing encode_sum telemetry
+            # remains meaningful without inventing a new stage name.
+            _mark("after_encode_off")
+            _mark("after_encode_force_on")
         else:
-            h_mem = h_mem_out
-    _mark("after_encode_force_on")
+            h_off = model.encode(
+                x, memory_mode="off", cache_read_cutoff=txn.read_cutoff
+            )
+            _mark("after_encode_off")
+            try:
+                h_mem_out = model.encode(
+                    x,
+                    memory_mode="force_on",
+                    cache_read_cutoff=txn.read_cutoff,
+                    return_memory_meta=True,
+                )
+            except TypeError:
+                h_mem_out = model.encode(
+                    x, memory_mode="force_on", cache_read_cutoff=txn.read_cutoff
+                )
+            if isinstance(h_mem_out, dict):
+                h_mem = h_mem_out["hidden"]
+                meta = h_mem_out.get("memory_meta")
+                if isinstance(meta, dict):
+                    memory_meta = meta
+            else:
+                h_mem = h_mem_out
+            _mark("after_encode_force_on")
 
     nll_off = chunked_nll_from_hidden(
         model, h_off, y, chunk_budget_bytes=_RANK3_NLL_CHUNK_BUDGET_BYTES

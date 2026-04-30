@@ -196,6 +196,40 @@ class _SequencePacketMockModel(_PacketMockModel):
         return hidden
 
 
+class _PairedMockModel(_MockModel):
+    def __init__(self, *, dim: int = 8, vocab: int = 32, seed: int = 0) -> None:
+        super().__init__(dim=dim, vocab=vocab, seed=seed)
+        self.paired_calls: list[dict[str, Any]] = []
+
+    def encode(self, *args: Any, **kwargs: Any) -> torch.Tensor:
+        raise AssertionError("rank3_score_batch_causal should use paired encode")
+
+    def encode_paired_for_score(
+        self,
+        input_ids: torch.Tensor,
+        *,
+        cache_read_cutoff: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
+        self.paired_calls.append({"cache_read_cutoff": cache_read_cutoff})
+        batch, seq = input_ids.shape
+        g_off = torch.Generator(device=input_ids.device).manual_seed(self._hidden_off_seed)
+        g_mem = torch.Generator(device=input_ids.device).manual_seed(self._hidden_mem_seed)
+        h_off = torch.randn(batch, seq, self._dim, generator=g_off, device=input_ids.device)
+        h_mem = torch.randn(batch, seq, self._dim, generator=g_mem, device=input_ids.device)
+        return (
+            h_off,
+            h_mem,
+            {
+                "memory_residual": torch.ones(
+                    batch,
+                    1,
+                    self._dim,
+                    device=input_ids.device,
+                ),
+            },
+        )
+
+
 # ---------------------------------------------------------------------------
 # plasticity_budget_from_hidden_delta
 # ---------------------------------------------------------------------------
@@ -796,6 +830,21 @@ class TestRank3ScoreBatchCausal:
         )
         cutoffs = {c["cache_read_cutoff"] for c in model.encode_calls}
         assert cutoffs == {42}
+
+    def test_paired_encode_is_used_when_model_provides_it(self) -> None:
+        model = _PairedMockModel()
+        cache = _MockCache(cutoff=42)
+        ids = torch.randint(0, 32, (2, 6))
+        mask = torch.ones_like(ids, dtype=torch.bool)
+        out = rank3_score_batch_causal(
+            model=model,
+            cache=cache,
+            input_ids=ids,
+            valid_mask=mask,
+        )
+
+        assert model.paired_calls == [{"cache_read_cutoff": 42}]
+        assert out["memory_residual"].shape == (2, 1, model._dim)
 
     def test_invalid_positions_zeroed_across_all_outputs(self) -> None:
         # Without masking on every output the wiring task would multiply
