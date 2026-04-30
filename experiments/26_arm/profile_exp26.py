@@ -112,6 +112,14 @@ def _health_from_result(result: dict[str, Any]) -> dict[str, Any]:
         "memory_rank_pre_pump_seconds_max": float(health.get("memory_rank_pre_pump_seconds_max", 0.0) or 0.0),
         "memory_rank_replay_seconds_sum": float(health.get("memory_rank_replay_seconds_sum", 0.0) or 0.0),
         "memory_rank_replay_seconds_max": float(health.get("memory_rank_replay_seconds_max", 0.0) or 0.0),
+        "memory_rank_replay_ticks": int(health.get("memory_rank_replay_ticks", 0) or 0),
+        "memory_rank_replay_probes_ingested": int(health.get("memory_rank_replay_probes_ingested", 0) or 0),
+        "memory_rank_replay_deferred_for_packet_work": int(
+            health.get("memory_rank_replay_deferred_for_packet_work", 0) or 0
+        ),
+        "memory_rank_replay_deferred_for_backpressure": int(
+            health.get("memory_rank_replay_deferred_for_backpressure", 0) or 0
+        ),
         "memory_rank_pump_loop_seconds_sum": float(health.get("memory_rank_pump_loop_seconds_sum", 0.0) or 0.0),
         "memory_rank_pump_loop_seconds_max": float(health.get("memory_rank_pump_loop_seconds_max", 0.0) or 0.0),
         "memory_rank_pump_idle_sleep_seconds_sum": float(health.get("memory_rank_pump_idle_sleep_seconds_sum", 0.0) or 0.0),
@@ -168,6 +176,15 @@ def _print_profile_summary(summary: dict[str, Any]) -> None:
             f"gpu3={row['maintenance_gpu3_starvation_reason']} "
             f"plasticity={row['plasticity_packets_received']}"
         )
+        if row.get("arm") == "validation_adaptive_residual_memory":
+            print(
+                "    "
+                f"memory_loop={row.get('memory_rank_outer_loop_seconds_sum', 0.0):.3f}s "
+                f"pump={row.get('memory_rank_pump_loop_seconds_sum', 0.0):.3f}s "
+                f"replay={row.get('memory_rank_replay_seconds_sum', 0.0):.3f}s "
+                f"replay_ticks={row.get('memory_rank_replay_ticks', 0)} "
+                f"replay_defer_packet={row.get('memory_rank_replay_deferred_for_packet_work', 0)}"
+            )
         if row.get("score_stage_timing_enabled"):
             stage_sum = max(
                 float(row.get("score_stage_encode_seconds_sum", 0.0))

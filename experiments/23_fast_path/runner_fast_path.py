@@ -2269,6 +2269,10 @@ class _CrctMailboxTeacherTransport:
             "memory_rank_pre_pump_seconds_max": 0.0,
             "memory_rank_replay_seconds_sum": 0.0,
             "memory_rank_replay_seconds_max": 0.0,
+            "memory_rank_replay_ticks": 0,
+            "memory_rank_replay_probes_ingested": 0,
+            "memory_rank_replay_deferred_for_packet_work": 0,
+            "memory_rank_replay_deferred_for_backpressure": 0,
             "memory_rank_pump_loop_seconds_sum": 0.0,
             "memory_rank_pump_loop_seconds_max": 0.0,
             "memory_rank_pump_idle_spins": 0,
@@ -10210,6 +10214,64 @@ def train_fast_for_budget(
                 float(elapsed),
             )
 
+    def _maybe_tick_crct_replay_maintenance(
+        step: int,
+        *,
+        packet_work_done: bool,
+    ) -> bool:
+        """Run low-priority replay maintenance only when packet service is clear."""
+        if replay_eviction_loop is None:
+            return False
+        probe_fresh = _crct_replay_cache_probe(
+            replay_eviction_loop,
+            model,
+            step,
+        )
+        if crct_teacher_transport is not None and probe_fresh:
+            crct_teacher_transport.metrics[
+                "memory_rank_replay_probes_ingested"
+            ] += 1
+        if not replay_eviction_loop.has_probe():
+            return False
+        if packet_work_done:
+            if crct_teacher_transport is not None:
+                crct_teacher_transport.metrics[
+                    "memory_rank_replay_deferred_for_packet_work"
+                ] += 1
+                crct_teacher_transport.metrics[
+                    "low_priority_maintenance_last_reason"
+                ] = "packet_work"
+            return False
+        defer_low_priority = False
+        if crct_teacher_transport is not None:
+            should_defer = getattr(
+                crct_teacher_transport,
+                "should_defer_low_priority_maintenance",
+                None,
+            )
+            if callable(should_defer):
+                defer_low_priority = bool(should_defer())
+        if defer_low_priority:
+            if crct_teacher_transport is not None:
+                crct_teacher_transport.metrics[
+                    "memory_rank_replay_deferred_for_backpressure"
+                ] += 1
+            return False
+        replay_step = _crct_replay_tick_step(
+            replay_eviction_loop,
+            model,
+            step,
+        )
+        tick_result = replay_eviction_loop.tick(
+            model=model,
+            step=replay_step,
+        )
+        if crct_teacher_transport is not None:
+            crct_teacher_transport.metrics["memory_rank_replay_ticks"] += 1
+        if tick_result.evicted_indices:
+            replay_eviction_loop.flush_trace()
+        return True
+
     try:
         while True:
             memory_rank_loop_t0 = (
@@ -10329,38 +10391,11 @@ def train_fast_for_budget(
                     )
                 pump_work_done = _pump_crct_memory_rank(steps)
                 replay_t0 = time.perf_counter()
-                if replay_eviction_loop is not None:
-                    probe_fresh = _crct_replay_cache_probe(
-                        replay_eviction_loop,
-                        model,
-                        steps,
-                    )
-                    defer_low_priority = False
-                    if probe_fresh and crct_teacher_transport is not None:
-                        should_defer = getattr(
-                            crct_teacher_transport,
-                            "should_defer_low_priority_maintenance",
-                            None,
-                        )
-                        if callable(should_defer):
-                            defer_low_priority = bool(should_defer())
-                    if (
-                        probe_fresh
-                        and replay_eviction_loop.has_probe()
-                        and not defer_low_priority
-                    ):
-                        replay_step = _crct_replay_tick_step(
-                            replay_eviction_loop,
-                            model,
-                            steps,
-                        )
-                        tick_result = replay_eviction_loop.tick(
-                            model=model,
-                            step=replay_step,
-                        )
-                        pump_work_done = True
-                        if tick_result.evicted_indices:
-                            replay_eviction_loop.flush_trace()
+                if _maybe_tick_crct_replay_maintenance(
+                    steps,
+                    packet_work_done=bool(pump_work_done),
+                ):
+                    pump_work_done = True
                 if crct_teacher_transport is not None:
                     replay_s = time.perf_counter() - replay_t0
                     crct_teacher_transport.metrics[
@@ -10661,38 +10696,11 @@ def train_fast_for_budget(
                         )
                         > weight_before
                 )
-                if replay_eviction_loop is not None:
-                    probe_fresh = _crct_replay_cache_probe(
-                        replay_eviction_loop,
-                        model,
-                        steps,
-                    )
-                    defer_low_priority = False
-                    if probe_fresh and crct_teacher_transport is not None:
-                        should_defer = getattr(
-                            crct_teacher_transport,
-                            "should_defer_low_priority_maintenance",
-                            None,
-                        )
-                        if callable(should_defer):
-                            defer_low_priority = bool(should_defer())
-                    if (
-                        probe_fresh
-                        and replay_eviction_loop.has_probe()
-                        and not defer_low_priority
-                    ):
-                        replay_step = _crct_replay_tick_step(
-                            replay_eviction_loop,
-                            model,
-                            steps,
-                        )
-                        tick_result = replay_eviction_loop.tick(
-                            model=model,
-                            step=replay_step,
-                        )
-                        pump_work_done = True
-                        if tick_result.evicted_indices:
-                            replay_eviction_loop.flush_trace()
+                if _maybe_tick_crct_replay_maintenance(
+                    steps,
+                    packet_work_done=bool(pump_work_done),
+                ):
+                    pump_work_done = True
                 if pump_work_done:
                     if crct_teacher_transport is not None:
                         crct_teacher_transport.metrics["memory_rank_pump_steps"] += 1
@@ -11130,33 +11138,10 @@ def train_fast_for_budget(
             # score batches are ingested as probe frames; ticks consume
             # bounded slot-work chunks from the rolling frame stream.
             if replay_eviction_loop is not None and rank_ == world_size_ - 1:
-                probe_fresh = _crct_replay_cache_probe(
-                    replay_eviction_loop,
-                    model,
+                _maybe_tick_crct_replay_maintenance(
                     steps,
+                    packet_work_done=False,
                 )
-                defer_low_priority = False
-                if probe_fresh and crct_teacher_transport is not None:
-                    should_defer = getattr(
-                        crct_teacher_transport,
-                        "should_defer_low_priority_maintenance",
-                        None,
-                    )
-                    if callable(should_defer):
-                        defer_low_priority = bool(should_defer())
-                if (
-                    probe_fresh
-                    and replay_eviction_loop.has_probe()
-                    and not defer_low_priority
-                ):
-                    replay_step = _crct_replay_tick_step(
-                        replay_eviction_loop,
-                        model,
-                        steps,
-                    )
-                    tick_result = replay_eviction_loop.tick(model=model, step=replay_step)
-                    if tick_result.evicted_indices:
-                        replay_eviction_loop.flush_trace()
             # Phase B5: deferred post-step CE pair pass on the episodic
             # rank. The in-step drain stages each successful replay and
             # the just-emitted REPLAY_OUTCOME dict; this call runs a
@@ -11472,6 +11457,18 @@ def train_fast_for_budget(
                 ),
                 "memory_rank_replay_seconds_max": float(
                     mem.get("memory_rank_replay_seconds_max", 0.0)
+                ),
+                "memory_rank_replay_ticks": int(
+                    mem.get("memory_rank_replay_ticks", 0)
+                ),
+                "memory_rank_replay_probes_ingested": int(
+                    mem.get("memory_rank_replay_probes_ingested", 0)
+                ),
+                "memory_rank_replay_deferred_for_packet_work": int(
+                    mem.get("memory_rank_replay_deferred_for_packet_work", 0)
+                ),
+                "memory_rank_replay_deferred_for_backpressure": int(
+                    mem.get("memory_rank_replay_deferred_for_backpressure", 0)
                 ),
                 "memory_rank_pump_loop_seconds_sum": float(
                     mem.get("memory_rank_pump_loop_seconds_sum", 0.0)

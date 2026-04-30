@@ -27,6 +27,13 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 
+try:  # CUDA fast path; CPU/unit-test fallback below remains the source of truth.
+    from chaoscontrol.kernels._lm_head_loss import (
+        fused_rms_linear_cross_entropy_with_ce as _fused_rms_linear_ce_with_ce,
+    )
+except Exception:  # pragma: no cover - extension availability is env-specific.
+    _fused_rms_linear_ce_with_ce = None
+
 
 __all__ = [
     "alpha_ramp",
@@ -94,6 +101,18 @@ _NLL_CHUNK_BUDGET_BYTES = 1 << 30  # 1 GiB peak per-chunk logits — GPU0-2 defa
 _RANK3_NLL_CHUNK_BUDGET_BYTES = 2 << 30
 
 
+def _largest_exact_ce_tile(vocab: int) -> int:
+    vocab_i = int(vocab)
+    if vocab_i <= 0:
+        return 0
+    tile = 1 << min(14, vocab_i.bit_length() - 1)
+    while tile >= 1:
+        if vocab_i % tile == 0:
+            return tile
+        tile >>= 1
+    return 0
+
+
 @torch.inference_mode()
 def chunked_nll_from_hidden(
     model: Any,
@@ -146,20 +165,50 @@ def chunked_nll_from_hidden(
     effective_chunk = min(int(chunk_size), int(budget_chunk))
 
     out = hidden_states.new_zeros((batch, seq), dtype=torch.float32)
+    norm_weight = getattr(final_norm, "weight", None)
+    lm_bias = getattr(lm_head, "bias", None)
+    use_fused_cuda_ce = (
+        _fused_rms_linear_ce_with_ce is not None
+        and hidden_states.device.type == "cuda"
+        and norm_weight is not None
+        and lm_bias is None
+    )
+    fused_ce_tile = _largest_exact_ce_tile(vocab) if use_fused_cuda_ce else 0
+    use_fused_cuda_ce = use_fused_cuda_ce and fused_ce_tile > 0
+    norm_eps = float(getattr(final_norm, "eps", 1e-6))
     start = 0
     while start < seq:
         end = min(start + effective_chunk, seq)
         h_chunk = hidden_states[:, start:end, :]
-        head_dtype = lm_head.weight.dtype
-        if h_chunk.dtype != head_dtype:
-            h_chunk = h_chunk.to(dtype=head_dtype)
-        logits_chunk = lm_head(final_norm(h_chunk))
         tgt_chunk = targets[:, start:end]
-        nll_flat = F.cross_entropy(
-            logits_chunk.reshape(-1, vocab).float(),
-            tgt_chunk.reshape(-1),
-            reduction="none",
-        )
+        if use_fused_cuda_ce:
+            head_dtype = lm_head.weight.dtype
+            if h_chunk.dtype != head_dtype:
+                h_chunk = h_chunk.to(dtype=head_dtype)
+            if not h_chunk.is_contiguous():
+                h_chunk = h_chunk.contiguous()
+            if not tgt_chunk.is_contiguous():
+                tgt_chunk = tgt_chunk.contiguous()
+            _, nll_flat = _fused_rms_linear_ce_with_ce(
+                h_chunk,
+                norm_weight,
+                lm_head.weight,
+                tgt_chunk,
+                eps=norm_eps,
+                reduction="mean",
+                backend="streaming_v2",
+                tile_size=int(fused_ce_tile),
+            )
+        else:
+            head_dtype = lm_head.weight.dtype
+            if h_chunk.dtype != head_dtype:
+                h_chunk = h_chunk.to(dtype=head_dtype)
+            logits_chunk = lm_head(final_norm(h_chunk))
+            nll_flat = F.cross_entropy(
+                logits_chunk.reshape(-1, vocab).float(),
+                tgt_chunk.reshape(-1),
+                reduction="none",
+            )
         out[:, start:end] = nll_flat.reshape(batch, end - start)
         start = end
     return out

@@ -206,6 +206,10 @@ def test_profile_summary_extracts_transport_and_maintenance_health(tmp_path):
             "memory_rank_pre_pump_seconds_max": 0.1,
             "memory_rank_replay_seconds_sum": 0.25,
             "memory_rank_replay_seconds_max": 0.05,
+            "memory_rank_replay_ticks": 14,
+            "memory_rank_replay_probes_ingested": 15,
+            "memory_rank_replay_deferred_for_packet_work": 16,
+            "memory_rank_replay_deferred_for_backpressure": 17,
             "memory_rank_pump_loop_seconds_sum": 1.25,
             "memory_rank_pump_loop_seconds_max": 0.5,
             "memory_rank_pump_idle_sleep_seconds_sum": 0.25,
@@ -244,6 +248,10 @@ def test_profile_summary_extracts_transport_and_maintenance_health(tmp_path):
     assert row["memory_rank_pre_pump_seconds_max"] == pytest.approx(0.1)
     assert row["memory_rank_replay_seconds_sum"] == pytest.approx(0.25)
     assert row["memory_rank_replay_seconds_max"] == pytest.approx(0.05)
+    assert row["memory_rank_replay_ticks"] == 14
+    assert row["memory_rank_replay_probes_ingested"] == 15
+    assert row["memory_rank_replay_deferred_for_packet_work"] == 16
+    assert row["memory_rank_replay_deferred_for_backpressure"] == 17
     assert row["memory_rank_pump_loop_seconds_sum"] == pytest.approx(1.25)
     assert row["memory_rank_pump_loop_seconds_max"] == pytest.approx(0.5)
     assert row["memory_rank_pump_idle_sleep_seconds_sum"] == pytest.approx(0.25)
