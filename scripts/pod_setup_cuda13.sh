@@ -100,6 +100,8 @@ print(paths[0])
 PY
 )}
 CU13_LIB=$PY_SITEPKG/nvidia/cu13/lib
+CU13_HOME=$PY_SITEPKG/nvidia/cu13
+CUDNN_HOME=$PY_SITEPKG/nvidia/cudnn
 REPO_ROOT=${REPO_ROOT:-/workspace/chaoscontrol}
 
 # --break-system-packages is not needed inside a venv — the venv owns
@@ -164,6 +166,19 @@ pip install "${PIP_FLAGS[@]}" $NVIDIA_INDEX \
     nvidia-cusparselt-cu13 \
     nvidia-nccl-cu13 \
     nvidia-nvshmem-cu13
+
+echo "==> 3b/5 installing TE build helpers and exporting wheel CUDA headers"
+# RunPod templates can ship a CUDA 12.x /usr/local/cuda tree while this
+# venv is intentionally CUDA 13. TransformerEngine's pybind11 build will
+# otherwise discover /usr/local/cuda/include first and fail to find the
+# cudnn headers provided by nvidia-cudnn-cu13. Point the build at the
+# wheel-owned CUDA/CUDNN headers and libs before invoking the TE build.
+pip install "${PIP_FLAGS[@]}" numpy ninja packaging pyyaml
+export CUDA_HOME="$CU13_HOME"
+export CPATH="$CUDNN_HOME/include:$CU13_HOME/include:${CPATH:-}"
+export CPLUS_INCLUDE_PATH="$CUDNN_HOME/include:$CU13_HOME/include:${CPLUS_INCLUDE_PATH:-}"
+export LIBRARY_PATH="$CUDNN_HOME/lib:$CU13_HOME/lib:${LIBRARY_PATH:-}"
+export LD_LIBRARY_PATH="$CUDNN_HOME/lib:$CU13_HOME/lib:${LD_LIBRARY_PATH:-}"
 
 echo "==> 4/5 installing TransformerEngine 2.13.0 (with NVIDIA index for cu13 deps)"
 # transformer_engine_torch is an sdist-only pybind11 extension that wraps

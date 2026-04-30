@@ -154,6 +154,16 @@ class TestPodNativeExtensionBootstrap:
         assert "site.getsitepackages()" in source
         assert "lib/python3.12/site-packages" not in source
 
+    def test_cuda13_setup_exports_wheel_cuda_headers_for_te(self) -> None:
+        """TE's source build must use CUDA/CUDNN headers from the venv
+        wheels, not the base image's /usr/local/cuda tree.
+        """
+        source = POD_SETUP.read_text()
+        assert "CUDNN_HOME=$PY_SITEPKG/nvidia/cudnn" in source
+        assert 'export CUDA_HOME="$CU13_HOME"' in source
+        assert 'export CPATH="$CUDNN_HOME/include:$CU13_HOME/include:${CPATH:-}"' in source
+        assert "pip install \"${PIP_FLAGS[@]}\" numpy ninja packaging pyyaml" in source
+
     def test_bootstrap_defaults_to_exp27_val_cache_path(self) -> None:
         """The final scorer path is Exp27; the default cache name should
         not send fresh pods into the older Exp23 cache directory.
