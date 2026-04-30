@@ -12328,6 +12328,9 @@ def run_condition(
         crct_teacher_score_interval_steps=int(
             config.get("crct_teacher_score_interval_steps", 1)
         ),
+        crct_score_stage_timing_enabled=bool(
+            config.get("crct_score_stage_timing_enabled", False)
+        ),
         crct_teacher_param_sync_interval_steps=(
             None
             if config.get("crct_teacher_param_sync_interval_steps") is None

@@ -82,6 +82,18 @@ def test_crct_object_collectives_use_gloo_side_group() -> None:
     assert "group=object_group or all_group" in source
 
 
+def test_score_stage_timing_config_reaches_main_train_call() -> None:
+    """The Exp26 stage profiler must wire through the real train call.
+
+    A previous bug set ``crct_score_stage_timing_enabled`` in the matrix but
+    only forwarded it through the warmup call, so the 8xH100 pulse silently
+    produced zero stage samples.
+    """
+    source = RUNNER_PATH.read_text()
+    assert source.count("crct_score_stage_timing_enabled=bool(") >= 2
+    assert source.count('config.get("crct_score_stage_timing_enabled", False)') >= 2
+
+
 class _TinyTrainStepModel(nn.Module):
     def __init__(self):
         super().__init__()
