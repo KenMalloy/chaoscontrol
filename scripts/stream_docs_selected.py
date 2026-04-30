@@ -24,7 +24,10 @@ import requests
 
 DEFAULT_REPO = "willdepueoai/parameter-golf"
 DEFAULT_PATH = "datasets/docs_selected.jsonl"
-DEFAULT_REVISION = "9bb295ddab0e05d785b879661af7260fed5140fc"
+# Current `main` as verified on 2026-04-30. The older shard-builder
+# revision was removed from HF, so keep the default pinned to a resolvable
+# commit instead of a moving branch name.
+DEFAULT_REVISION = "a85b0e6035c3c94bc23685a07c81a8f3bf89db80"
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_OUT = REPO_ROOT / "baselines/parameter_golf/datasets/docs_selected.jsonl"
 

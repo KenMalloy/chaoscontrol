@@ -45,7 +45,7 @@ from typing import Iterable, Iterator
 # The HuggingFace revision of ``willdepueoai/parameter-golf`` whose
 # ``docs_selected.jsonl`` defines our input corpus. Hard-coded so the
 # ``build_manifest.json`` we emit is self-identifying across machines.
-DATASET_REVISION = "9bb295ddab0e05d785b879661af7260fed5140fc"
+DATASET_REVISION = "a85b0e6035c3c94bc23685a07c81a8f3bf89db80"
 
 # Writing tokens as uint16 matches the on-disk convention in the published
 # shards (``cached_challenge_fineweb.py``) and the reader in

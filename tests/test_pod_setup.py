@@ -21,6 +21,8 @@ REPO = Path(__file__).resolve().parents[1]
 POD_BOOTSTRAP = REPO / "scripts" / "pod_bootstrap.sh"
 POD_BUILD_NATIVE_EXTENSIONS = REPO / "scripts" / "pod_build_native_extensions.sh"
 POD_SETUP = REPO / "scripts" / "pod_setup_cuda13.sh"
+STREAM_DOCS_SELECTED = REPO / "scripts" / "stream_docs_selected.py"
+BUILD_SP_SHARDS = REPO / "scripts" / "build_sp_shards.py"
 
 
 # Every Python package the full install produces that the pod is
@@ -180,3 +182,19 @@ class TestPodNativeExtensionBootstrap:
         """
         source = POD_BOOTSTRAP.read_text()
         assert "VAL_CACHE_DIR=${VAL_CACHE_DIR:-/workspace/cache/exp27_val_16384}" in source
+
+
+class TestValidationDatasetPins:
+    def test_docs_selected_streamer_uses_current_resolvable_revision(self) -> None:
+        """The previous pinned HF revision disappeared; keep the default
+        source pin aligned with the shard-builder manifest revision so a fresh
+        final pod does not fail after downloading the SP16384 shards.
+        """
+        streamer = STREAM_DOCS_SELECTED.read_text()
+        builder = BUILD_SP_SHARDS.read_text()
+        current = "a85b0e6035c3c94bc23685a07c81a8f3bf89db80"
+        stale = "9bb295ddab0e05d785b879661af7260fed5140fc"
+        assert f'DEFAULT_REVISION = "{current}"' in streamer
+        assert f'DATASET_REVISION = "{current}"' in builder
+        assert stale not in streamer
+        assert stale not in builder
