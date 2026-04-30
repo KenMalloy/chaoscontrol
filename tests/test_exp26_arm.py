@@ -82,7 +82,10 @@ def test_validation_active_is_full_arm_not_crct_only_or_shadow():
     assert active["replay_eviction_scoring_mode"] == "oracle"
     assert active["crct_teacher_score_interval_steps"] == 1
     assert active["compile_full_path"] is True
-    assert active["cuda_graph_mode"] == "none"
+    assert active["cuda_graph_mode"] == "probe"
+    assert active["optimizer_log_a_beta_coupling"] is True
+    assert active["optimizer_log_a_beta_ema"] == 0.99
+    assert active["optimizer_log_a_beta_min"] == 0.5
     assert active["crct_plasticity_budget_strength"] == 0.25
     assert "enable_controller" not in active
     assert "crct_lambda_controller" not in active

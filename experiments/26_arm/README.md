@@ -51,6 +51,10 @@ The train-rank encoder compile path has two static targets: the bare encoder
 for no-packet steps and the packet encoder for latest-complete residual steps.
 This keeps ARM on the compiled trunk path without making missing packets pay
 zero-residual packet math.
+`cuda_graph_mode="probe"` is enabled for the ARM validation config so graph
+eligibility is reported instead of silently disabled. Multi-rank CRCT still
+keeps NCCL/DDP collectives outside full-step graph capture; the important
+contract is that the packet encoder itself is compile-clean.
 
 `memory_mode="off"` remains valid only as an oracle/counterfactual mode: GPU3
 uses it to measure marginal memory value. It is not the final product path.
@@ -75,6 +79,13 @@ alongside the residual packet, and Muon uses it as a bounded LR multiplier on
 SSM-channel parameters. This is the training-time "gist" signal: where episodic
 memory is demonstrably supporting the recurrent state, the trunk can keep that
 channel more plastic without waiting for the memory plane.
+Muon also owns the SSM role policy for the ARM cell: `delta_proj` stays on the
+AdamW fallback because it encodes per-token timescale specialization, while
+`log_a` gets per-channel beta from a slow EMA of its own value. The EMA is the
+damping layer that prevents the old SemanticOptimizer feedback loop.
+Memory-side modules are excluded from the train optimizer in CRCT runs; GPU3
+uses them as the oracle/memory substrate, but train ranks do not spend optimizer
+state on params their packet-mode trunk never reads.
 
 ## Validation Cells
 
@@ -105,6 +116,9 @@ shape gives `384 -> 13.71 MB`, `416 -> 15.19 MB`, `448 -> 16.73 MB`, and
   `transport_summary.health.plasticity_packets_received`,
   `plasticity_budget_mean_received`, and optimizer
   `plasticity_budget.lr_multiplier_max`.
+- Optimizer role telemetry is present under `optimizer.ssm_role` and
+  `optimizer.excluded_params`, including `log_a_beta_*` summaries and counts of
+  memory-side params kept out of the train optimizer.
 - The ARM cell offers teacher work every step; stream backpressure and the
   latest-complete mirror decide what GPU3 actually adopts.
 - `transport_summary.health.weight_snapshot_published` and

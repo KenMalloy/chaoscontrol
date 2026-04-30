@@ -74,9 +74,20 @@ class Muon(torch.optim.Optimizer):
         is_matrix: Callable[[Tensor, str | None], bool] | None = None,
         fused: bool = False,
         compute_dtype: torch.dtype | None = None,
+        log_a_beta_coupling: bool = False,
+        log_a_beta_ema: float = 0.99,
+        log_a_beta_min: float = 0.5,
     ) -> None:
         if lr <= 0.0 or ns_steps <= 0 or not 0.0 <= momentum < 1.0:
             raise ValueError(f"invalid Muon hparams: lr={lr} momentum={momentum} ns_steps={ns_steps}")
+        if not 0.0 <= float(log_a_beta_min) < 1.0:
+            raise ValueError(
+                f"log_a_beta_min must be in [0, 1), got {log_a_beta_min}"
+            )
+        if not 0.0 <= float(log_a_beta_ema) < 1.0:
+            raise ValueError(
+                f"log_a_beta_ema must be in [0, 1), got {log_a_beta_ema}"
+            )
         defaults = dict(
             lr=lr, momentum=momentum, nesterov=nesterov, ns_steps=ns_steps,
             weight_decay=weight_decay, adamw_betas=adamw_betas, adamw_eps=adamw_eps,
@@ -102,6 +113,11 @@ class Muon(torch.optim.Optimizer):
         self._plasticity_last_dim: int = 0
         self._plasticity_last_budget: Tensor | None = None
         self._plasticity_last_confidence: Tensor | None = None
+        self._log_a_beta_coupling = bool(log_a_beta_coupling)
+        self._log_a_beta_ema = float(log_a_beta_ema)
+        self._log_a_beta_min = float(log_a_beta_min)
+        self._log_a_beta_updates = 0
+        self._log_a_beta_last: Tensor | None = None
 
     def bind_param_names(self, named_params: Iterable[tuple[str, Tensor]]) -> None:
         """Attach (name, param) pairs so the classifier can use names, if provided."""
@@ -112,6 +128,52 @@ class Muon(torch.optim.Optimizer):
         if self._matrix_param_names is not None and name is not None:
             return name in self._matrix_param_names
         return self._is_matrix_fn(p, name)
+
+    def _uses_log_a_beta(self, p: Tensor) -> bool:
+        if not self._log_a_beta_coupling:
+            return False
+        name = self._param_name_by_id.get(id(p), "")
+        return p.ndim == 1 and name.endswith(".log_a")
+
+    def _log_a_beta_for(
+        self,
+        p: Tensor,
+        state: dict[str, Any],
+        beta1: float,
+    ) -> tuple[Tensor, Tensor] | None:
+        """Return per-channel beta1 and bias correction for log_a.
+
+        The beta signal is derived from a slow EMA of log_a, not the
+        instant parameter value. That keeps the optimizer's timescale
+        match from forming a tight feedback loop with the same update it
+        is about to apply.
+        """
+        if not self._uses_log_a_beta(p):
+            return None
+        ema = state.get("log_a_slow_ema")
+        current = p.detach().float()
+        if ema is None:
+            ema = current.clone()
+            state["log_a_slow_ema"] = ema
+        else:
+            ema.mul_(self._log_a_beta_ema).add_(
+                current, alpha=1.0 - self._log_a_beta_ema
+            )
+        beta_floor = min(float(self._log_a_beta_min), float(beta1))
+        beta_vec = beta_floor + (float(beta1) - beta_floor) * torch.sigmoid(ema)
+        beta_vec = beta_vec.to(device=p.device, dtype=torch.float32)
+        prod = state.get("log_a_beta1_prod")
+        if prod is None:
+            prod = beta_vec.clone()
+            state["log_a_beta1_prod"] = prod
+        else:
+            prod.mul_(beta_vec)
+        bias1 = (1.0 - prod).clamp_min(1e-12)
+        self._log_a_beta_updates += 1
+        self._log_a_beta_last = beta_vec.detach()
+        return beta_vec.to(device=p.device, dtype=p.dtype), bias1.to(
+            device=p.device, dtype=p.dtype
+        )
 
     @torch.no_grad()
     def set_plasticity_budget(
@@ -216,6 +278,29 @@ class Muon(torch.optim.Optimizer):
             "top_budget": top_budget,
         }
 
+    def ssm_role_trace(self) -> dict[str, float | int | bool]:
+        beta = self._log_a_beta_last
+        if beta is None or int(beta.numel()) == 0:
+            return {
+                "log_a_beta_coupling": bool(self._log_a_beta_coupling),
+                "log_a_beta_updates": int(self._log_a_beta_updates),
+                "log_a_beta_ema": float(self._log_a_beta_ema),
+                "log_a_beta_min_config": float(self._log_a_beta_min),
+                "log_a_beta_min": 0.0,
+                "log_a_beta_mean": 0.0,
+                "log_a_beta_max": 0.0,
+            }
+        beta_cpu = beta.detach().float()
+        return {
+            "log_a_beta_coupling": bool(self._log_a_beta_coupling),
+            "log_a_beta_updates": int(self._log_a_beta_updates),
+            "log_a_beta_ema": float(self._log_a_beta_ema),
+            "log_a_beta_min_config": float(self._log_a_beta_min),
+            "log_a_beta_min": float(beta_cpu.min().item()),
+            "log_a_beta_mean": float(beta_cpu.mean().item()),
+            "log_a_beta_max": float(beta_cpu.max().item()),
+        }
+
     def _plasticity_multiplier_for(self, p: Tensor) -> Tensor | None:
         mult = self._plasticity_multiplier
         if mult is None:
@@ -247,6 +332,53 @@ class Muon(torch.optim.Optimizer):
         if name.endswith(".out_proj.weight") and int(p.shape[1]) == d:
             return m.view(1, d)
         return None
+
+    def _adamw_update_param(
+        self,
+        *,
+        p: Tensor,
+        state: dict[str, Any],
+        grad: Tensor,
+        beta1: float,
+        beta2: float,
+        adamw_eps: float,
+        adamw_lr: float,
+        adamw_wd: float,
+    ) -> None:
+        if "step" not in state:
+            state["step"] = 0
+            state["exp_avg"] = torch.zeros_like(
+                p, memory_format=torch.preserve_format
+            )
+            state["exp_avg_sq"] = torch.zeros_like(
+                p, memory_format=torch.preserve_format
+            )
+        state["step"] += 1
+        t = state["step"]
+        exp_avg = state["exp_avg"]
+        exp_avg_sq = state["exp_avg_sq"]
+        beta_pair = self._log_a_beta_for(p, state, beta1)
+        if beta_pair is None:
+            exp_avg.mul_(beta1).add_(grad, alpha=1.0 - beta1)
+            bias1: float | Tensor = 1.0 - beta1 ** t
+        else:
+            beta_vec, bias1 = beta_pair
+            exp_avg.mul_(beta_vec).add_(grad * (1.0 - beta_vec))
+        exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1.0 - beta2)
+        bias2 = 1.0 - beta2 ** t
+        denom = (exp_avg_sq.sqrt() / (bias2 ** 0.5)).add_(adamw_eps)
+        if adamw_wd > 0.0:
+            p.data.mul_(1.0 - adamw_lr * adamw_wd)
+        mult = self._plasticity_multiplier_for(p)
+        update = exp_avg / denom
+        if isinstance(bias1, torch.Tensor):
+            update = update / bias1
+            step = update if mult is None else update * mult
+            p.data.add_(step, alpha=-adamw_lr)
+        elif mult is None:
+            p.data.addcdiv_(exp_avg, denom, value=-adamw_lr / bias1)
+        else:
+            p.data.add_(update * mult, alpha=-adamw_lr / bias1)
 
     @torch.no_grad()
     def step(self, closure: Callable[[], Tensor] | None = None) -> Tensor | None:
@@ -295,27 +427,16 @@ class Muon(torch.optim.Optimizer):
                     p.data.add_(update.to(dtype=p.dtype), alpha=-lr * scale)
                 else:
                     # Decoupled AdamW fallback for scalar / vector / non-matrix params.
-                    if "step" not in state:
-                        state["step"] = 0
-                        state["exp_avg"] = torch.zeros_like(p, memory_format=torch.preserve_format)
-                        state["exp_avg_sq"] = torch.zeros_like(p, memory_format=torch.preserve_format)
-                    state["step"] += 1
-                    t = state["step"]
-                    exp_avg = state["exp_avg"]
-                    exp_avg_sq = state["exp_avg_sq"]
-                    exp_avg.mul_(beta1).add_(grad, alpha=1.0 - beta1)
-                    exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1.0 - beta2)
-                    bias1 = 1.0 - beta1 ** t
-                    bias2 = 1.0 - beta2 ** t
-                    denom = (exp_avg_sq.sqrt() / (bias2 ** 0.5)).add_(adamw_eps)
-                    if adamw_wd > 0.0:
-                        p.data.mul_(1.0 - adamw_lr * adamw_wd)
-                    mult = self._plasticity_multiplier_for(p)
-                    if mult is None:
-                        p.data.addcdiv_(exp_avg, denom, value=-adamw_lr / bias1)
-                    else:
-                        update = exp_avg / denom
-                        p.data.add_(update * mult, alpha=-adamw_lr / bias1)
+                    self._adamw_update_param(
+                        p=p,
+                        state=state,
+                        grad=grad,
+                        beta1=beta1,
+                        beta2=beta2,
+                        adamw_eps=adamw_eps,
+                        adamw_lr=adamw_lr,
+                        adamw_wd=adamw_wd,
+                    )
 
         return loss
 
@@ -443,27 +564,20 @@ class Muon(torch.optim.Optimizer):
             # unfused branch, we just lose the coalesce win for this
             # step.
             uniform_step = all(s == steps_before[0] for s in steps_before)
-            if not uniform_step:
+            adaptive_log_a = any(self._uses_log_a_beta(p) for p in nonmatrix_params)
+            if not uniform_step or adaptive_log_a:
                 for p in nonmatrix_params:
                     state = self.state[p]
-                    state["step"] += 1
-                    t = state["step"]
-                    exp_avg = state["exp_avg"]
-                    exp_avg_sq = state["exp_avg_sq"]
-                    grad = p.grad
-                    exp_avg.mul_(beta1).add_(grad, alpha=1.0 - beta1)
-                    exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1.0 - beta2)
-                    bias1 = 1.0 - beta1 ** t
-                    bias2 = 1.0 - beta2 ** t
-                    denom = (exp_avg_sq.sqrt() / (bias2 ** 0.5)).add_(adamw_eps)
-                    if adamw_wd > 0.0:
-                        p.data.mul_(1.0 - adamw_lr * adamw_wd)
-                    mult = self._plasticity_multiplier_for(p)
-                    if mult is None:
-                        p.data.addcdiv_(exp_avg, denom, value=-adamw_lr / bias1)
-                    else:
-                        update = exp_avg / denom
-                        p.data.add_(update * mult, alpha=-adamw_lr / bias1)
+                    self._adamw_update_param(
+                        p=p,
+                        state=state,
+                        grad=p.grad,
+                        beta1=beta1,
+                        beta2=beta2,
+                        adamw_eps=adamw_eps,
+                        adamw_lr=adamw_lr,
+                        adamw_wd=adamw_wd,
+                    )
                 continue
 
             # Uniform step-count path: coalesced update over flat buffers.

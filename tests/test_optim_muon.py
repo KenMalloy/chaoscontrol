@@ -293,6 +293,68 @@ class TestMuonPlasticityBudget(unittest.TestCase):
             atol=1e-6,
         )
 
+    def test_log_a_beta_coupling_uses_slow_ema_trace(self) -> None:
+        p = nn.Parameter(torch.tensor([-8.0, 8.0]))
+        opt = Muon(
+            [p],
+            lr=0.1,
+            adamw_betas=(0.9, 0.0),
+            adamw_eps=1e-12,
+            adamw_weight_decay=0.0,
+            matrix_param_names=set(),
+            log_a_beta_coupling=True,
+            log_a_beta_ema=0.99,
+            log_a_beta_min=0.2,
+            compute_dtype=torch.float32,
+        )
+        opt.bind_param_names([("layers.0.core.log_a", p)])
+        p.grad = torch.ones_like(p)
+
+        opt.step()
+
+        trace = opt.ssm_role_trace()
+        assert trace["log_a_beta_coupling"] is True
+        assert trace["log_a_beta_updates"] == 1
+        assert trace["log_a_beta_min"] == pytest.approx(0.2, abs=1e-3)
+        assert trace["log_a_beta_max"] == pytest.approx(0.9, abs=1e-3)
+        state = opt.state[p]
+        torch.testing.assert_close(
+            state["log_a_slow_ema"],
+            torch.tensor([-8.0, 8.0]),
+        )
+
+    def test_log_a_beta_coupling_updates_slow_ema_before_beta(self) -> None:
+        p = nn.Parameter(torch.tensor([0.0]))
+        opt = Muon(
+            [p],
+            lr=0.1,
+            adamw_betas=(0.9, 0.0),
+            adamw_eps=1e-12,
+            adamw_weight_decay=0.0,
+            matrix_param_names=set(),
+            log_a_beta_coupling=True,
+            log_a_beta_ema=0.5,
+            log_a_beta_min=0.1,
+            compute_dtype=torch.float32,
+        )
+        opt.bind_param_names([("layers.0.core.log_a", p)])
+        p.grad = torch.ones_like(p)
+        opt.step()
+        with torch.no_grad():
+            p.fill_(8.0)
+        p.grad = torch.ones_like(p)
+
+        opt.step()
+
+        state = opt.state[p]
+        # EMA moves halfway from the original 0.0 toward the new 8.0;
+        # beta is therefore high, but derived from the damped EMA rather
+        # than the instantaneous parameter.
+        torch.testing.assert_close(state["log_a_slow_ema"], torch.tensor([4.0]))
+        trace = opt.ssm_role_trace()
+        assert trace["log_a_beta_max"] < 0.9
+        assert trace["log_a_beta_max"] > 0.88
+
 
 class TestMuonClassifier(unittest.TestCase):
     def test_matrix_param_names_override(self) -> None:

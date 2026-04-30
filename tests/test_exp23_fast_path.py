@@ -226,6 +226,39 @@ def test_build_optimizer_defaults_to_flat_grouping():
     assert group["adamw_weight_decay"] == pytest.approx(0.02)
 
 
+def test_build_optimizer_crct_uses_role_dispatch_for_muon():
+    mod = _load_runner_module()
+    model = _TinySemanticModel()
+    model.outer_model = nn.Linear(4, 4, bias=False)
+    model.bucket_prototypes_module = nn.Linear(4, 4, bias=False)
+    optimizer = mod._build_optimizer(
+        {
+            "optimizer": "muon",
+            "base_lr": 0.05,
+            "weight_decay": 0.02,
+            "crct_enabled": True,
+            "optimizer_log_a_beta_ema": 0.98,
+            "optimizer_log_a_beta_min": 0.25,
+        },
+        model,
+    )
+
+    assert "layers.0.core.in_proj.weight" in optimizer._matrix_param_names
+    assert "layers.0.core.out_proj.weight" in optimizer._matrix_param_names
+    assert "layers.0.core.delta_proj.weight" not in optimizer._matrix_param_names
+    assert all(
+        not name.startswith(("outer_model.", "bucket_prototypes_module."))
+        for name in optimizer._param_name_by_id.values()
+    )
+    trace = optimizer.ssm_role_trace()
+    assert trace["log_a_beta_coupling"] is True
+    assert trace["log_a_beta_ema"] == pytest.approx(0.98)
+    assert trace["log_a_beta_min_config"] == pytest.approx(0.25)
+    diagnostics = mod._optimizer_diagnostics(optimizer)
+    assert diagnostics["excluded_params"]["outer_model"] == 1
+    assert diagnostics["excluded_params"]["bucket_prototypes"] == 1
+
+
 def test_build_optimizer_ssm_three_group_splits_by_role():
     """``optimizer_param_grouping='ssm_three_group'`` produces three
     param groups (dynamics / no_decay / main) with distinct lr+wd
@@ -1597,6 +1630,21 @@ def test_cuda_graph_probe_delegates_when_eligible(monkeypatch) -> None:
     assert calls
     assert calls[0]["cuda_graph_warmup_steps"] == 4
     assert calls[0]["cuda_graph_mode"] == "probe"
+
+
+def test_cuda_graph_probe_allows_compiled_encoder() -> None:
+    mod = _load_runner_module()
+
+    reasons = mod._cuda_graph_rejection_reasons(
+        device=torch.device("cuda"),
+        ddp_active=False,
+        activation_checkpoint=False,
+        compile_full_path=True,
+        lm_head_backward_mode="fused_streaming_cached",
+        optimizer=torch.optim.SGD([torch.nn.Parameter(torch.zeros(()))], lr=0.1),
+    )
+
+    assert "compile_full_path_not_supported" not in reasons
 
 
 def test_cuda_graph_probe_falls_back_to_eager_on_capture_failure(monkeypatch) -> None:

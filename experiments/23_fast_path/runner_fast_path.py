@@ -418,7 +418,25 @@ def _build_optimizer(
     weight_decay = float(config.get("weight_decay", 0.01))
     grouping = str(config.get("optimizer_param_grouping", "flat")).strip()
     dynamics_lr_mul = float(config.get("optimizer_dynamics_lr_mul", 0.1))
-    named_params = list(model.named_parameters())
+    all_named_params = list(model.named_parameters())
+    named_params = all_named_params
+    excluded_param_names: list[str] = []
+    if bool(config.get("crct_enabled", False)):
+        memory_prefixes = (
+            "outer_model.",
+            "semantic_tier.",
+            "bucket_prototypes_module.",
+        )
+        named_params = [
+            (param_name, param)
+            for param_name, param in all_named_params
+            if not param_name.startswith(memory_prefixes)
+        ]
+        excluded_param_names = [
+            param_name
+            for param_name, _ in all_named_params
+            if param_name.startswith(memory_prefixes)
+        ]
     params = build_optimizer_params(
         named_params,
         grouping=grouping,
@@ -444,6 +462,7 @@ def _build_optimizer(
                 if param.requires_grad
                 and param.ndim >= 2
                 and not param_name.startswith(adamw_prefixes)
+                and not param_name.endswith(".delta_proj.weight")
             }
         opt = Muon(
             params,
@@ -453,8 +472,17 @@ def _build_optimizer(
             adamw_weight_decay=weight_decay,
             matrix_param_names=matrix_param_names,
             fused=bool(config.get("fused_muon", True)),
+            log_a_beta_coupling=bool(
+                config.get(
+                    "optimizer_log_a_beta_coupling",
+                    bool(config.get("crct_enabled", False)),
+                )
+            ),
+            log_a_beta_ema=float(config.get("optimizer_log_a_beta_ema", 0.99)),
+            log_a_beta_min=float(config.get("optimizer_log_a_beta_min", 0.5)),
         )
         opt.bind_param_names(named_params)
+        opt._excluded_param_names = list(excluded_param_names)
         return opt
     if name == "semantic":
         semantic_cfg = _semantic_optimizer_config(
@@ -622,6 +650,26 @@ def _optimizer_diagnostics(optimizer: torch.optim.Optimizer) -> dict[str, Any]:
     plasticity_trace = getattr(optimizer, "plasticity_budget_trace", None)
     if callable(plasticity_trace):
         diagnostics["plasticity_budget"] = plasticity_trace()
+    role_trace = getattr(optimizer, "ssm_role_trace", None)
+    if callable(role_trace):
+        diagnostics["ssm_role"] = role_trace()
+    excluded = getattr(optimizer, "_excluded_param_names", None)
+    if isinstance(excluded, (list, tuple)):
+        diagnostics["excluded_params"] = {
+            "count": int(len(excluded)),
+            "outer_model": int(
+                sum(str(name).startswith("outer_model.") for name in excluded)
+            ),
+            "semantic_tier": int(
+                sum(str(name).startswith("semantic_tier.") for name in excluded)
+            ),
+            "bucket_prototypes": int(
+                sum(
+                    str(name).startswith("bucket_prototypes_module.")
+                    for name in excluded
+                )
+            ),
+        }
     return diagnostics
 
 
@@ -7520,8 +7568,6 @@ def _cuda_graph_rejection_reasons(
         reasons.append("ddp_not_supported")
     if activation_checkpoint:
         reasons.append("activation_checkpoint_not_supported")
-    if compile_full_path:
-        reasons.append("compile_full_path_not_supported")
     if lm_head_backward_mode not in {
         "fused",
         "fused_streaming",
