@@ -108,6 +108,8 @@ def _health_from_result(result: dict[str, Any]) -> dict[str, Any]:
         "memory_rank_request_events_superseded": int(health.get("memory_rank_request_events_superseded", 0) or 0),
         "memory_rank_pump_loop_seconds_sum": float(health.get("memory_rank_pump_loop_seconds_sum", 0.0) or 0.0),
         "memory_rank_pump_loop_seconds_max": float(health.get("memory_rank_pump_loop_seconds_max", 0.0) or 0.0),
+        "memory_rank_pump_idle_sleep_seconds_sum": float(health.get("memory_rank_pump_idle_sleep_seconds_sum", 0.0) or 0.0),
+        "memory_rank_pump_idle_sleep_seconds_max": float(health.get("memory_rank_pump_idle_sleep_seconds_max", 0.0) or 0.0),
         "plasticity_packets_received": int(health.get("plasticity_packets_received", 0) or 0),
         "plasticity_lr_multiplier_max": float(plasticity.get("lr_multiplier_max", 0.0) or 0.0),
         "teacher_fail_open": int(crct.get("teacher_fail_open", 0) or 0),

@@ -2266,6 +2266,8 @@ class _CrctMailboxTeacherTransport:
             "memory_rank_pump_loop_seconds_sum": 0.0,
             "memory_rank_pump_loop_seconds_max": 0.0,
             "memory_rank_pump_idle_spins": 0,
+            "memory_rank_pump_idle_sleep_seconds_sum": 0.0,
+            "memory_rank_pump_idle_sleep_seconds_max": 0.0,
             "memory_rank_pump_request_pops": 0,
             "memory_rank_pump_last_request_step": -1,
             "memory_rank_request_events_superseded": 0,
@@ -10304,7 +10306,23 @@ def train_fast_for_budget(
                         crct_teacher_transport.metrics[
                             "memory_rank_pump_idle_spins"
                         ] += 1
-                    time.sleep(0.0005)
+                    sleep_t0 = time.perf_counter()
+                    time.sleep(0)
+                    if crct_teacher_transport is not None:
+                        sleep_s = time.perf_counter() - sleep_t0
+                        crct_teacher_transport.metrics[
+                            "memory_rank_pump_idle_sleep_seconds_sum"
+                        ] += float(sleep_s)
+                        crct_teacher_transport.metrics[
+                            "memory_rank_pump_idle_sleep_seconds_max"
+                        ] = max(
+                            float(
+                                crct_teacher_transport.metrics[
+                                    "memory_rank_pump_idle_sleep_seconds_max"
+                                ]
+                            ),
+                            float(sleep_s),
+                        )
                 continue
 
             if prefetcher is not None:
@@ -10579,7 +10597,23 @@ def train_fast_for_budget(
                         crct_teacher_transport.metrics[
                             "memory_rank_pump_idle_spins"
                         ] += 1
-                    time.sleep(0.0005)
+                    sleep_t0 = time.perf_counter()
+                    time.sleep(0)
+                    if crct_teacher_transport is not None:
+                        sleep_s = time.perf_counter() - sleep_t0
+                        crct_teacher_transport.metrics[
+                            "memory_rank_pump_idle_sleep_seconds_sum"
+                        ] += float(sleep_s)
+                        crct_teacher_transport.metrics[
+                            "memory_rank_pump_idle_sleep_seconds_max"
+                        ] = max(
+                            float(
+                                crct_teacher_transport.metrics[
+                                    "memory_rank_pump_idle_sleep_seconds_max"
+                                ]
+                            ),
+                            float(sleep_s),
+                        )
                 continue
 
             optimizer.zero_grad(set_to_none=True)
@@ -11312,6 +11346,12 @@ def train_fast_for_budget(
                 ),
                 "memory_rank_pump_loop_seconds_max": float(
                     mem.get("memory_rank_pump_loop_seconds_max", 0.0)
+                ),
+                "memory_rank_pump_idle_sleep_seconds_sum": float(
+                    mem.get("memory_rank_pump_idle_sleep_seconds_sum", 0.0)
+                ),
+                "memory_rank_pump_idle_sleep_seconds_max": float(
+                    mem.get("memory_rank_pump_idle_sleep_seconds_max", 0.0)
                 ),
                 "memory_rank_pump_score_calls": int(
                     mem.get("memory_rank_pump_score_calls", 0)
