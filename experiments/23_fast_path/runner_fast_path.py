@@ -1935,6 +1935,118 @@ class _CrctAsyncTeacherTransport:
         return completed
 
 
+_TEACHER_RESULT_SLICE_NAMES = (
+    "target",
+    "confidence",
+    "loss_weight",
+    "utility",
+    "memory_residual",
+    "memory_gate",
+    "plasticity_coverage",
+    "plasticity_confidence",
+    "plasticity_budget",
+)
+
+
+def _align64(n: int) -> int:
+    return (int(n) + 63) & ~63
+
+
+def _teacher_shm_name(mailbox_dir: Path, suffix: str) -> str:
+    digest = hashlib.blake2s(str(mailbox_dir).encode("utf-8"), digest_size=4).hexdigest()
+    # macOS POSIX shm names are short; keep this under PSHMNAMLEN.
+    return f"/cc{suffix}{digest}"
+
+
+def _teacher_dtype_nbytes(dtype: torch.dtype) -> int:
+    if dtype in {torch.float16, torch.bfloat16}:
+        return 2
+    if dtype in {torch.float32, torch.int32}:
+        return 4
+    raise ValueError(f"unsupported teacher shm dtype: {dtype}")
+
+
+def _teacher_dtype_code(dtype: torch.dtype) -> int:
+    constants = _ext.wire_event_constants()
+    if dtype == torch.int32:
+        return int(constants["TEACHER_DTYPE_INT32"])
+    if dtype == torch.float32:
+        return int(constants["TEACHER_DTYPE_FLOAT32"])
+    if dtype == torch.float16:
+        return int(constants["TEACHER_DTYPE_FLOAT16"])
+    if dtype == torch.bfloat16:
+        return int(constants["TEACHER_DTYPE_BFLOAT16"])
+    raise ValueError(f"unsupported teacher shm dtype: {dtype}")
+
+
+def _teacher_dtype_from_code(code: int) -> torch.dtype | None:
+    constants = _ext.wire_event_constants()
+    code_i = int(code)
+    if code_i == int(constants["TEACHER_DTYPE_NONE"]):
+        return None
+    if code_i == int(constants["TEACHER_DTYPE_INT32"]):
+        return torch.int32
+    if code_i == int(constants["TEACHER_DTYPE_FLOAT32"]):
+        return torch.float32
+    if code_i == int(constants["TEACHER_DTYPE_FLOAT16"]):
+        return torch.float16
+    if code_i == int(constants["TEACHER_DTYPE_BFLOAT16"]):
+        return torch.bfloat16
+    raise ValueError(f"unknown teacher shm dtype code: {code_i}")
+
+
+def _teacher_empty_slice() -> dict[str, object]:
+    return {
+        "offset_bytes": 0,
+        "nbytes": 0,
+        "dtype": int(_ext.wire_event_constants()["TEACHER_DTYPE_NONE"]),
+        "rank": 0,
+        "shape": [0, 0, 0, 0],
+    }
+
+
+def _fast_slow_mode_code(mode: str) -> int:
+    if str(mode) == "learned":
+        return 1
+    if str(mode) == "interval":
+        return 2
+    if str(mode) == "hold":
+        return 3
+    if str(mode) == "disabled":
+        return 4
+    return 0
+
+
+def _fast_slow_mode_from_code(code: int) -> str:
+    return {
+        1: "learned",
+        2: "interval",
+        3: "hold",
+        4: "disabled",
+    }.get(int(code), "")
+
+
+def _fast_slow_reason_code(reason: str) -> int:
+    if str(reason) == "controller_consolidation_head":
+        return 1
+    if str(reason) == "fixed_interval_fallback":
+        return 2
+    if str(reason) == "not_due":
+        return 3
+    if str(reason) == "disabled":
+        return 4
+    return 0
+
+
+def _fast_slow_reason_from_code(code: int) -> str:
+    return {
+        1: "controller_consolidation_head",
+        2: "fixed_interval_fallback",
+        3: "not_due",
+        4: "disabled",
+    }.get(int(code), "")
+
+
 class _CrctMailboxTeacherTransport:
     """Same-node drop mailbox for CRCT teacher labels.
 
@@ -1961,6 +2073,7 @@ class _CrctMailboxTeacherTransport:
         score_interval_steps: int = 1,
         coordinator_rank: int = 0,
         plasticity_ema_beta: float = 0.95,
+        hidden_dim: int | None = None,
     ) -> None:
         self.rank = int(rank)
         self.world_size = int(world_size)
@@ -1970,6 +2083,11 @@ class _CrctMailboxTeacherTransport:
         self.mailbox_dir.mkdir(parents=True, exist_ok=True)
         self.payload_shape = tuple(int(x) for x in payload_shape)
         self.full_ids_shape = tuple(int(x) for x in full_ids_shape)
+        self.hidden_dim = int(
+            hidden_dim
+            if hidden_dim is not None and int(hidden_dim) > 0
+            else max(4096, int(self.payload_shape[-1]) if self.payload_shape else 1)
+        )
         self.device = device
         self.payload_dtype = payload_dtype
         self.plasticity_ema_beta = min(max(float(plasticity_ema_beta), 0.0), 0.9999)
@@ -1990,9 +2108,38 @@ class _CrctMailboxTeacherTransport:
         self._plasticity_coverage_ema: torch.Tensor | None = None
         self._plasticity_confidence_ema: torch.Tensor | None = None
         self._plasticity_budget_ema: torch.Tensor | None = None
+        self._teacher_request_ring: Any | None = None
+        self._teacher_result_ring: Any | None = None
+        self._teacher_request_payload: Any | None = None
+        self._teacher_result_payload: Any | None = None
+        self._teacher_request_ring_name = _teacher_shm_name(self.mailbox_dir, "tq")
+        self._teacher_result_ring_name = _teacher_shm_name(self.mailbox_dir, "tr")
+        self._teacher_request_payload_name = _teacher_shm_name(self.mailbox_dir, "tqb")
+        self._teacher_result_payload_name = _teacher_shm_name(self.mailbox_dir, "trb")
+        self._teacher_request_seq = 0
+        self._teacher_result_seq = 0
+        self._teacher_ring_capacity = int(_ext.ShmRingTeacherRequest.capacity)
+        self._teacher_request_slot_bytes = _align64(
+            int(np.prod(self.full_ids_shape)) * _teacher_dtype_nbytes(torch.int32)
+        )
+        bsz = int(self.payload_shape[1]) if len(self.payload_shape) >= 2 else 1
+        seq = int(self.payload_shape[2]) if len(self.payload_shape) >= 3 else 1
+        payload_item_bytes = _teacher_dtype_nbytes(self.payload_dtype)
+        self._teacher_result_slot_bytes = _align64(
+            (5 * bsz * seq * payload_item_bytes)
+            + (bsz * self.hidden_dim * payload_item_bytes)
+            + (3 * self.hidden_dim * payload_item_bytes)
+        )
+        self._teacher_request_payload_bytes = (
+            self._teacher_ring_capacity * self._teacher_request_slot_bytes
+        )
+        self._teacher_result_payload_bytes = (
+            self._teacher_ring_capacity * self._teacher_result_slot_bytes
+        )
+        self._init_teacher_shm()
         self.metrics: dict[str, Any] = {
-            "mode": "async_rank0_memory_mailbox",
-            "transport_group": "rank0_memory_mailbox",
+            "mode": "async_rank0_memory_shm",
+            "transport_group": "rank0_memory_shm",
             "coordinator_rank": int(self.coordinator_rank),
             "memory_rank": int(self.memory_rank),
             "participant": True,
@@ -2000,6 +2147,31 @@ class _CrctMailboxTeacherTransport:
             "payload_dtype": str(payload_dtype).replace("torch.", ""),
             "request_shape": list(self.full_ids_shape),
             "payload_shape": list(self.payload_shape),
+            "teacher_shm_request_ring": self._teacher_request_ring_name,
+            "teacher_shm_result_ring": self._teacher_result_ring_name,
+            "teacher_shm_request_payload": self._teacher_request_payload_name,
+            "teacher_shm_result_payload": self._teacher_result_payload_name,
+            "teacher_shm_ring_capacity": int(self._teacher_ring_capacity),
+            "teacher_shm_request_slot_bytes": int(self._teacher_request_slot_bytes),
+            "teacher_shm_result_slot_bytes": int(self._teacher_result_slot_bytes),
+            "teacher_shm_request_payload_bytes": int(
+                self._teacher_request_payload_bytes
+            ),
+            "teacher_shm_result_payload_bytes": int(
+                self._teacher_result_payload_bytes
+            ),
+            "teacher_shm_request_ring_full_drops": 0,
+            "teacher_shm_result_ring_full_drops": 0,
+            "teacher_shm_request_attach_misses": 0,
+            "teacher_shm_result_attach_misses": 0,
+            "teacher_shm_payload_write_seconds_sum": 0.0,
+            "teacher_shm_payload_write_seconds_max": 0.0,
+            "teacher_shm_payload_read_seconds_sum": 0.0,
+            "teacher_shm_payload_read_seconds_max": 0.0,
+            "teacher_shm_request_events_pushed": 0,
+            "teacher_shm_request_events_popped": 0,
+            "teacher_shm_result_events_pushed": 0,
+            "teacher_shm_result_events_popped": 0,
             "max_local_batches": int(self.max_local_batches),
             "max_payload_lag_steps": int(self.max_payload_lag_steps),
             "score_interval_steps": int(self.score_interval_steps),
@@ -2174,6 +2346,137 @@ class _CrctMailboxTeacherTransport:
             "low_priority_maintenance_last_reason": "",
         }
 
+    def _init_teacher_shm(self) -> None:
+        if self.rank == self.coordinator_rank:
+            for cls, name in (
+                (_ext.ShmRingTeacherRequest, self._teacher_request_ring_name),
+                (_ext.ShmRingTeacherResult, self._teacher_result_ring_name),
+                (_ext.PosixShm, self._teacher_request_payload_name),
+                (_ext.PosixShm, self._teacher_result_payload_name),
+            ):
+                try:
+                    cls.unlink(name)
+                except Exception:
+                    pass
+            self._teacher_request_ring = _ext.ShmRingTeacherRequest.create(
+                self._teacher_request_ring_name
+            )
+            self._teacher_result_ring = _ext.ShmRingTeacherResult.create(
+                self._teacher_result_ring_name
+            )
+            self._teacher_request_payload = _ext.PosixShm(
+                self._teacher_request_payload_name,
+                self._teacher_request_payload_bytes,
+                True,
+            )
+            self._teacher_result_payload = _ext.PosixShm(
+                self._teacher_result_payload_name,
+                self._teacher_result_payload_bytes,
+                True,
+            )
+
+    def _ensure_teacher_request_consumer(self) -> bool:
+        if self._teacher_request_ring is None:
+            try:
+                self._teacher_request_ring = _ext.ShmRingTeacherRequest.attach(
+                    self._teacher_request_ring_name
+                )
+            except Exception:
+                self.metrics["teacher_shm_request_attach_misses"] += 1
+                return False
+        if self._teacher_request_payload is None:
+            try:
+                self._teacher_request_payload = _ext.PosixShm(
+                    self._teacher_request_payload_name,
+                    0,
+                    False,
+                )
+            except Exception:
+                self.metrics["teacher_shm_request_attach_misses"] += 1
+                return False
+        return True
+
+    def _ensure_teacher_result_producer(self) -> bool:
+        if self._teacher_result_ring is None:
+            try:
+                self._teacher_result_ring = _ext.ShmRingTeacherResult.attach(
+                    self._teacher_result_ring_name
+                )
+            except Exception:
+                self.metrics["teacher_shm_result_attach_misses"] += 1
+                return False
+        if self._teacher_result_payload is None:
+            try:
+                self._teacher_result_payload = _ext.PosixShm(
+                    self._teacher_result_payload_name,
+                    0,
+                    False,
+                )
+            except Exception:
+                self.metrics["teacher_shm_result_attach_misses"] += 1
+                return False
+        return True
+
+    def _write_teacher_slice(
+        self,
+        *,
+        shm: Any,
+        slot_base: int,
+        cursor: int,
+        tensor: torch.Tensor,
+        dtype: torch.dtype,
+    ) -> tuple[dict[str, object], int]:
+        t = tensor.detach().to(device="cpu", dtype=dtype).contiguous()
+        nbytes = int(t.numel() * t.element_size())
+        offset = int(slot_base) + int(cursor)
+        slot_limit = int(slot_base) + int(
+            self._teacher_request_slot_bytes
+            if shm is self._teacher_request_payload
+            else self._teacher_result_slot_bytes
+        )
+        if offset + nbytes > slot_limit:
+            raise ValueError(
+                "teacher shm payload slot too small: "
+                f"offset={offset} nbytes={nbytes} slot_limit={slot_limit}"
+            )
+        t0 = time.perf_counter()
+        shm.write_tensor(offset, t)
+        elapsed = time.perf_counter() - t0
+        self.metrics["teacher_shm_payload_write_seconds_sum"] += float(elapsed)
+        self.metrics["teacher_shm_payload_write_seconds_max"] = max(
+            float(self.metrics["teacher_shm_payload_write_seconds_max"]),
+            float(elapsed),
+        )
+        shape = list(t.shape)[:4]
+        shape.extend([0] * (4 - len(shape)))
+        return (
+            {
+                "offset_bytes": offset,
+                "nbytes": nbytes,
+                "dtype": _teacher_dtype_code(t.dtype),
+                "rank": int(t.dim()),
+                "shape": [int(x) for x in shape],
+            },
+            _align64(int(cursor) + nbytes),
+        )
+
+    def _read_teacher_slice(self, shm: Any, desc: dict[str, object]) -> torch.Tensor | None:
+        dtype = _teacher_dtype_from_code(int(desc["dtype"]))
+        if dtype is None or int(desc["nbytes"]) <= 0:
+            return None
+        rank = int(desc["rank"])
+        shape = tuple(int(x) for x in list(desc["shape"])[:rank])
+        out = torch.empty(shape, dtype=dtype, device="cpu").contiguous()
+        t0 = time.perf_counter()
+        shm.read_tensor_into(int(desc["offset_bytes"]), out)
+        elapsed = time.perf_counter() - t0
+        self.metrics["teacher_shm_payload_read_seconds_sum"] += float(elapsed)
+        self.metrics["teacher_shm_payload_read_seconds_max"] = max(
+            float(self.metrics["teacher_shm_payload_read_seconds_max"]),
+            float(elapsed),
+        )
+        return out
+
     def begin_step(
         self,
         *,
@@ -2183,11 +2486,7 @@ class _CrctMailboxTeacherTransport:
     ) -> tuple[dict[str, torch.Tensor], torch.Tensor, torch.Tensor] | None:
         if self.rank == self.coordinator_rank:
             ready = self._poll_results(current_step=int(step))
-            if int(step) % int(self.score_interval_steps) == 0:
-                self._write_request(inputs=inputs, targets=targets, step=int(step))
-            else:
-                self.metrics["request_interval_skips"] += 1
-                self.metrics["broadcast_interval_skips"] += 1
+            self._write_request(inputs=inputs, targets=targets, step=int(step))
             return ready
         if self.rank == self.memory_rank:
             self._poll_requests()
@@ -2437,6 +2736,17 @@ class _CrctMailboxTeacherTransport:
             self._request_write_thread.join(timeout=0.01)
         if self._weight_publish_thread is not None:
             self._weight_publish_thread.join(timeout=0.01)
+        if self.rank == self.coordinator_rank:
+            for cls, name in (
+                (_ext.ShmRingTeacherRequest, self._teacher_request_ring_name),
+                (_ext.ShmRingTeacherResult, self._teacher_result_ring_name),
+                (_ext.PosixShm, self._teacher_request_payload_name),
+                (_ext.PosixShm, self._teacher_result_payload_name),
+            ):
+                try:
+                    cls.unlink(name)
+                except Exception:
+                    pass
         return
 
     def _request_path(self, step: int) -> Path:
@@ -2527,21 +2837,10 @@ class _CrctMailboxTeacherTransport:
             self.metrics["low_priority_maintenance_defer_pending_requests"] += 1
             self.metrics["low_priority_maintenance_last_reason"] = "pending_request"
             return True
-        try:
-            has_request_file = next(self.mailbox_dir.glob("request_*.pt"), None) is not None
-        except Exception as exc:
-            self.metrics["errors"] += 1
-            self.metrics["last_error"] = "".join(
-                traceback.format_exception_only(type(exc), exc)
-            ).strip()
-            self.metrics["low_priority_maintenance_last_reason"] = (
-                "request_mailbox_scan_error"
-            )
-            has_request_file = False
-        if has_request_file:
+        if self._ensure_teacher_request_consumer() and self._teacher_request_ring is not None and self._teacher_request_ring.size() > 0:
             self.metrics["low_priority_maintenance_defers"] += 1
             self.metrics["low_priority_maintenance_defer_request_mailbox"] += 1
-            self.metrics["low_priority_maintenance_last_reason"] = "request_mailbox"
+            self.metrics["low_priority_maintenance_last_reason"] = "request_ring"
             return True
         self.metrics["low_priority_maintenance_allows"] += 1
         self.metrics["low_priority_maintenance_last_reason"] = "allowed"
@@ -2866,13 +3165,8 @@ class _CrctMailboxTeacherTransport:
         targets: torch.Tensor,
         step: int,
     ) -> None:
-        if (
-            self._request_write_thread is not None
-            and self._request_write_thread.is_alive()
-        ):
-            self.metrics["request_write_skipped_busy"] += 1
-            self.metrics["request_write_publisher_busy"] = True
-            self.metrics["last_drop_reason"] = "request_writer_busy"
+        if self._teacher_request_ring is None or self._teacher_request_payload is None:
+            self.metrics["last_drop_reason"] = "teacher_shm_request_not_ready"
             return
         stage_t0 = time.perf_counter()
         full_ids = _crct_full_input_ids(inputs, targets).to(
@@ -2912,94 +3206,110 @@ class _CrctMailboxTeacherTransport:
             len(self.local_batches_by_step),
         )
         request_step = int(step)
-        self.metrics["request_write_publisher_busy"] = True
-
-        def _writer() -> None:
-            try:
-                copy_t0 = time.perf_counter()
-                host = self._request_host_staging
-                if (
-                    host is None
-                    or tuple(host.shape) != tuple(full_ids_staged.shape)
-                    or tuple(host.stride()) != tuple(full_ids_staged.stride())
-                    or host.dtype != full_ids_staged.dtype
-                ):
-                    self._request_host_staging = self._host_staging_like(
-                        full_ids_staged
-                    )
-                    host = self._request_host_staging
-                host.copy_(full_ids_staged, non_blocking=False)
-                full_ids_cpu = host
-                copy_s = time.perf_counter() - copy_t0
-                self.metrics["request_writer_cpu_copy_seconds_sum"] += float(copy_s)
-                self.metrics["request_writer_cpu_copy_seconds_max"] = max(
-                    float(self.metrics["request_writer_cpu_copy_seconds_max"]),
-                    float(copy_s),
-                )
-                self.metrics["request_host_pinned"] = bool(full_ids_cpu.is_pinned())
-                self.metrics["request_host_stage_bytes"] = int(
-                    full_ids_cpu.numel() * full_ids_cpu.element_size()
-                )
-                self._atomic_save(
-                    {
-                        "step": request_step,
-                        "full_ids": full_ids_cpu,
-                    },
-                    self._request_path(request_step),
-                )
-                self.metrics["mailbox_request_writes"] += 1
-            except Exception as exc:
-                self.metrics["errors"] += 1
-                self.metrics["last_error"] = "".join(
-                    traceback.format_exception_only(type(exc), exc)
-                ).strip()
-                self.metrics["last_drop_reason"] = "request_mailbox_write_error"
-            finally:
-                self.metrics["request_write_publisher_busy"] = False
-
-        self._request_write_thread = threading.Thread(
-            target=_writer,
-            name="crct-request-writer",
-            daemon=True,
-        )
-        self._request_write_thread.start()
-
-    def _poll_requests(self) -> None:
-        paths = sorted(self.mailbox_dir.glob("request_*.pt"))
-        if not paths:
-            return
-        keep = paths[-1]
-        for old in paths[:-1]:
-            self._safe_unlink(old)
-            self.metrics["completed_requests_dropped"] += 1
-            self.metrics["last_drop_reason"] = "newer_request_file_won"
         try:
-            t0 = time.perf_counter()
-            payload = torch.load(keep, map_location=self.device, weights_only=True)
-            elapsed = time.perf_counter() - t0
-            self.metrics["mailbox_read_seconds_sum"] += float(elapsed)
-            self.metrics["mailbox_read_seconds_max"] = max(
-                float(self.metrics["mailbox_read_seconds_max"]),
-                float(elapsed),
+            copy_t0 = time.perf_counter()
+            host = self._request_host_staging
+            if (
+                host is None
+                or tuple(host.shape) != tuple(full_ids_staged.shape)
+                or tuple(host.stride()) != tuple(full_ids_staged.stride())
+                or host.dtype != full_ids_staged.dtype
+            ):
+                self._request_host_staging = self._host_staging_like(
+                    full_ids_staged
+                )
+                host = self._request_host_staging
+            host.copy_(full_ids_staged, non_blocking=False)
+            copy_s = time.perf_counter() - copy_t0
+            self.metrics["request_writer_cpu_copy_seconds_sum"] += float(copy_s)
+            self.metrics["request_writer_cpu_copy_seconds_max"] = max(
+                float(self.metrics["request_writer_cpu_copy_seconds_max"]),
+                float(copy_s),
             )
-            self._safe_unlink(keep)
-            full_ids = payload["full_ids"].to(device=self.device, dtype=torch.int32)
-            step = int(payload["step"])
-            self.pending_input_requests.append({"step": step, "buffer": full_ids})
-            self.metrics["request_broadcasts_completed"] += 1
-            self.metrics["mailbox_request_reads"] += 1
-            self.metrics["max_pending_input_requests"] = max(
-                int(self.metrics["max_pending_input_requests"]),
-                len(self.pending_input_requests),
+            self.metrics["request_host_pinned"] = bool(host.is_pinned())
+            self.metrics["request_host_stage_bytes"] = int(
+                host.numel() * host.element_size()
             )
-        except FileNotFoundError:
-            return
+            request_id = int(self._teacher_request_seq)
+            self._teacher_request_seq += 1
+            slot = request_id % int(self._teacher_ring_capacity)
+            slot_base = slot * int(self._teacher_request_slot_bytes)
+            full_ids_slice, _ = self._write_teacher_slice(
+                shm=self._teacher_request_payload,
+                slot_base=slot_base,
+                cursor=0,
+                tensor=host,
+                dtype=torch.int32,
+            )
+            event = {
+                "event_type": 6,
+                "source_rank": int(self.rank),
+                "status": 0,
+                "flags": 0,
+                "slice_count": int(_ext.wire_event_constants()["TEACHER_REQUEST_SLICES"]),
+                "request_id": request_id,
+                "step": request_step,
+                "weight_snapshot_version": max(
+                    0, int(self.metrics.get("weight_snapshot_last_published_step", -1))
+                ),
+                "full_ids": full_ids_slice,
+            }
+            if self._teacher_request_ring.push(event):
+                self.metrics["teacher_shm_request_events_pushed"] += 1
+                self.metrics["mailbox_request_writes"] += 1
+                self.metrics["request_broadcasts_completed"] += 1
+                self.metrics["last_sent_request_step"] = request_step
+            else:
+                self.metrics["teacher_shm_request_ring_full_drops"] += 1
+                self.metrics["last_drop_reason"] = "teacher_request_ring_full"
         except Exception as exc:
             self.metrics["errors"] += 1
             self.metrics["last_error"] = "".join(
                 traceback.format_exception_only(type(exc), exc)
             ).strip()
-            self.metrics["last_drop_reason"] = "request_mailbox_read_error"
+            self.metrics["last_drop_reason"] = "request_shm_write_error"
+
+    def _poll_requests(self) -> None:
+        if not self._ensure_teacher_request_consumer():
+            return
+        assert self._teacher_request_ring is not None
+        assert self._teacher_request_payload is not None
+        latest: dict[str, object] | None = None
+        popped = 0
+        while True:
+            event = self._teacher_request_ring.pop()
+            if event is None:
+                break
+            latest = event
+            popped += 1
+        if latest is None:
+            return
+        if popped > 1:
+            self.metrics["completed_requests_dropped"] += popped - 1
+            self.metrics["last_drop_reason"] = "newer_request_event_won"
+        self.metrics["teacher_shm_request_events_popped"] += popped
+        try:
+            full_ids_cpu = self._read_teacher_slice(
+                self._teacher_request_payload,
+                latest["full_ids"],  # type: ignore[arg-type]
+            )
+            if full_ids_cpu is None:
+                self.metrics["last_drop_reason"] = "teacher_request_empty_full_ids"
+                return
+            full_ids = full_ids_cpu.to(device=self.device, dtype=torch.int32)
+            step = int(latest["step"])
+            self.pending_input_requests.append({"step": step, "buffer": full_ids})
+            self.metrics["mailbox_request_reads"] += 1
+            self.metrics["max_pending_input_requests"] = max(
+                int(self.metrics["max_pending_input_requests"]),
+                len(self.pending_input_requests),
+            )
+        except Exception as exc:
+            self.metrics["errors"] += 1
+            self.metrics["last_error"] = "".join(
+                traceback.format_exception_only(type(exc), exc)
+            ).strip()
+            self.metrics["last_drop_reason"] = "request_shm_read_error"
 
     def _plasticity_ema_update(
         self,
@@ -3048,68 +3358,92 @@ class _CrctMailboxTeacherTransport:
         )
 
     def _write_result(self, *, request_step: int, scored: dict[str, torch.Tensor]) -> None:
-        target_cpu = scored["target"].detach().to(
-            device="cpu", dtype=self.payload_dtype
-        )
-        payload = {
-            "step": int(request_step),
-            "target": target_cpu,
-            "confidence": scored["confidence"].detach().to(
-                device="cpu", dtype=self.payload_dtype
-            ),
-            "loss_weight": scored["loss_weight"].detach().to(
-                device="cpu", dtype=self.payload_dtype
-            ),
-            "utility": scored["utility"].detach().to(
-                device="cpu", dtype=self.payload_dtype
-            ),
+        if not self._ensure_teacher_result_producer():
+            self.metrics["last_drop_reason"] = "teacher_shm_result_not_ready"
+            return
+        assert self._teacher_result_ring is not None
+        assert self._teacher_result_payload is not None
+        result_id = int(self._teacher_result_seq)
+        self._teacher_result_seq += 1
+        slot = result_id % int(self._teacher_ring_capacity)
+        slot_base = slot * int(self._teacher_result_slot_bytes)
+        cursor = 0
+        slices_by_name: dict[str, dict[str, object]] = {
+            name: _teacher_empty_slice() for name in _TEACHER_RESULT_SLICE_NAMES
         }
+        try:
+            for key in ("target", "confidence", "loss_weight", "utility"):
+                slices_by_name[key], cursor = self._write_teacher_slice(
+                    shm=self._teacher_result_payload,
+                    slot_base=slot_base,
+                    cursor=cursor,
+                    tensor=scored[key],
+                    dtype=self.payload_dtype,
+                )
+        except Exception as exc:
+            self.metrics["errors"] += 1
+            self.metrics["last_error"] = "".join(
+                traceback.format_exception_only(type(exc), exc)
+            ).strip()
+            self.metrics["last_drop_reason"] = "result_shm_base_write_error"
+            return
         readiness = scored.get("fast_slow_readiness")
         if isinstance(readiness, dict):
-            payload["fast_slow_readiness"] = dict(readiness)
             self.metrics["fast_slow_readiness_result_payloads"] += 1
         decision = fast_slow_decision_from_dict(scored.get("fast_slow_decision"))
-        if decision is not None:
-            payload["fast_slow_decision"] = fast_slow_decision_to_dict(decision)
-            self.metrics["fast_slow_decisions_result_payloads"] += 1
         memory_residual = scored.get("memory_residual")
         memory_gate = scored.get("memory_gate")
         if isinstance(memory_residual, torch.Tensor) and isinstance(memory_gate, torch.Tensor):
-            payload["memory_residual"] = self._compact_memory_packet_residual_to_cpu(
-                memory_residual
-            )
-            gate_alias_target = bool(scored.get("memory_gate_alias_target", False))
-            if gate_alias_target and tuple(memory_gate.shape) == tuple(scored["target"].shape):
-                payload["memory_gate_alias_target"] = True
-                gate_bytes = 0
-                self.metrics["memory_packet_gate_alias_target_sent"] += 1
-                self.metrics["memory_packet_last_gate_shape"] = ["alias:target"]
-            else:
-                payload["memory_gate"] = memory_gate.detach().to(
-                    device="cpu", dtype=self.payload_dtype
+            try:
+                residual_cpu = self._compact_memory_packet_residual_to_cpu(
+                    memory_residual
                 )
-                gate_bytes = int(
-                    payload["memory_gate"].numel()
-                    * payload["memory_gate"].element_size()
+                slices_by_name["memory_residual"], cursor = self._write_teacher_slice(
+                    shm=self._teacher_result_payload,
+                    slot_base=slot_base,
+                    cursor=cursor,
+                    tensor=residual_cpu,
+                    dtype=self.payload_dtype,
                 )
-                self.metrics["memory_packet_last_gate_shape"] = list(
-                    payload["memory_gate"].shape
+                gate_alias_target = bool(scored.get("memory_gate_alias_target", False))
+                if gate_alias_target and tuple(memory_gate.shape) == tuple(scored["target"].shape):
+                    gate_bytes = 0
+                    self.metrics["memory_packet_gate_alias_target_sent"] += 1
+                    self.metrics["memory_packet_last_gate_shape"] = ["alias:target"]
+                    slices_by_name["memory_gate"] = _teacher_empty_slice()
+                else:
+                    slices_by_name["memory_gate"], cursor = self._write_teacher_slice(
+                        shm=self._teacher_result_payload,
+                        slot_base=slot_base,
+                        cursor=cursor,
+                        tensor=memory_gate,
+                        dtype=self.payload_dtype,
+                    )
+                    gate_bytes = int(slices_by_name["memory_gate"]["nbytes"])
+                    self.metrics["memory_packet_last_gate_shape"] = list(
+                        memory_gate.shape
+                    )
+                residual_bytes = int(slices_by_name["memory_residual"]["nbytes"])
+                packet_bytes = residual_bytes + gate_bytes
+                self.metrics["memory_packets_sent"] += 1
+                self.metrics["memory_packet_bytes_sent"] += int(packet_bytes)
+                self.metrics["memory_packet_bytes_sent_max"] = max(
+                    int(self.metrics["memory_packet_bytes_sent_max"]),
+                    int(packet_bytes),
                 )
-            residual_bytes = int(
-                payload["memory_residual"].numel()
-                * payload["memory_residual"].element_size()
-            )
-            packet_bytes = residual_bytes + gate_bytes
-            self.metrics["memory_packets_sent"] += 1
-            self.metrics["memory_packet_bytes_sent"] += int(packet_bytes)
-            self.metrics["memory_packet_bytes_sent_max"] = max(
-                int(self.metrics["memory_packet_bytes_sent_max"]),
-                int(packet_bytes),
-            )
-            self.metrics["memory_packet_gate_elements_max"] = max(
-                int(self.metrics["memory_packet_gate_elements_max"]),
-                int(memory_gate.numel()),
-            )
+                self.metrics["memory_packet_gate_elements_max"] = max(
+                    int(self.metrics["memory_packet_gate_elements_max"]),
+                    int(memory_gate.numel()),
+                )
+            except Exception as exc:
+                self.metrics["errors"] += 1
+                self.metrics["last_error"] = "".join(
+                    traceback.format_exception_only(type(exc), exc)
+                ).strip()
+                self.metrics["last_drop_reason"] = "result_shm_memory_packet_write_error"
+                if isinstance(exc, ValueError):
+                    raise
+                return
         else:
             self.metrics["memory_packet_missing_payloads"] += 1
         plasticity = self._plasticity_ema_update(scored)
@@ -3117,19 +3451,30 @@ class _CrctMailboxTeacherTransport:
             self.metrics["plasticity_packets_missing"] += 1
         else:
             coverage_ema, confidence_ema, budget_ema = plasticity
-            payload["plasticity_coverage"] = coverage_ema.to(dtype=self.payload_dtype)
-            payload["plasticity_confidence"] = confidence_ema.to(
-                dtype=self.payload_dtype
-            )
-            payload["plasticity_budget"] = budget_ema.to(dtype=self.payload_dtype)
+            try:
+                for key, tensor in (
+                    ("plasticity_coverage", coverage_ema),
+                    ("plasticity_confidence", confidence_ema),
+                    ("plasticity_budget", budget_ema),
+                ):
+                    slices_by_name[key], cursor = self._write_teacher_slice(
+                        shm=self._teacher_result_payload,
+                        slot_base=slot_base,
+                        cursor=cursor,
+                        tensor=tensor,
+                        dtype=self.payload_dtype,
+                    )
+            except Exception as exc:
+                self.metrics["errors"] += 1
+                self.metrics["last_error"] = "".join(
+                    traceback.format_exception_only(type(exc), exc)
+                ).strip()
+                self.metrics["last_drop_reason"] = "result_shm_plasticity_write_error"
+                return
             packet_bytes = int(
                 sum(
-                    payload[key].numel() * payload[key].element_size()
-                    for key in (
-                        "plasticity_coverage",
-                        "plasticity_confidence",
-                        "plasticity_budget",
-                    )
+                    int(slices_by_name[key]["nbytes"])
+                    for key in ("plasticity_coverage", "plasticity_confidence", "plasticity_budget")
                 )
             )
             self.metrics["plasticity_packets_sent"] += 1
@@ -3151,41 +3496,66 @@ class _CrctMailboxTeacherTransport:
             self.metrics["plasticity_coverage_abs_mean_sent"] = float(
                 coverage_ema.abs().mean().item()
             )
-        self._atomic_save(payload, self._result_path(int(request_step)))
-        self.metrics["payloads_sent"] += 1
-        self.metrics["payloads_received"] += 0
-        self.metrics["mailbox_result_writes"] += 1
-        self.metrics["result_broadcasts_started"] += 1
-        self.metrics["result_broadcasts_completed"] += 1
-        self.metrics["last_sent_request_step"] = int(request_step)
+        if decision is not None:
+            self.metrics["fast_slow_decisions_result_payloads"] += 1
+        result_event = {
+            "event_type": 7,
+            "source_rank": int(self.rank),
+            "status": 0,
+            "flags": 1 if (
+                isinstance(memory_gate, torch.Tensor)
+                and bool(scored.get("memory_gate_alias_target", False))
+                and tuple(memory_gate.shape) == tuple(scored["target"].shape)
+            ) else 0,
+            "slice_count": int(_ext.wire_event_constants()["TEACHER_RESULT_SLICES"]),
+            "request_id": result_id,
+            "step": int(request_step),
+            "weight_snapshot_version": max(0, int(self._last_applied_weight_step)),
+            "payload_version": result_id,
+            "score_seconds": float(scored.get("score_seconds", 0.0))
+            if not isinstance(scored.get("score_seconds"), torch.Tensor)
+            else float(scored["score_seconds"].detach().cpu().item()),
+            "packet_seconds": 0.0,
+            "target_token_count": int(scored["target"].numel()),
+            "hidden_dim": int(self.hidden_dim),
+            "plasticity_dim": int(
+                plasticity[2].numel() if plasticity is not None else 0
+            ),
+            "fast_slow_mode": _fast_slow_mode_code(decision.mode) if decision is not None else 0,
+            "fast_slow_accepted": int(bool(decision.accepted)) if decision is not None else 0,
+            "fast_slow_step": int(decision.step) if decision is not None else 0,
+            "fast_slow_alpha": float(decision.alpha) if decision is not None else 0.0,
+            "fast_slow_gate": float(decision.gate) if decision is not None else 0.0,
+            "fast_slow_effective_alpha": float(decision.effective_alpha) if decision is not None else 0.0,
+            "fast_slow_reason": _fast_slow_reason_code(decision.reason) if decision is not None else 0,
+            "slices": [slices_by_name[name] for name in _TEACHER_RESULT_SLICE_NAMES],
+        }
+        if self._teacher_result_ring.push(result_event):
+            self.metrics["payloads_sent"] += 1
+            self.metrics["payloads_received"] += 0
+            self.metrics["mailbox_result_writes"] += 1
+            self.metrics["result_broadcasts_started"] += 1
+            self.metrics["result_broadcasts_completed"] += 1
+            self.metrics["teacher_shm_result_events_pushed"] += 1
+            self.metrics["last_sent_request_step"] = int(request_step)
+        else:
+            self.metrics["teacher_shm_result_ring_full_drops"] += 1
+            self.metrics["last_drop_reason"] = "teacher_result_ring_full"
 
     def _poll_results(
         self,
         *,
         current_step: int,
     ) -> tuple[dict[str, torch.Tensor], torch.Tensor, torch.Tensor] | None:
+        if self._teacher_result_ring is None or self._teacher_result_payload is None:
+            return None
         ready: tuple[dict[str, torch.Tensor], torch.Tensor, torch.Tensor] | None = None
-        for path in sorted(self.mailbox_dir.glob("result_*.pt")):
-            try:
-                t0 = time.perf_counter()
-                payload_cpu = torch.load(path, map_location="cpu", weights_only=True)
-                elapsed = time.perf_counter() - t0
-                self.metrics["mailbox_read_seconds_sum"] += float(elapsed)
-                self.metrics["mailbox_read_seconds_max"] = max(
-                    float(self.metrics["mailbox_read_seconds_max"]),
-                    float(elapsed),
-                )
-                self._safe_unlink(path)
-            except FileNotFoundError:
-                continue
-            except Exception as exc:
-                self.metrics["errors"] += 1
-                self.metrics["last_error"] = "".join(
-                    traceback.format_exception_only(type(exc), exc)
-                ).strip()
-                self.metrics["last_drop_reason"] = "result_mailbox_read_error"
-                continue
-            request_step = int(payload_cpu["step"])
+        while True:
+            result_event = self._teacher_result_ring.pop()
+            if result_event is None:
+                break
+            self.metrics["teacher_shm_result_events_popped"] += 1
+            request_step = int(result_event["step"])
             lag = int(current_step) - request_step
             batch = self.local_batches_by_step.pop(request_step, None)
             try:
@@ -3196,41 +3566,75 @@ class _CrctMailboxTeacherTransport:
                 self.metrics["orphan_payloads_dropped"] += 1
                 self.metrics["last_drop_reason"] = "payload_without_local_batch"
                 continue
-            if self.max_payload_lag_steps > 0 and lag > self.max_payload_lag_steps:
-                self.metrics["stale_payloads_dropped"] += 1
-                self.metrics["last_drop_reason"] = "payload_too_stale"
-                continue
             if ready is not None:
                 self.metrics["superseded_payloads_dropped"] += 1
+            slices = {
+                name: desc
+                for name, desc in zip(
+                    _TEACHER_RESULT_SLICE_NAMES,
+                    result_event["slices"],
+                    strict=True,
+                )
+            }
+            try:
+                tensors_cpu = {
+                    name: self._read_teacher_slice(self._teacher_result_payload, desc)
+                    for name, desc in slices.items()
+                }
+            except Exception as exc:
+                self.metrics["errors"] += 1
+                self.metrics["last_error"] = "".join(
+                    traceback.format_exception_only(type(exc), exc)
+                ).strip()
+                self.metrics["last_drop_reason"] = "result_shm_read_error"
+                continue
+            target_cpu = tensors_cpu.get("target")
+            confidence_cpu = tensors_cpu.get("confidence")
+            loss_weight_cpu = tensors_cpu.get("loss_weight")
+            utility_cpu = tensors_cpu.get("utility")
+            if not (
+                isinstance(target_cpu, torch.Tensor)
+                and isinstance(confidence_cpu, torch.Tensor)
+                and isinstance(loss_weight_cpu, torch.Tensor)
+                and isinstance(utility_cpu, torch.Tensor)
+            ):
+                self.metrics["last_drop_reason"] = "result_shm_missing_base_tensor"
+                continue
             payload = {
                 "step_id": torch.tensor(request_step, device=self.device),
                 "step_id_int": int(request_step),
-                "target": payload_cpu["target"].to(
+                "target": target_cpu.to(
                     device=self.device, dtype=torch.float32
                 ),
-                "confidence": payload_cpu["confidence"].to(
+                "confidence": confidence_cpu.to(
                     device=self.device, dtype=torch.float32
                 ),
-                "loss_weight": payload_cpu["loss_weight"].to(
+                "loss_weight": loss_weight_cpu.to(
                     device=self.device, dtype=torch.float32
                 ),
-                "utility": payload_cpu["utility"].to(
+                "utility": utility_cpu.to(
                     device=self.device, dtype=torch.float32
                 ),
             }
-            readiness = payload_cpu.get("fast_slow_readiness")
-            if isinstance(readiness, dict):
-                payload["fast_slow_readiness"] = dict(readiness)
-            decision = fast_slow_decision_from_dict(
-                payload_cpu.get("fast_slow_decision")
-            )
-            if decision is not None:
-                payload["fast_slow_decision"] = fast_slow_decision_to_dict(decision)
-            memory_residual = payload_cpu.get("memory_residual")
-            memory_gate = payload_cpu.get("memory_gate")
-            gate_alias_target = bool(payload_cpu.get("memory_gate_alias_target", False))
+            if int(result_event.get("fast_slow_mode", 0)) != 0:
+                payload["fast_slow_decision"] = {
+                    "mode": _fast_slow_mode_from_code(result_event["fast_slow_mode"]),
+                    "accepted": bool(result_event["fast_slow_accepted"]),
+                    "alpha": float(result_event["fast_slow_alpha"]),
+                    "gate": float(result_event["fast_slow_gate"]),
+                    "effective_alpha": float(
+                        result_event["fast_slow_effective_alpha"]
+                    ),
+                    "step": int(result_event["fast_slow_step"]),
+                    "reason": _fast_slow_reason_from_code(
+                        result_event["fast_slow_reason"]
+                    ),
+                }
+            memory_residual = tensors_cpu.get("memory_residual")
+            memory_gate = tensors_cpu.get("memory_gate")
+            gate_alias_target = bool(int(result_event.get("flags", 0)) & 1)
             if gate_alias_target:
-                memory_gate = payload_cpu.get("target")
+                memory_gate = target_cpu
             if isinstance(memory_residual, torch.Tensor) and isinstance(memory_gate, torch.Tensor):
                 residual = memory_residual
                 if residual.dim() == 2:
@@ -3284,9 +3688,9 @@ class _CrctMailboxTeacherTransport:
                     if gate_alias_target
                     else list(memory_gate.shape)
                 )
-            plasticity_coverage = payload_cpu.get("plasticity_coverage")
-            plasticity_confidence = payload_cpu.get("plasticity_confidence")
-            plasticity_budget = payload_cpu.get("plasticity_budget")
+            plasticity_coverage = tensors_cpu.get("plasticity_coverage")
+            plasticity_confidence = tensors_cpu.get("plasticity_confidence")
+            plasticity_budget = tensors_cpu.get("plasticity_budget")
             if (
                 isinstance(plasticity_coverage, torch.Tensor)
                 and isinstance(plasticity_confidence, torch.Tensor)
@@ -9253,6 +9657,11 @@ def train_fast_for_budget(
                                     crct_teacher_score_interval_steps
                                 ),
                                 plasticity_ema_beta=float(crct_ema_beta),
+                                hidden_dim=int(
+                                    getattr(model, "dim", 0)
+                                    or getattr(model.lm_head, "in_features", 0)
+                                    or 0
+                                ),
                             )
                         else:
                             crct_teacher_transport = _CrctAsyncTeacherTransport(

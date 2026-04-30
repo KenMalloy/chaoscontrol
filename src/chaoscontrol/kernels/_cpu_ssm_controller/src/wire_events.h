@@ -207,8 +207,9 @@ struct TeacherRequest {
     TensorWireSlice full_ids;                     // int32 [B, T+1]
 };
 
-// 424 bytes total: header(8) + 4*u64(32) + 2*f32(8) + 3*u32(12) + pad(4)
-// + slices[9]*40(360). GPU3 -> train rank teacher packet. Slice order:
+// 456 bytes total: header(8) + 4*u64(32) + 2*f32(8) + 3*u32(12)
+// + fast/slow decision fields(32) + pad(4) + slices[9]*40(360).
+// GPU3 -> train rank teacher packet. Slice order:
 // target, confidence, loss_weight, utility, memory_residual, memory_gate,
 // plasticity_coverage, plasticity_confidence, plasticity_budget.
 struct TeacherResult {
@@ -226,6 +227,13 @@ struct TeacherResult {
     uint32_t target_token_count;
     uint32_t hidden_dim;
     uint32_t plasticity_dim;
+    uint32_t fast_slow_mode;                     // 0=none, 1=learned, 2=interval
+    uint32_t fast_slow_accepted;                 // 0=false, 1=true
+    uint64_t fast_slow_step;
+    float    fast_slow_alpha;
+    float    fast_slow_gate;
+    float    fast_slow_effective_alpha;
+    uint32_t fast_slow_reason;                   // compact reason code
     uint32_t _pad0;
     TensorWireSlice slices[TEACHER_RESULT_SLICES];
 };
@@ -263,7 +271,7 @@ static_assert(sizeof(ArmMaintenanceResult) == 192,
               "ArmMaintenanceResult must be exactly 192 bytes on the wire");
 static_assert(sizeof(TeacherRequest) == 72,
               "TeacherRequest must be exactly 72 bytes on the wire");
-static_assert(sizeof(TeacherResult) == 424,
-              "TeacherResult must be exactly 424 bytes on the wire");
+static_assert(sizeof(TeacherResult) == 456,
+              "TeacherResult must be exactly 456 bytes on the wire");
 static_assert(sizeof(WeightSnapshotHeader) == 64,
               "WeightSnapshotHeader must be exactly 64 bytes on the wire");

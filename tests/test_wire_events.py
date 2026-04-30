@@ -29,7 +29,7 @@ def test_wire_event_sizes_match_design():
     assert sizes["ArmMaintenanceResult"] == 192, sizes
     assert sizes["TensorWireSlice"] == 40, sizes
     assert sizes["TeacherRequest"] == 72, sizes
-    assert sizes["TeacherResult"] == 424, sizes
+    assert sizes["TeacherResult"] == 456, sizes
     assert sizes["WeightSnapshotHeader"] == 64, sizes
 
 

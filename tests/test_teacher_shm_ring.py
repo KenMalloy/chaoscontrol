@@ -97,6 +97,13 @@ def test_teacher_result_ring_round_trips_all_packet_slices():
             "target_token_count": 10,
             "hidden_dim": 8,
             "plasticity_dim": 8,
+            "fast_slow_mode": 1,
+            "fast_slow_accepted": 1,
+            "fast_slow_step": 457,
+            "fast_slow_alpha": 0.5,
+            "fast_slow_gate": 0.75,
+            "fast_slow_effective_alpha": 0.375,
+            "fast_slow_reason": 1,
             "slices": slices,
         }
         assert ring.push(event)
@@ -110,9 +117,18 @@ def test_teacher_result_ring_round_trips_all_packet_slices():
         assert out["target_token_count"] == event["target_token_count"]
         assert out["hidden_dim"] == event["hidden_dim"]
         assert out["plasticity_dim"] == event["plasticity_dim"]
+        assert out["fast_slow_mode"] == event["fast_slow_mode"]
+        assert out["fast_slow_accepted"] == event["fast_slow_accepted"]
+        assert out["fast_slow_step"] == event["fast_slow_step"]
+        assert out["fast_slow_reason"] == event["fast_slow_reason"]
         assert out["slices"] == event["slices"]
         assert out["score_seconds"] == pytest.approx(event["score_seconds"])
         assert out["packet_seconds"] == pytest.approx(event["packet_seconds"])
+        assert out["fast_slow_alpha"] == pytest.approx(event["fast_slow_alpha"])
+        assert out["fast_slow_gate"] == pytest.approx(event["fast_slow_gate"])
+        assert out["fast_slow_effective_alpha"] == pytest.approx(
+            event["fast_slow_effective_alpha"]
+        )
         assert ring.pop() is None
     finally:
         _ext.ShmRingTeacherResult.unlink(name)
@@ -139,6 +155,13 @@ def test_teacher_result_rejects_wrong_slice_count_shape():
             "target_token_count": 0,
             "hidden_dim": 0,
             "plasticity_dim": 0,
+            "fast_slow_mode": 0,
+            "fast_slow_accepted": 0,
+            "fast_slow_step": 0,
+            "fast_slow_alpha": 0.0,
+            "fast_slow_gate": 0.0,
+            "fast_slow_effective_alpha": 0.0,
+            "fast_slow_reason": 0,
             "slices": [],
         }
         with pytest.raises(ValueError, match="slices"):

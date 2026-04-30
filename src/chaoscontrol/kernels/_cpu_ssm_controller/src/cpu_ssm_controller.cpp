@@ -1304,7 +1304,9 @@ constexpr const char* kTeacherResultKeys[] = {
     "event_type", "source_rank", "status", "flags", "slice_count",
     "request_id", "step", "weight_snapshot_version", "payload_version",
     "score_seconds", "packet_seconds", "target_token_count", "hidden_dim",
-    "plasticity_dim", "slices",
+    "plasticity_dim", "fast_slow_mode", "fast_slow_accepted",
+    "fast_slow_step", "fast_slow_alpha", "fast_slow_gate",
+    "fast_slow_effective_alpha", "fast_slow_reason", "slices",
 };
 constexpr std::size_t kTeacherResultKeyCount =
     sizeof(kTeacherResultKeys) / sizeof(kTeacherResultKeys[0]);
@@ -1328,6 +1330,14 @@ TeacherResult dict_to_teacher_result(const pybind11::dict& d) {
   ev.target_token_count = d["target_token_count"].cast<uint32_t>();
   ev.hidden_dim = d["hidden_dim"].cast<uint32_t>();
   ev.plasticity_dim = d["plasticity_dim"].cast<uint32_t>();
+  ev.fast_slow_mode = d["fast_slow_mode"].cast<uint32_t>();
+  ev.fast_slow_accepted = d["fast_slow_accepted"].cast<uint32_t>();
+  ev.fast_slow_step = d["fast_slow_step"].cast<uint64_t>();
+  ev.fast_slow_alpha = d["fast_slow_alpha"].cast<float>();
+  ev.fast_slow_gate = d["fast_slow_gate"].cast<float>();
+  ev.fast_slow_effective_alpha =
+      d["fast_slow_effective_alpha"].cast<float>();
+  ev.fast_slow_reason = d["fast_slow_reason"].cast<uint32_t>();
   copy_tensor_wire_slice_array(d["slices"], ev.slices,
                                TEACHER_RESULT_SLICES, "slices");
   return ev;
@@ -1350,6 +1360,14 @@ pybind11::dict teacher_result_to_dict(const TeacherResult& ev) {
   d["target_token_count"] = pybind11::int_(ev.target_token_count);
   d["hidden_dim"] = pybind11::int_(ev.hidden_dim);
   d["plasticity_dim"] = pybind11::int_(ev.plasticity_dim);
+  d["fast_slow_mode"] = pybind11::int_(ev.fast_slow_mode);
+  d["fast_slow_accepted"] = pybind11::int_(ev.fast_slow_accepted);
+  d["fast_slow_step"] = pybind11::int_(ev.fast_slow_step);
+  d["fast_slow_alpha"] = pybind11::float_(ev.fast_slow_alpha);
+  d["fast_slow_gate"] = pybind11::float_(ev.fast_slow_gate);
+  d["fast_slow_effective_alpha"] =
+      pybind11::float_(ev.fast_slow_effective_alpha);
+  d["fast_slow_reason"] = pybind11::int_(ev.fast_slow_reason);
   d["slices"] = tensor_wire_slice_array_to_list(
       ev.slices, TEACHER_RESULT_SLICES);
   return d;
@@ -2282,7 +2300,53 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
                  static_cast<const char*>(self.ptr()) + offset, length);
            },
            pybind11::arg("offset"), pybind11::arg("length"),
-           "Test-only: read `length` bytes from the region at offset.");
+           "Test-only: read `length` bytes from the region at offset.")
+      .def("write_tensor",
+           [](PosixShm& self, std::size_t offset, const at::Tensor& tensor) {
+             TORCH_CHECK(!tensor.is_cuda(), "PosixShm.write_tensor requires a CPU tensor");
+             TORCH_CHECK(tensor.is_contiguous(), "PosixShm.write_tensor requires a contiguous tensor");
+             const auto nbytes = static_cast<std::size_t>(
+                 tensor.numel() * tensor.element_size());
+             TORCH_CHECK(
+                 offset <= self.size() && nbytes <= self.size() - offset,
+                 "PosixShm.write_tensor: offset(",
+                 offset,
+                 ") + nbytes(",
+                 nbytes,
+                 ") > size(",
+                 self.size(),
+                 ")");
+             pybind11::gil_scoped_release release;
+             std::memcpy(
+                 static_cast<char*>(self.ptr()) + offset,
+                 tensor.data_ptr(),
+                 nbytes);
+           },
+           pybind11::arg("offset"), pybind11::arg("tensor"),
+           "Copy a contiguous CPU tensor into the region at byte offset.")
+      .def("read_tensor_into",
+           [](const PosixShm& self, std::size_t offset, at::Tensor& tensor) {
+             TORCH_CHECK(!tensor.is_cuda(), "PosixShm.read_tensor_into requires a CPU tensor");
+             TORCH_CHECK(tensor.is_contiguous(), "PosixShm.read_tensor_into requires a contiguous tensor");
+             const auto nbytes = static_cast<std::size_t>(
+                 tensor.numel() * tensor.element_size());
+             TORCH_CHECK(
+                 offset <= self.size() && nbytes <= self.size() - offset,
+                 "PosixShm.read_tensor_into: offset(",
+                 offset,
+                 ") + nbytes(",
+                 nbytes,
+                 ") > size(",
+                 self.size(),
+                 ")");
+             pybind11::gil_scoped_release release;
+             std::memcpy(
+                 tensor.data_ptr(),
+                 static_cast<const char*>(self.ptr()) + offset,
+                 nbytes);
+           },
+           pybind11::arg("offset"), pybind11::arg("tensor"),
+           "Copy bytes from the region into an existing contiguous CPU tensor.");
 
   // Phase A4 binding — see tests/test_shm_ring.py. Move-only class
   // (owns a PosixShm) so we expose factory methods via def_static and

@@ -580,9 +580,7 @@ def test_crct_mailbox_transport_matches_stored_batch(tmp_path) -> None:
     targets = ((base + 1) % 32).to(dtype=torch.long)
 
     assert rank0.begin_step(inputs=inputs, targets=targets, step=0) is None
-    assert rank0._request_write_thread is not None
-    rank0._request_write_thread.join(timeout=5.0)
-    assert not rank0._request_write_thread.is_alive()
+    assert rank0._request_write_thread is None
     assert rank3.begin_step(inputs=inputs, targets=targets, step=0) is None
     rank3.after_optimizer_step(
         model=model,
@@ -598,9 +596,7 @@ def test_crct_mailbox_transport_matches_stored_batch(tmp_path) -> None:
     )
 
     ready = rank0.begin_step(inputs=inputs + 3, targets=targets + 3, step=1)
-    assert rank0._request_write_thread is not None
-    rank0._request_write_thread.join(timeout=5.0)
-    assert not rank0._request_write_thread.is_alive()
+    assert rank0._request_write_thread is None
     assert ready is not None
     payload, train_inputs, train_targets = ready
     assert int(payload["step_id"].item()) == 0
@@ -609,7 +605,7 @@ def test_crct_mailbox_transport_matches_stored_batch(tmp_path) -> None:
     assert torch.isfinite(payload["loss_weight"]).all()
     diag0 = rank0.diagnostics()
     diag3 = rank3.diagnostics()
-    assert diag0["mode"] == "async_rank0_memory_mailbox"
+    assert diag0["mode"] == "async_rank0_memory_shm"
     assert diag0["payloads_used"] == 1
     assert diag0["request_stage_started"] == 2
     assert diag0["request_writer_cpu_copy_seconds_max"] >= 0.0
@@ -699,14 +695,6 @@ def test_crct_mailbox_aliases_memory_gate_to_target_for_compact_packet(tmp_path)
         },
     )
 
-    payload_cpu = torch.load(
-        tmp_path / "result_000000000000.pt",
-        map_location="cpu",
-        weights_only=True,
-    )
-    assert payload_cpu["memory_gate_alias_target"] is True
-    assert "memory_gate" not in payload_cpu
-
     ready = rank0._poll_results(current_step=1)
     assert ready is not None
     payload, _inputs, _targets = ready
@@ -783,6 +771,7 @@ def test_crct_mailbox_rejects_sequence_memory_packet(tmp_path) -> None:
         "max_payload_lag_steps": 8,
         "score_interval_steps": 1,
     }
+    rank0 = mod._CrctMailboxTeacherTransport(rank=0, **kwargs)
     rank3 = mod._CrctMailboxTeacherTransport(rank=3, **kwargs)
 
     with pytest.raises(ValueError, match="compact"):
@@ -813,6 +802,7 @@ def test_crct_mailbox_defers_low_priority_maintenance_for_packet_work(tmp_path) 
         "max_payload_lag_steps": 8,
         "score_interval_steps": 1,
     }
+    rank0 = mod._CrctMailboxTeacherTransport(rank=0, **kwargs)
     rank3 = mod._CrctMailboxTeacherTransport(rank=3, **kwargs)
 
     assert rank3.should_defer_low_priority_maintenance() is False
@@ -821,9 +811,10 @@ def test_crct_mailbox_defers_low_priority_maintenance_for_packet_work(tmp_path) 
     )
     assert rank3.should_defer_low_priority_maintenance() is True
     rank3.pending_input_requests.clear()
-    torch.save(
-        {"step": 8, "full_ids": torch.zeros((2, 6), dtype=torch.int32)},
-        tmp_path / "request_000000000008.pt",
+    rank0.begin_step(
+        inputs=torch.zeros((2, 5), dtype=torch.int32),
+        targets=torch.ones((2, 5), dtype=torch.long),
+        step=8,
     )
     assert rank3.should_defer_low_priority_maintenance() is True
 
@@ -1032,8 +1023,8 @@ def test_crct_mailbox_weight_snapshot_drops_when_writer_busy(tmp_path) -> None:
     assert diag["weight_snapshot_published"] == 0
 
 
-def test_crct_mailbox_request_drops_when_writer_busy(tmp_path) -> None:
-    mod = _load_module("runner_fast_path_crct_mailbox_request_busy", RUNNER_PATH)
+def test_crct_mailbox_request_ignores_stale_writer_thread_state(tmp_path) -> None:
+    mod = _load_module("runner_fast_path_crct_mailbox_request_no_busy_gate", RUNNER_PATH)
     rank0 = mod._CrctMailboxTeacherTransport(
         rank=0,
         world_size=4,
@@ -1066,8 +1057,9 @@ def test_crct_mailbox_request_drops_when_writer_busy(tmp_path) -> None:
     rank0._request_write_thread.join(timeout=1.0)
 
     diag = rank0.diagnostics()
-    assert diag["request_write_skipped_busy"] == 1
-    assert diag["requests_started"] == 0
+    assert diag["request_write_skipped_busy"] == 0
+    assert diag["requests_started"] == 1
+    assert diag["teacher_shm_request_events_pushed"] == 1
 
 
 def test_fastslow_readiness_oracle_scores_against_slow_mirror_without_mutating_fast_model() -> None:

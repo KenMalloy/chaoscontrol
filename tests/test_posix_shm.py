@@ -11,6 +11,8 @@ from __future__ import annotations
 import os
 import time
 
+import torch
+
 from chaoscontrol.kernels import _cpu_ssm_controller as _ext
 
 
@@ -40,6 +42,22 @@ def test_posix_shm_single_process_round_trip():
         shm.write_bytes(0, b"hello shm world")
         got = shm.read_bytes(0, 15)
         assert got == b"hello shm world", f"round-trip mismatch: got {got!r}"
+    finally:
+        _ext.PosixShm.unlink(SHM_NAME)
+
+
+def test_posix_shm_tensor_copy_round_trip():
+    """Tensor copy APIs move contiguous CPU tensor bytes directly through
+    shm. This is the path teacher payload transport uses to avoid
+    torch.save/torch.load pickle overhead."""
+    _force_unlink(SHM_NAME)
+    shm = _ext.PosixShm(SHM_NAME, 4096, True)
+    try:
+        src = torch.arange(12, dtype=torch.float32).reshape(3, 4).contiguous()
+        dst = torch.empty_like(src)
+        shm.write_tensor(128, src)
+        shm.read_tensor_into(128, dst)
+        torch.testing.assert_close(dst, src)
     finally:
         _ext.PosixShm.unlink(SHM_NAME)
 
