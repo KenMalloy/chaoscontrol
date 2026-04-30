@@ -105,6 +105,24 @@ class TestFusedBlockForwardParity(unittest.TestCase):
                 f"(B={B},T={T},D={D},M={M}) forward drift: {max_diff:.2e}"
             )
 
+    def test_from_unfused_preserves_low_rank_delta_shape(self) -> None:
+        from chaoscontrol.core import LowRankDeltaProjection
+        from chaoscontrol.core_fused import FusedChaosSSMBlock
+        from chaoscontrol.model import ChaosSSMBlock
+
+        torch.manual_seed(17)
+        block = ChaosSSMBlock(
+            dim=24, ff_mult=2, a_mode="diag", ssm_delta_rank=4
+        )
+        fused = FusedChaosSSMBlock.from_unfused(block)
+        assert isinstance(fused.core.delta_proj, LowRankDeltaProjection)
+        assert fused.core.delta_rank == 4
+
+        x = torch.randn(2, 9, 24)
+        y_base = block(x)
+        y_fused = fused(x)
+        assert torch.allclose(y_base, y_fused, atol=1e-6, rtol=1e-6)
+
 
 class TestFusedBlockGradientParity(unittest.TestCase):
     """Backward-pass parity between ChaosSSMBlock and FusedChaosSSMBlock.

@@ -259,6 +259,38 @@ def test_build_optimizer_crct_uses_role_dispatch_for_muon():
     assert diagnostics["excluded_params"]["bucket_prototypes"] == 1
 
 
+def test_build_optimizer_crct_keeps_low_rank_delta_on_adamw_path():
+    mod = _load_runner_module()
+    from chaoscontrol.model import ChaosStudentLM
+
+    model = ChaosStudentLM(
+        vocab_size=16,
+        dim=8,
+        num_layers=1,
+        ff_mult=2,
+        a_mode="diag",
+        ssm_delta_rank=2,
+        outer_model_dim=4,
+        outer_model_type="multislot",
+        buffer_mode="append_only",
+    )
+    optimizer = mod._build_optimizer(
+        {
+            "optimizer": "muon",
+            "base_lr": 0.05,
+            "weight_decay": 0.02,
+            "crct_enabled": True,
+        },
+        model,
+    )
+
+    names = optimizer._param_name_by_id.values()
+    assert "layers.0.core.delta_proj.down.weight" in names
+    assert "layers.0.core.delta_proj.up.weight" in names
+    assert "layers.0.core.delta_proj.down.weight" not in optimizer._matrix_param_names
+    assert "layers.0.core.delta_proj.up.weight" not in optimizer._matrix_param_names
+
+
 def test_build_optimizer_ssm_three_group_splits_by_role():
     """``optimizer_param_grouping='ssm_three_group'`` produces three
     param groups (dynamics / no_decay / main) with distinct lr+wd

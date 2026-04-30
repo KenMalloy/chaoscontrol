@@ -35,6 +35,7 @@ class ChaosSSMBlock(nn.Module):
         a_mode: str = "diag",
         a_full_rank: int = 8,
         a_full_gamma: float = 0.05,
+        ssm_delta_rank: int = 0,
         rich_b_mode: str = "none",
         rich_b_bottleneck: int = 32,
         rich_b_num_subnets: int = 4,
@@ -44,7 +45,13 @@ class ChaosSSMBlock(nn.Module):
         self.input_norm = RMSNorm(dim)
         self.ff_norm = RMSNorm(dim)
         self.ff = FeedForward(dim, ff_mult)
-        self.core = ChaosSSMCore(dim, a_mode=a_mode, a_full_rank=a_full_rank, a_full_gamma=a_full_gamma)
+        self.core = ChaosSSMCore(
+            dim,
+            a_mode=a_mode,
+            a_full_rank=a_full_rank,
+            a_full_gamma=a_full_gamma,
+            delta_rank=ssm_delta_rank,
+        )
 
         if rich_b_mode == "none":
             self.rich_b: nn.Module | None = None
@@ -149,6 +156,7 @@ class ChaosSSMHybridBlock(nn.Module):
         a_mode: str = "diag",
         a_full_rank: int = 8,
         a_full_gamma: float = 0.05,
+        ssm_delta_rank: int = 0,
         local_attn_window: int = 64,
         local_attn_heads: int = 1,
         local_attn_dim: int = 64,
@@ -161,7 +169,7 @@ class ChaosSSMHybridBlock(nn.Module):
         self.ff = FeedForward(dim, ff_mult)
         self.core = ChaosSSMCore(
             dim, a_mode=a_mode, a_full_rank=a_full_rank,
-            a_full_gamma=a_full_gamma,
+            a_full_gamma=a_full_gamma, delta_rank=ssm_delta_rank,
         )
         self.rich_b = None  # compatibility with ChaosSSMBlock
 
@@ -578,6 +586,7 @@ class ChaosStudentLM(nn.Module):
         a_mode: str = "diag",
         a_full_rank: int = 8,
         a_full_gamma: float = 0.05,
+        ssm_delta_rank: int = 0,
         rich_b_mode: str = "none",
         rich_b_bottleneck: int = 32,
         rich_b_num_subnets: int = 4,
@@ -683,6 +692,7 @@ class ChaosStudentLM(nn.Module):
                 a_mode=a_mode,
                 a_full_rank=a_full_rank,
                 a_full_gamma=a_full_gamma,
+                ssm_delta_rank=ssm_delta_rank,
                 rich_b_mode=rich_b_mode,
                 rich_b_bottleneck=rich_b_bottleneck,
                 rich_b_num_subnets=rich_b_num_subnets,
@@ -698,6 +708,7 @@ class ChaosStudentLM(nn.Module):
                     a_mode=a_mode,
                     a_full_rank=a_full_rank,
                     a_full_gamma=a_full_gamma,
+                    ssm_delta_rank=ssm_delta_rank,
                     local_attn_window=local_attn_window,
                     local_attn_heads=local_attn_heads,
                     local_attn_dim=local_attn_dim,

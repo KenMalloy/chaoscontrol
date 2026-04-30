@@ -35,6 +35,7 @@ VALIDATION_ARMS: tuple[str, ...] = (
 )
 
 EXP26_MODEL_DIM = 384
+EXP26_DELTA_RANK = 32
 
 
 def _named_entry(
@@ -67,7 +68,7 @@ def _artifact_size_lock() -> dict[str, Any]:
     -> 16.73 MB; dim=512 -> 20.16 MB. 384 is the largest comfortable lock
     with enough room for trained-weight entropy and artifact metadata drift.
     """
-    return {"model_dim": EXP26_MODEL_DIM}
+    return {"model_dim": EXP26_MODEL_DIM, "ssm_delta_rank": EXP26_DELTA_RANK}
 
 
 def _fast_slow_lock() -> dict[str, Any]:

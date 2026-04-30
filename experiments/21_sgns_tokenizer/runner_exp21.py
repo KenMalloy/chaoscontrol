@@ -90,6 +90,7 @@ def _ssm_constructor_kwargs(config: dict[str, Any]) -> dict[str, Any]:
         a_mode=config.get("a_mode", "diag"),
         a_full_rank=int(config.get("a_full_rank", 8)),
         a_full_gamma=float(config.get("a_full_gamma", 0.05)),
+        ssm_delta_rank=int(config.get("ssm_delta_rank", 0)),
         outer_model_dim=(
             int(config.get("outer_model_dim", 64)) if crct_enabled else 0
         ),

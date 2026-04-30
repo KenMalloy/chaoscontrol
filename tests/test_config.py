@@ -5,6 +5,7 @@ from chaoscontrol.config import ChaosControlConfig
 def test_defaults():
     cfg = ChaosControlConfig(data_path="/tmp/data")
     assert cfg.a_mode == "diag"
+    assert cfg.ssm_delta_rank == 0
     assert cfg.rich_b_mode == "none"
     assert cfg.outer_model_dim == 0
     assert cfg.model_type == "ssm"

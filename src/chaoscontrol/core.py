@@ -335,6 +335,28 @@ class FeedForward(nn.Module):
         return self.proj(F.silu(self.fc(x)))
 
 
+class LowRankDeltaProjection(nn.Module):
+    """Low-rank timescale projection for the stripped CARE trunk.
+
+    The module deliberately stays behind the public ``delta_proj`` name so
+    callers still have a single timescale surface.  Internally it computes
+    ``up(down(x))`` with no bias, reducing the D×D delta projection to
+    D×r + r×D while keeping delta separate from the content gates.
+    """
+
+    def __init__(self, dim: int, rank: int) -> None:
+        super().__init__()
+        if rank <= 0:
+            raise ValueError(f"rank must be positive, got {rank}")
+        self.dim = int(dim)
+        self.rank = int(rank)
+        self.down = nn.Linear(dim, rank, bias=False)
+        self.up = nn.Linear(rank, dim, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.up(self.down(x))
+
+
 class ChaosSSMCore(nn.Module):
     """SSM recurrence with three A parameterizations: diag, paired, full."""
 
@@ -345,11 +367,14 @@ class ChaosSSMCore(nn.Module):
         a_mode: str = "diag",
         a_full_rank: int = 8,
         a_full_gamma: float = 0.05,
+        delta_rank: int = 0,
     ) -> None:
         super().__init__()
         self.dim = dim
         self.a_mode = a_mode
         self.a_full_rank = a_full_rank
+        self.delta_rank = int(delta_rank)
+        self._packed_content_projection_enabled = True
         # Private. Flip only via capture_states(); non-diag modes have no
         # write sites for _captured_states, so direct mutation silently no-ops.
         self._capture_states_enabled = False
@@ -362,7 +387,11 @@ class ChaosSSMCore(nn.Module):
         self.out_proj = nn.Linear(dim, dim, bias=False)
 
         if a_mode == "diag":
-            self.delta_proj = nn.Linear(dim, dim, bias=False)
+            if 0 < self.delta_rank < dim:
+                self.delta_proj = LowRankDeltaProjection(dim, self.delta_rank)
+            else:
+                self.delta_rank = 0
+                self.delta_proj = nn.Linear(dim, dim, bias=False)
             self.log_a = nn.Parameter(torch.zeros((dim,), dtype=torch.float32))
 
         elif a_mode == "paired":
@@ -391,6 +420,54 @@ class ChaosSSMCore(nn.Module):
 
         else:
             raise ValueError(f"unsupported a_mode: {a_mode}")
+
+    @staticmethod
+    def _module_has_runtime_hooks(module: nn.Module) -> bool:
+        return bool(
+            getattr(module, "_forward_pre_hooks", None)
+            or getattr(module, "_forward_hooks", None)
+            or getattr(module, "_backward_pre_hooks", None)
+            or getattr(module, "_backward_hooks", None)
+        )
+
+    def _can_use_packed_content_projection(self) -> bool:
+        if not self._packed_content_projection_enabled:
+            return False
+        # ScOpt / TTT attach hooks to the named projection modules.  If a hook
+        # is present, call the modules directly so the instrumentation sees
+        # exactly the same activations as before this fast path existed.
+        return not any(
+            self._module_has_runtime_hooks(module)
+            for module in (self.select_proj, self.in_proj, self.gate_proj)
+        )
+
+    def _content_terms(
+        self,
+        x: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Compute select/candidate/gate with one packed projection when safe."""
+        if self._can_use_packed_content_projection():
+            packed_weight = torch.cat(
+                (
+                    self.select_proj.weight,
+                    self.in_proj.weight,
+                    self.gate_proj.weight,
+                ),
+                dim=0,
+            )
+            select_raw, candidate_raw, gate_raw = F.linear(x, packed_weight).split(
+                self.dim,
+                dim=-1,
+            )
+        else:
+            select_raw = self.select_proj(x)
+            candidate_raw = self.in_proj(x)
+            gate_raw = self.gate_proj(x)
+        return (
+            torch.sigmoid(select_raw),
+            torch.tanh(candidate_raw),
+            torch.sigmoid(gate_raw),
+        )
 
     def _build_skew_symmetric(self) -> torch.Tensor:
         """Build a dim x dim skew-symmetric matrix from upper-triangle params."""
@@ -421,10 +498,8 @@ class ChaosSSMCore(nn.Module):
         a_base = torch.sigmoid(self.log_a).to(dtype=x.dtype)[None, None, :]
         delta = F.softplus(self.delta_proj(x)).clamp_min(1e-4)
         decay = torch.exp(-delta * a_base)
-        select = torch.sigmoid(self.select_proj(x))
-        candidate = torch.tanh(self.in_proj(x))
+        select, candidate, gate = self._content_terms(x)
         update = select * candidate
-        gate = torch.sigmoid(self.gate_proj(x))
         return decay, update, gate
 
     @contextmanager

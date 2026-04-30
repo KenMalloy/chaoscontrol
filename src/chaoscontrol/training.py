@@ -985,6 +985,7 @@ def run_chaoscontrol_matrix(
             a_mode=cell["a_mode"],
             a_full_rank=cfg.a_full_rank,
             a_full_gamma=cfg.a_full_gamma,
+            ssm_delta_rank=cfg.ssm_delta_rank,
             rich_b_mode=cell["rich_b_mode"],
             rich_b_bottleneck=cfg.rich_b_bottleneck,
             rich_b_num_subnets=cfg.rich_b_num_subnets,

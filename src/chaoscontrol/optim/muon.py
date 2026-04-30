@@ -52,6 +52,10 @@ def newton_schulz_orthogonalize(grad: Tensor, steps: int = 5, eps: float = 1e-7,
 
 def _default_is_matrix(param: Tensor, name: str | None) -> bool:  # noqa: ARG001
     """Default classifier: treat exactly-2D tensors as matrix params."""
+    if name and (
+        name.endswith(".delta_proj.weight") or ".delta_proj." in name
+    ):
+        return False
     return param.ndim == 2
 
 
@@ -326,9 +330,12 @@ class Muon(torch.optim.Optimizer):
                 ".select_proj.weight",
                 ".gate_proj.weight",
                 ".delta_proj.weight",
+                ".delta_proj.up.weight",
             )
         ) and int(p.shape[0]) == d:
             return m.view(d, 1)
+        if name.endswith(".delta_proj.down.weight") and int(p.shape[1]) == d:
+            return m.view(1, d)
         if name.endswith(".out_proj.weight") and int(p.shape[1]) == d:
             return m.view(1, d)
         return None

@@ -6,7 +6,7 @@ import unittest
 
 import torch
 
-from chaoscontrol.core import ChaosSSMCore, RMSNorm, criticality_loss
+from chaoscontrol.core import ChaosSSMCore, LowRankDeltaProjection, RMSNorm, criticality_loss
 
 
 def test_rms_norm_module_keeps_legacy_pytorch_math() -> None:
@@ -62,6 +62,55 @@ class TestChaosSSMCore(unittest.TestCase):
         y_ref = torch.stack(outputs, dim=1)
 
         assert torch.allclose(y_scan, y_ref, atol=1e-5), f"max diff: {(y_scan - y_ref).abs().max()}"
+
+    def test_packed_content_projection_respects_projection_hooks(self) -> None:
+        """Instrumentation hooks must see real projection calls.
+
+        ScOpt/TTT attach hooks to the named projection modules.  The packed
+        content fast path is allowed only when those modules are unobserved.
+        """
+        core = ChaosSSMCore(dim=16, a_mode="diag")
+        x = torch.randn(2, 5, 16)
+        calls: list[torch.Tensor] = []
+
+        handle = core.select_proj.register_forward_hook(
+            lambda _module, _inputs, output: calls.append(output.detach())
+        )
+        try:
+            y = core(x)
+        finally:
+            handle.remove()
+
+        assert y.shape == (2, 5, 16)
+        assert len(calls) == 1
+        assert calls[0].shape == (2, 5, 16)
+
+    def test_low_rank_delta_projection_matches_equivalent_full_delta(self) -> None:
+        """Low-rank delta is just a factored timescale projection."""
+        torch.manual_seed(11)
+        low = ChaosSSMCore(dim=12, a_mode="diag", delta_rank=3)
+        full = ChaosSSMCore(dim=12, a_mode="diag")
+        assert isinstance(low.delta_proj, LowRankDeltaProjection)
+        assert low.delta_rank == 3
+
+        with torch.no_grad():
+            full.log_a.copy_(low.log_a)
+            full.select_proj.weight.copy_(low.select_proj.weight)
+            full.in_proj.weight.copy_(low.in_proj.weight)
+            full.gate_proj.weight.copy_(low.gate_proj.weight)
+            full.out_proj.weight.copy_(low.out_proj.weight)
+            full.delta_proj.weight.copy_(
+                low.delta_proj.up.weight @ low.delta_proj.down.weight
+            )
+
+        x = torch.randn(3, 7, 12)
+        y_low = low(x)
+        y_full = full(x)
+        assert torch.allclose(y_low, y_full, atol=1e-5, rtol=1e-5)
+
+        y_low.square().mean().backward()
+        assert low.delta_proj.down.weight.grad is not None
+        assert low.delta_proj.up.weight.grad is not None
 
     def test_paired_output_shape(self) -> None:
         core = ChaosSSMCore(dim=16, a_mode="paired")

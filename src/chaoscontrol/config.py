@@ -26,6 +26,7 @@ class ChaosControlConfig:
     a_mode: str = "diag"  # "diag", "paired", "full"
     a_full_rank: int = 8
     a_full_gamma: float = 0.05
+    ssm_delta_rank: int = 0  # 0 = full-rank delta_proj; >0 = low-rank diag delta
 
     rich_b_mode: str = "none"  # "none", "nn", "hub", "assembly", "hybrid"
     rich_b_bottleneck: int = 32

@@ -61,6 +61,7 @@ def build_model(cfg: ChaosControlConfig, device: torch.device, param_dtype: torc
             num_layers=cfg.num_layers, ff_mult=cfg.ff_mult,
             a_mode=cfg.a_mode, a_full_rank=cfg.a_full_rank,
             a_full_gamma=cfg.a_full_gamma,
+            ssm_delta_rank=cfg.ssm_delta_rank,
             rich_b_mode=cfg.rich_b_mode, rich_b_bottleneck=cfg.rich_b_bottleneck,
             rich_b_num_subnets=cfg.rich_b_num_subnets,
             rich_b_settling_steps=cfg.rich_b_settling_steps,

@@ -285,6 +285,7 @@ class FusedChaosSSMBlock(nn.Module):
         a_mode: str = "diag",
         a_full_rank: int = 8,
         a_full_gamma: float = 0.05,
+        ssm_delta_rank: int = 0,
     ) -> None:
         super().__init__()
         # Names match ChaosSSMBlock so from_unfused() can copy weights
@@ -293,7 +294,11 @@ class FusedChaosSSMBlock(nn.Module):
         self.ff_norm = RMSNorm(dim)
         self.ff = FeedForward(dim, ff_mult)
         self.core = ChaosSSMCore(
-            dim, a_mode=a_mode, a_full_rank=a_full_rank, a_full_gamma=a_full_gamma
+            dim,
+            a_mode=a_mode,
+            a_full_rank=a_full_rank,
+            a_full_gamma=a_full_gamma,
+            delta_rank=ssm_delta_rank,
         )
         self.rich_b: nn.Module | None = None  # Only "none" supported in fused path
         self._a_mode = a_mode
@@ -322,7 +327,12 @@ class FusedChaosSSMBlock(nn.Module):
             )
         dim = core.dim
         ff_mult = block.ff.fc.out_features // dim
-        fused = cls(dim, ff_mult, a_mode="diag")
+        fused = cls(
+            dim,
+            ff_mult,
+            a_mode="diag",
+            ssm_delta_rank=int(getattr(core, "delta_rank", 0)),
+        )
         # Match source block dtype before copying weights, otherwise
         # load_state_dict would stuff bf16 values into float32 params.
         src_dtype = block.ff.fc.weight.dtype

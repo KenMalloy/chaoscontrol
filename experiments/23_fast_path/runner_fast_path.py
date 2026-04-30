@@ -462,6 +462,7 @@ def _build_optimizer(
                 if param.requires_grad
                 and param.ndim >= 2
                 and not param_name.startswith(adamw_prefixes)
+                and ".delta_proj." not in param_name
                 and not param_name.endswith(".delta_proj.weight")
             }
         opt = Muon(

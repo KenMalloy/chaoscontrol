@@ -48,6 +48,7 @@ def test_validation_matrix_is_fixed_two_cell_canary():
     assert {entry["seed"] for entry in entries} == {42}
     assert {entry["budget_seconds"] for entry in entries} == {45.0}
     assert {entry["model_dim"] for entry in entries} == {384}
+    assert {entry["ssm_delta_rank"] for entry in entries} == {32}
 
 
 def test_validation_control_has_no_memory_sidecar():
