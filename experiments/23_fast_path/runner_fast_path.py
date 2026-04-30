@@ -10308,9 +10308,13 @@ def train_fast_for_budget(
                 pump_work_done = _pump_crct_memory_rank(steps)
                 replay_t0 = time.perf_counter()
                 if replay_eviction_loop is not None:
-                    _crct_replay_cache_probe(replay_eviction_loop, model, steps)
+                    probe_fresh = _crct_replay_cache_probe(
+                        replay_eviction_loop,
+                        model,
+                        steps,
+                    )
                     defer_low_priority = False
-                    if crct_teacher_transport is not None:
+                    if probe_fresh and crct_teacher_transport is not None:
                         should_defer = getattr(
                             crct_teacher_transport,
                             "should_defer_low_priority_maintenance",
@@ -10318,7 +10322,11 @@ def train_fast_for_budget(
                         )
                         if callable(should_defer):
                             defer_low_priority = bool(should_defer())
-                    if replay_eviction_loop.has_probe() and not defer_low_priority:
+                    if (
+                        probe_fresh
+                        and replay_eviction_loop.has_probe()
+                        and not defer_low_priority
+                    ):
                         replay_step = _crct_replay_tick_step(
                             replay_eviction_loop,
                             model,
@@ -10630,11 +10638,15 @@ def train_fast_for_budget(
                             )
                         )
                         > weight_before
-                    )
+                )
                 if replay_eviction_loop is not None:
-                    _crct_replay_cache_probe(replay_eviction_loop, model, steps)
+                    probe_fresh = _crct_replay_cache_probe(
+                        replay_eviction_loop,
+                        model,
+                        steps,
+                    )
                     defer_low_priority = False
-                    if crct_teacher_transport is not None:
+                    if probe_fresh and crct_teacher_transport is not None:
                         should_defer = getattr(
                             crct_teacher_transport,
                             "should_defer_low_priority_maintenance",
@@ -10642,7 +10654,11 @@ def train_fast_for_budget(
                         )
                         if callable(should_defer):
                             defer_low_priority = bool(should_defer())
-                    if replay_eviction_loop.has_probe() and not defer_low_priority:
+                    if (
+                        probe_fresh
+                        and replay_eviction_loop.has_probe()
+                        and not defer_low_priority
+                    ):
                         replay_step = _crct_replay_tick_step(
                             replay_eviction_loop,
                             model,
@@ -11092,9 +11108,13 @@ def train_fast_for_budget(
             # score batches are ingested as probe frames; ticks consume
             # bounded slot-work chunks from the rolling frame stream.
             if replay_eviction_loop is not None and rank_ == world_size_ - 1:
-                _crct_replay_cache_probe(replay_eviction_loop, model, steps)
+                probe_fresh = _crct_replay_cache_probe(
+                    replay_eviction_loop,
+                    model,
+                    steps,
+                )
                 defer_low_priority = False
-                if crct_teacher_transport is not None:
+                if probe_fresh and crct_teacher_transport is not None:
                     should_defer = getattr(
                         crct_teacher_transport,
                         "should_defer_low_priority_maintenance",
@@ -11102,7 +11122,11 @@ def train_fast_for_budget(
                     )
                     if callable(should_defer):
                         defer_low_priority = bool(should_defer())
-                if replay_eviction_loop.has_probe() and not defer_low_priority:
+                if (
+                    probe_fresh
+                    and replay_eviction_loop.has_probe()
+                    and not defer_low_priority
+                ):
                     replay_step = _crct_replay_tick_step(
                         replay_eviction_loop,
                         model,
