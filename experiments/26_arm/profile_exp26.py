@@ -60,6 +60,33 @@ def _health_from_result(result: dict[str, Any]) -> dict[str, Any]:
         "payloads_scored": int(health.get("payloads_scored", 0) or 0),
         "payload_lag_steps_max": int(health.get("payload_lag_steps_max", 0) or 0),
         "score_seconds_max": float(health.get("score_seconds_max", 0.0) or 0.0),
+        "score_stage_timing_enabled": bool(health.get("score_stage_timing_enabled", False)),
+        "score_stage_samples": int(health.get("score_stage_samples", 0) or 0),
+        "score_stage_encode_seconds_sum": float(
+            health.get("score_stage_encode_off_seconds_sum", 0.0) or 0.0
+        )
+        + float(health.get("score_stage_encode_force_on_seconds_sum", 0.0) or 0.0),
+        "score_stage_encode_seconds_max": float(
+            health.get("score_stage_encode_off_seconds_max", 0.0) or 0.0
+        )
+        + float(health.get("score_stage_encode_force_on_seconds_max", 0.0) or 0.0),
+        "score_stage_nll_seconds_sum": float(
+            health.get("score_stage_nll_off_seconds_sum", 0.0) or 0.0
+        )
+        + float(health.get("score_stage_nll_mem_seconds_sum", 0.0) or 0.0),
+        "score_stage_nll_seconds_max": float(
+            health.get("score_stage_nll_off_seconds_max", 0.0) or 0.0
+        )
+        + float(health.get("score_stage_nll_mem_seconds_max", 0.0) or 0.0),
+        "score_stage_plasticity_seconds_sum": float(
+            health.get("score_stage_plasticity_seconds_sum", 0.0) or 0.0
+        ),
+        "score_stage_append_memory_seconds_sum": float(
+            health.get("score_stage_append_memory_seconds_sum", 0.0) or 0.0
+        ),
+        "score_stage_peak_allocated_mb_max": float(
+            health.get("score_stage_peak_allocated_mb_max", 0.0) or 0.0
+        ),
         "weight_snapshot_published": int(health.get("weight_snapshot_published", 0) or 0),
         "weight_snapshot_applied": int(health.get("weight_snapshot_applied", 0) or 0),
         "weight_snapshot_latest_overwrites": int(health.get("weight_snapshot_latest_overwrites", 0) or 0),
@@ -126,6 +153,24 @@ def _print_profile_summary(summary: dict[str, Any]) -> None:
             f"gpu3={row['maintenance_gpu3_starvation_reason']} "
             f"plasticity={row['plasticity_packets_received']}"
         )
+        if row.get("score_stage_timing_enabled"):
+            stage_sum = max(
+                float(row.get("score_stage_encode_seconds_sum", 0.0))
+                + float(row.get("score_stage_nll_seconds_sum", 0.0))
+                + float(row.get("score_stage_plasticity_seconds_sum", 0.0))
+                + float(row.get("score_stage_append_memory_seconds_sum", 0.0)),
+                1e-9,
+            )
+            print(
+                "    "
+                f"gpu3_stage_samples={row['score_stage_samples']} "
+                f"encode_sum={row['score_stage_encode_seconds_sum']:.3f}s "
+                f"nll_sum={row['score_stage_nll_seconds_sum']:.3f}s "
+                f"plasticity_sum={row['score_stage_plasticity_seconds_sum']:.3f}s "
+                f"append_sum={row['score_stage_append_memory_seconds_sum']:.3f}s "
+                f"encode_share={row['score_stage_encode_seconds_sum'] / stage_sum:.2%} "
+                f"peak_mb={row['score_stage_peak_allocated_mb_max']:.0f}"
+            )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -144,6 +189,11 @@ def main(argv: list[str] | None = None) -> int:
         help="Run both cells, only the control, or only the ARM active cell.",
     )
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument(
+        "--score-stage-timing",
+        action="store_true",
+        help="Enable rank-3 CUDA-event stage timing for short profile runs.",
+    )
     args = parser.parse_args(argv)
 
     speed_config = read_speed_config(args.config)
@@ -157,6 +207,10 @@ def main(argv: list[str] | None = None) -> int:
         entries = entries[:1]
     elif args.arm == "adaptive":
         entries = entries[1:]
+    if args.score_stage_timing:
+        for entry in entries:
+            if bool(entry.get("crct_enabled", False)):
+                entry["crct_score_stage_timing_enabled"] = True
 
     args.results_dir.mkdir(parents=True, exist_ok=True)
     write_matrix(args.results_dir / "matrix.json", entries)

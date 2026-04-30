@@ -244,6 +244,77 @@ class TestPlasticityBudgetFromHiddenDelta:
         assert torch.equal(out["plasticity_confidence"], torch.zeros(4))
         assert torch.equal(out["plasticity_budget"], torch.zeros(4))
 
+    def test_matches_centered_reference_implementation(self) -> None:
+        # The matmul-reduction form must agree with the centered
+        # ``E[(X-xm)(Y-ym)]`` reference within fp32 round-off across a
+        # range of batch shapes, partial masks, and dtypes — that's the
+        # promise the rank-3 path relies on when shipping the budget to
+        # the trunk plasticity gate.
+        torch.manual_seed(123)
+        cases = [
+            (1, 4, 3, torch.float32),
+            (2, 8, 5, torch.float32),
+            (3, 16, 7, torch.float32),
+            (2, 12, 4, torch.bfloat16),
+        ]
+        for B, T, D, dtype in cases:
+            h_off = torch.randn(B, T, D, dtype=dtype)
+            h_mem = h_off + 0.05 * torch.randn(B, T, D, dtype=dtype)
+            utility = torch.randn(B, T)
+            mask = torch.zeros(B, T, dtype=torch.bool)
+            mask[:, : max(1, T // 2)] = True
+
+            actual = plasticity_budget_from_hidden_delta(
+                h_off=h_off,
+                h_mem=h_mem,
+                utility=utility,
+                mask=mask,
+                tau=0.1,
+            )
+
+            x = (h_mem.float() - h_off.float()).abs()
+            y = torch.relu(utility.float()) * mask.float()
+            w = mask.float()
+            n = w.sum().clamp_min(1.0)
+            d = D
+            w3 = w.unsqueeze(-1)
+            x_mean = (x * w3).sum(dim=(0, 1)) / n
+            y_mean = y.sum() / n
+            dx = (x - x_mean.view(1, 1, d)) * w3
+            dy = (y - y_mean).unsqueeze(-1) * w3
+            cov = (dx * dy).sum(dim=(0, 1)) / n
+            x_var = (
+                ((x - x_mean.view(1, 1, d)).square() * w3).sum(dim=(0, 1)) / n
+            )
+            y_var = ((y - y_mean).square() * w).sum() / n
+            ref_coverage = cov / torch.sqrt(
+                (x_var * y_var).clamp_min(1e-6)
+            )
+            ref_coverage = ref_coverage.clamp(min=-1.0, max=1.0)
+            ref_energy = torch.sqrt((y.square() * w).sum() / n)
+            ref_conf_scalar = torch.tanh(ref_energy / 0.1)
+            ref_confidence = (ref_coverage.abs() * ref_conf_scalar).clamp(0.0, 1.0)
+            ref_budget = torch.relu(ref_coverage) * ref_confidence
+
+            torch.testing.assert_close(
+                actual["plasticity_coverage"],
+                ref_coverage,
+                rtol=1e-4,
+                atol=1e-5,
+            )
+            torch.testing.assert_close(
+                actual["plasticity_confidence"],
+                ref_confidence,
+                rtol=1e-4,
+                atol=1e-5,
+            )
+            torch.testing.assert_close(
+                actual["plasticity_budget"],
+                ref_budget,
+                rtol=1e-4,
+                atol=1e-5,
+            )
+
 
 # ---------------------------------------------------------------------------
 # positive_only_lm_weight
@@ -422,6 +493,36 @@ class TestChunkedNllFromHidden:
         assert torch.allclose(out, ref, atol=1e-6), (
             "chunk_size budget clamp must not change the per-token NLL output"
         )
+
+    def test_chunk_budget_bytes_override_does_not_change_result(self) -> None:
+        # GPU3 maintenance/oracle callers raise the per-chunk logits budget
+        # to amortise launch overhead at large gathered batch sizes. The
+        # override must be a launch-count knob only — the per-token NLL is
+        # still bit-stable (within the same chunk decomposition the global
+        # default would produce when both fit one chunk).
+        torch.manual_seed(13)
+        model = self._build_model(dim=4, vocab=8)
+        batch, seq = 3, 17
+        hidden = torch.randn(batch, seq, 4)
+        targets = torch.randint(0, 8, (batch, seq))
+        ref = chunked_nll_from_hidden(model, hidden, targets, chunk_size=1)
+        out = chunked_nll_from_hidden(
+            model,
+            hidden,
+            targets,
+            chunk_size=10_000,
+            chunk_budget_bytes=8 << 30,
+        )
+        assert torch.allclose(out, ref, atol=1e-6)
+
+    def test_chunk_budget_bytes_must_be_positive(self) -> None:
+        model = self._build_model(dim=4, vocab=8)
+        hidden = torch.randn(2, 5, 4)
+        targets = torch.randint(0, 8, (2, 5))
+        with pytest.raises(ValueError, match="chunk_budget_bytes"):
+            chunked_nll_from_hidden(
+                model, hidden, targets, chunk_budget_bytes=0
+            )
 
     def test_casts_hidden_to_lm_head_dtype(self) -> None:
         # Rank-3 maintenance probes may produce fp32 hidden variants even
@@ -800,6 +901,43 @@ class TestRank3ScoreBatchCausal:
         event_ids = model.append_calls[0]["event_ids"]
         assert event_ids is not None
         assert event_ids.tolist() == list(range(10, 20))
+
+    def test_record_stage_seconds_populates_named_stages(self) -> None:
+        # Opt-in stage timer fills a caller-provided dict; if omitted, the
+        # call has no host-side sync overhead. We can only smoke-check
+        # presence and non-negativity from a CPU mock — the CUDA-event
+        # contract is exercised on the GPU3 hot path itself.
+        model, cache, ids, mask = self._setup(batch=2, seq=6)
+        record: dict[str, float] = {}
+        rank3_score_batch_causal(
+            model=model,
+            cache=cache,
+            input_ids=ids,
+            valid_mask=mask,
+            record_stage_seconds=record,
+        )
+        for stage in (
+            "encode_off",
+            "encode_force_on",
+            "nll_off",
+            "nll_mem",
+            "plasticity",
+        ):
+            assert stage in record, f"stage {stage} missing from record"
+            assert record[stage] >= 0.0
+
+    def test_record_stage_seconds_default_is_no_op(self) -> None:
+        # Without the dict, no aggregation runs and the result still has the
+        # documented top-level keys. Verifies the timing path doesn't leak
+        # into the canonical output schema.
+        model, cache, ids, mask = self._setup()
+        out = rank3_score_batch_causal(
+            model=model,
+            cache=cache,
+            input_ids=ids,
+            valid_mask=mask,
+        )
+        assert "_stage_seconds" not in out
 
     def test_gradient_conflict_guardrail_can_skip_memory_write(self) -> None:
         model, cache, ids, mask = self._setup(batch=1, seq=5)

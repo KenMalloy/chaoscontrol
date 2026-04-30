@@ -26,7 +26,7 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 
-from .cache_utility import chunked_nll_from_hidden
+from .cache_utility import _RANK3_NLL_CHUNK_BUDGET_BYTES, chunked_nll_from_hidden
 from .kernels import _cpu_ssm_controller as _ext
 from .slot_table import SlotTable, SlotRecord, SlotId
 from .slot_table import SLOT_WARMING, SLOT_ACTIVE
@@ -326,7 +326,9 @@ def counterfactual_probe(
 
         h_flat = h_variants.reshape(C * B, T, D).float()
         y_flat = y.unsqueeze(0).expand(C, -1, -1).reshape(C * B, -1)
-        nll_chunk = chunked_nll_from_hidden(model, h_flat, y_flat)
+        nll_chunk = chunked_nll_from_hidden(
+            model, h_flat, y_flat, chunk_budget_bytes=_RANK3_NLL_CHUNK_BUDGET_BYTES
+        )
         nll_shaped = nll_chunk.reshape(C, B, T)
         nll_all[start:end] = nll_shaped
 
@@ -410,7 +412,9 @@ def oracle_confirm_slots(
                 cache_read_cutoff=cache_read_cutoff,
                 memory_slot_mask=slot_masks_exp,
             )
-        return chunked_nll_from_hidden(model, hidden, y_exp).reshape(variants, B, T)
+        return chunked_nll_from_hidden(
+            model, hidden, y_exp, chunk_budget_bytes=_RANK3_NLL_CHUNK_BUDGET_BYTES
+        ).reshape(variants, B, T)
 
     base_masks = torch.ones(2, n_slots, device=dev, dtype=torch.bool)
     base_masks[1, :] = False
@@ -506,7 +510,9 @@ def oracle_confirm_refresh_candidates(
     )
 
     def _score_hidden(hidden: torch.Tensor, targets: torch.Tensor, variants: int) -> torch.Tensor:
-        return chunked_nll_from_hidden(model, hidden, targets).reshape(variants, B, T)
+        return chunked_nll_from_hidden(
+            model, hidden, targets, chunk_budget_bytes=_RANK3_NLL_CHUNK_BUDGET_BYTES
+        ).reshape(variants, B, T)
 
     off_mask = torch.zeros(1, n_slots, device=dev, dtype=torch.bool)
     off_mask_exp = off_mask.expand(B, n_slots)

@@ -36,6 +36,9 @@ def _default_calc_type_hyperparams() -> dict[str, dict[str, Any]]:
             "horizon_shifts": [-0.5, 0.0, 0.5],
             "online_eta": 1.0,
             "decay": 1.0,
+            "online_episodic_chunk_tokens": 256,
+            "online_episodic_write_tokens_per_chunk": 16,
+            "online_episodic_gate": 1.0,
         },
         "carry_state": {"decay": 1.0},
         "dreamworld_eval": {

@@ -36,7 +36,11 @@ def main() -> None:
 
     files = sorted(
         s.rfilename
-        for s in HfApi().repo_info(REPO_ID, repo_type="dataset").siblings
+        for s in HfApi().repo_info(
+            REPO_ID,
+            repo_type="dataset",
+            revision=REVISION,
+        ).siblings
     )
     wanted = [
         f

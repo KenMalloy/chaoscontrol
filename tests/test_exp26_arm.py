@@ -5,6 +5,8 @@ import importlib.util
 import sys
 from pathlib import Path
 
+import pytest
+
 
 REPO = Path(__file__).resolve().parents[1]
 EXP24 = REPO / "experiments" / "24_training_time_bundle"
@@ -143,6 +145,7 @@ def test_profile_launcher_can_dry_run_single_arm(tmp_path):
             "--dry-run",
             "--arm",
             "adaptive",
+            "--score-stage-timing",
             "--budget",
             "3",
             "--results-dir",
@@ -154,6 +157,7 @@ def test_profile_launcher_can_dry_run_single_arm(tmp_path):
     matrix = (tmp_path / "matrix.json").read_text()
     assert "validation_adaptive_residual_memory" in matrix
     assert "validation_fastslow_control" not in matrix
+    assert "crct_score_stage_timing_enabled" in matrix
 
 
 def test_profile_summary_extracts_transport_and_maintenance_health(tmp_path):
@@ -172,13 +176,22 @@ def test_profile_summary_extracts_transport_and_maintenance_health(tmp_path):
     "optimizer": {"plasticity_budget": {"lr_multiplier_max": 1.25}},
     "mechanisms": {
       "crct": {
-        "teacher_fail_open": 1,
-        "transport_summary": {
-          "health": {
-            "payloads_used": 2,
-            "payloads_scored": 3,
-            "weight_snapshot_published": 4,
-            "weight_snapshot_applied": 5,
+	        "teacher_fail_open": 1,
+	        "transport_summary": {
+	          "health": {
+	            "payloads_used": 2,
+	            "payloads_scored": 3,
+	            "score_stage_timing_enabled": true,
+	            "score_stage_samples": 2,
+	            "score_stage_encode_off_seconds_sum": 0.5,
+	            "score_stage_encode_force_on_seconds_sum": 0.7,
+	            "score_stage_nll_off_seconds_sum": 0.2,
+	            "score_stage_nll_mem_seconds_sum": 0.3,
+	            "score_stage_plasticity_seconds_sum": 0.1,
+	            "score_stage_append_memory_seconds_sum": 0.05,
+	            "score_stage_peak_allocated_mb_max": 1234.0,
+	            "weight_snapshot_published": 4,
+	            "weight_snapshot_applied": 5,
             "weight_snapshot_shm_writes": 6,
             "weight_snapshot_shm_reads": 7,
             "plasticity_packets_received": 8
@@ -205,6 +218,11 @@ def test_profile_summary_extracts_transport_and_maintenance_health(tmp_path):
     assert row["weight_snapshot_shm_writes"] == 6
     assert row["weight_snapshot_shm_reads"] == 7
     assert row["plasticity_packets_received"] == 8
+    assert row["score_stage_timing_enabled"] is True
+    assert row["score_stage_samples"] == 2
+    assert row["score_stage_encode_seconds_sum"] == pytest.approx(1.2)
+    assert row["score_stage_nll_seconds_sum"] == pytest.approx(0.5)
+    assert row["score_stage_peak_allocated_mb_max"] == pytest.approx(1234.0)
     assert row["request_ring_full_drops"] == 9
     assert row["result_ring_full_drops"] == 10
     assert row["maintenance_jobs_pushed"] == 11

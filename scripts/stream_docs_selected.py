@@ -24,7 +24,7 @@ import requests
 
 DEFAULT_REPO = "willdepueoai/parameter-golf"
 DEFAULT_PATH = "datasets/docs_selected.jsonl"
-DEFAULT_REVISION = "main"
+DEFAULT_REVISION = "9bb295ddab0e05d785b879661af7260fed5140fc"
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_OUT = REPO_ROOT / "baselines/parameter_golf/datasets/docs_selected.jsonl"
 

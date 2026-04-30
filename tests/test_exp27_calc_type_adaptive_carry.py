@@ -55,6 +55,8 @@ class PacketTinyModel(nn.Module):
         memory_mode: str = "packet",
         initial_states: list[torch.Tensor] | None = None,
         return_final_states: bool = False,
+        episodic_residual: torch.Tensor | None = None,
+        episodic_gate: torch.Tensor | None = None,
     ):
         self.memory_modes.append(memory_mode)
         if initial_states is None:
@@ -62,6 +64,14 @@ class PacketTinyModel(nn.Module):
         else:
             self.init_states_log.append([s.detach().clone() for s in initial_states])
         x = self.embed(input_ids)
+        if episodic_residual is not None:
+            residual = episodic_residual.to(device=x.device, dtype=x.dtype)
+            if residual.dim() == 2:
+                residual = residual.unsqueeze(1)
+            gate = episodic_gate.to(device=x.device, dtype=x.dtype)
+            if gate.dim() == 1:
+                gate = gate[:, None]
+            x = x + residual * gate.unsqueeze(-1)
         if initial_states is None:
             state = torch.zeros(input_ids.size(0), DIM, device=x.device, dtype=x.dtype)
         else:
@@ -78,6 +88,48 @@ class PacketTinyModel(nn.Module):
 
     def forward(self, *_args, **_kwargs):  # pragma: no cover - failure path
         raise AssertionError("adaptive_carry must not call model.forward()")
+
+
+class TraceOuterModel:
+    def __init__(self, events: list[tuple[str, object]], dim: int) -> None:
+        self.events = events
+        self.dim = dim
+        self._slots: list[torch.Tensor] = []
+
+    def read(
+        self,
+        batch_size: int,
+        *,
+        cue: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        self.events.append(("read", len(self._slots)))
+        scale = 0.25 * max(1, len(self._slots))
+        return torch.full((batch_size, self.dim), scale)
+
+
+class EpisodicPacketTinyModel(PacketTinyModel):
+    def __init__(self, *, seed: int = 0) -> None:
+        super().__init__(seed=seed)
+        self.events: list[tuple[str, object]] = []
+        self.packet_flags: list[bool] = []
+        self.outer_model = TraceOuterModel(self.events, DIM)
+
+    def encode(self, input_ids: torch.Tensor, **kwargs):
+        has_packet = kwargs.get("episodic_residual") is not None
+        self.packet_flags.append(bool(has_packet))
+        self.events.append(("encode", bool(has_packet)))
+        return super().encode(input_ids, **kwargs)
+
+    def append_memory_from_hidden(
+        self,
+        hidden: torch.Tensor,
+        *,
+        score: torch.Tensor | None = None,
+        max_tokens: int | None = None,
+    ) -> bool:
+        self.events.append(("append", int(hidden.shape[1])))
+        self.outer_model._slots.append(hidden.detach().mean(dim=1))
+        return True
 
 
 def make_val_cache(
@@ -175,3 +227,40 @@ def test_adaptive_carry_rejects_bad_online_weight_count(tmp_path):
 
     with pytest.raises(ValueError, match="online_initial_weights length"):
         adaptive_carry(ctx)
+
+
+def test_adaptive_carry_online_episodic_eval_is_prequential(tmp_path):
+    """Episodic eval reads only cache entries committed by earlier chunks.
+
+    First chunk has no packet. After its loss is counted, adaptive_carry
+    appends hidden evidence. Later chunks can then read that cache and pass an
+    episodic packet into ``encode(memory_mode="packet")``.
+    """
+    model = EpisodicPacketTinyModel(seed=7)
+    cache = make_val_cache(tmp_path, doc_lens=[10])
+    ctx = make_ctx(
+        model,
+        cache,
+        config={
+            "horizon_shifts": [0.0],
+            "online_episodic_chunk_tokens": 3,
+            "online_episodic_write_tokens_per_chunk": 2,
+            "online_episodic_gate": 1.0,
+        },
+    )
+
+    result = adaptive_carry(ctx)
+
+    assert result.tokens_scored == 9
+    assert result.extra["online_episodic_writes"] > 0
+    assert result.extra["online_episodic_reads"] > 0
+    assert model.packet_flags[0] is False
+    assert any(model.packet_flags[1:])
+
+    first_append = next(
+        idx for idx, event in enumerate(model.events) if event[0] == "append"
+    )
+    first_read = next(
+        idx for idx, event in enumerate(model.events) if event[0] == "read"
+    )
+    assert first_append < first_read

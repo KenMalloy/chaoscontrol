@@ -19,6 +19,7 @@ from __future__ import annotations
 import contextlib
 import json
 import math
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -83,7 +84,14 @@ def positive_only_lm_weight(
 # ---------------------------------------------------------------------------
 
 
-_NLL_CHUNK_BUDGET_BYTES = 1 << 30  # 1 GiB peak per-chunk logits
+_NLL_CHUNK_BUDGET_BYTES = 1 << 30  # 1 GiB peak per-chunk logits — GPU0-2 default.
+
+# Rank-3 maintenance/oracle paths run on a GPU that does not carry the trunk
+# optimizer state, so a larger logits buffer is safely affordable. The 2 GiB
+# budget keeps launch overhead manageable at the gathered B≈3072, V=16384 scale
+# while leaving plenty of headroom on H100/A100 ranks; callers on those paths
+# pass it explicitly via ``chunk_budget_bytes``.
+_RANK3_NLL_CHUNK_BUDGET_BYTES = 2 << 30
 
 
 @torch.inference_mode()
@@ -93,6 +101,7 @@ def chunked_nll_from_hidden(
     targets: torch.Tensor,
     *,
     chunk_size: int = 1024,
+    chunk_budget_bytes: int | None = None,
 ) -> torch.Tensor:
     """Per-token negative log-likelihood ``(B, T)`` from encoder hidden
     states, computed in time-axis chunks to bound peak memory.
@@ -103,11 +112,14 @@ def chunked_nll_from_hidden(
     rank-3 scoring needs the per-position signal so it can compute
     utility deltas pointwise.
 
-    ``chunk_size`` is clamped against ``_NLL_CHUNK_BUDGET_BYTES`` so the
-    per-chunk allocation ``batch * chunk_size * vocab * 4`` (fp32 logits)
-    stays bounded regardless of the value a caller passes; otherwise an
-    over-large ``chunk_size`` (or one that exceeds ``seq`` and skips
-    chunking entirely) materialises the full logits tensor in one shot.
+    ``chunk_size`` is clamped against ``chunk_budget_bytes`` (default
+    ``_NLL_CHUNK_BUDGET_BYTES``) so the per-chunk allocation
+    ``batch * chunk_size * vocab * 4`` (fp32 logits) stays bounded
+    regardless of the value a caller passes; otherwise an over-large
+    ``chunk_size`` (or one that exceeds ``seq`` and skips chunking
+    entirely) materialises the full logits tensor in one shot. Rank-3
+    callers raise the budget to amortise per-chunk launch overhead at
+    large gathered batch sizes; GPU0-2 keeps the conservative default.
     """
     if chunk_size <= 0:
         raise ValueError(
@@ -118,9 +130,18 @@ def chunked_nll_from_hidden(
     lm_head = model.lm_head
     vocab = lm_head.out_features
 
+    budget_bytes = (
+        int(chunk_budget_bytes)
+        if chunk_budget_bytes is not None
+        else _NLL_CHUNK_BUDGET_BYTES
+    )
+    if budget_bytes <= 0:
+        raise ValueError(
+            f"chunked_nll_from_hidden: chunk_budget_bytes must be positive, got {budget_bytes}"
+        )
     budget_chunk = max(
         1,
-        _NLL_CHUNK_BUDGET_BYTES // max(1, int(batch) * int(vocab) * 4),
+        budget_bytes // max(1, int(batch) * int(vocab) * 4),
     )
     effective_chunk = min(int(chunk_size), int(budget_chunk))
 
@@ -722,27 +743,58 @@ def plasticity_budget_from_hidden_delta(
             f"hidden={tuple(h_off.shape)}"
         )
 
-    x = (h_mem.detach().float() - h_off.detach().float()).abs()
-    y = torch.relu(utility.detach().float()) * mask.detach().float()
+    # Mask is 0/1 so ``w == w**2``; multiplying ``x`` by ``w`` once gives a
+    # masked-residual tensor we can reuse for every weighted reduction below.
+    # That keeps peak fp32 memory at one (B, T, D) buffer instead of the
+    # 4-5 large intermediates the centered formulation needs. The fp32
+    # subtraction order matches the original implementation so cancellation
+    # in tightly coupled hidden states is not amplified.
     w = mask.detach().float()
     n = w.sum().clamp_min(1.0)
-    d = int(h_off.shape[-1])
+    y = torch.relu(utility.detach().float()) * w  # (B, T) — already mask-zeroed.
 
-    w3 = w.unsqueeze(-1)
-    x_mean = (x * w3).sum(dim=(0, 1)) / n
-    y_mean = y.sum() / n
-    dx = (x - x_mean.view(1, 1, d)) * w3
-    dy = (y - y_mean).unsqueeze(-1) * w3
-    cov = (dx * dy).sum(dim=(0, 1)) / n
-    x_var = ((x - x_mean.view(1, 1, d)).square() * w3).sum(dim=(0, 1)) / n
-    y_var = ((y - y_mean).square() * w).sum() / n
+    x_w = (h_mem.detach().float() - h_off.detach().float()).abs_()
+    x_w.mul_(w.unsqueeze(-1))
+
+    # Flattened views for matmul/reduction ops; no extra (B, T, D) allocs.
+    x_w_flat = x_w.flatten(0, 1)  # (N, D), view
+    y_flat = y.flatten()  # (N,)
+    d = int(h_off.shape[-1])
+    n_total = int(x_w_flat.shape[0])
+
+    x_sum = x_w_flat.sum(dim=0)  # (D,)
+    xy_sum = torch.mv(x_w_flat.t(), y_flat)  # (D,)
+
+    # ``xx_sum[d] = sum_n x_w[n, d]^2``. Done in N-axis chunks so the
+    # transient ``x_w[chunk] ** 2`` buffer is bounded (~100 MiB at the
+    # default 65 536-row chunk and D ≤ 4096) instead of the 4-5 GiB the
+    # elementwise (x.square() * w3) reduction would peak at on the
+    # gathered rank-3 batch. Same O(D·N) FLOPs as the original.
+    xx_sum = torch.zeros(d, device=x_w_flat.device, dtype=x_w_flat.dtype)
+    chunk = 65_536
+    for start in range(0, n_total, chunk):
+        end = min(n_total, start + chunk)
+        x_chunk = x_w_flat[start:end]  # view
+        xx_sum.add_(x_chunk.square().sum(dim=0))
+
+    y_sum = y.sum()  # already mask-zeroed.
+    yy_sum = (y_flat * y_flat).sum()  # cheap, (N,) ops.
+
+    x_mean = x_sum / n
+    y_mean = y_sum / n
+    cov = xy_sum / n - x_mean * y_mean
+    # Naive form ``E[X^2] - E[X]^2`` can dip slightly negative under
+    # rounding; clamp before sqrt.
+    x_var = (xx_sum / n - x_mean.square()).clamp_min(0.0)
+    y_var = (yy_sum / n - y_mean.square()).clamp_min(0.0)
+
     coverage = cov / torch.sqrt((x_var * y_var).clamp_min(float(eps)))
     coverage = coverage.clamp(min=-1.0, max=1.0)
 
     # A high correlation on a batch with no useful memory signal should
     # not open the optimizer gate. The scalar energy term is shared across
     # channels; correlation quality stays per-channel.
-    utility_energy = torch.sqrt((y.square() * w).sum() / n)
+    utility_energy = torch.sqrt(yy_sum / n)
     utility_conf = torch.tanh(utility_energy / max(float(tau), float(eps)))
     confidence = coverage.abs() * utility_conf
     confidence = confidence.clamp(min=0.0, max=1.0)
@@ -770,6 +822,7 @@ def rank3_score_batch_causal(
     memory_write_tokens: int | None = None,
     gradient_conflict_monitor: CrctGradientConflictMonitor | None = None,
     step: int | None = None,
+    record_stage_seconds: dict[str, float] | None = None,
 ) -> dict[str, torch.Tensor]:
     """Score a batch by comparing memory-on vs memory-off NLL.
 
@@ -787,17 +840,43 @@ def rank3_score_batch_causal(
       controller loss can de-emphasise ambiguous tokens.
     * ``loss_weight``: ``(B, T-1)`` mean-1 LM-loss reweighting that
       never goes below 1.0 in the raw form.
+
+    ``record_stage_seconds``, if provided, is populated with per-stage
+    elapsed seconds (``encode_off``, ``encode_force_on``, ``nll_off``,
+    ``nll_mem``, ``plasticity``, ``append_memory``). Timing uses CUDA
+    events on GPU paths so only one synchronize fires at the end of the
+    call — no per-stage stalls when the dict is omitted.
     """
     txn = cache.begin_batch()
     x = input_ids[:, :-1]
     y = input_ids[:, 1:]
     mask = valid_mask[:, 1:].bool()
 
+    use_cuda_timing = (
+        record_stage_seconds is not None
+        and input_ids.device.type == "cuda"
+        and torch.cuda.is_available()
+    )
+    use_cpu_timing = record_stage_seconds is not None and not use_cuda_timing
+    cuda_events: dict[str, torch.cuda.Event] = {}
+    cpu_marks: dict[str, float] = {}
+
+    def _mark(label: str) -> None:
+        if use_cuda_timing:
+            ev = torch.cuda.Event(enable_timing=True)
+            ev.record()
+            cuda_events[label] = ev
+        elif use_cpu_timing:
+            cpu_marks[label] = time.perf_counter()
+
+    _mark("start")
+
     memory_meta: dict[str, Any] | None = None
     with _autocast_for(input_ids.device.type):
         h_off = model.encode(
             x, memory_mode="off", cache_read_cutoff=txn.read_cutoff
         )
+        _mark("after_encode_off")
         try:
             h_mem_out = model.encode(
                 x,
@@ -816,9 +895,16 @@ def rank3_score_batch_causal(
                 memory_meta = meta
         else:
             h_mem = h_mem_out
+    _mark("after_encode_force_on")
 
-    nll_off = chunked_nll_from_hidden(model, h_off, y)
-    nll_mem = chunked_nll_from_hidden(model, h_mem, y)
+    nll_off = chunked_nll_from_hidden(
+        model, h_off, y, chunk_budget_bytes=_RANK3_NLL_CHUNK_BUDGET_BYTES
+    )
+    _mark("after_nll_off")
+    nll_mem = chunked_nll_from_hidden(
+        model, h_mem, y, chunk_budget_bytes=_RANK3_NLL_CHUNK_BUDGET_BYTES
+    )
+    _mark("after_nll_mem")
 
     utility = (nll_off - nll_mem) * mask.float()
     plasticity = plasticity_budget_from_hidden_delta(
@@ -828,6 +914,7 @@ def rank3_score_batch_causal(
         mask=mask,
         tau=float(tau),
     )
+    _mark("after_plasticity")
 
     if scarcity_optimizer is None:
         net = utility.float()
@@ -892,6 +979,14 @@ def rank3_score_batch_causal(
             if gradient_conflict_monitor is not None:
                 out["gradient_conflict"] = torch.zeros_like(utility)
                 out["write_score"] = write_score.detach()
+            _mark("after_append")
+            _flush_stage_seconds(
+                record_stage_seconds,
+                use_cuda_timing=use_cuda_timing,
+                use_cpu_timing=use_cpu_timing,
+                cuda_events=cuda_events,
+                cpu_marks=cpu_marks,
+            )
             return out
         event_ids = None
         reserve_event_ids = getattr(cache, "reserve_event_ids", None)
@@ -912,6 +1007,7 @@ def rank3_score_batch_causal(
                 "requires append-only multislot memory; the teacher would "
                 "otherwise keep comparing against an empty memory path."
             )
+    _mark("after_append")
 
     cache.commit(txn)
     out = {
@@ -933,4 +1029,61 @@ def rank3_score_batch_causal(
         out["memory_residual"] = memory_residual
         out["memory_gate"] = controller_target.detach()
     out.update(plasticity)
+    _flush_stage_seconds(
+        record_stage_seconds,
+        use_cuda_timing=use_cuda_timing,
+        use_cpu_timing=use_cpu_timing,
+        cuda_events=cuda_events,
+        cpu_marks=cpu_marks,
+    )
     return out
+
+
+_STAGE_LABELS: tuple[tuple[str, str, str], ...] = (
+    ("encode_off", "start", "after_encode_off"),
+    ("encode_force_on", "after_encode_off", "after_encode_force_on"),
+    ("nll_off", "after_encode_force_on", "after_nll_off"),
+    ("nll_mem", "after_nll_off", "after_nll_mem"),
+    ("plasticity", "after_nll_mem", "after_plasticity"),
+    ("append_memory", "after_plasticity", "after_append"),
+)
+
+
+def _flush_stage_seconds(
+    record_stage_seconds: dict[str, float] | None,
+    *,
+    use_cuda_timing: bool,
+    use_cpu_timing: bool,
+    cuda_events: dict[str, "torch.cuda.Event"],
+    cpu_marks: dict[str, float],
+) -> None:
+    """Resolve recorded marks into per-stage seconds.
+
+    CUDA events are queued on the same stream as the work, so a single
+    ``synchronize()`` here is the only mid-call host stall — and it only
+    fires when the caller asked for timing.  CPU-side marks need no sync.
+    """
+    if record_stage_seconds is None:
+        return
+    if use_cuda_timing:
+        if cuda_events:
+            torch.cuda.synchronize()
+        for label, start_key, end_key in _STAGE_LABELS:
+            start_ev = cuda_events.get(start_key)
+            end_ev = cuda_events.get(end_key)
+            if start_ev is None or end_ev is None:
+                continue
+            record_stage_seconds[label] = (
+                record_stage_seconds.get(label, 0.0)
+                + float(start_ev.elapsed_time(end_ev)) * 1e-3
+            )
+        return
+    if use_cpu_timing:
+        for label, start_key, end_key in _STAGE_LABELS:
+            t0 = cpu_marks.get(start_key)
+            t1 = cpu_marks.get(end_key)
+            if t0 is None or t1 is None:
+                continue
+            record_stage_seconds[label] = (
+                record_stage_seconds.get(label, 0.0) + max(0.0, float(t1 - t0))
+            )

@@ -152,6 +152,9 @@ def test_matrix_entries_carry_default_calc_types_and_hyperparams(
         assert configs["adaptive_carry"]["decay"] == 1.0
         assert configs["adaptive_carry"]["horizon_shifts"] == [-0.5, 0.0, 0.5]
         assert configs["adaptive_carry"]["online_eta"] == 1.0
+        assert configs["adaptive_carry"]["online_episodic_chunk_tokens"] == 256
+        assert configs["adaptive_carry"]["online_episodic_write_tokens_per_chunk"] == 16
+        assert configs["adaptive_carry"]["online_episodic_gate"] == 1.0
         # Default checkpoint_path is None until the orchestrator sets it.
         assert entry["checkpoint_path"] is None
         # World size + budget land in the entry.

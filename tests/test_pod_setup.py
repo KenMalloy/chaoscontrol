@@ -95,13 +95,15 @@ class TestPodNativeExtensionBootstrap:
     def test_one_command_bootstrap_keeps_val_cache_optional(self) -> None:
         """Exp26 setup needs SP16384 shards, not the full scorer val cache.
         The HF-token-gated docs stream should only run when explicitly
-        requested.
+        requested. Exp27 calc_types do need that ValCache, so the enabled
+        branch must verify it against Natooka's prepared val shard.
         """
         source = POD_BOOTSTRAP.read_text()
         assert "CHAOSCONTROL_BUILD_VAL_CACHE=${CHAOSCONTROL_BUILD_VAL_CACHE:-0}" in source
         assert 'if [ "$CHAOSCONTROL_BUILD_VAL_CACHE" = "1" ]; then' in source
         assert "stream_docs_selected.py" in source
         assert "build_exp20_val_cache.py" in source
+        assert "verify_sp16384_eval_cache.py" in source
         assert "not required for Exp26" in source
 
     def test_native_extension_helper_pins_cuda_home_and_builds_all_required_extensions(

@@ -587,6 +587,7 @@ def test_crct_mailbox_transport_matches_stored_batch(tmp_path) -> None:
         "max_local_batches": 8,
         "max_payload_lag_steps": 8,
         "score_interval_steps": 1,
+        "score_stage_timing_enabled": True,
     }
     rank0 = mod._CrctMailboxTeacherTransport(rank=0, **kwargs)
     rank3 = mod._CrctMailboxTeacherTransport(rank=3, **kwargs)
@@ -627,6 +628,10 @@ def test_crct_mailbox_transport_matches_stored_batch(tmp_path) -> None:
     assert diag0["request_stage_started"] == 2
     assert diag0["request_writer_cpu_copy_seconds_max"] >= 0.0
     assert diag0["request_submit_seconds_max"] >= 0.0
+    assert diag3["score_stage_timing_enabled"] is True
+    assert diag3["score_stage_samples"] == 1
+    assert diag3["score_stage_encode_off_seconds_sum"] >= 0.0
+    assert diag3["score_stage_encode_force_on_seconds_sum"] >= 0.0
     assert diag0["request_host_stage_bytes"] == (
         inputs.shape[0] * (inputs.shape[1] + 1) * 4
     )

@@ -62,6 +62,7 @@ from chaoscontrol.core import verify_diag_recurrence  # noqa: E402
 from chaoscontrol.cache_utility import (  # noqa: E402
     CrctGradientConflictMonitor,
     ScarcityAwareMemoryOptimizer as CrctScarcityAwareMemoryOptimizer,
+    _RANK3_NLL_CHUNK_BUDGET_BYTES,
     alpha_ramp as crct_alpha_ramp,
     chunked_nll_from_hidden,
     rank3_score_batch_causal,
@@ -1109,10 +1110,12 @@ def _crct_score_payload_inline(
     memory_write_tokens: int,
     gradient_conflict_monitor: CrctGradientConflictMonitor | None = None,
     update_model_memory_after: bool = False,
+    record_stage_seconds: dict[str, float] | None = None,
 ) -> dict[str, torch.Tensor]:
     input_ids = _crct_full_input_ids(inputs, targets)
+    valid_mask = _crct_valid_mask(input_ids)
     setattr(model, "_last_crct_probe_input_ids", input_ids.detach())
-    setattr(model, "_last_crct_probe_valid_mask", _crct_valid_mask(input_ids).detach())
+    setattr(model, "_last_crct_probe_valid_mask", valid_mask.detach())
     setattr(model, "_last_crct_probe_step", int(step))
     alpha = crct_alpha_ramp(
         int(step),
@@ -1123,7 +1126,7 @@ def _crct_score_payload_inline(
         model=model,
         cache=cache,
         input_ids=input_ids,
-        valid_mask=_crct_valid_mask(input_ids),
+        valid_mask=valid_mask,
         scarcity_optimizer=scarcity_optimizer,
         tau=float(tau),
         strength=float(strength) * float(alpha),
@@ -1132,13 +1135,14 @@ def _crct_score_payload_inline(
         memory_write_tokens=int(memory_write_tokens),
         gradient_conflict_monitor=gradient_conflict_monitor,
         step=int(step),
+        record_stage_seconds=record_stage_seconds,
     )
     outer_cue = getattr(model, "_last_outer_cue", None)
     if outer_cue is not None:
         setattr(model, "_last_crct_probe_outer_cue", outer_cue.detach())
     if scarcity_optimizer is not None:
         target = score["controller_target"]
-        mask = _crct_valid_mask(input_ids)[:, 1:].to(device=target.device)
+        mask = valid_mask[:, 1:].to(device=target.device)
         actual_read_rate = (
             float(target[mask].mean().detach().item()) if bool(mask.any()) else 0.0
         )
@@ -1209,6 +1213,7 @@ def _score_fast_slow_readiness_inline(
             hidden,
             y,
             chunk_size=int(chunk_size),
+            chunk_budget_bytes=_RANK3_NLL_CHUNK_BUDGET_BYTES,
         )
 
     score_t0 = time.perf_counter()
@@ -2078,6 +2083,7 @@ class _CrctMailboxTeacherTransport:
         coordinator_rank: int = 0,
         plasticity_ema_beta: float = 0.95,
         hidden_dim: int | None = None,
+        score_stage_timing_enabled: bool = False,
     ) -> None:
         self.rank = int(rank)
         self.world_size = int(world_size)
@@ -2100,6 +2106,7 @@ class _CrctMailboxTeacherTransport:
         self.max_local_batches = self.max_local_batches_configured
         self.max_payload_lag_steps = self.max_payload_lag_steps_configured
         self.score_interval_steps = max(1, int(score_interval_steps))
+        self.score_stage_timing_enabled = bool(score_stage_timing_enabled)
         self.pending_input_requests: deque[dict[str, Any]] = deque()
         self.ready_results: deque[
             tuple[dict[str, torch.Tensor], torch.Tensor, torch.Tensor]
@@ -2208,6 +2215,21 @@ class _CrctMailboxTeacherTransport:
             "max_local_batches": int(self.max_local_batches),
             "max_payload_lag_steps": int(self.max_payload_lag_steps),
             "score_interval_steps": int(self.score_interval_steps),
+            "score_stage_timing_enabled": bool(self.score_stage_timing_enabled),
+            "score_stage_samples": 0,
+            "score_stage_encode_off_seconds_sum": 0.0,
+            "score_stage_encode_off_seconds_max": 0.0,
+            "score_stage_encode_force_on_seconds_sum": 0.0,
+            "score_stage_encode_force_on_seconds_max": 0.0,
+            "score_stage_nll_off_seconds_sum": 0.0,
+            "score_stage_nll_off_seconds_max": 0.0,
+            "score_stage_nll_mem_seconds_sum": 0.0,
+            "score_stage_nll_mem_seconds_max": 0.0,
+            "score_stage_plasticity_seconds_sum": 0.0,
+            "score_stage_plasticity_seconds_max": 0.0,
+            "score_stage_append_memory_seconds_sum": 0.0,
+            "score_stage_append_memory_seconds_max": 0.0,
+            "score_stage_peak_allocated_mb_max": 0.0,
             "requests_started": 0,
             "result_broadcasts_started": 0,
             "result_broadcasts_completed": 0,
@@ -2592,6 +2614,16 @@ class _CrctMailboxTeacherTransport:
         try:
             train_inputs = request_full_ids[:, :-1].to(dtype=torch.int32)
             train_targets = request_full_ids[:, 1:].to(dtype=torch.long)
+            stage_seconds: dict[str, float] | None = (
+                {} if bool(self.score_stage_timing_enabled) else None
+            )
+            peak_stage_mb = 0.0
+            if (
+                stage_seconds is not None
+                and self.device.type == "cuda"
+                and torch.cuda.is_available()
+            ):
+                torch.cuda.reset_peak_memory_stats(self.device)
             t0 = time.perf_counter()
             scored = _crct_score_payload_inline(
                 model=model,
@@ -2608,7 +2640,16 @@ class _CrctMailboxTeacherTransport:
                 memory_write_tokens=int(memory_write_tokens),
                 gradient_conflict_monitor=gradient_conflict_monitor,
                 update_model_memory_after=True,
+                record_stage_seconds=stage_seconds,
             )
+            if (
+                stage_seconds is not None
+                and self.device.type == "cuda"
+                and torch.cuda.is_available()
+            ):
+                peak_stage_mb = float(
+                    torch.cuda.max_memory_allocated(self.device) / (1 << 20)
+                )
             if fast_slow is not None and fast_slow.enabled:
                 self.metrics["fast_slow_readiness_skips_gpu3_mirror"] += 1
             score_s = time.perf_counter() - t0
@@ -2620,6 +2661,12 @@ class _CrctMailboxTeacherTransport:
             self.metrics["payloads_scored"] += 1
             self.metrics["memory_rank_pump_score_calls"] += 1
             self.metrics["last_scored_request_step"] = request_step
+            if stage_seconds is not None:
+                self._record_score_stage_seconds(
+                    request_step=request_step,
+                    stage_seconds=stage_seconds,
+                    peak_mb=peak_stage_mb,
+                )
             self._write_result(request_step=request_step, scored=scored)
         except Exception as exc:
             self.metrics["errors"] += 1
@@ -2627,6 +2674,44 @@ class _CrctMailboxTeacherTransport:
                 traceback.format_exception_only(type(exc), exc)
             ).strip()
             self.metrics["last_drop_reason"] = "score_exception"
+
+    def _record_score_stage_seconds(
+        self,
+        *,
+        request_step: int,
+        stage_seconds: dict[str, float],
+        peak_mb: float,
+    ) -> None:
+        self.metrics["score_stage_samples"] += 1
+        for label in (
+            "encode_off",
+            "encode_force_on",
+            "nll_off",
+            "nll_mem",
+            "plasticity",
+            "append_memory",
+        ):
+            value = float(stage_seconds.get(label, 0.0))
+            sum_key = f"score_stage_{label}_seconds_sum"
+            max_key = f"score_stage_{label}_seconds_max"
+            self.metrics[sum_key] += value
+            self.metrics[max_key] = max(float(self.metrics[max_key]), value)
+        self.metrics["score_stage_peak_allocated_mb_max"] = max(
+            float(self.metrics["score_stage_peak_allocated_mb_max"]),
+            float(peak_mb),
+        )
+        print(
+            "[gpu3-stage] "
+            f"step={int(request_step)} "
+            f"encode_off={stage_seconds.get('encode_off', 0.0) * 1000:.1f}ms "
+            f"encode_force_on={stage_seconds.get('encode_force_on', 0.0) * 1000:.1f}ms "
+            f"nll_off={stage_seconds.get('nll_off', 0.0) * 1000:.1f}ms "
+            f"nll_mem={stage_seconds.get('nll_mem', 0.0) * 1000:.1f}ms "
+            f"plasticity={stage_seconds.get('plasticity', 0.0) * 1000:.1f}ms "
+            f"append={stage_seconds.get('append_memory', 0.0) * 1000:.1f}ms "
+            f"peak_mb={float(peak_mb):.0f}",
+            flush=True,
+        )
 
     def diagnostics(self) -> dict[str, Any]:
         out = dict(self.metrics)
@@ -8971,6 +9056,7 @@ def train_fast_for_budget(
     crct_async_teacher_max_lag_steps: int = 128,
     crct_async_teacher_payload_dtype: str = "auto",
     crct_teacher_score_interval_steps: int = 1,
+    crct_score_stage_timing_enabled: bool = False,
     crct_teacher_param_sync_interval_steps: int | None = None,
     crct_gradient_conflict_enabled: bool = False,
     crct_gradient_conflict_ema_beta: float = 0.95,
@@ -10134,6 +10220,9 @@ def train_fast_for_budget(
                                     or getattr(model.lm_head, "in_features", 0)
                                     or 0
                                 ),
+                                score_stage_timing_enabled=bool(
+                                    crct_score_stage_timing_enabled
+                                ),
                             )
                         else:
                             crct_teacher_transport = _CrctAsyncTeacherTransport(
@@ -10972,6 +11061,49 @@ def train_fast_for_budget(
                 "payloads_scored": int(mem.get("payloads_scored", 0)),
                 "payload_lag_steps_max": int(coord.get("payload_lag_steps_max", 0)),
                 "score_seconds_max": float(mem.get("score_seconds_max", 0.0)),
+                "score_stage_timing_enabled": bool(
+                    mem.get("score_stage_timing_enabled", False)
+                ),
+                "score_stage_samples": int(mem.get("score_stage_samples", 0)),
+                "score_stage_encode_off_seconds_sum": float(
+                    mem.get("score_stage_encode_off_seconds_sum", 0.0)
+                ),
+                "score_stage_encode_off_seconds_max": float(
+                    mem.get("score_stage_encode_off_seconds_max", 0.0)
+                ),
+                "score_stage_encode_force_on_seconds_sum": float(
+                    mem.get("score_stage_encode_force_on_seconds_sum", 0.0)
+                ),
+                "score_stage_encode_force_on_seconds_max": float(
+                    mem.get("score_stage_encode_force_on_seconds_max", 0.0)
+                ),
+                "score_stage_nll_off_seconds_sum": float(
+                    mem.get("score_stage_nll_off_seconds_sum", 0.0)
+                ),
+                "score_stage_nll_off_seconds_max": float(
+                    mem.get("score_stage_nll_off_seconds_max", 0.0)
+                ),
+                "score_stage_nll_mem_seconds_sum": float(
+                    mem.get("score_stage_nll_mem_seconds_sum", 0.0)
+                ),
+                "score_stage_nll_mem_seconds_max": float(
+                    mem.get("score_stage_nll_mem_seconds_max", 0.0)
+                ),
+                "score_stage_plasticity_seconds_sum": float(
+                    mem.get("score_stage_plasticity_seconds_sum", 0.0)
+                ),
+                "score_stage_plasticity_seconds_max": float(
+                    mem.get("score_stage_plasticity_seconds_max", 0.0)
+                ),
+                "score_stage_append_memory_seconds_sum": float(
+                    mem.get("score_stage_append_memory_seconds_sum", 0.0)
+                ),
+                "score_stage_append_memory_seconds_max": float(
+                    mem.get("score_stage_append_memory_seconds_max", 0.0)
+                ),
+                "score_stage_peak_allocated_mb_max": float(
+                    mem.get("score_stage_peak_allocated_mb_max", 0.0)
+                ),
                 "memory_rank_pump_steps": int(
                     mem.get("memory_rank_pump_steps", 0)
                 ),
@@ -11576,6 +11708,9 @@ def _warmup(
         ),
         crct_teacher_score_interval_steps=int(
             config.get("crct_teacher_score_interval_steps", 1)
+        ),
+        crct_score_stage_timing_enabled=bool(
+            config.get("crct_score_stage_timing_enabled", False)
         ),
         crct_teacher_param_sync_interval_steps=(
             None

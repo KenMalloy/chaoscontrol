@@ -18,8 +18,10 @@
 #      required)
 #   3. Install huggingface-hub + requests in the venv
 #   4. Fetch SP16384 train+val shards + tokenizer (Natooka)
-#   5. Optionally stream first 50k docs and build the Exp20 scorer val cache
-#      (set CHAOSCONTROL_BUILD_VAL_CACHE=1; not required for Exp26)
+#   5. Optionally stream first 50k docs, build the scorer ValCache, and
+#      byte-compare it against Natooka's prepared SP16384 val shard
+#      (set CHAOSCONTROL_BUILD_VAL_CACHE=1; required for Exp27 calc_types,
+#      not required for Exp26)
 #   6. Smoke-import everything to confirm the pod is fire-ready
 #
 # Total wall on a fresh pod: ~15 min for Exp26 readiness (most of it
@@ -86,8 +88,11 @@ if [ "$CHAOSCONTROL_BUILD_VAL_CACHE" = "1" ]; then
             --cache-dir "$VAL_CACHE_DIR" \
             --max-docs 50000
     fi
+    python "$REPO_ROOT/scripts/verify_sp16384_eval_cache.py" \
+        --val-shard "$REPO_ROOT/baselines/parameter_golf/datasets/fineweb10B_sp16384/fineweb_val_000000.bin" \
+        --val-cache-dir "$VAL_CACHE_DIR"
 else
-    echo "    skipping; set CHAOSCONTROL_BUILD_VAL_CACHE=1 for full scorer cache setup"
+    echo "    skipping; set CHAOSCONTROL_BUILD_VAL_CACHE=1 for Exp27 scorer cache setup"
 fi
 
 echo ""

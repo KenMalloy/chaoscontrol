@@ -50,6 +50,13 @@ on the same packet-clean trunk lane as training and cannot silently use
 the legacy direct sidecar read path. The online head mixer is token-causal:
 token `t` is scored with weights learned from tokens `< t`.
 
+The episodic cache is also online in this same prequential sense. Each
+source-ordered chunk reads only packets produced from prior chunks/docs,
+scores its targets, then commits high-loss hidden evidence to the cache for
+later chunks. There is no warm pass over validation and no rescoring: the
+operation order is `cue-read -> score -> commit-write`, with the cue-read
+restricted to strict-prefix memory.
+
 `dreamworld_eval` rejects `per_doc_reset=False` until a separate
 continual variant is registered with `requires_source_order=True` —
 the default `per_doc_reset=True` is the only supported mode.
@@ -118,7 +125,10 @@ writes a manifest of default hyperparameters and records `source_trace
 
 - `score_only_reset`: `{}`
 - `adaptive_carry`: `{"horizon_shifts": [-0.5, 0.0, 0.5],
-  "online_eta": 1.0, "decay": 1.0}`
+  "online_eta": 1.0, "decay": 1.0,
+  "online_episodic_chunk_tokens": 256,
+  "online_episodic_write_tokens_per_chunk": 16,
+  "online_episodic_gate": 1.0}`
 - `carry_state`: `{"decay": 1.0}`
 - `dreamworld_eval`: `{"K": 8, "L": 64, "lr": 0.001, "steps": 1,
   "per_doc_reset": True, "dream_target_mode": "argmax",
