@@ -10046,6 +10046,112 @@ def train_fast_for_budget(
         config=_episodic_controller_config,
     )
 
+    def _ensure_crct_teacher_transport(
+        *,
+        full_ids_shape: tuple[int, ...],
+        payload_shape: tuple[int, ...],
+        payload_device: torch.device,
+    ) -> None:
+        nonlocal crct_teacher_transport
+        if crct_teacher_transport is not None:
+            return
+        if crct_teacher_transport_mode not in {
+            "async_rank0_memory_broadcast",
+            "async_rank0_memory_mailbox",
+        }:
+            return
+        payload_dtype = _resolve_crct_async_payload_dtype(
+            crct_async_teacher_payload_dtype,
+            device=payload_device,
+        )
+        if crct_teacher_transport_mode == "async_rank0_memory_mailbox":
+            mailbox_dir = str(crct_teacher_mailbox_dir or "").strip()
+            if not mailbox_dir:
+                raise ValueError(
+                    "CRCT mailbox transport requires "
+                    "crct_teacher_mailbox_dir to be set"
+                )
+            crct_teacher_transport = _CrctMailboxTeacherTransport(
+                rank=rank_,
+                world_size=world_size_,
+                mailbox_dir=mailbox_dir,
+                payload_shape=payload_shape,
+                full_ids_shape=full_ids_shape,
+                device=payload_device,
+                payload_dtype=payload_dtype,
+                max_local_batches=int(crct_async_teacher_pending_batches),
+                max_payload_lag_steps=int(crct_async_teacher_max_lag_steps),
+                score_interval_steps=int(crct_teacher_score_interval_steps),
+                plasticity_ema_beta=float(crct_ema_beta),
+                hidden_dim=int(
+                    getattr(model, "dim", 0)
+                    or getattr(model.lm_head, "in_features", 0)
+                    or 0
+                ),
+                score_stage_timing_enabled=bool(
+                    crct_score_stage_timing_enabled
+                ),
+            )
+            return
+        if teacher_group is None:
+            raise ValueError(
+                "CRCT async rank0-memory transport requires "
+                "teacher_group to be initialized"
+            )
+        crct_teacher_transport = _CrctAsyncTeacherTransport(
+            rank=rank_,
+            world_size=world_size_,
+            teacher_group=teacher_group,
+            payload_shape=payload_shape,
+            full_ids_shape=full_ids_shape,
+            device=payload_device,
+            payload_dtype=payload_dtype,
+            max_local_batches=int(crct_async_teacher_pending_batches),
+            max_payload_lag_steps=int(crct_async_teacher_max_lag_steps),
+            score_interval_steps=int(crct_teacher_score_interval_steps),
+        )
+
+    def _pump_crct_memory_rank(step: int) -> bool:
+        if crct_teacher_transport is None:
+            return False
+        assert crct_cache is not None
+        score_before = int(crct_teacher_transport.metrics.get("payloads_scored", 0))
+        weight_before = int(
+            crct_teacher_transport.metrics.get("weight_snapshot_applied", 0)
+        )
+        request_pops_before = int(
+            crct_teacher_transport.metrics.get("memory_rank_pump_request_pops", 0)
+        )
+        empty = torch.empty((0, 0), dtype=torch.int32, device=device)
+        crct_teacher_transport.begin_step(inputs=empty, targets=empty, step=int(step))
+        crct_teacher_transport.after_optimizer_step(
+            model=model,
+            cache=crct_cache,
+            scarcity_optimizer=crct_scarcity,
+            step=int(step),
+            total_steps=max_steps,
+            tau=float(crct_lm_weight_tau),
+            strength=float(crct_lm_weight_strength),
+            w_max=float(crct_lm_weight_w_max),
+            alpha_max=float(crct_lm_weight_alpha_max),
+            memory_write_tokens=int(crct_memory_write_tokens_per_step),
+            gradient_conflict_monitor=crct_gradient_conflict,
+            replay_eviction_loop=replay_eviction_loop,
+            fast_slow=None,
+            fast_slow_action_space=None,
+            fast_slow_nll_chunk_size=int(chunk_size),
+        )
+        request_pops_after = int(
+            crct_teacher_transport.metrics.get("memory_rank_pump_request_pops", 0)
+        )
+        return (
+            request_pops_after > request_pops_before
+            or int(crct_teacher_transport.metrics.get("payloads_scored", 0))
+            > score_before
+            or int(crct_teacher_transport.metrics.get("weight_snapshot_applied", 0))
+            > weight_before
+        )
+
     try:
         while True:
             # Resolve the previous loss decision at the step boundary so
@@ -10107,6 +10213,60 @@ def train_fast_for_budget(
                     group=stop_group_eff,
                 ):
                     break
+
+            if (
+                crct_enabled
+                and bool(is_episodic_rank)
+                and not bool(episodic_enabled)
+                and not bool(memory_rank_joins_grad)
+            ):
+                if crct_teacher_transport_mode in {
+                    "async_rank0_memory_broadcast",
+                    "async_rank0_memory_mailbox",
+                }:
+                    _ensure_crct_teacher_transport(
+                        full_ids_shape=(int(batch_size), int(seq_len) + 1),
+                        payload_shape=(1, int(batch_size), int(seq_len)),
+                        payload_device=device,
+                    )
+                    crct_teacher_requests += 1
+                pump_work_done = _pump_crct_memory_rank(steps)
+                if replay_eviction_loop is not None:
+                    _crct_replay_cache_probe(replay_eviction_loop, model, steps)
+                    defer_low_priority = False
+                    if crct_teacher_transport is not None:
+                        should_defer = getattr(
+                            crct_teacher_transport,
+                            "should_defer_low_priority_maintenance",
+                            None,
+                        )
+                        if callable(should_defer):
+                            defer_low_priority = bool(should_defer())
+                    if replay_eviction_loop.has_probe() and not defer_low_priority:
+                        replay_step = _crct_replay_tick_step(
+                            replay_eviction_loop,
+                            model,
+                            steps,
+                        )
+                        tick_result = replay_eviction_loop.tick(
+                            model=model,
+                            step=replay_step,
+                        )
+                        pump_work_done = True
+                        if tick_result.evicted_indices:
+                            replay_eviction_loop.flush_trace()
+                if pump_work_done:
+                    if crct_teacher_transport is not None:
+                        crct_teacher_transport.metrics["memory_rank_pump_steps"] += 1
+                    losses.append(torch.zeros((), device=device, dtype=torch.float32))
+                    steps += 1
+                else:
+                    if crct_teacher_transport is not None:
+                        crct_teacher_transport.metrics[
+                            "memory_rank_pump_idle_spins"
+                        ] += 1
+                    time.sleep(0.0005)
+                continue
 
             if prefetcher is not None:
                 if steps == 0:
@@ -10223,75 +10383,18 @@ def train_fast_for_budget(
                             "teacher_group to be initialized"
                         )
                     elif crct_teacher_transport is None:
-                        full_ids_shape = tuple(
-                            int(x)
-                            for x in _crct_full_input_ids(inputs, targets).shape
+                        _ensure_crct_teacher_transport(
+                            full_ids_shape=tuple(
+                                int(x)
+                                for x in _crct_full_input_ids(inputs, targets).shape
+                            ),
+                            payload_shape=(
+                                1,
+                                int(targets.shape[0]),
+                                int(targets.shape[1]),
+                            ),
+                            payload_device=inputs.device,
                         )
-                        payload_shape = (
-                            1,
-                            int(targets.shape[0]),
-                            int(targets.shape[1]),
-                        )
-                        payload_dtype = _resolve_crct_async_payload_dtype(
-                            crct_async_teacher_payload_dtype,
-                            device=inputs.device,
-                        )
-                        if (
-                            crct_teacher_transport_mode
-                            == "async_rank0_memory_mailbox"
-                        ):
-                            mailbox_dir = str(crct_teacher_mailbox_dir or "").strip()
-                            if not mailbox_dir:
-                                raise ValueError(
-                                    "CRCT mailbox transport requires "
-                                    "crct_teacher_mailbox_dir to be set"
-                                )
-                            crct_teacher_transport = _CrctMailboxTeacherTransport(
-                                rank=rank_,
-                                world_size=world_size_,
-                                mailbox_dir=mailbox_dir,
-                                payload_shape=payload_shape,
-                                full_ids_shape=full_ids_shape,
-                                device=inputs.device,
-                                payload_dtype=payload_dtype,
-                                max_local_batches=int(
-                                    crct_async_teacher_pending_batches
-                                ),
-                                max_payload_lag_steps=int(
-                                    crct_async_teacher_max_lag_steps
-                                ),
-                                score_interval_steps=int(
-                                    crct_teacher_score_interval_steps
-                                ),
-                                plasticity_ema_beta=float(crct_ema_beta),
-                                hidden_dim=int(
-                                    getattr(model, "dim", 0)
-                                    or getattr(model.lm_head, "in_features", 0)
-                                    or 0
-                                ),
-                                score_stage_timing_enabled=bool(
-                                    crct_score_stage_timing_enabled
-                                ),
-                            )
-                        else:
-                            crct_teacher_transport = _CrctAsyncTeacherTransport(
-                                rank=rank_,
-                                world_size=world_size_,
-                                teacher_group=teacher_group,
-                                payload_shape=payload_shape,
-                                full_ids_shape=full_ids_shape,
-                                device=inputs.device,
-                                payload_dtype=payload_dtype,
-                                max_local_batches=int(
-                                    crct_async_teacher_pending_batches
-                                ),
-                                max_payload_lag_steps=int(
-                                    crct_async_teacher_max_lag_steps
-                                ),
-                                score_interval_steps=int(
-                                    crct_teacher_score_interval_steps
-                                ),
-                            )
                     if crct_teacher_transport is None:
                         ready = None
                     else:
