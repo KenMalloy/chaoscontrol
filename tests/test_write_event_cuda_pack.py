@@ -1,9 +1,12 @@
-"""CUDA WriteEvent pack kernel.
+"""CUDA WriteEvent pack kernel contract.
 
 The production writer path builds fixed-size WriteEvent structs on GPU, then
 copies a raw byte batch into pinned CPU staging for the shm-ring publisher. This
-test is hardware-gated: local arm64/CPU runs skip it, while H100 pod builds with
-CHAOSCONTROL_CPU_SSM_CUDA_WRITE_EVENT=1 exercise the exact wire layout.
+test supports both native extension builds:
+
+- CPU-only build: the availability flag is false and the stub raises a clear
+  rebuild error.
+- CUDA-enabled build: an H100 pod exercises the exact wire layout.
 """
 from __future__ import annotations
 
@@ -11,16 +14,36 @@ import pytest
 import torch
 
 from chaoscontrol.kernels import _cpu_ssm_controller as _ext
-from chaoscontrol.optim.episodic_writer import (
-    fingerprint_tokens,
-    tensor_fp16_to_u16_wire,
-)
+from chaoscontrol.optim.episodic_writer import fingerprint_tokens, tensor_fp16_to_u16_wire
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_cuda_pack_write_events_matches_wire_dict(tmp_path):
     if not bool(_ext.write_event_cuda_pack_available()):
-        pytest.skip("CUDA WriteEvent pack kernel not compiled into extension")
+        out = torch.empty((1, 8), dtype=torch.uint8)
+        ids = torch.zeros((1, 1), dtype=torch.long)
+        hidden = torch.zeros((1, 1, 1), dtype=torch.float32)
+        positions = torch.zeros((1, 1), dtype=torch.long)
+        with pytest.raises(RuntimeError, match="CHAOSCONTROL_CPU_SSM_CUDA_WRITE_EVENT=1"):
+            _ext.pack_write_events_cuda_(
+                out,
+                ids,
+                ids,
+                hidden,
+                hidden.squeeze(-1),
+                hidden.squeeze(-1),
+                positions,
+                ids[:, 0],
+                0,
+                0,
+                0,
+                1,
+                1,
+                1,
+            )
+        return
+
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA WriteEvent pack kernel compiled, but CUDA is unavailable")
 
     event_size = int(_ext.wire_event_sizes()["WriteEvent"])
     out = torch.empty((1, event_size), device="cuda", dtype=torch.uint8)

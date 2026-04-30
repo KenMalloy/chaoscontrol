@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import os
 import platform
+import re
+import subprocess
 from pathlib import Path
 
 
@@ -33,18 +35,91 @@ def _x86_accel_compile_args() -> list[str]:
     ]
 
 
+def _env_bool(value: str) -> bool:
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _cuda_major_minor(version: str | None) -> tuple[int, int] | None:
+    if not version:
+        return None
+    match = re.search(r"(\d+)\.(\d+)", str(version))
+    if match is None:
+        return None
+    return int(match.group(1)), int(match.group(2))
+
+
+def _torch_cuda_version() -> str | None:
+    try:
+        import torch
+    except ImportError:
+        return None
+    return getattr(getattr(torch, "version", None), "cuda", None)
+
+
+def _nvcc_cuda_version(cuda_home: str | os.PathLike[str]) -> str | None:
+    nvcc = Path(cuda_home) / "bin" / "nvcc"
+    if not nvcc.exists():
+        return None
+    try:
+        out = subprocess.run(
+            [str(nvcc), "--version"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except Exception:
+        return None
+    text = f"{out.stdout}\n{out.stderr}"
+    match = re.search(r"release\s+(\d+\.\d+)", text)
+    if match is not None:
+        return match.group(1)
+    return None
+
+
+def _cuda_toolkit_matches_torch(cuda_home: str | os.PathLike[str]) -> bool:
+    torch_cuda = _cuda_major_minor(_torch_cuda_version())
+    nvcc_cuda = _cuda_major_minor(_nvcc_cuda_version(cuda_home))
+    return torch_cuda is not None and nvcc_cuda is not None and torch_cuda == nvcc_cuda
+
+
 def _cuda_write_event_enabled() -> bool:
     requested = os.environ.get("CHAOSCONTROL_CPU_SSM_CUDA_WRITE_EVENT")
     if requested is not None:
-        return requested.strip().lower() in {"1", "true", "yes", "on"}
+        requested_enabled = _env_bool(requested)
+        if not requested_enabled:
+            return False
+    else:
+        requested_enabled = False
     try:
         from torch.utils.cpp_extension import CUDA_HOME
     except ImportError:
         return False
     if CUDA_HOME is None:
+        if requested_enabled:
+            raise RuntimeError(
+                "CHAOSCONTROL_CPU_SSM_CUDA_WRITE_EVENT=1 was requested, but "
+                "torch.utils.cpp_extension.CUDA_HOME is not set."
+            )
         return False
     nvcc = Path(CUDA_HOME) / "bin" / "nvcc"
-    return nvcc.exists()
+    if not nvcc.exists():
+        if requested_enabled:
+            raise RuntimeError(
+                "CHAOSCONTROL_CPU_SSM_CUDA_WRITE_EVENT=1 was requested, but "
+                f"nvcc was not found under CUDA_HOME={CUDA_HOME!r}."
+            )
+        return False
+    if not _cuda_toolkit_matches_torch(CUDA_HOME):
+        if requested_enabled:
+            raise RuntimeError(
+                "CHAOSCONTROL_CPU_SSM_CUDA_WRITE_EVENT=1 was requested, but "
+                f"CUDA_HOME={CUDA_HOME!r} does not match torch.version.cuda="
+                f"{_torch_cuda_version()!r}; refusing to build the CUDA "
+                "WriteEvent packer against a mismatched toolkit."
+            )
+        return False
+    return True
 
 
 def build_ext_modules() -> list:
