@@ -2233,6 +2233,11 @@ class _CrctMailboxTeacherTransport:
             "payloads_sent": 0,
             "payloads_received": 0,
             "payloads_used": 0,
+            "memory_rank_pump_steps": 0,
+            "memory_rank_pump_idle_spins": 0,
+            "memory_rank_pump_request_pops": 0,
+            "memory_rank_pump_last_request_step": -1,
+            "memory_rank_pump_score_calls": 0,
             "memory_packets_sent": 0,
             "memory_packets_received": 0,
             "memory_packet_bytes_sent": 0,
@@ -2361,6 +2366,7 @@ class _CrctMailboxTeacherTransport:
             "fast_slow_readiness_scores": 0,
             "fast_slow_readiness_skips_no_slow_mirror": 0,
             "fast_slow_readiness_skips_no_valid_tokens": 0,
+            "fast_slow_readiness_skips_gpu3_mirror": 0,
             "fast_slow_readiness_errors": 0,
             "fast_slow_readiness_seconds_sum": 0.0,
             "fast_slow_readiness_seconds_max": 0.0,
@@ -2537,7 +2543,8 @@ class _CrctMailboxTeacherTransport:
             self._submit_request(inputs=inputs, targets=targets, step=int(step))
             return ready
         if self.rank == self.memory_rank:
-            self._poll_requests()
+            popped = self._poll_requests()
+            self.metrics["memory_rank_pump_request_pops"] += int(popped)
         return None
 
     def after_optimizer_step(
@@ -2564,7 +2571,12 @@ class _CrctMailboxTeacherTransport:
                 model=model,
                 step=int(step),
                 replay_eviction_loop=replay_eviction_loop,
-                fast_slow=fast_slow,
+                # GPU3 is a latest-complete trunk mirror for the packet
+                # scorer.  The snapshot already includes whatever
+                # consolidation rank 0 committed; applying fast/slow again
+                # here makes the memory GPU own a second copy policy and slows
+                # exact-match packet production.
+                fast_slow=None,
             )
         if self.rank != self.memory_rank or not self.pending_input_requests:
             return
@@ -2597,74 +2609,8 @@ class _CrctMailboxTeacherTransport:
                 gradient_conflict_monitor=gradient_conflict_monitor,
                 update_model_memory_after=True,
             )
-            slow_model = self._refresh_fast_slow_slow_model(
-                model=model,
-                fast_slow=fast_slow,
-                step=request_step,
-            )
-            fast_slow_evidence = _score_fast_slow_readiness_inline(
-                model=model,
-                slow_model=slow_model,
-                fast_slow=fast_slow,
-                input_ids=request_full_ids,
-                step=request_step,
-                chunk_size=int(fast_slow_nll_chunk_size),
-            )
-            if fast_slow_evidence is not None:
-                fast_slow_evidence["weight_snapshot_version_lag_steps"] = int(
-                    self.metrics.get("weight_snapshot_version_lag_steps", 0)
-                )
-                scored["fast_slow_readiness"] = fast_slow_evidence
-                self.metrics["fast_slow_readiness_scores"] += 1
-                self.metrics["fast_slow_readiness_seconds_sum"] += float(
-                    fast_slow_evidence["score_seconds"]
-                )
-                self.metrics["fast_slow_readiness_seconds_max"] = max(
-                    float(self.metrics["fast_slow_readiness_seconds_max"]),
-                    float(fast_slow_evidence["score_seconds"]),
-                )
-                self.metrics["fast_slow_readiness_delta_sum"] += float(
-                    fast_slow_evidence["delta_nll"]
-                )
-                self.metrics["fast_slow_readiness_delta_abs_sum"] += abs(
-                    float(fast_slow_evidence["delta_nll"])
-                )
-                self.metrics["fast_slow_readiness_delta_last"] = float(
-                    fast_slow_evidence["delta_nll"]
-                )
-                delta = float(fast_slow_evidence["delta_nll"])
-                if delta > 0.0:
-                    self.metrics["fast_slow_readiness_delta_positive"] += 1
-                elif delta < 0.0:
-                    self.metrics["fast_slow_readiness_delta_negative"] += 1
-                else:
-                    self.metrics["fast_slow_readiness_delta_zero"] += 1
-                self.metrics["fast_slow_readiness_valid_tokens_sum"] += int(
-                    fast_slow_evidence["valid_tokens"]
-                )
-                self.metrics["fast_slow_readiness_last_step"] = int(request_step)
-                decision = _decide_fast_slow_from_oracle_evidence(
-                    fast_slow=fast_slow,
-                    action_space=fast_slow_action_space,
-                    evidence=fast_slow_evidence,
-                    model=model,
-                    step=request_step,
-                )
-                if decision is not None:
-                    scored["fast_slow_decision"] = fast_slow_decision_to_dict(
-                        decision
-                    )
-                    self.metrics["fast_slow_decisions_issued"] += 1
-                    self._refresh_fast_slow_slow_model(
-                        model=model,
-                        fast_slow=fast_slow,
-                        step=request_step,
-                    )
-            elif fast_slow is not None and fast_slow.enabled:
-                if slow_model is None:
-                    self.metrics["fast_slow_readiness_skips_no_slow_mirror"] += 1
-                else:
-                    self.metrics["fast_slow_readiness_skips_no_valid_tokens"] += 1
+            if fast_slow is not None and fast_slow.enabled:
+                self.metrics["fast_slow_readiness_skips_gpu3_mirror"] += 1
             score_s = time.perf_counter() - t0
             self.metrics["score_seconds_sum"] += float(score_s)
             self.metrics["score_seconds_max"] = max(
@@ -2672,6 +2618,7 @@ class _CrctMailboxTeacherTransport:
                 float(score_s),
             )
             self.metrics["payloads_scored"] += 1
+            self.metrics["memory_rank_pump_score_calls"] += 1
             self.metrics["last_scored_request_step"] = request_step
             self._write_result(request_step=request_step, scored=scored)
         except Exception as exc:
@@ -3764,9 +3711,9 @@ class _CrctMailboxTeacherTransport:
             ).strip()
             self.metrics["last_drop_reason"] = "request_shm_write_error"
 
-    def _poll_requests(self) -> None:
+    def _poll_requests(self) -> int:
         if not self._ensure_teacher_request_consumer():
-            return
+            return 0
         assert self._teacher_request_ring is not None
         assert self._teacher_request_payload is not None
         latest: dict[str, object] | None = None
@@ -3778,7 +3725,7 @@ class _CrctMailboxTeacherTransport:
             latest = event
             popped += 1
         if latest is None:
-            return
+            return 0
         if popped > 1:
             self.metrics["completed_requests_dropped"] += popped - 1
             self.metrics["last_drop_reason"] = "newer_request_event_won"
@@ -3790,21 +3737,24 @@ class _CrctMailboxTeacherTransport:
             )
             if full_ids_cpu is None:
                 self.metrics["last_drop_reason"] = "teacher_request_empty_full_ids"
-                return
+                return int(popped)
             full_ids = full_ids_cpu.to(device=self.device, dtype=torch.int32)
             step = int(latest["step"])
             self.pending_input_requests.append({"step": step, "buffer": full_ids})
+            self.metrics["memory_rank_pump_last_request_step"] = int(step)
             self.metrics["mailbox_request_reads"] += 1
             self.metrics["max_pending_input_requests"] = max(
                 int(self.metrics["max_pending_input_requests"]),
                 len(self.pending_input_requests),
             )
+            return int(popped)
         except Exception as exc:
             self.metrics["errors"] += 1
             self.metrics["last_error"] = "".join(
                 traceback.format_exception_only(type(exc), exc)
             ).strip()
             self.metrics["last_drop_reason"] = "request_shm_read_error"
+            return int(popped)
 
     def _plasticity_ema_update(
         self,
@@ -10082,6 +10032,7 @@ def train_fast_for_budget(
             crct_payload: dict[str, torch.Tensor] | None = None
             train_inputs = inputs
             train_targets = targets
+            memory_rank_request_pops_before: int | None = None
             if crct_enabled:
                 assert crct_cache is not None
                 crct_transport_participant = (
@@ -10180,6 +10131,16 @@ def train_fast_for_budget(
                     if crct_teacher_transport is None:
                         ready = None
                     else:
+                        if (
+                            crct_transport_participant
+                            and rank_ == world_size_ - 1
+                            and not bool(memory_rank_joins_grad)
+                        ):
+                            memory_rank_request_pops_before = int(
+                                crct_teacher_transport.metrics.get(
+                                    "memory_rank_pump_request_pops", 0
+                                )
+                            )
                         ready = crct_teacher_transport.begin_step(
                             inputs=inputs,
                             targets=targets,
@@ -10218,6 +10179,111 @@ def train_fast_for_budget(
                         crct_teacher_fail_open += 1
                 elif rank_ == 0:
                     crct_teacher_payloads += 1
+
+            if (
+                crct_enabled
+                and bool(is_episodic_rank)
+                and not bool(episodic_enabled)
+                and not bool(memory_rank_joins_grad)
+            ):
+                pump_work_done = False
+                if crct_teacher_transport is not None:
+                    assert crct_cache is not None
+                    score_before = int(
+                        crct_teacher_transport.metrics.get("payloads_scored", 0)
+                    )
+                    weight_before = int(
+                        crct_teacher_transport.metrics.get(
+                            "weight_snapshot_applied", 0
+                        )
+                    )
+                    crct_teacher_transport.after_optimizer_step(
+                        model=model,
+                        cache=crct_cache,
+                        scarcity_optimizer=crct_scarcity,
+                        step=steps,
+                        total_steps=max_steps,
+                        tau=float(crct_lm_weight_tau),
+                        strength=float(crct_lm_weight_strength),
+                        w_max=float(crct_lm_weight_w_max),
+                        alpha_max=float(crct_lm_weight_alpha_max),
+                        memory_write_tokens=int(crct_memory_write_tokens_per_step),
+                        gradient_conflict_monitor=crct_gradient_conflict,
+                        replay_eviction_loop=replay_eviction_loop,
+                        fast_slow=None,
+                        fast_slow_action_space=None,
+                        fast_slow_nll_chunk_size=int(chunk_size),
+                    )
+                    request_pops_after = int(
+                        crct_teacher_transport.metrics.get(
+                            "memory_rank_pump_request_pops", 0
+                        )
+                    )
+                    request_pops_before = (
+                        int(memory_rank_request_pops_before)
+                        if memory_rank_request_pops_before is not None
+                        else request_pops_after
+                    )
+                    pump_work_done = (
+                        request_pops_after > request_pops_before
+                        or int(
+                            crct_teacher_transport.metrics.get(
+                                "payloads_scored", 0
+                            )
+                        )
+                        > score_before
+                        or int(
+                            crct_teacher_transport.metrics.get(
+                                "weight_snapshot_applied", 0
+                            )
+                        )
+                        > weight_before
+                    )
+                if replay_eviction_loop is not None:
+                    _crct_replay_cache_probe(replay_eviction_loop, model, steps)
+                    defer_low_priority = False
+                    if crct_teacher_transport is not None:
+                        should_defer = getattr(
+                            crct_teacher_transport,
+                            "should_defer_low_priority_maintenance",
+                            None,
+                        )
+                        if callable(should_defer):
+                            defer_low_priority = bool(should_defer())
+                    if replay_eviction_loop.has_probe() and not defer_low_priority:
+                        replay_step = _crct_replay_tick_step(
+                            replay_eviction_loop,
+                            model,
+                            steps,
+                        )
+                        tick_result = replay_eviction_loop.tick(
+                            model=model,
+                            step=replay_step,
+                        )
+                        pump_work_done = True
+                        if tick_result.evicted_indices:
+                            replay_eviction_loop.flush_trace()
+                if pump_work_done:
+                    if crct_teacher_transport is not None:
+                        crct_teacher_transport.metrics["memory_rank_pump_steps"] += 1
+                    losses.append(torch.zeros((), device=device, dtype=torch.float32))
+                    last_request_step = (
+                        int(
+                            crct_teacher_transport.metrics.get(
+                                "memory_rank_pump_last_request_step", -1
+                            )
+                        )
+                        if crct_teacher_transport is not None
+                        else -1
+                    )
+                    steps = max(int(steps) + 1, int(last_request_step) + 1)
+                else:
+                    if crct_teacher_transport is not None:
+                        crct_teacher_transport.metrics[
+                            "memory_rank_pump_idle_spins"
+                        ] += 1
+                    time.sleep(0.0005)
+                continue
 
             optimizer.zero_grad(set_to_none=True)
             if predictive_aux_optimizer is not None:
@@ -10889,6 +10955,18 @@ def train_fast_for_budget(
                 "payloads_scored": int(mem.get("payloads_scored", 0)),
                 "payload_lag_steps_max": int(coord.get("payload_lag_steps_max", 0)),
                 "score_seconds_max": float(mem.get("score_seconds_max", 0.0)),
+                "memory_rank_pump_steps": int(
+                    mem.get("memory_rank_pump_steps", 0)
+                ),
+                "memory_rank_pump_idle_spins": int(
+                    mem.get("memory_rank_pump_idle_spins", 0)
+                ),
+                "memory_rank_pump_request_pops": int(
+                    mem.get("memory_rank_pump_request_pops", 0)
+                ),
+                "memory_rank_pump_score_calls": int(
+                    mem.get("memory_rank_pump_score_calls", 0)
+                ),
                 "mailbox_write_seconds_max": max(
                     float(coord.get("mailbox_write_seconds_max", 0.0)),
                     float(mem.get("mailbox_write_seconds_max", 0.0)),
@@ -10987,6 +11065,9 @@ def train_fast_for_budget(
                 ),
                 "fast_slow_readiness_scores": int(
                     mem.get("fast_slow_readiness_scores", 0)
+                ),
+                "fast_slow_readiness_skips_gpu3_mirror": int(
+                    mem.get("fast_slow_readiness_skips_gpu3_mirror", 0)
                 ),
                 "fast_slow_readiness_seconds_max": float(
                     mem.get("fast_slow_readiness_seconds_max", 0.0)

@@ -635,6 +635,59 @@ def test_crct_mailbox_transport_matches_stored_batch(tmp_path) -> None:
     assert diag3["payloads_scored"] == 1
 
 
+def test_crct_mailbox_gpu3_packet_score_ignores_fastslow_readiness(tmp_path) -> None:
+    mod = _load_module("runner_fast_path_crct_mailbox_no_fastslow", RUNNER_PATH)
+    model = _tiny_crct_model()
+    cache = TransactionalWakeCache(max_moments=0, max_hidden_buffer=0)
+    fast_slow = mod.FastSlowConsolidator.from_config(
+        model,
+        {
+            "fast_slow_enabled": True,
+            "fast_slow_interval": 0,
+            "fast_slow_alpha": 0.25,
+        },
+    )
+    kwargs = {
+        "world_size": 4,
+        "mailbox_dir": str(tmp_path),
+        "payload_shape": (1, 2, 5),
+        "full_ids_shape": (2, 6),
+        "device": torch.device("cpu"),
+        "payload_dtype": torch.float32,
+        "max_local_batches": 8,
+        "max_payload_lag_steps": 8,
+        "score_interval_steps": 1,
+    }
+    rank0 = mod._CrctMailboxTeacherTransport(rank=0, **kwargs)
+    rank3 = mod._CrctMailboxTeacherTransport(rank=3, **kwargs)
+    base = torch.arange(10, dtype=torch.long).reshape(2, 5)
+    inputs = (base % 32).to(dtype=torch.int32)
+    targets = ((base + 1) % 32).to(dtype=torch.long)
+
+    rank0.begin_step(inputs=inputs, targets=targets, step=0)
+    _wait_for_metric(rank0, "teacher_shm_request_events_pushed", 1)
+    rank3.begin_step(inputs=inputs, targets=targets, step=0)
+    rank3.after_optimizer_step(
+        model=model,
+        cache=cache,
+        scarcity_optimizer=None,
+        step=0,
+        total_steps=4,
+        tau=0.1,
+        strength=0.1,
+        w_max=1.2,
+        alpha_max=0.15,
+        memory_write_tokens=4,
+        fast_slow=fast_slow,
+    )
+
+    diag3 = rank3.diagnostics()
+    assert diag3["payloads_scored"] == 1
+    assert diag3["fast_slow_readiness_scores"] == 0
+    assert diag3["fast_slow_readiness_skips_gpu3_mirror"] == 1
+    assert diag3["fast_slow_decisions_issued"] == 0
+
+
 def test_crct_mailbox_transport_round_trips_memory_packet(tmp_path) -> None:
     mod = _load_module("runner_fast_path_crct_mailbox_packet", RUNNER_PATH)
     kwargs = {
