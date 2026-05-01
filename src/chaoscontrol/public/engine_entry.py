@@ -3,7 +3,7 @@
 
 This module is the stable public-facing interface for train_gpt.py.
 It provides:
-  - init_arm_topology(): GPU role routing (train / packet-serving / maintenance)
+  - init_arm_topology(): current role routing (train / packet-serving / maintenance)
   - build_arm_config(): hyperparams -> run_condition config dict
   - run_arm_submission(): delegates to runner_fast_path.run_condition()
 
@@ -35,6 +35,8 @@ class RoleInfo:
 
 def init_arm_topology(rank: int, world_size: int) -> RoleInfo:
     """Assign GPU role based on rank and world_size.
+
+    This is the current deployment mapping, not an architectural law.
 
     8+ GPU (split=True):  ranks 0..N-3 train, rank N-2 packet-serving, rank N-1 maintenance
     4 GPU (split=False):  ranks 0..2 train, rank 3 owns both memory roles

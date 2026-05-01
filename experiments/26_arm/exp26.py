@@ -71,8 +71,9 @@ def _artifact_size_lock() -> dict[str, Any]:
     return {
         "model_dim": EXP26_MODEL_DIM,
         "ssm_delta_rank": EXP26_DELTA_RANK,
-        # On the 8xH100 ARM topology, train ranks keep the full B=1024/T=512
-        # trunk while GPU6/GPU7 own memory work. The cached LM-head backward's
+        # On the current 8xH100 ARM deployment, train ranks keep the full
+        # B=1024/T=512 trunk while dedicated memory ranks own memory work. The
+        # cached LM-head backward's
         # scratch is B*T*tile*2 bytes; tile=8192 needs 8 GiB and OOMs on the
         # cu124 pod stack after model activations. 4096 preserves the fused
         # path while restoring deterministic train-rank headroom.
@@ -124,7 +125,7 @@ def _crct_lock() -> dict[str, Any]:
         "crct_ema_beta": 0.95,
         "crct_max_price": 0.50,
         "crct_plasticity_budget_strength": 0.25,
-        # Keep the packet-serving rank targeted: score every arrived request
+        # Keep the packet-service path targeted: score every arrived request
         # if possible, then
         # write only the highest-utility residuals. A 128-token write budget
         # made append_memory a first-order stage cost on 8xH100 profiles,

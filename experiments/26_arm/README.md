@@ -22,27 +22,27 @@ mechanism.
 The thesis is not "sometimes run with memory." The trunk should always expose
 an episodic residual input lane, and that lane must never make the trunk wait.
 
-Target steady-state shape:
+Target steady-state contract:
 
 ```text
-GPU0-5 trunk ranks on the final 8x run
+Trunk ranks on the final run
   train the SSM at full speed
   consume fixed-shape latest-complete episodic residual buffers
   never synchronously read the cache
   never wait for a memory GPU or the CPU controller
 
-GPU6 packet-serving rank
+Packet-service memory rank
   owns the low-latency populated sidecar used to produce residual packets
   builds packets from the pre-recurrence episodic read path without full
     off/force recurrence or LM-head scoring
   publishes residual packets without trunk rendezvous
   does not emit authoritative utility, controller-target, or plasticity labels
 
-GPU7 maintenance rank
+Maintenance/evidence memory rank
   owns learned slot coverage, refresh, distill, and replay-style maintenance
   owns exact memory_off / force_on / hide-slot / refresh-candidate physics
     against its own request stream
-  emits ordered slot commits to GPU6 after CPU-side legality/commit authority
+  emits ordered slot commits to the packet-service rank after CPU-side legality/commit authority
   may warm or capture its own fixed-shape oracle and maintenance CUDA graphs
   cannot warm or capture trunk-rank graphs for them
 
@@ -54,24 +54,27 @@ CPU controller plane
 ```
 
 Four-GPU smoke runs use the compact 3+1 version of the same contract: GPU0-2
-train and GPU3 shares packet serving plus maintenance. At eight GPUs, the
-topology derives 6+2 automatically when maintenance is enabled; it is not an
-ablation arm.
+train and GPU3 shares packet serving plus maintenance. The current 8xH100
+deployment derives a 6+2 split automatically when maintenance is enabled, but
+that split is an implementation of the contract, not the contract itself.
 
-When GPU6 and GPU7 split, the two memory ranks hold replicated slot identity.
-GPU6 is the serving authority for low-latency packets: it bootstrap-appends
+When packet service and maintenance split, the two memory ranks hold replicated
+slot identity. The packet-service rank is the serving authority for
+low-latency packets: it bootstrap-appends
 packet-serving slots from the same pre-recurrence stream the trunk will consume
-and publishes generation-stamped append commits to GPU7. Those appends are
-serving proposals, not evidence labels. GPU7 owns the exact counterfactual
-physics and learns against the replicated serving generations. After real
-physics confirms a maintenance action, GPU7 sends a compact slot commit back to
-GPU6 over the memory-rank peer lane. Commits contain the slot id, event id,
+and publishes generation-stamped append commits to the maintenance rank. Those
+appends are serving proposals, not evidence labels. The maintenance rank owns
+the exact counterfactual physics and learns against the replicated serving
+generations. After real physics confirms a maintenance action, the maintenance
+rank sends a compact slot commit back to the packet-service rank over the
+memory-rank peer lane. Commits contain the slot id, event id,
 base generation, new generation, action, and an optional one-slot tensor
-payload. GPU6 applies maintenance commits only if the generation matches; stale
-or divergent commits are dropped and counted. The train ranks do not participate
-in this lane. Capacity is owned by learned maintenance in the ARM config:
-packet serving appends only into free slots and does not run local lossy
-compression that GPU7 could not replay exactly.
+payload. The packet-service rank applies maintenance commits only if the
+generation matches; stale or divergent commits are dropped and counted. The
+train ranks do not participate in this lane. Capacity is owned by learned
+maintenance in the ARM config: packet serving appends only into free slots and
+does not run local lossy compression that the maintenance rank could not replay
+exactly.
 
 Train-rank graph compatibility comes from stable tensor addresses and shapes:
 the recurrent stream always has a residual input buffer and gate buffer. The
@@ -105,7 +108,7 @@ quietly overloading the residual lane.
 The optimizer-side packet uses the same latest-complete discipline but only
 exact counterfactual physics may author it: per-channel `plasticity_budget`
 comes from the correlation between `abs(h_mem - h_off)` and positive memory
-utility. The low-latency GPU6 serving path deliberately does not synthesize a
+utility. The low-latency packet-service path deliberately does not synthesize a
 plasticity packet from the approximate residual. When no fresh exact packet is
 available, Muon falls back to last-good or neutral plasticity, matching the
 residual lane's fail-open semantics.

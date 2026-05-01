@@ -1390,10 +1390,10 @@ def _crct_packet_payload_inline(
 ) -> dict[str, Any]:
     """Serve a CRCT residual packet without exact off/force scoring.
 
-    GPU6 is a low-latency serving rank, not the truth source. It retrieves the
-    current episodic residual and publishes that packet with neutral loss/utility
-    labels. GPU7's maintenance/evidence loop owns exact recurrent contrast and
-    the plasticity/commit feedback derived from it.
+    The packet-service rank is a low-latency serving rank, not the truth source.
+    It retrieves the current episodic residual and publishes that packet with
+    neutral loss/utility labels. The maintenance/evidence loop owns exact
+    recurrent contrast and the plasticity/commit feedback derived from it.
     """
     input_ids = _crct_full_input_ids(inputs, targets)
     valid_mask = _crct_valid_mask(input_ids)
@@ -1918,13 +1918,14 @@ _SLOT_COMMIT_SURVIVAL_SCALE = 1_000_000
 
 
 class _CrctSlotCommitPeerTransport:
-    """GPU6<->GPU7 slot-commit lane for split memory ranks.
+    """Peer slot-commit lane for split memory ranks.
 
     Tensor payloads use point-to-point distributed sends between the two memory
     ranks only.  On CUDA/NCCL this is the NVLink/P2P path; CPU/Gloo keeps the
-    same state machine for local tests.  GPU0-5 never join this transport.
-    GPU6 publishes authoritative APPEND commits to GPU7; GPU7 publishes
-    confirmed maintenance commits back to GPU6.
+    same state machine for local tests.  Train ranks never join this transport.
+    The packet-service rank publishes authoritative APPEND commits to the
+    maintenance rank; the maintenance rank publishes confirmed maintenance
+    commits back to the packet-service rank.
     """
 
     def __init__(
@@ -3997,9 +3998,10 @@ class _CrctMailboxTeacherTransport:
         """Turn latest request frames into replay work without packet scoring.
 
         A split maintenance rank consumes the request ring as a stream of probe
-        frames.  GPU6 owns low-latency residual serving, while GPU7 mirrors the
-        append side locally from the same stream so learned maintenance has a
-        cache to massage without a fragile GPU6<->GPU7 peer receive.
+        frames. The packet-service rank owns low-latency residual serving, while
+        the maintenance rank mirrors the append side locally from the same
+        stream so learned maintenance has a cache to massage without a fragile
+        peer receive.
         """
         if self.rank != self.memory_rank or self.produce_results:
             return
