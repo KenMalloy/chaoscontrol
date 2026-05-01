@@ -911,6 +911,48 @@ def rank3_score_batch_causal(
     use_cpu_timing = record_stage_seconds is not None and not use_cuda_timing
     cuda_events: dict[str, torch.cuda.Event] = {}
     cpu_marks: dict[str, float] = {}
+    vocab_size = int(getattr(getattr(model, "lm_head", None), "out_features", 0) or 0)
+    hidden_dim = int(getattr(model, "dim", 0) or getattr(input_ids, "shape", (0, 0))[-1])
+    batch_size = int(x.shape[0])
+    seq_len = int(x.shape[1])
+    nll_budget_bytes = int(_RANK3_NLL_CHUNK_BUDGET_BYTES)
+    nll_budget_chunk = max(
+        1,
+        nll_budget_bytes // max(1, batch_size * max(1, vocab_size) * 4),
+    )
+    nll_effective_chunk = min(1024, int(nll_budget_chunk))
+    nll_chunks_per_pass = int(math.ceil(seq_len / max(1, nll_effective_chunk)))
+    trace_progress = bool(
+        isinstance(record_stage_seconds, dict)
+        and record_stage_seconds.get("_trace_progress", False)
+    )
+    paired_encode_used = False
+
+    if record_stage_seconds is not None:
+        record_stage_seconds["_batch_size"] = float(batch_size)
+        record_stage_seconds["_seq_len"] = float(seq_len)
+        record_stage_seconds["_vocab_size"] = float(vocab_size)
+        record_stage_seconds["_hidden_dim"] = float(
+            int(getattr(model, "dim", 0) or (x.shape[-1] if x.dim() > 2 else 0))
+        )
+        record_stage_seconds["_nll_chunk_budget_bytes"] = float(nll_budget_bytes)
+        record_stage_seconds["_nll_effective_chunk"] = float(nll_effective_chunk)
+        record_stage_seconds["_nll_chunks_per_pass"] = float(nll_chunks_per_pass)
+
+    def _trace(label: str) -> None:
+        if not trace_progress:
+            return
+        print(
+            "[rank3-score-trace] "
+            f"step={-1 if step is None else int(step)} "
+            f"stage={label} "
+            f"B={batch_size} T={seq_len} V={vocab_size} "
+            f"nll_budget={nll_budget_bytes} "
+            f"nll_chunk={nll_effective_chunk} "
+            f"nll_chunks={nll_chunks_per_pass} "
+            f"update_memory={bool(update_model_memory_after)}",
+            flush=True,
+        )
 
     def _mark(label: str) -> None:
         if use_cuda_timing:
@@ -921,15 +963,19 @@ def rank3_score_batch_causal(
             cpu_marks[label] = time.perf_counter()
 
     _mark("start")
+    _trace("start")
 
     memory_meta: dict[str, Any] | None = None
     with _autocast_for(input_ids.device.type):
         paired_encode = getattr(model, "encode_paired_for_score", None)
         if callable(paired_encode):
+            paired_encode_used = True
+            _trace("enter_encode_paired")
             h_off, h_mem, memory_meta = paired_encode(
                 x,
                 cache_read_cutoff=txn.read_cutoff,
             )
+            _trace("leave_encode_paired")
             # The paired path is one recurrent pass over stacked off/on
             # streams. Attribute all encode time to ``encode_off`` and leave
             # ``encode_force_on`` near-zero so existing encode_sum telemetry
@@ -937,11 +983,14 @@ def rank3_score_batch_causal(
             _mark("after_encode_off")
             _mark("after_encode_force_on")
         else:
+            _trace("enter_encode_off")
             h_off = model.encode(
                 x, memory_mode="off", cache_read_cutoff=txn.read_cutoff
             )
+            _trace("leave_encode_off")
             _mark("after_encode_off")
             try:
+                _trace("enter_encode_force_on")
                 h_mem_out = model.encode(
                     x,
                     memory_mode="force_on",
@@ -949,9 +998,11 @@ def rank3_score_batch_causal(
                     return_memory_meta=True,
                 )
             except TypeError:
+                _trace("retry_encode_force_on_no_meta")
                 h_mem_out = model.encode(
                     x, memory_mode="force_on", cache_read_cutoff=txn.read_cutoff
                 )
+            _trace("leave_encode_force_on")
             if isinstance(h_mem_out, dict):
                 h_mem = h_mem_out["hidden"]
                 meta = h_mem_out.get("memory_meta")
@@ -960,17 +1011,25 @@ def rank3_score_batch_causal(
             else:
                 h_mem = h_mem_out
             _mark("after_encode_force_on")
+    if record_stage_seconds is not None:
+        record_stage_seconds["_hidden_dim"] = float(int(h_off.shape[-1]))
+        record_stage_seconds["_paired_encode"] = 1.0 if paired_encode_used else 0.0
 
+    _trace("enter_nll_off")
     nll_off = chunked_nll_from_hidden(
         model, h_off, y, chunk_budget_bytes=_RANK3_NLL_CHUNK_BUDGET_BYTES
     )
+    _trace("leave_nll_off")
     _mark("after_nll_off")
+    _trace("enter_nll_mem")
     nll_mem = chunked_nll_from_hidden(
         model, h_mem, y, chunk_budget_bytes=_RANK3_NLL_CHUNK_BUDGET_BYTES
     )
+    _trace("leave_nll_mem")
     _mark("after_nll_mem")
 
     utility = (nll_off - nll_mem) * mask.float()
+    _trace("enter_plasticity")
     plasticity = plasticity_budget_from_hidden_delta(
         h_off=h_off,
         h_mem=h_mem,
@@ -978,6 +1037,7 @@ def rank3_score_batch_causal(
         mask=mask,
         tau=float(tau),
     )
+    _trace("leave_plasticity")
     _mark("after_plasticity")
 
     if scarcity_optimizer is None:
@@ -1044,6 +1104,7 @@ def rank3_score_batch_causal(
                 out["gradient_conflict"] = torch.zeros_like(utility)
                 out["write_score"] = write_score.detach()
             _mark("after_append")
+            _trace("skip_append_write_limit")
             _flush_stage_seconds(
                 record_stage_seconds,
                 use_cuda_timing=use_cuda_timing,
@@ -1068,12 +1129,16 @@ def rank3_score_batch_causal(
             "max_tokens": write_limit,
             "event_ids": event_ids,
         }
+        _trace("enter_append_memory")
         write_records = append_fn(h_off.detach(), **append_kwargs)
+        _trace("leave_append_memory")
         if not isinstance(write_records, list):
             raise TypeError(
                 "append_memory_from_hidden must return generation-stamped records"
             )
     _mark("after_append")
+    if not update_model_memory_after:
+        _trace("skip_append_disabled")
 
     cache.commit(txn)
     out = {
@@ -1106,6 +1171,7 @@ def rank3_score_batch_causal(
         cuda_events=cuda_events,
         cpu_marks=cpu_marks,
     )
+    _trace("done")
     return out
 
 

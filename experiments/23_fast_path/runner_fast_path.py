@@ -1247,6 +1247,105 @@ def _crct_score_payload_inline(
 
 
 @torch.inference_mode()
+def _crct_packet_payload_inline(
+    *,
+    model: torch.nn.Module,
+    cache: TransactionalWakeCache,
+    inputs: torch.Tensor,
+    targets: torch.Tensor,
+    step: int,
+    memory_write_tokens: int,
+) -> dict[str, Any]:
+    """Serve a CRCT residual packet without exact off/force scoring.
+
+    GPU6 is a low-latency serving rank, not the truth source. It retrieves the
+    current episodic residual and publishes that packet with neutral loss/utility
+    labels. GPU7's maintenance/evidence loop owns exact recurrent contrast and
+    the plasticity/commit feedback derived from it.
+    """
+    input_ids = _crct_full_input_ids(inputs, targets)
+    valid_mask = _crct_valid_mask(input_ids)
+    setattr(model, "_last_crct_probe_input_ids", input_ids.detach())
+    setattr(model, "_last_crct_probe_valid_mask", valid_mask.detach())
+    setattr(model, "_last_crct_probe_step", int(step))
+
+    packet_fn = getattr(model, "build_episodic_packet", None)
+    if not callable(packet_fn):
+        raise ValueError(
+            "approximate CRCT packet serving requires "
+            "model.build_episodic_packet(...)"
+        )
+
+    txn = cache.begin_batch()
+    x = input_ids[:, :-1].to(dtype=torch.int32)
+    mask = valid_mask[:, 1:].to(device=inputs.device, dtype=torch.float32)
+    packet = packet_fn(x, cache_read_cutoff=txn.read_cutoff)
+    outer_cue = getattr(model, "_last_outer_cue", None)
+    if outer_cue is not None:
+        setattr(model, "_last_crct_probe_outer_cue", outer_cue.detach())
+
+    residual = packet.get("memory_residual")
+    gate = packet.get("memory_gate")
+    if not isinstance(residual, torch.Tensor) or not isinstance(gate, torch.Tensor):
+        raise TypeError("build_episodic_packet must return memory_residual and memory_gate tensors")
+    gate = gate.to(device=inputs.device, dtype=torch.float32) * mask
+
+    write_records: list[dict[str, object]] | None = None
+    write_limit = int(memory_write_tokens)
+    if write_limit > 0:
+        append_fn = getattr(model, "append_memory_from_hidden", None)
+        source_hidden = packet.get("packet_source_hidden")
+        if append_fn is None or not isinstance(source_hidden, torch.Tensor):
+            raise ValueError(
+                "approximate CRCT packet serving requires packet_source_hidden "
+                "and model.append_memory_from_hidden(...) for cache bootstrap"
+            )
+        write_score = packet.get("packet_write_score")
+        if isinstance(write_score, torch.Tensor):
+            write_score = write_score.to(device=source_hidden.device, dtype=torch.float32)
+            if write_score.shape == mask.shape:
+                write_score = write_score * mask.to(device=source_hidden.device)
+        else:
+            write_score = None
+        event_ids = None
+        reserve_event_ids = getattr(cache, "reserve_event_ids", None)
+        if callable(reserve_event_ids):
+            n_write = min(int(source_hidden.shape[0] * source_hidden.shape[1]), write_limit)
+            event_ids = reserve_event_ids(n_write, device=source_hidden.device)
+        write_records = append_fn(
+            source_hidden.detach(),
+            bucket_ids=packet.get("packet_source_bucket_ids"),
+            score=write_score,
+            max_tokens=write_limit,
+            event_ids=event_ids,
+        )
+        if not isinstance(write_records, list):
+            raise TypeError(
+                "append_memory_from_hidden must return generation-stamped records"
+            )
+
+    cache.commit(txn)
+    neutral_target = torch.zeros_like(mask)
+    out: dict[str, Any] = {
+        "step_id": torch.tensor(int(step), device=inputs.device),
+        "step_id_int": int(step),
+        "target": neutral_target.detach().clone(),
+        "confidence": neutral_target.detach().clone(),
+        "loss_weight": mask.detach().clone(),
+        "utility": torch.zeros_like(mask),
+        "memory_residual": residual.detach().clone(),
+        "memory_gate": gate.detach().clone(),
+        "memory_gate_alias_target": False,
+        "packet_source_count": int(packet.get("packet_source_count", 0)),
+        "packet_approximate": True,
+    }
+    if write_records is not None:
+        out["memory_write_records"] = write_records
+        out["approx_memory_write_records"] = len(write_records)
+    return out
+
+
+@torch.inference_mode()
 def _score_fast_slow_readiness_inline(
     *,
     model: torch.nn.Module,
@@ -2096,6 +2195,8 @@ class _CrctAsyncTeacherTransport:
             "local_batch_gpu_clones": 0,
             "local_request_evictions": 0,
             "payloads_scored": 0,
+            "payloads_served": 0,
+            "payloads_served_approximate": 0,
             "score_interval_skips": 0,
             "payloads_sent": 0,
             "payloads_received": 0,
@@ -2156,6 +2257,11 @@ class _CrctAsyncTeacherTransport:
             "pre_sync_wait_seconds_max": 0.0,
             "score_seconds_sum": 0.0,
             "score_seconds_max": 0.0,
+            "packet_service_seconds_sum": 0.0,
+            "packet_service_seconds_max": 0.0,
+            "packet_service_source_count_sum": 0,
+            "packet_service_zero_source_packets": 0,
+            "packet_service_approx_write_records": 0,
             "payload_lag_steps_sum": 0,
             "payload_lag_steps_max": 0,
             "max_pending_result_broadcasts": 0,
@@ -2919,6 +3025,14 @@ class _CrctMailboxTeacherTransport:
             "score_stage_append_memory_seconds_sum": 0.0,
             "score_stage_append_memory_seconds_max": 0.0,
             "score_stage_peak_allocated_mb_max": 0.0,
+            "score_stage_last_batch_size": 0,
+            "score_stage_last_seq_len": 0,
+            "score_stage_last_vocab_size": 0,
+            "score_stage_last_hidden_dim": 0,
+            "score_stage_last_nll_chunk_budget_bytes": 0,
+            "score_stage_last_nll_effective_chunk": 0,
+            "score_stage_last_nll_chunks_per_pass": 0,
+            "score_stage_last_paired_encode": False,
             "requests_started": 0,
             "result_broadcasts_started": 0,
             "result_broadcasts_completed": 0,
@@ -2943,6 +3057,8 @@ class _CrctMailboxTeacherTransport:
             "local_batch_gpu_clones": 0,
             "local_request_evictions": 0,
             "payloads_scored": 0,
+            "payloads_served": 0,
+            "payloads_served_approximate": 0,
             "score_interval_skips": 0,
             "payloads_sent": 0,
             "payloads_received": 0,
@@ -2969,6 +3085,9 @@ class _CrctMailboxTeacherTransport:
             "memory_rank_pump_last_request_step": -1,
             "memory_rank_request_events_superseded": 0,
             "memory_rank_pump_score_calls": 0,
+            "maintenance_request_frames_ingested": 0,
+            "maintenance_request_frames_dropped_no_loop": 0,
+            "maintenance_score_path_skips": 0,
             "memory_packets_sent": 0,
             "memory_packets_received": 0,
             "memory_packet_bytes_sent": 0,
@@ -3024,6 +3143,11 @@ class _CrctMailboxTeacherTransport:
             "pre_sync_wait_seconds_max": 0.0,
             "score_seconds_sum": 0.0,
             "score_seconds_max": 0.0,
+            "packet_service_seconds_sum": 0.0,
+            "packet_service_seconds_max": 0.0,
+            "packet_service_source_count_sum": 0,
+            "packet_service_zero_source_packets": 0,
+            "packet_service_approx_write_records": 0,
             "payload_lag_steps_sum": 0,
             "payload_lag_steps_max": 0,
             "max_pending_result_broadcasts": 0,
@@ -3328,6 +3452,9 @@ class _CrctMailboxTeacherTransport:
                 # exact-match packet production.
                 fast_slow=None,
             )
+        if self.rank == self.memory_rank and not self.produce_results:
+            self._ingest_maintenance_requests(replay_eviction_loop=replay_eviction_loop)
+            return
         if self.rank != self.memory_rank or not self.pending_input_requests:
             return
         slot = self.pending_input_requests.popleft()
@@ -3336,64 +3463,51 @@ class _CrctMailboxTeacherTransport:
         try:
             train_inputs = request_full_ids[:, :-1].to(dtype=torch.int32)
             train_targets = request_full_ids[:, 1:].to(dtype=torch.long)
-            stage_seconds: dict[str, float] | None = (
-                {} if bool(self.score_stage_timing_enabled) else None
-            )
-            peak_stage_mb = 0.0
-            if (
-                stage_seconds is not None
-                and self.device.type == "cuda"
-                and torch.cuda.is_available()
-            ):
-                torch.cuda.reset_peak_memory_stats(self.device)
             t0 = time.perf_counter()
-            scored = _crct_score_payload_inline(
+            scored = _crct_packet_payload_inline(
                 model=model,
                 cache=cache,
-                scarcity_optimizer=scarcity_optimizer,
                 inputs=train_inputs,
                 targets=train_targets,
                 step=request_step,
-                total_steps=total_steps,
-                tau=tau,
-                strength=strength,
-                w_max=w_max,
-                alpha_max=alpha_max,
                 memory_write_tokens=int(memory_write_tokens),
-                gradient_conflict_monitor=gradient_conflict_monitor,
-                update_model_memory_after=bool(update_model_memory_after),
-                record_stage_seconds=stage_seconds,
             )
-            if (
-                stage_seconds is not None
-                and self.device.type == "cuda"
-                and torch.cuda.is_available()
-            ):
-                peak_stage_mb = float(
-                    torch.cuda.max_memory_allocated(self.device) / (1 << 20)
-                )
-            if fast_slow is not None and fast_slow.enabled:
-                self.metrics["fast_slow_readiness_skips_gpu3_mirror"] += 1
-            score_s = time.perf_counter() - t0
-            self.metrics["score_seconds_sum"] += float(score_s)
-            self.metrics["score_seconds_max"] = max(
-                float(self.metrics["score_seconds_max"]),
-                float(score_s),
+            packet_s = time.perf_counter() - t0
+            scored["packet_seconds"] = float(packet_s)
+            self.metrics["packet_service_seconds_sum"] += float(packet_s)
+            self.metrics["packet_service_seconds_max"] = max(
+                float(self.metrics["packet_service_seconds_max"]),
+                float(packet_s),
             )
-            self.metrics["payloads_scored"] += 1
+            self.metrics["payloads_served"] += 1
+            self.metrics["payloads_served_approximate"] += 1
             self.metrics["memory_rank_pump_score_calls"] += 1
+            if fast_slow is not None and getattr(fast_slow, "enabled", False):
+                self.metrics["fast_slow_readiness_skips_gpu3_mirror"] += 1
             self.metrics["last_scored_request_step"] = request_step
+            source_count = int(scored.get("packet_source_count", 0))
+            self.metrics["packet_service_source_count_sum"] += source_count
+            if source_count <= 0:
+                self.metrics["packet_service_zero_source_packets"] += 1
+            self.metrics["packet_service_approx_write_records"] += int(
+                scored.get("approx_memory_write_records", 0)
+            )
             if bool(update_model_memory_after):
                 self._publish_memory_write_commits(
                     request_step=request_step,
                     scored=scored,
                     slot_commit_transport=slot_commit_transport,
                 )
-            if stage_seconds is not None:
-                self._record_score_stage_seconds(
-                    request_step=request_step,
-                    stage_seconds=stage_seconds,
-                    peak_mb=peak_stage_mb,
+            if bool(self.score_stage_timing_enabled):
+                print(
+                    "[gpu6-packet] "
+                    f"step={request_step} "
+                    f"B={int(train_inputs.shape[0])} "
+                    f"T={int(train_inputs.shape[1])} "
+                    f"sources={source_count} "
+                    f"writes={int(scored.get('approx_memory_write_records', 0))} "
+                    f"packet={packet_s * 1000:.1f}ms",
+                    flush=True,
                 )
             if self.produce_results:
                 self._write_result(request_step=request_step, scored=scored)
@@ -3431,9 +3545,32 @@ class _CrctMailboxTeacherTransport:
             float(self.metrics["score_stage_peak_allocated_mb_max"]),
             float(peak_mb),
         )
+        for metric_name, stage_key in (
+            ("score_stage_last_batch_size", "_batch_size"),
+            ("score_stage_last_seq_len", "_seq_len"),
+            ("score_stage_last_vocab_size", "_vocab_size"),
+            ("score_stage_last_hidden_dim", "_hidden_dim"),
+            ("score_stage_last_nll_chunk_budget_bytes", "_nll_chunk_budget_bytes"),
+            ("score_stage_last_nll_effective_chunk", "_nll_effective_chunk"),
+            ("score_stage_last_nll_chunks_per_pass", "_nll_chunks_per_pass"),
+        ):
+            if stage_key in stage_seconds:
+                self.metrics[metric_name] = int(stage_seconds.get(stage_key, 0.0))
+        if "_paired_encode" in stage_seconds:
+            self.metrics["score_stage_last_paired_encode"] = bool(
+                stage_seconds.get("_paired_encode", 0.0)
+            )
         print(
             "[gpu3-stage] "
             f"step={int(request_step)} "
+            f"B={int(self.metrics['score_stage_last_batch_size'])} "
+            f"T={int(self.metrics['score_stage_last_seq_len'])} "
+            f"D={int(self.metrics['score_stage_last_hidden_dim'])} "
+            f"V={int(self.metrics['score_stage_last_vocab_size'])} "
+            f"nll_budget={int(self.metrics['score_stage_last_nll_chunk_budget_bytes'])} "
+            f"nll_chunk={int(self.metrics['score_stage_last_nll_effective_chunk'])} "
+            f"nll_chunks={int(self.metrics['score_stage_last_nll_chunks_per_pass'])} "
+            f"paired={bool(self.metrics['score_stage_last_paired_encode'])} "
             f"encode_off={stage_seconds.get('encode_off', 0.0) * 1000:.1f}ms "
             f"encode_force_on={stage_seconds.get('encode_force_on', 0.0) * 1000:.1f}ms "
             f"nll_off={stage_seconds.get('nll_off', 0.0) * 1000:.1f}ms "
@@ -3443,6 +3580,45 @@ class _CrctMailboxTeacherTransport:
             f"peak_mb={float(peak_mb):.0f}",
             flush=True,
         )
+
+    def _ingest_maintenance_requests(
+        self,
+        *,
+        replay_eviction_loop: ReplayEvictionLoop | None,
+    ) -> None:
+        """Turn latest request frames into replay work without packet scoring.
+
+        A split maintenance rank consumes the request ring as a stream of probe
+        frames.  It must not run the packet producer's exact off/force score or
+        write residual payloads; GPU6 owns low-latency packet serving, while
+        GPU7's deeper work is scheduled by ``ReplayEvictionLoop.tick``.
+        """
+        if self.rank != self.memory_rank or self.produce_results:
+            return
+        if not self.pending_input_requests:
+            return
+        self.metrics["maintenance_score_path_skips"] += len(self.pending_input_requests)
+        if replay_eviction_loop is None:
+            dropped = len(self.pending_input_requests)
+            self.pending_input_requests.clear()
+            self.metrics["maintenance_request_frames_dropped_no_loop"] += int(dropped)
+            self.metrics["last_drop_reason"] = "maintenance_no_replay_loop"
+            return
+        while self.pending_input_requests:
+            slot = self.pending_input_requests.popleft()
+            request_step = int(slot["step"])
+            request_full_ids = slot["buffer"]
+            valid_mask = _crct_valid_mask(request_full_ids)
+            replay_eviction_loop.cache_probe(
+                input_ids=request_full_ids,
+                valid_mask=valid_mask,
+                cue=None,
+                cache_read_cutoff=None,
+                step=request_step,
+                stream_id=request_step,
+            )
+            self.metrics["maintenance_request_frames_ingested"] += 1
+            self.metrics["last_received_request_step"] = request_step
 
     def diagnostics(self) -> dict[str, Any]:
         out = dict(self.metrics)
@@ -3488,6 +3664,17 @@ class _CrctMailboxTeacherTransport:
         scored = int(out.get("payloads_scored", 0))
         out["score_seconds_mean"] = (
             float(out["score_seconds_sum"]) / float(scored) if scored else 0.0
+        )
+        served = int(out.get("payloads_served", 0))
+        out["packet_service_seconds_mean"] = (
+            float(out["packet_service_seconds_sum"]) / float(served)
+            if served
+            else 0.0
+        )
+        out["packet_service_source_count_mean"] = (
+            float(out["packet_service_source_count_sum"]) / float(served)
+            if served
+            else 0.0
         )
         packets = int(out.get("memory_packets_received", 0))
         out["memory_packet_lag_steps_mean"] = (
@@ -4877,7 +5064,9 @@ class _CrctMailboxTeacherTransport:
             "score_seconds": float(scored.get("score_seconds", 0.0))
             if not isinstance(scored.get("score_seconds"), torch.Tensor)
             else float(scored["score_seconds"].detach().cpu().item()),
-            "packet_seconds": 0.0,
+            "packet_seconds": float(scored.get("packet_seconds", 0.0))
+            if not isinstance(scored.get("packet_seconds"), torch.Tensor)
+            else float(scored["packet_seconds"].detach().cpu().item()),
             "target_token_count": int(scored["target"].numel()),
             "hidden_dim": int(self.hidden_dim),
             "plasticity_dim": int(
@@ -11014,6 +11203,9 @@ def train_fast_for_budget(
             score_before = int(
                 active_transport.metrics.get("payloads_scored", 0)
             )
+            served_before = int(
+                active_transport.metrics.get("payloads_served", 0)
+            )
             weight_before = int(
                 active_transport.metrics.get("weight_snapshot_applied", 0)
             )
@@ -11053,6 +11245,8 @@ def train_fast_for_budget(
                 request_pops_after > request_pops_before
                 or int(active_transport.metrics.get("payloads_scored", 0))
                 > score_before
+                or int(active_transport.metrics.get("payloads_served", 0))
+                > served_before
                 or int(active_transport.metrics.get("weight_snapshot_applied", 0))
                 > weight_before
             )
@@ -11613,6 +11807,9 @@ def train_fast_for_budget(
                     score_before = int(
                         crct_teacher_transport.metrics.get("payloads_scored", 0)
                     )
+                    served_before = int(
+                        crct_teacher_transport.metrics.get("payloads_served", 0)
+                    )
                     weight_before = int(
                         crct_teacher_transport.metrics.get(
                             "weight_snapshot_applied", 0
@@ -11674,6 +11871,12 @@ def train_fast_for_budget(
                             )
                         )
                         > score_before
+                        or int(
+                            crct_teacher_transport.metrics.get(
+                                "payloads_served", 0
+                            )
+                        )
+                        > served_before
                         or int(
                             crct_teacher_transport.metrics.get(
                                 "weight_snapshot_applied", 0
@@ -12423,6 +12626,10 @@ def train_fast_for_budget(
                 "maintenance_errors": int(maintenance.get("errors", 0)),
                 "payloads_used": int(coord.get("payloads_used", 0)),
                 "payloads_scored": int(mem.get("payloads_scored", 0)),
+                "payloads_served": int(mem.get("payloads_served", 0)),
+                "payloads_served_approximate": int(
+                    mem.get("payloads_served_approximate", 0)
+                ),
                 "maintenance_payloads_scored": int(
                     maintenance.get("payloads_scored", 0)
                 ),
@@ -12469,6 +12676,21 @@ def train_fast_for_budget(
                 ),
                 "payload_lag_steps_max": int(coord.get("payload_lag_steps_max", 0)),
                 "score_seconds_max": float(mem.get("score_seconds_max", 0.0)),
+                "packet_service_seconds_max": float(
+                    mem.get("packet_service_seconds_max", 0.0)
+                ),
+                "packet_service_seconds_mean": float(
+                    mem.get("packet_service_seconds_mean", 0.0)
+                ),
+                "packet_service_source_count_mean": float(
+                    mem.get("packet_service_source_count_mean", 0.0)
+                ),
+                "packet_service_zero_source_packets": int(
+                    mem.get("packet_service_zero_source_packets", 0)
+                ),
+                "packet_service_approx_write_records": int(
+                    mem.get("packet_service_approx_write_records", 0)
+                ),
                 "score_stage_timing_enabled": bool(
                     mem.get("score_stage_timing_enabled", False)
                 ),

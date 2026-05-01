@@ -1124,6 +1124,144 @@ class CareStudentLM(nn.Module):
             )
         return records
 
+    @torch.no_grad()
+    def build_episodic_packet(
+        self,
+        input_ids: torch.Tensor,
+        *,
+        cache_read_cutoff: int | None = None,
+    ) -> dict[str, Any]:
+        """Build a low-latency residual packet without recurrent scoring.
+
+        Packet-serving memory ranks use this path to retrieve the same
+        pre-recurrence memory bias that ``memory_mode='force_on'`` would inject,
+        but they do not run the SSM loop, the LM head, or any off/force contrast.
+        The returned packet is therefore a serving proposal, not an oracle label:
+        exact utility/plasticity evidence must come from the maintenance rank.
+        """
+        x = self.embed(input_ids)
+        bucket_ids = None
+        if self.wernicke is not None:
+            x, bucket_ids, _balance_loss = self.wernicke(x)
+
+        batch = x.size(0)
+        seq = x.size(1)
+        model_dim = x.size(2)
+        residual = torch.zeros(
+            batch,
+            1,
+            model_dim,
+            device=x.device,
+            dtype=x.dtype,
+        )
+        source_count = 0
+
+        def _add_bias(bias: torch.Tensor) -> None:
+            nonlocal source_count
+            residual.add_(bias.to(device=x.device, dtype=x.dtype))
+            source_count += 1
+
+        if (
+            isinstance(self.outer_model, MultiSlotOuterModel)
+            and self.cue_projection
+        ):
+            self._last_outer_cue = x.detach().mean(dim=1)
+        else:
+            self._last_outer_cue = None
+
+        if self.outer_model is not None and self.buffer_mode == "append_only":
+            if isinstance(self.outer_model, MultiSlotOuterModel) and self.outer_model._slots:
+                if bucket_ids is not None:
+                    per_sample_buckets = bucket_ids.mode(dim=1).values
+                else:
+                    per_sample_buckets = torch.zeros(
+                        batch,
+                        dtype=torch.long,
+                        device=x.device,
+                    )
+                outer_read = torch.zeros(
+                    batch,
+                    1,
+                    model_dim,
+                    device=x.device,
+                    dtype=x.dtype,
+                )
+                for b_id in per_sample_buckets.unique():
+                    mask = per_sample_buckets == b_id
+                    cue = None
+                    if self.retrieval_mode in ("bucket_topk", "softmax_all"):
+                        cue = self.outer_model.cue_proj(
+                            x[mask]
+                            .detach()
+                            .mean(dim=1)
+                            .to(dtype=self.outer_model.cue_proj.weight.dtype)
+                        )
+                    read = self.outer_model.read_bucket(
+                        int(mask.sum()),
+                        bucket_id=int(b_id.item()),
+                        mode=self.retrieval_mode,
+                        k=self.retrieval_k,
+                        cue=cue,
+                        read_cutoff=cache_read_cutoff,
+                    )
+                    outer_read[mask] = read.unsqueeze(1).to(dtype=x.dtype)
+                _add_bias(outer_read)
+
+            if self.bucket_prototypes_module is not None and bucket_ids is not None:
+                per_sample_buckets = bucket_ids.mode(dim=1).values
+                proto_bias = torch.zeros(
+                    batch,
+                    1,
+                    model_dim,
+                    device=x.device,
+                    dtype=x.dtype,
+                )
+                for b_id in per_sample_buckets.unique():
+                    mask = per_sample_buckets == b_id
+                    proto = self.bucket_prototypes_module.read(
+                        int(mask.sum()),
+                        int(b_id.item()),
+                    )
+                    proto_bias[mask] = proto.unsqueeze(1).to(dtype=x.dtype)
+                _add_bias(proto_bias)
+        elif self.outer_model is not None:
+            if isinstance(self.outer_model, MultiSlotOuterModel):
+                cue = x.detach().mean(dim=1) if self.cue_projection else None
+                outer_read = self.outer_model.read(
+                    batch,
+                    cue=cue,
+                    read_cutoff=cache_read_cutoff,
+                )
+            else:
+                outer_read = self.outer_model.read(batch)
+            _add_bias(outer_read.unsqueeze(1))
+
+        if self.semantic_tier is not None:
+            semantic_bias = self.semantic_tier.read(batch)
+            _add_bias(semantic_bias.unsqueeze(1))
+
+        # This is a serving packet, not an extra saliency policy.  The gate is
+        # the same full-strength force-on lane encode() uses internally, with a
+        # zero packet when there was no memory source to serve.
+        gate = torch.ones(batch, seq, device=x.device, dtype=x.dtype)
+        if source_count == 0:
+            gate.zero_()
+
+        # A serving rank still needs a cache to serve from. Until exact GPU7
+        # feedback refreshes the slot, use the same model-dim pre-recurrence
+        # stream as an approximate write source. This is deliberately separate
+        # from oracle utility and is tagged by the transport as approximate.
+        write_score = x.detach().float().square().mean(dim=-1)
+
+        return {
+            "memory_residual": residual.contiguous(),
+            "memory_gate": gate,
+            "packet_source_hidden": x.detach(),
+            "packet_source_bucket_ids": None if bucket_ids is None else bucket_ids.detach(),
+            "packet_write_score": write_score,
+            "packet_source_count": source_count,
+        }
+
     def encode_paired_for_score(
         self,
         input_ids: torch.Tensor,

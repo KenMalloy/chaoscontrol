@@ -182,6 +182,11 @@ def test_profile_summary_extracts_transport_and_maintenance_health(tmp_path):
 	          "health": {
 	            "payloads_used": 2,
 	            "payloads_scored": 3,
+	            "payloads_served": 4,
+	            "payloads_served_approximate": 4,
+	            "packet_service_seconds_mean": 0.125,
+	            "packet_service_seconds_max": 0.25,
+	            "packet_service_source_count_mean": 1.5,
 	            "score_stage_timing_enabled": true,
 	            "score_stage_samples": 2,
 	            "score_stage_encode_off_seconds_sum": 0.5,
@@ -234,6 +239,11 @@ def test_profile_summary_extracts_transport_and_maintenance_health(tmp_path):
     row = summary["rows"][0]
 
     assert row["payloads_used"] == 2
+    assert row["payloads_served"] == 4
+    assert row["payloads_served_approximate"] == 4
+    assert row["packet_service_seconds_mean"] == pytest.approx(0.125)
+    assert row["packet_service_seconds_max"] == pytest.approx(0.25)
+    assert row["packet_service_source_count_mean"] == pytest.approx(1.5)
     assert row["weight_snapshot_shm_writes"] == 6
     assert row["weight_snapshot_shm_reads"] == 7
     assert row["weight_snapshot_read_seconds_sum"] == pytest.approx(0.125)

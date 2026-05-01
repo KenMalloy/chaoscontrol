@@ -58,11 +58,30 @@ def _health_from_result(result: dict[str, Any]) -> dict[str, Any]:
         "final_loss": float(train.get("final_loss", 0.0) or 0.0),
         "payloads_used": int(health.get("payloads_used", 0) or 0),
         "payloads_scored": int(health.get("payloads_scored", 0) or 0),
+        "payloads_served": int(health.get("payloads_served", 0) or 0),
+        "payloads_served_approximate": int(
+            health.get("payloads_served_approximate", 0) or 0
+        ),
         "maintenance_payloads_scored": int(
             health.get("maintenance_payloads_scored", 0) or 0
         ),
         "payload_lag_steps_max": int(health.get("payload_lag_steps_max", 0) or 0),
         "score_seconds_max": float(health.get("score_seconds_max", 0.0) or 0.0),
+        "packet_service_seconds_max": float(
+            health.get("packet_service_seconds_max", 0.0) or 0.0
+        ),
+        "packet_service_seconds_mean": float(
+            health.get("packet_service_seconds_mean", 0.0) or 0.0
+        ),
+        "packet_service_source_count_mean": float(
+            health.get("packet_service_source_count_mean", 0.0) or 0.0
+        ),
+        "packet_service_zero_source_packets": int(
+            health.get("packet_service_zero_source_packets", 0) or 0
+        ),
+        "packet_service_approx_write_records": int(
+            health.get("packet_service_approx_write_records", 0) or 0
+        ),
         "score_stage_timing_enabled": bool(health.get("score_stage_timing_enabled", False)),
         "score_stage_samples": int(health.get("score_stage_samples", 0) or 0),
         "score_stage_encode_seconds_sum": float(
@@ -200,7 +219,8 @@ def _print_profile_summary(summary: dict[str, Any]) -> None:
         print(
             "  "
             f"{row['arm']}: steps={row['steps']} tps={row['tokens_per_sec']:.1f}"
-            f"{ratio_s} payloads={row['payloads_used']}/{row['payloads_scored']} "
+            f"{ratio_s} payloads={row['payloads_used']}/{row['payloads_served']}"
+            f"/{row['payloads_scored']} "
             f"snap={row['weight_snapshot_published']}/{row['weight_snapshot_applied']} "
             f"rings_drop={row['request_ring_full_drops']}/{row['result_ring_full_drops']} "
             f"gpu3={row['maintenance_gpu3_starvation_reason']} "
@@ -210,6 +230,9 @@ def _print_profile_summary(summary: dict[str, Any]) -> None:
             print(
                 "    "
                 f"memory_loop={row.get('memory_rank_outer_loop_seconds_sum', 0.0):.3f}s "
+                f"packet_mean={row.get('packet_service_seconds_mean', 0.0):.3f}s "
+                f"packet_max={row.get('packet_service_seconds_max', 0.0):.3f}s "
+                f"packet_sources={row.get('packet_service_source_count_mean', 0.0):.1f} "
                 f"pump={row.get('memory_rank_pump_loop_seconds_sum', 0.0):.3f}s "
                 f"replay={row.get('memory_rank_replay_seconds_sum', 0.0):.3f}s "
                 f"replay_ticks={row.get('memory_rank_replay_ticks', 0)} "

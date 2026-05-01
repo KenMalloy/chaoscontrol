@@ -147,6 +147,9 @@ def test_crct_maintenance_mailbox_has_own_request_ring_and_no_result_packets(
     tmp_path,
 ) -> None:
     mod = _load_module("runner_fast_path_crct_maintenance_mailbox", RUNNER_PATH)
+    model = _tiny_crct_model()
+    cache = TransactionalWakeCache(max_moments=0, max_hidden_buffer=0)
+    loop = ReplayEvictionLoop()
     kwargs = {
         "world_size": 8,
         "mailbox_dir": str(tmp_path),
@@ -183,9 +186,59 @@ def test_crct_maintenance_mailbox_has_own_request_ring_and_no_result_packets(
         assert len(rank7.pending_input_requests) == 1
         assert rank7.pending_input_requests[0]["step"] == 3
         assert rank7.diagnostics()["teacher_shm_request_events_popped"] == 1
+        rank7.after_optimizer_step(
+            model=model,
+            cache=cache,
+            scarcity_optimizer=None,
+            step=3,
+            total_steps=4,
+            tau=0.1,
+            strength=0.1,
+            w_max=1.2,
+            alpha_max=0.15,
+            memory_write_tokens=4,
+            replay_eviction_loop=loop,
+        )
+        diag7 = rank7.diagnostics()
+        assert diag7["payloads_scored"] == 0
+        assert diag7["maintenance_score_path_skips"] == 1
+        assert diag7["maintenance_request_frames_ingested"] == 1
+        assert diag7["pending_input_requests"] == 0
+        assert loop.has_probe()
+        assert loop._probe_step == 3
+        torch.testing.assert_close(
+            loop._probe_input_ids,
+            mod._crct_full_input_ids(inputs, targets).to(torch.int32),
+        )
     finally:
         rank7.close()
         rank0.close()
+
+
+def test_crct_packet_builder_matches_force_on_pre_recurrence_lane() -> None:
+    model = _tiny_crct_model()
+    model.eval()
+    torch.manual_seed(7)
+    model.append_memory_from_hidden(torch.randn(2, 4, model.dim), max_tokens=4)
+    inputs = torch.arange(10, dtype=torch.long).reshape(2, 5) % 32
+
+    packet = model.build_episodic_packet(inputs)
+
+    assert packet["packet_source_count"] > 0
+    assert packet["memory_residual"].shape == (2, 1, model.dim)
+    assert packet["memory_gate"].shape == inputs.shape
+    assert torch.equal(packet["memory_gate"], torch.ones_like(packet["memory_gate"]))
+
+    with torch.no_grad():
+        h_force = model.encode(inputs, memory_mode="force_on")
+        h_packet = model.encode(
+            inputs,
+            memory_mode="packet",
+            episodic_residual=packet["memory_residual"],
+            episodic_gate=packet["memory_gate"],
+        )
+
+    torch.testing.assert_close(h_packet, h_force, rtol=1e-5, atol=1e-5)
 
 
 def test_crct_fast_path_allows_bucket_prototypes_as_sidecar_prior() -> None:
@@ -839,15 +892,20 @@ def test_crct_mailbox_transport_matches_stored_batch(tmp_path) -> None:
     assert diag0["request_writer_cpu_copy_seconds_max"] >= 0.0
     assert diag0["request_submit_seconds_max"] >= 0.0
     assert diag3["score_stage_timing_enabled"] is True
-    assert diag3["score_stage_samples"] == 1
-    assert diag3["score_stage_encode_off_seconds_sum"] >= 0.0
-    assert diag3["score_stage_encode_force_on_seconds_sum"] >= 0.0
+    assert diag3["score_stage_samples"] == 0
     assert diag0["request_host_stage_bytes"] == (
         inputs.shape[0] * (inputs.shape[1] + 1) * 4
     )
     assert isinstance(diag0["request_host_pinned"], bool)
     assert diag0["local_batch_gpu_clones"] == 0
-    assert diag3["payloads_scored"] == 1
+    assert diag3["payloads_scored"] == 0
+    assert diag3["payloads_served"] == 1
+    assert diag3["payloads_served_approximate"] == 1
+    assert diag3["packet_service_seconds_max"] >= 0.0
+    assert diag3["packet_service_approx_write_records"] == 4
+    assert torch.count_nonzero(payload["target"]) == 0
+    assert torch.count_nonzero(payload["confidence"]) == 0
+    assert torch.isfinite(payload["memory_gate"]).all()
 
 
 def test_crct_mailbox_gpu3_packet_score_ignores_fastslow_readiness(tmp_path) -> None:
@@ -897,7 +955,9 @@ def test_crct_mailbox_gpu3_packet_score_ignores_fastslow_readiness(tmp_path) -> 
     )
 
     diag3 = rank3.diagnostics()
-    assert diag3["payloads_scored"] == 1
+    assert diag3["payloads_scored"] == 0
+    assert diag3["payloads_served"] == 1
+    assert diag3["payloads_served_approximate"] == 1
     assert diag3["fast_slow_readiness_scores"] == 0
     assert diag3["fast_slow_readiness_skips_gpu3_mirror"] == 1
     assert diag3["fast_slow_decisions_issued"] == 0

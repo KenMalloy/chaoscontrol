@@ -987,6 +987,12 @@ class TestRank3ScoreBatchCausal:
         ):
             assert stage in record, f"stage {stage} missing from record"
             assert record[stage] >= 0.0
+        assert record["_batch_size"] == 2
+        assert record["_seq_len"] == 5
+        assert record["_vocab_size"] == 32
+        assert record["_nll_chunk_budget_bytes"] == float(2 << 30)
+        assert record["_nll_effective_chunk"] >= 1
+        assert record["_nll_chunks_per_pass"] >= 1
 
     def test_record_stage_seconds_default_is_no_op(self) -> None:
         # Without the dict, no aggregation runs and the result still has the

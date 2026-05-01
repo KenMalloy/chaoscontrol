@@ -33,12 +33,15 @@ GPU0-5 trunk ranks on the final 8x run
 
 GPU6 packet-serving rank
   owns the low-latency populated sidecar used to produce residual packets
-  runs memory_off / force_on exact scoring for packet production
-  publishes residual, gate, and plasticity packets without trunk rendezvous
+  builds packets from the pre-recurrence episodic read path without full
+    off/force recurrence or LM-head scoring
+  publishes residual packets without trunk rendezvous
+  does not emit authoritative utility, controller-target, or plasticity labels
 
 GPU7 maintenance rank
   owns learned slot coverage, refresh, distill, and replay-style maintenance
-  runs hide-slot / refresh-candidate physics against its own request stream
+  owns exact memory_off / force_on / hide-slot / refresh-candidate physics
+    against its own request stream
   emits ordered slot commits to GPU6 after CPU-side legality/commit authority
   may warm or capture its own fixed-shape oracle and maintenance CUDA graphs
   cannot warm or capture trunk-rank graphs for them
@@ -56,12 +59,14 @@ topology derives 6+2 automatically when maintenance is enabled; it is not an
 ablation arm.
 
 When GPU6 and GPU7 split, the two memory ranks hold replicated slot identity.
-GPU6 is the serving authority: it appends new packet-serving slots and publishes
-generation-stamped append commits to GPU7. GPU7 never independently appends in
-the split topology; it learns against the replicated serving generations. After
-real physics confirms a maintenance action, GPU7 sends a compact slot commit
-back to GPU6 over the memory-rank peer lane. Commits contain the slot id, event
-id, base generation, new generation, action, and an optional one-slot tensor
+GPU6 is the serving authority for low-latency packets: it bootstrap-appends
+packet-serving slots from the same pre-recurrence stream the trunk will consume
+and publishes generation-stamped append commits to GPU7. Those appends are
+serving proposals, not evidence labels. GPU7 owns the exact counterfactual
+physics and learns against the replicated serving generations. After real
+physics confirms a maintenance action, GPU7 sends a compact slot commit back to
+GPU6 over the memory-rank peer lane. Commits contain the slot id, event id,
+base generation, new generation, action, and an optional one-slot tensor
 payload. GPU6 applies maintenance commits only if the generation matches; stale
 or divergent commits are dropped and counted. The train ranks do not participate
 in this lane. Capacity is owned by learned maintenance in the ARM config:
@@ -97,13 +102,13 @@ stream before the SSM layers. It is not direct A-matrix modulation. If we add
 A-modulation later, it should be named as a separate mechanism rather than
 quietly overloading the residual lane.
 
-The optimizer receives a sibling packet on the same latest-complete protocol:
-the packet-serving rank computes per-channel `plasticity_budget` from the correlation between
-`abs(h_mem - h_off)` and positive memory utility, the mailbox carries the EMA
-alongside the residual packet, and Muon uses it as a bounded LR multiplier on
-SSM-channel parameters. This is the training-time "gist" signal: where episodic
-memory is demonstrably supporting the recurrent state, the trunk can keep that
-channel more plastic without waiting for the memory plane.
+The optimizer-side packet uses the same latest-complete discipline but only
+exact counterfactual physics may author it: per-channel `plasticity_budget`
+comes from the correlation between `abs(h_mem - h_off)` and positive memory
+utility. The low-latency GPU6 serving path deliberately does not synthesize a
+plasticity packet from the approximate residual. When no fresh exact packet is
+available, Muon falls back to last-good or neutral plasticity, matching the
+residual lane's fail-open semantics.
 Muon also owns the SSM role policy for the ARM cell: `delta_proj` stays on the
 AdamW fallback because it encodes per-token timescale specialization, while
 `log_a` gets per-channel beta from a slow EMA of its own value. The EMA is the
@@ -136,11 +141,14 @@ shape gives `384 -> 13.71 MB`, `416 -> 15.19 MB`, `448 -> 16.73 MB`, and
 - The ARM cell writes replay-maintenance traces under `validation/traces/`.
 - `replay_eviction_arm_runtime_enabled` is true and the runtime namespace is
   per-cell.
-- Memory-rank scoring and maintenance telemetry is non-empty.
-- Plasticity telemetry is present:
+- Packet-serving and maintenance telemetry is non-empty:
+  `payloads_served`, `packet_service_seconds_*`, maintenance replay ticks, and
+  exact maintenance/physics counters.
+- Plasticity telemetry is explicit even when neutral:
   `transport_summary.health.plasticity_packets_received`,
-  `plasticity_budget_mean_received`, and optimizer
-  `plasticity_budget.lr_multiplier_max`.
+  `plasticity_packets_missing`, `plasticity_budget_mean_received`, and optimizer
+  `plasticity_budget.lr_multiplier_max` should tell us whether exact evidence
+  packets actually reached the train optimizer.
 - Optimizer role telemetry is present under `optimizer.ssm_role` and
   `optimizer.excluded_params`, including `log_a_beta_*` summaries and counts of
   memory-side params kept out of the train optimizer.
