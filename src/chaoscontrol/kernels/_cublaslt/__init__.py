@@ -18,8 +18,6 @@ Attribution: the kernel design was informed by reading NVIDIA
 TransformerEngine v2.13 (Apache 2.0); no upstream source files were
 copied. See ``NOTICE`` and ``LICENSE_UPSTREAM`` in this directory.
 """
-from __future__ import annotations
-
 from typing import Any
 
 import torch

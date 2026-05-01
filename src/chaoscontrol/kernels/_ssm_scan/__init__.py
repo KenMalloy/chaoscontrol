@@ -27,8 +27,6 @@ can trace them as opaque primitives when the caller is compiled.
 Attribution: informed by FLA (MIT) and Mamba's selective_scan (Apache 2.0)
 — see ``NOTICE`` in this directory. No source files copied.
 """
-from __future__ import annotations
-
 from typing import Any
 
 import torch
