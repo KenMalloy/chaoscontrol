@@ -111,6 +111,7 @@ def build_arm_config(hyperparams: Any) -> dict[str, Any]:
         "data_path",
         "val_cache_dir",
         "sp_model_path",
+        "activation_checkpoint",
     )
     for key in _FORWARD_KEYS:
         val = getattr(hyperparams, key, _MISSING)
