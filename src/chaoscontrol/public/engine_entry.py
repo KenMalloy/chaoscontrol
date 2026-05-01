@@ -34,7 +34,36 @@ class RoleInfo:
 
 
 def init_arm_topology(rank: int, world_size: int) -> RoleInfo:
-    raise NotImplementedError
+    """Assign GPU role based on rank and world_size.
+
+    8+ GPU (split=True):  ranks 0..N-3 train, rank N-2 packet-serving, rank N-1 maintenance
+    4 GPU (split=False):  ranks 0..2 train, rank 3 owns both memory roles
+    1 GPU:                rank 0 is train only (no dedicated memory GPU)
+    """
+    world = int(world_size)
+    split = world >= 8
+    packet_rank = world - (2 if split else 1)
+    maintenance_rank = world - 1
+    if world <= 1:
+        # Single GPU: no dedicated memory ranks; rank 0 is train-only.
+        is_packet = False
+        is_maintenance = False
+        is_train = True
+    else:
+        is_packet = rank == packet_rank
+        is_maintenance = rank == maintenance_rank
+        # On 4 GPU: packet_rank == maintenance_rank == 3, so that rank is both.
+        is_train = not is_packet and not is_maintenance
+    return RoleInfo(
+        rank=rank,
+        world_size=world_size,
+        packet_rank=packet_rank,
+        maintenance_rank=maintenance_rank,
+        is_train_rank=is_train,
+        is_packet_rank=is_packet,
+        is_maintenance_rank=is_maintenance,
+        split_memory_ranks=split,
+    )
 
 
 def build_arm_config(hyperparams: Any) -> dict[str, Any]:
