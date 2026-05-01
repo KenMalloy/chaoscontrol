@@ -41,6 +41,8 @@ def init_arm_topology(rank: int, world_size: int) -> RoleInfo:
     1 GPU:                rank 0 is train only (no dedicated memory GPU)
     """
     world = int(world_size)
+    if world > 0:
+        assert 0 <= rank < world, f"rank {rank} out of range for world_size {world}"
     split = world >= 8
     packet_rank = world - (2 if split else 1)
     maintenance_rank = world - 1
@@ -56,7 +58,7 @@ def init_arm_topology(rank: int, world_size: int) -> RoleInfo:
         is_train = not is_packet and not is_maintenance
     return RoleInfo(
         rank=rank,
-        world_size=world_size,
+        world_size=world,
         packet_rank=packet_rank,
         maintenance_rank=maintenance_rank,
         is_train_rank=is_train,
