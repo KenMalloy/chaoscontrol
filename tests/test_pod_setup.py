@@ -108,6 +108,27 @@ class TestPodNativeExtensionBootstrap:
         assert "verify_sp16384_eval_cache.py" in source
         assert "not required for Exp26" in source
 
+    def test_one_command_bootstrap_records_stage_timing(self) -> None:
+        """Fresh-pod setup cost must be measurable after the fact, including
+        partial timing if the bootstrap fails before reaching the smoke check.
+        """
+        source = POD_BOOTSTRAP.read_text()
+        assert "BOOTSTRAP_TIMING_PATH" in source
+        assert "_bootstrap_record_timing" in source
+        assert "_bootstrap_step_begin" in source
+        assert "_bootstrap_step_end" in source
+        assert "trap _bootstrap_on_exit EXIT" in source
+        assert "[bootstrap-timing]" in source
+        for step in (
+            "setup_cuda13",
+            "build_native_extensions",
+            "install_hf_requests",
+            "fetch_sp16384",
+            "optional_val_cache",
+            "smoke_check",
+        ):
+            assert f'"{step}"' in source
+
     def test_native_extension_helper_pins_cuda_home_and_builds_all_required_extensions(
         self,
     ) -> None:
