@@ -1,5 +1,17 @@
+import os
+
 import pytest
-from chaoscontrol.public.engine_entry import init_arm_topology
+
+os.environ.setdefault(
+    "CHAOSCONTROL_ROOT",
+    "/Users/kennethmalloy/Local Documents/Developer/chaoscontrol",
+)
+
+from chaoscontrol.public.engine_entry import build_arm_config, init_arm_topology  # noqa: E402
+
+
+class _FakeHyperparams:
+    """Minimal stand-in for a hyperparams object with no required attributes."""
 
 
 def test_init_arm_topology_8gpu():
@@ -49,3 +61,23 @@ def test_packet_rank_value_8gpu():
     role = init_arm_topology(rank=0, world_size=8)
     assert role.packet_rank == 6
     assert role.maintenance_rank == 7
+
+
+def test_build_arm_config_telemetry_tuned_defaults():
+    cfg = build_arm_config(_FakeHyperparams())
+    assert cfg["crct_memory_write_tokens_per_step"] == 256
+    assert cfg["online_episodic_write_tokens_per_chunk"] == 64
+    assert abs(cfg["crct_target_write_rate"] - 0.25) < 1e-6
+
+
+def test_build_arm_config_eval_routing():
+    cfg = build_arm_config(_FakeHyperparams())
+    assert cfg.get("calc_types") == ["packet_online_cache"]
+    assert cfg.get("headline_calc_type") == "packet_online_cache"
+
+
+def test_build_arm_config_hyperparams_forwarded():
+    hp = _FakeHyperparams()
+    hp.model_dim = 384
+    cfg = build_arm_config(hp)
+    assert cfg.get("model_dim") == 384
