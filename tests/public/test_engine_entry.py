@@ -110,3 +110,36 @@ def test_run_arm_submission_signature():
     params = sig.parameters
     for key in ("config", "data_path", "sp_model_path", "budget_seconds", "output_json", "val_cache_dir"):
         assert key in params, f"Missing parameter: {key}"
+
+
+def test_run_arm_submission_delegates_to_run_condition(monkeypatch):
+    """Verify the wrapper actually delegates to run_condition with expected args."""
+    import sys
+    _exp_dir = str(pathlib.Path(__file__).parent.parent.parent / "experiments" / "23_fast_path")
+    if _exp_dir not in sys.path:
+        sys.path.insert(0, _exp_dir)
+    import runner_fast_path
+
+    calls = []
+
+    def _fake_run_condition(config, **kwargs):
+        calls.append({"config": config, "kwargs": kwargs})
+        return {"train": {}, "eval": {"bpb": 1.5}, "artifact": {}}
+
+    monkeypatch.setattr(runner_fast_path, "run_condition", _fake_run_condition)
+
+    result = run_arm_submission(
+        {"model_dim": 384},
+        data_path="/data",
+        sp_model_path="/tok.model",
+        budget_seconds=600,
+        output_json="/out.json",
+        val_cache_dir="/val",
+    )
+
+    assert len(calls) == 1
+    call = calls[0]
+    assert call["config"]["model_dim"] == 384
+    assert call["kwargs"]["data_path"] == "/data"
+    assert call["kwargs"]["budget_seconds"] == 600.0
+    assert "bpb" in result.get("eval", {})
