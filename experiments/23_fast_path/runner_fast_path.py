@@ -1650,6 +1650,28 @@ def _hotpath_yield() -> None:
         sched_yield()
 
 
+def _should_stop_memory_rank_loop(
+    *,
+    steps: int,
+    elapsed_s: float,
+    budget_seconds: float,
+    stop_margin_seconds: float,
+    max_steps: int | None = None,
+) -> bool:
+    """Stop predicate for async memory ranks.
+
+    The shared train-rank predicate deliberately refuses to stop at
+    ``steps == 0`` so a cold train rank cannot exit before doing work. Memory
+    ranks count scored/served packets, not trunk steps; when no requests arrive
+    they can legitimately remain at zero local steps and must still exit on the
+    wall-clock budget so teardown collectives cannot hang.
+    """
+    if max_steps is not None and int(steps) >= int(max_steps):
+        return True
+    effective_budget = max(0.0, float(budget_seconds) - float(stop_margin_seconds))
+    return float(elapsed_s) >= effective_budget
+
+
 def _crct_rank_topology(
     *,
     world_size: int,
@@ -9905,13 +9927,22 @@ def _train_fast_for_budget_cuda_graph(
                 or max_steps_reached
             ):
                 elapsed = time.perf_counter() - start_time
-                local_stop = should_stop_training_loop(
-                    steps=steps,
-                    elapsed_s=elapsed,
-                    budget_seconds=budget_seconds,
-                    stop_margin_seconds=stop_margin_seconds,
-                    max_steps=max_steps,
-                )
+                if memory_rank_wall_stop_check:
+                    local_stop = _should_stop_memory_rank_loop(
+                        steps=steps,
+                        elapsed_s=elapsed,
+                        budget_seconds=budget_seconds,
+                        stop_margin_seconds=stop_margin_seconds,
+                        max_steps=max_steps,
+                    )
+                else:
+                    local_stop = should_stop_training_loop(
+                        steps=steps,
+                        elapsed_s=elapsed,
+                        budget_seconds=budget_seconds,
+                        stop_margin_seconds=stop_margin_seconds,
+                        max_steps=max_steps,
+                    )
                 stop_ddp_active = bool(ddp_active)
                 stop_group_eff = stop_group
                 if crct_enabled and not episodic_enabled and is_episodic_rank:
@@ -11481,13 +11512,22 @@ def train_fast_for_budget(
                 or max_steps_reached
             ):
                 elapsed = time.perf_counter() - start_time
-                local_stop = should_stop_training_loop(
-                    steps=steps,
-                    elapsed_s=elapsed,
-                    budget_seconds=budget_seconds,
-                    stop_margin_seconds=stop_margin_seconds,
-                    max_steps=max_steps,
-                )
+                if memory_rank_wall_stop_check:
+                    local_stop = _should_stop_memory_rank_loop(
+                        steps=steps,
+                        elapsed_s=elapsed,
+                        budget_seconds=budget_seconds,
+                        stop_margin_seconds=stop_margin_seconds,
+                        max_steps=max_steps,
+                    )
+                else:
+                    local_stop = should_stop_training_loop(
+                        steps=steps,
+                        elapsed_s=elapsed,
+                        budget_seconds=budget_seconds,
+                        stop_margin_seconds=stop_margin_seconds,
+                        max_steps=max_steps,
+                    )
                 stop_ddp_active = bool(ddp_active)
                 stop_group_eff = stop_group
                 if crct_enabled and not episodic_enabled and is_episodic_rank:
