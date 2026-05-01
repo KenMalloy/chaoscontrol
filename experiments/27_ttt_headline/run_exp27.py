@@ -270,8 +270,9 @@ def main(argv: list[str] | None = None) -> int:
         type=Path,
         default=None,
         help=(
-            "Reserved for a future explicit checkpoint-load path. Currently "
-            "unsupported because runner_fast_path does not load this field."
+            "Optional trained trunk checkpoint. When set, Exp27 runs "
+            "eval-only calc_types against this checkpoint instead of "
+            "training a fresh trunk."
         ),
     )
     parser.add_argument("--world-size", type=int, default=4)

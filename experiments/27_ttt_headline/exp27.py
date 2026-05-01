@@ -113,12 +113,6 @@ def build_ttt_headline_matrix(
     same trained weights. Calibrated hyperparameters for each calc_type
     are read from the manifest and embedded into the entry config.
     """
-    if checkpoint_path is not None:
-        raise NotImplementedError(
-            "Exp27 checkpoint_path is not wired into runner_fast_path loading. "
-            "Run the Exp26 ARM entry fresh for final TTT, or add an explicit "
-            "checkpoint-load path before using this option."
-        )
     seeds = list(seed_values) if seed_values is not None else list(
         DEFAULT_HEADLINE_SEEDS
     )
@@ -173,5 +167,14 @@ def build_ttt_headline_matrix(
                 "checkpoint_path": ckpt_value,
             }
         )
+        if ckpt_value is not None:
+            entry.update(
+                {
+                    "eval_only": True,
+                    "warmup_steps": 0,
+                    "max_steps": 0,
+                    "restore_after_warmup": False,
+                }
+            )
         entries.append(entry)
     return entries

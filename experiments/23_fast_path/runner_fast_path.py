@@ -284,6 +284,70 @@ def _merge_online_eval_state_payloads(
     return merged
 
 
+def _load_checkpoint_into_model_for_runner(
+    model: torch.nn.Module,
+    checkpoint_path: str | Path,
+) -> dict[str, Any]:
+    """Load a runner checkpoint and return metadata needed by eval-only runs."""
+    path = Path(checkpoint_path)
+    if not path.exists():
+        raise FileNotFoundError(f"checkpoint_path does not exist: {path}")
+    blob = torch.load(path, map_location="cpu", weights_only=False)
+    if not isinstance(blob, dict):
+        raise TypeError(f"checkpoint at {path} must be a dict, got {type(blob)!r}")
+    state = blob.get("model")
+    if not isinstance(state, dict):
+        raise KeyError(f"checkpoint at {path} missing dict key 'model'")
+    load_result = model.load_state_dict(state, strict=True)
+    online_eval_state = blob.get("online_eval_state")
+    if not isinstance(online_eval_state, dict):
+        online_eval_state = {}
+    return {
+        "checkpoint_path": str(path),
+        "checkpoint_keys": sorted(str(k) for k in blob.keys()),
+        "missing_keys": list(getattr(load_result, "missing_keys", [])),
+        "unexpected_keys": list(getattr(load_result, "unexpected_keys", [])),
+        "online_eval_state": online_eval_state,
+    }
+
+
+def _train_fast_eval_only_result(
+    model: torch.nn.Module,
+    **kwargs: Any,
+) -> dict[str, Any]:
+    """Return a finite train-result shell for checkpoint-only eval runs."""
+    device = kwargs.get("device", torch.device("cpu"))
+    rank = int(kwargs.get("rank", 0))
+    world_size = int(kwargs.get("world_size", 1))
+    seq_len = int(kwargs.get("seq_len", 0))
+    batch_size = int(kwargs.get("batch_size", 0))
+    if isinstance(device, torch.device) and device.type == "cuda":
+        peak_vram_mb = float(torch.cuda.max_memory_allocated(device) / (1 << 20))
+    else:
+        peak_vram_mb = 0.0
+    artifact_bytes = (
+        int(model.artifact_bytes())
+        if hasattr(model, "artifact_bytes")
+        else int(sum(p.numel() for p in model.parameters()) * 2)
+    )
+    return {
+        "eval_only": True,
+        "steps": 0,
+        "elapsed_s": 0.0,
+        "rank": rank,
+        "world_size": world_size,
+        "initial_loss": 0.0,
+        "final_loss": 0.0,
+        "loss_trajectory": [],
+        "loss_delta": 0.0,
+        "peak_vram_mb": peak_vram_mb,
+        "aggregate_tokens_per_sec": 0.0,
+        "per_gpu_tokens_per_sec": 0.0,
+        "tokens_per_step": int(batch_size * seq_len * max(1, world_size)),
+        "artifact_bytes_estimate": artifact_bytes,
+    }
+
+
 def _env_int(name: str, default: int) -> int:
     val = os.environ.get(name)
     if val is None:
@@ -14050,6 +14114,20 @@ def run_condition(
         model, crct_enabled=bool(config.get("crct_enabled", False))
     )
     model_params = sum(p.numel() for p in model.parameters())
+    eval_only = bool(config.get("eval_only", False))
+    checkpoint_load_metadata: dict[str, Any] | None = None
+    checkpoint_online_eval_state: dict[str, Any] = {}
+    checkpoint_path_value = str(config.get("checkpoint_path", "") or "").strip()
+    if checkpoint_path_value:
+        checkpoint_load_metadata = _load_checkpoint_into_model_for_runner(
+            model,
+            checkpoint_path_value,
+        )
+        raw_online_state = checkpoint_load_metadata.get("online_eval_state")
+        if isinstance(raw_online_state, dict):
+            checkpoint_online_eval_state = raw_online_state
+    elif eval_only:
+        raise ValueError("eval_only=True requires config.checkpoint_path")
 
     if is_rank0:
         print(
@@ -14060,26 +14138,38 @@ def run_condition(
             f"params={model_params:,}",
             flush=True,
         )
+        if checkpoint_load_metadata is not None:
+            print(
+                f"[rank 0/{world_size}] loaded checkpoint "
+                f"{checkpoint_load_metadata['checkpoint_path']} "
+                f"eval_only={eval_only}",
+                flush=True,
+            )
 
     saved_state = None
-    if bool(config.get("restore_after_warmup", False)) and int(config.get("warmup_steps", 0)) > 0:
+    if (
+        not eval_only
+        and bool(config.get("restore_after_warmup", False))
+        and int(config.get("warmup_steps", 0)) > 0
+    ):
         saved_state = _state_dict_clone(model)
-    optimizer = _build_optimizer(config, model)
-    _warmup(
-        model=model,
-        train_tokens=train_tokens,
-        train_num_tokens=int(train_tokens.numel()),
-        stride=stride,
-        seq_len=seq_len,
-        batch_size=batch_size,
-        device=device,
-        optimizer=optimizer,
-        config=config,
-        rank=rank,
-        world_size=world_size,
-        seed=seed,
-        vocab_size=vocab_size,
-    )
+    optimizer = None if eval_only else _build_optimizer(config, model)
+    if not eval_only:
+        _warmup(
+            model=model,
+            train_tokens=train_tokens,
+            train_num_tokens=int(train_tokens.numel()),
+            stride=stride,
+            seq_len=seq_len,
+            batch_size=batch_size,
+            device=device,
+            optimizer=optimizer,
+            config=config,
+            rank=rank,
+            world_size=world_size,
+            seed=seed,
+            vocab_size=vocab_size,
+        )
     if saved_state is not None:
         _restore_state_dict(model, saved_state)
         optimizer = _build_optimizer(config, model)
@@ -14112,7 +14202,10 @@ def run_condition(
         )
         crct_teacher_mailbox_dir = str(Path("/dev/shm") / "chaoscontrol_crct" / stem)
 
-    train_result = train_fast_for_budget(
+    train_fast_impl = (
+        _train_fast_eval_only_result if eval_only else train_fast_for_budget
+    )
+    train_result = train_fast_impl(
         model,
         train_tokens=train_tokens,
         train_num_tokens=int(train_tokens.numel()),
@@ -14599,6 +14692,15 @@ def run_condition(
             config.get("replay_eviction_evidence_engine_d_model", 384)
         ),
     )
+    if checkpoint_load_metadata is not None:
+        train_result["checkpoint_path"] = str(
+            checkpoint_load_metadata["checkpoint_path"]
+        )
+        train_result["checkpoint_keys"] = list(
+            checkpoint_load_metadata.get("checkpoint_keys", [])
+        )
+        if checkpoint_online_eval_state and "_online_eval_state" not in train_result:
+            train_result["_online_eval_state"] = checkpoint_online_eval_state
     episodic_cache_payload = train_result.pop("_episodic_cache_payload", None)
     online_eval_state_payload = train_result.pop("_online_eval_state", None)
     if isinstance(online_eval_state_payload, dict) and online_eval_state_payload:

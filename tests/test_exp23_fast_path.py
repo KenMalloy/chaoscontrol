@@ -100,6 +100,31 @@ def test_score_stage_timing_config_reaches_main_train_call() -> None:
     assert source.count('config.get("crct_score_stage_timing_enabled", False)') >= 2
 
 
+def test_runner_checkpoint_loader_restores_model_and_online_eval_state(tmp_path):
+    mod = _load_runner_module()
+    model = nn.Linear(3, 2)
+    src = nn.Linear(3, 2)
+    with torch.no_grad():
+        src.weight.fill_(0.25)
+        src.bias.fill_(0.75)
+    ckpt = tmp_path / "runner.pt"
+    torch.save(
+        {
+            "model": src.state_dict(),
+            "online_eval_state": {"packet_cache": {"schema_version": 1}},
+        },
+        ckpt,
+    )
+
+    meta = mod._load_checkpoint_into_model_for_runner(model, ckpt)
+
+    assert meta["checkpoint_path"] == str(ckpt)
+    assert "model" in meta["checkpoint_keys"]
+    assert meta["online_eval_state"] == {"packet_cache": {"schema_version": 1}}
+    assert torch.allclose(model.weight, src.weight)
+    assert torch.allclose(model.bias, src.bias)
+
+
 def test_crct_memory_rank_checks_wall_clock_even_when_idle() -> None:
     """Idle memory rank must stop from wall clock, not local score steps."""
     mod = _load_runner_module()
