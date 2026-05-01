@@ -685,6 +685,7 @@ def _build_optimizer(
                 "semantic_tier.",
                 "bucket_prototypes_module.",
             ) if bool(config.get("crct_enabled", False)) else (),
+            weight_ema_fake_quant_bits=int(config.get("weight_ema_fake_quant_bits", 0)),
         )
         return opt
     if name == "semantic":

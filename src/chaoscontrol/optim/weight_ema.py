@@ -37,6 +37,7 @@ class WeightEMA:
         *,
         decay: float,
         exclude_prefixes: Iterable[str] = (),
+        fake_quant_bits: int = 0,
     ) -> None:
         if not 0.0 <= decay < 1.0:
             raise ValueError(f"decay must be in [0, 1), got {decay}")
@@ -53,6 +54,7 @@ class WeightEMA:
             if self._is_excluded(name):
                 continue
             self.shadow[name] = param.detach().to(torch.float32).clone()
+        self.fake_quant_bits = int(fake_quant_bits)
 
     def _is_excluded(self, name: str) -> bool:
         return any(name.startswith(prefix) for prefix in self.exclude_prefixes)
@@ -68,6 +70,8 @@ class WeightEMA:
         for name, shadow_t in self.shadow.items():
             current = sd[name]
             shadow_t.mul_(decay).add_(current.detach().to(torch.float32), alpha=alpha)
+            if self.fake_quant_bits > 0:
+                _fake_quant_per_tensor_(shadow_t, bits=self.fake_quant_bits)
 
     @contextlib.contextmanager
     def applied(self, model: torch.nn.Module) -> Iterator[None]:
@@ -87,6 +91,23 @@ class WeightEMA:
         finally:
             for name, original in saved.items():
                 sd[name].copy_(original)
+
+
+@torch.no_grad()
+def _fake_quant_per_tensor_(t: torch.Tensor, *, bits: int) -> None:
+    """In-place per-tensor symmetric uniform fake-quant.
+
+    Clamps ``t`` onto a (2**bits - 1)-level grid covering [-amax, +amax].
+    Used as a soft regularizer toward the artifact's quantization manifold.
+    """
+    if bits <= 0:
+        return
+    levels = (1 << bits) - 1
+    amax = t.abs().max()
+    if amax.item() == 0.0:
+        return
+    scale = amax / (levels // 2)
+    t.div_(scale).round_().mul_(scale)
 
 
 from typing import Callable, TypeVar

@@ -27,6 +27,7 @@ def wrap_optimizer_step(
     weight_ema_decay: float,
     is_rank_zero: bool,
     ema_exclude_prefixes: Iterable[str],
+    weight_ema_fake_quant_bits: int = 0,
 ) -> None:
     """Replace ``optimizer.step`` with a closure that schedules momentum and
     updates a weight EMA. Mutates ``optimizer`` in place.
@@ -40,6 +41,7 @@ def wrap_optimizer_step(
             model,
             decay=weight_ema_decay,
             exclude_prefixes=tuple(ema_exclude_prefixes),
+            fake_quant_bits=weight_ema_fake_quant_bits,
         )
     else:
         ema = None
