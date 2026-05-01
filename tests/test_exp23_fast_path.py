@@ -145,9 +145,25 @@ def test_dist_work_done_uses_timeout_bounded_wait_for_progress() -> None:
         IncompleteWork(),
         device=torch.device("cpu"),
     ) is False
-    assert calls == ["is_completed"]
+    assert calls == ["is_completed", "is_completed"]
     assert waits
     assert waits[0].total_seconds() <= 0.001
+
+
+def test_dist_work_done_rechecks_completion_after_timeout_wait() -> None:
+    mod = _load_runner_module()
+
+    class MisleadingWaitWork:
+        def is_completed(self):
+            return False
+
+        def wait(self, _timeout):
+            return True
+
+    assert mod._dist_work_done(
+        MisleadingWaitWork(),
+        device=torch.device("cpu"),
+    ) is False
 
 
 def test_dist_work_done_fallback_wait_is_timeout_bounded() -> None:

@@ -1661,6 +1661,7 @@ def _dist_work_done(
     if work is None:
         return True
     is_completed = getattr(work, "is_completed", None)
+    has_completion_probe = callable(is_completed)
     if callable(is_completed):
         try:
             if bool(is_completed()):
@@ -1670,7 +1671,13 @@ def _dist_work_done(
     wait = getattr(work, "wait", None)
     if callable(wait):
         try:
-            return bool(wait(datetime.timedelta(milliseconds=1)))
+            wait_result = wait(datetime.timedelta(milliseconds=1))
+            if has_completion_probe:
+                try:
+                    return bool(is_completed())
+                except Exception:
+                    return False
+            return bool(wait_result)
         except TypeError:
             return False
         except Exception:
