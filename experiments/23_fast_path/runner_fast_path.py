@@ -191,6 +191,66 @@ from runner_exp21 import (  # noqa: E402
 )
 
 
+def _outer_slot_count_for_eval(model: torch.nn.Module) -> int:
+    outer = getattr(model, "outer_model", None)
+    table = getattr(outer, "table", None)
+    if table is not None:
+        return int(len(table))
+    slots = getattr(outer, "_slots", None)
+    if slots is not None:
+        return int(len(slots))
+    return 0
+
+
+def _crct_packet_cache_eval_state(model: torch.nn.Module) -> dict[str, Any] | None:
+    """Snapshot the packet-rank slot bank for post-train eval.
+
+    The train ranks run the packet lane without owning CRCT slots. Exp27's
+    calc-type eval runs on rank 0 after the DDP loop, so rank 0 must inherit
+    the packet rank's latest complete cache before scoring. This transfer is
+    outside the training timer and contains no validation data.
+    """
+    outer = getattr(model, "outer_model", None)
+    get_extra_state = getattr(outer, "get_extra_state", None)
+    if not callable(get_extra_state):
+        return None
+    slot_count = _outer_slot_count_for_eval(model)
+    return {
+        "schema_version": 1,
+        "slot_count": int(slot_count),
+        "outer_model_extra_state": get_extra_state(),
+    }
+
+
+def _apply_crct_packet_cache_eval_state(
+    model: torch.nn.Module,
+    state: dict[str, Any] | None,
+) -> int:
+    """Install a packet-rank slot-bank snapshot on the local eval model."""
+    if not isinstance(state, dict):
+        return 0
+    extra_state = state.get("outer_model_extra_state")
+    if not isinstance(extra_state, dict):
+        return 0
+    outer = getattr(model, "outer_model", None)
+    set_extra_state = getattr(outer, "set_extra_state", None)
+    if not callable(set_extra_state):
+        raise AttributeError("model.outer_model must expose set_extra_state()")
+    set_extra_state(extra_state)
+    return _outer_slot_count_for_eval(model)
+
+
+def _merge_online_eval_state_payloads(
+    payloads: list[dict[str, Any] | None] | tuple[dict[str, Any] | None, ...],
+) -> dict[str, Any]:
+    """Merge rank-local online eval state from packet and maintenance ranks."""
+    merged: dict[str, Any] = {}
+    for payload in payloads:
+        if isinstance(payload, dict):
+            merged.update(payload)
+    return merged
+
+
 def _env_int(name: str, default: int) -> int:
     val = os.environ.get(name)
     if val is None:
@@ -12140,28 +12200,30 @@ def train_fast_for_budget(
                 crct_rank_diagnostics = gathered_crct
         else:
             crct_rank_diagnostics = [crct_local_diagnostics]
-        local_online_state: dict[str, Any] | None = None
+        local_online_state: dict[str, Any] = {}
         if replay_eviction_loop is not None and rank_ == int(crct_maintenance_rank):
-            local_online_state = {
-                "replay_eviction": replay_eviction_loop.state_dict()
-            }
+            local_online_state["replay_eviction"] = replay_eviction_loop.state_dict()
+        if rank_ == int(crct_packet_rank):
+            packet_cache_state = _crct_packet_cache_eval_state(model)
+            if packet_cache_state is not None:
+                local_online_state["packet_cache"] = packet_cache_state
+        local_online_payload = local_online_state or None
         if ddp_active and dist.is_initialized() and all_group is not None:
             gathered_online: list[dict[str, Any] | None] | None = (
                 [None for _ in range(world_size_)] if rank_ == 0 else None
             )
             dist.gather_object(
-                local_online_state,
+                local_online_payload,
                 object_gather_list=gathered_online,
                 dst=0,
                 group=object_group or all_group,
             )
             if rank_ == 0 and gathered_online is not None:
-                online_eval_state_payload = next(
-                    (p for p in gathered_online if p),
-                    {},
+                online_eval_state_payload = _merge_online_eval_state_payloads(
+                    gathered_online
                 )
-        elif local_online_state:
-            online_eval_state_payload = local_online_state
+        elif local_online_payload:
+            online_eval_state_payload = local_online_payload
 
     elapsed_s = time.perf_counter() - start_time
     loss_cpu = torch.stack(losses).cpu() if losses else torch.empty(0)
@@ -13730,6 +13792,15 @@ def run_condition(
     online_eval_state_payload = train_result.pop("_online_eval_state", None)
     if isinstance(online_eval_state_payload, dict) and online_eval_state_payload:
         model._online_eval_state = online_eval_state_payload
+        applied_slots = _apply_crct_packet_cache_eval_state(
+            model,
+            online_eval_state_payload.get("packet_cache"),
+        )
+        if applied_slots > 0:
+            train_result["online_eval_packet_cache_slots"] = int(applied_slots)
+        train_result["online_eval_state_keys"] = sorted(
+            str(k) for k in online_eval_state_payload.keys()
+        )
 
     if ddp_active:
         dist.barrier()

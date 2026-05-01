@@ -111,6 +111,38 @@ def test_crct_rank_topology_splits_packet_and_maintenance_only_at_8x() -> None:
     assert top8["split_memory_ranks"] is True
 
 
+def test_crct_online_eval_state_merges_packet_cache_and_maintenance_state() -> None:
+    mod = _load_module("runner_fast_path_crct_online_eval_state", RUNNER_PATH)
+    packet_model = _tiny_crct_model()
+    records = packet_model.append_memory_from_hidden(
+        torch.randn(1, 4, packet_model.dim),
+        max_tokens=3,
+    )
+    assert len(records) == 3
+
+    packet_state = mod._crct_packet_cache_eval_state(packet_model)
+    merged = mod._merge_online_eval_state_payloads(
+        [
+            {"packet_cache": packet_state},
+            {"replay_eviction": {"schema_version": 1, "updates_total": 7}},
+            None,
+        ]
+    )
+
+    assert set(merged) == {"packet_cache", "replay_eviction"}
+    assert merged["packet_cache"]["slot_count"] == 3
+    assert merged["replay_eviction"]["updates_total"] == 7
+
+    eval_model = _tiny_crct_model()
+    assert len(eval_model.outer_model.table) == 0
+    applied = mod._apply_crct_packet_cache_eval_state(
+        eval_model,
+        merged["packet_cache"],
+    )
+    assert applied == 3
+    assert len(eval_model.outer_model.table) == 3
+
+
 def test_crct_maintenance_mailbox_has_own_request_ring_and_no_result_packets(
     tmp_path,
 ) -> None:
