@@ -294,12 +294,19 @@ def _requires_online_replay_eval(blob: dict, cfg: dict) -> bool:
     )
 
 
-def _build_model_with_blob(ckpt_path: Path) -> tuple[torch.nn.Module, dict, dict]:
+def _build_model_with_blob(
+    ckpt_path: Path,
+    *,
+    allow_online_replay_checkpoint: bool = False,
+) -> tuple[torch.nn.Module, dict, dict]:
     from chaoscontrol.model import CareStudentLM
 
     blob = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     cfg = blob["config"]
-    if _requires_online_replay_eval(blob, cfg):
+    if (
+        _requires_online_replay_eval(blob, cfg)
+        and not bool(allow_online_replay_checkpoint)
+    ):
         raise RuntimeError(_ONLINE_REPLAY_EVAL_ERROR)
     model = CareStudentLM(**cfg)
     model.load_state_dict(blob["model"], strict=True)
@@ -969,7 +976,12 @@ def run(args: argparse.Namespace) -> dict:
 
     setup_t0 = time.monotonic()
     cache = load_val_cache(args.cache_dir)
-    model, ckpt_cfg, ckpt_blob = _build_model_with_blob(args.checkpoint_path)
+    model, ckpt_cfg, ckpt_blob = _build_model_with_blob(
+        args.checkpoint_path,
+        allow_online_replay_checkpoint=bool(
+            args.allow_online_replay_checkpoint
+        ),
+    )
     model.to(device)
     model.eval()
     if args.torch_compile_mode != "none":
@@ -1375,6 +1387,16 @@ def parse_args() -> argparse.Namespace:
             "warning when set: the CPU SSM controller's online learning "
             "loop is not yet wired into the eval path. Until that lands, "
             "trained-online arms behave identically to trained-frozen."
+        ),
+    )
+    parser.add_argument(
+        "--allow-online-replay-checkpoint",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Allow frozen-weight score-only eval of checkpoints that carry "
+            "CRCT replay-eviction online state. This is an explicit diagnostic "
+            "escape hatch: the CPU/GPU memory control plane is not run."
         ),
     )
     parser.add_argument("--device", default="auto")

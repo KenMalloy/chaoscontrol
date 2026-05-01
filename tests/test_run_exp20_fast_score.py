@@ -372,7 +372,6 @@ def test_fast_score_rejects_online_replay_eviction_checkpoint(tmp_path: Path) ->
                 "num_layers": 1,
                 "block_type": "ssm",
                 "a_mode": "diag",
-                "replay_eviction_enabled": True,
             },
             "online_eval_state": {"replay_eviction": {"schema_version": 1}},
         },
@@ -381,6 +380,44 @@ def test_fast_score_rejects_online_replay_eviction_checkpoint(tmp_path: Path) ->
 
     with pytest.raises(RuntimeError, match="GPU3 memory oracle"):
         fast_score._build_model_with_blob(ckpt_path)
+
+
+def test_fast_score_can_explicitly_allow_online_replay_checkpoint(
+    tmp_path: Path,
+) -> None:
+    from chaoscontrol.model import CareStudentLM
+
+    model = CareStudentLM(
+        vocab_size=32,
+        dim=8,
+        num_layers=1,
+        block_type="ssm",
+        a_mode="diag",
+    )
+    ckpt_path = tmp_path / "online_allowed.pt"
+    torch.save(
+        {
+            "model": model.state_dict(),
+            "config": {
+                "vocab_size": 32,
+                "dim": 8,
+                "num_layers": 1,
+                "block_type": "ssm",
+                "a_mode": "diag",
+            },
+            "online_eval_state": {"replay_eviction": {"schema_version": 1}},
+        },
+        ckpt_path,
+    )
+
+    loaded, cfg, blob = fast_score._build_model_with_blob(
+        ckpt_path,
+        allow_online_replay_checkpoint=True,
+    )
+
+    assert isinstance(loaded, CareStudentLM)
+    assert cfg["vocab_size"] == 32
+    assert blob["online_eval_state"]["replay_eviction"]["schema_version"] == 1
 
 
 def test_fake_graph_path_matches_eager_and_replays_zero_initial_chunks(
