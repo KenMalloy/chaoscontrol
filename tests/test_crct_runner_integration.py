@@ -717,12 +717,15 @@ def test_slot_commit_peer_transport_updates_packet_cache_over_cpu_control_group(
     assert rank1["append_event_id"] == 700
 
 
-def test_crct_split_slot_commit_group_is_gloo_control_plane() -> None:
-    """Split memory slot commits must not leave dangling NCCL P2P receives."""
+def test_crct_split_runtime_does_not_use_gloo_slot_commit_p2p() -> None:
+    """Split memory ranks mirror request frames instead of P2P slot commits."""
     source = RUNNER_PATH.read_text()
-    assert "slot_commit_group = dist.new_group(" in source
-    assert 'backend="gloo"' in source
-    assert "device=torch.device(\"cpu\")" in source
+    assert "maintenance_local_append_packets" in source
+    assert "and int(crct_packet_rank) != int(crct_maintenance_rank)" not in source[
+        source.index("crct_slot_commit_transport:") : source.index(
+            "if bool(replay_eviction_enabled)"
+        )
+    ]
 
 
 def test_exp24_model_builder_threads_crct_memory_without_trunk_controller() -> None:

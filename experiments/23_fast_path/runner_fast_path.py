@@ -3300,6 +3300,11 @@ class _CrctMailboxTeacherTransport:
             "maintenance_request_frames_ingested": 0,
             "maintenance_request_frames_dropped_no_loop": 0,
             "maintenance_score_path_skips": 0,
+            "maintenance_local_append_packets": 0,
+            "maintenance_local_append_records": 0,
+            "maintenance_local_append_seconds_sum": 0.0,
+            "maintenance_local_append_seconds_max": 0.0,
+            "maintenance_local_append_errors": 0,
             "memory_packets_sent": 0,
             "memory_packets_received": 0,
             "memory_packet_bytes_sent": 0,
@@ -3721,7 +3726,12 @@ class _CrctMailboxTeacherTransport:
                 fast_slow=None,
             )
         if self.rank == self.memory_rank and not self.produce_results:
-            self._ingest_maintenance_requests(replay_eviction_loop=replay_eviction_loop)
+            self._ingest_maintenance_requests(
+                model=model,
+                cache=cache,
+                replay_eviction_loop=replay_eviction_loop,
+                memory_write_tokens=int(memory_write_tokens),
+            )
             return
         if self.rank != self.memory_rank or not self.pending_input_requests:
             return
@@ -3852,14 +3862,17 @@ class _CrctMailboxTeacherTransport:
     def _ingest_maintenance_requests(
         self,
         *,
+        model: torch.nn.Module,
+        cache: TransactionalWakeCache,
         replay_eviction_loop: ReplayEvictionLoop | None,
+        memory_write_tokens: int,
     ) -> None:
         """Turn latest request frames into replay work without packet scoring.
 
         A split maintenance rank consumes the request ring as a stream of probe
-        frames.  It must not run the packet producer's exact off/force score or
-        write residual payloads; GPU6 owns low-latency packet serving, while
-        GPU7's deeper work is scheduled by ``ReplayEvictionLoop.tick``.
+        frames.  GPU6 owns low-latency residual serving, while GPU7 mirrors the
+        append side locally from the same stream so learned maintenance has a
+        cache to massage without a fragile GPU6<->GPU7 peer receive.
         """
         if self.rank != self.memory_rank or self.produce_results:
             return
@@ -3887,6 +3900,38 @@ class _CrctMailboxTeacherTransport:
             )
             self.metrics["maintenance_request_frames_ingested"] += 1
             self.metrics["last_received_request_step"] = request_step
+            append_t0 = time.perf_counter()
+            try:
+                train_inputs = request_full_ids[:, :-1].to(dtype=torch.int32)
+                train_targets = request_full_ids[:, 1:].to(dtype=torch.long)
+                scored = _crct_packet_payload_inline(
+                    model=model,
+                    cache=cache,
+                    inputs=train_inputs,
+                    targets=train_targets,
+                    step=request_step,
+                    memory_write_tokens=int(memory_write_tokens),
+                )
+                write_records = scored.get("memory_write_records")
+                n_records = len(write_records) if isinstance(write_records, list) else 0
+                self.metrics["maintenance_local_append_packets"] += 1
+                self.metrics["maintenance_local_append_records"] += int(n_records)
+            except Exception as exc:
+                self.metrics["maintenance_local_append_errors"] += 1
+                self.metrics["errors"] += 1
+                self.metrics["last_error"] = "".join(
+                    traceback.format_exception_only(type(exc), exc)
+                ).strip()
+                self.metrics["last_drop_reason"] = "maintenance_local_append_error"
+            finally:
+                append_s = time.perf_counter() - append_t0
+                self.metrics["maintenance_local_append_seconds_sum"] += float(
+                    append_s
+                )
+                self.metrics["maintenance_local_append_seconds_max"] = max(
+                    float(self.metrics["maintenance_local_append_seconds_max"]),
+                    float(append_s),
+                )
 
     def diagnostics(self) -> dict[str, Any]:
         out = dict(self.metrics)
@@ -10606,15 +10651,6 @@ def train_fast_for_budget(
             train_ranks = list(crct_train_ranks)
             train_group = dist.new_group(train_ranks)
             teacher_group = dist.new_group([0, crct_packet_rank])
-            if int(crct_packet_rank) != int(crct_maintenance_rank):
-                # Slot commits are ordered control-plane mutations, not bulk
-                # residual packets. Keep them on Gloo/CPU so a perpetually
-                # posted NCCL P2P receive cannot poison later all-rank CUDA
-                # barriers when a short run emits no commits.
-                slot_commit_group = dist.new_group(
-                    [int(crct_packet_rank), int(crct_maintenance_rank)],
-                    backend="gloo",
-                )
             grad_group = train_group
             grad_world_size = len(train_ranks)
             memory_rank_joins_grad = False
@@ -11155,18 +11191,10 @@ def train_fast_for_budget(
     crct_teacher_bypass_steps = 0
     replay_eviction_loop: ReplayEvictionLoop | None = None
     online_eval_state_payload: dict[str, Any] = {}
-    if (
-        crct_enabled
-        and int(crct_packet_rank) != int(crct_maintenance_rank)
-        and rank_ in {int(crct_packet_rank), int(crct_maintenance_rank)}
-    ):
-        crct_slot_commit_transport = _CrctSlotCommitPeerTransport(
-            rank=int(rank_),
-            packet_rank=int(crct_packet_rank),
-            maintenance_rank=int(crct_maintenance_rank),
-            group=slot_commit_group,
-            device=torch.device("cpu"),
-        )
+    # Split memory ranks ingest the same request stream and build their local
+    # caches independently.  PyTorch Gloo P2P is not a safe hot commit lane on
+    # this pod: timeout polling can close the pair, and unbounded waits violate
+    # the nonblocking memory-rank contract.
     if bool(replay_eviction_enabled) and crct_enabled:
         replay_eviction_loop = ReplayEvictionLoop(
             action_mode=str(replay_eviction_mode),
