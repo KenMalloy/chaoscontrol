@@ -110,6 +110,43 @@ _bootstrap_on_exit() {
 }
 trap _bootstrap_on_exit EXIT
 
+# ---------------------------------------------------------------------------
+# Parallel-fetch fork: kick off the SP16384 download (network-bound, 145 MiB,
+# ~3 min) in the background using a throwaway pre-venv so it overlaps with
+# the foreground CUDA install + native extension build (~10–12 min). The
+# fetch only depends on huggingface-hub + network — not on torch, TE, or
+# chaoscontrol — so it's safely independent of steps 1+2.
+#
+# Correctness contract:
+#   - Output is captured to a log file; surfaced on failure (or always with
+#     CHAOSCONTROL_BOOTSTRAP_VERBOSE_FETCH=1) so two-stream interleave never
+#     hides diagnostics.
+#   - We `wait $PID` and propagate the exit code BEFORE step 5 runs, so the
+#     val-cache build never starts without its data.
+#   - One JSONL timing entry is emitted per logical step (fork-time start,
+#     wait-time end), preserving the bootstrap_timing contract.
+#   - Pre-venv creation is ~5–10s overhead; rolled into the fetch step's
+#     elapsed time.
+#   - Idempotent: the fetch script is itself size-checked and the pre-venv
+#     is created under /tmp so re-runs cost a few seconds at most.
+# ---------------------------------------------------------------------------
+PREFETCH_VENV=${PREFETCH_VENV:-/tmp/bootstrap_prefetch_venv}
+PREFETCH_LOG=${PREFETCH_LOG:-"$REPO_ROOT/bootstrap_prefetch_$(date -u '+%Y%m%dT%H%M%SZ').log"}
+
+echo ""
+echo "==> Pre-step: fork SP16384 fetch in background (overlaps steps 1–3)"
+_FETCH_STARTED_AT=$(date +%s)
+if [ ! -x "$PREFETCH_VENV/bin/python" ]; then
+    python3 -m venv "$PREFETCH_VENV"
+fi
+"$PREFETCH_VENV/bin/pip" install --quiet --upgrade pip >/dev/null 2>&1 || true
+"$PREFETCH_VENV/bin/pip" install --quiet --only-binary=:all: huggingface-hub requests
+echo "    fetch log: $PREFETCH_LOG"
+"$PREFETCH_VENV/bin/python" "$REPO_ROOT/scripts/fetch_sp16384_dataset.py" \
+    >"$PREFETCH_LOG" 2>&1 &
+_FETCH_PID=$!
+echo "    fetch_sp16384 PID=$_FETCH_PID — running in parallel with foreground steps"
+
 _bootstrap_step_begin "setup_cuda13" "Step 1/6: CUDA 13 + TE + chaoscontrol editable (idempotent)"
 bash scripts/pod_setup_cuda13.sh
 # pod_setup_cuda13.sh activates and creates /workspace/venv. Source it
@@ -123,13 +160,43 @@ bash scripts/pod_build_native_extensions.sh
 _bootstrap_step_end
 
 _bootstrap_step_begin "install_hf_requests" "Step 3/6: install huggingface-hub + requests in venv"
-# Idempotent: pip skips if up-to-date.
+# Idempotent: pip skips if up-to-date. Step 4 already used hf-hub from the
+# pre-venv; this install puts it in the workspace venv for step 5's helpers
+# (stream_docs_selected.py uses requests; build_exp20_val_cache.py imports
+# chaoscontrol which is in the workspace venv).
 pip install --only-binary=:all: huggingface-hub requests
 _bootstrap_step_end
 
-_bootstrap_step_begin "fetch_sp16384" "Step 4/6: fetch SP16384 train+val shards + tokenizer"
-python "$REPO_ROOT/scripts/fetch_sp16384_dataset.py"
-_bootstrap_step_end
+# Step 4: join the backgrounded fetch. We must close any "open" foreground
+# step BEFORE wait, otherwise a non-zero exit from the background job would
+# trip set -e and the EXIT trap would blame whatever foreground step the
+# previous _bootstrap_step_end thought was still open. (Currently step 3 is
+# closed cleanly above, so _BOOTSTRAP_STEP_OPEN=0 is already set, but we
+# assert it explicitly to make the contract local-readable.)
+_BOOTSTRAP_STEP_OPEN=0
+_BOOTSTRAP_STEP_NAME=""
+echo ""
+echo "==> Step 4/6: wait for backgrounded SP16384 fetch (PID=$_FETCH_PID)"
+if wait "$_FETCH_PID"; then
+    _fetch_ended_at=$(date +%s)
+    _bootstrap_record_timing "fetch_sp16384" "ok" "$_FETCH_STARTED_AT" "$_fetch_ended_at"
+    if [ "${CHAOSCONTROL_BOOTSTRAP_VERBOSE_FETCH:-0}" = "1" ]; then
+        echo "--- fetch_sp16384 log (verbose mode) ---"
+        cat "$PREFETCH_LOG"
+        echo "--- end fetch_sp16384 log ---"
+    else
+        # Surface the final summary lines so the operator sees the rate /
+        # "SP16384 ready" tail without flooding the terminal with progress.
+        tail -n 5 "$PREFETCH_LOG" || true
+    fi
+else
+    _fetch_status=$?
+    _fetch_ended_at=$(date +%s)
+    _bootstrap_record_timing "fetch_sp16384" "failed" "$_FETCH_STARTED_AT" "$_fetch_ended_at"
+    echo "ERROR: backgrounded SP16384 fetch failed (exit=$_fetch_status). Full log:" >&2
+    cat "$PREFETCH_LOG" >&2 || true
+    exit "$_fetch_status"
+fi
 
 _bootstrap_step_begin "exp27_val_cache" "Step 5/6: Exp27 scorer ValCache"
 if [ "$CHAOSCONTROL_BUILD_VAL_CACHE" = "1" ]; then
