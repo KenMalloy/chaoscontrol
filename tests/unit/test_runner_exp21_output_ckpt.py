@@ -162,6 +162,38 @@ def test_save_output_ckpt_can_include_online_eval_state(tmp_path):
     assert restored_model._online_eval_state["replay_eviction"]["schema_version"] == 1
 
 
+def test_save_output_ckpt_preserves_non_tensor_extra_state(tmp_path):
+    """PyTorch state_dict extra-state entries are metadata dicts, not tensors."""
+
+    class ModuleWithExtraState(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.ones(2, 3))
+
+        def get_extra_state(self):
+            return {
+                "schema_version": 1,
+                "nested": {"tensor": torch.arange(3), "name": "cache"},
+                "flags": [True, 7],
+            }
+
+        def set_extra_state(self, state) -> None:
+            self._extra_state = state
+
+    config = _tiny_ssm_config()
+    model = ModuleWithExtraState()
+    ckpt_path = tmp_path / "ckpt.pt"
+
+    _save_output_ckpt(str(ckpt_path), model, config)
+
+    blob = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    state = blob["model"]
+    assert torch.equal(state["weight"], torch.ones(2, 3))
+    assert state["_extra_state"]["schema_version"] == 1
+    assert state["_extra_state"]["nested"]["name"] == "cache"
+    assert torch.equal(state["_extra_state"]["nested"]["tensor"], torch.arange(3))
+
+
 def test_ssm_arm_round_trips_through_run_exp20_eval_loader(tmp_path):
     """Save SSM checkpoint, reload via the exact run_exp20_eval pattern.
 

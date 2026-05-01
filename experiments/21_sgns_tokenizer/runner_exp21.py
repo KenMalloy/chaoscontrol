@@ -67,6 +67,19 @@ from runner_exp17 import (  # noqa: E402
 )
 
 
+def _checkpoint_value_to_cpu(value: Any) -> Any:
+    """Move checkpoint tensor leaves to CPU while preserving metadata leaves."""
+    if torch.is_tensor(value):
+        return value.detach().to("cpu")
+    if isinstance(value, dict):
+        return {k: _checkpoint_value_to_cpu(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_checkpoint_value_to_cpu(v) for v in value]
+    if isinstance(value, tuple):
+        return tuple(_checkpoint_value_to_cpu(v) for v in value)
+    return value
+
+
 def _ssm_constructor_kwargs(config: dict[str, Any]) -> dict[str, Any]:
     """Extract the exact CareStudentLM(**kwargs) needed to reconstruct the
     SSM-arm model from a runner training config.
@@ -312,7 +325,9 @@ def _save_output_ckpt(
         ctor_kwargs = _transformer_constructor_kwargs(config)
     else:
         ctor_kwargs = _ssm_constructor_kwargs(config)
-    cpu_state = {k: v.detach().to("cpu") for k, v in model.state_dict().items()}
+    cpu_state = {
+        k: _checkpoint_value_to_cpu(v) for k, v in model.state_dict().items()
+    }
     blob: dict[str, Any] = {"model": cpu_state, "config": ctor_kwargs}
     if episodic_cache is not None:
         if isinstance(episodic_cache, dict):
