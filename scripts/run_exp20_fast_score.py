@@ -426,6 +426,27 @@ def _model_final_states(out: object) -> list[torch.Tensor] | None:
     return None
 
 
+_PACKET_CALL_SUPPORT_CACHE: dict[int, bool] = {}
+
+
+def _packet_encode_accepts_memory_mode(model: torch.nn.Module) -> bool:
+    key = id(model)
+    cached = _PACKET_CALL_SUPPORT_CACHE.get(key)
+    if cached is not None:
+        return bool(cached)
+    encode = getattr(model, "encode", None)
+    if not callable(encode):
+        _PACKET_CALL_SUPPORT_CACHE[key] = False
+        return False
+    params = inspect.signature(encode).parameters
+    accepts_kwargs = any(
+        p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()
+    )
+    accepts = bool("memory_mode" in params or accepts_kwargs)
+    _PACKET_CALL_SUPPORT_CACHE[key] = accepts
+    return accepts
+
+
 def _score_model_call(
     model: torch.nn.Module,
     chunk: torch.Tensor,
@@ -444,14 +465,10 @@ def _score_model_call(
         raise AttributeError(
             "--score-through-packet-lane requires model.encode(...) and lm_head"
         )
-    params = inspect.signature(encode).parameters
-    accepts_kwargs = any(
-        p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()
-    )
     kwargs: dict[str, object] = {"return_final_states": True}
     if initial_states is not None:
         kwargs["initial_states"] = initial_states
-    if "memory_mode" in params or accepts_kwargs:
+    if _packet_encode_accepts_memory_mode(model):
         kwargs["memory_mode"] = "packet"
     out = encode(chunk, **kwargs)
     if isinstance(out, dict):
