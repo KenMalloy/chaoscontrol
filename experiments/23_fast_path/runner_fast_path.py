@@ -2908,6 +2908,8 @@ _TEACHER_RESULT_SLICE_NAMES = (
     "plasticity_budget",
 )
 _WEIGHT_SNAPSHOT_HEADER = struct.Struct("<IIIIQQQQIIIIQfffIQ")
+_TEACHER_REQUEST_EVENT_TYPE = 6
+_TEACHER_REQUEST_FLAG_SHUTDOWN = 1 << 0
 
 
 def _align64(n: int) -> int:
@@ -3141,6 +3143,7 @@ class _CrctMailboxTeacherTransport:
         self._teacher_result_payload_bytes = (
             self._teacher_ring_capacity * self._teacher_result_slot_bytes
         )
+        self._request_shutdown_seen = False
         self._init_teacher_shm()
         self.metrics: dict[str, Any] = {
             "mode": "async_rank0_memory_shm",
@@ -3182,6 +3185,11 @@ class _CrctMailboxTeacherTransport:
             "teacher_shm_payload_read_seconds_max": 0.0,
             "teacher_shm_request_events_pushed": 0,
             "teacher_shm_request_events_popped": 0,
+            "teacher_shm_request_shutdown_events_pushed": 0,
+            "teacher_shm_request_shutdown_events_popped": 0,
+            "teacher_shm_request_shutdown_overwrites": 0,
+            "teacher_shm_request_shutdown_ring_full_drops": 0,
+            "teacher_request_shutdown_seen": False,
             "teacher_shm_result_events_pushed": 0,
             "teacher_shm_result_events_popped": 0,
             "max_local_batches": int(self.max_local_batches),
@@ -3589,6 +3597,53 @@ class _CrctMailboxTeacherTransport:
         )
         return out
 
+    @property
+    def shutdown_requested(self) -> bool:
+        return bool(self._request_shutdown_seen)
+
+    def _push_shutdown_request(self) -> None:
+        if self.rank != self.coordinator_rank:
+            return
+        if self._teacher_request_ring is None:
+            self.metrics["last_drop_reason"] = "teacher_request_shutdown_ring_missing"
+            return
+        request_id = int(self._teacher_request_seq)
+        self._teacher_request_seq += 1
+        step = max(
+            0,
+            int(
+                self.metrics.get("last_sent_request_step")
+                or self.metrics.get("weight_snapshot_last_published_step")
+                or 0
+            ),
+        )
+        event = {
+            "event_type": _TEACHER_REQUEST_EVENT_TYPE,
+            "source_rank": int(self.rank),
+            "status": 0,
+            "flags": _TEACHER_REQUEST_FLAG_SHUTDOWN,
+            "slice_count": 0,
+            "request_id": request_id,
+            "step": step,
+            "weight_snapshot_version": max(
+                0,
+                int(self.metrics.get("weight_snapshot_last_published_step", -1)),
+            ),
+            "full_ids": _teacher_empty_slice(),
+        }
+        for _ in range(int(self._teacher_ring_capacity) + 1):
+            if self._teacher_request_ring.push(event):
+                self.metrics["teacher_shm_request_shutdown_events_pushed"] += 1
+                self.metrics["teacher_shm_request_events_pushed"] += 1
+                self.metrics["last_drop_reason"] = "teacher_request_shutdown_sent"
+                return
+            dropped = self._teacher_request_ring.pop()
+            if dropped is None:
+                break
+            self.metrics["teacher_shm_request_shutdown_overwrites"] += 1
+        self.metrics["teacher_shm_request_shutdown_ring_full_drops"] += 1
+        self.metrics["last_drop_reason"] = "teacher_request_shutdown_ring_full"
+
     def begin_step(
         self,
         *,
@@ -3938,11 +3993,15 @@ class _CrctMailboxTeacherTransport:
             self._request_write_cv.notify_all()
         if self._request_write_thread is not None:
             self._request_write_thread.join(timeout=0.25)
+        self._push_shutdown_request()
         with self._weight_snapshot_cv:
             self._weight_snapshot_writer_stop = True
             self._weight_snapshot_cv.notify_all()
         if self._weight_publish_thread is not None:
             self._weight_publish_thread.join(timeout=0.25)
+        return
+
+    def unlink_shared_resources(self) -> None:
         if self.rank == self.coordinator_rank:
             owned_resources: list[tuple[Any, str]] = [
                 (_ext.ShmRingTeacherRequest, self._teacher_request_ring_name),
@@ -3959,6 +4018,7 @@ class _CrctMailboxTeacherTransport:
             for cls, name in owned_resources:
                 try:
                     cls.unlink(name)
+                    self.metrics["mailbox_unlinks"] += 1
                 except Exception:
                     pass
         return
@@ -4923,7 +4983,7 @@ class _CrctMailboxTeacherTransport:
                 dtype=torch.int32,
             )
             event = {
-                "event_type": 6,
+                "event_type": _TEACHER_REQUEST_EVENT_TYPE,
                 "source_rank": int(self.rank),
                 "status": 0,
                 "flags": 0,
@@ -4957,15 +5017,39 @@ class _CrctMailboxTeacherTransport:
         assert self._teacher_request_payload is not None
         popped = 0
         latest_event: dict[str, Any] | None = None
+        shutdown_seen = False
         while True:
             event = self._teacher_request_ring.pop()
             if event is None:
                 break
             popped += 1
+            if int(event.get("flags", 0)) & _TEACHER_REQUEST_FLAG_SHUTDOWN:
+                if latest_event is not None:
+                    self.metrics["memory_rank_request_events_superseded"] += 1
+                    self.metrics["completed_requests_dropped"] += 1
+                    latest_event = None
+                shutdown_seen = True
+                self.metrics["teacher_shm_request_shutdown_events_popped"] += 1
+                continue
+            if shutdown_seen:
+                self.metrics["memory_rank_request_events_superseded"] += 1
+                self.metrics["completed_requests_dropped"] += 1
+                continue
             if latest_event is not None:
                 self.metrics["memory_rank_request_events_superseded"] += 1
                 self.metrics["completed_requests_dropped"] += 1
             latest_event = event
+        if shutdown_seen:
+            if self.pending_input_requests:
+                dropped = len(self.pending_input_requests)
+                self.pending_input_requests.clear()
+                self.metrics["memory_rank_request_events_superseded"] += int(dropped)
+                self.metrics["completed_requests_dropped"] += int(dropped)
+            self._request_shutdown_seen = True
+            self.metrics["teacher_request_shutdown_seen"] = True
+            self.metrics["last_drop_reason"] = "teacher_request_shutdown"
+            self.metrics["teacher_shm_request_events_popped"] += int(popped)
+            return int(popped)
         if latest_event is not None:
             if self.pending_input_requests:
                 dropped = len(self.pending_input_requests)
@@ -11703,6 +11787,17 @@ def train_fast_for_budget(
                     steps,
                     transport=active_memory_transport,
                 )
+                if (
+                    active_memory_transport is not None
+                    and bool(
+                        getattr(
+                            active_memory_transport,
+                            "shutdown_requested",
+                            False,
+                        )
+                    )
+                ):
+                    break
                 if crct_slot_commit_transport is not None:
                     commit_work_done = (
                         crct_slot_commit_transport.poll(model=model)
@@ -12045,6 +12140,10 @@ def train_fast_for_budget(
                         fast_slow_action_space=None,
                         fast_slow_nll_chunk_size=int(chunk_size),
                     )
+                    if bool(
+                        getattr(crct_teacher_transport, "shutdown_requested", False)
+                    ):
+                        break
                     if (
                         crct_teacher_transport_mode
                         == "async_rank0_memory_broadcast"
@@ -12592,6 +12691,10 @@ def train_fast_for_budget(
             group=object_group or all_group,
             label="train_teardown",
         )
+    if crct_teacher_transport is not None:
+        crct_teacher_transport.unlink_shared_resources()
+    if crct_maintenance_transport is not None:
+        crct_maintenance_transport.unlink_shared_resources()
 
     if (
         fast_slow.enabled

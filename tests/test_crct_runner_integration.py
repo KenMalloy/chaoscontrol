@@ -1288,6 +1288,50 @@ def test_crct_mailbox_defers_low_priority_maintenance_only_at_ring_capacity(tmp_
     assert diag["low_priority_maintenance_last_reason"] == "request_ring_capacity"
 
 
+def test_crct_mailbox_shutdown_request_wins_over_pending_work(tmp_path) -> None:
+    mod = _load_module("runner_fast_path_crct_mailbox_shutdown", RUNNER_PATH)
+    kwargs = {
+        "world_size": 4,
+        "mailbox_dir": str(tmp_path),
+        "payload_shape": (1, 2, 5),
+        "full_ids_shape": (2, 6),
+        "device": torch.device("cpu"),
+        "payload_dtype": torch.float32,
+        "max_local_batches": 8,
+        "max_payload_lag_steps": 8,
+        "score_interval_steps": 1,
+    }
+    rank0 = mod._CrctMailboxTeacherTransport(rank=0, **kwargs)
+    rank3 = mod._CrctMailboxTeacherTransport(rank=3, **kwargs)
+
+    assert rank0._teacher_request_ring is not None
+    assert rank0._teacher_request_ring.push(
+        {
+            "event_type": mod._TEACHER_REQUEST_EVENT_TYPE,
+            "source_rank": 0,
+            "status": 0,
+            "flags": 0,
+            "slice_count": 1,
+            "request_id": 1,
+            "step": 1,
+            "weight_snapshot_version": 0,
+            "full_ids": mod._teacher_empty_slice(),
+        }
+    )
+    rank3.pending_input_requests.append(
+        {"step": 0, "buffer": torch.zeros((2, 6), dtype=torch.int32)}
+    )
+    rank0._push_shutdown_request()
+
+    assert rank3._poll_requests() == 2
+    assert rank3.shutdown_requested is True
+    assert len(rank3.pending_input_requests) == 0
+    diag = rank3.diagnostics()
+    assert diag["teacher_request_shutdown_seen"] is True
+    assert diag["teacher_shm_request_shutdown_events_popped"] == 1
+    assert diag["completed_requests_dropped"] == 2
+
+
 def test_crct_mailbox_weight_snapshot_applies_latest_model(tmp_path) -> None:
     mod = _load_module("runner_fast_path_crct_mailbox_weights", RUNNER_PATH)
     kwargs = {
