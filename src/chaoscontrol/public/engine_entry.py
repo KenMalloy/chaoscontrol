@@ -101,7 +101,11 @@ def build_arm_config(hyperparams: Any) -> dict[str, Any]:
     # --- 4. Forward hyperparams attributes ---
     _MISSING = object()
     _FORWARD_KEYS = (
+        "vocab_size",
         "model_dim",
+        "seq_len",
+        "batch_size",
+        "seed",
         "budget_seconds",
         "data_path",
         "val_cache_dir",
