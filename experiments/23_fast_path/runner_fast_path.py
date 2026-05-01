@@ -1653,15 +1653,23 @@ def _apply_plasticity_budget_payload(
     return True
 
 
-def _dist_work_done(work: Any, *, device: torch.device | None = None) -> bool:
+def _dist_work_done(
+    work: Any,
+    *,
+    device: torch.device | None = None,
+    wait_for_progress: bool = True,
+) -> bool:
     if work is None:
         return True
     is_completed = getattr(work, "is_completed", None)
     if callable(is_completed):
         try:
-            return bool(is_completed())
+            if bool(is_completed()):
+                return True
         except Exception:
             pass
+    if not bool(wait_for_progress):
+        return False
     wait = getattr(work, "wait", None)
     if callable(wait):
         try:
@@ -2012,8 +2020,17 @@ class _CrctSlotCommitPeerTransport:
         progressed = self._poll_recv(model=model) or progressed
         return progressed
 
-    def _work_done(self, work: Any | None) -> bool:
-        return _dist_work_done(work, device=self.device)
+    def _work_done(
+        self,
+        work: Any | None,
+        *,
+        wait_for_progress: bool = True,
+    ) -> bool:
+        return _dist_work_done(
+            work,
+            device=self.device,
+            wait_for_progress=wait_for_progress,
+        )
 
     def _header_device(self) -> torch.device:
         return self.device if self.device.type == "cuda" else torch.device("cpu")
@@ -2199,7 +2216,10 @@ class _CrctSlotCommitPeerTransport:
             self._post_header_recv()
             return False
         if self._recv_header_work is not None:
-            if not self._work_done(self._recv_header_work):
+            if not self._work_done(
+                self._recv_header_work,
+                wait_for_progress=False,
+            ):
                 return False
             self._recv_header_work = None
             assert self._recv_header is not None
@@ -2227,7 +2247,10 @@ class _CrctSlotCommitPeerTransport:
                 self.metrics["recv_payloads_started"] += 1
                 return True
         if self._recv_payload_work is not None:
-            if not self._work_done(self._recv_payload_work):
+            if not self._work_done(
+                self._recv_payload_work,
+                wait_for_progress=False,
+            ):
                 return False
             self._recv_payload_work = None
         if self._recv_pending_header is None:

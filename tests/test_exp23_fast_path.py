@@ -127,40 +127,47 @@ def test_crct_memory_rank_checks_wall_clock_even_when_idle() -> None:
     )
 
 
-def test_dist_work_done_does_not_block_on_incomplete_cpu_work() -> None:
+def test_dist_work_done_uses_timeout_bounded_wait_for_progress() -> None:
     mod = _load_runner_module()
     calls = []
+    waits = []
 
     class IncompleteWork:
         def is_completed(self):
             calls.append("is_completed")
             return False
 
-        def wait(self, *_args, **_kwargs):  # pragma: no cover - must not run
-            raise AssertionError("polling CPU work must not block in wait()")
+        def wait(self, timeout):
+            waits.append(timeout)
+            return False
 
     assert mod._dist_work_done(
         IncompleteWork(),
         device=torch.device("cpu"),
     ) is False
     assert calls == ["is_completed"]
-
-
-def test_dist_work_done_fallback_wait_is_timeout_bounded() -> None:
-    mod = _load_runner_module()
-    waits = []
-
-    class TimeoutWaitWork:
-        def wait(self, timeout):
-            waits.append(timeout)
-            return True
-
-    assert mod._dist_work_done(
-        TimeoutWaitWork(),
-        device=torch.device("cpu"),
-    ) is True
     assert waits
     assert waits[0].total_seconds() <= 0.001
+
+
+def test_dist_work_done_can_pure_poll_without_waiting() -> None:
+    mod = _load_runner_module()
+    calls = []
+
+    class IncompleteReceiveWork:
+        def is_completed(self):
+            calls.append("is_completed")
+            return False
+
+        def wait(self, *_args, **_kwargs):  # pragma: no cover - must not run
+            raise AssertionError("posted receives should be pure-polled")
+
+    assert mod._dist_work_done(
+        IncompleteReceiveWork(),
+        device=torch.device("cpu"),
+        wait_for_progress=False,
+    ) is False
+    assert calls == ["is_completed"]
 
 
 class _TinyTrainStepModel(nn.Module):
