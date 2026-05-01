@@ -166,6 +166,26 @@ def test_dist_work_done_rechecks_completion_after_timeout_wait() -> None:
     ) is False
 
 
+def test_dist_work_done_can_disable_progress_wait() -> None:
+    mod = _load_runner_module()
+    calls = []
+
+    class IdleReceiveWork:
+        def is_completed(self):
+            calls.append("is_completed")
+            return False
+
+        def wait(self, *_args, **_kwargs):  # pragma: no cover - must not run
+            raise AssertionError("idle receive lanes should be pure-polled")
+
+    assert mod._dist_work_done(
+        IdleReceiveWork(),
+        device=torch.device("cpu"),
+        wait_for_progress=False,
+    ) is False
+    assert calls == ["is_completed"]
+
+
 def test_dist_work_done_fallback_wait_is_timeout_bounded() -> None:
     mod = _load_runner_module()
     waits = []
