@@ -1,11 +1,10 @@
 import os
+import pathlib
 
 import pytest
 
-os.environ.setdefault(
-    "CHAOSCONTROL_ROOT",
-    "/Users/kennethmalloy/Local Documents/Developer/chaoscontrol",
-)
+_REPO_ROOT = str(pathlib.Path(__file__).parent.parent.parent)
+os.environ.setdefault("CHAOSCONTROL_ROOT", _REPO_ROOT)
 
 from chaoscontrol.public.engine_entry import build_arm_config, init_arm_topology  # noqa: E402
 
@@ -81,3 +80,15 @@ def test_build_arm_config_hyperparams_forwarded():
     hp.model_dim = 384
     cfg = build_arm_config(hp)
     assert cfg.get("model_dim") == 384
+
+
+def test_telemetry_overrides_win_over_lock(monkeypatch):
+    import sys, os
+    _root = os.environ.get("CHAOSCONTROL_ROOT", "/workspace/chaoscontrol")
+    _exp26_dir = os.path.join(_root, "experiments", "26_arm")
+    if _exp26_dir not in sys.path:
+        sys.path.insert(0, _exp26_dir)
+    import exp26
+    monkeypatch.setattr(exp26, "_crct_lock", lambda: {"crct_target_write_rate": 99.0})
+    cfg = build_arm_config(_FakeHyperparams())
+    assert abs(cfg["crct_target_write_rate"] - 0.25) < 1e-6
