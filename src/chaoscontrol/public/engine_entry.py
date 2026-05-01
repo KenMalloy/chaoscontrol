@@ -103,6 +103,7 @@ def build_arm_config(hyperparams: Any) -> dict[str, Any]:
     _FORWARD_KEYS = (
         "vocab_size",
         "model_dim",
+        "num_layers",
         "seq_len",
         "batch_size",
         "seed",
@@ -115,6 +116,15 @@ def build_arm_config(hyperparams: Any) -> dict[str, Any]:
         val = getattr(hyperparams, key, _MISSING)
         if val is not _MISSING:
             cfg[key] = val
+
+    # --- 5. Fail fast on missing hard-required runner keys ---
+    _REQUIRED = ("vocab_size", "model_dim", "num_layers", "seq_len", "batch_size")
+    missing = [k for k in _REQUIRED if k not in cfg]
+    if missing:
+        raise ValueError(
+            f"build_arm_config: missing required keys {missing}. "
+            "Set them on your Hyperparameters object or pass them in config."
+        )
 
     return cfg
 
