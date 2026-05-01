@@ -481,7 +481,7 @@ class MultiSlotOuterModel(nn.Module):
 
         if cue is not None:
             cue = cue.to(dtype=self.cue_proj.weight.dtype)
-            cue_outer = self.cue_proj(cue)
+            cue_outer = self.cue_proj(cue).to(dtype=slot_matrix.dtype)
             sim = torch.mm(cue_outer, slot_matrix.T)
             if override_pos is not None and override_values is not None:
                 sim[:, override_pos] = (cue_outer * override_values).sum(dim=-1)

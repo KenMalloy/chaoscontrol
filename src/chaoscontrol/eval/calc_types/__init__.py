@@ -11,6 +11,8 @@ Registered calc_types:
 - ``carry_state`` — SSM state continues across docs (with optional decay).
 - ``adaptive_carry`` — packet-clean state carry with online horizon mixing.
 - ``dreamworld_eval`` — per-doc dream-rollout + backward + SGD step.
+- ``packet_online_cache`` — submission path: prefix-safe cue + packet score
+  + post-score cache write (episodic memory is part of the model).
 """
 from __future__ import annotations
 
@@ -20,3 +22,4 @@ from chaoscontrol.eval.calc_types import score_only_reset  # noqa: F401
 from chaoscontrol.eval.calc_types import carry_state  # noqa: F401
 from chaoscontrol.eval.calc_types import adaptive_carry  # noqa: F401
 from chaoscontrol.eval.calc_types import dreamworld_eval  # noqa: F401
+from chaoscontrol.eval.calc_types import packet_online_cache  # noqa: F401
