@@ -13164,6 +13164,9 @@ def train_fast_for_budget(
                 "maintenance_payloads_scored": int(
                     maintenance.get("payloads_scored", 0)
                 ),
+                "payload_lag_steps_mean": float(
+                    coord.get("payload_lag_steps_mean", 0.0)
+                ),
                 "maintenance_replay_ticks": int(
                     maintenance.get("memory_rank_replay_ticks", 0)
                 ),
@@ -13248,6 +13251,12 @@ def train_fast_for_budget(
                 ),
                 "packet_service_approx_write_records": int(
                     mem.get("packet_service_approx_write_records", 0)
+                ),
+                "memory_packet_lag_steps_mean": float(
+                    mem.get("memory_packet_lag_steps_mean", 0.0)
+                ),
+                "memory_packet_lag_steps_max": int(
+                    mem.get("memory_packet_lag_steps_max", 0)
                 ),
                 "score_stage_timing_enabled": bool(
                     mem.get("score_stage_timing_enabled", False)

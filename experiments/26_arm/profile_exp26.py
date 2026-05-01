@@ -50,7 +50,7 @@ def _health_from_result(result: dict[str, Any]) -> dict[str, Any]:
     replay = crct.get("replay_eviction") or {}
     optimizer = train.get("optimizer") or {}
     plasticity = optimizer.get("plasticity_budget") or {}
-    return {
+    row = {
         "steps": int(train.get("steps", 0) or 0),
         "elapsed_s": float(train.get("elapsed_s", 0.0) or 0.0),
         "tokens_per_sec": float(train.get("aggregate_tokens_per_sec", 0.0) or 0.0),
@@ -65,7 +65,19 @@ def _health_from_result(result: dict[str, Any]) -> dict[str, Any]:
         "maintenance_payloads_scored": int(
             health.get("maintenance_payloads_scored", 0) or 0
         ),
+        "teacher_requests": int(crct.get("teacher_requests", 0) or 0),
+        "teacher_fail_open": int(crct.get("teacher_fail_open", 0) or 0),
+        "teacher_bypass_steps": int(crct.get("teacher_bypass_steps", 0) or 0),
+        "payload_lag_steps_mean": float(
+            health.get("payload_lag_steps_mean", 0.0) or 0.0
+        ),
         "payload_lag_steps_max": int(health.get("payload_lag_steps_max", 0) or 0),
+        "memory_packet_lag_steps_mean": float(
+            health.get("memory_packet_lag_steps_mean", 0.0) or 0.0
+        ),
+        "memory_packet_lag_steps_max": int(
+            health.get("memory_packet_lag_steps_max", 0) or 0
+        ),
         "score_seconds_max": float(health.get("score_seconds_max", 0.0) or 0.0),
         "crct_loss_reweight_samples": int(
             health.get("crct_loss_reweight_samples", 0) or 0
@@ -197,8 +209,27 @@ def _health_from_result(result: dict[str, Any]) -> dict[str, Any]:
         "memory_rank_pump_idle_yields": int(health.get("memory_rank_pump_idle_yields", 0) or 0),
         "plasticity_packets_received": int(health.get("plasticity_packets_received", 0) or 0),
         "plasticity_lr_multiplier_max": float(plasticity.get("lr_multiplier_max", 0.0) or 0.0),
-        "teacher_fail_open": int(crct.get("teacher_fail_open", 0) or 0),
     }
+    requests = max(0, int(row.get("teacher_requests", 0) or 0))
+    served = max(0, int(row.get("payloads_served", 0) or 0))
+    used = max(0, int(row.get("payloads_used", 0) or 0))
+    fail_open = max(0, int(row.get("teacher_fail_open", 0) or 0))
+    superseded = max(
+        0, int(row.get("memory_rank_request_events_superseded", 0) or 0)
+    )
+    row["packet_served_per_request"] = (
+        float(served) / float(requests) if requests else 0.0
+    )
+    row["packet_used_per_request"] = (
+        float(used) / float(requests) if requests else 0.0
+    )
+    row["packet_fail_open_rate"] = (
+        float(fail_open) / float(requests) if requests else 0.0
+    )
+    row["packet_request_superseded_rate"] = (
+        float(superseded) / float(requests) if requests else 0.0
+    )
+    return row
 
 
 def summarize_profile(results_dir: Path) -> dict[str, Any]:
@@ -241,8 +272,11 @@ def _print_profile_summary(summary: dict[str, Any]) -> None:
         print(
             "  "
             f"{row['arm']}: steps={row['steps']} tps={row['tokens_per_sec']:.1f}"
-            f"{ratio_s} payloads={row['payloads_used']}/{row['payloads_served']}"
-            f"/{row['payloads_scored']} "
+            f"{ratio_s} req={row.get('teacher_requests', 0)} "
+            f"used={row['payloads_used']} served={row['payloads_served']}"
+            f" scored={row['payloads_scored']} "
+            f"fail_open={row.get('teacher_fail_open', 0)}"
+            f" ({row.get('packet_fail_open_rate', 0.0):.2%}) "
             f"snap={row['weight_snapshot_published']}/{row['weight_snapshot_applied']} "
             f"rings_drop={row['request_ring_full_drops']}/{row['result_ring_full_drops']} "
             f"gpu3={row['maintenance_gpu3_starvation_reason']} "
@@ -254,6 +288,11 @@ def _print_profile_summary(summary: dict[str, Any]) -> None:
                 f"memory_loop={row.get('memory_rank_outer_loop_seconds_sum', 0.0):.3f}s "
                 f"packet_mean={row.get('packet_service_seconds_mean', 0.0):.3f}s "
                 f"packet_max={row.get('packet_service_seconds_max', 0.0):.3f}s "
+                f"served/request={row.get('packet_served_per_request', 0.0):.2%} "
+                f"used/request={row.get('packet_used_per_request', 0.0):.2%} "
+                f"superseded/request={row.get('packet_request_superseded_rate', 0.0):.2%} "
+                f"lag_mean={row.get('payload_lag_steps_mean', 0.0):.2f} "
+                f"lag_max={row.get('payload_lag_steps_max', 0)} "
                 f"packet_sources={row.get('packet_service_source_count_mean', 0.0):.1f} "
                 f"crct_reweight={row.get('crct_loss_reweight_delta_mean', 0.0):+.4f} "
                 f"crct_weight_dev={row.get('crct_loss_weight_abs_dev_mean', 0.0):.4f} "
