@@ -83,9 +83,8 @@ def test_build_arm_config_hyperparams_forwarded():
 
 
 def test_telemetry_overrides_win_over_lock(monkeypatch):
-    import sys, os
-    _root = os.environ.get("CHAOSCONTROL_ROOT", "/workspace/chaoscontrol")
-    _exp26_dir = os.path.join(_root, "experiments", "26_arm")
+    import sys
+    _exp26_dir = str(pathlib.Path(__file__).parent.parent.parent / "experiments" / "26_arm")
     if _exp26_dir not in sys.path:
         sys.path.insert(0, _exp26_dir)
     import exp26
