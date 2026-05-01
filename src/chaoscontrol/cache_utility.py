@@ -215,6 +215,8 @@ def chunked_nll_from_hidden(
         budget_bytes // max(1, int(batch) * int(vocab) * 4),
     )
     effective_chunk = min(int(chunk_size), int(budget_chunk))
+    if targets.dtype != torch.long:
+        targets = targets.to(dtype=torch.long)
 
     out = hidden_states.new_zeros((batch, seq), dtype=torch.float32)
     norm_weight = getattr(final_norm, "weight", None)

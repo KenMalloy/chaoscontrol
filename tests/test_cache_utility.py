@@ -514,6 +514,17 @@ class TestChunkedNllFromHidden:
         out = chunked_nll_from_hidden(model, hidden, targets, chunk_size=2)
         assert torch.allclose(out, ref, atol=1e-5)
 
+    def test_accepts_packed_int32_targets(self) -> None:
+        torch.manual_seed(9)
+        model = self._build_model(dim=4, vocab=8)
+        hidden = torch.randn(3, 6, 4)
+        targets_i32 = torch.randint(0, 8, (3, 6), dtype=torch.int32)
+
+        out = chunked_nll_from_hidden(model, hidden, targets_i32, chunk_size=2)
+        ref = chunked_nll_from_hidden(model, hidden, targets_i32.long(), chunk_size=2)
+
+        assert torch.allclose(out, ref, atol=1e-6)
+
     def test_chunk_size_clamped_against_memory_budget(self) -> None:
         # When chunk_size * batch * vocab * 4 exceeds the per-chunk
         # budget the function must clamp chunk_size down and still
