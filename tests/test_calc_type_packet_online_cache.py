@@ -315,6 +315,26 @@ def test_packet_online_cache_gate_zero_disables_residual(tmp_path):
     assert all(flag is False for flag in model.packet_flags)
 
 
+def test_packet_online_cache_max_docs_caps_source_order_smoke(tmp_path):
+    model = PacketOnlineModel(seed=4)
+    cache = make_val_cache(tmp_path, doc_lens=[8, 10, 12])
+    ctx = make_ctx(
+        model,
+        cache,
+        config={
+            "chunk_tokens": 4,
+            "write_tokens_per_chunk": 1,
+            "max_docs": 2,
+        },
+    )
+
+    result = packet_online_cache(ctx)
+
+    assert result.docs_scored == 2
+    assert result.tokens_scored == (8 - 1) + (10 - 1)
+    assert result.hyperparams["max_docs"] == 2
+
+
 def test_packet_online_cache_rejects_bad_config(tmp_path):
     model = PacketOnlineModel(seed=0)
     cache = make_val_cache(tmp_path, doc_lens=[4])

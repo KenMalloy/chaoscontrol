@@ -104,6 +104,7 @@ def build_arm_config(hyperparams: Any) -> dict[str, Any]:
         "vocab_size",
         "model_dim",
         "num_layers",
+        "ssm_delta_rank",
         "seq_len",
         "batch_size",
         "seed",
@@ -112,6 +113,22 @@ def build_arm_config(hyperparams: Any) -> dict[str, Any]:
         "val_cache_dir",
         "sp_model_path",
         "activation_checkpoint",
+        "lm_head_tile_size",
+        "base_lr",
+        "weight_decay",
+        "grad_clip_norm",
+        "optimizer_log_a_beta_coupling",
+        "optimizer_log_a_beta_ema",
+        "optimizer_log_a_beta_min",
+        "crct_memory_write_tokens_per_step",
+        "online_episodic_write_tokens_per_chunk",
+        "crct_target_write_rate",
+        "max_steps",
+        "eval_only",
+        "checkpoint_path",
+        "calc_types",
+        "headline_calc_type",
+        "calc_type_configs",
     )
     for key in _FORWARD_KEYS:
         val = getattr(hyperparams, key, _MISSING)
@@ -138,6 +155,7 @@ def run_arm_submission(
     budget_seconds: float,
     output_json: str | None,
     val_cache_dir: str | None,
+    output_ckpt: str | None = None,
     world_size_override: int | None = None,
 ) -> dict[str, Any]:
     """Delegate to runner_fast_path.run_condition() for full ARM training + eval.
@@ -152,8 +170,7 @@ def run_arm_submission(
         "exp24": {...},
       }
 
-    All kwargs are passed through to run_condition as keyword arguments;
-    output_ckpt is not exposed by this wrapper and is always None.
+    All kwargs are passed through to run_condition as keyword arguments.
     """
     _root = os.environ.get("CHAOSCONTROL_ROOT", "/workspace/chaoscontrol")
     _runner_dir = os.path.join(_root, "experiments", "23_fast_path")
@@ -167,7 +184,7 @@ def run_arm_submission(
         sp_model_path=sp_model_path,
         budget_seconds=float(budget_seconds),
         output_json=output_json,
-        output_ckpt=None,
+        output_ckpt=output_ckpt,
         world_size_override=world_size_override,
         val_cache_dir=val_cache_dir,
     )

@@ -10,7 +10,13 @@ from chaoscontrol.public.engine_entry import build_arm_config, init_arm_topology
 
 
 class _FakeHyperparams:
-    """Minimal stand-in for a hyperparams object with no required attributes."""
+    """Minimal stand-in for a submission hyperparams object."""
+
+    vocab_size = 16384
+    model_dim = 384
+    num_layers = 8
+    seq_len = 512
+    batch_size = 896
 
 
 def test_init_arm_topology_8gpu():
@@ -78,8 +84,14 @@ def test_build_arm_config_eval_routing():
 def test_build_arm_config_hyperparams_forwarded():
     hp = _FakeHyperparams()
     hp.model_dim = 384
+    hp.lm_head_tile_size = 2048
+    hp.max_steps = 1
+    hp.eval_only = False
     cfg = build_arm_config(hp)
     assert cfg.get("model_dim") == 384
+    assert cfg.get("lm_head_tile_size") == 2048
+    assert cfg.get("max_steps") == 1
+    assert cfg.get("eval_only") is False
 
 
 def test_telemetry_overrides_win_over_lock(monkeypatch):
@@ -108,7 +120,15 @@ def test_run_arm_submission_signature():
     import inspect
     sig = inspect.signature(run_arm_submission)
     params = sig.parameters
-    for key in ("config", "data_path", "sp_model_path", "budget_seconds", "output_json", "val_cache_dir"):
+    for key in (
+        "config",
+        "data_path",
+        "sp_model_path",
+        "budget_seconds",
+        "output_json",
+        "output_ckpt",
+        "val_cache_dir",
+    ):
         assert key in params, f"Missing parameter: {key}"
 
 
@@ -134,6 +154,7 @@ def test_run_arm_submission_delegates_to_run_condition(monkeypatch):
         sp_model_path="/tok.model",
         budget_seconds=600,
         output_json="/out.json",
+        output_ckpt="/out.pt",
         val_cache_dir="/val",
     )
 
@@ -142,4 +163,5 @@ def test_run_arm_submission_delegates_to_run_condition(monkeypatch):
     assert call["config"]["model_dim"] == 384
     assert call["kwargs"]["data_path"] == "/data"
     assert call["kwargs"]["budget_seconds"] == 600.0
+    assert call["kwargs"]["output_ckpt"] == "/out.pt"
     assert "bpb" in result.get("eval", {})

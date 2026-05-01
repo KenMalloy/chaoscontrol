@@ -221,6 +221,8 @@ def packet_online_cache(ctx: CalcTypeContext) -> CalcTypeResult:
         decay: cross-doc decay applied to carried recurrent state (default 1.0).
         seeded: if False, clear ``model.outer_model`` before eval to isolate
             online accumulation from training-seeded cache (default True).
+        max_docs: optional source-order doc cap for smoke tests. Omitted or
+            <=0 means score the full cache.
     """
     cfg = ctx.config
     chunk_tokens = int(cfg.get("chunk_tokens", 256))
@@ -228,6 +230,7 @@ def packet_online_cache(ctx: CalcTypeContext) -> CalcTypeResult:
     gate_value = float(cfg.get("gate_value", 1.0))
     decay = float(cfg.get("decay", 1.0))
     seeded = bool(cfg.get("seeded", True))
+    max_docs = int(cfg.get("max_docs", 0) or 0)
     if chunk_tokens < 1:
         raise ValueError("chunk_tokens must be >= 1")
     if write_tokens_per_chunk < 0:
@@ -258,6 +261,8 @@ def packet_online_cache(ctx: CalcTypeContext) -> CalcTypeResult:
     try:
         with torch.no_grad():
             for doc in val_cache.iter_docs():
+                if max_docs > 0 and docs_scored >= max_docs:
+                    break
                 if doc.token_len < 2:
                     continue
                 tokens_np = val_cache.tokens_for_doc(doc)
@@ -366,6 +371,7 @@ def packet_online_cache(ctx: CalcTypeContext) -> CalcTypeResult:
             "gate_value": gate_value,
             "decay": decay,
             "seeded": seeded,
+            "max_docs": max_docs,
         },
         extra={
             "episodic_reads": episodic_reads,
