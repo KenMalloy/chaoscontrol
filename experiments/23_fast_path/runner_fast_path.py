@@ -1659,18 +1659,15 @@ def _dist_work_done(work: Any, *, device: torch.device | None = None) -> bool:
     is_completed = getattr(work, "is_completed", None)
     if callable(is_completed):
         try:
-            if bool(is_completed()):
-                return True
+            return bool(is_completed())
         except Exception:
             pass
-        if device is not None and device.type == "cuda":
-            return False
     wait = getattr(work, "wait", None)
     if callable(wait):
         try:
-            if device is None or device.type != "cuda":
-                return bool(wait())
             return bool(wait(datetime.timedelta(milliseconds=1)))
+        except TypeError:
+            return False
         except Exception:
             return False
     return False

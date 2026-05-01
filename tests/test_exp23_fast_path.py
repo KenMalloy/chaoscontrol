@@ -127,6 +127,42 @@ def test_crct_memory_rank_checks_wall_clock_even_when_idle() -> None:
     )
 
 
+def test_dist_work_done_does_not_block_on_incomplete_cpu_work() -> None:
+    mod = _load_runner_module()
+    calls = []
+
+    class IncompleteWork:
+        def is_completed(self):
+            calls.append("is_completed")
+            return False
+
+        def wait(self, *_args, **_kwargs):  # pragma: no cover - must not run
+            raise AssertionError("polling CPU work must not block in wait()")
+
+    assert mod._dist_work_done(
+        IncompleteWork(),
+        device=torch.device("cpu"),
+    ) is False
+    assert calls == ["is_completed"]
+
+
+def test_dist_work_done_fallback_wait_is_timeout_bounded() -> None:
+    mod = _load_runner_module()
+    waits = []
+
+    class TimeoutWaitWork:
+        def wait(self, timeout):
+            waits.append(timeout)
+            return True
+
+    assert mod._dist_work_done(
+        TimeoutWaitWork(),
+        device=torch.device("cpu"),
+    ) is True
+    assert waits
+    assert waits[0].total_seconds() <= 0.001
+
+
 class _TinyTrainStepModel(nn.Module):
     def __init__(self):
         super().__init__()
