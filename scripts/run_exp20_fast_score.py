@@ -10,6 +10,7 @@ distributed sharding layer on top after this path is parity-tested.
 from __future__ import annotations
 
 import argparse
+import inspect
 import json
 import os
 import sys
@@ -425,6 +426,46 @@ def _model_final_states(out: object) -> list[torch.Tensor] | None:
     return None
 
 
+def _score_model_call(
+    model: torch.nn.Module,
+    chunk: torch.Tensor,
+    *,
+    initial_states: list[torch.Tensor] | None = None,
+    score_through_packet_lane: bool = False,
+) -> object:
+    """Call the model for scoring, optionally forcing the packet-clean lane."""
+    if not bool(score_through_packet_lane):
+        kwargs = {"initial_states": initial_states} if initial_states is not None else {}
+        return model(chunk, **kwargs)
+
+    encode = getattr(model, "encode", None)
+    lm_head = getattr(model, "lm_head", None)
+    if not callable(encode) or lm_head is None:
+        raise AttributeError(
+            "--score-through-packet-lane requires model.encode(...) and lm_head"
+        )
+    params = inspect.signature(encode).parameters
+    accepts_kwargs = any(
+        p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()
+    )
+    kwargs: dict[str, object] = {"return_final_states": True}
+    if initial_states is not None:
+        kwargs["initial_states"] = initial_states
+    if "memory_mode" in params or accepts_kwargs:
+        kwargs["memory_mode"] = "packet"
+    out = encode(chunk, **kwargs)
+    if isinstance(out, dict):
+        hidden = out["hidden"]
+        final_states = list(out.get("final_states") or [])
+    else:
+        hidden, final_states = out
+        final_states = list(final_states or [])
+    final_norm = getattr(model, "final_norm", None)
+    if final_norm is not None:
+        hidden = final_norm(hidden)
+    return {"logits": lm_head(hidden), "final_states": final_states}
+
+
 def _probe_max_forward_tokens(
     model: torch.nn.Module,
     *,
@@ -664,6 +705,7 @@ def _score_doc(
     device: torch.device,
     score_boundary_targets: bool,
     device_tokens: torch.Tensor | None = None,
+    score_through_packet_lane: bool = False,
 ) -> tuple[float, int, int, float, float, float]:
     prev_states: list[torch.Tensor] | None = None
     doc_ce = torch.zeros((), device=device, dtype=torch.float64)
@@ -681,8 +723,12 @@ def _score_doc(
             assert doc_tokens_np is not None
             chunk_np = doc_tokens_np[start:end]
             chunk = torch.tensor(chunk_np, dtype=torch.long, device=device).unsqueeze(0)
-        kwargs = {"initial_states": prev_states} if prev_states else {}
-        out = model(chunk, **kwargs)
+        out = _score_model_call(
+            model,
+            chunk,
+            initial_states=prev_states,
+            score_through_packet_lane=score_through_packet_lane,
+        )
         logits = _model_logits(out)
         loss = F.cross_entropy(
             logits[:, :-1].reshape(-1, logits.size(-1)),
@@ -731,6 +777,7 @@ def _score_docs_reset_batch(
     score_boundary_targets: bool,
     score_graph_runner: _CudaGraphScoreRunner | None = None,
     graph_stats: _ScoreGraphStats | None = None,
+    score_through_packet_lane: bool = False,
 ) -> list[_DocScore]:
     """Score a document batch while preserving reset-mode semantics.
 
@@ -854,8 +901,12 @@ def _score_docs_reset_batch(
         else:
             if graph_stats is not None:
                 graph_stats.fallback_count += 1
-            kwargs = {"initial_states": initial_states} if initial_states is not None else {}
-            out = model(chunk, **kwargs)
+            out = _score_model_call(
+                model,
+                chunk,
+                initial_states=initial_states,
+                score_through_packet_lane=score_through_packet_lane,
+            )
             logits = _model_logits(out)
             losses = F.cross_entropy(
                 logits[:, :-1].reshape(-1, logits.size(-1)),
@@ -1156,6 +1207,9 @@ def run(args: argparse.Namespace) -> dict:
                         device=device,
                         score_boundary_targets=args.score_boundary_targets,
                         device_tokens=device_tokens,
+                        score_through_packet_lane=bool(
+                            args.score_through_packet_lane
+                        ),
                     )
                     scores.append(_DocScore(
                         doc=doc,
@@ -1177,6 +1231,7 @@ def run(args: argparse.Namespace) -> dict:
                     score_boundary_targets=args.score_boundary_targets,
                     score_graph_runner=score_graph_runner,
                     graph_stats=graph_stats,
+                    score_through_packet_lane=bool(args.score_through_packet_lane),
                 )
             budget.add_score_time(time.monotonic() - score_t0)
             for score in scores:
@@ -1360,6 +1415,17 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--score-warmup-steps", type=int, default=0)
     parser.add_argument("--score-graph-mode", choices=["none", "cuda"], default="none")
+    parser.add_argument(
+        "--score-through-packet-lane",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Score CareStudentLM-style checkpoints through "
+            "encode(memory_mode='packet') instead of model.forward(). Use this "
+            "for packet-clean ARM/CARE checkpoints so legacy direct sidecar "
+            "reads cannot enter the diagnostic scorer."
+        ),
+    )
     parser.add_argument("--episodic-cache-enabled", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--episodic-cache-reset-per-doc", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--episodic-cache-capacity", type=int, default=4096)
