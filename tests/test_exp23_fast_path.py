@@ -150,24 +150,21 @@ def test_dist_work_done_uses_timeout_bounded_wait_for_progress() -> None:
     assert waits[0].total_seconds() <= 0.001
 
 
-def test_dist_work_done_can_pure_poll_without_waiting() -> None:
+def test_dist_work_done_fallback_wait_is_timeout_bounded() -> None:
     mod = _load_runner_module()
-    calls = []
+    waits = []
 
-    class IncompleteReceiveWork:
-        def is_completed(self):
-            calls.append("is_completed")
-            return False
-
-        def wait(self, *_args, **_kwargs):  # pragma: no cover - must not run
-            raise AssertionError("posted receives should be pure-polled")
+    class TimeoutWaitWork:
+        def wait(self, timeout):
+            waits.append(timeout)
+            return True
 
     assert mod._dist_work_done(
-        IncompleteReceiveWork(),
+        TimeoutWaitWork(),
         device=torch.device("cpu"),
-        wait_for_progress=False,
-    ) is False
-    assert calls == ["is_completed"]
+    ) is True
+    assert waits
+    assert waits[0].total_seconds() <= 0.001
 
 
 class _TinyTrainStepModel(nn.Module):

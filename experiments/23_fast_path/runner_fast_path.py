@@ -1657,7 +1657,6 @@ def _dist_work_done(
     work: Any,
     *,
     device: torch.device | None = None,
-    wait_for_progress: bool = True,
 ) -> bool:
     if work is None:
         return True
@@ -1668,8 +1667,6 @@ def _dist_work_done(
                 return True
         except Exception:
             pass
-    if not bool(wait_for_progress):
-        return False
     wait = getattr(work, "wait", None)
     if callable(wait):
         try:
@@ -2023,13 +2020,10 @@ class _CrctSlotCommitPeerTransport:
     def _work_done(
         self,
         work: Any | None,
-        *,
-        wait_for_progress: bool = True,
     ) -> bool:
         return _dist_work_done(
             work,
             device=self.device,
-            wait_for_progress=wait_for_progress,
         )
 
     def _header_device(self) -> torch.device:
@@ -2216,10 +2210,7 @@ class _CrctSlotCommitPeerTransport:
             self._post_header_recv()
             return False
         if self._recv_header_work is not None:
-            if not self._work_done(
-                self._recv_header_work,
-                wait_for_progress=False,
-            ):
+            if not self._work_done(self._recv_header_work):
                 return False
             self._recv_header_work = None
             assert self._recv_header is not None
@@ -2247,10 +2238,7 @@ class _CrctSlotCommitPeerTransport:
                 self.metrics["recv_payloads_started"] += 1
                 return True
         if self._recv_payload_work is not None:
-            if not self._work_done(
-                self._recv_payload_work,
-                wait_for_progress=False,
-            ):
+            if not self._work_done(self._recv_payload_work):
                 return False
             self._recv_payload_work = None
         if self._recv_pending_header is None:
