@@ -59,9 +59,11 @@ class TraceOuterModel:
         batch_size: int,
         *,
         cue: torch.Tensor | None = None,
+        slot_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        self.events.append(("read", len(self._slots)))
-        scale = 0.25 * max(1, len(self._slots))
+        selected = int(slot_mask.sum().item()) if slot_mask is not None else 0
+        self.events.append(("read", {"slots": len(self._slots), "selected": selected}))
+        scale = 0.25 * max(1, selected or len(self._slots))
         return torch.full((batch_size, self.dim), scale)
 
 
@@ -253,8 +255,8 @@ def test_packet_online_cache_score_before_write_ordering(tmp_path):
     # No read sees a non-empty cache before the first append.
     for i, event in enumerate(model.events[:first_append_idx]):
         if event[0] == "read":
-            assert event[1] == 0, (
-                f"read at event index {i} saw {event[1]} slots before any append"
+            assert event[1]["slots"] == 0, (
+                f"read at event index {i} saw {event[1]} before any append"
             )
 
 
@@ -394,6 +396,37 @@ def test_packet_online_cache_batched_write_zero_is_seeded_read_only(tmp_path):
     assert "append" not in [event[0] for event in model.events]
 
 
+def test_packet_online_cache_controller_read_selects_bounded_slots(tmp_path):
+    model = PacketOnlineModel(seed=8)
+    for i in range(5):
+        model.outer_model._slots.append(torch.full((1, DIM), float(i + 1) / 10.0))
+        model.outer_model._survival.append(float(i + 1))
+        model.outer_model._slot_buckets.append(0)
+        model.outer_model._slot_event_ids.append(0)
+    cache = make_val_cache(tmp_path, doc_lens=[8, 10])
+    ctx = make_ctx(
+        model,
+        cache,
+        config={
+            "batch_docs": 2,
+            "batch_token_budget": 64,
+            "write_tokens_per_chunk": 0,
+            "controller_read_enabled": True,
+            "controller_topk_k": 2,
+        },
+    )
+
+    result = packet_online_cache(ctx)
+
+    assert result.extra["episodic_reads"] == 1
+    assert result.extra["controller_reads"] == 1
+    assert result.extra["controller_selected_slots"] == 4  # batch 2 * topk 2
+    read_events = [payload for name, payload in model.events if name == "read"]
+    assert read_events[0]["selected"] == 4
+    assert result.hyperparams["controller_read_enabled"] is True
+    assert result.hyperparams["controller_topk_k"] == 2
+
+
 def test_packet_online_cache_rejects_bad_config(tmp_path):
     model = PacketOnlineModel(seed=0)
     cache = make_val_cache(tmp_path, doc_lens=[4])
@@ -410,3 +443,22 @@ def test_packet_online_cache_rejects_bad_config(tmp_path):
         packet_online_cache(make_ctx(model, cache, config={"batch_docs": 0}))
     with pytest.raises(ValueError, match="batch_token_budget"):
         packet_online_cache(make_ctx(model, cache, config={"batch_token_budget": -1}))
+    with pytest.raises(ValueError, match="controller_topk_k"):
+        packet_online_cache(
+            make_ctx(
+                model,
+                cache,
+                config={"controller_read_enabled": True, "controller_topk_k": 0},
+            )
+        )
+    with pytest.raises(ValueError, match="controller_score_mode"):
+        packet_online_cache(
+            make_ctx(
+                model,
+                cache,
+                config={
+                    "controller_read_enabled": True,
+                    "controller_score_mode": "not_real",
+                },
+            )
+        )

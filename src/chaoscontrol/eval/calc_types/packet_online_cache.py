@@ -116,6 +116,142 @@ def _outer_slot_count(model: torch.nn.Module) -> int:
     return 0
 
 
+def _outer_slot_matrix_and_indices(
+    model: torch.nn.Module,
+) -> tuple[torch.Tensor | None, list[int]]:
+    outer = getattr(model, "outer_model", None)
+    if outer is None:
+        return None, []
+    table = getattr(outer, "table", None)
+    if table is not None:
+        visible = getattr(table, "visible_indices", None)
+        slot_matrix = getattr(table, "slot_matrix", None)
+        if callable(visible) and callable(slot_matrix):
+            indices = [int(i) for i in visible()]
+            if not indices:
+                return None, []
+            return slot_matrix(indices), indices
+    slots = getattr(outer, "_slots", None)
+    if not slots:
+        return None, []
+    matrix = torch.cat([slot.detach().reshape(1, -1) for slot in slots], dim=0)
+    return matrix, list(range(int(matrix.shape[0])))
+
+
+def _outer_slot_survival(
+    model: torch.nn.Module,
+    *,
+    indices: list[int],
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    outer = getattr(model, "outer_model", None)
+    survival = getattr(outer, "_survival", None)
+    if isinstance(survival, list) and survival:
+        vals = [
+            float(survival[i]) if 0 <= int(i) < len(survival) else 1.0
+            for i in indices
+        ]
+        return torch.tensor(vals, device=device, dtype=dtype)
+    table = getattr(outer, "table", None)
+    table_survival = getattr(table, "_survival", None)
+    if isinstance(table_survival, list) and table_survival:
+        vals = [
+            float(table_survival[i]) if 0 <= int(i) < len(table_survival) else 1.0
+            for i in indices
+        ]
+        return torch.tensor(vals, device=device, dtype=dtype)
+    return torch.ones(len(indices), device=device, dtype=dtype)
+
+
+def _controller_slot_mask_from_prefix(
+    model: torch.nn.Module,
+    *,
+    cue: torch.Tensor | None,
+    batch_size: int,
+    topk: int,
+    score_mode: str,
+) -> tuple[torch.Tensor | None, int]:
+    """Select a bounded slot set before packet read.
+
+    This is the eval-side controller toggle: a strict-prefix cue, when
+    available, ranks memory slots before ``outer.read`` forms the residual.
+    The direct packet path still owns the final decode; the controller only
+    narrows *which* slots are allowed to participate.
+    """
+    outer = getattr(model, "outer_model", None)
+    if outer is None or int(topk) <= 0:
+        return None, 0
+    slot_matrix, indices = _outer_slot_matrix_and_indices(model)
+    if slot_matrix is None or not indices:
+        return None, 0
+    slot_device = slot_matrix.device
+    slot_dtype = slot_matrix.dtype
+    k_eff = min(int(topk), len(indices))
+    mode = str(score_mode).strip().lower()
+    valid_modes = {
+        "cosine",
+        "cosine_survival",
+        "cosine_utility_weighted",
+        "dot",
+        "dot_survival",
+    }
+    if mode not in valid_modes:
+        raise ValueError(
+            f"controller_score_mode must be one of {sorted(valid_modes)}, "
+            f"got {score_mode!r}"
+        )
+    survival = _outer_slot_survival(
+        model,
+        indices=indices,
+        device=slot_device,
+        dtype=slot_dtype,
+    )
+    if cue is None:
+        scores = survival.unsqueeze(0).expand(int(batch_size), -1)
+    else:
+        cue = cue.detach()
+        if cue.dim() > 2:
+            cue = cue.reshape(cue.shape[0], -1)
+        if cue.shape[0] == 1 and int(batch_size) != 1:
+            cue = cue.expand(int(batch_size), -1)
+        elif cue.shape[0] != int(batch_size):
+            cue = cue[:1].expand(int(batch_size), -1)
+        cue_proj = getattr(outer, "cue_proj", None)
+        if cue_proj is not None:
+            cue_outer = cue_proj(
+                cue.to(device=slot_device, dtype=cue_proj.weight.dtype)
+            ).to(dtype=slot_dtype)
+        else:
+            cue_outer = cue.to(device=slot_device, dtype=slot_dtype)
+            if cue_outer.shape[-1] != slot_matrix.shape[-1]:
+                cue_outer = cue_outer[..., : slot_matrix.shape[-1]]
+                if cue_outer.shape[-1] < slot_matrix.shape[-1]:
+                    cue_outer = torch.nn.functional.pad(
+                        cue_outer,
+                        (0, slot_matrix.shape[-1] - cue_outer.shape[-1]),
+                    )
+        if mode in {"cosine", "cosine_survival", "cosine_utility_weighted"}:
+            q = cue_outer / (cue_outer.norm(dim=-1, keepdim=True) + 1e-8)
+            keys = slot_matrix / (slot_matrix.norm(dim=-1, keepdim=True) + 1e-8)
+            scores = q @ keys.T
+        else:
+            scores = cue_outer @ slot_matrix.T
+        if mode in {"cosine_survival", "dot_survival", "cosine_utility_weighted"}:
+            scores = scores * survival.unsqueeze(0)
+    top = torch.topk(scores, k=k_eff, dim=-1, largest=True, sorted=False).indices
+    physical = torch.tensor(indices, device=slot_device, dtype=torch.long)[top]
+    mask_width = max(indices) + 1
+    slot_mask = torch.zeros(
+        int(batch_size),
+        int(mask_width),
+        device=slot_device,
+        dtype=torch.bool,
+    )
+    slot_mask.scatter_(1, physical, True)
+    return slot_mask, int(physical.numel())
+
+
 def _clear_outer_cache(model: torch.nn.Module) -> None:
     """Drop every active slot before eval. Used by the empty/no-seed variant."""
     outer = getattr(model, "outer_model", None)
@@ -138,7 +274,10 @@ def _episodic_packet_from_prefix(
     states: list[torch.Tensor] | None,
     batch_size: int,
     gate_value: float,
-) -> tuple[torch.Tensor | None, torch.Tensor | None, bool]:
+    controller_read_enabled: bool = False,
+    controller_topk_k: int = 16,
+    controller_score_mode: str = "cosine_survival",
+) -> tuple[torch.Tensor | None, torch.Tensor | None, bool, int]:
     """Read a residual from already-committed memory.
 
     The cue is the recurrent state at the chunk boundary: strict-prefix
@@ -146,26 +285,39 @@ def _episodic_packet_from_prefix(
     the cue, so the residual is legal for every target in that chunk.
     """
     if gate_value <= 0.0 or _outer_slot_count(model) <= 0:
-        return None, None, False
+        return None, None, False, 0
     outer = getattr(model, "outer_model", None)
     read = getattr(outer, "read", None)
     if read is None or not callable(read):
-        return None, None, False
+        return None, None, False, 0
     cue = None
     if states:
         cue = states[-1].detach()
         if cue.dim() > 2:
             cue = cue.reshape(cue.shape[0], -1)
-    residual = read(int(batch_size), cue=cue)
+    slot_mask = None
+    controller_selected = 0
+    if controller_read_enabled:
+        slot_mask, controller_selected = _controller_slot_mask_from_prefix(
+            model,
+            cue=cue,
+            batch_size=int(batch_size),
+            topk=int(controller_topk_k),
+            score_mode=str(controller_score_mode),
+        )
+    read_kwargs: dict[str, Any] = {"cue": cue}
+    if slot_mask is not None:
+        read_kwargs["slot_mask"] = slot_mask
+    residual = read(int(batch_size), **read_kwargs)
     if not isinstance(residual, torch.Tensor):
-        return None, None, False
+        return None, None, False, controller_selected
     gate = torch.full(
         (int(batch_size),),
         float(gate_value),
         device=residual.device,
         dtype=residual.dtype,
     )
-    return residual.detach(), gate.detach(), True
+    return residual.detach(), gate.detach(), True, controller_selected
 
 
 def _append_online_episodic_memory(
@@ -261,7 +413,10 @@ def _score_doc_microbatch(
     packet_support: tuple[bool, bool],
     gate_value: float,
     write_tokens_per_chunk: int,
-) -> tuple[float, int, int, int, int, int]:
+    controller_read_enabled: bool,
+    controller_topk_k: int,
+    controller_score_mode: str,
+) -> tuple[float, int, int, int, int, int, int]:
     """Score a source-ordered microbatch, then append its evidence.
 
     This is prequential at the microbatch boundary: no hidden state from the
@@ -270,7 +425,7 @@ def _score_doc_microbatch(
     information within the microbatch, but it never uses future information.
     """
     if not docs:
-        return 0.0, 0, 0, 0, 0, 0
+        return 0.0, 0, 0, 0, 0, 0, 0
     token_arrays: list[np.ndarray] = [val_cache.tokens_for_doc(doc) for doc in docs]
     lengths = [int(arr.shape[0]) - 1 for arr in token_arrays]
     max_len = max(lengths)
@@ -286,11 +441,14 @@ def _score_doc_microbatch(
         mask[row, :length] = True
 
     slot_count_at_score = _outer_slot_count(model)
-    residual, gate, read_hit = _episodic_packet_from_prefix(
+    residual, gate, read_hit, controller_selected = _episodic_packet_from_prefix(
         model,
         states=None,
         batch_size=batch,
         gate_value=gate_value,
+        controller_read_enabled=controller_read_enabled,
+        controller_topk_k=controller_topk_k,
+        controller_score_mode=controller_score_mode,
     )
     hidden, _final_states = _packet_encode(
         model,
@@ -325,7 +483,15 @@ def _score_doc_microbatch(
         score=scores_for_write,
         max_tokens=write_limit,
     )
-    return ce_nats, tokens_scored, raw_bytes, int(bool(read_hit)), writes, 1
+    return (
+        ce_nats,
+        tokens_scored,
+        raw_bytes,
+        int(bool(read_hit)),
+        writes,
+        1,
+        int(controller_selected),
+    )
 
 
 @register_calc_type(
@@ -356,6 +522,11 @@ def packet_online_cache(ctx: CalcTypeContext) -> CalcTypeResult:
             microbatch before committing its evidence.
         batch_token_budget: padded-token budget for batched eval. ``0`` means
             only ``batch_docs`` limits the microbatch.
+        controller_read_enabled: when True, a strict-prefix controller selector
+            picks a bounded top-K slot mask before packet residual formation.
+        controller_topk_k: slot budget for the controller selector.
+        controller_score_mode: ``cosine_survival`` (default), ``cosine``, or
+            ``dot_survival``.
     """
     cfg = ctx.config
     chunk_tokens = int(cfg.get("chunk_tokens", 256))
@@ -366,6 +537,9 @@ def packet_online_cache(ctx: CalcTypeContext) -> CalcTypeResult:
     max_docs = int(cfg.get("max_docs", 0) or 0)
     batch_docs = int(cfg.get("batch_docs", 1))
     batch_token_budget = int(cfg.get("batch_token_budget", 0) or 0)
+    controller_read_enabled = bool(cfg.get("controller_read_enabled", False))
+    controller_topk_k = int(cfg.get("controller_topk_k", 16))
+    controller_score_mode = str(cfg.get("controller_score_mode", "cosine_survival"))
     if chunk_tokens < 1:
         raise ValueError("chunk_tokens must be >= 1")
     if write_tokens_per_chunk < 0:
@@ -376,6 +550,23 @@ def packet_online_cache(ctx: CalcTypeContext) -> CalcTypeResult:
         raise ValueError("batch_docs must be >= 1")
     if batch_token_budget < 0:
         raise ValueError("batch_token_budget must be >= 0")
+    if controller_topk_k < 1:
+        raise ValueError("controller_topk_k must be >= 1")
+    valid_controller_modes = {
+        "cosine",
+        "cosine_survival",
+        "cosine_utility_weighted",
+        "dot",
+        "dot_survival",
+    }
+    if (
+        controller_read_enabled
+        and controller_score_mode.strip().lower() not in valid_controller_modes
+    ):
+        raise ValueError(
+            "controller_score_mode must be one of "
+            f"{sorted(valid_controller_modes)}, got {controller_score_mode!r}"
+        )
 
     model = ctx.model
     val_cache = ctx.val_cache
@@ -394,6 +585,8 @@ def packet_online_cache(ctx: CalcTypeContext) -> CalcTypeResult:
     episodic_reads = 0
     episodic_writes = 0
     chunks_scored = 0
+    controller_reads = 0
+    controller_selected_slots = 0
 
     was_training = model.training
     model.eval()
@@ -413,6 +606,7 @@ def packet_online_cache(ctx: CalcTypeContext) -> CalcTypeResult:
                         reads,
                         writes,
                         chunks,
+                        selected_slots,
                     ) = _score_doc_microbatch(
                         model,
                         val_cache,
@@ -421,6 +615,9 @@ def packet_online_cache(ctx: CalcTypeContext) -> CalcTypeResult:
                         packet_support=packet_support,
                         gate_value=gate_value,
                         write_tokens_per_chunk=write_tokens_per_chunk,
+                        controller_read_enabled=controller_read_enabled,
+                        controller_topk_k=controller_topk_k,
+                        controller_score_mode=controller_score_mode,
                     )
                     total_ce_nats += torch.tensor(ce_nats, dtype=torch.float64)
                     total_tokens_scored += int(tokens_scored)
@@ -429,6 +626,9 @@ def packet_online_cache(ctx: CalcTypeContext) -> CalcTypeResult:
                     episodic_reads += int(reads)
                     episodic_writes += int(writes)
                     chunks_scored += int(chunks)
+                    if selected_slots > 0:
+                        controller_reads += 1
+                        controller_selected_slots += int(selected_slots)
             else:
                 for doc in _iter_score_docs(val_cache, max_docs=max_docs):
                     tokens_np = val_cache.tokens_for_doc(doc)
@@ -449,14 +649,25 @@ def packet_online_cache(ctx: CalcTypeContext) -> CalcTypeResult:
                             break
 
                         slot_count_at_score = _outer_slot_count(model)
-                        residual, gate, read_hit = _episodic_packet_from_prefix(
+                        (
+                            residual,
+                            gate,
+                            read_hit,
+                            selected_slots,
+                        ) = _episodic_packet_from_prefix(
                             model,
                             states=states,
                             batch_size=int(chunk_inputs.shape[0]),
                             gate_value=gate_value,
+                            controller_read_enabled=controller_read_enabled,
+                            controller_topk_k=controller_topk_k,
+                            controller_score_mode=controller_score_mode,
                         )
                         if read_hit:
                             episodic_reads += 1
+                        if selected_slots > 0:
+                            controller_reads += 1
+                            controller_selected_slots += int(selected_slots)
                         hidden, final_states = _packet_encode(
                             model,
                             chunk_inputs,
@@ -493,14 +704,25 @@ def packet_online_cache(ctx: CalcTypeContext) -> CalcTypeResult:
                     # carry reflects the full observed stream.  No new score is
                     # produced here (the tail target was already scored above).
                     tail = input_ids[:, -1:]
-                    residual, gate, read_hit = _episodic_packet_from_prefix(
+                    (
+                        residual,
+                        gate,
+                        read_hit,
+                        selected_slots,
+                    ) = _episodic_packet_from_prefix(
                         model,
                         states=states,
                         batch_size=int(tail.shape[0]),
                         gate_value=gate_value,
+                        controller_read_enabled=controller_read_enabled,
+                        controller_topk_k=controller_topk_k,
+                        controller_score_mode=controller_score_mode,
                     )
                     if read_hit:
                         episodic_reads += 1
+                    if selected_slots > 0:
+                        controller_reads += 1
+                        controller_selected_slots += int(selected_slots)
                     _, final_states = _packet_encode(
                         model,
                         tail,
@@ -540,11 +762,16 @@ def packet_online_cache(ctx: CalcTypeContext) -> CalcTypeResult:
             "max_docs": max_docs,
             "batch_docs": batch_docs,
             "batch_token_budget": batch_token_budget,
+            "controller_read_enabled": controller_read_enabled,
+            "controller_topk_k": controller_topk_k,
+            "controller_score_mode": controller_score_mode,
         },
         extra={
             "episodic_reads": episodic_reads,
             "episodic_writes": episodic_writes,
             "chunks_scored": chunks_scored,
+            "controller_reads": controller_reads,
+            "controller_selected_slots": controller_selected_slots,
             "slot_count_initial": initial_slot_count,
             "slot_count_final": _outer_slot_count(model),
         },
