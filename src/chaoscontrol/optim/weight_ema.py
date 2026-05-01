@@ -87,3 +87,25 @@ class WeightEMA:
         finally:
             for name, original in saved.items():
                 sd[name].copy_(original)
+
+
+from typing import Callable, TypeVar
+
+T = TypeVar("T")
+
+
+def eval_with_ema(
+    model: torch.nn.Module,
+    ema: WeightEMA | None,
+    eval_fn: Callable[[], T],
+) -> T:
+    """Run ``eval_fn()`` with EMA weights swapped into ``model``.
+
+    If ``ema`` is None (e.g. on non-rank-0 ranks), ``eval_fn`` runs against
+    the model's current weights unchanged. Always restores the original
+    weights before returning.
+    """
+    if ema is None:
+        return eval_fn()
+    with ema.applied(model):
+        return eval_fn()
