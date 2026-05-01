@@ -147,6 +147,7 @@ from chaoscontrol.optim.episodic_writer import (  # noqa: E402
 )
 from chaoscontrol.optim.lamb import LAMB  # noqa: E402
 from chaoscontrol.optim.muon import Muon  # noqa: E402
+from chaoscontrol.optim.step_wrapper import wrap_optimizer_step  # noqa: E402
 from chaoscontrol.optim.param_groups import build_optimizer_params  # noqa: E402
 from chaoscontrol.optim.scopt import (  # noqa: E402
     FrequencyBucketBaseline,
@@ -579,6 +580,22 @@ def _compute_per_bucket_val_ce(
     }
 
 
+def _current_rank() -> int:
+    """Return this process's distributed rank, or 0 if dist isn't initialized.
+
+    Uses ``torch.distributed.get_rank()`` so it works correctly under torchrun
+    after ``init_process_group`` has been called, and degrades gracefully in
+    single-process tests where dist is unavailable.
+    """
+    try:
+        import torch.distributed as dist
+        if dist.is_available() and dist.is_initialized():
+            return int(dist.get_rank())
+    except Exception:
+        pass
+    return 0
+
+
 def _build_optimizer(
     config: dict[str, Any],
     model: torch.nn.Module,
@@ -654,6 +671,20 @@ def _build_optimizer(
         )
         opt.bind_param_names(named_params)
         opt._excluded_param_names = list(excluded_param_names)
+        wrap_optimizer_step(
+            opt,
+            model=model,
+            target_momentum=float(config.get("muon_momentum", 0.95)),
+            warmup_start=float(config.get("muon_momentum_warmup_start", 0.95)),
+            warmup_steps=int(config.get("muon_momentum_warmup_steps", 0)),
+            weight_ema_decay=float(config.get("weight_ema_decay", 0.0)),
+            is_rank_zero=_current_rank() == 0,
+            ema_exclude_prefixes=(
+                "outer_model.",
+                "semantic_tier.",
+                "bucket_prototypes_module.",
+            ) if bool(config.get("crct_enabled", False)) else (),
+        )
         return opt
     if name == "semantic":
         semantic_cfg = _semantic_optimizer_config(
