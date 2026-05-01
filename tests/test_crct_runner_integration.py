@@ -93,7 +93,7 @@ def _wait_for_metric(
     assert int(transport.diagnostics().get(key, 0)) >= int(expected)
 
 
-def test_crct_rank_topology_splits_packet_and_maintenance_only_at_8x() -> None:
+def test_crct_rank_topology_shares_packet_and_maintenance_on_default_topologies() -> None:
     mod = _load_module("runner_fast_path_crct_rank_topology", RUNNER_PATH)
 
     top4 = mod._crct_rank_topology(world_size=4, replay_eviction_enabled=True)
@@ -104,11 +104,11 @@ def test_crct_rank_topology_splits_packet_and_maintenance_only_at_8x() -> None:
     assert top4["split_memory_ranks"] is False
 
     top8 = mod._crct_rank_topology(world_size=8, replay_eviction_enabled=True)
-    assert top8["train_ranks"] == [0, 1, 2, 3, 4, 5]
-    assert top8["packet_rank"] == 6
+    assert top8["train_ranks"] == [0, 1, 2, 3, 4, 5, 6]
+    assert top8["packet_rank"] == 7
     assert top8["maintenance_rank"] == 7
-    assert top8["memory_ranks"] == [6, 7]
-    assert top8["split_memory_ranks"] is True
+    assert top8["memory_ranks"] == [7]
+    assert top8["split_memory_ranks"] is False
 
 
 def test_crct_online_eval_state_merges_packet_cache_and_maintenance_state() -> None:
@@ -695,7 +695,12 @@ def _worker_slot_commit_transport(
         dist.destroy_process_group()
 
 
-def test_slot_commit_peer_transport_updates_packet_cache_over_cpu_control_group(tmp_path) -> None:
+def test_slot_commit_peer_transport_class_updates_packet_cache_over_cpu_control_group(tmp_path) -> None:
+    if sys.platform == "darwin":
+        pytest.skip(
+            "split peer transport is no longer the default runtime path and "
+            "the local Gloo CPU transport aborts on macOS in this spawn test"
+        )
     port = _pick_free_port_or_skip()
     world_size = 2
     mp.spawn(
@@ -717,15 +722,12 @@ def test_slot_commit_peer_transport_updates_packet_cache_over_cpu_control_group(
     assert rank1["append_event_id"] == 700
 
 
-def test_crct_split_runtime_does_not_use_gloo_slot_commit_p2p() -> None:
-    """Split memory ranks mirror request frames instead of P2P slot commits."""
+def test_crct_shared_runtime_keeps_split_transport_out_of_default_topology() -> None:
+    """Default runtime shares packet + maintenance on one memory rank."""
     source = RUNNER_PATH.read_text()
     assert "maintenance_local_append_packets" in source
-    assert "and int(crct_packet_rank) != int(crct_maintenance_rank)" not in source[
-        source.index("crct_slot_commit_transport:") : source.index(
-            "if bool(replay_eviction_enabled)"
-        )
-    ]
+    assert '"memory_owner": (' in source
+    assert '"packet_and_maintenance_shared"' in source
 
 
 def test_exp24_model_builder_threads_crct_memory_without_trunk_controller() -> None:

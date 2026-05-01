@@ -38,14 +38,14 @@ def init_arm_topology(rank: int, world_size: int) -> RoleInfo:
 
     This is the current deployment mapping, not an architectural law.
 
-    8+ GPU (split=True):  ranks 0..N-3 train, rank N-2 packet-serving, rank N-1 maintenance
-    4 GPU (split=False):  ranks 0..2 train, rank 3 owns both memory roles
+    Multi-GPU default:     ranks 0..N-2 train, rank N-1 owns packet + maintenance
+    4 GPU smoke shape:     ranks 0..2 train, rank 3 owns both memory roles
     1 GPU:                rank 0 is train only (no dedicated memory GPU)
     """
     world = int(world_size)
     if world > 0:
         assert 0 <= rank < world, f"rank {rank} out of range for world_size {world}"
-    split = world >= 8
+    split = False
     packet_rank = world - (2 if split else 1)
     maintenance_rank = world - 1
     if world <= 1:

@@ -1890,7 +1890,7 @@ def _crct_rank_topology(
     world = int(world_size)
     if world < 1:
         raise ValueError(f"world_size must be positive, got {world_size!r}")
-    split = bool(replay_eviction_enabled) and world >= 8
+    split = False
     packet_rank = world - (2 if split else 1)
     maintenance_rank = world - 1
     memory_ranks = sorted({int(packet_rank), int(maintenance_rank)})
@@ -2037,8 +2037,8 @@ class _CrctSlotCommitPeerTransport:
     def _close_peer_lane(self, *, timeout_s: float = 1.0) -> None:
         """Match the peer's outstanding header receive before shutdown.
 
-        The split memory lane keeps one header ``irecv`` posted so GPU6/GPU7
-        can exchange slot commits without polling a CPU mailbox. NCCL P2P
+        The legacy split-memory lane keeps one header ``irecv`` posted so the
+        two memory ranks can exchange slot commits without polling a CPU mailbox. NCCL P2P
         receives cannot be abandoned safely before later collectives, so both
         peers send a fixed close header and wait briefly for the matching
         receive to complete.
@@ -12904,7 +12904,7 @@ def train_fast_for_budget(
             label="train_teardown",
         )
     if crct_teacher_transport is not None:
-        crct_teacher_transport.unlink_shared_resources()
+        crct_teacher_transport.close()
     if crct_maintenance_transport is not None:
         crct_maintenance_transport.unlink_shared_resources()
 

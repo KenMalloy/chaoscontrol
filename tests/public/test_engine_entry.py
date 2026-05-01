@@ -20,18 +20,16 @@ class _FakeHyperparams:
 
 
 def test_init_arm_topology_8gpu():
-    role5 = init_arm_topology(rank=5, world_size=8)
     role6 = init_arm_topology(rank=6, world_size=8)
     role7 = init_arm_topology(rank=7, world_size=8)
     role0 = init_arm_topology(rank=0, world_size=8)
-    assert role5.is_train_rank
-    assert role6.is_packet_rank
-    assert not role6.is_maintenance_rank
+    assert role6.is_train_rank
     assert role7.is_maintenance_rank
-    assert not role7.is_packet_rank
+    assert role7.is_packet_rank
+    assert not role7.is_train_rank
     assert role0.is_train_rank
-    assert role6.split_memory_ranks
-    assert role7.split_memory_ranks
+    assert not role6.split_memory_ranks
+    assert not role7.split_memory_ranks
 
 
 def test_init_arm_topology_4gpu():
@@ -64,7 +62,7 @@ def test_init_arm_topology_6gpu():
 
 def test_packet_rank_value_8gpu():
     role = init_arm_topology(rank=0, world_size=8)
-    assert role.packet_rank == 6
+    assert role.packet_rank == 7
     assert role.maintenance_rank == 7
 
 

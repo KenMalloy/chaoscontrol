@@ -55,8 +55,9 @@ CPU controller plane
 
 Four-GPU smoke runs use the compact 3+1 version of the same contract: GPU0-2
 train and GPU3 shares packet serving plus maintenance. The current 8xH100
-deployment derives a 6+2 split automatically when maintenance is enabled, but
-that split is an implementation of the contract, not the contract itself.
+default is the analogous 7+1 shape: seven train ranks and one shared memory
+rank. A split 6+2 deployment remains an alternate implementation of the same
+contract, not the contract itself.
 
 When packet service and maintenance split, the two memory ranks hold replicated
 slot identity. The packet-service rank is the serving authority for

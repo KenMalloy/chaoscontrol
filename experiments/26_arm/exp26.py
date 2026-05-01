@@ -71,8 +71,8 @@ def _artifact_size_lock() -> dict[str, Any]:
     return {
         "model_dim": EXP26_MODEL_DIM,
         "ssm_delta_rank": EXP26_DELTA_RANK,
-        # On the current 8xH100 ARM deployment, train ranks keep the full
-        # B=1024/T=512 trunk while dedicated memory ranks own memory work. The
+        # On the current 8xH100 ARM deployment, seven train ranks keep the full
+        # B=1024/T=512 trunk while one shared memory rank owns memory work. The
         # cached LM-head backward's
         # scratch is B*T*tile*2 bytes; tile=8192 needs 8 GiB and OOMs on the
         # cu124 pod stack after model activations. 4096 preserves the fused
