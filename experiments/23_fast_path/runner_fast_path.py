@@ -9978,7 +9978,7 @@ def _train_fast_for_budget_cuda_graph(
             prefetcher.close()
 
     if ddp_active:
-        dist.barrier()
+        dist.barrier(group=object_group or all_group)
 
     elapsed_s = time.perf_counter() - start_time
     loss_cpu = torch.stack(losses).cpu() if losses else torch.empty(0)
@@ -13716,6 +13716,11 @@ def run_condition(
     rank, world_size, local_rank = _init_distributed(world_size_override)
     is_rank0 = rank == 0
     ddp_active = world_size > 1
+    control_group = (
+        dist.new_group(list(range(world_size)), backend="gloo")
+        if ddp_active
+        else None
+    )
     device = _pick_device(local_rank, str(config.get("device", "auto")))
     dtype = resolve_param_dtype(str(config.get("dtype", "bf16")), device)
     if device.type == "cuda":
@@ -14322,7 +14327,7 @@ def run_condition(
         )
 
     if ddp_active:
-        dist.barrier()
+        dist.barrier(group=control_group)
 
     eval_result: dict[str, Any] = {}
     calc_types_requested = list(config.get("calc_types") or [])
@@ -14351,7 +14356,7 @@ def run_condition(
         )
 
     if ddp_active:
-        dist.barrier()
+        dist.barrier(group=control_group)
 
     artifact = {
         "artifact_impact": str(
