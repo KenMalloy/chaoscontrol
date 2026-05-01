@@ -1511,6 +1511,7 @@ def _crct_rank_topology(
 
 
 _SLOT_COMMIT_MAGIC = 0x4353434D544C414E  # "CSCMTLAN"
+_SLOT_COMMIT_CLOSE_MAGIC = 0x4353434D544C434C  # "CSCMTLCL"
 _SLOT_COMMIT_HEADER_VERSION = 1
 _SLOT_COMMIT_HEADER_FIELDS = 16
 _SLOT_COMMIT_SURVIVAL_SCALE = 1_000_000
@@ -1553,6 +1554,7 @@ class _CrctSlotCommitPeerTransport:
         self._recv_header_work: Any | None = None
         self._recv_payload_work: Any | None = None
         self._recv_pending_header: torch.Tensor | None = None
+        self._peer_close_seen = False
         self._seq = 0
         cuda_peer_access_possible = False
         if device.type == "cuda" and torch.cuda.is_available():
@@ -1592,6 +1594,9 @@ class _CrctSlotCommitPeerTransport:
             "recv_headers_completed": 0,
             "recv_payloads_started": 0,
             "recv_completed": 0,
+            "close_headers_sent": 0,
+            "close_headers_received": 0,
+            "close_timeout": 0,
             "applied": 0,
             "dropped": 0,
             "stale_generation_drops": 0,
@@ -1611,6 +1616,8 @@ class _CrctSlotCommitPeerTransport:
             self._post_header_recv()
 
     def close(self) -> None:
+        if self.participant and self.group is not None:
+            self._close_peer_lane()
         self._send_queue.clear()
         self._send_header = None
         self._send_payload = None
@@ -1621,6 +1628,84 @@ class _CrctSlotCommitPeerTransport:
         self._recv_header_work = None
         self._recv_payload_work = None
         self._recv_pending_header = None
+
+    def _close_peer_lane(self, *, timeout_s: float = 1.0) -> None:
+        """Match the peer's outstanding header receive before shutdown.
+
+        The split memory lane keeps one header ``irecv`` posted so GPU6/GPU7
+        can exchange slot commits without polling a CPU mailbox. NCCL P2P
+        receives cannot be abandoned safely before later collectives, so both
+        peers send a fixed close header and wait briefly for the matching
+        receive to complete.
+        """
+        deadline = time.monotonic() + max(0.0, float(timeout_s))
+        self._send_queue.clear()
+        if (
+            not self._peer_close_seen
+            and self._recv_header_work is None
+            and self._recv_payload_work is None
+        ):
+            self._post_header_recv()
+        if self._send_header_work is None and self._send_payload_work is None:
+            self._send_header = self._make_close_header()
+            try:
+                self._send_header_work = dist.isend(
+                    self._send_header,
+                    dst=self._peer_rank(),
+                    group=self.group,
+                )
+                self.metrics["close_headers_sent"] += 1
+            except Exception as exc:
+                self.metrics["errors"] += 1
+                self.metrics["last_error"] = "".join(
+                    traceback.format_exception_only(type(exc), exc)
+                ).strip()
+                return
+        while time.monotonic() < deadline:
+            progressed = False
+            if self._send_header_work is not None and self._work_done(
+                self._send_header_work
+            ):
+                self._send_header_work = None
+                self._send_header = None
+                progressed = True
+            if self._send_payload_work is not None and self._work_done(
+                self._send_payload_work
+            ):
+                self._send_payload_work = None
+                self._send_payload = None
+                progressed = True
+            if self._recv_header_work is not None and self._work_done(
+                self._recv_header_work
+            ):
+                self._recv_header_work = None
+                if self._recv_header is not None and self._is_close_header(
+                    self._recv_header
+                ):
+                    self._mark_peer_close_seen()
+                    self._recv_header = None
+                    self._recv_pending_header = None
+                else:
+                    self._recv_pending_header = (
+                        self._recv_header.detach().clone()
+                        if self._recv_header is not None
+                        else None
+                    )
+                    self._recv_header = None
+                    self._recv_pending_header = None
+                    if not self._peer_close_seen:
+                        self._post_header_recv()
+                progressed = True
+            if (
+                self._send_header_work is None
+                and self._send_payload_work is None
+                and self._peer_close_seen
+                and self._recv_payload_work is None
+            ):
+                return
+            if not progressed:
+                _hotpath_yield()
+        self.metrics["close_timeout"] += 1
 
     def diagnostics(self) -> dict[str, Any]:
         out = dict(self.metrics)
@@ -1704,6 +1789,41 @@ class _CrctSlotCommitPeerTransport:
         ]
         self._seq += 1
         return torch.tensor(fields, device=self._header_device(), dtype=torch.int64)
+
+    def _make_close_header(self) -> torch.Tensor:
+        fields = [
+            _SLOT_COMMIT_CLOSE_MAGIC,
+            _SLOT_COMMIT_HEADER_VERSION,
+            int(self._seq),
+            0,
+            0,
+            -1,
+            -1,
+            -1,
+            -1,
+            0,
+            0,
+            0,
+            0,
+            int(self.rank),
+            0,
+            0,
+        ]
+        self._seq += 1
+        return torch.tensor(fields, device=self._header_device(), dtype=torch.int64)
+
+    def _is_close_header(self, header: torch.Tensor) -> bool:
+        try:
+            return int(header.reshape(-1)[0].detach().cpu().item()) == int(
+                _SLOT_COMMIT_CLOSE_MAGIC
+            )
+        except Exception:
+            return False
+
+    def _mark_peer_close_seen(self) -> None:
+        if not self._peer_close_seen:
+            self.metrics["close_headers_received"] += 1
+        self._peer_close_seen = True
 
     def _peer_rank(self) -> int:
         return (
@@ -1823,6 +1943,11 @@ class _CrctSlotCommitPeerTransport:
             assert self._recv_header is not None
             self._recv_pending_header = self._recv_header.detach().clone()
             self.metrics["recv_headers_completed"] += 1
+            if self._is_close_header(self._recv_pending_header):
+                self._mark_peer_close_seen()
+                self._recv_pending_header = None
+                self._recv_header = None
+                return True
             h = self._recv_pending_header.detach().to(device="cpu", dtype=torch.int64)
             payload_numel = int(h[10].item())
             dtype = slot_commit_dtype_from_code(int(h[11].item()))
