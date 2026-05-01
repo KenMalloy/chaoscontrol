@@ -34,7 +34,10 @@ def test_wrapped_step_applies_momentum_schedule():
         ema_exclude_prefixes=(),
     )
     _step_with_dummy_loss(opt, model)
-    # After 1 call, step counter == 1, frac = 1/10 = 0.1.
+    # First call evaluated schedule with step=0 -> momentum = start.
+    assert opt.param_groups[0]["momentum"] == pytest.approx(0.92)
+    _step_with_dummy_loss(opt, model)
+    # Second call evaluated schedule with step=1 -> frac = 1/10 = 0.1.
     assert opt.param_groups[0]["momentum"] == pytest.approx(0.92 + 0.07 * 0.1)
 
 
@@ -98,11 +101,9 @@ def test_wrapped_step_does_not_break_newton_schulz_path():
             self.linear = torch.nn.Linear(64, 64, bias=False)
 
     model = _Wide()
-    matrix_names = {"linear.weight"}
-    opt = Muon(
-        list(model.parameters()), lr=0.01, momentum=0.95,
-        matrix_param_names=matrix_names,
-    )
+    # The 64x64 weight is 2D, so Muon's default classifier routes it through
+    # the Newton-Schulz path without needing matrix_param_names + bind.
+    opt = Muon(list(model.parameters()), lr=0.01, momentum=0.95)
     wrap_optimizer_step(
         opt, model=model, target_momentum=0.99, warmup_start=0.92,
         warmup_steps=10, weight_ema_decay=0.997, is_rank_zero=True,
