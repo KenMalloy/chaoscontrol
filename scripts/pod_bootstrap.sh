@@ -3,8 +3,12 @@
 #
 #     bash scripts/pod_bootstrap.sh
 #
-# Add `CHAOSCONTROL_BUILD_VAL_CACHE=1 HF_TOKEN=hf_...` only when the
-# full Exp20 scorer val cache is needed.
+# By default this builds a scoring-ready pod: native extensions, Natooka
+# SP16384 shards, tokenizer, and the Exp27 ValCache verified against the
+# prepared validation shard. For a train-only pod, set:
+#
+#     CHAOSCONTROL_BUILD_VAL_CACHE=0 CHAOSCONTROL_REQUIRE_VAL_CACHE=0 \
+#         bash scripts/pod_bootstrap.sh
 #
 # The script is idempotent — re-running on a partially-set-up pod skips
 # anything that's already done.
@@ -18,14 +22,15 @@
 #      required)
 #   3. Install huggingface-hub + requests in the venv
 #   4. Fetch SP16384 train+val shards + tokenizer (Natooka)
-#   5. Optionally stream first 50k docs, build the scorer ValCache, and
-#      byte-compare it against Natooka's prepared SP16384 val shard
-#      (set CHAOSCONTROL_BUILD_VAL_CACHE=1; required for Exp27 calc_types,
-#      not required for Exp26)
+#   5. Stream first 50k docs, build the scorer ValCache, and byte-compare
+#      it against Natooka's prepared SP16384 val shard. This is required
+#      for Exp27 calc_types and final scoring. It can be explicitly disabled
+#      for train-only pods.
 #   6. Smoke-import everything to confirm the pod is fire-ready
 #
-# Total wall on a fresh pod: ~15 min for Exp26 readiness (most of it
-# pod_setup pip installs), plus optional val-cache time if requested.
+# Total wall on a fresh pod: setup time plus ValCache construction. The
+# script writes per-step bootstrap timings so pod bring-up cost stays
+# explicit next time.
 #
 # Reproducibility: every dependency, env var, and download path is
 # captured here. The next pod is one bash invocation away from ready.
@@ -34,9 +39,10 @@ set -euo pipefail
 
 REPO_ROOT=${REPO_ROOT:-/workspace/chaoscontrol}
 WORKSPACE_VENV=${WORKSPACE_VENV:-/workspace/venv}
-VAL_CACHE_DIR=${VAL_CACHE_DIR:-/workspace/cache/exp27_val_16384}
+VAL_CACHE_DIR=${VAL_CACHE_DIR:-"$REPO_ROOT/experiments/27_ttt_headline/val_cache"}
 HF_TOKEN_REQUIRED=${HF_TOKEN_REQUIRED:-1}
-CHAOSCONTROL_BUILD_VAL_CACHE=${CHAOSCONTROL_BUILD_VAL_CACHE:-0}
+CHAOSCONTROL_BUILD_VAL_CACHE=${CHAOSCONTROL_BUILD_VAL_CACHE:-1}
+CHAOSCONTROL_REQUIRE_VAL_CACHE=${CHAOSCONTROL_REQUIRE_VAL_CACHE:-1}
 BOOTSTRAP_TIMING_PATH=${BOOTSTRAP_TIMING_PATH:-"$REPO_ROOT/bootstrap_timing_$(date -u '+%Y%m%dT%H%M%SZ').jsonl"}
 
 if [ ! -d "$REPO_ROOT" ]; then
@@ -125,12 +131,12 @@ _bootstrap_step_begin "fetch_sp16384" "Step 4/6: fetch SP16384 train+val shards 
 python "$REPO_ROOT/scripts/fetch_sp16384_dataset.py"
 _bootstrap_step_end
 
-_bootstrap_step_begin "optional_val_cache" "Step 5/6: optional Exp20 scorer val cache"
+_bootstrap_step_begin "exp27_val_cache" "Step 5/6: Exp27 scorer ValCache"
 if [ "$CHAOSCONTROL_BUILD_VAL_CACHE" = "1" ]; then
     echo "    CHAOSCONTROL_BUILD_VAL_CACHE=1, streaming docs and building cache"
     if [ -z "${HF_TOKEN:-}" ] && [ "$HF_TOKEN_REQUIRED" = "1" ]; then
         echo "ERROR: HF_TOKEN env var required (willdepueoai/parameter-golf is auth-only)" >&2
-        echo "  HF_TOKEN=hf_... CHAOSCONTROL_BUILD_VAL_CACHE=1 bash scripts/pod_bootstrap.sh" >&2
+        echo "  HF_TOKEN=hf_... bash scripts/pod_bootstrap.sh" >&2
         exit 1
     fi
     python "$REPO_ROOT/scripts/stream_docs_selected.py"
@@ -150,7 +156,19 @@ if [ "$CHAOSCONTROL_BUILD_VAL_CACHE" = "1" ]; then
         --val-shard "$REPO_ROOT/baselines/parameter_golf/datasets/fineweb10B_sp16384/fineweb_val_000000.bin" \
         --val-cache-dir "$VAL_CACHE_DIR"
 else
-    echo "    skipping; set CHAOSCONTROL_BUILD_VAL_CACHE=1 for Exp27 scorer cache setup"
+    echo "    CHAOSCONTROL_BUILD_VAL_CACHE=0, skipping cache build"
+    if [ -f "$VAL_CACHE_DIR/manifest.json" ]; then
+        echo "    existing val cache found at $VAL_CACHE_DIR — verifying"
+        python "$REPO_ROOT/scripts/verify_sp16384_eval_cache.py" \
+            --val-shard "$REPO_ROOT/baselines/parameter_golf/datasets/fineweb10B_sp16384/fineweb_val_000000.bin" \
+            --val-cache-dir "$VAL_CACHE_DIR"
+    elif [ "$CHAOSCONTROL_REQUIRE_VAL_CACHE" = "1" ]; then
+        echo "ERROR: Exp27/final scoring ValCache is missing: $VAL_CACHE_DIR" >&2
+        echo "  Leave CHAOSCONTROL_BUILD_VAL_CACHE=1, or set CHAOSCONTROL_REQUIRE_VAL_CACHE=0 for train-only pods." >&2
+        exit 1
+    else
+        echo "    train-only setup allowed by CHAOSCONTROL_REQUIRE_VAL_CACHE=0"
+    fi
 fi
 _bootstrap_step_end
 
