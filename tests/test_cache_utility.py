@@ -758,6 +758,7 @@ class TestRank3ScoreBatchCausal:
             "utility",
             "controller_target",
             "loss_weight",
+            "loss_reweight_diagnostics",
             "confidence",
             "plasticity_coverage",
             "plasticity_confidence",
@@ -804,6 +805,7 @@ class TestRank3ScoreBatchCausal:
         assert out["utility"].shape == (2, 5)
         assert out["controller_target"].shape == (2, 5)
         assert out["loss_weight"].shape == (2, 5)
+        assert out["loss_reweight_diagnostics"].shape == (8,)
         assert out["confidence"].shape == (2, 5)
         assert out["plasticity_coverage"].shape == (model._dim,)
         assert out["plasticity_confidence"].shape == (model._dim,)
@@ -911,6 +913,19 @@ class TestRank3ScoreBatchCausal:
             assert math.isclose(
                 out["loss_weight"][target_mask].mean().item(), 1.0, abs_tol=1e-5
             )
+
+    def test_loss_reweight_diagnostics_measure_weighted_vs_plain_nll(self) -> None:
+        model, cache, ids, mask = self._setup(batch=3, seq=9)
+        out = rank3_score_batch_causal(
+            model=model, cache=cache, input_ids=ids, valid_mask=mask
+        )
+        diag = out["loss_reweight_diagnostics"]
+        assert diag.device.type == "cpu"
+        assert int(diag[0].item()) == int(mask[:, 1:].sum().item())
+        assert torch.isfinite(diag).all()
+        assert diag[5].item() >= 0.0
+        assert diag[6].item() >= 0.0
+        assert diag[7].item() >= 0.0
 
     def test_update_model_memory_appends_predictor_states_only(self) -> None:
         model, cache, ids, mask = self._setup(batch=2, seq=6)

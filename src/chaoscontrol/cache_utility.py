@@ -86,6 +86,58 @@ def positive_only_lm_weight(
     return weights * mask_bool.float()
 
 
+_LOSS_REWEIGHT_DIAGNOSTIC_NAMES: tuple[str, ...] = (
+    "valid_tokens",
+    "plain_nll_mean",
+    "weighted_nll_mean",
+    "weighted_minus_plain",
+    "weighted_rel_delta",
+    "loss_weight_abs_dev_mean",
+    "loss_weight_std",
+    "loss_weight_max",
+)
+
+
+def _loss_reweight_diagnostics(
+    *,
+    nll_off: torch.Tensor,
+    loss_weight: torch.Tensor,
+    mask: torch.Tensor,
+) -> torch.Tensor:
+    """Return CPU scalar diagnostics for the exact CRCT weighting signal."""
+    with torch.no_grad():
+        mask_bool = mask.bool()
+        valid_tokens = int(mask_bool.sum().item())
+        if valid_tokens <= 0:
+            return torch.zeros(
+                len(_LOSS_REWEIGHT_DIAGNOSTIC_NAMES),
+                dtype=torch.float32,
+                device="cpu",
+            )
+        nll = nll_off.detach().float()
+        weight = loss_weight.detach().float()
+        valid_nll = nll[mask_bool]
+        valid_weight = weight[mask_bool]
+        plain = valid_nll.mean()
+        weighted = (nll * weight).sum() / weight.sum().clamp_min(1e-8)
+        delta = weighted - plain
+        rel_delta = delta / plain.abs().clamp_min(1e-8)
+        weight_delta = valid_weight - 1.0
+        values = torch.stack(
+            (
+                torch.tensor(float(valid_tokens), device=nll.device),
+                plain,
+                weighted,
+                delta,
+                rel_delta,
+                weight_delta.abs().mean(),
+                valid_weight.std(unbiased=False),
+                valid_weight.max(),
+            )
+        )
+        return values.detach().float().cpu()
+
+
 # ---------------------------------------------------------------------------
 # Chunked per-token NLL through the LM head.
 # ---------------------------------------------------------------------------
@@ -1059,6 +1111,11 @@ def rank3_score_batch_causal(
     loss_weight = positive_only_lm_weight(
         utility, mask, tau=tau, strength=strength, w_max=w_max
     )
+    loss_reweight_diagnostics = _loss_reweight_diagnostics(
+        nll_off=nll_off,
+        loss_weight=loss_weight,
+        mask=mask,
+    )
 
     memory_residual = None
     if memory_meta is not None:
@@ -1095,6 +1152,7 @@ def rank3_score_batch_causal(
                 "controller_target": controller_target,
                 "confidence": confidence,
                 "loss_weight": loss_weight,
+                "loss_reweight_diagnostics": loss_reweight_diagnostics,
             }
             if memory_residual is not None:
                 out["memory_residual"] = memory_residual
@@ -1146,6 +1204,7 @@ def rank3_score_batch_causal(
         "controller_target": controller_target,
         "confidence": confidence,
         "loss_weight": loss_weight,
+        "loss_reweight_diagnostics": loss_reweight_diagnostics,
         **(
             {
                 "write_score": (

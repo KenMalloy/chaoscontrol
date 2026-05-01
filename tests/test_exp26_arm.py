@@ -187,6 +187,11 @@ def test_profile_summary_extracts_transport_and_maintenance_health(tmp_path):
 	            "packet_service_seconds_mean": 0.125,
 	            "packet_service_seconds_max": 0.25,
 	            "packet_service_source_count_mean": 1.5,
+	            "crct_loss_reweight_samples": 2,
+	            "crct_loss_reweight_plain_nll_mean": 1.5,
+	            "crct_loss_reweight_weighted_nll_mean": 1.45,
+	            "crct_loss_reweight_delta_mean": -0.05,
+	            "crct_loss_weight_abs_dev_mean": 0.02,
 	            "score_stage_timing_enabled": true,
 	            "score_stage_samples": 2,
 	            "score_stage_encode_off_seconds_sum": 0.5,
@@ -244,6 +249,11 @@ def test_profile_summary_extracts_transport_and_maintenance_health(tmp_path):
     assert row["packet_service_seconds_mean"] == pytest.approx(0.125)
     assert row["packet_service_seconds_max"] == pytest.approx(0.25)
     assert row["packet_service_source_count_mean"] == pytest.approx(1.5)
+    assert row["crct_loss_reweight_samples"] == 2
+    assert row["crct_loss_reweight_plain_nll_mean"] == pytest.approx(1.5)
+    assert row["crct_loss_reweight_weighted_nll_mean"] == pytest.approx(1.45)
+    assert row["crct_loss_reweight_delta_mean"] == pytest.approx(-0.05)
+    assert row["crct_loss_weight_abs_dev_mean"] == pytest.approx(0.02)
     assert row["weight_snapshot_shm_writes"] == 6
     assert row["weight_snapshot_shm_reads"] == 7
     assert row["weight_snapshot_read_seconds_sum"] == pytest.approx(0.125)

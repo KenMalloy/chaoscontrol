@@ -67,6 +67,28 @@ def _health_from_result(result: dict[str, Any]) -> dict[str, Any]:
         ),
         "payload_lag_steps_max": int(health.get("payload_lag_steps_max", 0) or 0),
         "score_seconds_max": float(health.get("score_seconds_max", 0.0) or 0.0),
+        "crct_loss_reweight_samples": int(
+            health.get("crct_loss_reweight_samples", 0) or 0
+        ),
+        "crct_loss_reweight_plain_nll_mean": float(
+            health.get("crct_loss_reweight_plain_nll_mean", 0.0) or 0.0
+        ),
+        "crct_loss_reweight_weighted_nll_mean": float(
+            health.get("crct_loss_reweight_weighted_nll_mean", 0.0) or 0.0
+        ),
+        "crct_loss_reweight_delta_mean": float(
+            health.get("crct_loss_reweight_delta_mean", 0.0) or 0.0
+        ),
+        "crct_loss_reweight_rel_delta_mean": float(
+            health.get("crct_loss_reweight_rel_delta_mean", 0.0) or 0.0
+        ),
+        "crct_loss_weight_abs_dev_mean": float(
+            health.get("crct_loss_weight_abs_dev_mean", 0.0) or 0.0
+        ),
+        "crct_loss_weight_std_mean": float(
+            health.get("crct_loss_weight_std_mean", 0.0) or 0.0
+        ),
+        "crct_loss_weight_max": float(health.get("crct_loss_weight_max", 0.0) or 0.0),
         "packet_service_seconds_max": float(
             health.get("packet_service_seconds_max", 0.0) or 0.0
         ),
@@ -233,6 +255,8 @@ def _print_profile_summary(summary: dict[str, Any]) -> None:
                 f"packet_mean={row.get('packet_service_seconds_mean', 0.0):.3f}s "
                 f"packet_max={row.get('packet_service_seconds_max', 0.0):.3f}s "
                 f"packet_sources={row.get('packet_service_source_count_mean', 0.0):.1f} "
+                f"crct_reweight={row.get('crct_loss_reweight_delta_mean', 0.0):+.4f} "
+                f"crct_weight_dev={row.get('crct_loss_weight_abs_dev_mean', 0.0):.4f} "
                 f"pump={row.get('memory_rank_pump_loop_seconds_sum', 0.0):.3f}s "
                 f"replay={row.get('memory_rank_replay_seconds_sum', 0.0):.3f}s "
                 f"replay_ticks={row.get('memory_rank_replay_ticks', 0)} "

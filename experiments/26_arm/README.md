@@ -144,6 +144,12 @@ shape gives `384 -> 13.71 MB`, `416 -> 15.19 MB`, `448 -> 16.73 MB`, and
 - Packet-serving and maintenance telemetry is non-empty:
   `payloads_served`, `packet_service_seconds_*`, maintenance replay ticks, and
   exact maintenance/physics counters.
+- Exact CRCT reweighting telemetry is visible when the exact scorer runs:
+  `crct_loss_reweight_plain_nll_mean`,
+  `crct_loss_reweight_weighted_nll_mean`,
+  `crct_loss_reweight_delta_mean`, and `crct_loss_weight_abs_dev_mean`.
+  These answer how much gradient-side signal the low-latency packet path is no
+  longer carrying synchronously.
 - Plasticity telemetry is explicit even when neutral:
   `transport_summary.health.plasticity_packets_received`,
   `plasticity_packets_missing`, `plasticity_budget_mean_received`, and optimizer

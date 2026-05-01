@@ -1229,6 +1229,7 @@ def _crct_score_payload_inline(
         "plasticity_coverage",
         "plasticity_confidence",
         "plasticity_budget",
+        "loss_reweight_diagnostics",
     ):
         value = score.get(key)
         if isinstance(value, torch.Tensor):
@@ -1343,6 +1344,80 @@ def _crct_packet_payload_inline(
         out["memory_write_records"] = write_records
         out["approx_memory_write_records"] = len(write_records)
     return out
+
+
+def _record_crct_loss_reweight_metrics(
+    metrics: dict[str, Any],
+    scored: dict[str, Any],
+) -> None:
+    diag = scored.get("loss_reweight_diagnostics")
+    if not isinstance(diag, torch.Tensor) or int(diag.numel()) < 8:
+        return
+    vals = diag.detach().float().reshape(-1).cpu()
+    valid_tokens = float(vals[0].item())
+    if valid_tokens <= 0.0:
+        return
+    plain = float(vals[1].item())
+    weighted = float(vals[2].item())
+    delta = float(vals[3].item())
+    rel_delta = float(vals[4].item())
+    abs_dev = float(vals[5].item())
+    std = float(vals[6].item())
+    weight_max = float(vals[7].item())
+
+    metrics["crct_loss_reweight_samples"] += 1
+    metrics["crct_loss_reweight_valid_tokens_sum"] += int(valid_tokens)
+    metrics["crct_loss_reweight_plain_nll_weighted_sum"] += (
+        plain * valid_tokens
+    )
+    metrics["crct_loss_reweight_weighted_nll_weighted_sum"] += (
+        weighted * valid_tokens
+    )
+    metrics["crct_loss_reweight_delta_weighted_sum"] += delta * valid_tokens
+    metrics["crct_loss_reweight_rel_delta_sum"] += rel_delta
+    metrics["crct_loss_weight_abs_dev_mean_sum"] += abs_dev
+    metrics["crct_loss_weight_std_sum"] += std
+    metrics["crct_loss_weight_max"] = max(
+        float(metrics["crct_loss_weight_max"]),
+        weight_max,
+    )
+
+
+def _add_crct_loss_reweight_metric_means(out: dict[str, Any]) -> None:
+    samples = int(out.get("crct_loss_reweight_samples", 0))
+    valid_tokens = int(out.get("crct_loss_reweight_valid_tokens_sum", 0))
+    if valid_tokens > 0:
+        out["crct_loss_reweight_plain_nll_mean"] = (
+            float(out.get("crct_loss_reweight_plain_nll_weighted_sum", 0.0))
+            / float(valid_tokens)
+        )
+        out["crct_loss_reweight_weighted_nll_mean"] = (
+            float(out.get("crct_loss_reweight_weighted_nll_weighted_sum", 0.0))
+            / float(valid_tokens)
+        )
+        out["crct_loss_reweight_delta_mean"] = (
+            float(out.get("crct_loss_reweight_delta_weighted_sum", 0.0))
+            / float(valid_tokens)
+        )
+    else:
+        out["crct_loss_reweight_plain_nll_mean"] = 0.0
+        out["crct_loss_reweight_weighted_nll_mean"] = 0.0
+        out["crct_loss_reweight_delta_mean"] = 0.0
+    out["crct_loss_reweight_rel_delta_mean"] = (
+        float(out.get("crct_loss_reweight_rel_delta_sum", 0.0)) / float(samples)
+        if samples
+        else 0.0
+    )
+    out["crct_loss_weight_abs_dev_mean"] = (
+        float(out.get("crct_loss_weight_abs_dev_mean_sum", 0.0)) / float(samples)
+        if samples
+        else 0.0
+    )
+    out["crct_loss_weight_std_mean"] = (
+        float(out.get("crct_loss_weight_std_sum", 0.0)) / float(samples)
+        if samples
+        else 0.0
+    )
 
 
 @torch.inference_mode()
@@ -2257,6 +2332,15 @@ class _CrctAsyncTeacherTransport:
             "pre_sync_wait_seconds_max": 0.0,
             "score_seconds_sum": 0.0,
             "score_seconds_max": 0.0,
+            "crct_loss_reweight_samples": 0,
+            "crct_loss_reweight_valid_tokens_sum": 0,
+            "crct_loss_reweight_plain_nll_weighted_sum": 0.0,
+            "crct_loss_reweight_weighted_nll_weighted_sum": 0.0,
+            "crct_loss_reweight_delta_weighted_sum": 0.0,
+            "crct_loss_reweight_rel_delta_sum": 0.0,
+            "crct_loss_weight_abs_dev_mean_sum": 0.0,
+            "crct_loss_weight_std_sum": 0.0,
+            "crct_loss_weight_max": 0.0,
             "packet_service_seconds_sum": 0.0,
             "packet_service_seconds_max": 0.0,
             "packet_service_source_count_sum": 0,
@@ -2392,6 +2476,7 @@ class _CrctAsyncTeacherTransport:
                 float(score_s),
             )
             self.metrics["payloads_scored"] += 1
+            _record_crct_loss_reweight_metrics(self.metrics, scored)
             self.metrics["last_scored_request_step"] = request_step
             self.ready_result = scored
             self.ready_result_request_step = request_step
@@ -2425,6 +2510,7 @@ class _CrctAsyncTeacherTransport:
             out["score_seconds_mean"] = float(out["score_seconds_sum"]) / float(scored)
         else:
             out["score_seconds_mean"] = 0.0
+        _add_crct_loss_reweight_metric_means(out)
         return out
 
     def wait_for_pending_collectives(self) -> None:
@@ -3143,6 +3229,15 @@ class _CrctMailboxTeacherTransport:
             "pre_sync_wait_seconds_max": 0.0,
             "score_seconds_sum": 0.0,
             "score_seconds_max": 0.0,
+            "crct_loss_reweight_samples": 0,
+            "crct_loss_reweight_valid_tokens_sum": 0,
+            "crct_loss_reweight_plain_nll_weighted_sum": 0.0,
+            "crct_loss_reweight_weighted_nll_weighted_sum": 0.0,
+            "crct_loss_reweight_delta_weighted_sum": 0.0,
+            "crct_loss_reweight_rel_delta_sum": 0.0,
+            "crct_loss_weight_abs_dev_mean_sum": 0.0,
+            "crct_loss_weight_std_sum": 0.0,
+            "crct_loss_weight_max": 0.0,
             "packet_service_seconds_sum": 0.0,
             "packet_service_seconds_max": 0.0,
             "packet_service_source_count_sum": 0,
@@ -3665,6 +3760,7 @@ class _CrctMailboxTeacherTransport:
         out["score_seconds_mean"] = (
             float(out["score_seconds_sum"]) / float(scored) if scored else 0.0
         )
+        _add_crct_loss_reweight_metric_means(out)
         served = int(out.get("payloads_served", 0))
         out["packet_service_seconds_mean"] = (
             float(out["packet_service_seconds_sum"]) / float(served)
@@ -12676,6 +12772,33 @@ def train_fast_for_budget(
                 ),
                 "payload_lag_steps_max": int(coord.get("payload_lag_steps_max", 0)),
                 "score_seconds_max": float(mem.get("score_seconds_max", 0.0)),
+                "crct_loss_reweight_samples": int(
+                    mem.get("crct_loss_reweight_samples", 0)
+                ),
+                "crct_loss_reweight_valid_tokens_sum": int(
+                    mem.get("crct_loss_reweight_valid_tokens_sum", 0)
+                ),
+                "crct_loss_reweight_plain_nll_mean": float(
+                    mem.get("crct_loss_reweight_plain_nll_mean", 0.0)
+                ),
+                "crct_loss_reweight_weighted_nll_mean": float(
+                    mem.get("crct_loss_reweight_weighted_nll_mean", 0.0)
+                ),
+                "crct_loss_reweight_delta_mean": float(
+                    mem.get("crct_loss_reweight_delta_mean", 0.0)
+                ),
+                "crct_loss_reweight_rel_delta_mean": float(
+                    mem.get("crct_loss_reweight_rel_delta_mean", 0.0)
+                ),
+                "crct_loss_weight_abs_dev_mean": float(
+                    mem.get("crct_loss_weight_abs_dev_mean", 0.0)
+                ),
+                "crct_loss_weight_std_mean": float(
+                    mem.get("crct_loss_weight_std_mean", 0.0)
+                ),
+                "crct_loss_weight_max": float(
+                    mem.get("crct_loss_weight_max", 0.0)
+                ),
                 "packet_service_seconds_max": float(
                     mem.get("packet_service_seconds_max", 0.0)
                 ),
