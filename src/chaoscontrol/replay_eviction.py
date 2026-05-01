@@ -28,6 +28,7 @@ import torch.nn.functional as F
 
 from .cache_utility import _RANK3_NLL_CHUNK_BUDGET_BYTES, chunked_nll_from_hidden
 from .kernels import _cpu_ssm_controller as _ext
+from .slot_commit import SlotCommit
 from .slot_table import SlotTable, SlotRecord, SlotId
 from .slot_table import SLOT_WARMING, SLOT_ACTIVE
 from .slot_table import SLOT_DECAYING, SLOT_QUARANTINED, SLOT_RETIRED
@@ -44,6 +45,7 @@ __all__ = [
     "LearnedCommitPolicy",
     "CpuRefreshProposalModel",
     "ProbeFrame",
+    "SlotCommit",
     "_evict_slots",
 ]
 
@@ -73,6 +75,7 @@ class TickResult:
     released: list[int] = field(default_factory=list)
     distilled: list[int] = field(default_factory=list)
     decayed: list[int] = field(default_factory=list)
+    slot_commits: list[SlotCommit] = field(default_factory=list)
 
     @property
     def evicted_indices(self) -> list[int]:
@@ -2039,6 +2042,55 @@ class ReplayEvictionLoop:
         self._commit_decisions_total = 0
         self._commit_rule_disagreements_total = 0
         self._commit_feedback_updates_total = 0
+        self._slot_commits_emitted_total = 0
+        self._slot_commit_emit_failures_total = 0
+        self._slot_commit_emit_reasons: dict[str, int] = {}
+        self._slot_commits_by_action: dict[str, int] = {}
+
+    def _record_slot_commit_emit(self, *, action: str, reason: str, ok: bool) -> None:
+        self._slot_commits_by_action[str(action)] = (
+            int(self._slot_commits_by_action.get(str(action), 0)) + 1
+        )
+        if ok:
+            self._slot_commits_emitted_total += 1
+            return
+        self._slot_commit_emit_failures_total += 1
+        self._slot_commit_emit_reasons[str(reason)] = (
+            int(self._slot_commit_emit_reasons.get(str(reason), 0)) + 1
+        )
+
+    def _emit_slot_commit(
+        self,
+        *,
+        table: SlotTable,
+        slot_id: int,
+        action: str,
+        step: int,
+        base_generation: int,
+        tensor: torch.Tensor | None = None,
+        survival_factor: float = 1.0,
+        reason: str = "",
+    ) -> SlotCommit | None:
+        rec = table.record(int(slot_id))
+        new_generation = (
+            int(rec.write_generation)
+            if rec is not None
+            else int(base_generation) + 1
+        )
+        commit = SlotCommit(
+            slot_id=int(slot_id),
+            action=str(action),
+            step=int(step),
+            base_generation=int(base_generation),
+            new_generation=int(new_generation),
+            bucket_id=int(rec.bucket_id) if rec is not None else -1,
+            event_id=int(rec.event_id) if rec is not None else 0,
+            survival_factor=float(survival_factor),
+            tensor=tensor.detach().clone() if tensor is not None else None,
+            reason=str(reason),
+        )
+        self._record_slot_commit_emit(action=action, reason="created", ok=True)
+        return commit
 
     def _policy_kwargs(self, outer: Any) -> dict[str, Any]:
         return dict(
@@ -3319,6 +3371,11 @@ class ReplayEvictionLoop:
         result = TickResult()
         policy_kwargs = self._policy_kwargs(outer)
 
+        def record_slot_commit(**kwargs: Any) -> None:
+            commit = self._emit_slot_commit(**kwargs)
+            if commit is not None:
+                result.slot_commits.append(commit)
+
         # Collect actions per slot
         actions: dict[int, str] = {}  # slot_id_or_idx -> action
         decisions: dict[int, CommitDecision] = {}
@@ -3354,8 +3411,11 @@ class ReplayEvictionLoop:
                 if action == SLOT_REFRESH:
                     accepted = False
                     agreed = confirmed and self._commit_action_ready(sid, action, rec)
+                    base_generation = int(rec.write_generation)
                     if agreed:
-                        accepted = self._execute_refresh(model, outer, sid, cf, t0=t0)
+                        accepted = self._execute_refresh(
+                            model, outer, sid, cf, step=step, t0=t0
+                        )
                     if decision is not None:
                         self._record_commit_feedback(
                             decision,
@@ -3368,6 +3428,15 @@ class ReplayEvictionLoop:
                         self._refreshes_total += 1
                         rec.refresh_count += 1
                         rec.state = SLOT_ACTIVE
+                        record_slot_commit(
+                            table=table,
+                            slot_id=sid,
+                            action=action,
+                            step=step,
+                            base_generation=base_generation,
+                            tensor=table.get_tensor(sid),
+                            reason="refreshed",
+                        )
                     rec.last_action = action
                     reason = (
                         ""
@@ -3400,9 +3469,29 @@ class ReplayEvictionLoop:
                             accepted=False, reason="awaiting_agreement", extra=extra,
                         )
                         continue
-                    self._execute_quarantine(outer, sid)
+                    base_generation = int(rec.write_generation)
+                    overflow_commits = self._execute_quarantine(
+                        outer, sid, step=step
+                    )
                     result.quarantined.append(sid)
                     rec.last_action = action
+                    record_slot_commit(
+                        table=table,
+                        slot_id=sid,
+                        action=action,
+                        step=step,
+                        base_generation=base_generation,
+                        reason="quarantined",
+                    )
+                    for overflow_sid, overflow_generation in overflow_commits:
+                        record_slot_commit(
+                            table=table,
+                            slot_id=overflow_sid,
+                            action=SLOT_EVICT,
+                            step=step,
+                            base_generation=overflow_generation,
+                            reason="quarantine_overflow",
+                        )
                     if decision is not None:
                         self._record_commit_feedback(
                             decision,
@@ -3426,11 +3515,21 @@ class ReplayEvictionLoop:
                             accepted=False, reason="oracle_rejected", extra=extra,
                         )
                         continue
+                    base_generation = int(rec.write_generation)
                     self._execute_decay(outer, sid)
                     result.decayed.append(sid)
                     self._decays_total += 1
                     rec.state = SLOT_DECAYING
                     rec.last_action = action
+                    record_slot_commit(
+                        table=table,
+                        slot_id=sid,
+                        action=action,
+                        step=step,
+                        base_generation=base_generation,
+                        survival_factor=0.9,
+                        reason="decayed",
+                    )
                     if decision is not None:
                         self._record_commit_feedback(
                             decision,
@@ -3461,12 +3560,21 @@ class ReplayEvictionLoop:
                             accepted=False, reason="awaiting_agreement", extra=extra,
                         )
                         continue
+                    base_generation = int(rec.write_generation)
                     table.release(sid)
                     self._quarantined.discard(sid)
                     result.released.append(sid)
                     self._releases_total += 1
                     rec.state = SLOT_ACTIVE
                     rec.last_action = action
+                    record_slot_commit(
+                        table=table,
+                        slot_id=sid,
+                        action=action,
+                        step=step,
+                        base_generation=base_generation,
+                        reason="released",
+                    )
                     if decision is not None:
                         self._record_commit_feedback(
                             decision,
@@ -3500,6 +3608,19 @@ class ReplayEvictionLoop:
                 rec = table.record(sid)
                 decision = decisions.get(sid)
                 extra = self._decision_trace_extra(rec, policy_kwargs, decision)
+                if rec is None:
+                    self._trace_event(
+                        step, sid, action, rec,
+                        accepted=False, reason="missing_record", extra=extra,
+                    )
+                    if decision is not None:
+                        self._record_commit_feedback(
+                            decision,
+                            accepted=False,
+                            structural=True,
+                            slot_id=sid,
+                        )
+                    continue
                 if not confirmations.get(sid, False):
                     self._trace_event(
                         step, sid, action, rec,
@@ -3524,6 +3645,8 @@ class ReplayEvictionLoop:
                         rec.last_action = action
                     continue
                 if action == SLOT_DISTILL:
+                    base_generation = int(rec.write_generation)
+                    distill_tensor = table.get_tensor(sid)
                     receipt = self._execute_distill(outer, sid, step, model=model)
                     distill_extra = dict(extra)
                     distill_extra.update({
@@ -3534,6 +3657,15 @@ class ReplayEvictionLoop:
                     if receipt.accepted:
                         result.distilled.append(sid)
                         self._distills_total += 1
+                        record_slot_commit(
+                            table=table,
+                            slot_id=sid,
+                            action=action,
+                            step=step,
+                            base_generation=base_generation,
+                            tensor=distill_tensor,
+                            reason="distilled",
+                        )
                         if decision is not None:
                             self._record_commit_feedback(
                                 decision,
@@ -3564,9 +3696,18 @@ class ReplayEvictionLoop:
                             extra=distill_extra,
                         )
                 else:
+                    base_generation = int(rec.write_generation)
                     table.retire(sid, reason="evicted")
                     result.evicted.append(sid)
                     self._evictions_total += 1
+                    record_slot_commit(
+                        table=table,
+                        slot_id=sid,
+                        action=action,
+                        step=step,
+                        base_generation=base_generation,
+                        reason="evicted",
+                    )
                     if decision is not None:
                         self._record_commit_feedback(
                             decision,
@@ -3640,8 +3781,10 @@ class ReplayEvictionLoop:
         slot_id: int,
         cf: CounterfactualResult,
         *,
+        step: int = 0,
         t0: float,
     ) -> bool:
+        del step
         table = getattr(outer, "table", None)
         if table is None:
             return False
@@ -3828,8 +3971,16 @@ class ReplayEvictionLoop:
         """Backward-compatible mean marginal helper for older tests."""
         return self._slot_mean_marginal(phys_idx, cf)
 
-    def _execute_quarantine(self, outer: Any, slot_id: int) -> None:
+    def _execute_quarantine(
+        self,
+        outer: Any,
+        slot_id: int,
+        *,
+        step: int,
+    ) -> list[tuple[int, int]]:
+        del step
         table = getattr(outer, "table", None)
+        overflow: list[tuple[int, int]] = []
         if table is not None:
             table.quarantine(slot_id)
         self._quarantined.add(slot_id)
@@ -3844,9 +3995,15 @@ class ReplayEvictionLoop:
                     worst_util = rec.utility_ema
                     worst_id = qid
             if worst_id is not None and worst_id != slot_id:
+                worst_rec = table.record(worst_id)
+                overflow_generation = (
+                    int(worst_rec.write_generation) if worst_rec is not None else -1
+                )
                 table.retire(worst_id, reason="quarantine_overflow")
                 self._quarantined.discard(worst_id)
                 self._evictions_total += 1
+                overflow.append((int(worst_id), int(overflow_generation)))
+        return overflow
 
     def _execute_decay(self, outer: Any, slot_id: int) -> None:
         table = getattr(outer, "table", None)
@@ -4316,6 +4473,10 @@ class ReplayEvictionLoop:
             "commit_decisions_total": self._commit_decisions_total,
             "commit_rule_disagreements_total": self._commit_rule_disagreements_total,
             "commit_feedback_updates_total": self._commit_feedback_updates_total,
+            "slot_commits_emitted_total": self._slot_commits_emitted_total,
+            "slot_commit_emit_failures_total": self._slot_commit_emit_failures_total,
+            "slot_commits_by_action": dict(self._slot_commits_by_action),
+            "slot_commit_emit_reasons": dict(self._slot_commit_emit_reasons),
             "queue_depth_sum": self._queue_depth_sum,
             "queue_depth_samples": self._queue_depth_samples,
             "queue_depth_max": self._queue_depth_max,
@@ -4403,6 +4564,8 @@ class ReplayEvictionLoop:
             "_commit_decisions_total": "commit_decisions_total",
             "_commit_rule_disagreements_total": "commit_rule_disagreements_total",
             "_commit_feedback_updates_total": "commit_feedback_updates_total",
+            "_slot_commits_emitted_total": "slot_commits_emitted_total",
+            "_slot_commit_emit_failures_total": "slot_commit_emit_failures_total",
             "_queue_depth_sum": "queue_depth_sum",
             "_queue_depth_samples": "queue_depth_samples",
             "_queue_depth_max": "queue_depth_max",
@@ -4414,6 +4577,14 @@ class ReplayEvictionLoop:
         for attr, key in int_fields.items():
             if key in state:
                 setattr(self, attr, int(state[key]))
+        if isinstance(state.get("slot_commits_by_action"), dict):
+            self._slot_commits_by_action = {
+                str(k): int(v) for k, v in state["slot_commits_by_action"].items()
+            }
+        if isinstance(state.get("slot_commit_emit_reasons"), dict):
+            self._slot_commit_emit_reasons = {
+                str(k): int(v) for k, v in state["slot_commit_emit_reasons"].items()
+            }
 
         float_fields = {
             "_refresh_candidate_proposal_seconds_total": (
@@ -4715,6 +4886,11 @@ class ReplayEvictionLoop:
             "commit_decisions_total": self._commit_decisions_total,
             "commit_rule_disagreements_total": self._commit_rule_disagreements_total,
             "commit_feedback_updates_total": self._commit_feedback_updates_total,
+            "slot_commit_emission_active": True,
+            "slot_commits_emitted_total": self._slot_commits_emitted_total,
+            "slot_commit_emit_failures_total": self._slot_commit_emit_failures_total,
+            "slot_commits_by_action": dict(self._slot_commits_by_action),
+            "slot_commit_emit_reasons": dict(self._slot_commit_emit_reasons),
             "commit_online_lr": self._commit_online_lr,
             "commit_temperature": self._commit_temperature,
             "action_agreement_count": self._action_agreement_count,

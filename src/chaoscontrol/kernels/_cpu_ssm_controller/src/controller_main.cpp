@@ -1,6 +1,5 @@
 #include "controller_main.h"
 
-#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <optional>
@@ -45,6 +44,9 @@ uint64_t controller_main(
     const std::string& replay_ring_name,
     const std::string& exit_flag_shm_name,
     uint32_t idle_sleep_ns) {
+  // Kept for ABI compatibility with existing Python bindings.  The native loop
+  // yields on empty rings instead of imposing a fixed sleep cadence.
+  (void)idle_sleep_ns;
   std::vector<WriteRing> write_rings;
   write_rings.reserve(write_ring_names.size());
   for (const std::string& name : write_ring_names) {
@@ -89,7 +91,7 @@ uint64_t controller_main(
     }
 
     if (!processed) {
-      std::this_thread::sleep_for(std::chrono::nanoseconds(idle_sleep_ns));
+      std::this_thread::yield();
     }
   }
 

@@ -321,7 +321,7 @@ class MultiSlotOuterModel(nn.Module):
     ) -> list[int]:
         return self.table.visible_indices(read_cutoff=read_cutoff, bucket_id=bucket_id)
 
-    def append_kv_batch(self, encoded_batch: torch.Tensor, bucket_ids: torch.Tensor) -> None:
+    def append_kv_batch(self, encoded_batch: torch.Tensor, bucket_ids: torch.Tensor) -> list[int]:
         """Append multiple KV pairs at once as a batched operation.
 
         Avoids per-token Python loops and GPU syncs. One .tolist() call
@@ -331,14 +331,14 @@ class MultiSlotOuterModel(nn.Module):
             encoded_batch: (N, outer_dim) pre-encoded KV pairs.
             bucket_ids: (N,) integer bucket assignments for each pair.
         """
-        self._append_kv_batch_committed(encoded_batch, bucket_ids, event_ids=None)
+        return self._append_kv_batch_committed(encoded_batch, bucket_ids, event_ids=None)
 
     def _append_kv_batch_committed(
         self,
         encoded_batch: torch.Tensor,
         bucket_ids: torch.Tensor,
         event_ids: torch.Tensor | None = None,
-    ) -> None:
+    ) -> list[int]:
         """Append pre-encoded KV pairs with explicit MVCC event ids.
 
         Event id ``0`` is the legacy/default value: visible to every
@@ -347,7 +347,22 @@ class MultiSlotOuterModel(nn.Module):
         """
         n = int(encoded_batch.shape[0])
         if n == 0:
-            return
+            return []
+        maintenance_owns_capacity = str(self.compression_selection).lower() in {
+            "maintenance",
+            "learned",
+            "none",
+        }
+        if maintenance_owns_capacity and self.max_slots > 0:
+            free_slots = int(self.max_slots) - len(self.table)
+            if free_slots <= 0:
+                return []
+            if n > free_slots:
+                n = int(free_slots)
+                encoded_batch = encoded_batch[:n]
+                bucket_ids = bucket_ids[:n]
+                if event_ids is not None:
+                    event_ids = event_ids[:n]
         # Single GPU→CPU transfer for all bucket ids
         bid_list = [int(b) for b in bucket_ids.detach().reshape(-1).tolist()]
         if len(bid_list) != n:
@@ -364,17 +379,25 @@ class MultiSlotOuterModel(nn.Module):
                 )
         # Append through SlotTable to maintain identity mappings
         tensors = encoded_batch.detach().unsqueeze(1).unbind(0)
+        appended: list[int] = []
         for i, tensor in enumerate(tensors):
-            self.table.append(
-                tensor,
-                bucket_id=bid_list[i],
-                event_id=event_list[i],
-                survival=1.0,
+            appended.append(
+                self.table.append(
+                    tensor,
+                    bucket_id=bid_list[i],
+                    event_id=event_list[i],
+                    survival=1.0,
+                )
             )
 
         # Compress if capped
-        if self.max_slots > 0 and len(self.table) > self.max_slots:
+        if (
+            not maintenance_owns_capacity
+            and self.max_slots > 0
+            and len(self.table) > self.max_slots
+        ):
             self._compress()
+        return appended
 
     def get_extra_state(self) -> dict:
         """Persist slots, survival scores, bucket assignments, latent traces, and affinity."""

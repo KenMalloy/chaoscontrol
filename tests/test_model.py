@@ -376,14 +376,14 @@ class TestCareStudentLM(unittest.TestCase):
         score = torch.arange(10, dtype=torch.float32).reshape(2, 5)
         event_ids = torch.tensor([100, 101, 102], dtype=torch.long)
 
-        wrote = model.append_memory_from_hidden(
+        write_records = model.append_memory_from_hidden(
             hidden,
             score=score,
             max_tokens=3,
             event_ids=event_ids,
         )
 
-        assert wrote is True
+        assert len(write_records) == 3
         assert model.outer_model is not None
         assert model.outer_model.table._slot_event_ids == [100, 101, 102]
         assert len(model.outer_model.table) == 3

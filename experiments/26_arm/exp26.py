@@ -3,8 +3,8 @@
 
 Exp26 is no longer a headline ablation matrix. It is a fixed systems canary:
 one locked fast/slow control and one full Adaptive Residual Memory cell. The
-ARM cell includes CRCT evidence, GPU3 oracle scoring, streaming maintenance,
-learned Full-A commit authority, traces, and the native CPU/GPU3 maintenance
+ARM cell includes CRCT evidence, memory-rank scoring, streaming maintenance,
+learned Full-A commit authority, traces, and the native CPU/memory maintenance
 runtime. There is intentionally no CRCT-only or shadow-mode switch here.
 """
 
@@ -115,7 +115,8 @@ def _crct_lock() -> dict[str, Any]:
         "crct_ema_beta": 0.95,
         "crct_max_price": 0.50,
         "crct_plasticity_budget_strength": 0.25,
-        # Keep GPU3 targeted: score every arrived request if possible, then
+        # Keep the packet-serving rank targeted: score every arrived request
+        # if possible, then
         # write only the highest-utility residuals. A 128-token write budget
         # made append_memory a first-order stage cost on 8xH100 profiles,
         # starving later packets without improving freshness.
@@ -124,12 +125,13 @@ def _crct_lock() -> dict[str, Any]:
         "crct_async_teacher_transport_backend": "mailbox",
         "crct_async_teacher_payload_dtype": "auto",
         # The memory plane gets an every-step opportunity. Backpressure and
-        # latest-only mailbox semantics decide what GPU3 actually scores.
+        # latest-only mailbox semantics decide what the packet rank scores.
         "crct_teacher_score_interval_steps": 1,
         "outer_model_dim": 64,
         "outer_model_type": "multislot",
         "outer_max_slots": 4096,
         "outer_compress_ratio": 2,
+        "compression_selection": "maintenance",
         "buffer_mode": "append_only",
         "retrieval_mode": "softmax_all",
         "retrieval_k": 16,
@@ -156,7 +158,7 @@ def _replay_eviction_pipeline_lock() -> dict[str, Any]:
     """Streaming ARM pipeline knobs for the fixed validation cell.
 
     Threshold priors and shadow/headline splits are intentionally absent. The
-    learned controller owns commit authority and GPU3 supplies physics
+    learned controller owns commit authority and the memory ranks supply physics
     confirmation.
     """
     return {

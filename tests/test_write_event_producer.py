@@ -470,7 +470,6 @@ def test_write_drain_daemon_survives_drain_exception():
             kwargs={
                 "consumer": consumer,
                 "stop_event": stop_event,
-                "idle_sleep_s": 0.001,
                 "embedding_version_ref": [0],
                 "controller_score_mode": "pressure_only",
                 "controller_topk_k": 16,

@@ -180,7 +180,8 @@ class TestMultiSlotOuterModel(unittest.TestCase):
         om = MultiSlotOuterModel(model_dim=16, outer_dim=32, max_slots=100)
         encoded = torch.randn(5, 32)  # 5 pre-encoded entries
         bucket_ids = torch.tensor([0, 1, 2, 0, 1])
-        om.append_kv_batch(encoded, bucket_ids)
+        appended = om.append_kv_batch(encoded, bucket_ids)
+        assert appended == [0, 1, 2, 3, 4]
         assert len(om._slots) == 5
         assert om._slot_buckets == [0, 1, 2, 0, 1]
         assert om._slot_event_ids == [0, 0, 0, 0, 0]
@@ -210,8 +211,30 @@ class TestMultiSlotOuterModel(unittest.TestCase):
         om = MultiSlotOuterModel(model_dim=16, outer_dim=32, max_slots=100)
         encoded = torch.randn(0, 32)
         bucket_ids = torch.tensor([], dtype=torch.long)
-        om.append_kv_batch(encoded, bucket_ids)
+        appended = om.append_kv_batch(encoded, bucket_ids)
+        assert appended == []
         assert len(om._slots) == 0
+
+    def test_maintenance_capacity_drops_new_appends_without_compressing(self) -> None:
+        om = MultiSlotOuterModel(
+            model_dim=16,
+            outer_dim=8,
+            max_slots=2,
+            compression_selection="maintenance",
+        )
+        first = om.append_kv_batch(
+            torch.randn(2, 8),
+            torch.tensor([0, 1]),
+        )
+        second = om.append_kv_batch(
+            torch.randn(2, 8),
+            torch.tensor([2, 3]),
+        )
+
+        assert first == [0, 1]
+        assert second == []
+        assert len(om._slots) == 2
+        assert om._slot_buckets == [0, 1]
 
     def test_typed_compression_merges_within_bucket(self) -> None:
         om = MultiSlotOuterModel(model_dim=16, outer_dim=32, max_slots=4, compress_ratio=2)

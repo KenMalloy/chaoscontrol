@@ -58,6 +58,9 @@ def _health_from_result(result: dict[str, Any]) -> dict[str, Any]:
         "final_loss": float(train.get("final_loss", 0.0) or 0.0),
         "payloads_used": int(health.get("payloads_used", 0) or 0),
         "payloads_scored": int(health.get("payloads_scored", 0) or 0),
+        "maintenance_payloads_scored": int(
+            health.get("maintenance_payloads_scored", 0) or 0
+        ),
         "payload_lag_steps_max": int(health.get("payload_lag_steps_max", 0) or 0),
         "score_seconds_max": float(health.get("score_seconds_max", 0.0) or 0.0),
         "score_stage_timing_enabled": bool(health.get("score_stage_timing_enabled", False)),
@@ -98,7 +101,31 @@ def _health_from_result(result: dict[str, Any]) -> dict[str, Any]:
         "weight_snapshot_read_tensor_count": int(health.get("weight_snapshot_read_tensor_count", 0) or 0),
         "weight_snapshot_read_bytes": int(health.get("weight_snapshot_read_bytes", 0) or 0),
         "request_ring_full_drops": int(_get_path(transport_summary, "coordinator.teacher_shm_request_ring_full_drops", 0) or 0),
+        "maintenance_request_ring_full_drops": int(
+            health.get("maintenance_request_ring_full_drops", 0) or 0
+        ),
         "result_ring_full_drops": int(_get_path(transport_summary, "memory.teacher_shm_result_ring_full_drops", 0) or 0),
+        "slot_commit_p2p_available": bool(
+            health.get("slot_commit_p2p_available", False)
+        ),
+        "append_commits_sent": int(health.get("append_commits_sent", 0) or 0),
+        "append_commits_applied": int(health.get("append_commits_applied", 0) or 0),
+        "maintenance_commits_sent": int(
+            health.get("maintenance_commits_sent", 0) or 0
+        ),
+        "maintenance_commits_applied": int(
+            health.get("maintenance_commits_applied", 0) or 0
+        ),
+        "slot_commit_drops": int(health.get("slot_commit_drops", 0) or 0),
+        "slot_commit_stale_generation_drops": int(
+            health.get("slot_commit_stale_generation_drops", 0) or 0
+        ),
+        "slot_commit_replica_capacity_full_drops": int(
+            health.get("slot_commit_replica_capacity_full_drops", 0) or 0
+        ),
+        "slot_commit_queue_overwrites": int(
+            health.get("slot_commit_queue_overwrites", 0) or 0
+        ),
         "maintenance_gpu3_starvation_reason": str(replay.get("gpu3_starvation_reason", "")),
         "maintenance_memory_streams_active": bool(replay.get("memory_streams_active", False)),
         "maintenance_jobs_pushed": int(_get_path(replay, "arm_runtime.jobs_pushed", 0) or 0),
@@ -113,7 +140,11 @@ def _health_from_result(result: dict[str, Any]) -> dict[str, Any]:
         "memory_rank_replay_seconds_sum": float(health.get("memory_rank_replay_seconds_sum", 0.0) or 0.0),
         "memory_rank_replay_seconds_max": float(health.get("memory_rank_replay_seconds_max", 0.0) or 0.0),
         "memory_rank_replay_ticks": int(health.get("memory_rank_replay_ticks", 0) or 0),
+        "maintenance_replay_ticks": int(health.get("maintenance_replay_ticks", 0) or 0),
         "memory_rank_replay_probes_ingested": int(health.get("memory_rank_replay_probes_ingested", 0) or 0),
+        "maintenance_replay_probes_ingested": int(
+            health.get("maintenance_replay_probes_ingested", 0) or 0
+        ),
         "memory_rank_replay_deferred_for_packet_work": int(
             health.get("memory_rank_replay_deferred_for_packet_work", 0) or 0
         ),
@@ -122,8 +153,7 @@ def _health_from_result(result: dict[str, Any]) -> dict[str, Any]:
         ),
         "memory_rank_pump_loop_seconds_sum": float(health.get("memory_rank_pump_loop_seconds_sum", 0.0) or 0.0),
         "memory_rank_pump_loop_seconds_max": float(health.get("memory_rank_pump_loop_seconds_max", 0.0) or 0.0),
-        "memory_rank_pump_idle_sleep_seconds_sum": float(health.get("memory_rank_pump_idle_sleep_seconds_sum", 0.0) or 0.0),
-        "memory_rank_pump_idle_sleep_seconds_max": float(health.get("memory_rank_pump_idle_sleep_seconds_max", 0.0) or 0.0),
+        "memory_rank_pump_idle_yields": int(health.get("memory_rank_pump_idle_yields", 0) or 0),
         "plasticity_packets_received": int(health.get("plasticity_packets_received", 0) or 0),
         "plasticity_lr_multiplier_max": float(plasticity.get("lr_multiplier_max", 0.0) or 0.0),
         "teacher_fail_open": int(crct.get("teacher_fail_open", 0) or 0),
@@ -183,7 +213,12 @@ def _print_profile_summary(summary: dict[str, Any]) -> None:
                 f"pump={row.get('memory_rank_pump_loop_seconds_sum', 0.0):.3f}s "
                 f"replay={row.get('memory_rank_replay_seconds_sum', 0.0):.3f}s "
                 f"replay_ticks={row.get('memory_rank_replay_ticks', 0)} "
-                f"replay_defer_packet={row.get('memory_rank_replay_deferred_for_packet_work', 0)}"
+                f"replay_defer_packet={row.get('memory_rank_replay_deferred_for_packet_work', 0)} "
+                f"append_commits={row.get('append_commits_sent', 0)}/"
+                f"{row.get('append_commits_applied', 0)} "
+                f"maintenance_commits={row.get('maintenance_commits_sent', 0)}/"
+                f"{row.get('maintenance_commits_applied', 0)} "
+                f"slot_drops={row.get('slot_commit_drops', 0)}"
             )
         if row.get("score_stage_timing_enabled"):
             stage_sum = max(

@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import copy
 import contextlib
+import datetime
 import hashlib
 import json
 import math
@@ -68,6 +69,15 @@ from chaoscontrol.cache_utility import (  # noqa: E402
     rank3_score_batch_causal,
 )
 from chaoscontrol.replay_eviction import ReplayEvictionLoop  # noqa: E402
+from chaoscontrol.slot_commit import (  # noqa: E402
+    SLOT_COMMIT_APPEND,
+    SLOT_COMMIT_CODE_TO_ACTION,
+    SlotCommit,
+    apply_append_slot_commit_to_model,
+    apply_slot_commit_to_model,
+    slot_commit_dtype_code,
+    slot_commit_dtype_from_code,
+)
 from chaoscontrol.data import (  # noqa: E402
     load_fineweb_tokens,
     resolve_device,
@@ -1049,8 +1059,8 @@ def _crct_replay_cache_probe(
     step: int,
 ) -> bool:
     """Cache the most recent batch as probe data for replay-eviction."""
-    outer = getattr(model, "outer_model", None)
-    if outer is None or len(getattr(outer, "table", getattr(outer, "_slots", []))) == 0:
+    outer = model.outer_model
+    if len(outer.table) == 0:
         return False
     probe_ids = getattr(model, "_last_crct_probe_input_ids", None)
     if probe_ids is None:
@@ -1111,7 +1121,7 @@ def _crct_score_payload_inline(
     gradient_conflict_monitor: CrctGradientConflictMonitor | None = None,
     update_model_memory_after: bool = False,
     record_stage_seconds: dict[str, float] | None = None,
-) -> dict[str, torch.Tensor]:
+) -> dict[str, Any]:
     input_ids = _crct_full_input_ids(inputs, targets)
     valid_mask = _crct_valid_mask(input_ids)
     setattr(model, "_last_crct_probe_input_ids", input_ids.detach())
@@ -1170,6 +1180,9 @@ def _crct_score_payload_inline(
         # as the CRCT controller target. The mailbox can transport that once
         # and alias it back to memory_gate on the train rank.
         payload["memory_gate_alias_target"] = True
+    write_records = score.get("memory_write_records")
+    if isinstance(write_records, list):
+        payload["memory_write_records"] = write_records
     return payload
 
 
@@ -1373,11 +1386,447 @@ def _apply_plasticity_budget_payload(
     return True
 
 
-def _dist_work_done(work: Any) -> bool:
-    try:
-        return bool(work.is_completed())
-    except Exception:
-        return False
+def _dist_work_done(work: Any, *, device: torch.device | None = None) -> bool:
+    if work is None:
+        return True
+    is_completed = getattr(work, "is_completed", None)
+    if callable(is_completed):
+        try:
+            if bool(is_completed()):
+                return True
+        except Exception:
+            pass
+        if device is not None and device.type == "cuda":
+            return False
+    wait = getattr(work, "wait", None)
+    if callable(wait):
+        try:
+            if device is None or device.type != "cuda":
+                return bool(wait())
+            return bool(wait(datetime.timedelta(milliseconds=1)))
+        except Exception:
+            return False
+    return False
+
+
+def _hotpath_yield() -> None:
+    """Yield on Linux; Darwin local tests intentionally busy-spin here."""
+    sched_yield = getattr(os, "sched_yield", None)
+    if sched_yield is not None:
+        sched_yield()
+
+
+def _crct_rank_topology(
+    *,
+    world_size: int,
+    replay_eviction_enabled: bool,
+) -> dict[str, Any]:
+    """Return the CRCT hardware roles for the current DDP world.
+
+    Four-GPU validation keeps the historical 3+1 shape.  At 8 GPUs, learned
+    maintenance gets its own coprocessor so packet serving no longer has to
+    choose between low-latency residual production and slot coverage.
+    """
+    world = int(world_size)
+    if world < 1:
+        raise ValueError(f"world_size must be positive, got {world_size!r}")
+    split = bool(replay_eviction_enabled) and world >= 8
+    packet_rank = world - (2 if split else 1)
+    maintenance_rank = world - 1
+    memory_ranks = sorted({int(packet_rank), int(maintenance_rank)})
+    train_ranks = [rank for rank in range(world) if rank not in memory_ranks]
+    return {
+        "split_memory_ranks": bool(split),
+        "packet_rank": int(packet_rank),
+        "maintenance_rank": int(maintenance_rank),
+        "memory_ranks": memory_ranks,
+        "train_ranks": train_ranks,
+        "grad_world_size": len(train_ranks),
+        "memory_owner": (
+            "split_packet_and_maintenance"
+            if split
+            else "packet_and_maintenance_shared"
+        ),
+    }
+
+
+_SLOT_COMMIT_MAGIC = 0x4353434D544C414E  # "CSCMTLAN"
+_SLOT_COMMIT_HEADER_VERSION = 1
+_SLOT_COMMIT_HEADER_FIELDS = 16
+_SLOT_COMMIT_SURVIVAL_SCALE = 1_000_000
+
+
+class _CrctSlotCommitPeerTransport:
+    """GPU6<->GPU7 slot-commit lane for split memory ranks.
+
+    Tensor payloads use point-to-point distributed sends between the two memory
+    ranks only.  On CUDA/NCCL this is the NVLink/P2P path; CPU/Gloo keeps the
+    same state machine for local tests.  GPU0-5 never join this transport.
+    GPU6 publishes authoritative APPEND commits to GPU7; GPU7 publishes
+    confirmed maintenance commits back to GPU6.
+    """
+
+    def __init__(
+        self,
+        *,
+        rank: int,
+        packet_rank: int,
+        maintenance_rank: int,
+        group: "dist.ProcessGroup | None",
+        device: torch.device,
+        queue_capacity: int = 1024,
+    ) -> None:
+        self.rank = int(rank)
+        self.packet_rank = int(packet_rank)
+        self.maintenance_rank = int(maintenance_rank)
+        self.group = group
+        self.device = device
+        self.queue_capacity = max(1, int(queue_capacity))
+        self.participant = self.rank in {self.packet_rank, self.maintenance_rank}
+        self._send_queue: deque[SlotCommit] = deque()
+        self._send_header: torch.Tensor | None = None
+        self._send_payload: torch.Tensor | None = None
+        self._send_header_work: Any | None = None
+        self._send_payload_work: Any | None = None
+        self._recv_header: torch.Tensor | None = None
+        self._recv_payload: torch.Tensor | None = None
+        self._recv_header_work: Any | None = None
+        self._recv_payload_work: Any | None = None
+        self._recv_pending_header: torch.Tensor | None = None
+        self._seq = 0
+        cuda_peer_access_possible = False
+        if device.type == "cuda" and torch.cuda.is_available():
+            try:
+                local_idx = int(device.index if device.index is not None else torch.cuda.current_device())
+                other_idx = (
+                    int(self.maintenance_rank)
+                    if self.rank == self.packet_rank
+                    else int(self.packet_rank)
+                )
+                if 0 <= other_idx < torch.cuda.device_count():
+                    cuda_peer_access_possible = bool(
+                        torch.cuda.can_device_access_peer(local_idx, other_idx)
+                    )
+            except Exception:
+                cuda_peer_access_possible = False
+        self.metrics: dict[str, Any] = {
+            "mode": "slot_commit_p2p",
+            "participant": bool(self.participant),
+            "packet_rank": int(self.packet_rank),
+            "maintenance_rank": int(self.maintenance_rank),
+            "device": str(self.device),
+            "queue_capacity": int(self.queue_capacity),
+            "queue_depth": 0,
+            "queue_depth_max": 0,
+            "submitted": 0,
+            "queued": 0,
+            "queue_overwrites": 0,
+            "append_commits_sent": 0,
+            "append_commits_applied": 0,
+            "maintenance_commits_sent": 0,
+            "maintenance_commits_applied": 0,
+            "send_headers_started": 0,
+            "send_payloads_started": 0,
+            "send_completed": 0,
+            "recv_headers_posted": 0,
+            "recv_headers_completed": 0,
+            "recv_payloads_started": 0,
+            "recv_completed": 0,
+            "applied": 0,
+            "dropped": 0,
+            "stale_generation_drops": 0,
+            "missing_slot_drops": 0,
+            "replica_capacity_full_drops": 0,
+            "errors": 0,
+            "last_error": "",
+            "last_drop_reason": "",
+            "last_action": "",
+            "last_slot_id": -1,
+            "last_step": -1,
+            "last_payload_numel": 0,
+            "p2p_available": bool(self.participant and self.group is not None),
+            "cuda_peer_access_possible": bool(cuda_peer_access_possible),
+        }
+        if self.participant and self.group is not None:
+            self._post_header_recv()
+
+    def close(self) -> None:
+        self._send_queue.clear()
+        self._send_header = None
+        self._send_payload = None
+        self._send_header_work = None
+        self._send_payload_work = None
+        self._recv_header = None
+        self._recv_payload = None
+        self._recv_header_work = None
+        self._recv_payload_work = None
+        self._recv_pending_header = None
+
+    def diagnostics(self) -> dict[str, Any]:
+        out = dict(self.metrics)
+        out["queue_depth"] = len(self._send_queue)
+        out["send_in_flight"] = self._send_header_work is not None
+        out["payload_in_flight"] = (
+            self._send_payload_work is not None
+            or self._recv_payload_work is not None
+        )
+        return out
+
+    def submit_peer(self, commit: SlotCommit) -> bool:
+        if not self.participant or self.group is None:
+            return False
+        self.metrics["submitted"] += 1
+        if len(self._send_queue) >= int(self.queue_capacity):
+            self.metrics["queue_overwrites"] += 1
+            self.metrics["dropped"] += 1
+            self.metrics["last_drop_reason"] = "queue_full_newest_drop"
+            self.metrics["last_action"] = str(commit.action)
+            self.metrics["last_slot_id"] = int(commit.slot_id)
+            self.metrics["last_step"] = int(commit.step)
+            return False
+        self._send_queue.append(commit)
+        self.metrics["queued"] += 1
+        if commit.action is SLOT_COMMIT_APPEND:
+            self.metrics["append_commits_sent"] += 1
+        else:
+            self.metrics["maintenance_commits_sent"] += 1
+        self.metrics["queue_depth"] = len(self._send_queue)
+        self.metrics["queue_depth_max"] = max(
+            int(self.metrics["queue_depth_max"]), len(self._send_queue)
+        )
+        self._poll_send()
+        return True
+
+    def poll(self, *, model: torch.nn.Module | None = None) -> bool:
+        if not self.participant or self.group is None:
+            return False
+        progressed = False
+        progressed = self._poll_send() or progressed
+        progressed = self._poll_recv(model=model) or progressed
+        return progressed
+
+    def _work_done(self, work: Any | None) -> bool:
+        return _dist_work_done(work, device=self.device)
+
+    def _header_device(self) -> torch.device:
+        return self.device if self.device.type == "cuda" else torch.device("cpu")
+
+    def _payload_device(self) -> torch.device:
+        return self.device if self.device.type == "cuda" else torch.device("cpu")
+
+    def _make_header(self, commit: SlotCommit, payload: torch.Tensor | None) -> torch.Tensor:
+        dtype_code = (
+            slot_commit_dtype_code(payload.dtype) if payload is not None else 0
+        )
+        payload_numel = int(payload.numel()) if payload is not None else 0
+        # APPEND has no parent slot generation in the Python data model; -1 is
+        # only the fixed-width wire representation.
+        base_generation = (
+            -1 if commit.base_generation is None else int(commit.base_generation)
+        )
+        fields = [
+            _SLOT_COMMIT_MAGIC,
+            _SLOT_COMMIT_HEADER_VERSION,
+            int(self._seq),
+            int(commit.step),
+            int(commit.action),
+            int(commit.slot_id),
+            base_generation,
+            int(commit.new_generation),
+            int(commit.bucket_id),
+            int(commit.event_id),
+            int(payload_numel),
+            int(dtype_code),
+            int(round(float(commit.survival_factor) * _SLOT_COMMIT_SURVIVAL_SCALE)),
+            int(self.rank),
+            0,
+            0,
+        ]
+        self._seq += 1
+        return torch.tensor(fields, device=self._header_device(), dtype=torch.int64)
+
+    def _peer_rank(self) -> int:
+        return (
+            int(self.maintenance_rank)
+            if int(self.rank) == int(self.packet_rank)
+            else int(self.packet_rank)
+        )
+
+    def _commit_from_header(
+        self,
+        header: torch.Tensor,
+        payload: torch.Tensor | None,
+    ) -> SlotCommit:
+        h = header.detach().to(device="cpu", dtype=torch.int64).tolist()
+        if int(h[0]) != _SLOT_COMMIT_MAGIC:
+            raise ValueError("bad slot commit magic")
+        if int(h[1]) != _SLOT_COMMIT_HEADER_VERSION:
+            raise ValueError("bad slot commit header version")
+        action = SLOT_COMMIT_CODE_TO_ACTION[int(h[4])]
+        base_generation = (
+            None
+            if action is SLOT_COMMIT_APPEND and int(h[6]) < 0
+            else int(h[6])
+        )
+        survival_factor = float(h[12]) / float(_SLOT_COMMIT_SURVIVAL_SCALE)
+        tensor = None
+        if payload is not None:
+            tensor = payload.reshape(1, -1).detach()
+        return SlotCommit(
+            slot_id=int(h[5]),
+            action=action,
+            step=int(h[3]),
+            base_generation=base_generation,
+            new_generation=int(h[7]),
+            bucket_id=int(h[8]),
+            event_id=int(h[9]),
+            survival_factor=survival_factor,
+            tensor=tensor,
+            reason="p2p_commit",
+        )
+
+    def _start_next_send(self) -> bool:
+        if not self._send_queue:
+            return False
+        commit = self._send_queue.popleft()
+        payload = None
+        if commit.tensor is not None:
+            payload = commit.tensor.detach().to(
+                device=self._payload_device(),
+                dtype=commit.tensor.dtype,
+            ).contiguous().view(-1)
+        header = self._make_header(commit, payload)
+        self._send_header = header
+        self._send_payload = payload
+        self._send_header_work = dist.isend(
+            header,
+            dst=self._peer_rank(),
+            group=self.group,
+        )
+        self.metrics["send_headers_started"] += 1
+        self.metrics["last_action"] = str(commit.action)
+        self.metrics["last_slot_id"] = int(commit.slot_id)
+        self.metrics["last_step"] = int(commit.step)
+        self.metrics["last_payload_numel"] = int(payload.numel()) if payload is not None else 0
+        return True
+
+    def _poll_send(self) -> bool:
+        progressed = False
+        if self._send_header_work is None and self._send_payload_work is None:
+            return self._start_next_send()
+        if self._send_payload_work is None:
+            if not self._work_done(self._send_header_work):
+                return False
+            self._send_header_work = None
+            progressed = True
+            if self._send_payload is not None:
+                self._send_payload_work = dist.isend(
+                    self._send_payload,
+                    dst=self._peer_rank(),
+                    group=self.group,
+                )
+                self.metrics["send_payloads_started"] += 1
+                return True
+        if self._send_payload_work is not None:
+            if not self._work_done(self._send_payload_work):
+                return progressed
+            self._send_payload_work = None
+            progressed = True
+        self._send_header = None
+        self._send_payload = None
+        self.metrics["send_completed"] += 1
+        return self._start_next_send() or progressed
+
+    def _post_header_recv(self) -> None:
+        if self._recv_header_work is not None:
+            return
+        self._recv_header = torch.empty(
+            _SLOT_COMMIT_HEADER_FIELDS,
+            device=self._header_device(),
+            dtype=torch.int64,
+        )
+        self._recv_header_work = dist.irecv(
+            self._recv_header,
+            src=self._peer_rank(),
+            group=self.group,
+        )
+        self.metrics["recv_headers_posted"] += 1
+
+    def _poll_recv(self, *, model: torch.nn.Module | None) -> bool:
+        if self._recv_header_work is None and self._recv_payload_work is None:
+            self._post_header_recv()
+            return False
+        if self._recv_header_work is not None:
+            if not self._work_done(self._recv_header_work):
+                return False
+            self._recv_header_work = None
+            assert self._recv_header is not None
+            self._recv_pending_header = self._recv_header.detach().clone()
+            self.metrics["recv_headers_completed"] += 1
+            h = self._recv_pending_header.detach().to(device="cpu", dtype=torch.int64)
+            payload_numel = int(h[10].item())
+            dtype = slot_commit_dtype_from_code(int(h[11].item()))
+            if payload_numel > 0:
+                self._recv_payload = torch.empty(
+                    payload_numel,
+                    device=self._payload_device(),
+                    dtype=dtype,
+                )
+                self._recv_payload_work = dist.irecv(
+                    self._recv_payload,
+                    src=self._peer_rank(),
+                    group=self.group,
+                )
+                self.metrics["recv_payloads_started"] += 1
+                return True
+        if self._recv_payload_work is not None:
+            if not self._work_done(self._recv_payload_work):
+                return False
+            self._recv_payload_work = None
+        if self._recv_pending_header is None:
+            return False
+        try:
+            commit = self._commit_from_header(
+                self._recv_pending_header,
+                self._recv_payload,
+            )
+            self.metrics["last_action"] = str(commit.action)
+            self.metrics["last_slot_id"] = int(commit.slot_id)
+            self.metrics["last_step"] = int(commit.step)
+            if model is None:
+                self.metrics["dropped"] += 1
+                self.metrics["last_drop_reason"] = "missing_model"
+            else:
+                if commit.action is SLOT_COMMIT_APPEND:
+                    accepted, reason = apply_append_slot_commit_to_model(model, commit)
+                else:
+                    accepted, reason = apply_slot_commit_to_model(model, commit)
+                if accepted:
+                    self.metrics["applied"] += 1
+                    if commit.action is SLOT_COMMIT_APPEND:
+                        self.metrics["append_commits_applied"] += 1
+                    else:
+                        self.metrics["maintenance_commits_applied"] += 1
+                else:
+                    self.metrics["dropped"] += 1
+                    self.metrics["last_drop_reason"] = str(reason)
+                    if reason == "stale_generation":
+                        self.metrics["stale_generation_drops"] += 1
+                    elif reason in {"missing_slot", "missing_record"}:
+                        self.metrics["missing_slot_drops"] += 1
+                    elif reason == "replica_capacity_full":
+                        self.metrics["replica_capacity_full_drops"] += 1
+        except Exception as exc:
+            self.metrics["errors"] += 1
+            self.metrics["last_error"] = "".join(
+                traceback.format_exception_only(type(exc), exc)
+            ).strip()
+        finally:
+            self._recv_pending_header = None
+            self._recv_header = None
+            self._recv_payload = None
+            self.metrics["recv_completed"] += 1
+        return True
 
 
 class _CrctAsyncTeacherTransport:
@@ -1413,17 +1862,21 @@ class _CrctAsyncTeacherTransport:
         max_payload_lag_steps: int,
         score_interval_steps: int = 1,
         coordinator_rank: int = 0,
+        memory_rank: int | None = None,
     ) -> None:
         self.rank = int(rank)
         self.world_size = int(world_size)
-        self.memory_rank = self.world_size - 1
-        self.n_train = self.world_size - 1
+        self.memory_rank = (
+            int(memory_rank) if memory_rank is not None else self.world_size - 1
+        )
+        self.n_train = max(1, self.world_size - 1)
         self.coordinator_rank = int(coordinator_rank)
         self.teacher_group = teacher_group
         self.payload_shape = tuple(int(x) for x in payload_shape)
         self.full_ids_shape = tuple(int(x) for x in full_ids_shape)
         self.device = device
         self.payload_dtype = payload_dtype
+        self._async_collectives = self.device.type != "cpu"
         self.max_local_batches_configured = max(1, int(max_local_batches))
         self.max_payload_lag_steps_configured = max(0, int(max_payload_lag_steps))
         self.max_local_batches = self.max_local_batches_configured
@@ -1462,6 +1915,32 @@ class _CrctAsyncTeacherTransport:
             "payloads_sent": 0,
             "payloads_received": 0,
             "payloads_used": 0,
+            "memory_rank_pump_steps": 0,
+            "memory_rank_outer_loop_seconds_sum": 0.0,
+            "memory_rank_outer_loop_seconds_max": 0.0,
+            "memory_rank_pre_pump_seconds_sum": 0.0,
+            "memory_rank_pre_pump_seconds_max": 0.0,
+            "memory_rank_replay_seconds_sum": 0.0,
+            "memory_rank_replay_seconds_max": 0.0,
+            "memory_rank_replay_ticks": 0,
+            "memory_rank_replay_probes_ingested": 0,
+            "memory_rank_replay_deferred_for_packet_work": 0,
+            "memory_rank_replay_deferred_for_backpressure": 0,
+            "memory_rank_pump_loop_seconds_sum": 0.0,
+            "memory_rank_pump_loop_seconds_max": 0.0,
+            "memory_rank_pump_idle_spins": 0,
+            "memory_rank_pump_idle_yields": 0,
+            "memory_rank_pump_request_pops": 0,
+            "memory_rank_pump_last_request_step": -1,
+            "memory_rank_request_events_superseded": 0,
+            "memory_rank_pump_score_calls": 0,
+            "low_priority_maintenance_checks": 0,
+            "low_priority_maintenance_allows": 0,
+            "low_priority_maintenance_defers": 0,
+            "low_priority_maintenance_defer_pending_requests": 0,
+            "low_priority_maintenance_defer_request_mailbox": 0,
+            "low_priority_maintenance_pending_requests": 0,
+            "low_priority_maintenance_last_reason": "",
             "memory_packets_sent": 0,
             "memory_packets_received": 0,
             "memory_packet_bytes_sent": 0,
@@ -1560,6 +2039,8 @@ class _CrctAsyncTeacherTransport:
         fast_slow: FastSlowConsolidator | None = None,
         fast_slow_action_space: ConstrainedActionSpace | None = None,
         fast_slow_nll_chunk_size: int = 1024,
+        slot_commit_transport: "_CrctSlotCommitPeerTransport | None" = None,
+        update_model_memory_after: bool = True,
     ) -> None:
         # The non-mailbox transport does not own a teacher-snapshot apply
         # path, so it does not refresh the evidence engine LM head or score
@@ -1570,6 +2051,7 @@ class _CrctAsyncTeacherTransport:
             fast_slow,
             fast_slow_action_space,
             fast_slow_nll_chunk_size,
+            slot_commit_transport,
         )
         completed = self._reap_input_requests()
         if self.rank != self.memory_rank:
@@ -1610,7 +2092,7 @@ class _CrctAsyncTeacherTransport:
                 alpha_max=alpha_max,
                 memory_write_tokens=int(memory_write_tokens),
                 gradient_conflict_monitor=gradient_conflict_monitor,
-                update_model_memory_after=True,
+                update_model_memory_after=bool(update_model_memory_after),
             )
             score_s = time.perf_counter() - t0
             self.metrics["score_seconds_sum"] += float(score_s)
@@ -1703,7 +2185,9 @@ class _CrctAsyncTeacherTransport:
         while self.pending_input_requests:
             slot = self.pending_input_requests.popleft()
             try:
-                slot["work"].wait()
+                wait = getattr(slot["work"], "wait", None)
+                if wait is not None:
+                    wait()
                 self.metrics["request_broadcasts_completed"] += 1
                 self.metrics["shutdown_input_requests_drained"] += 1
             except Exception as exc:
@@ -1780,33 +2264,34 @@ class _CrctAsyncTeacherTransport:
                 buffers["target"],
                 src=self.memory_rank,
                 group=self.teacher_group,
-                async_op=True,
+                async_op=bool(self._async_collectives),
             ),
             dist.broadcast(
                 buffers["confidence"],
                 src=self.memory_rank,
                 group=self.teacher_group,
-                async_op=True,
+                async_op=bool(self._async_collectives),
             ),
             dist.broadcast(
                 buffers["loss_weight"],
                 src=self.memory_rank,
                 group=self.teacher_group,
-                async_op=True,
+                async_op=bool(self._async_collectives),
             ),
             dist.broadcast(
                 buffers["utility"],
                 src=self.memory_rank,
                 group=self.teacher_group,
-                async_op=True,
+                async_op=bool(self._async_collectives),
             ),
             dist.broadcast(
                 buffers["meta"],
                 src=self.memory_rank,
                 group=self.teacher_group,
-                async_op=True,
+                async_op=bool(self._async_collectives),
             ),
         ]
+        works = [work for work in works if work is not None]
         self.pending_result_broadcasts.append(
             {"works": works, "buffers": buffers, "send_step": int(send_step)}
         )
@@ -1855,7 +2340,7 @@ class _CrctAsyncTeacherTransport:
             request_buf,
             src=self.coordinator_rank,
             group=self.teacher_group,
-            async_op=True,
+            async_op=bool(self._async_collectives),
         )
         self.pending_input_requests.append(
             {"work": work, "buffer": request_buf, "step": int(step)}
@@ -2081,14 +2566,21 @@ class _CrctMailboxTeacherTransport:
         max_payload_lag_steps: int,
         score_interval_steps: int = 1,
         coordinator_rank: int = 0,
+        memory_rank: int | None = None,
+        memory_role: str = "packet",
+        produce_results: bool = True,
         plasticity_ema_beta: float = 0.95,
         hidden_dim: int | None = None,
         score_stage_timing_enabled: bool = False,
     ) -> None:
         self.rank = int(rank)
         self.world_size = int(world_size)
-        self.memory_rank = self.world_size - 1
+        self.memory_rank = (
+            int(memory_rank) if memory_rank is not None else self.world_size - 1
+        )
         self.coordinator_rank = int(coordinator_rank)
+        self.memory_role = str(memory_role or "packet")
+        self.produce_results = bool(produce_results)
         self.mailbox_dir = Path(mailbox_dir)
         self.mailbox_dir.mkdir(parents=True, exist_ok=True)
         self.payload_shape = tuple(int(x) for x in payload_shape)
@@ -2141,10 +2633,19 @@ class _CrctMailboxTeacherTransport:
         self._teacher_result_ring: Any | None = None
         self._teacher_request_payload: Any | None = None
         self._teacher_result_payload: Any | None = None
-        self._teacher_request_ring_name = _teacher_shm_name(self.mailbox_dir, "tq")
-        self._teacher_result_ring_name = _teacher_shm_name(self.mailbox_dir, "tr")
-        self._teacher_request_payload_name = _teacher_shm_name(self.mailbox_dir, "tqb")
-        self._teacher_result_payload_name = _teacher_shm_name(self.mailbox_dir, "trb")
+        ring_prefix = "tm" if self.memory_role == "maintenance" else "t"
+        self._teacher_request_ring_name = _teacher_shm_name(
+            self.mailbox_dir, f"{ring_prefix}q"
+        )
+        self._teacher_result_ring_name = _teacher_shm_name(
+            self.mailbox_dir, f"{ring_prefix}r"
+        )
+        self._teacher_request_payload_name = _teacher_shm_name(
+            self.mailbox_dir, f"{ring_prefix}qb"
+        )
+        self._teacher_result_payload_name = _teacher_shm_name(
+            self.mailbox_dir, f"{ring_prefix}rb"
+        )
         self._weight_snapshot_shm_name = _teacher_shm_name(self.mailbox_dir, "ws")
         self._weight_snapshot_shm: Any | None = None
         self._weight_snapshot_layout: list[dict[str, Any]] | None = None
@@ -2178,6 +2679,8 @@ class _CrctMailboxTeacherTransport:
             "transport_group": "rank0_memory_shm",
             "coordinator_rank": int(self.coordinator_rank),
             "memory_rank": int(self.memory_rank),
+            "memory_role": self.memory_role,
+            "produce_results": bool(self.produce_results),
             "participant": True,
             "mailbox_dir": str(self.mailbox_dir),
             "payload_dtype": str(payload_dtype).replace("torch.", ""),
@@ -2276,8 +2779,7 @@ class _CrctMailboxTeacherTransport:
             "memory_rank_pump_loop_seconds_sum": 0.0,
             "memory_rank_pump_loop_seconds_max": 0.0,
             "memory_rank_pump_idle_spins": 0,
-            "memory_rank_pump_idle_sleep_seconds_sum": 0.0,
-            "memory_rank_pump_idle_sleep_seconds_max": 0.0,
+            "memory_rank_pump_idle_yields": 0,
             "memory_rank_pump_request_pops": 0,
             "memory_rank_pump_last_request_step": -1,
             "memory_rank_request_events_superseded": 0,
@@ -2300,6 +2802,10 @@ class _CrctMailboxTeacherTransport:
             "memory_packet_lag_steps_max": 0,
             "memory_packet_last_residual_shape": [],
             "memory_packet_last_gate_shape": [],
+            "slot_append_records_seen": 0,
+            "slot_append_commits_published": 0,
+            "slot_append_commit_publish_failures": 0,
+            "slot_append_commits_local_only": 0,
             "plasticity_ema_beta": float(self.plasticity_ema_beta),
             "plasticity_packets_sent": 0,
             "plasticity_packets_received": 0,
@@ -2449,13 +2955,19 @@ class _CrctMailboxTeacherTransport:
 
     def _init_teacher_shm(self) -> None:
         if self.rank == self.coordinator_rank:
-            for cls, name in (
+            owned_resources: list[tuple[Any, str]] = [
                 (_ext.ShmRingTeacherRequest, self._teacher_request_ring_name),
-                (_ext.ShmRingTeacherResult, self._teacher_result_ring_name),
                 (_ext.PosixShm, self._teacher_request_payload_name),
-                (_ext.PosixShm, self._teacher_result_payload_name),
-                (_ext.PosixShm, self._weight_snapshot_shm_name),
-            ):
+            ]
+            if self.produce_results:
+                owned_resources.extend(
+                    [
+                        (_ext.ShmRingTeacherResult, self._teacher_result_ring_name),
+                        (_ext.PosixShm, self._teacher_result_payload_name),
+                        (_ext.PosixShm, self._weight_snapshot_shm_name),
+                    ]
+                )
+            for cls, name in owned_resources:
                 try:
                     cls.unlink(name)
                 except Exception:
@@ -2463,19 +2975,20 @@ class _CrctMailboxTeacherTransport:
             self._teacher_request_ring = _ext.ShmRingTeacherRequest.create(
                 self._teacher_request_ring_name
             )
-            self._teacher_result_ring = _ext.ShmRingTeacherResult.create(
-                self._teacher_result_ring_name
-            )
             self._teacher_request_payload = _ext.PosixShm(
                 self._teacher_request_payload_name,
                 self._teacher_request_payload_bytes,
                 True,
             )
-            self._teacher_result_payload = _ext.PosixShm(
-                self._teacher_result_payload_name,
-                self._teacher_result_payload_bytes,
-                True,
-            )
+            if self.produce_results:
+                self._teacher_result_ring = _ext.ShmRingTeacherResult.create(
+                    self._teacher_result_ring_name
+                )
+                self._teacher_result_payload = _ext.PosixShm(
+                    self._teacher_result_payload_name,
+                    self._teacher_result_payload_bytes,
+                    True,
+                )
 
     def _ensure_teacher_request_consumer(self) -> bool:
         if self._teacher_request_ring is None:
@@ -2499,6 +3012,8 @@ class _CrctMailboxTeacherTransport:
         return True
 
     def _ensure_teacher_result_producer(self) -> bool:
+        if not self.produce_results:
+            return False
         if self._teacher_result_ring is None:
             try:
                 self._teacher_result_ring = _ext.ShmRingTeacherResult.attach(
@@ -2613,6 +3128,8 @@ class _CrctMailboxTeacherTransport:
         fast_slow: FastSlowConsolidator | None = None,
         fast_slow_action_space: ConstrainedActionSpace | None = None,
         fast_slow_nll_chunk_size: int = 1024,
+        slot_commit_transport: "_CrctSlotCommitPeerTransport | None" = None,
+        update_model_memory_after: bool = True,
     ) -> None:
         if self.rank == self.memory_rank:
             self.poll_weight_snapshot(
@@ -2659,7 +3176,7 @@ class _CrctMailboxTeacherTransport:
                 alpha_max=alpha_max,
                 memory_write_tokens=int(memory_write_tokens),
                 gradient_conflict_monitor=gradient_conflict_monitor,
-                update_model_memory_after=True,
+                update_model_memory_after=bool(update_model_memory_after),
                 record_stage_seconds=stage_seconds,
             )
             if (
@@ -2681,13 +3198,22 @@ class _CrctMailboxTeacherTransport:
             self.metrics["payloads_scored"] += 1
             self.metrics["memory_rank_pump_score_calls"] += 1
             self.metrics["last_scored_request_step"] = request_step
+            if bool(update_model_memory_after):
+                self._publish_memory_write_commits(
+                    request_step=request_step,
+                    scored=scored,
+                    slot_commit_transport=slot_commit_transport,
+                )
             if stage_seconds is not None:
                 self._record_score_stage_seconds(
                     request_step=request_step,
                     stage_seconds=stage_seconds,
                     peak_mb=peak_stage_mb,
                 )
-            self._write_result(request_step=request_step, scored=scored)
+            if self.produce_results:
+                self._write_result(request_step=request_step, scored=scored)
+            else:
+                self.metrics["last_sent_request_step"] = request_step
         except Exception as exc:
             self.metrics["errors"] += 1
             self.metrics["last_error"] = "".join(
@@ -2859,13 +3385,19 @@ class _CrctMailboxTeacherTransport:
         if self._weight_publish_thread is not None:
             self._weight_publish_thread.join(timeout=0.25)
         if self.rank == self.coordinator_rank:
-            for cls, name in (
+            owned_resources: list[tuple[Any, str]] = [
                 (_ext.ShmRingTeacherRequest, self._teacher_request_ring_name),
-                (_ext.ShmRingTeacherResult, self._teacher_result_ring_name),
                 (_ext.PosixShm, self._teacher_request_payload_name),
-                (_ext.PosixShm, self._teacher_result_payload_name),
-                (_ext.PosixShm, self._weight_snapshot_shm_name),
-            ):
+            ]
+            if self.produce_results:
+                owned_resources.extend(
+                    [
+                        (_ext.ShmRingTeacherResult, self._teacher_result_ring_name),
+                        (_ext.PosixShm, self._teacher_result_payload_name),
+                        (_ext.PosixShm, self._weight_snapshot_shm_name),
+                    ]
+                )
+            for cls, name in owned_resources:
                 try:
                     cls.unlink(name)
                 except Exception:
@@ -3959,7 +4491,50 @@ class _CrctMailboxTeacherTransport:
             self._plasticity_budget_ema,
         )
 
-    def _write_result(self, *, request_step: int, scored: dict[str, torch.Tensor]) -> None:
+    def _publish_memory_write_commits(
+        self,
+        *,
+        request_step: int,
+        scored: dict[str, Any],
+        slot_commit_transport: "_CrctSlotCommitPeerTransport | None",
+    ) -> None:
+        write_records = scored.get("memory_write_records")
+        if not isinstance(write_records, list) or not write_records:
+            return
+        self.metrics["slot_append_records_seen"] += len(write_records)
+        if slot_commit_transport is None:
+            self.metrics["slot_append_commits_local_only"] += len(write_records)
+            return
+        for record in write_records:
+            if not isinstance(record, dict):
+                self.metrics["slot_append_commit_publish_failures"] += 1
+                self.metrics["last_drop_reason"] = "slot_append_bad_record"
+                continue
+            tensor = record.get("tensor")
+            if not isinstance(tensor, torch.Tensor):
+                self.metrics["slot_append_commit_publish_failures"] += 1
+                self.metrics["last_drop_reason"] = "slot_append_missing_tensor"
+                continue
+            commit = SlotCommit(
+                slot_id=int(record.get("slot_id", -1)),
+                action=SLOT_COMMIT_APPEND,
+                step=int(request_step),
+                base_generation=None,
+                new_generation=int(record.get("generation", 0)),
+                bucket_id=int(record.get("bucket_id", -1)),
+                event_id=int(record.get("event_id", 0)),
+                tensor=tensor.detach(),
+                reason="packet_append",
+            )
+            if slot_commit_transport.submit_peer(commit):
+                self.metrics["slot_append_commits_published"] += 1
+            else:
+                self.metrics["slot_append_commit_publish_failures"] += 1
+                self.metrics["last_drop_reason"] = "slot_append_submit_failed"
+
+    def _write_result(self, *, request_step: int, scored: dict[str, Any]) -> None:
+        if not self.produce_results:
+            return
         if not self._ensure_teacher_result_producer():
             self.metrics["last_drop_reason"] = "teacher_shm_result_not_ready"
             return
@@ -4149,6 +4724,8 @@ class _CrctMailboxTeacherTransport:
         *,
         current_step: int,
     ) -> tuple[dict[str, torch.Tensor], torch.Tensor, torch.Tensor] | None:
+        if not self.produce_results:
+            return None
         if self._teacher_result_ring is None or self._teacher_result_payload is None:
             return self._pop_ready_result(current_step=current_step)
         while True:
@@ -5054,6 +5631,7 @@ class _CudaWriteEventPublisher:
         self.free_slots: deque[int] = deque(range(self.depth))
         self.pending: deque[int] = deque()
         self.lock = threading.Lock()
+        self.cond = threading.Condition(self.lock)
         self.stop_event = threading.Event()
         self.submitted_batches = 0
         self.pushed_events = 0
@@ -5098,27 +5676,29 @@ class _CudaWriteEventPublisher:
                 return
             self.pending.append(slot_i)
             self.submitted_batches += 1
+            self.cond.notify()
 
     def close(self, timeout: float = 2.0) -> None:
         self.stop_event.set()
+        with self.cond:
+            self.cond.notify_all()
         self.thread.join(timeout=timeout)
 
     def _run(self) -> None:
-        idle_sleep = 0.00001
-        idle_sleep_cap = 0.001
         try:
             while not self.stop_event.is_set() or self.pending:
                 slot: int | None = None
-                with self.lock:
-                    if self.pending:
-                        candidate = self.pending[0]
-                        if bool(self.events[candidate].query()):
-                            slot = self.pending.popleft()
+                with self.cond:
+                    while not self.pending and not self.stop_event.is_set():
+                        self.cond.wait()
+                    if not self.pending:
+                        continue
+                    candidate = self.pending[0]
+                    if bool(self.events[candidate].query()):
+                        slot = self.pending.popleft()
                 if slot is None:
-                    time.sleep(idle_sleep)
-                    idle_sleep = min(idle_sleep * 2.0, idle_sleep_cap)
+                    _hotpath_yield()
                     continue
-                idle_sleep = 0.00001
                 try:
                     stats = self.ring.push_batch_tensor(self.cpu_slots[slot])
                     self.pushed_events += int(stats.get("pushed", 0))
@@ -6306,7 +6886,6 @@ def _write_drain_main(
     *,
     consumer: _EpisodicConsumerState,
     stop_event: threading.Event,
-    idle_sleep_s: float,
     embedding_version_ref: list[int],
     controller_score_mode: str,
     controller_topk_k: int,
@@ -6341,8 +6920,8 @@ def _write_drain_main(
             drained = 0
         current_step += 1
         heartbeat[0] += 1
-        if drained == 0 and stop_event.wait(timeout=float(idle_sleep_s)):
-            break
+        if drained == 0:
+            _hotpath_yield()
 
 
 def _spawn_episodic_write_drain(
@@ -6364,9 +6943,6 @@ def _spawn_episodic_write_drain(
         kwargs={
             "consumer": consumer,
             "stop_event": stop_event,
-            "idle_sleep_s": float(
-                config.get("episodic_write_ring_idle_sleep_s", 0.001)
-            ),
             "embedding_version_ref": embedding_version_ref,
             "controller_score_mode": str(
                 _controller_score_mode_from_config(config)
@@ -7275,9 +7851,6 @@ def _spawn_episodic_controller(
 
     score_mode = _controller_score_mode_from_config(config)
     k = int(config.get("episodic_controller_topk_k", 16))
-    idle_sleep_s = float(
-        config.get("episodic_controller_idle_sleep_s", 0.005)
-    )
     simplex_selection_mode = str(
         config.get("episodic_controller_selection_mode", "argmax")
     ).strip().lower()
@@ -7338,7 +7911,6 @@ def _spawn_episodic_controller(
             "simplex_selection_mode": simplex_selection_mode,
             "simplex_generator": simplex_generator,
             "action_space": action_space,
-            "cycle_idle_sleep_s": idle_sleep_s,
             "heartbeat": controller_heartbeat,
         },
         daemon=True,
@@ -9076,11 +9648,9 @@ def train_fast_for_budget(
     episodic_cuda_write_event_stage_depth: int = 4,
     episodic_event_ring_id: str | None = None,
     episodic_write_ring_max_drain_per_step: int = 4096,
-    episodic_write_ring_idle_sleep_s: float = 0.001,
     episodic_compute_replay_ce_pair: bool = False,
     episodic_controller_score_mode: str = "cosine_utility_weighted",
     episodic_controller_topk_k: int = 16,
-    episodic_controller_idle_sleep_s: float = 0.005,
     episodic_controller_selection_mode: str = "argmax",
     episodic_controller_selection_seed: int | None = None,
     episodic_controller_runtime: str = "heuristic",
@@ -9280,9 +9850,17 @@ def train_fast_for_budget(
     # with a real replay grad so ``(main_avg + replay_full)`` flows in
     # the same single collective with no API change at the call sites.
     is_episodic_rank = False
+    is_crct_packet_rank = False
+    is_crct_maintenance_rank = False
+    crct_packet_rank = world_size_ - 1
+    crct_maintenance_rank = world_size_ - 1
+    crct_memory_ranks: list[int] = []
+    crct_train_ranks: list[int] = list(range(world_size_))
+    crct_memory_owner = "disabled"
     all_group = None
     train_group = None
     teacher_group = None
+    slot_commit_group = None
     grad_group = None
     object_group = None
     grad_world_size = world_size_
@@ -9300,7 +9878,28 @@ def train_fast_for_budget(
                 "3+1 memory topology requires world_size >= 2 "
                 f"(1 train + 1 memory rank), got world_size={world_size_}"
             )
-        is_episodic_rank = (rank_ == world_size_ - 1)
+        if crct_enabled and not episodic_enabled:
+            _crct_backend_for_topology = str(
+                crct_async_teacher_transport_backend
+            ).strip().lower()
+            crct_topology = _crct_rank_topology(
+                world_size=world_size_,
+                replay_eviction_enabled=(
+                    bool(replay_eviction_enabled)
+                    and _crct_backend_for_topology
+                    in {"mailbox", "file", "file_mailbox"}
+                ),
+            )
+            crct_packet_rank = int(crct_topology["packet_rank"])
+            crct_maintenance_rank = int(crct_topology["maintenance_rank"])
+            crct_memory_ranks = [int(r) for r in crct_topology["memory_ranks"]]
+            crct_train_ranks = [int(r) for r in crct_topology["train_ranks"]]
+            crct_memory_owner = str(crct_topology["memory_owner"])
+            is_crct_packet_rank = rank_ == crct_packet_rank
+            is_crct_maintenance_rank = rank_ == crct_maintenance_rank
+            is_episodic_rank = rank_ in set(crct_memory_ranks)
+        else:
+            is_episodic_rank = (rank_ == world_size_ - 1)
         # ``all_group`` is the all-rank process group as an explicit
         # handle. Phase 5 will introduce ``main_group`` (just train
         # ranks) without changing any all_group call sites. Note:
@@ -9320,11 +9919,15 @@ def train_fast_for_budget(
             # replay-gradient producer. Keep train-rank gradients and
             # stop checks on the train subgroup so oracle scoring can lag
             # without touching trunk SSM throughput.
-            train_ranks = list(range(world_size_ - 1))
+            train_ranks = list(crct_train_ranks)
             train_group = dist.new_group(train_ranks)
-            teacher_group = dist.new_group([0, world_size_ - 1])
+            teacher_group = dist.new_group([0, crct_packet_rank])
+            if int(crct_packet_rank) != int(crct_maintenance_rank):
+                slot_commit_group = dist.new_group(
+                    [int(crct_packet_rank), int(crct_maintenance_rank)]
+                )
             grad_group = train_group
-            grad_world_size = world_size_ - 1
+            grad_world_size = len(train_ranks)
             memory_rank_joins_grad = False
             if not is_episodic_rank:
                 stop_group = train_group
@@ -9349,6 +9952,12 @@ def train_fast_for_budget(
             "crct_enabled=True requires world_size>=4 so rank world_size-1 "
             "can own the teacher memory without coupling train-rank trunk "
             "forwards to cache reads."
+        )
+    if crct_enabled and not episodic_enabled and grad_world_size < 1:
+        raise ValueError(
+            "crct_enabled=True requires at least one train rank after "
+            f"memory-role assignment; got world_size={world_size_} "
+            f"memory_ranks={crct_memory_ranks}"
         )
     if scopt_active and grad_allreduce_mode_ != "bulk":
         raise ValueError("ScOpt currently requires grad_allreduce_mode='bulk'")
@@ -9497,9 +10106,6 @@ def train_fast_for_budget(
     _episodic_controller_config = {
         "episodic_controller_score_mode": str(episodic_controller_score_mode),
         "episodic_controller_topk_k": int(episodic_controller_topk_k),
-        "episodic_controller_idle_sleep_s": float(
-            episodic_controller_idle_sleep_s
-        ),
         "episodic_controller_selection_mode": str(
             episodic_controller_selection_mode
         ),
@@ -9538,9 +10144,6 @@ def train_fast_for_budget(
         ),
         "episodic_controller_history_entries": int(
             episodic_controller_history_entries
-        ),
-        "episodic_write_ring_idle_sleep_s": float(
-            episodic_write_ring_idle_sleep_s
         ),
         **_action_space_config,
     }
@@ -9856,10 +10459,25 @@ def train_fast_for_budget(
             else int(crct_teacher_param_sync_interval_steps)
         )
     crct_teacher_transport: _CrctAsyncTeacherTransport | None = None
+    crct_maintenance_transport: _CrctMailboxTeacherTransport | None = None
+    crct_slot_commit_transport: _CrctSlotCommitPeerTransport | None = None
+    crct_memory_begin_step_by_role: dict[str, int] = {}
     crct_teacher_transport_mode = "disabled"
     crct_teacher_bypass_steps = 0
     replay_eviction_loop: ReplayEvictionLoop | None = None
     online_eval_state_payload: dict[str, Any] = {}
+    if (
+        crct_enabled
+        and int(crct_packet_rank) != int(crct_maintenance_rank)
+        and rank_ in {int(crct_packet_rank), int(crct_maintenance_rank)}
+    ):
+        crct_slot_commit_transport = _CrctSlotCommitPeerTransport(
+            rank=int(rank_),
+            packet_rank=int(crct_packet_rank),
+            maintenance_rank=int(crct_maintenance_rank),
+            group=slot_commit_group,
+            device=device,
+        )
     if bool(replay_eviction_enabled) and crct_enabled:
         replay_eviction_loop = ReplayEvictionLoop(
             action_mode=str(replay_eviction_mode),
@@ -9923,14 +10541,14 @@ def train_fast_for_budget(
             commit_temperature=float(replay_eviction_commit_temperature),
             arm_runtime_enabled=(
                 bool(replay_eviction_arm_runtime_enabled)
-                and int(rank_) == int(world_size_) - 1
+                and int(rank_) == int(crct_maintenance_rank)
             ),
             arm_runtime_namespace=(
                 str(replay_eviction_arm_runtime_namespace) or None
             ),
             evidence_engine_enabled=(
                 bool(replay_eviction_evidence_engine_enabled)
-                and int(rank_) == int(world_size_) - 1
+                and int(rank_) == int(crct_maintenance_rank)
             ),
             evidence_engine_d_model=int(replay_eviction_evidence_engine_d_model),
         )
@@ -10117,6 +10735,9 @@ def train_fast_for_budget(
                 max_local_batches=int(crct_async_teacher_pending_batches),
                 max_payload_lag_steps=int(crct_async_teacher_max_lag_steps),
                 score_interval_steps=int(crct_teacher_score_interval_steps),
+                memory_rank=int(crct_packet_rank),
+                memory_role="packet",
+                produce_results=True,
                 plasticity_ema_beta=float(crct_ema_beta),
                 hidden_dim=int(
                     getattr(model, "dim", 0)
@@ -10144,32 +10765,81 @@ def train_fast_for_budget(
             max_local_batches=int(crct_async_teacher_pending_batches),
             max_payload_lag_steps=int(crct_async_teacher_max_lag_steps),
             score_interval_steps=int(crct_teacher_score_interval_steps),
+            memory_rank=int(crct_packet_rank),
         )
 
-    def _pump_crct_memory_rank(step: int) -> bool:
-        if crct_teacher_transport is None:
+    def _ensure_crct_maintenance_transport(
+        *,
+        full_ids_shape: tuple[int, ...],
+        payload_shape: tuple[int, ...],
+        payload_device: torch.device,
+    ) -> None:
+        nonlocal crct_maintenance_transport
+        if crct_maintenance_transport is not None:
+            return
+        if int(crct_maintenance_rank) == int(crct_packet_rank):
+            return
+        if crct_teacher_transport_mode != "async_rank0_memory_mailbox":
+            return
+        if rank_ not in {0, int(crct_maintenance_rank)}:
+            return
+        mailbox_dir = str(crct_teacher_mailbox_dir or "").strip()
+        if not mailbox_dir:
+            raise ValueError(
+                "CRCT mailbox transport requires crct_teacher_mailbox_dir to be set"
+            )
+        payload_dtype = _resolve_crct_async_payload_dtype(
+            crct_async_teacher_payload_dtype,
+            device=payload_device,
+        )
+        crct_maintenance_transport = _CrctMailboxTeacherTransport(
+            rank=rank_,
+            world_size=world_size_,
+            mailbox_dir=mailbox_dir,
+            payload_shape=payload_shape,
+            full_ids_shape=full_ids_shape,
+            device=payload_device,
+            payload_dtype=payload_dtype,
+            max_local_batches=int(crct_async_teacher_pending_batches),
+            max_payload_lag_steps=int(crct_async_teacher_max_lag_steps),
+            score_interval_steps=int(crct_teacher_score_interval_steps),
+            memory_rank=int(crct_maintenance_rank),
+            memory_role="maintenance",
+            produce_results=False,
+            plasticity_ema_beta=float(crct_ema_beta),
+            hidden_dim=int(
+                getattr(model, "dim", 0)
+                or getattr(model.lm_head, "in_features", 0)
+                or 0
+            ),
+            score_stage_timing_enabled=bool(crct_score_stage_timing_enabled),
+        )
+
+    def _pump_crct_memory_rank(
+        step: int,
+        *,
+        transport: _CrctAsyncTeacherTransport | _CrctMailboxTeacherTransport | None = None,
+    ) -> bool:
+        active_transport = crct_teacher_transport if transport is None else transport
+        if active_transport is None:
             return False
         pump_t0 = time.perf_counter()
         assert crct_cache is not None
         try:
             score_before = int(
-                crct_teacher_transport.metrics.get("payloads_scored", 0)
+                active_transport.metrics.get("payloads_scored", 0)
             )
             weight_before = int(
-                crct_teacher_transport.metrics.get("weight_snapshot_applied", 0)
+                active_transport.metrics.get("weight_snapshot_applied", 0)
             )
             request_pops_before = int(
-                crct_teacher_transport.metrics.get(
-                    "memory_rank_pump_request_pops", 0
-                )
+                active_transport.metrics.get("memory_rank_pump_request_pops", 0)
             )
-            poll_requests = getattr(crct_teacher_transport, "_poll_requests", None)
+            poll_requests = getattr(active_transport, "_poll_requests", None)
             if callable(poll_requests):
                 popped = int(poll_requests())
-                crct_teacher_transport.metrics["memory_rank_pump_request_pops"] += (
-                    popped
-                )
-            crct_teacher_transport.after_optimizer_step(
+                active_transport.metrics["memory_rank_pump_request_pops"] += popped
+            active_transport.after_optimizer_step(
                 model=model,
                 cache=crct_cache,
                 scarcity_optimizer=crct_scarcity,
@@ -10185,32 +10855,29 @@ def train_fast_for_budget(
                 fast_slow=None,
                 fast_slow_action_space=None,
                 fast_slow_nll_chunk_size=int(chunk_size),
+                slot_commit_transport=crct_slot_commit_transport,
+                update_model_memory_after=not (
+                    int(crct_packet_rank) != int(crct_maintenance_rank)
+                    and getattr(active_transport, "memory_role", "") == "maintenance"
+                ),
             )
             request_pops_after = int(
-                crct_teacher_transport.metrics.get("memory_rank_pump_request_pops", 0)
+                active_transport.metrics.get("memory_rank_pump_request_pops", 0)
             )
             return (
                 request_pops_after > request_pops_before
-                or int(crct_teacher_transport.metrics.get("payloads_scored", 0))
+                or int(active_transport.metrics.get("payloads_scored", 0))
                 > score_before
-                or int(
-                    crct_teacher_transport.metrics.get(
-                        "weight_snapshot_applied", 0
-                    )
-                )
+                or int(active_transport.metrics.get("weight_snapshot_applied", 0))
                 > weight_before
             )
         finally:
             elapsed = time.perf_counter() - pump_t0
-            crct_teacher_transport.metrics["memory_rank_pump_loop_seconds_sum"] += (
-                float(elapsed)
+            active_transport.metrics["memory_rank_pump_loop_seconds_sum"] += float(
+                elapsed
             )
-            crct_teacher_transport.metrics["memory_rank_pump_loop_seconds_max"] = max(
-                float(
-                    crct_teacher_transport.metrics[
-                        "memory_rank_pump_loop_seconds_max"
-                    ]
-                ),
+            active_transport.metrics["memory_rank_pump_loop_seconds_max"] = max(
+                float(active_transport.metrics["memory_rank_pump_loop_seconds_max"]),
                 float(elapsed),
             )
 
@@ -10218,42 +10885,43 @@ def train_fast_for_budget(
         step: int,
         *,
         packet_work_done: bool,
+        transport: _CrctAsyncTeacherTransport | _CrctMailboxTeacherTransport | None = None,
+        defer_for_packet_work: bool = True,
     ) -> bool:
         """Run low-priority replay maintenance only when packet service is clear."""
         if replay_eviction_loop is None:
             return False
+        active_transport = crct_teacher_transport if transport is None else transport
         probe_fresh = _crct_replay_cache_probe(
             replay_eviction_loop,
             model,
             step,
         )
-        if crct_teacher_transport is not None and probe_fresh:
-            crct_teacher_transport.metrics[
-                "memory_rank_replay_probes_ingested"
-            ] += 1
+        if active_transport is not None and probe_fresh:
+            active_transport.metrics["memory_rank_replay_probes_ingested"] += 1
         if not replay_eviction_loop.has_probe():
             return False
-        if packet_work_done:
-            if crct_teacher_transport is not None:
-                crct_teacher_transport.metrics[
+        if packet_work_done and defer_for_packet_work:
+            if active_transport is not None:
+                active_transport.metrics[
                     "memory_rank_replay_deferred_for_packet_work"
                 ] += 1
-                crct_teacher_transport.metrics[
-                    "low_priority_maintenance_last_reason"
-                ] = "packet_work"
+                active_transport.metrics["low_priority_maintenance_last_reason"] = (
+                    "packet_work"
+                )
             return False
         defer_low_priority = False
-        if crct_teacher_transport is not None:
+        if active_transport is not None:
             should_defer = getattr(
-                crct_teacher_transport,
+                active_transport,
                 "should_defer_low_priority_maintenance",
                 None,
             )
             if callable(should_defer):
                 defer_low_priority = bool(should_defer())
         if defer_low_priority:
-            if crct_teacher_transport is not None:
-                crct_teacher_transport.metrics[
+            if active_transport is not None:
+                active_transport.metrics[
                     "memory_rank_replay_deferred_for_backpressure"
                 ] += 1
             return False
@@ -10266,8 +10934,11 @@ def train_fast_for_budget(
             model=model,
             step=replay_step,
         )
-        if crct_teacher_transport is not None:
-            crct_teacher_transport.metrics["memory_rank_replay_ticks"] += 1
+        if crct_slot_commit_transport is not None:
+            for commit in tick_result.slot_commits:
+                crct_slot_commit_transport.submit_peer(commit)
+        if active_transport is not None:
+            active_transport.metrics["memory_rank_replay_ticks"] += 1
         if tick_result.evicted_indices:
             replay_eviction_loop.flush_trace()
         return True
@@ -10360,97 +11031,152 @@ def train_fast_for_budget(
                 and bool(is_episodic_rank)
                 and not bool(episodic_enabled)
                 and not bool(memory_rank_joins_grad)
+                and crct_teacher_transport_mode == "async_rank0_memory_mailbox"
             ):
+                active_memory_transport = (
+                    crct_teacher_transport
+                    if bool(is_crct_packet_rank)
+                    else crct_maintenance_transport
+                )
                 if crct_teacher_transport_mode in {
                     "async_rank0_memory_broadcast",
                     "async_rank0_memory_mailbox",
                 }:
-                    _ensure_crct_teacher_transport(
-                        full_ids_shape=(int(batch_size), int(seq_len) + 1),
-                        payload_shape=(1, int(batch_size), int(seq_len)),
-                        payload_device=device,
+                    if bool(is_crct_packet_rank):
+                        _ensure_crct_teacher_transport(
+                            full_ids_shape=(int(batch_size), int(seq_len) + 1),
+                            payload_shape=(1, int(batch_size), int(seq_len)),
+                            payload_device=device,
+                        )
+                    if bool(is_crct_maintenance_rank):
+                        _ensure_crct_maintenance_transport(
+                            full_ids_shape=(int(batch_size), int(seq_len) + 1),
+                            payload_shape=(1, int(batch_size), int(seq_len)),
+                            payload_device=device,
+                        )
+                    active_memory_transport = (
+                        crct_teacher_transport
+                        if bool(is_crct_packet_rank)
+                        else crct_maintenance_transport
                     )
                     crct_teacher_requests += 1
                 if (
-                    crct_teacher_transport is not None
+                    active_memory_transport is not None
+                    and crct_teacher_transport_mode
+                    == "async_rank0_memory_broadcast"
+                    and bool(is_crct_packet_rank)
+                ):
+                    role_key = str(
+                        active_memory_transport.metrics.get("memory_role", "packet")
+                    )
+                    if crct_memory_begin_step_by_role.get(role_key) != int(steps):
+                        dummy_inputs = torch.empty(
+                            (int(batch_size), int(seq_len)),
+                            device=device,
+                            dtype=torch.int32,
+                        )
+                        dummy_targets = torch.empty(
+                            (int(batch_size), int(seq_len)),
+                            device=device,
+                            dtype=torch.long,
+                        )
+                        active_memory_transport.begin_step(
+                            inputs=dummy_inputs,
+                            targets=dummy_targets,
+                            step=steps,
+                        )
+                        crct_memory_begin_step_by_role[role_key] = int(steps)
+                if (
+                    active_memory_transport is not None
                     and memory_rank_loop_t0 is not None
                 ):
                     pre_pump_s = time.perf_counter() - memory_rank_loop_t0
-                    crct_teacher_transport.metrics[
+                    active_memory_transport.metrics[
                         "memory_rank_pre_pump_seconds_sum"
                     ] += float(pre_pump_s)
-                    crct_teacher_transport.metrics[
+                    active_memory_transport.metrics[
                         "memory_rank_pre_pump_seconds_max"
                     ] = max(
                         float(
-                            crct_teacher_transport.metrics[
+                            active_memory_transport.metrics[
                                 "memory_rank_pre_pump_seconds_max"
                             ]
                         ),
                         float(pre_pump_s),
                     )
-                pump_work_done = _pump_crct_memory_rank(steps)
+                commit_work_done = False
+                if crct_slot_commit_transport is not None:
+                    commit_work_done = crct_slot_commit_transport.poll(model=model)
+                pump_work_done = _pump_crct_memory_rank(
+                    steps,
+                    transport=active_memory_transport,
+                )
+                if crct_slot_commit_transport is not None:
+                    commit_work_done = (
+                        crct_slot_commit_transport.poll(model=model)
+                        or commit_work_done
+                    )
                 replay_t0 = time.perf_counter()
-                if _maybe_tick_crct_replay_maintenance(
+                replay_work_done = bool(is_crct_maintenance_rank) and _maybe_tick_crct_replay_maintenance(
                     steps,
                     packet_work_done=bool(pump_work_done),
-                ):
+                    transport=active_memory_transport,
+                    defer_for_packet_work=not bool(
+                        int(crct_maintenance_rank) != int(crct_packet_rank)
+                    ),
+                )
+                if crct_slot_commit_transport is not None:
+                    commit_work_done = (
+                        crct_slot_commit_transport.poll(model=model)
+                        or commit_work_done
+                    )
+                if replay_work_done:
                     pump_work_done = True
-                if crct_teacher_transport is not None:
+                if commit_work_done:
+                    pump_work_done = True
+                if active_memory_transport is not None:
                     replay_s = time.perf_counter() - replay_t0
-                    crct_teacher_transport.metrics[
+                    active_memory_transport.metrics[
                         "memory_rank_replay_seconds_sum"
                     ] += float(replay_s)
-                    crct_teacher_transport.metrics[
+                    active_memory_transport.metrics[
                         "memory_rank_replay_seconds_max"
                     ] = max(
                         float(
-                            crct_teacher_transport.metrics[
+                            active_memory_transport.metrics[
                                 "memory_rank_replay_seconds_max"
                             ]
                         ),
                         float(replay_s),
                     )
                 if pump_work_done:
-                    if crct_teacher_transport is not None:
-                        crct_teacher_transport.metrics["memory_rank_pump_steps"] += 1
+                    if active_memory_transport is not None:
+                        active_memory_transport.metrics["memory_rank_pump_steps"] += 1
                     losses.append(torch.zeros((), device=device, dtype=torch.float32))
                     steps += 1
                 else:
-                    if crct_teacher_transport is not None:
-                        crct_teacher_transport.metrics[
+                    if active_memory_transport is not None:
+                        active_memory_transport.metrics[
                             "memory_rank_pump_idle_spins"
                         ] += 1
-                    sleep_t0 = time.perf_counter()
-                    time.sleep(0)
-                    if crct_teacher_transport is not None:
-                        sleep_s = time.perf_counter() - sleep_t0
-                        crct_teacher_transport.metrics[
-                            "memory_rank_pump_idle_sleep_seconds_sum"
-                        ] += float(sleep_s)
-                        crct_teacher_transport.metrics[
-                            "memory_rank_pump_idle_sleep_seconds_max"
-                        ] = max(
-                            float(
-                                crct_teacher_transport.metrics[
-                                    "memory_rank_pump_idle_sleep_seconds_max"
-                                ]
-                            ),
-                            float(sleep_s),
-                        )
+                    if active_memory_transport is not None:
+                        active_memory_transport.metrics[
+                            "memory_rank_pump_idle_yields"
+                        ] += 1
+                    _hotpath_yield()
                 if (
-                    crct_teacher_transport is not None
+                    active_memory_transport is not None
                     and memory_rank_loop_t0 is not None
                 ):
                     loop_s = time.perf_counter() - memory_rank_loop_t0
-                    crct_teacher_transport.metrics[
+                    active_memory_transport.metrics[
                         "memory_rank_outer_loop_seconds_sum"
                     ] += float(loop_s)
-                    crct_teacher_transport.metrics[
+                    active_memory_transport.metrics[
                         "memory_rank_outer_loop_seconds_max"
                     ] = max(
                         float(
-                            crct_teacher_transport.metrics[
+                            active_memory_transport.metrics[
                                 "memory_rank_outer_loop_seconds_max"
                             ]
                         ),
@@ -10552,17 +11278,28 @@ def train_fast_for_budget(
                         "async_rank0_memory_broadcast",
                         "async_rank0_memory_mailbox",
                     }
-                    and rank_ in {0, world_size_ - 1}
+                    and rank_ in {0, int(crct_packet_rank)}
+                )
+                crct_maintenance_transport_participant = (
+                    crct_teacher_transport_mode == "async_rank0_memory_mailbox"
+                    and int(crct_maintenance_rank) != int(crct_packet_rank)
+                    and rank_ in {0, int(crct_maintenance_rank)}
                 )
                 if crct_teacher_transport_mode in {
                     "async_rank0_memory_broadcast",
                     "async_rank0_memory_mailbox",
                 }:
-                    if not crct_transport_participant:
+                    if not (
+                        crct_transport_participant
+                        or crct_maintenance_transport_participant
+                    ):
                         crct_teacher_bypass_steps += 1
                     else:
                         crct_teacher_requests += 1
-                    if not crct_transport_participant:
+                    if not (
+                        crct_transport_participant
+                        or crct_maintenance_transport_participant
+                    ):
                         pass
                     elif (
                         crct_teacher_transport_mode == "async_rank0_memory_broadcast"
@@ -10572,8 +11309,24 @@ def train_fast_for_budget(
                             "CRCT async rank0-memory transport requires "
                             "teacher_group to be initialized"
                         )
-                    elif crct_teacher_transport is None:
+                    elif crct_transport_participant and crct_teacher_transport is None:
                         _ensure_crct_teacher_transport(
+                            full_ids_shape=tuple(
+                                int(x)
+                                for x in _crct_full_input_ids(inputs, targets).shape
+                            ),
+                            payload_shape=(
+                                1,
+                                int(targets.shape[0]),
+                                int(targets.shape[1]),
+                            ),
+                            payload_device=inputs.device,
+                        )
+                    if (
+                        crct_maintenance_transport_participant
+                        and crct_maintenance_transport is None
+                    ):
+                        _ensure_crct_maintenance_transport(
                             full_ids_shape=tuple(
                                 int(x)
                                 for x in _crct_full_input_ids(inputs, targets).shape
@@ -10590,7 +11343,7 @@ def train_fast_for_budget(
                     else:
                         if (
                             crct_transport_participant
-                            and rank_ == world_size_ - 1
+                            and rank_ == int(crct_packet_rank)
                             and not bool(memory_rank_joins_grad)
                         ):
                             memory_rank_request_pops_before = int(
@@ -10598,11 +11351,31 @@ def train_fast_for_budget(
                                     "memory_rank_pump_request_pops", 0
                                 )
                             )
-                        ready = crct_teacher_transport.begin_step(
-                            inputs=inputs,
-                            targets=targets,
-                            step=steps,
+                        skip_duplicate_memory_collective = (
+                            crct_teacher_transport_mode
+                            == "async_rank0_memory_broadcast"
+                            and crct_transport_participant
+                            and rank_ == int(crct_packet_rank)
+                            and not bool(memory_rank_joins_grad)
+                            and crct_memory_begin_step_by_role.get("packet")
+                            == int(steps)
                         )
+                        if skip_duplicate_memory_collective:
+                            ready = None
+                        else:
+                            ready = crct_teacher_transport.begin_step(
+                                inputs=inputs,
+                                targets=targets,
+                                step=steps,
+                            )
+                            if (
+                                crct_teacher_transport_mode
+                                == "async_rank0_memory_broadcast"
+                                and crct_transport_participant
+                                and rank_ == int(crct_packet_rank)
+                                and not bool(memory_rank_joins_grad)
+                            ):
+                                crct_memory_begin_step_by_role["packet"] = int(steps)
                         if ready is not None:
                             crct_payload, train_inputs, train_targets = ready
                             _apply_fast_slow_result_payload(
@@ -10611,6 +11384,12 @@ def train_fast_for_budget(
                                 payload=crct_payload,
                                 metrics=crct_teacher_transport.metrics,
                             )
+                    if crct_maintenance_transport is not None:
+                        crct_maintenance_transport.begin_step(
+                            inputs=inputs,
+                            targets=targets,
+                            step=steps,
+                        )
                 else:
                     crct_teacher_requests += 1
                     crct_payload = _collect_crct_teacher_payload(
@@ -10671,6 +11450,27 @@ def train_fast_for_budget(
                         fast_slow_action_space=None,
                         fast_slow_nll_chunk_size=int(chunk_size),
                     )
+                    if (
+                        crct_teacher_transport_mode
+                        == "async_rank0_memory_broadcast"
+                        and teacher_group is not None
+                        and int(crct_teacher_param_sync_interval) > 0
+                        and steps % int(crct_teacher_param_sync_interval) == 0
+                    ):
+                        crct_teacher_transport.wait_for_pending_collectives()
+                        sync_t0 = time.perf_counter()
+                        _broadcast_model_params_coalesced(
+                            model,
+                            src=0,
+                            group=teacher_group,
+                        )
+                        sync_s = time.perf_counter() - sync_t0
+                        crct_teacher_param_syncs += 1
+                        crct_teacher_param_sync_seconds_sum += float(sync_s)
+                        crct_teacher_param_sync_seconds_max = max(
+                            float(crct_teacher_param_sync_seconds_max),
+                            float(sync_s),
+                        )
                     request_pops_after = int(
                         crct_teacher_transport.metrics.get(
                             "memory_rank_pump_request_pops", 0
@@ -10711,23 +11511,18 @@ def train_fast_for_budget(
                         crct_teacher_transport.metrics[
                             "memory_rank_pump_idle_spins"
                         ] += 1
-                    sleep_t0 = time.perf_counter()
-                    time.sleep(0)
                     if crct_teacher_transport is not None:
-                        sleep_s = time.perf_counter() - sleep_t0
                         crct_teacher_transport.metrics[
-                            "memory_rank_pump_idle_sleep_seconds_sum"
-                        ] += float(sleep_s)
-                        crct_teacher_transport.metrics[
-                            "memory_rank_pump_idle_sleep_seconds_max"
-                        ] = max(
-                            float(
-                                crct_teacher_transport.metrics[
-                                    "memory_rank_pump_idle_sleep_seconds_max"
-                                ]
-                            ),
-                            float(sleep_s),
-                        )
+                            "memory_rank_pump_idle_yields"
+                        ] += 1
+                    if (
+                        crct_teacher_transport is not None
+                        and crct_teacher_transport_mode
+                        == "async_rank0_memory_broadcast"
+                    ):
+                        crct_teacher_transport.wait_for_pending_collectives()
+                    else:
+                        _hotpath_yield()
                 continue
 
             optimizer.zero_grad(set_to_none=True)
@@ -11173,6 +11968,10 @@ def train_fast_for_budget(
             async_grad_reducer.close()
         if crct_teacher_transport is not None:
             crct_teacher_transport.close()
+        if crct_maintenance_transport is not None:
+            crct_maintenance_transport.close()
+        if crct_slot_commit_transport is not None:
+            crct_slot_commit_transport.close()
         # Phase 2: stop the episodic controller thread. None handle
         # (train ranks, episodic disabled, controller flag off) is a
         # no-op. Bounded join so a stuck loop can't block the runner's
@@ -11223,10 +12022,21 @@ def train_fast_for_budget(
             episodic_cache_payload = local_cache_payload
 
     if crct_enabled:
+        local_crct_transport = (
+            crct_teacher_transport
+            if crct_teacher_transport is not None
+            else crct_maintenance_transport
+        )
         crct_local_diagnostics: dict[str, Any] = {
             "rank": int(rank_),
-            "is_memory_rank": bool(rank_ == world_size_ - 1 and world_size_ >= 4),
-            "memory_owner": "rank3_teacher_only",
+            "is_memory_rank": bool(rank_ in set(crct_memory_ranks)),
+            "is_packet_rank": bool(rank_ == int(crct_packet_rank)),
+            "is_maintenance_rank": bool(rank_ == int(crct_maintenance_rank)),
+            "packet_rank": int(crct_packet_rank),
+            "maintenance_rank": int(crct_maintenance_rank),
+            "memory_ranks": [int(r) for r in crct_memory_ranks],
+            "train_ranks": [int(r) for r in crct_train_ranks],
+            "memory_owner": str(crct_memory_owner),
             "grad_sync_group": (
                 "all_ranks" if bool(memory_rank_joins_grad) else "train_ranks"
             ),
@@ -11240,10 +12050,11 @@ def train_fast_for_budget(
             "train_rank_slot_writes": 0,
             "teacher_transport_mode": str(crct_teacher_transport_mode),
             "teacher_transport_participant": bool(
-                crct_teacher_transport is not None
+                local_crct_transport is not None
             ),
             "teacher_coordinator_rank": 0,
-            "teacher_memory_rank": int(world_size_ - 1),
+            "teacher_memory_rank": int(crct_packet_rank),
+            "teacher_maintenance_rank": int(crct_maintenance_rank),
             "teacher_requests": int(crct_teacher_requests),
             "teacher_payloads": int(crct_teacher_payloads),
             "teacher_fail_open": int(crct_teacher_fail_open),
@@ -11287,13 +12098,13 @@ def train_fast_for_budget(
                 else {"enabled": False}
             ),
             "transport": (
-                crct_teacher_transport.diagnostics()
-                if crct_teacher_transport is not None
+                local_crct_transport.diagnostics()
+                if local_crct_transport is not None
                 else {
                     "mode": str(crct_teacher_transport_mode),
                     "transport_group": "rank0_memory",
                     "coordinator_rank": 0,
-                    "memory_rank": int(world_size_ - 1),
+                    "memory_rank": int(crct_packet_rank),
                     "participant": False,
                     "requests_started": 0,
                     "payloads_used": 0,
@@ -11303,6 +12114,16 @@ def train_fast_for_budget(
                     "errors": 0,
                     "last_error": "",
                 }
+            ),
+            "maintenance_transport": (
+                crct_maintenance_transport.diagnostics()
+                if crct_maintenance_transport is not None
+                else None
+            ),
+            "slot_commit_transport": (
+                crct_slot_commit_transport.diagnostics()
+                if crct_slot_commit_transport is not None
+                else None
             ),
         }
         if ddp_active and dist.is_initialized() and all_group is not None:
@@ -11320,7 +12141,7 @@ def train_fast_for_budget(
         else:
             crct_rank_diagnostics = [crct_local_diagnostics]
         local_online_state: dict[str, Any] | None = None
-        if replay_eviction_loop is not None and rank_ == world_size_ - 1:
+        if replay_eviction_loop is not None and rank_ == int(crct_maintenance_rank):
             local_online_state = {
                 "replay_eviction": replay_eviction_loop.state_dict()
             }
@@ -11362,27 +12183,103 @@ def train_fast_for_budget(
             if isinstance(transport, dict) and bool(
                 diag.get("teacher_transport_participant", False)
             ):
-                if bool(diag.get("is_memory_rank", False)):
+                if bool(diag.get("is_packet_rank", False)):
                     role = "memory"
+                elif bool(diag.get("is_maintenance_rank", False)):
+                    role = "maintenance"
                 elif int(diag.get("rank", -1)) == 0:
                     role = "coordinator"
                 else:
                     role = f"rank_{int(diag.get('rank', -1))}"
                 crct_transport_summary[role] = transport
-            if diag is not None and bool(diag.get("is_memory_rank", False)):
+            maintenance_transport = diag.get("maintenance_transport")
+            slot_commit_transport = diag.get("slot_commit_transport")
+            if (
+                int(diag.get("rank", -1)) == 0
+                and isinstance(maintenance_transport, dict)
+            ):
+                crct_transport_summary["maintenance_coordinator"] = (
+                    maintenance_transport
+                )
+            if isinstance(slot_commit_transport, dict):
+                if bool(diag.get("is_packet_rank", False)):
+                    crct_transport_summary["slot_commit_packet"] = (
+                        slot_commit_transport
+                    )
+                elif bool(diag.get("is_maintenance_rank", False)):
+                    crct_transport_summary["slot_commit_maintenance"] = (
+                        slot_commit_transport
+                    )
+            if diag is not None and bool(diag.get("is_packet_rank", False)):
                 crct_gradient_conflict_summary = dict(
                     diag.get("gradient_conflict", crct_gradient_conflict_summary)
                 )
                 crct_teacher_memory_slots = int(diag.get("memory_slots", 0))
         if "memory" in crct_transport_summary and "coordinator" in crct_transport_summary:
-            coord = crct_transport_summary["coordinator"]
-            mem = crct_transport_summary["memory"]
+            coord = dict(crct_transport_summary["coordinator"])
+            mem = dict(crct_transport_summary["memory"])
+            maintenance = dict(crct_transport_summary.get("maintenance") or {})
+            maintenance_coord = dict(
+                crct_transport_summary.get("maintenance_coordinator") or {}
+            )
+            slot_commit_packet = dict(
+                crct_transport_summary.get("slot_commit_packet") or {}
+            )
+            slot_commit_maintenance = dict(
+                crct_transport_summary.get("slot_commit_maintenance") or {}
+            )
+            replay_mem = maintenance or mem
             crct_transport_summary["health"] = {
                 "mode": str(coord.get("mode", mem.get("mode", ""))),
                 "coordinator_errors": int(coord.get("errors", 0)),
                 "memory_errors": int(mem.get("errors", 0)),
+                "maintenance_errors": int(maintenance.get("errors", 0)),
                 "payloads_used": int(coord.get("payloads_used", 0)),
                 "payloads_scored": int(mem.get("payloads_scored", 0)),
+                "maintenance_payloads_scored": int(
+                    maintenance.get("payloads_scored", 0)
+                ),
+                "maintenance_replay_ticks": int(
+                    maintenance.get("memory_rank_replay_ticks", 0)
+                ),
+                "maintenance_replay_probes_ingested": int(
+                    maintenance.get("memory_rank_replay_probes_ingested", 0)
+                ),
+                "maintenance_request_ring_full_drops": int(
+                    maintenance_coord.get("teacher_shm_request_ring_full_drops", 0)
+                ),
+                "slot_commit_p2p_available": bool(
+                    slot_commit_packet.get("p2p_available", False)
+                    or slot_commit_maintenance.get("p2p_available", False)
+                ),
+                "append_commits_sent": int(
+                    slot_commit_packet.get("append_commits_sent", 0)
+                ),
+                "append_commits_applied": int(
+                    slot_commit_maintenance.get("append_commits_applied", 0)
+                ),
+                "maintenance_commits_sent": int(
+                    slot_commit_maintenance.get("maintenance_commits_sent", 0)
+                ),
+                "maintenance_commits_applied": int(
+                    slot_commit_packet.get("maintenance_commits_applied", 0)
+                ),
+                "slot_commit_drops": int(
+                    slot_commit_packet.get("dropped", 0)
+                    + slot_commit_maintenance.get("dropped", 0)
+                ),
+                "slot_commit_stale_generation_drops": int(
+                    slot_commit_packet.get("stale_generation_drops", 0)
+                    + slot_commit_maintenance.get("stale_generation_drops", 0)
+                ),
+                "slot_commit_replica_capacity_full_drops": int(
+                    slot_commit_packet.get("replica_capacity_full_drops", 0)
+                    + slot_commit_maintenance.get("replica_capacity_full_drops", 0)
+                ),
+                "slot_commit_queue_overwrites": int(
+                    slot_commit_packet.get("queue_overwrites", 0)
+                    + slot_commit_maintenance.get("queue_overwrites", 0)
+                ),
                 "payload_lag_steps_max": int(coord.get("payload_lag_steps_max", 0)),
                 "score_seconds_max": float(mem.get("score_seconds_max", 0.0)),
                 "score_stage_timing_enabled": bool(
@@ -11434,6 +12331,9 @@ def train_fast_for_budget(
                 "memory_rank_pump_idle_spins": int(
                     mem.get("memory_rank_pump_idle_spins", 0)
                 ),
+                "memory_rank_pump_idle_yields": int(
+                    mem.get("memory_rank_pump_idle_yields", 0)
+                ),
                 "memory_rank_pump_request_pops": int(
                     mem.get("memory_rank_pump_request_pops", 0)
                 ),
@@ -11453,34 +12353,30 @@ def train_fast_for_budget(
                     mem.get("memory_rank_pre_pump_seconds_max", 0.0)
                 ),
                 "memory_rank_replay_seconds_sum": float(
-                    mem.get("memory_rank_replay_seconds_sum", 0.0)
+                    replay_mem.get("memory_rank_replay_seconds_sum", 0.0)
                 ),
                 "memory_rank_replay_seconds_max": float(
-                    mem.get("memory_rank_replay_seconds_max", 0.0)
+                    replay_mem.get("memory_rank_replay_seconds_max", 0.0)
                 ),
                 "memory_rank_replay_ticks": int(
-                    mem.get("memory_rank_replay_ticks", 0)
+                    replay_mem.get("memory_rank_replay_ticks", 0)
                 ),
                 "memory_rank_replay_probes_ingested": int(
-                    mem.get("memory_rank_replay_probes_ingested", 0)
+                    replay_mem.get("memory_rank_replay_probes_ingested", 0)
                 ),
                 "memory_rank_replay_deferred_for_packet_work": int(
-                    mem.get("memory_rank_replay_deferred_for_packet_work", 0)
+                    replay_mem.get("memory_rank_replay_deferred_for_packet_work", 0)
                 ),
                 "memory_rank_replay_deferred_for_backpressure": int(
-                    mem.get("memory_rank_replay_deferred_for_backpressure", 0)
+                    replay_mem.get(
+                        "memory_rank_replay_deferred_for_backpressure", 0
+                    )
                 ),
                 "memory_rank_pump_loop_seconds_sum": float(
                     mem.get("memory_rank_pump_loop_seconds_sum", 0.0)
                 ),
                 "memory_rank_pump_loop_seconds_max": float(
                     mem.get("memory_rank_pump_loop_seconds_max", 0.0)
-                ),
-                "memory_rank_pump_idle_sleep_seconds_sum": float(
-                    mem.get("memory_rank_pump_idle_sleep_seconds_sum", 0.0)
-                ),
-                "memory_rank_pump_idle_sleep_seconds_max": float(
-                    mem.get("memory_rank_pump_idle_sleep_seconds_max", 0.0)
                 ),
                 "memory_rank_pump_score_calls": int(
                     mem.get("memory_rank_pump_score_calls", 0)
@@ -11802,9 +12698,9 @@ def train_fast_for_budget(
             },
             "crct": {
                 "enabled": bool(crct_enabled),
-                "memory_owner": (
-                    "rank3_teacher_only" if bool(crct_enabled) else "disabled"
-                ),
+                "memory_owner": str(crct_memory_owner)
+                if bool(crct_enabled)
+                else "disabled",
                 "trunk_memory_mode": "packet" if bool(crct_enabled) else "disabled",
                 "grad_sync_group": (
                     "all_ranks"
@@ -11835,7 +12731,10 @@ def train_fast_for_budget(
                     }
                 ),
                 "teacher_coordinator_rank": 0,
-                "teacher_memory_rank": int(world_size_ - 1),
+                "teacher_memory_rank": int(crct_packet_rank),
+                "teacher_maintenance_rank": int(crct_maintenance_rank),
+                "memory_ranks": [int(r) for r in crct_memory_ranks],
+                "train_ranks": [int(r) for r in crct_train_ranks],
                 "teacher_bypass_steps": int(crct_teacher_bypass_steps),
                 "async_teacher_pending_batches": int(
                     crct_async_teacher_pending_batches
@@ -12541,9 +13440,6 @@ def run_condition(
         episodic_write_ring_max_drain_per_step=int(
             config.get("episodic_write_ring_max_drain_per_step", 4096)
         ),
-        episodic_write_ring_idle_sleep_s=float(
-            config.get("episodic_write_ring_idle_sleep_s", 0.001)
-        ),
         episodic_compute_replay_ce_pair=bool(
             config.get("episodic_compute_replay_ce_pair", False)
         ),
@@ -12552,9 +13448,6 @@ def run_condition(
         ),
         episodic_controller_topk_k=int(
             config.get("episodic_controller_topk_k", 16)
-        ),
-        episodic_controller_idle_sleep_s=float(
-            config.get("episodic_controller_idle_sleep_s", 0.005)
         ),
         episodic_controller_selection_mode=str(
             config.get("episodic_controller_selection_mode", "argmax")

@@ -80,16 +80,25 @@ class SlotTable:
         self._next_id += 1
         return sid
 
-    def append(
+    def _install_slot(
         self,
+        sid: SlotId,
         tensor: torch.Tensor,
         *,
-        bucket_id: int = -1,
-        event_id: int = 0,
-        step: int = 0,
-        survival: float = 0.0,
+        bucket_id: int,
+        event_id: int,
+        step: int,
+        survival: float,
+        generation: int,
     ) -> SlotId:
-        sid = self._allocate_id()
+        sid = int(sid)
+        if sid in self._id_to_physical:
+            raise ValueError(f"slot_id {sid} already exists")
+        bucket_id = int(bucket_id)
+        event_id = int(event_id)
+        step = int(step)
+        survival = float(survival)
+        generation = int(generation)
         phys = len(self._slots)
 
         self._slots.append(tensor.detach())
@@ -100,16 +109,59 @@ class SlotTable:
 
         self._id_to_physical[sid] = phys
         self._physical_to_id[phys] = sid
+        self._next_id = max(int(self._next_id), sid + 1)
 
         rec = SlotRecord(
             slot_id=sid,
             state=SLOT_WARMING,
             created_step=step,
+            write_generation=generation,
             bucket_id=bucket_id,
             event_id=event_id,
         )
         self._records[sid] = rec
         return sid
+
+    def append(
+        self,
+        tensor: torch.Tensor,
+        *,
+        bucket_id: int = -1,
+        event_id: int = 0,
+        step: int = 0,
+        survival: float = 0.0,
+    ) -> SlotId:
+        return self._install_slot(
+            self._allocate_id(),
+            tensor,
+            bucket_id=bucket_id,
+            event_id=event_id,
+            step=step,
+            survival=survival,
+            generation=0,
+        )
+
+    def append_with_id(
+        self,
+        slot_id: SlotId,
+        tensor: torch.Tensor,
+        *,
+        bucket_id: int = -1,
+        event_id: int = 0,
+        step: int = 0,
+        survival: float = 0.0,
+        generation: int = 0,
+    ) -> SlotId:
+        """Append a replicated slot with an externally assigned identity."""
+        return self._install_slot(
+            slot_id,
+            tensor,
+            bucket_id=bucket_id,
+            event_id=event_id,
+            step=step,
+            survival=survival,
+            generation=generation,
+        )
 
     def retire(self, slot_id: SlotId, *, reason: str = "evicted") -> bool:
         if slot_id not in self._id_to_physical:

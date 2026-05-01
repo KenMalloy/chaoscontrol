@@ -1011,7 +1011,7 @@ class CareStudentLM(nn.Module):
         score: torch.Tensor | None = None,
         max_tokens: int | None = None,
         event_ids: torch.Tensor | None = None,
-    ) -> bool:
+    ) -> list[dict[str, object]]:
         """Append sequence hidden states into the append-only outer memory.
 
         ``forward(memory_write_mode='append_only')`` already owns this write
@@ -1021,17 +1021,18 @@ class CareStudentLM(nn.Module):
         so this helper factors the write side out without changing the default
         side-effect-free ``encode()`` contract.
 
-        Returns ``True`` when a write happened. A ``False`` return means the
-        model is not configured with a multislot append-only outer memory, so
-        callers can fail loudly instead of training against a zero-utility
-        teacher by accident.
+        Returns the generation-stamped slot records actually appended, which may
+        be empty when a maintenance-owned cache is already at capacity. A model
+        without append-only multislot memory is a caller contract violation.
         """
         if (
             self.buffer_mode != "append_only"
             or self.outer_model is None
             or not isinstance(self.outer_model, MultiSlotOuterModel)
         ):
-            return False
+            raise ValueError(
+                "append_memory_from_hidden requires append-only MultiSlotOuterModel"
+            )
         batch, seq, dim = hidden.shape
         h_flat = hidden.detach().reshape(-1, dim)
         event_source = None
@@ -1098,14 +1099,30 @@ class CareStudentLM(nn.Module):
             if selected is not None:
                 bids_flat = bids_flat.index_select(0, selected)
         if event_flat is None:
-            self.outer_model.append_kv_batch(encoded_flat, bids_flat)
+            appended_ids = self.outer_model.append_kv_batch(encoded_flat, bids_flat)
         else:
-            self.outer_model._append_kv_batch_committed(
+            appended_ids = self.outer_model._append_kv_batch_committed(
                 encoded_flat,
                 bids_flat,
                 event_ids=event_flat,
-        )
-        return True
+            )
+        records: list[dict[str, object]] = []
+        for i, slot_id in enumerate(appended_ids):
+            rec = self.outer_model.table.record(int(slot_id))
+            records.append(
+                {
+                    "slot_id": int(slot_id),
+                    "tensor": encoded_flat[i].detach().reshape(1, -1),
+                    "bucket_id": int(bids_flat[i].item()),
+                    "event_id": (
+                        int(event_flat[i].item())
+                        if event_flat is not None
+                        else int(rec.event_id if rec is not None else 0)
+                    ),
+                    "generation": int(rec.write_generation if rec is not None else 0),
+                }
+            )
+        return records
 
     def encode_paired_for_score(
         self,
@@ -1791,9 +1808,12 @@ class CareStudentLM(nn.Module):
             and self.outer_model is not None
             and isinstance(self.outer_model, MultiSlotOuterModel)
         ):
-            wrote = self.append_memory_from_hidden(hidden, bucket_ids=bucket_ids)
+            write_records = self.append_memory_from_hidden(
+                hidden,
+                bucket_ids=bucket_ids,
+            )
             if (
-                wrote
+                write_records
                 and self.bucket_prototypes_module is not None
                 and bucket_ids is not None
             ):

@@ -872,7 +872,7 @@ def rank3_score_batch_causal(
     gradient_conflict_monitor: CrctGradientConflictMonitor | None = None,
     step: int | None = None,
     record_stage_seconds: dict[str, float] | None = None,
-) -> dict[str, torch.Tensor]:
+) -> dict[str, Any]:
     """Score a batch by comparing memory-on vs memory-off NLL.
 
     The cache transaction wraps the whole compare so both encode passes
@@ -900,6 +900,8 @@ def rank3_score_batch_causal(
     x = input_ids[:, :-1]
     y = input_ids[:, 1:]
     mask = valid_mask[:, 1:].bool()
+    write_records: list[dict[str, object]] | None = None
+    write_score: torch.Tensor = torch.empty(0, device=input_ids.device)
 
     use_cuda_timing = (
         record_stage_seconds is not None
@@ -1055,6 +1057,7 @@ def rank3_score_batch_causal(
         if callable(reserve_event_ids):
             n_write = int(h_off.shape[0] * h_off.shape[1])
             if write_limit is not None:
+                # Reserve only ids the top-k write clamp can consume.
                 n_write = min(n_write, max(0, int(write_limit)))
             event_ids = reserve_event_ids(
                 n_write,
@@ -1065,12 +1068,10 @@ def rank3_score_batch_causal(
             "max_tokens": write_limit,
             "event_ids": event_ids,
         }
-        wrote = bool(append_fn(h_off.detach(), **append_kwargs))
-        if not wrote:
-            raise ValueError(
-                "rank3_score_batch_causal(update_model_memory_after=True) "
-                "requires append-only multislot memory; the teacher would "
-                "otherwise keep comparing against an empty memory path."
+        write_records = append_fn(h_off.detach(), **append_kwargs)
+        if not isinstance(write_records, list):
+            raise TypeError(
+                "append_memory_from_hidden must return generation-stamped records"
             )
     _mark("after_append")
 
@@ -1082,9 +1083,11 @@ def rank3_score_batch_causal(
         "loss_weight": loss_weight,
         **(
             {
-                "write_score": write_score.detach()
-                if "write_score" in locals()
-                else utility.detach()
+                "write_score": (
+                    write_score.detach()
+                    if write_score.numel() > 0
+                    else utility.detach()
+                )
             }
             if gradient_conflict_monitor is not None
             else {}
@@ -1093,6 +1096,8 @@ def rank3_score_batch_causal(
     if memory_residual is not None:
         out["memory_residual"] = memory_residual
         out["memory_gate"] = controller_target.detach()
+    if write_records is not None:
+        out["memory_write_records"] = write_records
     out.update(plasticity)
     _flush_stage_seconds(
         record_stage_seconds,

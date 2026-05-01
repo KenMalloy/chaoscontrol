@@ -126,10 +126,19 @@ class EpisodicPacketTinyModel(PacketTinyModel):
         *,
         score: torch.Tensor | None = None,
         max_tokens: int | None = None,
-    ) -> bool:
+        event_ids: torch.Tensor | None = None,
+    ) -> list[dict[str, object]]:
         self.events.append(("append", int(hidden.shape[1])))
         self.outer_model._slots.append(hidden.detach().mean(dim=1))
-        return True
+        return [
+            {
+                "slot_id": len(self.outer_model._slots) - 1,
+                "tensor": self.outer_model._slots[-1],
+                "bucket_id": 0,
+                "event_id": int(event_ids[0].item()) if event_ids is not None else 0,
+                "generation": 0,
+            }
+        ]
 
 
 def make_val_cache(

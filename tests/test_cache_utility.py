@@ -128,7 +128,7 @@ class _MockModel(nn.Module):
         score: torch.Tensor | None = None,
         max_tokens: int | None = None,
         event_ids: torch.Tensor | None = None,
-    ) -> bool:
+    ) -> list[dict[str, object]]:
         self.append_calls.append(
             {
                 "hidden": hidden.detach().clone(),
@@ -137,7 +137,20 @@ class _MockModel(nn.Module):
                 "event_ids": None if event_ids is None else event_ids.detach().clone(),
             }
         )
-        return True
+        n = int(hidden.numel() // hidden.shape[-1])
+        if max_tokens is not None:
+            n = min(n, int(max_tokens))
+        flat = hidden.detach().reshape(-1, hidden.shape[-1])[:n]
+        return [
+            {
+                "slot_id": i,
+                "tensor": flat[i].reshape(1, -1),
+                "bucket_id": 0,
+                "event_id": int(event_ids[i].item()) if event_ids is not None else 0,
+                "generation": 0,
+            }
+            for i in range(n)
+        ]
 
 
 class _PacketMockModel(_MockModel):

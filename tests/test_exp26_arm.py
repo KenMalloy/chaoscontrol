@@ -212,8 +212,7 @@ def test_profile_summary_extracts_transport_and_maintenance_health(tmp_path):
             "memory_rank_replay_deferred_for_backpressure": 17,
             "memory_rank_pump_loop_seconds_sum": 1.25,
             "memory_rank_pump_loop_seconds_max": 0.5,
-            "memory_rank_pump_idle_sleep_seconds_sum": 0.25,
-            "memory_rank_pump_idle_sleep_seconds_max": 0.01,
+            "memory_rank_pump_idle_yields": 18,
             "plasticity_packets_received": 8
           },
           "coordinator": {"teacher_shm_request_ring_full_drops": 9},
@@ -254,8 +253,7 @@ def test_profile_summary_extracts_transport_and_maintenance_health(tmp_path):
     assert row["memory_rank_replay_deferred_for_backpressure"] == 17
     assert row["memory_rank_pump_loop_seconds_sum"] == pytest.approx(1.25)
     assert row["memory_rank_pump_loop_seconds_max"] == pytest.approx(0.5)
-    assert row["memory_rank_pump_idle_sleep_seconds_sum"] == pytest.approx(0.25)
-    assert row["memory_rank_pump_idle_sleep_seconds_max"] == pytest.approx(0.01)
+    assert row["memory_rank_pump_idle_yields"] == 18
     assert row["plasticity_packets_received"] == 8
     assert row["score_stage_timing_enabled"] is True
     assert row["score_stage_samples"] == 2

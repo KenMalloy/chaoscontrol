@@ -26,7 +26,7 @@ This module exposes two entry points:
   long-running loop.
 
   ``controller_main`` — long-running loop. Wraps ``run_controller_cycle``
-  with a ``stop_event`` check + idle sleep. Designed to run as a
+  with a ``stop_event`` check + scheduler yield. Designed to run as a
   ``threading.Thread(daemon=True, target=controller_main, ...)``
   spawned from the runner's init region.
 
@@ -42,6 +42,7 @@ hook), heartbeat counter for the runner's outer loop, crash recovery.
 from __future__ import annotations
 
 import hashlib
+import os
 import threading
 import time
 import math
@@ -842,15 +843,14 @@ def controller_main(
     simplex_selection_mode: str = "argmax",
     simplex_generator: torch.Generator | None = None,
     action_space: Any | None = None,
-    cycle_idle_sleep_s: float = 0.005,
     heartbeat: list[int] | None = None,
 ) -> None:
     """Long-running controller loop. Designed for ``threading.Thread``.
 
     Polls ``controller_query_queue`` in a tight loop until
     ``stop_event`` is set. Each iteration calls ``run_controller_cycle``;
-    if the cycle drained zero candidates, sleeps ``cycle_idle_sleep_s``
-    seconds before checking again so the loop doesn't peg a CPU core.
+    if the cycle drained zero candidates, yields the OS thread without
+    imposing a fixed software cadence.
 
     ``queue_lock`` defaults to ``None``: the runner's production spawn
     relies on GIL atomicity of ``list.append()`` (producer side) and
@@ -905,9 +905,6 @@ def controller_main(
         if heartbeat is not None:
             heartbeat[0] += 1
         if n == 0:
-            # Idle cycle — sleep briefly to keep CPU usage off the
-            # train-step path. ``stop_event.wait(...)`` returns True if
-            # the event fires during the sleep, which gives us a clean
-            # exit without a separate poll.
-            if stop_event.wait(timeout=cycle_idle_sleep_s):
-                break
+            sched_yield = getattr(os, "sched_yield", None)
+            if sched_yield is not None:
+                sched_yield()

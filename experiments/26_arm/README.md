@@ -8,8 +8,8 @@ locked fast/slow trunk
 + CRCT evidence/oracle substrate
 + streaming Adaptive Residual Memory maintenance
 + learned Full-A commit authority
-+ GPU3 physics confirmation
-+ latest-complete GPU0->GPU3 teacher-weight mirror
++ dedicated packet-serving and maintenance memory ranks
++ latest-complete train->memory teacher-weight mirror
 ```
 
 CRCT-only, shadow-mode, calibration, and headline-arm switches were removed.
@@ -25,25 +25,50 @@ an episodic residual input lane, and that lane must never make the trunk wait.
 Target steady-state shape:
 
 ```text
-GPU0-2 trunk ranks
+GPU0-5 trunk ranks on the final 8x run
   train the SSM at full speed
   consume fixed-shape latest-complete episodic residual buffers
   never synchronously read the cache
-  never wait for GPU3 or the CPU controller
+  never wait for a memory GPU or the CPU controller
 
-GPU3 memory/oracle rank
-  owns the populated episodic sidecar
-  runs memory_off / force_on / hide-slot / refresh-candidate physics
+GPU6 packet-serving rank
+  owns the low-latency populated sidecar used to produce residual packets
+  runs memory_off / force_on exact scoring for packet production
+  publishes residual, gate, and plasticity packets without trunk rendezvous
+
+GPU7 maintenance rank
+  owns learned slot coverage, refresh, distill, and replay-style maintenance
+  runs hide-slot / refresh-candidate physics against its own request stream
+  emits ordered slot commits to GPU6 after CPU-side legality/commit authority
   may warm or capture its own fixed-shape oracle and maintenance CUDA graphs
-  cannot warm or capture GPU0-2's graphs for them
+  cannot warm or capture trunk-rank graphs for them
 
 CPU controller plane
   schedules work, maintains evidence, proposes bounded actions, and logs traces
+  stamps slot-maintenance commits with ordering and legality evidence
   does not own exact oracle truth
   does not sit in the train-rank hot path
 ```
 
-GPU0-2 graph compatibility comes from stable tensor addresses and shapes:
+Four-GPU smoke runs use the compact 3+1 version of the same contract: GPU0-2
+train and GPU3 shares packet serving plus maintenance. At eight GPUs, the
+topology derives 6+2 automatically when maintenance is enabled; it is not an
+ablation arm.
+
+When GPU6 and GPU7 split, the two memory ranks hold replicated slot identity.
+GPU6 is the serving authority: it appends new packet-serving slots and publishes
+generation-stamped append commits to GPU7. GPU7 never independently appends in
+the split topology; it learns against the replicated serving generations. After
+real physics confirms a maintenance action, GPU7 sends a compact slot commit
+back to GPU6 over the memory-rank peer lane. Commits contain the slot id, event
+id, base generation, new generation, action, and an optional one-slot tensor
+payload. GPU6 applies maintenance commits only if the generation matches; stale
+or divergent commits are dropped and counted. The train ranks do not participate
+in this lane. Capacity is owned by learned maintenance in the ARM config:
+packet serving appends only into free slots and does not run local lossy
+compression that GPU7 could not replay exactly.
+
+Train-rank graph compatibility comes from stable tensor addresses and shapes:
 the recurrent stream always has a residual input buffer and gate buffer. The
 contents may be zero, stale-but-safe, or latest-complete, but the trunk graph
 does not change shape and does not block waiting for a fresher packet.
@@ -56,10 +81,10 @@ eligibility is reported instead of silently disabled. Multi-rank CRCT still
 keeps NCCL/DDP collectives outside full-step graph capture; the important
 contract is that the packet encoder itself is compile-clean.
 
-`memory_mode="off"` remains valid only as an oracle/counterfactual mode: GPU3
-uses it to measure marginal memory value. It is not the final product path.
-Likewise, `force_on` and hide-slot modes are physics probes owned by GPU3, not
-ablation knobs for normal trunk training.
+`memory_mode="off"` remains valid only as a counterfactual scoring mode: the
+memory ranks use it to measure marginal memory value. It is not the final
+product path. Likewise, `force_on` and hide-slot modes are physics probes
+owned by the memory ranks, not ablation knobs for normal trunk training.
 
 The CPU/maintenance controller is the off-path evidence and scheduling plane;
 learned Full-A authority lives there for maintenance/commit decisions. There is
@@ -73,7 +98,7 @@ A-modulation later, it should be named as a separate mechanism rather than
 quietly overloading the residual lane.
 
 The optimizer receives a sibling packet on the same latest-complete protocol:
-GPU3 computes per-channel `plasticity_budget` from the correlation between
+the packet-serving rank computes per-channel `plasticity_budget` from the correlation between
 `abs(h_mem - h_off)` and positive memory utility, the mailbox carries the EMA
 alongside the residual packet, and Muon uses it as a bounded LR multiplier on
 SSM-channel parameters. This is the training-time "gist" signal: where episodic
@@ -83,16 +108,16 @@ Muon also owns the SSM role policy for the ARM cell: `delta_proj` stays on the
 AdamW fallback because it encodes per-token timescale specialization, while
 `log_a` gets per-channel beta from a slow EMA of its own value. The EMA is the
 damping layer that prevents the old SemanticOptimizer feedback loop.
-Memory-side modules are excluded from the train optimizer in CRCT runs; GPU3
-uses them as the oracle/memory substrate, but train ranks do not spend optimizer
-state on params their packet-mode trunk never reads.
+Memory-side modules are excluded from the train optimizer in CRCT runs; memory
+ranks use them as the scoring/memory substrate, but train ranks do not spend
+optimizer state on params their packet-mode trunk never reads.
 
 ## Validation Cells
 
 | Cell | Purpose |
 |---|---|
 | `validation_fastslow_control` | locked fast/slow trunk, no CRCT, no maintenance |
-| `validation_adaptive_residual_memory` | full ARM path: CRCT evidence, GPU3 oracle, learned maintenance, traces |
+| `validation_adaptive_residual_memory` | full ARM path: CRCT evidence, memory-rank physics, learned maintenance, traces |
 
 The run is not intended to produce a BPB claim. It answers: does the system
 light up without breaking the trunk-throughput contract?
@@ -111,7 +136,7 @@ shape gives `384 -> 13.71 MB`, `416 -> 15.19 MB`, `448 -> 16.73 MB`, and
 - The ARM cell writes replay-maintenance traces under `validation/traces/`.
 - `replay_eviction_arm_runtime_enabled` is true and the runtime namespace is
   per-cell.
-- GPU3 oracle/maintenance telemetry is non-empty.
+- Memory-rank scoring and maintenance telemetry is non-empty.
 - Plasticity telemetry is present:
   `transport_summary.health.plasticity_packets_received`,
   `plasticity_budget_mean_received`, and optimizer
@@ -120,18 +145,25 @@ shape gives `384 -> 13.71 MB`, `416 -> 15.19 MB`, `448 -> 16.73 MB`, and
   `optimizer.excluded_params`, including `log_a_beta_*` summaries and counts of
   memory-side params kept out of the train optimizer.
 - The ARM cell offers teacher work every step; stream backpressure and the
-  latest-complete mirror decide what GPU3 actually adopts.
+  latest-complete mirror decide what the memory ranks actually adopt.
 - ARM maintenance uses `replay_eviction_max_seconds=0.0`, meaning no
-  software wall-clock governor. Ring occupancy, frame arrival, and GPU3/CPU
+  software wall-clock governor. Ring occupancy, frame arrival, and memory-rank/CPU
   throughput are the backpressure sources; duty-cycle telemetry tells us if
   the memory plane is actually hot.
 - `transport_summary.health.weight_snapshot_published` and
   `weight_snapshot_applied` are non-zero in the ARM cell; mirror copy/save/apply
   timing and version lag are visible.
 - Learned commit feedback updates are non-zero once oracle confirmations land.
+- On 8x runs, slot-commit telemetry is present:
+  `transport_summary.slot_commit_packet`,
+  `transport_summary.slot_commit_maintenance`, and health counters
+  `append_commits_sent`, `append_commits_applied`,
+  `maintenance_commits_sent`, `maintenance_commits_applied`,
+  `slot_commit_drops`, `slot_commit_stale_generation_drops`, and
+  `slot_commit_replica_capacity_full_drops`.
 - Fail-open/stale/drop counters are visible and bounded.
 - Train-rank throughput is not catastrophically coupled to memory work.
-- Treat any train-rank synchronous cache read, rank-3 wait, or memory-owned
+- Treat any train-rank synchronous cache read, memory-rank wait, or memory-owned
   collective in the trunk step as a thesis violation.
 
 ## Usage

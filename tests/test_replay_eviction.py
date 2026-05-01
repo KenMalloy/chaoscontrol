@@ -25,6 +25,11 @@ from chaoscontrol.slot_table import (
     SLOT_WARMING, SLOT_ACTIVE, SLOT_DECAYING,
     SLOT_QUARANTINED, SLOT_RETIRED,
 )
+from chaoscontrol.slot_commit import (
+    SlotCommit,
+    apply_append_slot_commit_to_model,
+    apply_slot_commit_to_model,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -35,6 +40,7 @@ from chaoscontrol.slot_table import (
 class _StubOuterModel:
     def __init__(self, outer_dim: int = 8, n_slots: int = 10) -> None:
         self.outer_dim = outer_dim
+        self.max_slots = max(16, n_slots)
         self.encoder = nn.Linear(16, outer_dim, bias=False)
         self.encoder.weight.requires_grad_(False)
         self.decoder = nn.Linear(outer_dim, 16, bias=False)
@@ -55,6 +61,7 @@ class _StubOuterModel:
 class _StubOuterWithTable:
     def __init__(self, outer_dim: int = 8, n_slots: int = 10) -> None:
         self.outer_dim = outer_dim
+        self.max_slots = max(16, n_slots)
         self.encoder = nn.Linear(16, outer_dim, bias=False)
         self.encoder.weight.requires_grad_(False)
         self.decoder = nn.Linear(outer_dim, 16, bias=False)
@@ -220,6 +227,198 @@ class TestTickResult:
     def test_evicted_indices_union(self):
         r = TickResult(evicted=[1, 3], distilled=[5, 7])
         assert sorted(r.evicted_indices) == [1, 3, 5, 7]
+
+
+# ---------------------------------------------------------------------------
+# Tests for split-rank slot commits
+# ---------------------------------------------------------------------------
+
+
+class TestSlotCommit:
+    def test_refresh_commit_updates_slot_when_generation_matches(self):
+        model = _StubModel(use_table=True, n_slots=2)
+        table = model.outer_model.table
+        assert table is not None
+        before = table.get_tensor(0).clone()
+        replacement = torch.full_like(before, 0.125)
+
+        accepted, reason = apply_slot_commit_to_model(
+            model,
+            SlotCommit(
+                slot_id=0,
+                action=SLOT_REFRESH,
+                step=7,
+                base_generation=0,
+                new_generation=1,
+                tensor=replacement,
+            ),
+        )
+
+        assert accepted is True
+        assert reason == "refreshed"
+        torch.testing.assert_close(table.get_tensor(0), replacement)
+        assert table.record(0).write_generation == 1
+
+    def test_commit_stale_generation_is_dropped(self):
+        model = _StubModel(use_table=True, n_slots=2)
+        table = model.outer_model.table
+        assert table is not None
+        before = table.get_tensor(0).clone()
+
+        accepted, reason = apply_slot_commit_to_model(
+            model,
+            SlotCommit(
+                slot_id=0,
+                action=SLOT_DECAY,
+                step=7,
+                base_generation=99,
+                new_generation=100,
+                survival_factor=0.5,
+            ),
+        )
+
+        assert accepted is False
+        assert reason == "stale_generation"
+        torch.testing.assert_close(table.get_tensor(0), before)
+        assert table.record(0).write_generation == 0
+
+    def test_commit_can_resolve_by_event_id_when_slot_ids_differ(self):
+        model = _StubModel(use_table=True, n_slots=2)
+        table = model.outer_model.table
+        assert table is not None
+        table.record(1).event_id = 1234
+        table.record(1).bucket_id = 7
+        replacement = torch.full_like(table.get_tensor(1), -0.5)
+
+        accepted, reason = apply_slot_commit_to_model(
+            model,
+            SlotCommit(
+                slot_id=99,
+                action=SLOT_REFRESH,
+                step=7,
+                base_generation=0,
+                new_generation=1,
+                bucket_id=7,
+                event_id=1234,
+                tensor=replacement,
+            ),
+        )
+
+        assert accepted is True
+        assert reason == "refreshed"
+        torch.testing.assert_close(table.get_tensor(1), replacement)
+
+    def test_distill_commit_preserves_latent_trace_then_retires(self):
+        model = _StubModel(use_table=True, n_slots=2)
+        table = model.outer_model.table
+        assert table is not None
+        slot = table.get_tensor(0).clone()
+
+        accepted, reason = apply_slot_commit_to_model(
+            model,
+            SlotCommit(
+                slot_id=0,
+                action=SLOT_DISTILL,
+                step=7,
+                base_generation=0,
+                new_generation=1,
+                bucket_id=3,
+                tensor=slot,
+            ),
+        )
+
+        assert accepted is True
+        assert reason == "distilled"
+        assert table.record(0).state == SLOT_RETIRED
+        traces = model.outer_model._latent_traces
+        assert len(traces) == 1
+        assert traces[0]["bucket_id"] == 3
+        torch.testing.assert_close(traces[0]["centroid_contrib"], slot)
+
+    def test_append_commit_replicates_packet_slot_to_maintenance_table(self):
+        packet = _StubModel(use_table=True, n_slots=1)
+        maintenance = _StubModel(use_table=True, n_slots=0)
+        src_table = packet.outer_model.table
+        dst_table = maintenance.outer_model.table
+        assert src_table is not None
+        assert dst_table is not None
+        tensor = src_table.get_tensor(0).clone()
+
+        accepted, reason = apply_append_slot_commit_to_model(
+            maintenance,
+            SlotCommit(
+                slot_id=0,
+                action="APPEND",
+                step=11,
+                base_generation=None,
+                new_generation=0,
+                bucket_id=5,
+                event_id=123,
+                tensor=tensor,
+            ),
+        )
+
+        assert accepted is True
+        assert reason == "appended"
+        assert dst_table.record(0).bucket_id == 5
+        assert dst_table.record(0).event_id == 123
+        torch.testing.assert_close(dst_table.get_tensor(0), tensor)
+
+    def test_append_commit_handler_rejects_non_append_actions(self):
+        model = _StubModel(use_table=True, n_slots=1)
+        with pytest.raises(ValueError, match="only accepts APPEND"):
+            apply_append_slot_commit_to_model(
+                model,
+                SlotCommit(
+                    slot_id=0,
+                    action=SLOT_DECAY,
+                    step=11,
+                    base_generation=0,
+                    new_generation=1,
+                    survival_factor=0.9,
+                ),
+            )
+
+    def test_maintenance_commit_handler_rejects_append_actions(self):
+        model = _StubModel(use_table=True, n_slots=1)
+        with pytest.raises(ValueError, match="APPEND commits must use"):
+            apply_slot_commit_to_model(
+                model,
+                SlotCommit(
+                    slot_id=0,
+                    action="APPEND",
+                    step=11,
+                    base_generation=None,
+                    new_generation=0,
+                    tensor=torch.zeros(1, model.outer_model.outer_dim),
+                ),
+            )
+
+    def test_replay_loop_returns_generation_stamped_commit(self):
+        loop = ReplayEvictionLoop()
+        outer = _StubOuterWithTable(n_slots=1)
+        table = outer.table
+        base_generation = table.record(0).write_generation
+
+        table.scale_survival(0, 0.9)
+        commit = loop._emit_slot_commit(
+            table=table,
+            slot_id=0,
+            action=SLOT_DECAY,
+            step=11,
+            base_generation=base_generation,
+            survival_factor=0.9,
+            reason="unit",
+        )
+
+        assert commit is not None
+        assert commit.slot_id == 0
+        assert str(commit.action) == SLOT_DECAY
+        assert commit.base_generation == 0
+        assert commit.new_generation == 1
+        diag = loop.diagnostics()
+        assert diag["slot_commit_emission_active"] is True
+        assert diag["slot_commits_emitted_total"] == 1
 
 
 # ---------------------------------------------------------------------------

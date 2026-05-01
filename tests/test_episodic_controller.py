@@ -698,7 +698,6 @@ def test_controller_thread_starts_and_stops_cleanly():
             "stop_event": stop_event,
             "k": 2,
             "score_mode": "cosine_utility_weighted",
-            "cycle_idle_sleep_s": 0.001,
         },
         daemon=True,
         name="episodic_controller_test",
