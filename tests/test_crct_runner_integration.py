@@ -695,7 +695,7 @@ def _worker_slot_commit_transport(
         dist.destroy_process_group()
 
 
-def test_slot_commit_peer_transport_updates_packet_cache_over_p2p(tmp_path) -> None:
+def test_slot_commit_peer_transport_updates_packet_cache_over_cpu_control_group(tmp_path) -> None:
     port = _pick_free_port_or_skip()
     world_size = 2
     mp.spawn(
@@ -708,11 +708,21 @@ def test_slot_commit_peer_transport_updates_packet_cache_over_p2p(tmp_path) -> N
     rank0 = json.loads(Path(tmp_path, "rank0.json").read_text())
     rank1 = json.loads(Path(tmp_path, "rank1.json").read_text())
     assert rank0["diagnostics"]["maintenance_commits_applied"] == 1
+    assert rank0["diagnostics"]["mode"] == "slot_commit_gloo_cpu"
     assert rank0["generation"] == 1
     assert rank0["slot"] == [[0.25, 0.25, 0.25, 0.25]]
     assert rank1["diagnostics"]["append_commits_applied"] == 1
+    assert rank1["diagnostics"]["mode"] == "slot_commit_gloo_cpu"
     assert rank1["append_slot"] == [[-0.75, -0.75, -0.75, -0.75]]
     assert rank1["append_event_id"] == 700
+
+
+def test_crct_split_slot_commit_group_is_gloo_control_plane() -> None:
+    """Split memory slot commits must not leave dangling NCCL P2P receives."""
+    source = RUNNER_PATH.read_text()
+    assert "slot_commit_group = dist.new_group(" in source
+    assert 'backend="gloo"' in source
+    assert "device=torch.device(\"cpu\")" in source
 
 
 def test_exp24_model_builder_threads_crct_memory_without_trunk_controller() -> None:

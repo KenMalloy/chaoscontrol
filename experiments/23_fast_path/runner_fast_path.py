@@ -1768,7 +1768,11 @@ class _CrctSlotCommitPeerTransport:
             except Exception:
                 cuda_peer_access_possible = False
         self.metrics: dict[str, Any] = {
-            "mode": "slot_commit_p2p",
+            "mode": (
+                "slot_commit_gloo_cpu"
+                if self.device.type == "cpu"
+                else "slot_commit_p2p"
+            ),
             "participant": bool(self.participant),
             "packet_rank": int(self.packet_rank),
             "maintenance_rank": int(self.maintenance_rank),
@@ -10424,8 +10428,13 @@ def train_fast_for_budget(
             train_group = dist.new_group(train_ranks)
             teacher_group = dist.new_group([0, crct_packet_rank])
             if int(crct_packet_rank) != int(crct_maintenance_rank):
+                # Slot commits are ordered control-plane mutations, not bulk
+                # residual packets. Keep them on Gloo/CPU so a perpetually
+                # posted NCCL P2P receive cannot poison later all-rank CUDA
+                # barriers when a short run emits no commits.
                 slot_commit_group = dist.new_group(
-                    [int(crct_packet_rank), int(crct_maintenance_rank)]
+                    [int(crct_packet_rank), int(crct_maintenance_rank)],
+                    backend="gloo",
                 )
             grad_group = train_group
             grad_world_size = len(train_ranks)
@@ -10977,7 +10986,7 @@ def train_fast_for_budget(
             packet_rank=int(crct_packet_rank),
             maintenance_rank=int(crct_maintenance_rank),
             group=slot_commit_group,
-            device=device,
+            device=torch.device("cpu"),
         )
     if bool(replay_eviction_enabled) and crct_enabled:
         replay_eviction_loop = ReplayEvictionLoop(
