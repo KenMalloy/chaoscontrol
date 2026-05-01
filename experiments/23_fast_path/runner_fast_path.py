@@ -12,11 +12,13 @@ import argparse
 import copy
 import contextlib
 import datetime
+import faulthandler
 import hashlib
 import json
 import math
 import os
 import random
+import signal
 import struct
 import sys
 import threading
@@ -58,6 +60,37 @@ def configure_exp23_fast_backend_defaults(
 
 
 configure_exp23_fast_backend_defaults()
+
+_STACK_DUMP_SIGNAL_REGISTERED = False
+
+
+def _enable_runner_stack_dump_signal() -> None:
+    """Allow ``kill -USR1 <pid>`` to dump all Python thread stacks.
+
+    External profilers are often blocked on managed pods. ``faulthandler`` is
+    in-process, has no hot-loop cost, and gives us enough context to avoid
+    rerunning blind when a distributed control path stalls.
+    """
+    global _STACK_DUMP_SIGNAL_REGISTERED
+    if _STACK_DUMP_SIGNAL_REGISTERED:
+        return
+    sigusr1 = getattr(signal, "SIGUSR1", None)
+    if sigusr1 is None:
+        _STACK_DUMP_SIGNAL_REGISTERED = True
+        return
+    try:
+        faulthandler.register(sigusr1, file=sys.stderr, all_threads=True)
+    except Exception:
+        pass
+    _STACK_DUMP_SIGNAL_REGISTERED = True
+
+
+def _dump_runner_stacks(label: str) -> None:
+    print(f"[stack-dump] {label}", file=sys.stderr, flush=True)
+    try:
+        faulthandler.dump_traceback(file=sys.stderr, all_threads=True)
+    except Exception:
+        traceback.print_stack(file=sys.stderr)
 
 from chaoscontrol.core import verify_diag_recurrence  # noqa: E402
 from chaoscontrol.cache_utility import (  # noqa: E402
@@ -1670,6 +1703,38 @@ def _should_stop_memory_rank_loop(
         return True
     effective_budget = max(0.0, float(budget_seconds) - float(stop_margin_seconds))
     return float(elapsed_s) >= effective_budget
+
+
+def _control_barrier(
+    *,
+    group: "dist.ProcessGroup | None",
+    label: str,
+) -> None:
+    """Bounded control-plane barrier for post-run bookkeeping.
+
+    Split-memory runs use Gloo side groups for Python objects and lifecycle
+    sync. A raw NCCL barrier here can spin forever and hides the missing rank;
+    monitored Gloo barriers turn that into a labelled exception.
+    """
+    if not (dist.is_available() and dist.is_initialized()):
+        return
+    timeout_s = float(os.environ.get("CHAOSCONTROL_CONTROL_BARRIER_TIMEOUT_S", "30"))
+    timeout = datetime.timedelta(seconds=max(1.0, timeout_s))
+    try:
+        monitored = getattr(dist, "monitored_barrier", None)
+        if callable(monitored) and group is not None:
+            try:
+                monitored(group=group, timeout=timeout, wait_all_ranks=True)
+            except TypeError:
+                monitored(group=group, timeout=timeout)
+        else:
+            dist.barrier(group=group)
+    except Exception as exc:
+        _dump_runner_stacks(f"control barrier {label!r} failure")
+        raise RuntimeError(
+            f"control barrier {label!r} failed or timed out after "
+            f"{timeout.total_seconds():.1f}s"
+        ) from exc
 
 
 def _crct_rank_topology(
@@ -9978,7 +10043,10 @@ def _train_fast_for_budget_cuda_graph(
             prefetcher.close()
 
     if ddp_active:
-        dist.barrier(group=object_group or all_group)
+        _control_barrier(
+            group=object_group or all_group,
+            label="cuda_graph_train_teardown",
+        )
 
     elapsed_s = time.perf_counter() - start_time
     loss_cpu = torch.stack(losses).cpu() if losses else torch.empty(0)
@@ -12520,7 +12588,10 @@ def train_fast_for_budget(
                 pass
 
     if ddp_active:
-        dist.barrier(group=object_group or all_group)
+        _control_barrier(
+            group=object_group or all_group,
+            label="train_teardown",
+        )
 
     if (
         fast_slow.enabled
@@ -13713,6 +13784,7 @@ def run_condition(
     world_size_override: int | None,
     val_cache_dir: str | None = None,
 ) -> dict[str, Any]:
+    _enable_runner_stack_dump_signal()
     rank, world_size, local_rank = _init_distributed(world_size_override)
     is_rank0 = rank == 0
     ddp_active = world_size > 1
@@ -14327,7 +14399,7 @@ def run_condition(
         )
 
     if ddp_active:
-        dist.barrier(group=control_group)
+        _control_barrier(group=control_group, label="post_train_eval_state")
 
     eval_result: dict[str, Any] = {}
     calc_types_requested = list(config.get("calc_types") or [])
@@ -14356,7 +14428,7 @@ def run_condition(
         )
 
     if ddp_active:
-        dist.barrier(group=control_group)
+        _control_barrier(group=control_group, label="post_eval")
 
     artifact = {
         "artifact_impact": str(

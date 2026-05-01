@@ -79,9 +79,13 @@ def test_crct_object_collectives_use_gloo_side_group() -> None:
     """
     source = RUNNER_PATH.read_text()
     assert 'object_group = dist.new_group(list(range(world_size_)), backend="gloo")' in source
-    assert "group=object_group or all_group" in source
+    assert "label=\"train_teardown\"" in source
     assert 'control_group = (\n        dist.new_group(list(range(world_size)), backend="gloo")' in source
-    assert source.count("dist.barrier(group=control_group)") >= 2
+    assert 'label="post_train_eval_state"' in source
+    assert 'label="post_eval"' in source
+    assert "monitored_barrier" in source
+    assert "faulthandler.dump_traceback" in source
+    assert "SIGUSR1" in source
 
 
 def test_score_stage_timing_config_reaches_main_train_call() -> None:
