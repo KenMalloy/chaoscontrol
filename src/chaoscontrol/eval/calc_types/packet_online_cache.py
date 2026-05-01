@@ -18,8 +18,10 @@ from __future__ import annotations
 
 import inspect
 import math
+from collections.abc import Iterable
 from typing import Any
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 
@@ -28,6 +30,7 @@ from chaoscontrol.eval.ttt_eval import (
     CalcTypeResult,
     register_calc_type,
 )
+from chaoscontrol.eval_stream.val_cache import CachedDoc, ValCache
 
 
 def _packet_encode_support(model: torch.nn.Module) -> tuple[bool, bool]:
@@ -200,6 +203,131 @@ def _token_nll_equal_length(
     return -log_probs.gather(-1, targets.unsqueeze(-1)).squeeze(-1)
 
 
+def _iter_score_docs(
+    val_cache: ValCache,
+    *,
+    max_docs: int,
+) -> Iterable[CachedDoc]:
+    docs_scored = 0
+    for doc in val_cache.iter_docs():
+        if max_docs > 0 and docs_scored >= max_docs:
+            break
+        if doc.token_len < 2:
+            continue
+        yield doc
+        docs_scored += 1
+
+
+def _iter_doc_microbatches(
+    val_cache: ValCache,
+    *,
+    max_docs: int,
+    batch_docs: int,
+    batch_token_budget: int,
+) -> Iterable[list[CachedDoc]]:
+    """Yield source-ordered doc groups for score-first batched eval.
+
+    The budget is measured in padded input tokens (B * max_len), matching the
+    forward/LM-head work the batch will actually materialize.
+    """
+    batch: list[CachedDoc] = []
+    max_input_len = 0
+    for doc in _iter_score_docs(val_cache, max_docs=max_docs):
+        input_len = int(doc.token_len) - 1
+        next_count = len(batch) + 1
+        next_max = max(max_input_len, input_len)
+        over_docs = batch_docs > 0 and next_count > batch_docs
+        over_tokens = (
+            batch_token_budget > 0
+            and bool(batch)
+            and next_count * next_max > batch_token_budget
+        )
+        if over_docs or over_tokens:
+            yield batch
+            batch = []
+            max_input_len = 0
+        batch.append(doc)
+        max_input_len = max(max_input_len, input_len)
+    if batch:
+        yield batch
+
+
+def _score_doc_microbatch(
+    model: torch.nn.Module,
+    val_cache: ValCache,
+    docs: list[CachedDoc],
+    *,
+    device: torch.device,
+    packet_support: tuple[bool, bool],
+    gate_value: float,
+    write_tokens_per_chunk: int,
+) -> tuple[float, int, int, int, int, int]:
+    """Score a source-ordered microbatch, then append its evidence.
+
+    This is prequential at the microbatch boundary: no hidden state from the
+    microbatch is written until every token in the microbatch has already had
+    its loss accumulated.  The model may ignore some available strict-prefix
+    information within the microbatch, but it never uses future information.
+    """
+    if not docs:
+        return 0.0, 0, 0, 0, 0, 0
+    token_arrays: list[np.ndarray] = [val_cache.tokens_for_doc(doc) for doc in docs]
+    lengths = [int(arr.shape[0]) - 1 for arr in token_arrays]
+    max_len = max(lengths)
+    batch = len(docs)
+    input_ids = torch.zeros((batch, max_len), dtype=torch.long, device=device)
+    targets = torch.zeros((batch, max_len), dtype=torch.long, device=device)
+    mask = torch.zeros((batch, max_len), dtype=torch.bool, device=device)
+    for row, arr in enumerate(token_arrays):
+        length = lengths[row]
+        ids = torch.tensor(arr, dtype=torch.long, device=device)
+        input_ids[row, :length] = ids[:-1]
+        targets[row, :length] = ids[1:]
+        mask[row, :length] = True
+
+    slot_count_at_score = _outer_slot_count(model)
+    residual, gate, read_hit = _episodic_packet_from_prefix(
+        model,
+        states=None,
+        batch_size=batch,
+        gate_value=gate_value,
+    )
+    hidden, _final_states = _packet_encode(
+        model,
+        input_ids,
+        initial_states=None,
+        episodic_residual=residual,
+        episodic_gate=gate,
+        packet_support=packet_support,
+    )
+    logits = _lm_logits(model, hidden)
+    token_nll = F.cross_entropy(
+        logits.reshape(-1, logits.size(-1)),
+        targets.reshape(-1),
+        reduction="none",
+    ).reshape(batch, max_len)
+    if _outer_slot_count(model) != slot_count_at_score:
+        raise RuntimeError(
+            "score-before-write violated: cache grew from "
+            f"{slot_count_at_score} to {_outer_slot_count(model)} "
+            "between batched cue read and score accumulation"
+        )
+
+    valid_nll = token_nll.masked_select(mask)
+    ce_nats = float(valid_nll.detach().to(device="cpu", dtype=torch.float64).sum().item())
+    tokens_scored = int(mask.sum().item())
+    raw_bytes = int(sum(int(doc.raw_bytes) for doc in docs))
+    scores_for_write = token_nll.masked_fill(~mask, float("-inf"))
+    write_limit = min(max(0, int(write_tokens_per_chunk)) * batch, tokens_scored)
+    writes = _append_online_episodic_memory(
+        model,
+        hidden,
+        score=scores_for_write,
+        max_tokens=write_limit,
+    )
+    return ce_nats, tokens_scored, raw_bytes, int(bool(read_hit)), writes, 1
+
+
 @register_calc_type(
     "packet_online_cache",
     requires_source_order=True,
@@ -223,6 +351,11 @@ def packet_online_cache(ctx: CalcTypeContext) -> CalcTypeResult:
             online accumulation from training-seeded cache (default True).
         max_docs: optional source-order doc cap for smoke tests. Omitted or
             <=0 means score the full cache.
+        batch_docs: optional microbatch doc count. ``1`` keeps the exact
+            chunk-by-chunk online path; values >1 score a source-ordered
+            microbatch before committing its evidence.
+        batch_token_budget: padded-token budget for batched eval. ``0`` means
+            only ``batch_docs`` limits the microbatch.
     """
     cfg = ctx.config
     chunk_tokens = int(cfg.get("chunk_tokens", 256))
@@ -231,12 +364,18 @@ def packet_online_cache(ctx: CalcTypeContext) -> CalcTypeResult:
     decay = float(cfg.get("decay", 1.0))
     seeded = bool(cfg.get("seeded", True))
     max_docs = int(cfg.get("max_docs", 0) or 0)
+    batch_docs = int(cfg.get("batch_docs", 1))
+    batch_token_budget = int(cfg.get("batch_token_budget", 0) or 0)
     if chunk_tokens < 1:
         raise ValueError("chunk_tokens must be >= 1")
     if write_tokens_per_chunk < 0:
         raise ValueError("write_tokens_per_chunk must be >= 0")
     if gate_value < 0.0:
         raise ValueError("gate_value must be non-negative")
+    if batch_docs < 1:
+        raise ValueError("batch_docs must be >= 1")
+    if batch_token_budget < 0:
+        raise ValueError("batch_token_budget must be >= 0")
 
     model = ctx.model
     val_cache = ctx.val_cache
@@ -260,93 +399,120 @@ def packet_online_cache(ctx: CalcTypeContext) -> CalcTypeResult:
     model.eval()
     try:
         with torch.no_grad():
-            for doc in val_cache.iter_docs():
-                if max_docs > 0 and docs_scored >= max_docs:
-                    break
-                if doc.token_len < 2:
-                    continue
-                tokens_np = val_cache.tokens_for_doc(doc)
-                input_ids = torch.tensor(
-                    tokens_np,
-                    dtype=torch.long,
-                    device=device,
-                ).unsqueeze(0)
-                score_pos = 1
-                while score_pos < int(input_ids.shape[1]):
-                    target_end = min(
-                        int(input_ids.shape[1]),
-                        score_pos + chunk_tokens,
+            if batch_docs > 1 or batch_token_budget > 0:
+                for docs in _iter_doc_microbatches(
+                    val_cache,
+                    max_docs=max_docs,
+                    batch_docs=batch_docs,
+                    batch_token_budget=batch_token_budget,
+                ):
+                    (
+                        ce_nats,
+                        tokens_scored,
+                        raw_bytes,
+                        reads,
+                        writes,
+                        chunks,
+                    ) = _score_doc_microbatch(
+                        model,
+                        val_cache,
+                        docs,
+                        device=device,
+                        packet_support=packet_support,
+                        gate_value=gate_value,
+                        write_tokens_per_chunk=write_tokens_per_chunk,
                     )
-                    chunk_inputs = input_ids[:, score_pos - 1 : target_end - 1]
-                    targets = input_ids[:, score_pos:target_end]
-                    if chunk_inputs.numel() == 0 or targets.numel() == 0:
-                        break
+                    total_ce_nats += torch.tensor(ce_nats, dtype=torch.float64)
+                    total_tokens_scored += int(tokens_scored)
+                    total_raw_bytes += int(raw_bytes)
+                    docs_scored += len(docs)
+                    episodic_reads += int(reads)
+                    episodic_writes += int(writes)
+                    chunks_scored += int(chunks)
+            else:
+                for doc in _iter_score_docs(val_cache, max_docs=max_docs):
+                    tokens_np = val_cache.tokens_for_doc(doc)
+                    input_ids = torch.tensor(
+                        tokens_np,
+                        dtype=torch.long,
+                        device=device,
+                    ).unsqueeze(0)
+                    score_pos = 1
+                    while score_pos < int(input_ids.shape[1]):
+                        target_end = min(
+                            int(input_ids.shape[1]),
+                            score_pos + chunk_tokens,
+                        )
+                        chunk_inputs = input_ids[:, score_pos - 1 : target_end - 1]
+                        targets = input_ids[:, score_pos:target_end]
+                        if chunk_inputs.numel() == 0 or targets.numel() == 0:
+                            break
 
-                    slot_count_at_score = _outer_slot_count(model)
+                        slot_count_at_score = _outer_slot_count(model)
+                        residual, gate, read_hit = _episodic_packet_from_prefix(
+                            model,
+                            states=states,
+                            batch_size=int(chunk_inputs.shape[0]),
+                            gate_value=gate_value,
+                        )
+                        if read_hit:
+                            episodic_reads += 1
+                        hidden, final_states = _packet_encode(
+                            model,
+                            chunk_inputs,
+                            initial_states=states,
+                            episodic_residual=residual,
+                            episodic_gate=gate,
+                            packet_support=packet_support,
+                        )
+                        log_probs = F.log_softmax(_lm_logits(model, hidden), dim=-1)
+                        token_nll = _token_nll_equal_length(log_probs, targets)
+                        if _outer_slot_count(model) != slot_count_at_score:
+                            raise RuntimeError(
+                                "score-before-write violated: cache grew from "
+                                f"{slot_count_at_score} to {_outer_slot_count(model)} "
+                                "between cue read and score accumulation"
+                            )
+                        total_ce_nats += token_nll.sum().detach().to(
+                            device="cpu",
+                            dtype=torch.float64,
+                        )
+                        total_tokens_scored += int(targets.numel())
+
+                        states = _decay_states(final_states, decay=decay)
+                        episodic_writes += _append_online_episodic_memory(
+                            model,
+                            hidden,
+                            score=token_nll,
+                            max_tokens=write_tokens_per_chunk,
+                        )
+                        chunks_scored += 1
+                        score_pos = target_end
+
+                    # Commit the trailing token to recurrent state so cross-doc
+                    # carry reflects the full observed stream.  No new score is
+                    # produced here (the tail target was already scored above).
+                    tail = input_ids[:, -1:]
                     residual, gate, read_hit = _episodic_packet_from_prefix(
                         model,
                         states=states,
-                        batch_size=int(chunk_inputs.shape[0]),
+                        batch_size=int(tail.shape[0]),
                         gate_value=gate_value,
                     )
                     if read_hit:
                         episodic_reads += 1
-                    hidden, final_states = _packet_encode(
+                    _, final_states = _packet_encode(
                         model,
-                        chunk_inputs,
+                        tail,
                         initial_states=states,
                         episodic_residual=residual,
                         episodic_gate=gate,
                         packet_support=packet_support,
                     )
-                    log_probs = F.log_softmax(_lm_logits(model, hidden), dim=-1)
-                    token_nll = _token_nll_equal_length(log_probs, targets)
-                    if _outer_slot_count(model) != slot_count_at_score:
-                        raise RuntimeError(
-                            "score-before-write violated: cache grew from "
-                            f"{slot_count_at_score} to {_outer_slot_count(model)} "
-                            "between cue read and score accumulation"
-                        )
-                    total_ce_nats += token_nll.sum().detach().to(
-                        device="cpu",
-                        dtype=torch.float64,
-                    )
-                    total_tokens_scored += int(targets.numel())
-
                     states = _decay_states(final_states, decay=decay)
-                    episodic_writes += _append_online_episodic_memory(
-                        model,
-                        hidden,
-                        score=token_nll,
-                        max_tokens=write_tokens_per_chunk,
-                    )
-                    chunks_scored += 1
-                    score_pos = target_end
 
-                # Commit the trailing token to recurrent state so cross-doc
-                # carry reflects the full observed stream.  No new score is
-                # produced here (the tail target was already scored above).
-                tail = input_ids[:, -1:]
-                residual, gate, read_hit = _episodic_packet_from_prefix(
-                    model,
-                    states=states,
-                    batch_size=int(tail.shape[0]),
-                    gate_value=gate_value,
-                )
-                if read_hit:
-                    episodic_reads += 1
-                _, final_states = _packet_encode(
-                    model,
-                    tail,
-                    initial_states=states,
-                    episodic_residual=residual,
-                    episodic_gate=gate,
-                    packet_support=packet_support,
-                )
-                states = _decay_states(final_states, decay=decay)
-
-                total_raw_bytes += int(doc.raw_bytes)
-                docs_scored += 1
+                    total_raw_bytes += int(doc.raw_bytes)
+                    docs_scored += 1
     finally:
         if was_training:
             model.train()
@@ -372,6 +538,8 @@ def packet_online_cache(ctx: CalcTypeContext) -> CalcTypeResult:
             "decay": decay,
             "seeded": seeded,
             "max_docs": max_docs,
+            "batch_docs": batch_docs,
+            "batch_token_budget": batch_token_budget,
         },
         extra={
             "episodic_reads": episodic_reads,

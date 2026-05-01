@@ -123,6 +123,7 @@ def build_arm_config(hyperparams: Any) -> dict[str, Any]:
         "crct_memory_write_tokens_per_step",
         "online_episodic_write_tokens_per_chunk",
         "crct_target_write_rate",
+        "crct_teacher_param_sync_interval_steps",
         "max_steps",
         "eval_only",
         "checkpoint_path",

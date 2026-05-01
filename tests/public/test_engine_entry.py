@@ -85,11 +85,13 @@ def test_build_arm_config_hyperparams_forwarded():
     hp = _FakeHyperparams()
     hp.model_dim = 384
     hp.lm_head_tile_size = 2048
+    hp.crct_teacher_param_sync_interval_steps = 6
     hp.max_steps = 1
     hp.eval_only = False
     cfg = build_arm_config(hp)
     assert cfg.get("model_dim") == 384
     assert cfg.get("lm_head_tile_size") == 2048
+    assert cfg.get("crct_teacher_param_sync_interval_steps") == 6
     assert cfg.get("max_steps") == 1
     assert cfg.get("eval_only") is False
 

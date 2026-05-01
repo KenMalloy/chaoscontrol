@@ -335,6 +335,65 @@ def test_packet_online_cache_max_docs_caps_source_order_smoke(tmp_path):
     assert result.hyperparams["max_docs"] == 2
 
 
+def test_packet_online_cache_batched_score_before_write_ordering(tmp_path):
+    model = PacketOnlineModel(seed=5)
+    # Seed one slot so the first batched score can read memory, then verify no
+    # append happens until every doc in the first microbatch has been encoded.
+    model.outer_model._slots.append(torch.full((1, DIM), 0.25))
+    model.outer_model._survival.append(1.0)
+    model.outer_model._slot_buckets.append(0)
+    model.outer_model._slot_event_ids.append(0)
+    cache = make_val_cache(tmp_path, doc_lens=[8, 10, 12, 14])
+    ctx = make_ctx(
+        model,
+        cache,
+        config={
+            "batch_docs": 2,
+            "batch_token_budget": 64,
+            "write_tokens_per_chunk": 2,
+        },
+    )
+
+    result = packet_online_cache(ctx)
+
+    assert result.docs_scored == 4
+    assert result.extra["chunks_scored"] == 2
+    assert result.extra["episodic_reads"] == 2
+    assert result.extra["episodic_writes"] == 2
+    assert result.hyperparams["batch_docs"] == 2
+    first_append_idx = next(
+        i for i, event in enumerate(model.events) if event[0] == "append"
+    )
+    assert [event[0] for event in model.events[:first_append_idx]].count("encode") == 1
+
+
+def test_packet_online_cache_batched_write_zero_is_seeded_read_only(tmp_path):
+    model = PacketOnlineModel(seed=6)
+    model.outer_model._slots.append(torch.full((1, DIM), 0.25))
+    model.outer_model._survival.append(1.0)
+    model.outer_model._slot_buckets.append(0)
+    model.outer_model._slot_event_ids.append(0)
+    cache = make_val_cache(tmp_path, doc_lens=[8, 10])
+    ctx = make_ctx(
+        model,
+        cache,
+        config={
+            "batch_docs": 2,
+            "batch_token_budget": 64,
+            "write_tokens_per_chunk": 0,
+        },
+    )
+
+    result = packet_online_cache(ctx)
+
+    assert result.docs_scored == 2
+    assert result.extra["episodic_reads"] == 1
+    assert result.extra["episodic_writes"] == 0
+    assert result.extra["slot_count_initial"] == 1
+    assert result.extra["slot_count_final"] == 1
+    assert "append" not in [event[0] for event in model.events]
+
+
 def test_packet_online_cache_rejects_bad_config(tmp_path):
     model = PacketOnlineModel(seed=0)
     cache = make_val_cache(tmp_path, doc_lens=[4])
@@ -347,3 +406,7 @@ def test_packet_online_cache_rejects_bad_config(tmp_path):
         )
     with pytest.raises(ValueError, match="gate_value"):
         packet_online_cache(make_ctx(model, cache, config={"gate_value": -0.5}))
+    with pytest.raises(ValueError, match="batch_docs"):
+        packet_online_cache(make_ctx(model, cache, config={"batch_docs": 0}))
+    with pytest.raises(ValueError, match="batch_token_budget"):
+        packet_online_cache(make_ctx(model, cache, config={"batch_token_budget": -1}))
