@@ -148,6 +148,7 @@ from chaoscontrol.optim.episodic_writer import (  # noqa: E402
 from chaoscontrol.optim.lamb import LAMB  # noqa: E402
 from chaoscontrol.optim.muon import Muon  # noqa: E402
 from chaoscontrol.optim.step_wrapper import wrap_optimizer_step  # noqa: E402
+from chaoscontrol.optim.weight_ema import eval_with_ema  # noqa: E402
 from chaoscontrol.optim.param_groups import build_optimizer_params  # noqa: E402
 from chaoscontrol.optim.scopt import (  # noqa: E402
     FrequencyBucketBaseline,
@@ -14773,19 +14774,26 @@ def run_condition(
                     "provided to the runner"
                 )
             val_cache = load_val_cache(Path(val_cache_dir))
-        eval_result = dispatch_eval_for_config(
-            config,
-            model=model,
-            val_cache=val_cache,
-            val_tokens=val_tokens,
-            eval_starts=eval_starts,
-            batch_size=batch_size,
-            seq_len=seq_len,
-            device=device,
-            base_bytes_lut=base_bytes_lut,
-            has_leading_space_lut=has_leading_space_lut,
-            is_boundary_token_lut=is_boundary_token_lut,
-            legacy_evaluate_fn=evaluate_bpb_sp,
+        def _do_eval():
+            return dispatch_eval_for_config(
+                config,
+                model=model,
+                val_cache=val_cache,
+                val_tokens=val_tokens,
+                eval_starts=eval_starts,
+                batch_size=batch_size,
+                seq_len=seq_len,
+                device=device,
+                base_bytes_lut=base_bytes_lut,
+                has_leading_space_lut=has_leading_space_lut,
+                is_boundary_token_lut=is_boundary_token_lut,
+                legacy_evaluate_fn=evaluate_bpb_sp,
+            )
+
+        eval_result = eval_with_ema(
+            model,
+            getattr(optimizer, "_weight_ema", None) if optimizer is not None else None,
+            _do_eval,
         )
 
     if ddp_active:
