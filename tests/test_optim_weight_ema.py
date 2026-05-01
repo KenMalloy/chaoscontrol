@@ -86,3 +86,33 @@ def test_ema_swap_and_restore():
         assert torch.allclose(model.linear.weight, torch.full_like(pre_swap, 7.0))
     # Original weights restored after context exit.
     assert torch.allclose(model.linear.weight, pre_swap)
+
+
+def test_eval_with_ema_helper_uses_shadow_weights():
+    """The runner-side helper should temporarily install EMA weights for eval."""
+    from chaoscontrol.optim.weight_ema import eval_with_ema
+
+    model = _Tiny()
+    with torch.no_grad():
+        model.linear.weight.fill_(2.0)
+    ema = WeightEMA(model, decay=0.9, exclude_prefixes=())
+    ema.shadow["linear.weight"].fill_(11.0)
+
+    captured = []
+    def eval_fn():
+        captured.append(model.linear.weight.detach().clone())
+        return 42
+
+    result = eval_with_ema(model, ema, eval_fn)
+    assert result == 42
+    assert torch.allclose(captured[0], torch.full_like(captured[0], 11.0))
+    # Restored after eval.
+    assert torch.allclose(model.linear.weight, torch.full_like(captured[0], 2.0))
+
+
+def test_eval_with_ema_passes_through_when_ema_is_none():
+    """Non-rank-0 ranks have ema=None; helper should just call the eval fn."""
+    from chaoscontrol.optim.weight_ema import eval_with_ema
+    model = _Tiny()
+    result = eval_with_ema(model, None, lambda: "no-ema")
+    assert result == "no-ema"
