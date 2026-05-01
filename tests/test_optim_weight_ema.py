@@ -116,3 +116,26 @@ def test_eval_with_ema_passes_through_when_ema_is_none():
     model = _Tiny()
     result = eval_with_ema(model, None, lambda: "no-ema")
     assert result == "no-ema"
+
+
+def test_ema_with_fake_quant_clamps_to_grid():
+    """When fake_quant_bits>0, the shadow stays on the quantization grid
+    after each update (per-tensor symmetric uniform quant for the test)."""
+    model = _Tiny()
+    with torch.no_grad():
+        model.linear.weight.uniform_(-1.0, 1.0)
+    ema = WeightEMA(
+        model, decay=0.5, exclude_prefixes=(),
+        fake_quant_bits=4,
+    )
+    # After several updates, the shadow values should snap to a 4-bit grid
+    # (16 levels). Take unique values modulo the grid spacing to verify.
+    for _ in range(5):
+        with torch.no_grad():
+            model.linear.weight.add_(0.01)
+        ema.update(model)
+    w = ema.shadow["linear.weight"]
+    grid_step = 2.0 * w.abs().max().item() / (2 ** 4 - 1)
+    # Each value, divided by grid_step, should be near an integer.
+    fractional = (w / grid_step).abs() - (w / grid_step).abs().round()
+    assert fractional.abs().max() < 1e-5
