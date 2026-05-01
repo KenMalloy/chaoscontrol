@@ -6,7 +6,7 @@ import pytest
 _REPO_ROOT = str(pathlib.Path(__file__).parent.parent.parent)
 os.environ.setdefault("CHAOSCONTROL_ROOT", _REPO_ROOT)
 
-from chaoscontrol.public.engine_entry import build_arm_config, init_arm_topology  # noqa: E402
+from chaoscontrol.public.engine_entry import build_arm_config, init_arm_topology, run_arm_submission  # noqa: E402
 
 
 class _FakeHyperparams:
@@ -91,3 +91,22 @@ def test_telemetry_overrides_win_over_lock(monkeypatch):
     monkeypatch.setattr(exp26, "_crct_lock", lambda: {"crct_target_write_rate": 99.0})
     cfg = build_arm_config(_FakeHyperparams())
     assert abs(cfg["crct_target_write_rate"] - 0.25) < 1e-6
+
+
+def test_run_arm_submission_import_chain():
+    """Verify runner_fast_path can be imported and run_condition is callable."""
+    import sys
+    _exp_dir = str(pathlib.Path(__file__).parent.parent.parent / "experiments" / "23_fast_path")
+    if _exp_dir not in sys.path:
+        sys.path.insert(0, _exp_dir)
+    from runner_fast_path import run_condition
+    assert callable(run_condition)
+
+
+def test_run_arm_submission_signature():
+    """Verify run_arm_submission accepts the expected keyword arguments."""
+    import inspect
+    sig = inspect.signature(run_arm_submission)
+    params = sig.parameters
+    for key in ("config", "data_path", "sp_model_path", "budget_seconds", "output_json", "val_cache_dir"):
+        assert key in params, f"Missing parameter: {key}"

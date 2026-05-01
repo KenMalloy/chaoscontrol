@@ -125,4 +125,34 @@ def run_arm_submission(
     val_cache_dir: str | None,
     world_size_override: int | None = None,
 ) -> dict[str, Any]:
-    raise NotImplementedError
+    """Delegate to runner_fast_path.run_condition() for full ARM training + eval.
+
+    Returns the nested result dict from run_condition directly:
+      {
+        "config": ...,
+        "params": int,
+        "train": {"steps": ..., "final_loss": ..., "train_time_s": ..., ...},
+        "eval":  {"bpb": ..., "loss": ..., "eval_time_s": ..., ...},
+        "artifact": {"bytes": ..., ...},
+        "exp24": {...},
+      }
+
+    All kwargs are passed through to run_condition as keyword arguments;
+    output_ckpt is not exposed by this wrapper and is always None.
+    """
+    _root = os.environ.get("CHAOSCONTROL_ROOT", "/workspace/chaoscontrol")
+    _runner_dir = os.path.join(_root, "experiments", "23_fast_path")
+    if _runner_dir not in sys.path:
+        sys.path.insert(0, _runner_dir)
+    from runner_fast_path import run_condition  # noqa: PLC0415
+
+    return run_condition(
+        dict(config),
+        data_path=data_path,
+        sp_model_path=sp_model_path,
+        budget_seconds=float(budget_seconds),
+        output_json=output_json,
+        output_ckpt=None,
+        world_size_override=world_size_override,
+        val_cache_dir=val_cache_dir,
+    )
