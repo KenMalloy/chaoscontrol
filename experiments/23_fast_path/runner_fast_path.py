@@ -12520,7 +12520,7 @@ def train_fast_for_budget(
                 pass
 
     if ddp_active:
-        dist.barrier()
+        dist.barrier(group=object_group or all_group)
 
     if (
         fast_slow.enabled
