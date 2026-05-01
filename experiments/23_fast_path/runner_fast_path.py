@@ -1717,6 +1717,35 @@ def _should_stop_memory_rank_loop(
     return float(elapsed_s) >= effective_budget
 
 
+def _should_defer_memory_rank_stop_for_shutdown(
+    *,
+    local_stop: bool,
+    elapsed_s: float,
+    budget_seconds: float,
+    stop_margin_seconds: float,
+    transport_mode: str,
+    active_transport: Any | None,
+) -> bool:
+    """Keep async memory ranks alive briefly to consume shutdown sentinels.
+
+    Train ranks send the mailbox sentinel during teardown, after their own
+    training loop exits. If memory ranks stop at the same wall-clock edge they
+    can miss that sentinel and appear to shut down by timeout. The drain window
+    is outside the trunk hot path: memory ranks keep polling for a bounded grace
+    period, but still fall back to wall-clock exit if rank 0 never sends.
+    """
+    if not bool(local_stop):
+        return False
+    if str(transport_mode) != "async_rank0_memory_mailbox":
+        return False
+    if active_transport is None:
+        return False
+    if bool(getattr(active_transport, "shutdown_requested", False)):
+        return False
+    grace_s = max(5.0, float(stop_margin_seconds))
+    return float(elapsed_s) < float(budget_seconds) + grace_s
+
+
 def _control_barrier(
     *,
     group: "dist.ProcessGroup | None",
@@ -10160,6 +10189,20 @@ def _train_fast_for_budget_cuda_graph(
                         stop_margin_seconds=stop_margin_seconds,
                         max_steps=max_steps,
                     )
+                    active_stop_transport = (
+                        crct_teacher_transport
+                        if bool(is_crct_packet_rank)
+                        else crct_maintenance_transport
+                    )
+                    if _should_defer_memory_rank_stop_for_shutdown(
+                        local_stop=bool(local_stop),
+                        elapsed_s=elapsed,
+                        budget_seconds=budget_seconds,
+                        stop_margin_seconds=stop_margin_seconds,
+                        transport_mode=str(crct_teacher_transport_mode),
+                        active_transport=active_stop_transport,
+                    ):
+                        local_stop = False
                 else:
                     local_stop = should_stop_training_loop(
                         steps=steps,
@@ -11736,6 +11779,20 @@ def train_fast_for_budget(
                         stop_margin_seconds=stop_margin_seconds,
                         max_steps=max_steps,
                     )
+                    active_stop_transport = (
+                        crct_teacher_transport
+                        if bool(is_crct_packet_rank)
+                        else crct_maintenance_transport
+                    )
+                    if _should_defer_memory_rank_stop_for_shutdown(
+                        local_stop=bool(local_stop),
+                        elapsed_s=elapsed,
+                        budget_seconds=budget_seconds,
+                        stop_margin_seconds=stop_margin_seconds,
+                        transport_mode=str(crct_teacher_transport_mode),
+                        active_transport=active_stop_transport,
+                    ):
+                        local_stop = False
                 else:
                     local_stop = should_stop_training_loop(
                         steps=steps,

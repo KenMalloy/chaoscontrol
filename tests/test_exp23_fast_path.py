@@ -127,6 +127,42 @@ def test_crct_memory_rank_checks_wall_clock_even_when_idle() -> None:
     )
 
 
+def test_crct_memory_rank_defers_wall_stop_until_shutdown_sentinel() -> None:
+    """Mailbox memory ranks should drain teardown sentinel before wall fallback."""
+    mod = _load_runner_module()
+
+    class _Transport:
+        shutdown_requested = False
+
+    transport = _Transport()
+    assert mod._should_defer_memory_rank_stop_for_shutdown(
+        local_stop=True,
+        elapsed_s=10.0,
+        budget_seconds=10.0,
+        stop_margin_seconds=2.0,
+        transport_mode="async_rank0_memory_mailbox",
+        active_transport=transport,
+    )
+    transport.shutdown_requested = True
+    assert not mod._should_defer_memory_rank_stop_for_shutdown(
+        local_stop=True,
+        elapsed_s=10.0,
+        budget_seconds=10.0,
+        stop_margin_seconds=2.0,
+        transport_mode="async_rank0_memory_mailbox",
+        active_transport=transport,
+    )
+    transport.shutdown_requested = False
+    assert not mod._should_defer_memory_rank_stop_for_shutdown(
+        local_stop=True,
+        elapsed_s=15.1,
+        budget_seconds=10.0,
+        stop_margin_seconds=2.0,
+        transport_mode="async_rank0_memory_mailbox",
+        active_transport=transport,
+    )
+
+
 def test_dist_work_done_uses_timeout_bounded_wait_for_progress() -> None:
     mod = _load_runner_module()
     calls = []
