@@ -113,6 +113,7 @@ from chaoscontrol.slot_commit import (  # noqa: E402
 )
 from chaoscontrol.data import (  # noqa: E402
     load_fineweb_tokens,
+    load_fineweb_val_tokens,
     resolve_device,
     resolve_param_dtype,
 )
@@ -14085,7 +14086,21 @@ def run_condition(
     verify_diag_recurrence(device)
 
     vocab_size = int(config["vocab_size"])
-    train_tokens, val_tokens = load_fineweb_tokens(data_path)
+    eval_only = bool(config.get("eval_only", False))
+    calc_types_requested = list(config.get("calc_types") or [])
+    if eval_only:
+        if bool(config.get("rare_bucket_ce_enabled", False)):
+            raise ValueError(
+                "eval_only=True cannot derive rare_bucket_ce token frequencies "
+                "without loading the training stream"
+            )
+        train_tokens = torch.empty(0, dtype=torch.int16)
+        if calc_types_requested:
+            val_tokens = torch.empty(0, dtype=torch.int16)
+        else:
+            val_tokens = load_fineweb_val_tokens(data_path)
+    else:
+        train_tokens, val_tokens = load_fineweb_tokens(data_path)
 
     import sentencepiece as spm
 
@@ -14114,7 +14129,6 @@ def run_condition(
         model, crct_enabled=bool(config.get("crct_enabled", False))
     )
     model_params = sum(p.numel() for p in model.parameters())
-    eval_only = bool(config.get("eval_only", False))
     checkpoint_load_metadata: dict[str, Any] | None = None
     checkpoint_online_eval_state: dict[str, Any] = {}
     checkpoint_path_value = str(config.get("checkpoint_path", "") or "").strip()
@@ -14719,7 +14733,6 @@ def run_condition(
         _control_barrier(group=control_group, label="post_train_eval_state")
 
     eval_result: dict[str, Any] = {}
-    calc_types_requested = list(config.get("calc_types") or [])
     if is_rank0 and (eval_batches > 0 or calc_types_requested):
         val_cache = None
         if calc_types_requested:

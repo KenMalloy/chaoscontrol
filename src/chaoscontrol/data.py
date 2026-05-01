@@ -145,6 +145,21 @@ def load_fineweb_tokens(data_dir: str) -> tuple[torch.Tensor, torch.Tensor]:
     return train_tokens, val_tokens
 
 
+def load_fineweb_val_tokens(data_dir: str) -> torch.Tensor:
+    """Load only FineWeb validation shards.
+
+    Eval-only calc_type runs use ValCache for scoring and should not have to
+    build the large concatenated training cache as a side effect. This helper
+    keeps legacy random-window eval available without touching train shards.
+    """
+    data_path = Path(data_dir)
+    val_shards = sorted(data_path.glob("fineweb_val_*.bin"))
+    if not val_shards:
+        raise FileNotFoundError(f"No validation shards found in {data_dir}")
+    val_mmap = _concat_shards_mmap(val_shards, data_path / ".val_cache.bin")
+    return torch.from_numpy(val_mmap.view(np.int16))
+
+
 def _extract_jsonl_to_raw(jsonl_path: Path, raw_path: Path) -> None:
     """Extract raw UTF-8 text from docs_selected.jsonl to a flat bytes file.
 

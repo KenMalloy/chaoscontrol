@@ -3009,6 +3009,82 @@ def test_run_condition_threads_max_steps_from_config(monkeypatch):
     assert result["train"]["steps"] == 517
 
 
+def test_run_condition_eval_only_calc_type_skips_train_token_cache(monkeypatch, tmp_path):
+    """Submission eval should not materialize the training-token mmap cache.
+
+    The packet_online_cache path scores from ValCache and a checkpoint. Loading
+    the 25+ GB training shard concat during eval-only is both unnecessary and a
+    real disk-pressure failure mode on fresh pods.
+    """
+    mod = _load_runner_module()
+    model_for_ckpt = _TinyTokenTrainModel()
+    ckpt = tmp_path / "eval_only.pt"
+    torch.save({"model": model_for_ckpt.state_dict()}, ckpt)
+
+    monkeypatch.setattr(mod, "_init_distributed", lambda _world_size: (0, 1, 0))
+    monkeypatch.setattr(mod, "_pick_device", lambda _rank, _device: torch.device("cpu"))
+    monkeypatch.setattr(mod, "resolve_param_dtype", lambda _dtype, _device: torch.float32)
+    monkeypatch.setattr(mod, "verify_diag_recurrence", lambda _device: None)
+
+    def forbidden_train_load(_path):
+        raise AssertionError("eval_only calc_type must not load train tokens")
+
+    monkeypatch.setattr(mod, "load_fineweb_tokens", forbidden_train_load)
+    monkeypatch.setattr(
+        mod,
+        "load_fineweb_val_tokens",
+        lambda _path: (_ for _ in ()).throw(
+            AssertionError("ValCache calc_type does not need val token mmap")
+        ),
+    )
+    monkeypatch.setattr(mod, "build_sentencepiece_luts", lambda *_args: (None, None, None))
+    monkeypatch.setattr(mod, "build_model", lambda *_args: _TinyTokenTrainModel())
+    monkeypatch.setattr(mod, "_apply_embed_init", lambda *_args: None)
+    monkeypatch.setattr(mod, "_reject_unsupported_fast_step", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(mod, "load_val_cache", lambda _path: object())
+
+    def fake_dispatch_eval_for_config(config, **kwargs):
+        assert kwargs["val_tokens"].numel() == 0
+        assert config["calc_types"] == ["packet_online_cache"]
+        return {"bpb": 1.25, "loss": 0.5, "headline_calc_type": "packet_online_cache"}
+
+    monkeypatch.setattr(mod, "dispatch_eval_for_config", fake_dispatch_eval_for_config)
+
+    class FakeSP:
+        def Load(self, _path):
+            return True
+
+    monkeypatch.setitem(
+        sys.modules,
+        "sentencepiece",
+        type("M", (), {"SentencePieceProcessor": FakeSP}),
+    )
+
+    result = mod.run_condition(
+        {
+            "name": "eval_only_packet_cache",
+            "vocab_size": 6,
+            "seq_len": 3,
+            "stride": 1,
+            "batch_size": 2,
+            "eval_only": True,
+            "checkpoint_path": str(ckpt),
+            "calc_types": ["packet_online_cache"],
+            "headline_calc_type": "packet_online_cache",
+        },
+        data_path="unused",
+        sp_model_path="unused.model",
+        budget_seconds=1.0,
+        output_json=None,
+        output_ckpt=None,
+        world_size_override=1,
+        val_cache_dir=str(tmp_path / "val-cache"),
+    )
+
+    assert result["train"]["eval_only"] is True
+    assert result["eval"]["bpb"] == 1.25
+
+
 def test_run_condition_derives_rare_bucket_frequencies_and_uses_val_tokens(monkeypatch):
     """YAML cannot carry a tensor frequency table. The CLI path should derive
     rarity buckets from train-token counts, while the CE readout itself should
