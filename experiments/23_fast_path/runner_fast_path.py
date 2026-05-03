@@ -3279,8 +3279,13 @@ class _CrctMailboxTeacherTransport:
         self._teacher_request_seq = 0
         self._teacher_result_seq = 0
         self._teacher_ring_capacity = int(_ext.ShmRingTeacherRequest.capacity)
-        self.max_local_batches = int(self._teacher_ring_capacity)
-        self.max_payload_lag_steps = 0
+        # Mailbox transport should honor the configured backlog/lag policy, but
+        # the queue can never exceed the physical ring capacity.
+        self.max_local_batches = min(
+            int(self.max_local_batches_configured),
+            int(self._teacher_ring_capacity),
+        )
+        self.max_payload_lag_steps = int(self.max_payload_lag_steps_configured)
         self._teacher_request_slot_bytes = _align64(
             int(np.prod(self.full_ids_shape)) * _teacher_dtype_nbytes(torch.int32)
         )
@@ -5589,6 +5594,10 @@ class _CrctMailboxTeacherTransport:
             if batch is None:
                 self.metrics["orphan_payloads_dropped"] += 1
                 self.metrics["last_drop_reason"] = "payload_without_local_batch"
+                continue
+            if self.max_payload_lag_steps > 0 and lag > self.max_payload_lag_steps:
+                self.metrics["stale_payloads_dropped"] += 1
+                self.metrics["last_drop_reason"] = "payload_too_stale"
                 continue
             slices = {
                 name: desc

@@ -1117,6 +1117,45 @@ def test_crct_mailbox_transport_round_trips_memory_packet(tmp_path) -> None:
     assert rank0.diagnostics()["memory_packets_received"] == 1
 
 
+def test_crct_mailbox_transport_drops_stale_payloads_per_configured_lag(
+    tmp_path,
+) -> None:
+    mod = _load_module("runner_fast_path_crct_mailbox_packet_stale", RUNNER_PATH)
+    kwargs = {
+        "world_size": 4,
+        "mailbox_dir": str(tmp_path),
+        "payload_shape": (1, 2, 5),
+        "full_ids_shape": (2, 6),
+        "device": torch.device("cpu"),
+        "payload_dtype": torch.float32,
+        "max_local_batches": 8,
+        "max_payload_lag_steps": 1,
+        "score_interval_steps": 1,
+    }
+    rank0 = mod._CrctMailboxTeacherTransport(rank=0, **kwargs)
+    rank3 = mod._CrctMailboxTeacherTransport(rank=3, **kwargs)
+    inputs = torch.randint(0, 32, (2, 5), dtype=torch.int32)
+    targets = torch.randint(0, 32, (2, 5), dtype=torch.long)
+    rank0.local_batches_by_step[0] = (inputs, targets)
+    rank0.local_batch_order.append(0)
+
+    rank3._write_result(
+        request_step=0,
+        scored={
+            "target": torch.full((2, 5), 0.85),
+            "confidence": torch.ones(2, 5),
+            "loss_weight": torch.ones(2, 5),
+            "utility": torch.zeros(2, 5),
+        },
+    )
+
+    assert rank0._poll_results(current_step=3) is None
+    diag0 = rank0.diagnostics()
+    assert diag0["stale_payloads_dropped"] == 1
+    assert diag0["payloads_received"] == 0
+    assert diag0["ready_result_queue_depth"] == 0
+
+
 def test_crct_mailbox_aliases_memory_gate_to_target_for_compact_packet(tmp_path) -> None:
     mod = _load_module("runner_fast_path_crct_mailbox_packet_alias", RUNNER_PATH)
     kwargs = {
