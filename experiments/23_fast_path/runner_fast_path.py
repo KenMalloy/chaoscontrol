@@ -1910,6 +1910,28 @@ def _crct_rank_topology(
     }
 
 
+def _packet_teacher_weight_snapshot_scope(
+    *,
+    packet_rank: int,
+    maintenance_rank: int,
+) -> str:
+    """Return the weight-snapshot scope for the packet teacher transport.
+
+    Packet scope is only safe when the packet rank is not also the
+    maintenance rank. When the topology consolidates both roles onto a
+    single rank (3+1 smoke or 7+1 default), ``replay_eviction_loop.tick``
+    runs on that rank and calls ``model.encode(..., memory_mode='off'
+    / 'force_on' / hide-one)``; the off/force/hide physics walks the
+    full SSM trunk and needs fresh ``self.layers.*`` weights. Fall back
+    to ``"full"`` in that case.
+    """
+    return (
+        "packet"
+        if int(packet_rank) != int(maintenance_rank)
+        else "full"
+    )
+
+
 _SLOT_COMMIT_MAGIC = 0x4353434D544C414E  # "CSCMTLAN"
 _SLOT_COMMIT_CLOSE_MAGIC = 0x4353434D544C434C  # "CSCMTLCL"
 _SLOT_COMMIT_HEADER_VERSION = 1
@@ -11672,7 +11694,10 @@ def train_fast_for_budget(
                 memory_rank=int(crct_packet_rank),
                 memory_role="packet",
                 produce_results=True,
-                weight_snapshot_scope="packet",
+                weight_snapshot_scope=_packet_teacher_weight_snapshot_scope(
+                    packet_rank=int(crct_packet_rank),
+                    maintenance_rank=int(crct_maintenance_rank),
+                ),
                 plasticity_ema_beta=float(crct_ema_beta),
                 hidden_dim=int(
                     getattr(model, "dim", 0)

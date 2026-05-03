@@ -111,6 +111,34 @@ def test_crct_rank_topology_shares_packet_and_maintenance_on_default_topologies(
     assert top8["split_memory_ranks"] is False
 
 
+def test_packet_teacher_weight_snapshot_scope_falls_back_to_full_when_consolidated() -> None:
+    """Consolidated topologies must ship full snapshots to the shared rank.
+
+    On 3+1 and the default 7+1 the packet rank is also the maintenance
+    rank. ``replay_eviction_loop.tick`` runs on that rank and calls
+    ``model.encode`` with the off/force/hide physics, which walks the full
+    SSM trunk. The packet teacher transport is the only weight-snapshot
+    consumer on that rank, so it must ship the full state — packet scope
+    would starve the trunk of fresh ``self.layers.*`` weights.
+    """
+    mod = _load_module(
+        "runner_fast_path_packet_teacher_weight_snapshot_scope", RUNNER_PATH
+    )
+
+    assert (
+        mod._packet_teacher_weight_snapshot_scope(packet_rank=7, maintenance_rank=7)
+        == "full"
+    )
+    assert (
+        mod._packet_teacher_weight_snapshot_scope(packet_rank=3, maintenance_rank=3)
+        == "full"
+    )
+    assert (
+        mod._packet_teacher_weight_snapshot_scope(packet_rank=6, maintenance_rank=7)
+        == "packet"
+    )
+
+
 def test_crct_online_eval_state_merges_packet_cache_and_maintenance_state() -> None:
     mod = _load_module("runner_fast_path_crct_online_eval_state", RUNNER_PATH)
     packet_model = _tiny_crct_model()
