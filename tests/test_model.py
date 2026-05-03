@@ -678,5 +678,67 @@ class TestCareSSMHybridBlock(unittest.TestCase):
             )
 
 
+def test_packet_forward_state_keys_cover_packet_forward() -> None:
+    """Mutating non-packet weights must not change ``build_episodic_packet``.
+
+    The packet-serving rank consumes a snapshot subset advertised by
+    ``CareStudentLM.packet_forward_state_keys``. This test fails loud if a
+    future change to ``build_episodic_packet`` starts reading a parameter
+    outside that subset — drop a NaN into every non-listed weight, re-run
+    the packet path, and require a bit-identical output.
+    """
+    torch.manual_seed(0)
+    model = CareStudentLM(
+        vocab_size=32,
+        dim=8,
+        num_layers=2,
+        ff_mult=2,
+        a_mode="diag",
+        outer_model_dim=4,
+        outer_model_type="multislot",
+        outer_max_slots=8,
+        buffer_mode="append_only",
+        wernicke_enabled=True,
+        wernicke_k_max=4,
+        cue_projection=True,
+        semantic_tier_bases=2,
+        bucket_prototypes=True,
+        prototype_dim=4,
+    )
+    model.eval()
+
+    packet_keys = model.packet_forward_state_keys()
+    state = model.state_dict()
+    non_packet_tensor_keys = [
+        name
+        for name, value in state.items()
+        if torch.is_tensor(value) and name not in packet_keys
+    ]
+    assert non_packet_tensor_keys, (
+        "test fixture should expose at least one non-packet tensor; "
+        "if the model now ships only packet tensors, this guard is obsolete"
+    )
+
+    input_ids = torch.randint(0, 32, (2, 5), dtype=torch.long)
+    with torch.no_grad():
+        baseline = model.build_episodic_packet(input_ids)
+    baseline_residual = baseline["memory_residual"].detach().clone()
+    baseline_gate = baseline["memory_gate"].detach().clone()
+
+    with torch.no_grad():
+        for name in non_packet_tensor_keys:
+            param = dict(model.named_parameters()).get(name)
+            buffer = dict(model.named_buffers()).get(name)
+            target = param if param is not None else buffer
+            if target is None:
+                continue
+            target.fill_(float("nan"))
+
+    with torch.no_grad():
+        perturbed = model.build_episodic_packet(input_ids)
+    torch.testing.assert_close(perturbed["memory_residual"], baseline_residual)
+    torch.testing.assert_close(perturbed["memory_gate"], baseline_gate)
+
+
 if __name__ == "__main__":
     unittest.main()

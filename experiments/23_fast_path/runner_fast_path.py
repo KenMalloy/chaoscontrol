@@ -3194,6 +3194,7 @@ class _CrctMailboxTeacherTransport:
         memory_rank: int | None = None,
         memory_role: str = "packet",
         produce_results: bool = True,
+        weight_snapshot_scope: str = "full",
         plasticity_ema_beta: float = 0.95,
         hidden_dim: int | None = None,
         score_stage_timing_enabled: bool = False,
@@ -3206,6 +3207,13 @@ class _CrctMailboxTeacherTransport:
         self.coordinator_rank = int(coordinator_rank)
         self.memory_role = str(memory_role or "packet")
         self.produce_results = bool(produce_results)
+        self.weight_snapshot_scope = str(weight_snapshot_scope or "full").strip().lower()
+        if self.weight_snapshot_scope not in {"full", "packet"}:
+            raise ValueError(
+                "weight_snapshot_scope must be 'full' or 'packet'; got "
+                f"{weight_snapshot_scope!r}"
+            )
+        self._packet_state_keys: set[str] | None = None
         self.mailbox_dir = Path(mailbox_dir)
         self.mailbox_dir.mkdir(parents=True, exist_ok=True)
         self.payload_shape = tuple(int(x) for x in payload_shape)
@@ -3312,6 +3320,7 @@ class _CrctMailboxTeacherTransport:
             "memory_rank": int(self.memory_rank),
             "memory_role": self.memory_role,
             "produce_results": bool(self.produce_results),
+            "weight_snapshot_scope": self.weight_snapshot_scope,
             "participant": True,
             "mailbox_dir": str(self.mailbox_dir),
             "payload_dtype": str(payload_dtype).replace("torch.", ""),
@@ -4312,6 +4321,8 @@ class _CrctMailboxTeacherTransport:
         layout: list[dict[str, Any]] = []
         cursor = _align64(_WEIGHT_SNAPSHOT_HEADER.size)
         for name, value in state_dict.items():
+            if not self._should_include_weight_snapshot_name(str(name)):
+                continue
             if not torch.is_tensor(value):
                 continue
             tensor = value.detach()
@@ -4328,6 +4339,36 @@ class _CrctMailboxTeacherTransport:
             )
             cursor = _align64(cursor + nbytes)
         return layout
+
+    def _resolve_packet_state_keys(self, model: torch.nn.Module) -> set[str]:
+        """Cache and return the packet-scope key set advertised by the model.
+
+        The set is a function of the model's submodule layout, which is fixed
+        at construction; safe to cache for the lifetime of the transport.
+        """
+        if self._packet_state_keys is not None:
+            return self._packet_state_keys
+        get_keys = getattr(model, "packet_forward_state_keys", None)
+        if not callable(get_keys):
+            raise TypeError(
+                "weight_snapshot_scope='packet' requires "
+                "model.packet_forward_state_keys() (got "
+                f"{type(model).__name__})"
+            )
+        keys = set(get_keys())
+        self._packet_state_keys = keys
+        return keys
+
+    def _should_include_weight_snapshot_name(self, name: str) -> bool:
+        if self.weight_snapshot_scope == "full":
+            return True
+        if self._packet_state_keys is None:
+            # Filter is consulted before publisher/applier had a chance to
+            # resolve keys from the model. Be conservative and include the
+            # name; the publisher/applier path resolves keys before staging,
+            # so this branch should not fire in practice.
+            return True
+        return name in self._packet_state_keys
 
     def _ensure_weight_snapshot_writer(
         self,
@@ -4381,6 +4422,8 @@ class _CrctMailboxTeacherTransport:
         for bank_idx in range(int(self._weight_snapshot_bank_count)):
             tensors: dict[str, torch.Tensor] = {}
             for name, value in state_dict.items():
+                if not self._should_include_weight_snapshot_name(str(name)):
+                    continue
                 if not torch.is_tensor(value):
                     continue
                 src = value.detach()
@@ -4819,6 +4862,8 @@ class _CrctMailboxTeacherTransport:
         if self.rank != self.coordinator_rank:
             return
         self.metrics["weight_snapshot_attempts"] += 1
+        if self.weight_snapshot_scope == "packet":
+            self._resolve_packet_state_keys(model)
         state_dict = model.state_dict()
         if not self._ensure_weight_snapshot_writer(state_dict):
             return
@@ -4846,6 +4891,8 @@ class _CrctMailboxTeacherTransport:
             dst_tensors: list[torch.Tensor] = []
             stage_bytes = 0
             for name, value in state_dict.items():
+                if not self._should_include_weight_snapshot_name(str(name)):
+                    continue
                 if not torch.is_tensor(value):
                     passthrough[name] = value
                     continue
@@ -4935,6 +4982,8 @@ class _CrctMailboxTeacherTransport:
         """
         if self.rank != self.memory_rank:
             return
+        if self.weight_snapshot_scope == "packet":
+            self._resolve_packet_state_keys(model)
         try:
             snapshot = self._read_weight_snapshot_shm(
                 model=model,
@@ -4957,7 +5006,13 @@ class _CrctMailboxTeacherTransport:
             )
             missing = getattr(load_result, "missing_keys", [])
             unexpected = getattr(load_result, "unexpected_keys", [])
-            if missing or unexpected:
+            # In packet scope, missing keys are expected (the publisher
+            # intentionally ships only the packet subset). Only flag the load
+            # as partial when we see unexpected keys, or any missing key in
+            # full scope.
+            if unexpected or (
+                missing and self.weight_snapshot_scope == "full"
+            ):
                 self.metrics["last_drop_reason"] = "weight_snapshot_partial_load"
             if fast_slow is not None:
                 decision = fast_slow_decision_from_dict(decision_payload)
@@ -11617,6 +11672,7 @@ def train_fast_for_budget(
                 memory_rank=int(crct_packet_rank),
                 memory_role="packet",
                 produce_results=True,
+                weight_snapshot_scope="packet",
                 plasticity_ema_beta=float(crct_ema_beta),
                 hidden_dim=int(
                     getattr(model, "dim", 0)
@@ -11685,6 +11741,7 @@ def train_fast_for_budget(
             memory_rank=int(crct_maintenance_rank),
             memory_role="maintenance",
             produce_results=False,
+            weight_snapshot_scope="full",
             plasticity_ema_beta=float(crct_ema_beta),
             hidden_dim=int(
                 getattr(model, "dim", 0)

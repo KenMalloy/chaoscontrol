@@ -1002,6 +1002,44 @@ class CareStudentLM(nn.Module):
     def artifact_bytes(self) -> int:
         return int(sum(p.numel() for p in self.parameters()) * 2)
 
+    # Submodule attribute names whose state ``build_episodic_packet`` reads.
+    # The packet-serving rank consumes a snapshot subset restricted to these
+    # modules; the SSM trunk, posterior delta, and head/norm are excluded
+    # because the serving forward never multiplies anything against them.
+    _PACKET_FORWARD_MODULE_ATTRS: tuple[str, ...] = (
+        "embed",
+        "wernicke",
+        "outer_model",
+        "semantic_tier",
+        "bucket_prototypes_module",
+    )
+
+    def packet_forward_state_keys(self) -> set[str]:
+        """Return tensor state_dict keys consumed by ``build_episodic_packet``.
+
+        The packet-serving memory rank only needs the subset of the trunk
+        snapshot that this method reads; shipping the SSM trunk to it on
+        every snapshot tick is wasted bandwidth. Keep this in sync with
+        ``build_episodic_packet`` — when that method starts reading a new
+        submodule, add its attribute name to ``_PACKET_FORWARD_MODULE_ATTRS``.
+        ``test_packet_forward_state_keys_cover_packet_forward`` is the
+        coverage gate.
+
+        Only tensor-valued state_dict entries are returned; non-tensor
+        ``get_extra_state`` payloads are excluded since the snapshot
+        transport ships tensors only.
+        """
+        keys: set[str] = set()
+        for attr in self._PACKET_FORWARD_MODULE_ATTRS:
+            module = getattr(self, attr, None)
+            if module is None or not isinstance(module, nn.Module):
+                continue
+            for sub_name, value in module.state_dict().items():
+                if not torch.is_tensor(value):
+                    continue
+                keys.add(f"{attr}.{sub_name}")
+        return keys
+
     @torch.no_grad()
     def append_memory_from_hidden(
         self,

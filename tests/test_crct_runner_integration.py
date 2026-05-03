@@ -1453,6 +1453,92 @@ def test_crct_mailbox_weight_snapshot_applies_latest_model(tmp_path) -> None:
     assert diag3_after["weight_snapshot_stat_skips"] == 1
 
 
+def test_crct_mailbox_packet_scope_weight_snapshot_applies_packet_subset(
+    tmp_path,
+) -> None:
+    mod = _load_module(
+        "runner_fast_path_crct_mailbox_weights_packet_scope", RUNNER_PATH
+    )
+    kwargs = {
+        "world_size": 4,
+        "mailbox_dir": str(tmp_path),
+        "payload_shape": (1, 2, 5),
+        "full_ids_shape": (2, 6),
+        "device": torch.device("cpu"),
+        "payload_dtype": torch.float32,
+        "max_local_batches": 8,
+        "max_payload_lag_steps": 8,
+        "score_interval_steps": 1,
+        "weight_snapshot_scope": "packet",
+    }
+    model_kwargs = dict(
+        vocab_size=32,
+        dim=8,
+        num_layers=2,
+        ff_mult=2,
+        a_mode="diag",
+        outer_model_dim=4,
+        outer_model_type="multislot",
+        outer_max_slots=8,
+        buffer_mode="append_only",
+        wernicke_enabled=True,
+        wernicke_k_max=4,
+        cue_projection=True,
+        semantic_tier_bases=2,
+        bucket_prototypes=True,
+        prototype_dim=4,
+    )
+    rank0 = mod._CrctMailboxTeacherTransport(rank=0, **kwargs)
+    rank3 = mod._CrctMailboxTeacherTransport(rank=3, **kwargs)
+    model0 = CareStudentLM(**model_kwargs)
+    model3 = CareStudentLM(**model_kwargs)
+    with torch.no_grad():
+        for param in model0.parameters():
+            param.fill_(0.25)
+        for param in model3.parameters():
+            param.fill_(-0.5)
+
+    expected_packet_keys = model0.packet_forward_state_keys()
+    before = {
+        name: tensor.detach().clone()
+        for name, tensor in model3.state_dict().items()
+        if torch.is_tensor(tensor)
+    }
+    staged_expected = {
+        name: tensor.detach().clone()
+        for name, tensor in model0.state_dict().items()
+        if torch.is_tensor(tensor)
+    }
+    rank0.maybe_publish_weight_snapshot(model=model0, step=7)
+    with torch.no_grad():
+        for param in model0.parameters():
+            param.fill_(0.75)
+    _wait_for_metric(rank0, "weight_snapshot_published", 1)
+
+    rank3.poll_weight_snapshot(model=model3, step=11)
+
+    for name in expected_packet_keys:
+        torch.testing.assert_close(model3.state_dict()[name], staged_expected[name])
+    non_packet = [
+        name
+        for name in before.keys()
+        if name not in expected_packet_keys
+    ]
+    assert non_packet, "test fixture should expose at least one non-packet weight"
+    for name in non_packet:
+        torch.testing.assert_close(model3.state_dict()[name], before[name])
+
+    diag0 = rank0.diagnostics()
+    diag3 = rank3.diagnostics()
+    assert diag0["weight_snapshot_scope"] == "packet"
+    assert diag0["weight_snapshot_stage_tensor_count"] == len(expected_packet_keys)
+    assert diag3["weight_snapshot_scope"] == "packet"
+    assert diag3["weight_snapshot_applied"] == 1
+    assert diag3["weight_snapshot_last_applied_step"] == 7
+    assert diag3["weight_snapshot_read_tensor_count"] == len(expected_packet_keys)
+    assert diag3["last_drop_reason"] != "weight_snapshot_partial_load"
+
+
 def test_crct_mailbox_weight_snapshot_applies_fastslow_decision(tmp_path) -> None:
     mod = _load_module("runner_fast_path_crct_mailbox_fastslow", RUNNER_PATH)
     kwargs = {
