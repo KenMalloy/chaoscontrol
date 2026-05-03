@@ -3429,6 +3429,7 @@ class _CrctMailboxTeacherTransport:
             "memory_rank_pump_request_pops": 0,
             "memory_rank_pump_last_request_step": -1,
             "memory_rank_request_events_superseded": 0,
+            "memory_rank_pending_request_queue_drops": 0,
             "memory_rank_pump_score_calls": 0,
             "maintenance_request_frames_ingested": 0,
             "maintenance_request_frames_dropped_no_loop": 0,
@@ -5222,7 +5223,7 @@ class _CrctMailboxTeacherTransport:
         assert self._teacher_request_ring is not None
         assert self._teacher_request_payload is not None
         popped = 0
-        latest_event: dict[str, Any] | None = None
+        request_events: list[dict[str, Any]] = []
         shutdown_seen = False
         while True:
             event = self._teacher_request_ring.pop()
@@ -5230,10 +5231,13 @@ class _CrctMailboxTeacherTransport:
                 break
             popped += 1
             if int(event.get("flags", 0)) & _TEACHER_REQUEST_FLAG_SHUTDOWN:
-                if latest_event is not None:
-                    self.metrics["memory_rank_request_events_superseded"] += 1
-                    self.metrics["completed_requests_dropped"] += 1
-                    latest_event = None
+                if request_events:
+                    dropped = len(request_events)
+                    self.metrics["memory_rank_request_events_superseded"] += int(
+                        dropped
+                    )
+                    self.metrics["completed_requests_dropped"] += int(dropped)
+                    request_events.clear()
                 shutdown_seen = True
                 self.metrics["teacher_shm_request_shutdown_events_popped"] += 1
                 continue
@@ -5241,10 +5245,7 @@ class _CrctMailboxTeacherTransport:
                 self.metrics["memory_rank_request_events_superseded"] += 1
                 self.metrics["completed_requests_dropped"] += 1
                 continue
-            if latest_event is not None:
-                self.metrics["memory_rank_request_events_superseded"] += 1
-                self.metrics["completed_requests_dropped"] += 1
-            latest_event = event
+            request_events.append(event)
         if shutdown_seen:
             if self.pending_input_requests:
                 dropped = len(self.pending_input_requests)
@@ -5256,41 +5257,50 @@ class _CrctMailboxTeacherTransport:
             self.metrics["last_drop_reason"] = "teacher_request_shutdown"
             self.metrics["teacher_shm_request_events_popped"] += int(popped)
             return int(popped)
-        if latest_event is not None:
-            if self.pending_input_requests:
-                dropped = len(self.pending_input_requests)
-                self.pending_input_requests.clear()
+        if request_events:
+            capacity = max(1, int(self.max_local_batches))
+            if len(request_events) > capacity:
+                dropped = len(request_events) - capacity
+                request_events = request_events[-capacity:]
                 self.metrics["memory_rank_request_events_superseded"] += int(dropped)
                 self.metrics["completed_requests_dropped"] += int(dropped)
-            try:
-                full_ids_cpu = self._read_teacher_slice(
-                    self._teacher_request_payload,
-                    latest_event["full_ids"],  # type: ignore[arg-type]
-                )
-                if full_ids_cpu is None:
-                    self.metrics["last_drop_reason"] = (
-                        "teacher_request_empty_full_ids"
+                self.metrics["memory_rank_pending_request_queue_drops"] += int(dropped)
+            while len(self.pending_input_requests) + len(request_events) > capacity:
+                self.pending_input_requests.popleft()
+                self.metrics["memory_rank_request_events_superseded"] += 1
+                self.metrics["completed_requests_dropped"] += 1
+                self.metrics["memory_rank_pending_request_queue_drops"] += 1
+            for request_event in request_events:
+                try:
+                    full_ids_cpu = self._read_teacher_slice(
+                        self._teacher_request_payload,
+                        request_event["full_ids"],  # type: ignore[arg-type]
                     )
-                else:
+                    if full_ids_cpu is None:
+                        self.metrics["last_drop_reason"] = (
+                            "teacher_request_empty_full_ids"
+                        )
+                        continue
                     full_ids = full_ids_cpu.to(device=self.device, dtype=torch.int32)
-                    step = int(latest_event["step"])
+                    step = int(request_event["step"])
                     self.pending_input_requests.append(
                         {"step": step, "buffer": full_ids}
                     )
                     self.metrics["memory_rank_pump_last_request_step"] = int(step)
                     self.metrics["mailbox_request_reads"] += 1
-                    if self.metrics["memory_rank_request_events_superseded"]:
-                        self.metrics["last_drop_reason"] = "newer_request_won"
                     self.metrics["max_pending_input_requests"] = max(
                         int(self.metrics["max_pending_input_requests"]),
                         len(self.pending_input_requests),
                     )
-            except Exception as exc:
-                self.metrics["errors"] += 1
-                self.metrics["last_error"] = "".join(
-                    traceback.format_exception_only(type(exc), exc)
-                ).strip()
-                self.metrics["last_drop_reason"] = "request_shm_read_error"
+                except Exception as exc:
+                    self.metrics["errors"] += 1
+                    self.metrics["last_error"] = "".join(
+                        traceback.format_exception_only(type(exc), exc)
+                    ).strip()
+                    self.metrics["last_drop_reason"] = "request_shm_read_error"
+                    break
+            if self.metrics["memory_rank_request_events_superseded"]:
+                self.metrics["last_drop_reason"] = "newer_request_won"
         self.metrics["teacher_shm_request_events_popped"] += int(popped)
         return int(popped)
 

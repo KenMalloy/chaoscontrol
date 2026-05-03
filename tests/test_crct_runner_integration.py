@@ -1033,7 +1033,9 @@ def test_crct_mailbox_preserves_burst_results_fifo(tmp_path) -> None:
     assert diag0["ready_result_queue_max"] == 2
 
 
-def test_crct_mailbox_request_ingest_is_latest_only(tmp_path) -> None:
+def test_crct_mailbox_request_ingest_keeps_recent_backlog_within_capacity(
+    tmp_path,
+) -> None:
     mod = _load_module("runner_fast_path_crct_mailbox_request_latest", RUNNER_PATH)
     kwargs = {
         "world_size": 4,
@@ -1042,7 +1044,7 @@ def test_crct_mailbox_request_ingest_is_latest_only(tmp_path) -> None:
         "full_ids_shape": (2, 6),
         "device": torch.device("cpu"),
         "payload_dtype": torch.float32,
-        "max_local_batches": 8,
+        "max_local_batches": 2,
         "max_payload_lag_steps": 8,
         "score_interval_steps": 1,
     }
@@ -1060,18 +1062,24 @@ def test_crct_mailbox_request_ingest_is_latest_only(tmp_path) -> None:
 
     assert rank3.begin_step(inputs=inputs0, targets=targets0, step=1) is None
 
-    assert len(rank3.pending_input_requests) == 1
+    assert len(rank3.pending_input_requests) == 2
+    earlier = rank3.pending_input_requests.popleft()
     latest = rank3.pending_input_requests.popleft()
+    assert int(earlier["step"]) == 0
+    torch.testing.assert_close(
+        earlier["buffer"],
+        mod._crct_full_input_ids(inputs0, targets0).to(torch.int32),
+    )
     assert int(latest["step"]) == 1
     torch.testing.assert_close(
         latest["buffer"],
         mod._crct_full_input_ids(inputs1, targets1).to(torch.int32),
     )
     diag3 = rank3.diagnostics()
-    assert diag3["completed_requests_dropped"] == 1
-    assert diag3["memory_rank_request_events_superseded"] == 1
+    assert diag3["completed_requests_dropped"] == 0
+    assert diag3["memory_rank_request_events_superseded"] == 0
     assert diag3["memory_rank_pump_request_pops"] == 2
-    assert diag3["max_pending_input_requests"] == 1
+    assert diag3["max_pending_input_requests"] == 2
 
 
 def test_crct_mailbox_transport_round_trips_memory_packet(tmp_path) -> None:
